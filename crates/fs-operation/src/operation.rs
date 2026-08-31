@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::FsError;
 
-/// Logical path relative to the bound Workdir root.
+/// Scope-checked filesystem path. Relative paths resolve below the bound
+/// Workdir root; absolute paths require an explicit matching scope rule.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct FsPath(String);
@@ -16,11 +17,30 @@ impl<'de> Deserialize<'de> for FsPath {
         D: serde::Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        Self::new(&value).map_err(serde::de::Error::custom)
+        Self::new_scoped(&value).map_err(serde::de::Error::custom)
     }
 }
 
 impl FsPath {
+    /// Construct a path for a scope-checked operation that may target an
+    /// explicitly granted absolute path outside the provider root.
+    pub fn new_scoped(value: impl Into<String>) -> Result<Self, FsError> {
+        let value = value.into();
+        if !Path::new(&value).is_absolute() {
+            return Self::new(value);
+        }
+        if value.contains('\\') {
+            return Err(FsError::InvalidPath(value));
+        }
+        if Path::new(&value)
+            .components()
+            .any(|component| component == Component::ParentDir)
+        {
+            return Err(FsError::InvalidPath(value));
+        }
+        Ok(Self(value))
+    }
+
     pub fn root() -> Self {
         Self(String::new())
     }

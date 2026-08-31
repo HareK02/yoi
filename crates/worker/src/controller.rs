@@ -222,6 +222,7 @@ impl WorkerController {
     pub async fn spawn<C, St>(
         worker: Worker<C, St>,
         runtime_base: &Path,
+        bash_output_dir: &Path,
     ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
     where
         C: LlmClient + Clone + 'static,
@@ -230,6 +231,7 @@ impl WorkerController {
         Self::spawn_inner(
             worker,
             runtime_base,
+            bash_output_dir,
             false,
             None,
             WorkerControllerTransport::UnixSocket,
@@ -242,23 +244,8 @@ impl WorkerController {
     pub async fn spawn_with_transport<C, St>(
         worker: Worker<C, St>,
         runtime_base: &Path,
+        bash_output_dir: &Path,
         transport: WorkerControllerTransport,
-    ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
-    where
-        C: LlmClient + Clone + 'static,
-        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
-    {
-        Self::spawn_inner(worker, runtime_base, false, None, transport).await
-    }
-
-    /// Spawn a Worker owned by `worker-runtime`.
-    ///
-    /// The controller still uses an ephemeral directory for Unix sockets and
-    /// tool spill artifacts, but does not write legacy pid/status/manifest
-    /// liveness projections.
-    pub async fn spawn_runtime_managed<C, St>(
-        worker: Worker<C, St>,
-        runtime_base: &Path,
     ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
     where
         C: LlmClient + Clone + 'static,
@@ -267,6 +254,33 @@ impl WorkerController {
         Self::spawn_inner(
             worker,
             runtime_base,
+            bash_output_dir,
+            false,
+            None,
+            transport,
+        )
+        .await
+    }
+
+    /// Spawn a Worker owned by `worker-runtime`.
+    ///
+    /// The controller uses an ephemeral directory for Unix sockets while tool
+    /// spill artifacts use the separately supplied Worker-owned temporary path.
+    /// Runtime-managed Workers do not write legacy pid/status/manifest liveness
+    /// projections.
+    pub async fn spawn_runtime_managed<C, St>(
+        worker: Worker<C, St>,
+        runtime_base: &Path,
+        bash_output_dir: &Path,
+    ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
+    where
+        C: LlmClient + Clone + 'static,
+        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
+        Self::spawn_inner(
+            worker,
+            runtime_base,
+            bash_output_dir,
             true,
             None,
             WorkerControllerTransport::UnixSocket,
@@ -278,6 +292,7 @@ impl WorkerController {
     pub async fn spawn_runtime_managed_run<C, St>(
         worker: Worker<C, St>,
         run_dir: &Path,
+        bash_output_dir: &Path,
     ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
     where
         C: LlmClient + Clone + 'static,
@@ -286,6 +301,7 @@ impl WorkerController {
         Self::spawn_runtime_managed_run_with_transport(
             worker,
             run_dir,
+            bash_output_dir,
             WorkerControllerTransport::UnixSocket,
         )
         .await
@@ -296,6 +312,7 @@ impl WorkerController {
     pub async fn spawn_runtime_managed_run_with_transport<C, St>(
         worker: Worker<C, St>,
         run_dir: &Path,
+        bash_output_dir: &Path,
         transport: WorkerControllerTransport,
     ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
     where
@@ -305,12 +322,21 @@ impl WorkerController {
         let parent = run_dir
             .parent()
             .ok_or_else(|| std::io::Error::other("run path has no parent"))?;
-        Self::spawn_inner(worker, parent, true, Some(run_dir), transport).await
+        Self::spawn_inner(
+            worker,
+            parent,
+            bash_output_dir,
+            true,
+            Some(run_dir),
+            transport,
+        )
+        .await
     }
 
     async fn spawn_inner<C, St>(
         worker: Worker<C, St>,
         runtime_base: &Path,
+        bash_output_dir: &Path,
         runtime_managed: bool,
         runtime_run: Option<&Path>,
         transport: WorkerControllerTransport,
@@ -323,6 +349,7 @@ impl WorkerController {
         let result = Self::spawn_initialized(
             worker,
             runtime_base,
+            bash_output_dir,
             runtime_managed,
             runtime_run,
             transport,
@@ -340,6 +367,7 @@ impl WorkerController {
     async fn spawn_initialized<C, St>(
         mut worker: Worker<C, St>,
         runtime_base: &Path,
+        bash_output_dir: &Path,
         runtime_managed: bool,
         runtime_run: Option<&Path>,
         transport: WorkerControllerTransport,
@@ -397,11 +425,11 @@ impl WorkerController {
         worker.attach_internal_worker_registry(spawned_registry.clone());
         worker.attach_working_event_tx(working_event_tx.clone());
 
-        // Bash spills long outputs to a per-worker subdir under the runtime
-        // dir. Push a recursive `allow(Read)` for that path into the
-        // Worker's runtime scope so the agent can `Read` saved files
-        // without polluting the workspace.
-        let bash_output_dir = runtime_dir.path().join("bash-output");
+        // Bash spill artifacts are owned by the stable Worker identity rather
+        // than a controller session/run generation. Push a recursive
+        // `allow(Read)` for the exact tool output path into the Worker's shared
+        // runtime scope so the Workdir session and system prompt stay aligned.
+        let bash_output_dir = bash_output_dir.to_path_buf();
         std::fs::create_dir_all(&bash_output_dir).map_err(|e| {
             std::io::Error::other(format!(
                 "create bash output dir {}: {e}",
@@ -880,7 +908,7 @@ where
             .register_tools(tools::core_builtin_tools(
                 workdir.clone(),
                 tracker.clone(),
-                bash_output_dir,
+                bash_output_dir.clone(),
             ));
         if feature_config.image.enabled && model_supports_image_attachments(&spawner_manifest.model)
         {
@@ -1103,6 +1131,7 @@ where
                 spawner_workspace_context,
                 parent_notifications,
                 runtime_base.clone(),
+                bash_output_dir.clone(),
                 spawner_workspace_root,
                 source_workdir_session,
                 spawned_registry.clone(),

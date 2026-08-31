@@ -394,14 +394,21 @@ async fn bash_inherits_workdir_cwd() {
 }
 
 #[tokio::test]
-async fn bash_provider_output_does_not_expose_internal_paths() {
+async fn bash_provider_output_exposes_readable_retained_path() {
     let (_dir, spill, reg) = setup();
     let bash = reg.get("Bash");
     let out = call(&bash, json!({ "command": "printf 'x%.0s' {1..20480}" })).await;
     let body = out.content.unwrap();
     assert!(body.contains("bounded WorkdirSession command output"));
-    assert!(!body.contains(spill.path().to_str().unwrap()));
-    assert_eq!(std::fs::read_dir(spill.path()).unwrap().count(), 0);
+    assert!(body.contains("full output saved to"));
+    assert!(body.contains(spill.path().to_str().unwrap()));
+    let artifact = std::fs::read_dir(spill.path())
+        .unwrap()
+        .next()
+        .expect("retained output")
+        .unwrap()
+        .path();
+    assert_eq!(std::fs::metadata(artifact).unwrap().len(), 20_480);
 }
 
 #[tokio::test]

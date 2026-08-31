@@ -47,7 +47,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let worker = worker::Worker::from_manifest_toml(&toml, store).await?;
 
     let runtime_tmp = tempfile::tempdir()?;
-    let (handle, _shutdown_rx) = WorkerController::spawn(worker, runtime_tmp.path()).await?;
+    let bash_output_dir = runtime_tmp.path().join("bash-output");
+    let (handle, _shutdown_rx) =
+        WorkerController::spawn(worker, runtime_tmp.path(), &bash_output_dir).await?;
 
     // Check initial status via shared state
     println!("[shared_state] {}", handle.shared_state.status_json());

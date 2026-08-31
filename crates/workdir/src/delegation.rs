@@ -743,6 +743,7 @@ mod tests {
                 command: command.into(),
                 timeout_secs: 5,
                 output_limit: 1024,
+                spill_dir: None,
                 tool_call_id: Some(tool_call_id.into()),
             })
             .await
@@ -770,6 +771,7 @@ mod tests {
                 command: "printf ready; sleep 0.2; printf done".into(),
                 timeout_secs: 5,
                 output_limit: 1024,
+                spill_dir: None,
                 tool_call_id: Some("tool-delegated".into()),
             })
             .await
@@ -858,6 +860,7 @@ mod tests {
                     command: "printf denied".into(),
                     timeout_secs: 5,
                     output_limit: 1024,
+                    spill_dir: None,
                     tool_call_id: Some("read-only-command".into()),
                 })
                 .await,
@@ -993,6 +996,7 @@ mod tests {
                     command: "printf revoked".into(),
                     timeout_secs: 5,
                     output_limit: 1024,
+                    spill_dir: None,
                     tool_call_id: Some("revoked-child-command".into()),
                 })
                 .await,
@@ -1171,6 +1175,7 @@ mod tests {
                     command: "printf closed".into(),
                     timeout_secs: 5,
                     output_limit: 1024,
+                    spill_dir: None,
                     tool_call_id: Some("closed-parent-command".into()),
                 })
                 .await,

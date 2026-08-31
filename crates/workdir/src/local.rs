@@ -10,9 +10,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
-#[cfg(test)]
-use std::io::Write as _;
-use std::io::{Read as _, Seek as _, SeekFrom};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -691,6 +689,11 @@ impl WorkdirSession for LocalWorkdirSession {
     async fn start_command(&self, request: CommandRequest) -> Result<CommandHandle, WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Command)?;
         self.ensure_open()?;
+        if let Some(spill_dir) = request.spill_dir.as_deref()
+            && !self.inner.scope.snapshot().is_readable(spill_dir)
+        {
+            return Err(WorkdirError::OutOfScope(spill_dir.to_path_buf()));
+        }
         let id = self.inner.next_command_id.fetch_add(1, Ordering::Relaxed);
         let handle = CommandHandle(format!("command-{id}"));
         let cwd = self.inner.cwd.clone();
@@ -776,6 +779,7 @@ impl WorkdirSession for LocalWorkdirSession {
                         content: String::new(),
                         next_cursor: None,
                         truncated: false,
+                        output_path: None,
                     });
                 }
                 drop(commands);
@@ -792,6 +796,7 @@ impl WorkdirSession for LocalWorkdirSession {
                     content: String::new(),
                     next_cursor: None,
                     truncated: false,
+                    output_path: None,
                 });
             }
             break commands
@@ -901,6 +906,7 @@ fn command_output_page(output: &CommandOutput, cursor: usize, limit: usize) -> C
         content,
         next_cursor: (end < total_chars).then_some(end),
         truncated: output.truncated || end < total_chars,
+        output_path: output.output_path.clone(),
     }
 }
 
@@ -1059,6 +1065,22 @@ async fn run_command(
 
     let (content, truncated) =
         read_command_output_files(&stdout_path, &stderr_path, request.output_limit.max(1))?;
+    let output_path = match (truncated, request.spill_dir) {
+        (true, Some(spill_dir)) => {
+            let stdout_path = stdout_path.to_path_buf();
+            let stderr_path = stderr_path.to_path_buf();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    persist_command_output(&stdout_path, &stderr_path, &spill_dir)
+                })
+                .await
+                .map_err(|error| {
+                    WorkdirError::Unavailable(format!("Bash output spill task failed: {error}"))
+                })??,
+            )
+        }
+        _ => None,
+    };
     Ok(CommandOutput {
         status,
         exit_code,
@@ -1066,6 +1088,7 @@ async fn run_command(
         content,
         next_cursor: None,
         truncated,
+        output_path,
     })
 }
 
@@ -1152,6 +1175,59 @@ fn stable_utf8_prefix_len(bytes: &[u8]) -> usize {
         }
     }
     inspected
+}
+
+fn persist_command_output(
+    stdout_path: &Path,
+    stderr_path: &Path,
+    spill_dir: &Path,
+) -> Result<PathBuf, WorkdirError> {
+    std::fs::create_dir_all(spill_dir).map_err(|error| WorkdirError::io(spill_dir, error))?;
+    let mut artifact = tempfile::Builder::new()
+        .prefix("bash-")
+        .suffix(".log")
+        .tempfile_in(spill_dir)
+        .map_err(|error| WorkdirError::io(spill_dir, error))?;
+    let artifact_path = artifact.path().to_path_buf();
+
+    let mut stdout =
+        std::fs::File::open(stdout_path).map_err(|error| WorkdirError::io(stdout_path, error))?;
+    let stdout_len = stdout
+        .metadata()
+        .map_err(|error| WorkdirError::io(stdout_path, error))?
+        .len();
+    std::io::copy(&mut stdout, &mut artifact)
+        .map_err(|error| WorkdirError::io(&artifact_path, error))?;
+
+    let mut stderr =
+        std::fs::File::open(stderr_path).map_err(|error| WorkdirError::io(stderr_path, error))?;
+    let stderr_len = stderr
+        .metadata()
+        .map_err(|error| WorkdirError::io(stderr_path, error))?
+        .len();
+    if stdout_len > 0 && stderr_len > 0 {
+        stdout
+            .seek(SeekFrom::End(-1))
+            .map_err(|error| WorkdirError::io(stdout_path, error))?;
+        let mut last = [0_u8; 1];
+        stdout
+            .read_exact(&mut last)
+            .map_err(|error| WorkdirError::io(stdout_path, error))?;
+        if last[0] != b'\n' {
+            artifact
+                .write_all(b"\n")
+                .map_err(|error| WorkdirError::io(&artifact_path, error))?;
+        }
+    }
+    std::io::copy(&mut stderr, &mut artifact)
+        .map_err(|error| WorkdirError::io(&artifact_path, error))?;
+    artifact
+        .flush()
+        .map_err(|error| WorkdirError::io(&artifact_path, error))?;
+    artifact
+        .keep()
+        .map(|(_, path)| path)
+        .map_err(|error| WorkdirError::io(&artifact_path, error.error))
 }
 
 fn read_command_output_files(
@@ -1440,6 +1516,7 @@ mod tests {
                 command: "sleep 30".to_owned(),
                 timeout_secs: 60,
                 output_limit: 1024,
+                spill_dir: None,
                 tool_call_id: None,
             },
         )
@@ -1966,6 +2043,7 @@ mod tests {
                 command: "pwd && printf provider-command".into(),
                 timeout_secs: 5,
                 output_limit: 4096,
+                spill_dir: None,
                 tool_call_id: None,
             },
         )
@@ -1992,6 +2070,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicitly_scoped_absolute_artifact_can_be_read_and_grepped() {
+        let dir = TempDir::new().unwrap();
+        let spill = TempDir::new().unwrap();
+        let artifact = spill.path().join("bash-output.log");
+        std::fs::write(&artifact, "first\nFINAL-NEEDLE\nlast\n").unwrap();
+        let scope = Scope::from_config(&ScopeConfig {
+            allow: vec![
+                ScopeRule {
+                    target: dir.path().to_path_buf(),
+                    permission: Permission::Write,
+                    recursive: true,
+                },
+                ScopeRule {
+                    target: spill.path().to_path_buf(),
+                    permission: Permission::Read,
+                    recursive: true,
+                },
+            ],
+            deny: Vec::new(),
+        })
+        .unwrap();
+        let workdir = LocalWorkdirSession::new(scope, dir.path().to_path_buf());
+        let artifact_path = WorkdirPath::new_scoped(artifact.to_string_lossy()).unwrap();
+
+        let read = WorkdirSession::read(
+            &workdir,
+            ReadRequest {
+                path: artifact_path.clone(),
+                offset: 1,
+                limit: 1,
+                max_bytes: 1024,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(String::from_utf8(read.bytes).unwrap(), "FINAL-NEEDLE\n");
+
+        let grep = WorkdirSession::grep(
+            &workdir,
+            GrepRequest {
+                pattern: "FINAL-NEEDLE".into(),
+                path: artifact_path,
+                glob: None,
+                file_type: None,
+                case_insensitive: false,
+                before_context: 0,
+                after_context: 0,
+                multiline: false,
+                output_mode: crate::GrepOutputMode::Content,
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(grep.match_count, 1);
+        assert!(grep.output.contains("FINAL-NEEDLE"));
+    }
+
+    #[tokio::test]
+    async fn command_rejects_spill_directory_without_read_scope() {
+        let dir = TempDir::new().unwrap();
+        let spill = TempDir::new().unwrap();
+        let workdir = make_fs(&dir);
+
+        let error = WorkdirSession::start_command(
+            &workdir,
+            CommandRequest {
+                command: "printf hidden".into(),
+                timeout_secs: 5,
+                output_limit: 1,
+                spill_dir: Some(spill.path().to_path_buf()),
+                tool_call_id: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, WorkdirError::OutOfScope(path) if path == spill.path()));
+    }
+
+    #[tokio::test]
+    async fn truncated_command_output_is_retained_in_the_requested_spill_directory() {
+        let dir = TempDir::new().unwrap();
+        let spill = TempDir::new().unwrap();
+        let scope = Scope::from_config(&ScopeConfig {
+            allow: vec![
+                ScopeRule {
+                    target: dir.path().to_path_buf(),
+                    permission: Permission::Write,
+                    recursive: true,
+                },
+                ScopeRule {
+                    target: spill.path().to_path_buf(),
+                    permission: Permission::Read,
+                    recursive: true,
+                },
+            ],
+            deny: Vec::new(),
+        })
+        .unwrap();
+        let workdir = LocalWorkdirSession::new(scope, dir.path().to_path_buf());
+        let handle = WorkdirSession::start_command(
+            &workdir,
+            CommandRequest {
+                command: "i=0; while [ $i -lt 200 ]; do printf 'line-%03d\\n' \"$i\"; i=$((i+1)); done; printf 'FINAL-NEEDLE\\n'".into(),
+                timeout_secs: 5,
+                output_limit: 64,
+                spill_dir: Some(spill.path().to_path_buf()),
+                tool_call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let output = WorkdirSession::command_output(
+            &workdir,
+            CommandOutputRequest {
+                handle,
+                cursor: 0,
+                limit: 4096,
+                wait: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(output.truncated);
+        let output_path = output.output_path.expect("retained output path");
+        assert_eq!(output_path.parent(), Some(spill.path()));
+        let retained = std::fs::read_to_string(&output_path).unwrap();
+        assert!(retained.starts_with("line-000\n"));
+        assert!(retained.ends_with("FINAL-NEEDLE\n"));
+        assert_eq!(retained.lines().count(), 201);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(output_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn completed_command_output_can_be_read_in_bounded_unicode_pages() {
         let dir = TempDir::new().unwrap();
         let workdir = make_fs(&dir);
@@ -2001,6 +2224,7 @@ mod tests {
                 command: "printf 'aéz'".into(),
                 timeout_secs: 5,
                 output_limit: 1024,
+                spill_dir: None,
                 tool_call_id: None,
             },
         )
@@ -2120,6 +2344,7 @@ mod tests {
                 content: "done".into(),
                 next_cursor: None,
                 truncated: false,
+                output_path: None,
             })
         });
         workdir.inner.commands.lock().await.insert(
@@ -2224,6 +2449,7 @@ mod tests {
                 command: "printf ready; printf warning >&2; sleep 0.2; printf done".into(),
                 timeout_secs: 5,
                 output_limit: 1024,
+                spill_dir: None,
                 tool_call_id: Some("tool-7".into()),
             },
         )
@@ -2327,6 +2553,7 @@ mod tests {
                 command: "sleep 30".into(),
                 timeout_secs: 1,
                 output_limit: 1024,
+                spill_dir: None,
                 tool_call_id: None,
             },
         )
@@ -2396,6 +2623,7 @@ mod tests {
                 command: "sleep 30".into(),
                 timeout_secs: 60,
                 output_limit: 1024,
+                spill_dir: None,
                 tool_call_id: None,
             },
         )

@@ -276,10 +276,36 @@ async fn spawn_controller(worker: Worker<MockClient, TestStore>) -> WorkerHandle
     let tmp = tempfile::tempdir().unwrap();
     let runtime_base = tmp.path().to_owned();
     std::mem::forget(tmp);
-    let (handle, _shutdown_rx) = WorkerController::spawn(worker, &runtime_base)
+    let bash_output_dir = runtime_base.join("bash-output");
+    let (handle, _shutdown_rx) = WorkerController::spawn(worker, &runtime_base, &bash_output_dir)
         .await
         .unwrap();
     handle
+}
+
+#[tokio::test]
+async fn controller_grants_read_scope_for_exact_bash_output_directory() {
+    let worker = make_worker(MockClient::new(simple_text_events())).await;
+    let shared_scope = worker.scope().clone();
+    let runtime_base = tempfile::tempdir().unwrap();
+    let worker_tmp = tempfile::tempdir().unwrap();
+    let bash_output_dir = worker_tmp.path().join("worker-1").join("bash-output");
+
+    let (handle, shutdown_rx) =
+        WorkerController::spawn(worker, runtime_base.path(), &bash_output_dir)
+            .await
+            .unwrap();
+
+    assert!(bash_output_dir.is_dir());
+    assert!(shared_scope.snapshot().allow_rules().iter().any(|rule| {
+        rule.target == bash_output_dir
+            && rule.permission == manifest::Permission::Read
+            && rule.recursive
+    }));
+    assert!(!handle.runtime_dir.path().join("bash-output").exists());
+
+    handle.send(Method::Shutdown).await.unwrap();
+    shutdown_rx.await.unwrap();
 }
 
 #[tokio::test]
@@ -297,6 +323,7 @@ async fn shutdown_closes_bound_workdir_session() {
             command: "sleep 30".to_owned(),
             timeout_secs: 60,
             output_limit: 1024,
+            spill_dir: None,
             tool_call_id: None,
         })
         .await
@@ -304,9 +331,11 @@ async fn shutdown_closes_bound_workdir_session() {
     worker.bind_workdir_session(Some(Arc::clone(&session)));
 
     let runtime_base = tempfile::tempdir().unwrap();
-    let (handle, shutdown_rx) = WorkerController::spawn(worker, runtime_base.path())
-        .await
-        .unwrap();
+    let bash_output_dir = runtime_base.path().join("bash-output");
+    let (handle, shutdown_rx) =
+        WorkerController::spawn(worker, runtime_base.path(), &bash_output_dir)
+            .await
+            .unwrap();
     handle.send(Method::Shutdown).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), shutdown_rx)
         .await
@@ -338,6 +367,7 @@ async fn controller_projects_workdir_command_events_and_snapshot_state() {
             command: "printf ready; sleep 0.3; printf done".to_owned(),
             timeout_secs: 5,
             output_limit: 1024,
+            spill_dir: None,
             tool_call_id: Some("tool-command-1".into()),
         })
         .await
@@ -445,6 +475,7 @@ async fn controller_refreshes_command_snapshot_after_high_output_provider_lag() 
                 .to_owned(),
             timeout_secs: 10,
             output_limit: 1024,
+            spill_dir: None,
             tool_call_id: Some("tool-high-output".into()),
         })
         .await
@@ -508,8 +539,9 @@ async fn controller_startup_failure_closes_bound_workdir_session() {
     let invalid_runtime_base = runtime_base.path().join("not-a-directory");
     std::fs::write(&invalid_runtime_base, "file").unwrap();
 
+    let bash_output_dir = runtime_base.path().join("bash-output");
     assert!(
-        WorkerController::spawn(worker, &invalid_runtime_base)
+        WorkerController::spawn(worker, &invalid_runtime_base, &bash_output_dir)
             .await
             .is_err()
     );
@@ -519,6 +551,7 @@ async fn controller_startup_failure_closes_bound_workdir_session() {
                 command: "printf unreachable".to_owned(),
                 timeout_secs: 5,
                 output_limit: 1024,
+                spill_dir: None,
                 tool_call_id: None,
             })
             .await,
@@ -863,7 +896,8 @@ permission = "write"
     let client = MockClient::new(simple_text_events());
     let worker = make_worker_with_pwd_and_manifest(client, manifest).await.0;
     let tmp = tempfile::tempdir().unwrap();
-    let result = WorkerController::spawn(worker, tmp.path()).await;
+    let bash_output_dir = tmp.path().join("bash-output");
+    let result = WorkerController::spawn(worker, tmp.path(), &bash_output_dir).await;
     assert!(
         result.is_ok(),
         "feature exposure must not imply delegation authority"

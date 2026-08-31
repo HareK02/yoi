@@ -634,10 +634,12 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let bash_output_dir = crate::bash_output_dir_for_worker_id(&worker_name);
     let started = match start_worker_controller(
         worker,
         WorkerBootstrapLayout::Direct {
             runtime_base: runtime_base.clone(),
+            bash_output_dir,
         },
         WorkerControllerTransport::UnixSocket,
     )

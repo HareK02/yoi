@@ -861,7 +861,8 @@ async fn controller_compact_method_emits_start_and_done() {
     ]);
     let worker = make_worker_with_manifest(POST_RUN_MANIFEST_TOML, client).await;
     let runtime_tmp = tempfile::tempdir().unwrap();
-    let (handle, _shutdown) = WorkerController::spawn(worker, runtime_tmp.path())
+    let bash_output_dir = runtime_tmp.path().join("bash-output");
+    let (handle, _shutdown) = WorkerController::spawn(worker, runtime_tmp.path(), &bash_output_dir)
         .await
         .unwrap();
     let mut rx = handle.subscribe();

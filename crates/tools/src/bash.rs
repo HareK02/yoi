@@ -21,6 +21,7 @@ struct BashParams {
 
 pub(crate) struct BashTool {
     session: WorkdirSessionHandle,
+    output_dir: PathBuf,
     state: Arc<Mutex<BashExecutionState>>,
 }
 
@@ -117,6 +118,7 @@ impl Tool for BashTool {
                 command: params.command,
                 timeout_secs,
                 output_limit: INLINE_BYTE_BUDGET,
+                spill_dir: Some(self.output_dir.clone()),
                 tool_call_id: Some(call_id.clone()),
             })
             .await
@@ -183,10 +185,15 @@ impl Tool for BashTool {
         let content = if output.content.is_empty() {
             None
         } else if output.truncated {
-            Some(format!(
-                "[showing bounded WorkdirSession command output; additional output was truncated]\n{}",
-                output.content
-            ))
+            let notice = match output.output_path {
+                Some(path) => format!(
+                    "[showing bounded WorkdirSession command output; full output saved to {}]",
+                    path.display()
+                ),
+                None => "[showing bounded WorkdirSession command output; additional output was truncated]"
+                    .to_owned(),
+            };
+            Some(format!("{notice}\n{}", output.content))
         } else {
             Some(output.content)
         };
@@ -259,16 +266,137 @@ fn truncate_for_summary(command: &str) -> String {
     summary
 }
 
-pub fn bash_tool(session: WorkdirSessionHandle, _output_dir: PathBuf) -> ToolDefinition {
+pub fn bash_tool(session: WorkdirSessionHandle, output_dir: PathBuf) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(BashParams);
         let meta = ToolMeta::new("Bash")
-            .description("Execute a shell command in the bound Workdir. Process start, bounded output, timeout and cancellation are owned by the WorkdirSession provider. This is not a sandbox.")
+            .description("Execute a shell command in the bound Workdir. Process start, bounded inline output, full-output spill, timeout and cancellation are owned by the WorkdirSession provider. This is not a sandbox.")
             .input_schema(serde_json::to_value(schema).expect("Bash schema serialization"));
         let tool: Arc<dyn Tool> = Arc::new(BashTool {
             session: session.clone(),
+            output_dir: output_dir.clone(),
             state: Arc::new(Mutex::new(BashExecutionState::default())),
         });
         (meta, tool)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
+    use tempfile::TempDir;
+    use workdir::{LocalWorkdirSession, WorkdirSessionHandle};
+
+    use super::bash_tool;
+    use crate::{grep::grep_tool, read::read_tool, tracker::Tracker};
+
+    fn session_with_output_scope(root: &TempDir, output: &TempDir) -> WorkdirSessionHandle {
+        let scope = Scope::from_config(&ScopeConfig {
+            allow: vec![
+                ScopeRule {
+                    target: root.path().to_path_buf(),
+                    permission: Permission::Write,
+                    recursive: true,
+                },
+                ScopeRule {
+                    target: output.path().to_path_buf(),
+                    permission: Permission::Read,
+                    recursive: true,
+                },
+            ],
+            deny: Vec::new(),
+        })
+        .unwrap();
+        Arc::new(LocalWorkdirSession::new(scope, root.path().to_path_buf()))
+    }
+
+    #[tokio::test]
+    async fn long_output_is_spilled_and_available_to_read_and_grep() {
+        let root = TempDir::new().unwrap();
+        let output = TempDir::new().unwrap();
+        let session = session_with_output_scope(&root, &output);
+        let (_, bash) = bash_tool(session.clone(), output.path().to_path_buf())();
+        let command = "i=0; while [ $i -lt 2000 ]; do printf 'line-%04d\\n' \"$i\"; i=$((i+1)); done; printf 'FINAL-NEEDLE\\n'";
+        let result = bash
+            .execute(
+                &serde_json::json!({ "command": command }).to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let rendered = result.content.expect("bounded Bash output");
+        let artifact = std::fs::read_dir(output.path())
+            .unwrap()
+            .next()
+            .expect("artifact entry")
+            .unwrap()
+            .path();
+
+        assert!(rendered.contains("full output saved to"));
+        assert!(rendered.contains(&artifact.display().to_string()));
+        let retained = std::fs::read_to_string(&artifact).unwrap();
+        assert!(retained.starts_with("line-0000\n"));
+        assert!(retained.ends_with("FINAL-NEEDLE\n"));
+        assert_eq!(retained.lines().count(), 2001);
+
+        let (_, read) = read_tool(session.clone(), Tracker::new())();
+        let read_result = read
+            .execute(
+                &serde_json::json!({
+                    "file_path": artifact,
+                    "offset": 2000,
+                    "limit": 1,
+                })
+                .to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            read_result
+                .content
+                .expect("Read content")
+                .contains("FINAL-NEEDLE")
+        );
+
+        let (_, grep) = grep_tool(session)();
+        let grep_result = grep
+            .execute(
+                &serde_json::json!({
+                    "pattern": "FINAL-NEEDLE",
+                    "path": artifact,
+                    "output_mode": "content",
+                })
+                .to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let grep_content = grep_result.content.expect("Grep content");
+        assert!(
+            grep_content.contains("FINAL-NEEDLE"),
+            "unexpected Grep content: {grep_content:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn short_output_does_not_leave_a_spill_artifact() {
+        let root = TempDir::new().unwrap();
+        let output = TempDir::new().unwrap();
+        let session = session_with_output_scope(&root, &output);
+        let (_, bash) = bash_tool(session, output.path().to_path_buf())();
+
+        let result = bash
+            .execute(
+                &serde_json::json!({ "command": "printf short" }).to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.content.as_deref(), Some("short"));
+        assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
+    }
 }

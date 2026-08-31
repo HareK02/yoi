@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -9,6 +11,9 @@ pub struct CommandRequest {
     pub command: String,
     pub timeout_secs: u64,
     pub output_limit: usize,
+    /// Provider-local directory where complete output is retained when the
+    /// inline result exceeds `output_limit`.
+    pub spill_dir: Option<PathBuf>,
     /// Optional caller-owned correlation id. Bash supplies its tool-call id so
     /// user-facing command telemetry can update the corresponding Console row
     /// without exposing provider/session handles.
@@ -96,4 +101,6 @@ pub struct CommandOutput {
     pub content: String,
     pub next_cursor: Option<usize>,
     pub truncated: bool,
+    /// Complete output retained by the provider when `truncated` is true.
+    pub output_path: Option<PathBuf>,
 }

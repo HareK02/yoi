@@ -177,6 +177,8 @@ mod tests {
     fn logical_paths_reject_absolute_parent_and_backslash_forms() {
         assert!(FsPath::new("src/lib.rs").is_ok());
         assert!(FsPath::new("/tmp/file").is_err());
+        assert!(FsPath::new_scoped("/tmp/file").is_ok());
+        assert!(FsPath::new_scoped("/tmp/../secret").is_err());
         assert!(FsPath::new("../file").is_err());
         assert!(FsPath::new("src\\lib.rs").is_err());
     }

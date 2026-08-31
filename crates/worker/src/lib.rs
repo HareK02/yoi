@@ -27,7 +27,7 @@ mod worker;
 
 pub use bootstrap::{
     BootstrappedWorker, PreparedWorker, WorkerBootstrap, WorkerBootstrapError,
-    WorkerBootstrapLayout, start_worker_controller,
+    WorkerBootstrapLayout, bash_output_dir_for_worker_id, start_worker_controller,
 };
 pub use compact::token_counter::{EstimateSource, SplitPoint, TokenEstimate};
 pub use controller::{ShutdownReceiver, WorkerController, WorkerControllerTransport, WorkerHandle};
