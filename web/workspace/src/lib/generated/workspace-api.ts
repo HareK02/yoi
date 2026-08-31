@@ -10,6 +10,8 @@ export type WorkspaceSummary = {
   updated_at: string;
 };
 
+export type WorkspaceCatalogListResponse = Array<WorkspaceSummary>;
+
 export type WorkspaceRepositoryRecord = {
   workspace_id: string;
   repository_id: string;

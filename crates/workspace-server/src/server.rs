@@ -67,10 +67,10 @@ use workspace_api::{
     RepositoryDetailResponse, RepositoryListResponse, RepositoryLogResponse,
     RepositorySshCredential, RepositorySshHostTrust, RotateRepositorySshCredentialRequest,
     RuntimeConnectionTestResponse, RuntimeManagementSummary, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
-    TICKET_RELATIONS_QUERY_PATH, WorkspaceCreateResponse, WorkspaceExtensionPointState,
-    WorkspaceExtensionPoints, WorkspacePermissionSummary, WorkspaceRepositoryRecord,
-    WorkspaceResponse, WorkspaceRuntimeResource, WorkspaceSummary, WorkspaceWorkerDiscoveryItem,
-    WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
+    TICKET_RELATIONS_QUERY_PATH, WorkspaceCatalogListResponse, WorkspaceCreateResponse,
+    WorkspaceExtensionPointState, WorkspaceExtensionPoints, WorkspacePermissionSummary,
+    WorkspaceRepositoryRecord, WorkspaceResponse, WorkspaceRuntimeResource, WorkspaceSummary,
+    WorkspaceWorkerDiscoveryItem, WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
 };
 
 use crate::auth::{
@@ -980,7 +980,9 @@ async fn list_server_workspaces(
     let owner = match resolve_server_actor(&api, &headers).await {
         Ok(Some(actor)) => Some(actor.account_id),
         Ok(None) => match api.catalog.is_empty() {
-            Ok(true) => return Json(Vec::<WorkspaceSummary>::new()).into_response(),
+            Ok(true) => {
+                return Json(WorkspaceCatalogListResponse(Vec::new())).into_response();
+            }
             Ok(false) => return StatusCode::UNAUTHORIZED.into_response(),
             Err(error) => return server_error_response(error),
         },
@@ -990,12 +992,9 @@ async fn list_server_workspaces(
         .catalog
         .list(owner.as_deref(), query.limit.unwrap_or(100))
     {
-        Ok(workspaces) => Json(
-            workspaces
-                .into_iter()
-                .map(workspace_summary)
-                .collect::<Vec<_>>(),
-        )
+        Ok(workspaces) => Json(WorkspaceCatalogListResponse(
+            workspaces.into_iter().map(workspace_summary).collect(),
+        ))
         .into_response(),
         Err(error) => server_error_response(error),
     }
@@ -17784,10 +17783,10 @@ mod tests {
         let catalog_body = to_bytes(authenticated_catalog.into_body(), usize::MAX)
             .await
             .unwrap();
-        let typed_catalog: Vec<workspace_api::WorkspaceSummary> =
+        let typed_catalog: workspace_api::WorkspaceCatalogListResponse =
             serde_json::from_slice(&catalog_body).unwrap();
         assert_eq!(
-            typed_catalog[0].workspace_id,
+            typed_catalog.0[0].workspace_id,
             workspace.workspace.workspace_id
         );
 

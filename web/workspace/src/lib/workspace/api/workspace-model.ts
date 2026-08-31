@@ -11,6 +11,7 @@ import type {
   RepositorySourceKind,
   RepositorySummary,
   WorkspaceAuthConfig,
+  WorkspaceCatalogListResponse,
   WorkspaceCreateResponse,
   WorkspaceExtensionPoints,
   WorkspaceExtensionPointState,
@@ -28,6 +29,7 @@ export type {
   RepositoryListResponse,
   RepositoryLogResponse,
   RepositorySummary,
+  WorkspaceCatalogListResponse,
   WorkspaceCreateResponse,
   WorkspacePermissionSummary,
   WorkspaceResponse,
@@ -412,7 +414,7 @@ function commitSummary(value: unknown, path: string): GitCommitSummary {
 
 export function parseWorkspaceCatalogResponse(
   value: unknown,
-): WorkspaceSummary[] {
+): WorkspaceCatalogListResponse {
   return array(value, "workspaces").map((item, index) =>
     workspaceSummary(item, `workspaces[${index}]`)
   );

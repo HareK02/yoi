@@ -2,7 +2,10 @@ use crate::{BackendApiClient, BackendApiClientError};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use workspace_api::{WorkspaceCreateResponse, WorkspaceRepositoryRecord, WorkspaceSummary};
+use workspace_api::{
+    WorkspaceCatalogListResponse, WorkspaceCreateResponse, WorkspaceRepositoryRecord,
+    WorkspaceSummary,
+};
 
 const DEFAULT_WORKSPACE_LIMIT: usize = 200;
 
@@ -88,7 +91,7 @@ async fn list_backend_workspaces_with_client(
         .send()
         .await?;
     client.check_status(response.status())?;
-    Ok(response.json::<Vec<BackendWorkspace>>().await?)
+    Ok(response.json::<WorkspaceCatalogListResponse>().await?.0)
 }
 
 pub async fn create_backend_workspace(

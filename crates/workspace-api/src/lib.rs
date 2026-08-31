@@ -105,6 +105,14 @@ pub struct WorkspaceSummary {
     pub updated_at: String,
 }
 
+/// Public response returned by `GET /api/workspaces`.
+///
+/// The transparent newtype keeps the established top-level JSON array while making the
+/// complete list response a named cross-crate and generated-TypeScript authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct WorkspaceCatalogListResponse(pub Vec<WorkspaceSummary>);
+
 /// Public Repository record embedded in Workspace creation responses.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -754,6 +762,7 @@ pub fn catalog_typescript() -> String {
     let config = ts_rs::Config::default();
     let declarations = [
         WorkspaceSummary::decl(&config),
+        WorkspaceCatalogListResponse::decl(&config),
         WorkspaceRepositoryRecord::decl(&config),
         WorkspaceCreateResponse::decl(&config),
         WorkspaceAuthConfig::decl(&config),
@@ -814,6 +823,17 @@ mod tests {
         let parsed: WorkspaceResponse = serde_json::from_value(workspace.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), workspace);
 
+        let catalog = serde_json::json!([{
+            "workspace_id": "workspace-test",
+            "owner_account_id": "user-test",
+            "display_name": "Test",
+            "state": "active",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }]);
+        let parsed: WorkspaceCatalogListResponse = serde_json::from_value(catalog.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), catalog);
+
         let repositories = serde_json::json!({
             "workspace_id": "workspace-test",
             "items": [{
@@ -860,6 +880,9 @@ mod tests {
     #[test]
     fn generated_catalog_typescript_keeps_public_wrappers_and_nullability() {
         let output = catalog_typescript();
+        assert!(
+            output.contains("export type WorkspaceCatalogListResponse = Array<WorkspaceSummary>")
+        );
         assert!(output.contains("export type WorkspaceResponse ="));
         assert!(output.contains("permissions: WorkspacePermissionSummary"));
         assert!(output.contains("export type RepositoryListResponse ="));
