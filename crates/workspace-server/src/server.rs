@@ -24168,6 +24168,18 @@ mod tests {
 
         let companion_transcript = get_json(app.clone(), "/api/companion/transcript").await;
         assert_eq!(companion_transcript["total"], 0);
+        let empty_window = get_json(app.clone(), "/api/companion/transcript?start=0&limit=0").await;
+        assert_eq!(
+            empty_window,
+            json!({
+                "state": "stopped",
+                "start": 0,
+                "limit": 0,
+                "total": 0,
+                "next": null,
+                "items": [],
+            })
+        );
 
         let host_workers = get_json(app.clone(), &format!("/api/hosts/{host_id}/workers")).await;
         assert!(

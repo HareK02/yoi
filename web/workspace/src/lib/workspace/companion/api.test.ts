@@ -104,6 +104,24 @@ Deno.test("Companion transcript boundary accepts only bounded user-visible items
     ],
   };
   assertEquals(parseCompanionTranscriptProjection(fixture), fixture);
+  assertEquals(
+    parseCompanionTranscriptProjection({
+      state: "stopped",
+      start: 0,
+      limit: 0,
+      total: 0,
+      next: null,
+      items: [],
+    }),
+    {
+      state: "stopped",
+      start: 0,
+      limit: 0,
+      total: 0,
+      next: null,
+      items: [],
+    },
+  );
 
   assertThrows(
     () =>

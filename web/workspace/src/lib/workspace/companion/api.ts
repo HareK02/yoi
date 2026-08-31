@@ -63,7 +63,7 @@ export function parseCompanionTranscriptProjection(
   ]);
   const start = boundedInteger(record.start);
   const limit = boundedInteger(record.limit);
-  if (limit < 1 || limit > MAX_TRANSCRIPT_ITEMS) {
+  if (limit > MAX_TRANSCRIPT_ITEMS) {
     throw new TypeError("Companion transcript limit is out of range");
   }
   const items = boundedArray(record.items, limit).map(parseTranscriptItem);
