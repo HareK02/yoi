@@ -341,7 +341,7 @@ pub(crate) fn workspace_worker_summary(
             can_stop: summary.capabilities.can_stop,
             can_spawn_followup: summary.capabilities.can_spawn_followup,
         },
-        working_directory: summary.working_directory,
+        working_directory: summary.working_directory.map(crate::workdir_api::summary),
         diagnostics: summary.diagnostics.into_iter().map(Into::into).collect(),
     }
 }

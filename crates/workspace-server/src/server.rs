@@ -48,10 +48,7 @@ use workdir::http::{
     WorkdirSessionOperation, WorkdirSessionOperationResult, WorkdirTransportError,
 };
 use workdir::workspace::{
-    MaterializerKind, WorkingDirectoryCleanupTarget,
-    WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
-    WorkingDirectoryDiagnostic, WorkingDirectoryDiagnosticSeverity,
-    WorkingDirectoryListResponse as BrowserWorkingDirectoryListResponse, WorkingDirectoryOccupancy,
+    MaterializerKind, WorkingDirectoryCleanupTarget, WorkingDirectoryOccupancy,
     WorkingDirectoryStatusKind, WorkingDirectorySummary, WorkspaceWorkdirSessionFence,
     WorkspaceWorkdirSessionOperationRequest,
 };
@@ -66,8 +63,12 @@ use workspace_api::{
     ObjectiveStateRequest, PutRepositorySshHostTrustRequest, RepositoryAccessProjection,
     RepositorySshCredential, RepositorySshHostTrust, RotateRepositorySshCredentialRequest,
     RuntimeConnectionTestResponse, RuntimeManagementSummary, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
-    TICKET_RELATIONS_QUERY_PATH, WorkspaceRuntimeResource, WorkspaceWorkerDiscoveryItem,
-    WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
+    TICKET_RELATIONS_QUERY_PATH,
+    WorkingDirectoryCreateRequest as BrowserWorkingDirectoryCreateRequest,
+    WorkingDirectoryCreateResponse as BrowserWorkingDirectoryCreateResponse,
+    WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
+    WorkingDirectoryListResponse as BrowserWorkingDirectoryListResponse, WorkspaceRuntimeResource,
+    WorkspaceWorkerDiscoveryItem, WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
 };
 
 use crate::auth::{
@@ -2992,18 +2993,6 @@ pub struct WorkingDirectoryRepositoryOption {
     pub display_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_selector: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BrowserWorkingDirectoryCreateRequest {
-    #[serde(default)]
-    pub runtime_id: Option<String>,
-    pub repository_id: String,
-    #[serde(default)]
-    pub selector: Option<String>,
-    #[serde(default)]
-    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -8827,15 +8816,15 @@ async fn scoped_get_worker_launch_options(
 
 fn working_directory_diagnostics(
     diagnostics: Vec<RuntimeDiagnostic>,
-) -> Vec<WorkingDirectoryDiagnostic> {
+) -> Vec<workspace_api::Diagnostic> {
     diagnostics
         .into_iter()
-        .map(|diagnostic| WorkingDirectoryDiagnostic {
+        .map(|diagnostic| workspace_api::Diagnostic {
             code: diagnostic.code,
             severity: match diagnostic.severity {
-                DiagnosticSeverity::Info => WorkingDirectoryDiagnosticSeverity::Info,
-                DiagnosticSeverity::Warning => WorkingDirectoryDiagnosticSeverity::Warning,
-                DiagnosticSeverity::Error => WorkingDirectoryDiagnosticSeverity::Error,
+                DiagnosticSeverity::Info => workspace_api::DiagnosticSeverity::Info,
+                DiagnosticSeverity::Warning => workspace_api::DiagnosticSeverity::Warning,
+                DiagnosticSeverity::Error => workspace_api::DiagnosticSeverity::Error,
             },
             message: diagnostic.message,
         })
@@ -8850,7 +8839,7 @@ async fn scoped_list_runtime_working_directories(
     let (items, diagnostics) = runtime_working_directory_summaries(&api, &path.runtime_id)?;
     Ok(Json(BrowserWorkingDirectoryListResponse {
         workspace_id: api.config.workspace_id.clone(),
-        items,
+        items: items.into_iter().map(crate::workdir_api::summary).collect(),
         diagnostics: working_directory_diagnostics(diagnostics),
     }))
 }
@@ -8859,7 +8848,7 @@ async fn scoped_create_runtime_working_directory(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
     Json(request): Json<BrowserWorkingDirectoryCreateRequest>,
-) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryDetailResponse>)> {
+) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryCreateResponse>)> {
     create_workspace_working_directory(
         &api,
         &path.workspace_id,
@@ -8893,7 +8882,7 @@ async fn scoped_list_working_directories(
     let items = working_directory_summaries(&api)?;
     Ok(Json(BrowserWorkingDirectoryListResponse {
         workspace_id: api.config.workspace_id.clone(),
-        items,
+        items: items.into_iter().map(crate::workdir_api::summary).collect(),
         diagnostics: Vec::new(),
     }))
 }
@@ -8902,7 +8891,7 @@ async fn scoped_create_working_directory(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     Json(request): Json<BrowserWorkingDirectoryCreateRequest>,
-) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryDetailResponse>)> {
+) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryCreateResponse>)> {
     create_workspace_working_directory(&api, &path.workspace_id, None, request).await
 }
 
@@ -8995,7 +8984,7 @@ async fn create_workspace_working_directory(
     workspace_id: &str,
     route_runtime_id: Option<&str>,
     request: BrowserWorkingDirectoryCreateRequest,
-) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryDetailResponse>)> {
+) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryCreateResponse>)> {
     validate_workspace_scope(api, workspace_id)?;
     if let (Some(route_runtime_id), Some(request_runtime_id)) =
         (route_runtime_id, request.runtime_id.as_deref())
@@ -9158,7 +9147,17 @@ async fn create_workspace_working_directory(
             &reserved.resolved_runtime_id,
             &reserved.working_directory_id,
         )
-        .map(|response| (StatusCode::OK, response));
+        .map(|Json(response)| {
+            (
+                StatusCode::OK,
+                Json(BrowserWorkingDirectoryCreateResponse {
+                    workspace_id: response.workspace_id,
+                    runtime_id: response.runtime_id,
+                    item: response.item,
+                    diagnostics: response.diagnostics,
+                }),
+            )
+        });
     }
 
     let runtime = match api
@@ -9337,10 +9336,10 @@ async fn create_workspace_working_directory(
     apply_workdir_occupancy_projection(api, &mut summary)?;
     Ok((
         StatusCode::CREATED,
-        Json(BrowserWorkingDirectoryDetailResponse {
+        Json(BrowserWorkingDirectoryCreateResponse {
             workspace_id: workspace_id.to_string(),
             runtime_id: reserved.resolved_runtime_id,
-            item: summary,
+            item: crate::workdir_api::summary(summary),
             diagnostics: working_directory_diagnostics(result.diagnostics),
         }),
     ))
@@ -9363,7 +9362,7 @@ fn working_directory_detail_for_runtime(
         return Ok(Json(BrowserWorkingDirectoryDetailResponse {
             workspace_id: api.config.workspace_id.clone(),
             runtime_id: runtime_id.to_string(),
-            item: summary,
+            item: crate::workdir_api::summary(summary),
             diagnostics: working_directory_diagnostics(result.diagnostics),
         }));
     }
@@ -9374,7 +9373,9 @@ fn working_directory_detail_for_runtime(
         return Ok(Json(BrowserWorkingDirectoryDetailResponse {
             workspace_id: api.config.workspace_id.clone(),
             runtime_id: runtime_id.to_string(),
-            item: projected_workdir_summary_from_record(&api, &record)?,
+            item: crate::workdir_api::summary(projected_workdir_summary_from_record(
+                &api, &record,
+            )?),
             diagnostics: working_directory_diagnostics(result.diagnostics),
         }));
     }
@@ -9433,7 +9434,7 @@ fn cleanup_working_directory_for_runtime(
     Ok(Json(BrowserWorkingDirectoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
         runtime_id: runtime_id.to_string(),
-        item: summary,
+        item: crate::workdir_api::summary(summary),
         diagnostics: working_directory_diagnostics(result.diagnostics),
     }))
 }
@@ -22988,6 +22989,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_workspace_workdir_create_rejects_stale_json_before_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let token = seed_test_api_token(api.store.as_ref(), "stale-workdir-create-json");
+
+        let response = request_json_authenticated(
+            build_router(api.clone()),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
+            Some(serde_json::json!({
+                "runtime_id": "missing-runtime",
+                "repository_id": TEST_REPOSITORY_ID,
+                "selector": "HEAD",
+                "operation_id": "stale-workdir-create",
+                "path": "/tmp/legacy-workdir",
+            })),
+            &token,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+        .await;
+        assert!(
+            response["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown field")
+        );
+        assert!(
+            api.config_store
+                .load_workdir_create_operation(TEST_WORKSPACE_ID, "stale-workdir-create")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_workspace_workdir_create_rejects_unconfigured_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let token = seed_test_api_token(api.store.as_ref(), "missing-workdir-repository");
+
+        let response = request_json_authenticated(
+            build_router(api.clone()),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
+            Some(serde_json::json!({
+                "runtime_id": EMBEDDED_WORKER_RUNTIME_ID,
+                "repository_id": "foreign-or-missing-repository",
+                "selector": "HEAD",
+                "operation_id": "missing-workdir-repository",
+            })),
+            &token,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert!(
+            response["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown local repository")
+        );
+        assert!(
+            api.config_store
+                .load_workdir_create_operation(TEST_WORKSPACE_ID, "missing-workdir-repository")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn browser_workspace_workdir_create_delegates_and_records_default_runtime_failure() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
@@ -25405,7 +25477,7 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
     fn workspace_workdir_response_serializes_shared_occupied_contract() {
         let response = BrowserWorkingDirectoryListResponse {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
-            items: vec![WorkingDirectorySummary {
+            items: vec![crate::workdir_api::summary(WorkingDirectorySummary {
                 working_directory_id: "wd-1".to_string(),
                 repository_id: "main".to_string(),
                 creation_selector: None,
@@ -25425,7 +25497,7 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
                     display_name: "Coder".to_string(),
                     linked_at: "2026-08-12T00:00:00Z".to_string(),
                 }),
-            }],
+            })],
             diagnostics: vec![],
         };
 

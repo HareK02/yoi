@@ -200,39 +200,6 @@ impl WorkingDirectorySummary {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkingDirectoryDiagnosticSeverity {
-    Info,
-    Warning,
-    Error,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkingDirectoryDiagnostic {
-    pub code: String,
-    pub severity: WorkingDirectoryDiagnosticSeverity,
-    pub message: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkingDirectoryListResponse {
-    pub workspace_id: String,
-    pub items: Vec<WorkingDirectorySummary>,
-    pub diagnostics: Vec<WorkingDirectoryDiagnostic>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkingDirectoryDetailResponse {
-    pub workspace_id: String,
-    pub runtime_id: String,
-    pub item: WorkingDirectorySummary,
-    pub diagnostics: Vec<WorkingDirectoryDiagnostic>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,91 +219,6 @@ mod tests {
             assert_eq!(status.to_string(), expected);
             assert_eq!(serde_json::to_value(status).unwrap(), expected);
         }
-    }
-
-    #[test]
-    fn occupied_and_free_list_response_round_trips() {
-        let response = WorkingDirectoryListResponse {
-            workspace_id: "workspace".to_string(),
-            items: vec![
-                WorkingDirectorySummary {
-                    working_directory_id: "occupied".to_string(),
-                    repository_id: "repo".to_string(),
-                    creation_selector: Some("develop".to_string()),
-                    creation_ref: Some("abc123".to_string()),
-                    creation_tree: Some("tree123".to_string()),
-                    current_selector: Some("work/ticket".to_string()),
-                    current_ref: Some("def456".to_string()),
-                    current_tree: Some("tree456".to_string()),
-                    observed_at_epoch_seconds: Some(1_777_777_777),
-                    materializer_kind: MaterializerKind::LocalGitWorktree,
-                    cleanup_target: Some(WorkingDirectoryCleanupTarget {
-                        kind: "git_worktree".to_string(),
-                        working_directory_id: "occupied".to_string(),
-                        repository_id: "repo".to_string(),
-                    }),
-                    status: WorkingDirectoryStatusKind::Active,
-                    cleanliness: Some("clean".to_string()),
-                    primary_worker_id: None,
-                    occupied_by: Some(WorkingDirectoryOccupancy {
-                        worker: RuntimeWorkerRef::new("arcadia", "worker-opaque-64"),
-                        display_name: "Coder".to_string(),
-                        linked_at: "2026-08-12T00:00:00Z".to_string(),
-                    }),
-                },
-                WorkingDirectorySummary {
-                    working_directory_id: "free".to_string(),
-                    repository_id: "repo".to_string(),
-                    creation_selector: None,
-                    creation_ref: None,
-                    creation_tree: None,
-                    current_selector: None,
-                    current_ref: Some("987fed".to_string()),
-                    current_tree: None,
-                    observed_at_epoch_seconds: None,
-                    materializer_kind: MaterializerKind::LocalGitWorktree,
-                    cleanup_target: None,
-                    status: WorkingDirectoryStatusKind::Active,
-                    cleanliness: Some("unknown".to_string()),
-                    primary_worker_id: None,
-                    occupied_by: None,
-                },
-            ],
-            diagnostics: vec![WorkingDirectoryDiagnostic {
-                code: "observed".to_string(),
-                severity: WorkingDirectoryDiagnosticSeverity::Info,
-                message: "inventory observed".to_string(),
-            }],
-        };
-
-        let encoded = serde_json::to_value(&response).unwrap();
-        assert_eq!(
-            encoded["items"][0]["occupied_by"]["worker_id"],
-            "worker-opaque-64"
-        );
-        assert!(
-            encoded["items"][0]["occupied_by"]
-                .get("runtime_worker_id")
-                .is_none()
-        );
-        assert!(encoded["items"][1].get("occupied_by").is_none());
-
-        let mut stale = encoded.clone();
-        stale["items"][0]["occupied_by"]["runtime_worker_id"] = serde_json::json!(64);
-        assert!(serde_json::from_value::<WorkingDirectoryListResponse>(stale).is_err());
-
-        let decoded: WorkingDirectoryListResponse = serde_json::from_value(encoded).unwrap();
-        assert_eq!(decoded, response);
-
-        let detail = WorkingDirectoryDetailResponse {
-            workspace_id: decoded.workspace_id.clone(),
-            runtime_id: "arcadia".to_string(),
-            item: decoded.items[0].clone(),
-            diagnostics: decoded.diagnostics.clone(),
-        };
-        let encoded = serde_json::to_value(&detail).unwrap();
-        let decoded: WorkingDirectoryDetailResponse = serde_json::from_value(encoded).unwrap();
-        assert_eq!(decoded, detail);
     }
 }
 

@@ -17,7 +17,6 @@ tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "sync"
 tokio-tungstenite = { workspace = true }
 uuid = { workspace = true }
 workspace-api.workspace = true
-workdir = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -12,16 +12,17 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use workdir::http::{WorkdirSessionOperation, WorkdirSessionOperationResult};
-use workdir::workspace::{
-    WorkingDirectoryDetailResponse as WorkdirDetailResponse,
-    WorkingDirectoryListResponse as WorkdirListResponse, WorkspaceWorkdirSessionFence,
-    WorkspaceWorkdirSessionOperationRequest,
-};
+use workdir::workspace::{WorkspaceWorkdirSessionFence, WorkspaceWorkdirSessionOperationRequest};
 use workdir::{
     CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
     EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
     ReadRequest, ReadResult, StatRequest, StatResult, Workdir, WorkdirError, WorkdirSession,
     WorkdirSessionCapabilities, WorkdirSessionHandle, WriteRequest, WriteResult,
+};
+
+use workspace_api::{
+    WorkingDirectoryDetailResponse as WorkdirDetailResponse,
+    WorkingDirectoryListResponse as WorkdirListResponse,
 };
 
 use crate::feature::{

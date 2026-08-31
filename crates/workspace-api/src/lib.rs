@@ -5,7 +5,6 @@
 //! callers must explicitly construct these Workspace-authoritative resources.
 
 use serde::{Deserialize, Serialize};
-use workdir::workspace::WorkingDirectorySummary;
 
 /// Provider-neutral classification of an authoritative Repository source.
 ///
@@ -93,6 +92,7 @@ pub const TICKET_RELATIONS_QUERY_PATH: &str = "/tickets/relations/search";
 pub const TICKET_ORCHESTRATION_PLANS_QUERY_PATH: &str = "/tickets/orchestration-plans/search";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticSeverity {
     Info,
@@ -101,10 +101,138 @@ pub enum DiagnosticSeverity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct Diagnostic {
     pub code: String,
     pub severity: DiagnosticSeverity,
     pub message: String,
+}
+
+/// Public Workdir materializer classification.
+///
+/// The value identifies stable materialization provenance without exposing a
+/// provider path, Runtime handle, or session identity.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkingDirectoryMaterializerKind {
+    RuntimeGitCache,
+    LocalGitWorktree,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkingDirectoryStatusKind {
+    Active,
+    CleanupPending,
+    Corrupted,
+    NotFound,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectoryCleanupTarget {
+    pub kind: String,
+    pub working_directory_id: String,
+    pub repository_id: String,
+}
+
+/// Durable Workspace occupancy projection for one Workdir.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectoryOccupancy {
+    pub runtime_id: String,
+    pub worker_id: String,
+    pub display_name: String,
+    pub linked_at: String,
+}
+
+/// Public, provider-neutral Workdir inventory projection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectorySummary {
+    pub working_directory_id: String,
+    pub repository_id: String,
+    #[serde(default)]
+    pub creation_selector: Option<String>,
+    #[serde(default)]
+    pub creation_ref: Option<String>,
+    #[serde(default)]
+    pub creation_tree: Option<String>,
+    #[serde(default)]
+    pub current_selector: Option<String>,
+    #[serde(default)]
+    pub current_ref: Option<String>,
+    #[serde(default)]
+    pub current_tree: Option<String>,
+    #[serde(default)]
+    #[cfg_attr(feature = "typescript", ts(optional, type = "number | null"))]
+    pub observed_at_epoch_seconds: Option<u64>,
+    pub materializer_kind: WorkingDirectoryMaterializerKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_target: Option<WorkingDirectoryCleanupTarget>,
+    pub status: WorkingDirectoryStatusKind,
+    #[serde(default)]
+    pub cleanliness: Option<String>,
+    #[serde(default)]
+    pub primary_worker_id: Option<String>,
+    #[serde(default)]
+    pub occupied_by: Option<WorkingDirectoryOccupancy>,
+}
+
+/// Browser/Rust-client Workdir materialization request.
+///
+/// `runtime_id = None` requests Workspace default Runtime resolution and
+/// `operation_id = Some(_)` fences exact replay. All four fields deliberately
+/// preserve the Server's existing optionality.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectoryCreateRequest {
+    #[serde(default)]
+    pub runtime_id: Option<String>,
+    pub repository_id: String,
+    #[serde(default)]
+    pub selector: Option<String>,
+    #[serde(default)]
+    pub operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectoryListResponse {
+    pub workspace_id: String,
+    pub items: Vec<WorkingDirectorySummary>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectoryDetailResponse {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub item: WorkingDirectorySummary,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectoryCreateResponse {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub item: WorkingDirectorySummary,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -537,6 +665,61 @@ pub struct RepositoryAccessProjection {
     pub bindings: Vec<RepositorySshAccessBinding>,
 }
 
+#[cfg(feature = "typescript")]
+pub fn workdir_api_typescript() -> String {
+    use ts_rs::TS;
+
+    let config = ts_rs::Config::default();
+    let declarations = [
+        DiagnosticSeverity::decl(&config),
+        Diagnostic::decl(&config),
+        WorkingDirectoryMaterializerKind::decl(&config),
+        WorkingDirectoryStatusKind::decl(&config),
+        WorkingDirectoryCleanupTarget::decl(&config),
+        WorkingDirectoryOccupancy::decl(&config),
+        WorkingDirectorySummary::decl(&config),
+        WorkingDirectoryCreateRequest::decl(&config),
+        WorkingDirectoryListResponse::decl(&config),
+        WorkingDirectoryDetailResponse::decl(&config),
+        WorkingDirectoryCreateResponse::decl(&config),
+    ];
+    format!(
+        "// Generated from workspace-api. Do not edit by hand.\n// Regenerate: cargo run -q -p workspace-api --features typescript --example generate_workdir_api_types > web/workspace/src/lib/generated/workdir-api.ts\n\n{}\n",
+        declarations
+            .into_iter()
+            .map(|declaration| format!("export {declaration}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    )
+}
+
+#[cfg(all(test, feature = "typescript"))]
+mod typescript_tests {
+    #[test]
+    fn generated_workdir_api_contract_is_current() {
+        let expected = super::workdir_api_typescript();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/workspace/src/lib/generated/workdir-api.ts");
+        let actual = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        assert_eq!(
+            normalize(&actual),
+            normalize(&expected),
+            "regenerate Workdir API TypeScript types with `cargo run -q -p workspace-api --features typescript --example generate_workdir_api_types > web/workspace/src/lib/generated/workdir-api.ts` and format the generated file",
+        );
+    }
+
+    fn normalize(value: &str) -> String {
+        value
+            .chars()
+            .filter_map(|character| match character {
+                '\r' | '\n' | ' ' | '\t' => None,
+                _ => Some(character),
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,5 +742,53 @@ mod tests {
         });
 
         assert!(serde_json::from_value::<WorkerSummary>(payload).is_err());
+    }
+
+    #[test]
+    fn workdir_create_request_preserves_optional_operation_fields() {
+        let payload = serde_json::json!({"repository_id": "main"});
+        let request = serde_json::from_value::<WorkingDirectoryCreateRequest>(payload)
+            .expect("optional create fields may be absent");
+
+        assert_eq!(request.runtime_id, None);
+        assert_eq!(request.selector, None);
+        assert_eq!(request.operation_id, None);
+    }
+
+    #[test]
+    fn workdir_create_request_rejects_stale_or_incomplete_json() {
+        let stale = serde_json::json!({
+            "repository_id": "main",
+            "selector": "develop",
+            "path": "/tmp/workdir"
+        });
+        assert!(serde_json::from_value::<WorkingDirectoryCreateRequest>(stale).is_err());
+
+        let incomplete = serde_json::json!({
+            "runtime_id": "arcadia",
+            "operation_id": "operation-1"
+        });
+        assert!(serde_json::from_value::<WorkingDirectoryCreateRequest>(incomplete).is_err());
+    }
+
+    #[test]
+    fn workdir_response_rejects_stale_occupancy_shape() {
+        let stale = serde_json::json!({
+            "workspace_id": "workspace-test",
+            "items": [{
+                "working_directory_id": "workdir-1",
+                "repository_id": "main",
+                "materializer_kind": "runtime_git_cache",
+                "status": "active",
+                "occupied_by": {
+                    "runtime_worker_id": "worker-1",
+                    "display_name": "Coder",
+                    "linked_at": "2026-01-01T00:00:00Z"
+                }
+            }],
+            "diagnostics": []
+        });
+
+        assert!(serde_json::from_value::<WorkingDirectoryListResponse>(stale).is_err());
     }
 }
