@@ -5,7 +5,6 @@
 //! callers must explicitly construct these Workspace-authoritative resources.
 
 use serde::{Deserialize, Serialize};
-use workdir::workspace::WorkingDirectorySummary;
 
 /// Provider-neutral classification of an authoritative Repository source.
 ///
@@ -319,10 +318,163 @@ pub enum DiagnosticSeverity {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct Diagnostic {
     pub code: String,
     pub severity: DiagnosticSeverity,
     pub message: String,
+}
+
+/// Public Workdir materializer classification.
+///
+/// The value identifies stable materialization provenance without exposing a
+/// provider path, Runtime handle, or session identity.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkingDirectoryMaterializerKind {
+    #[default]
+    RuntimeGitCache,
+    LocalGitWorktree,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkingDirectoryStatusKind {
+    Active,
+    CleanupPending,
+    Corrupted,
+    NotFound,
+    Unknown,
+}
+
+impl WorkingDirectoryStatusKind {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::CleanupPending => "cleanup_pending",
+            Self::Corrupted => "corrupted",
+            Self::NotFound => "not_found",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for WorkingDirectoryStatusKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectoryCleanupTarget {
+    pub kind: String,
+    pub working_directory_id: String,
+    pub repository_id: String,
+}
+
+/// Durable Workspace occupancy projection for one Workdir.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectoryOccupancy {
+    pub runtime_id: String,
+    pub worker_id: String,
+    pub display_name: String,
+    pub linked_at: String,
+}
+
+/// Public, provider-neutral Workdir inventory projection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectorySummary {
+    pub working_directory_id: String,
+    pub repository_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_selector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_tree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_selector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_tree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional, type = "number | null"))]
+    pub observed_at_epoch_seconds: Option<u64>,
+    pub materializer_kind: WorkingDirectoryMaterializerKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_target: Option<WorkingDirectoryCleanupTarget>,
+    pub status: WorkingDirectoryStatusKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanliness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_worker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occupied_by: Option<WorkingDirectoryOccupancy>,
+}
+
+impl WorkingDirectorySummary {
+    /// Workspace-managed inventory rows carry explicit cleanup authority.
+    pub fn is_workspace_managed(&self) -> bool {
+        self.cleanup_target.is_some()
+    }
+}
+
+/// Browser/Rust-client Workdir materialization request.
+///
+/// `runtime_id = None` requests Workspace default Runtime resolution and
+/// `operation_id = Some(_)` fences exact replay. All four fields deliberately
+/// preserve the Server's existing optionality.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectoryCreateRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
+    pub repository_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectoryListResponse {
+    pub workspace_id: String,
+    pub items: Vec<WorkingDirectorySummary>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectoryDetailResponse {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub item: WorkingDirectorySummary,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectoryCreateResponse {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub item: WorkingDirectorySummary,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -543,6 +695,7 @@ pub struct WorkerCapabilitySummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkspaceWorkerSubject {
     RuntimeWorker {
@@ -555,6 +708,7 @@ pub enum WorkspaceWorkerSubject {
 /// Runtime placement appears only in the typed subject required by Worker
 /// control operations; provider and launch internals are intentionally omitted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkspaceWorkerDiscoveryItem {
     pub subject: WorkspaceWorkerSubject,
     pub resource_key: String,
@@ -562,6 +716,137 @@ pub struct WorkspaceWorkerDiscoveryItem {
     pub profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+}
+
+/// Public lifecycle projection for the Workspace Companion endpoint.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum CompanionLifecycleState {
+    Idle,
+    Running,
+    Stopped,
+}
+
+/// Public outcome of a Companion message submission.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum CompanionMessageDisposition {
+    Accepted,
+    Rejected,
+}
+
+/// Public, bounded transport metadata for Companion status.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct CompanionTransportSummary {
+    pub mode: String,
+    pub available: bool,
+}
+
+/// Public Workspace Companion status response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct CompanionStatusResponse {
+    pub state: CompanionLifecycleState,
+    pub worker: Option<WorkspaceWorkerDiscoveryItem>,
+    pub transport: CompanionTransportSummary,
+    #[serde(default)]
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Public Workspace Companion message request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct CompanionMessageRequest {
+    pub content: String,
+}
+
+/// Public Workspace Companion cancellation request.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct CompanionCancelRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Public Workspace Companion message response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct CompanionMessageResponse {
+    pub state: CompanionMessageDisposition,
+    pub message: String,
+}
+
+/// User-visible role accepted in the public Companion transcript.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum CompanionTranscriptRole {
+    User,
+    Assistant,
+}
+
+/// One allowlisted, user-visible Companion transcript item.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct CompanionTranscriptItem {
+    pub sequence: usize,
+    pub role: CompanionTranscriptRole,
+    pub content: String,
+    pub created_at: String,
+}
+
+/// Bounded public Companion transcript projection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct CompanionTranscriptProjection {
+    pub state: CompanionLifecycleState,
+    pub start: usize,
+    pub limit: usize,
+    pub total: usize,
+    pub next: Option<usize>,
+    pub items: Vec<CompanionTranscriptItem>,
+}
+
+#[cfg(feature = "typescript")]
+pub fn companion_api_typescript() -> String {
+    use ts_rs::TS;
+
+    let config = ts_rs::Config::default();
+    let declarations = [
+        DiagnosticSeverity::decl(&config),
+        Diagnostic::decl(&config),
+        WorkspaceWorkerSubject::decl(&config),
+        WorkspaceWorkerDiscoveryItem::decl(&config),
+        CompanionLifecycleState::decl(&config),
+        CompanionMessageDisposition::decl(&config),
+        CompanionTransportSummary::decl(&config),
+        CompanionStatusResponse::decl(&config),
+        CompanionMessageRequest::decl(&config),
+        CompanionCancelRequest::decl(&config),
+        CompanionMessageResponse::decl(&config),
+        CompanionTranscriptRole::decl(&config),
+        CompanionTranscriptItem::decl(&config),
+        CompanionTranscriptProjection::decl(&config),
+    ];
+
+    format!(
+        "// Generated by `cargo run -p workspace-api --features typescript --example generate_companion_api_types`.\n// Do not edit manually.\n\n{}\n",
+        declarations
+            .into_iter()
+            .map(|declaration| format!("export {declaration}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -649,6 +934,7 @@ pub struct UpdateWorkspaceMemorySettingsRequest {
 ///
 /// Secret references and secret material are deliberately not part of this DTO.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositorySshCredential {
     pub credential_id: String,
@@ -656,6 +942,7 @@ pub struct RepositorySshCredential {
     pub name: String,
     pub public_key_algorithm: String,
     pub public_key_fingerprint: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
     pub current_revision: u64,
     pub status: String,
     pub created_at: String,
@@ -665,6 +952,7 @@ pub struct RepositorySshCredential {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct CreateRepositorySshCredentialRequest {
     pub operation_id: String,
@@ -676,9 +964,11 @@ pub struct CreateRepositorySshCredentialRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RotateRepositorySshCredentialRequest {
     pub operation_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
     pub expected_revision: u64,
     pub private_key: String,
     #[serde(default)]
@@ -686,14 +976,17 @@ pub struct RotateRepositorySshCredentialRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct DeleteRepositorySshCredentialRequest {
     pub operation_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
     pub expected_revision: u64,
 }
 
 /// Public metadata for an explicitly pinned SSH host key.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositorySshHostTrust {
     pub host_trust_id: String,
@@ -703,6 +996,7 @@ pub struct RepositorySshHostTrust {
     pub key_algorithm: String,
     pub host_key: String,
     pub fingerprint: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
     pub current_revision: u64,
     pub created_at: String,
     pub updated_at: String,
@@ -711,6 +1005,7 @@ pub struct RepositorySshHostTrust {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct PutRepositorySshHostTrustRequest {
     pub operation_id: String,
@@ -719,17 +1014,22 @@ pub struct PutRepositorySshHostTrustRequest {
     pub port: u16,
     pub host_key: String,
     #[serde(default)]
+    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
     pub expected_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct DeleteRepositorySshHostTrustRequest {
     pub operation_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
     pub expected_revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(rename_all = "snake_case"))]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryAccessMode {
     ReadOnly,
@@ -737,6 +1037,7 @@ pub enum RepositoryAccessMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositorySshAccessBinding {
     pub repository_id: String,
@@ -747,9 +1048,11 @@ pub struct RepositorySshAccessBinding {
 
 /// Secret-free active Repository access projection consumed by later Runtime work.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryAccessProjection {
     pub workspace_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
     pub config_revision: u64,
     pub projection_digest: String,
     pub bindings: Vec<RepositorySshAccessBinding>,
@@ -790,6 +1093,88 @@ pub fn catalog_typescript() -> String {
         "// This file is generated by `cargo run -p workspace-api --features typescript --example generate_typescript | deno fmt -`.\n// Do not edit this file directly.\n\n{}\n",
         declarations.join("\n\n")
     )
+}
+
+#[cfg(feature = "typescript")]
+pub fn repository_access_api_typescript() -> String {
+    use ts_rs::TS;
+
+    let config = ts_rs::Config::default();
+    let declarations = [
+        RepositorySshCredential::decl(&config),
+        CreateRepositorySshCredentialRequest::decl(&config),
+        RotateRepositorySshCredentialRequest::decl(&config),
+        DeleteRepositorySshCredentialRequest::decl(&config),
+        RepositorySshHostTrust::decl(&config),
+        PutRepositorySshHostTrustRequest::decl(&config),
+        DeleteRepositorySshHostTrustRequest::decl(&config),
+        RepositoryAccessMode::decl(&config),
+        RepositorySshAccessBinding::decl(&config),
+        RepositoryAccessProjection::decl(&config),
+    ];
+    format!(
+        "// Generated from workspace-api. Do not edit by hand.\n// Regenerate: cargo run -q -p workspace-api --features typescript --example generate_repository_access_types > web/workspace/src/lib/generated/repository-access-api.ts\n\n{}\n",
+        declarations
+            .into_iter()
+            .map(|declaration| format!("export {declaration}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    )
+}
+
+#[cfg(feature = "typescript")]
+pub fn workdir_api_typescript() -> String {
+    use ts_rs::TS;
+
+    let config = ts_rs::Config::default();
+    let declarations = [
+        DiagnosticSeverity::decl(&config),
+        Diagnostic::decl(&config),
+        WorkingDirectoryMaterializerKind::decl(&config),
+        WorkingDirectoryStatusKind::decl(&config),
+        WorkingDirectoryCleanupTarget::decl(&config),
+        WorkingDirectoryOccupancy::decl(&config),
+        WorkingDirectorySummary::decl(&config),
+        WorkingDirectoryCreateRequest::decl(&config),
+        WorkingDirectoryListResponse::decl(&config),
+        WorkingDirectoryDetailResponse::decl(&config),
+        WorkingDirectoryCreateResponse::decl(&config),
+    ];
+    format!(
+        "// Generated from workspace-api. Do not edit by hand.\n// Regenerate: cargo run -q -p workspace-api --features typescript --example generate_workdir_api_types > web/workspace/src/lib/generated/workdir-api.ts\n\n{}\n",
+        declarations
+            .into_iter()
+            .map(|declaration| format!("export {declaration}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    )
+}
+
+#[cfg(all(test, feature = "typescript"))]
+mod workdir_typescript_tests {
+    #[test]
+    fn generated_workdir_api_contract_is_current() {
+        let expected = super::workdir_api_typescript();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/workspace/src/lib/generated/workdir-api.ts");
+        let actual = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        assert_eq!(
+            normalize(&actual),
+            normalize(&expected),
+            "regenerate Workdir API TypeScript types with `cargo run -q -p workspace-api --features typescript --example generate_workdir_api_types > web/workspace/src/lib/generated/workdir-api.ts` and format the generated file",
+        );
+    }
+
+    fn normalize(value: &str) -> String {
+        value
+            .chars()
+            .filter_map(|character| match character {
+                '\r' | '\n' | ' ' | '\t' => None,
+                _ => Some(character),
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -909,5 +1294,300 @@ mod tests {
         });
 
         assert!(serde_json::from_value::<WorkerSummary>(payload).is_err());
+    }
+
+    fn round_trip<T>(value: T)
+    where
+        T: std::fmt::Debug + PartialEq + Serialize + for<'de> Deserialize<'de>,
+    {
+        let encoded = serde_json::to_vec(&value).expect("fixture should serialize");
+        let decoded: T = serde_json::from_slice(&encoded).expect("fixture should deserialize");
+        assert_eq!(decoded, value);
+    }
+
+    fn companion_worker() -> WorkspaceWorkerDiscoveryItem {
+        WorkspaceWorkerDiscoveryItem {
+            subject: WorkspaceWorkerSubject::RuntimeWorker {
+                runtime_id: "arcadia".to_string(),
+                worker_id: "worker-7".to_string(),
+            },
+            resource_key: "W-7".to_string(),
+            display_name: "Companion".to_string(),
+            profile: Some("builtin:companion".to_string()),
+            status: Some("idle".to_string()),
+        }
+    }
+
+    #[test]
+    fn companion_status_fixtures_round_trip() {
+        for state in [
+            CompanionLifecycleState::Idle,
+            CompanionLifecycleState::Running,
+            CompanionLifecycleState::Stopped,
+        ] {
+            round_trip(CompanionStatusResponse {
+                state,
+                worker: Some(companion_worker()),
+                transport: CompanionTransportSummary {
+                    mode: "worker_runtime".to_string(),
+                    available: state != CompanionLifecycleState::Stopped,
+                },
+                diagnostics: Vec::new(),
+            });
+        }
+    }
+
+    #[test]
+    fn companion_message_fixtures_round_trip() {
+        for state in [
+            CompanionMessageDisposition::Accepted,
+            CompanionMessageDisposition::Rejected,
+        ] {
+            round_trip(CompanionMessageResponse {
+                state,
+                message: if state == CompanionMessageDisposition::Accepted {
+                    "accepted"
+                } else {
+                    "rejected"
+                }
+                .to_string(),
+            });
+        }
+    }
+
+    #[test]
+    fn companion_transcript_fixture_round_trips() {
+        round_trip(CompanionTranscriptProjection {
+            state: CompanionLifecycleState::Idle,
+            start: 0,
+            limit: 2,
+            total: 2,
+            next: None,
+            items: vec![
+                CompanionTranscriptItem {
+                    sequence: 1,
+                    role: CompanionTranscriptRole::User,
+                    content: "hello".to_string(),
+                    created_at: "2026-08-31T00:00:00Z".to_string(),
+                },
+                CompanionTranscriptItem {
+                    sequence: 2,
+                    role: CompanionTranscriptRole::Assistant,
+                    content: "hi".to_string(),
+                    created_at: "2026-08-31T00:00:01Z".to_string(),
+                },
+            ],
+        });
+    }
+
+    #[test]
+    fn companion_transcript_rejects_system_and_private_fields() {
+        let public_item = CompanionTranscriptItem {
+            sequence: 1,
+            role: CompanionTranscriptRole::Assistant,
+            content: "visible".to_string(),
+            created_at: "2026-08-31T00:00:00Z".to_string(),
+        };
+        let public_fields = serde_json::to_value(public_item)
+            .expect("public transcript item should serialize")
+            .as_object()
+            .expect("public transcript item should be an object")
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            public_fields,
+            ["content", "created_at", "role", "sequence"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+
+        let system_item = serde_json::json!({
+            "sequence": 1,
+            "role": "system",
+            "content": "raw system prompt",
+            "created_at": "2026-08-31T00:00:00Z"
+        });
+        assert!(serde_json::from_value::<CompanionTranscriptItem>(system_item).is_err());
+
+        let private_item = serde_json::json!({
+            "sequence": 1,
+            "role": "assistant",
+            "content": "visible",
+            "created_at": "2026-08-31T00:00:00Z",
+            "reasoning": "hidden",
+            "credential": "secret",
+            "provider_session_id": "session-private"
+        });
+        assert!(serde_json::from_value::<CompanionTranscriptItem>(private_item).is_err());
+    }
+
+    #[cfg(feature = "typescript")]
+    #[test]
+    fn generated_companion_api_contract_is_current() {
+        let expected = companion_api_typescript();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/workspace/src/lib/generated/companion-api.ts");
+        let actual = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        assert_eq!(
+            normalize_typescript(&actual),
+            normalize_typescript(&expected),
+            "regenerate Companion API TypeScript types with `cargo run -q -p workspace-api --features typescript --example generate_companion_api_types > web/workspace/src/lib/generated/companion-api.ts` and format the generated file",
+        );
+    }
+
+    #[cfg(feature = "typescript")]
+    fn normalize_typescript(value: &str) -> String {
+        value
+            .chars()
+            .filter_map(|character| match character {
+                character if character.is_whitespace() => None,
+                ',' => Some(';'),
+                character => Some(character),
+            })
+            .collect::<String>()
+            .replace(";}", "}")
+    }
+
+    #[test]
+    fn workdir_create_request_preserves_optional_operation_fields() {
+        let payload = serde_json::json!({"repository_id": "main"});
+        let request = serde_json::from_value::<WorkingDirectoryCreateRequest>(payload)
+            .expect("optional create fields may be absent");
+
+        assert_eq!(request.runtime_id, None);
+        assert_eq!(request.selector, None);
+        assert_eq!(request.operation_id, None);
+
+        let serialized = serde_json::to_value(request).expect("serialize create request");
+        assert_eq!(serialized, serde_json::json!({"repository_id": "main"}));
+    }
+
+    #[test]
+    fn workdir_create_request_rejects_stale_or_incomplete_json() {
+        let stale = serde_json::json!({
+            "repository_id": "main",
+            "selector": "develop",
+            "path": "/tmp/workdir"
+        });
+        assert!(serde_json::from_value::<WorkingDirectoryCreateRequest>(stale).is_err());
+
+        let incomplete = serde_json::json!({
+            "runtime_id": "arcadia",
+            "operation_id": "operation-1"
+        });
+        assert!(serde_json::from_value::<WorkingDirectoryCreateRequest>(incomplete).is_err());
+    }
+
+    #[test]
+    fn workdir_summary_omits_absent_optional_fields_on_the_wire() {
+        let value = serde_json::to_value(WorkingDirectorySummary {
+            working_directory_id: "workdir-1".into(),
+            repository_id: "main".into(),
+            creation_selector: None,
+            creation_ref: None,
+            creation_tree: None,
+            current_selector: None,
+            current_ref: None,
+            current_tree: None,
+            observed_at_epoch_seconds: None,
+            materializer_kind: WorkingDirectoryMaterializerKind::RuntimeGitCache,
+            cleanup_target: None,
+            status: WorkingDirectoryStatusKind::Active,
+            cleanliness: None,
+            primary_worker_id: None,
+            occupied_by: None,
+        })
+        .expect("serialize Workdir summary");
+        let object = value.as_object().expect("Workdir summary object");
+
+        for key in [
+            "creation_selector",
+            "creation_ref",
+            "creation_tree",
+            "current_selector",
+            "current_ref",
+            "current_tree",
+            "observed_at_epoch_seconds",
+            "cleanup_target",
+            "cleanliness",
+            "primary_worker_id",
+            "occupied_by",
+        ] {
+            assert!(
+                !object.contains_key(key),
+                "absent field {key} must be omitted"
+            );
+        }
+    }
+
+    #[test]
+    fn workdir_response_rejects_stale_occupancy_shape() {
+        let stale = serde_json::json!({
+            "workspace_id": "workspace-test",
+            "items": [{
+                "working_directory_id": "workdir-1",
+                "repository_id": "main",
+                "materializer_kind": "runtime_git_cache",
+                "status": "active",
+                "occupied_by": {
+                    "runtime_worker_id": "worker-1",
+                    "display_name": "Coder",
+                    "linked_at": "2026-01-01T00:00:00Z"
+                }
+            }],
+            "diagnostics": []
+        });
+
+        assert!(serde_json::from_value::<WorkingDirectoryListResponse>(stale).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "typescript"))]
+mod typescript_tests {
+    #[test]
+    fn generated_repository_access_contract_is_current() {
+        let expected = super::repository_access_api_typescript();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/workspace/src/lib/generated/repository-access-api.ts");
+        let actual = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        assert_eq!(
+            normalize(&actual),
+            normalize(&expected),
+            "regenerate Repository Access TypeScript types with `cargo run -q -p workspace-api --features typescript --example generate_repository_access_types > web/workspace/src/lib/generated/repository-access-api.ts` and format the generated file",
+        );
+    }
+
+    #[test]
+    fn generated_repository_access_responses_remain_secret_free() {
+        use ts_rs::TS;
+
+        let config = ts_rs::Config::default();
+        for declaration in [
+            super::RepositorySshCredential::decl(&config),
+            super::RepositorySshHostTrust::decl(&config),
+            super::RepositoryAccessProjection::decl(&config),
+        ] {
+            for forbidden in ["private_key", "passphrase", "secret_ref"] {
+                assert!(
+                    !declaration.contains(forbidden),
+                    "Repository Access response declaration must not expose `{forbidden}`"
+                );
+            }
+        }
+    }
+
+    fn normalize(value: &str) -> String {
+        value
+            .chars()
+            .filter_map(|character| match character {
+                character if character.is_whitespace() => None,
+                ',' => Some(';'),
+                character => Some(character),
+            })
+            .collect()
     }
 }

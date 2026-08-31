@@ -48,10 +48,7 @@ use workdir::http::{
     WorkdirSessionOperation, WorkdirSessionOperationResult, WorkdirTransportError,
 };
 use workdir::workspace::{
-    MaterializerKind, WorkingDirectoryCleanupTarget,
-    WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
-    WorkingDirectoryDiagnostic, WorkingDirectoryDiagnosticSeverity,
-    WorkingDirectoryListResponse as BrowserWorkingDirectoryListResponse, WorkingDirectoryOccupancy,
+    MaterializerKind, WorkingDirectoryCleanupTarget, WorkingDirectoryOccupancy,
     WorkingDirectoryStatusKind, WorkingDirectorySummary, WorkspaceWorkdirSessionFence,
     WorkspaceWorkdirSessionOperationRequest,
 };
@@ -67,10 +64,15 @@ use workspace_api::{
     RepositoryDetailResponse, RepositoryListResponse, RepositoryLogResponse,
     RepositorySshCredential, RepositorySshHostTrust, RotateRepositorySshCredentialRequest,
     RuntimeConnectionTestResponse, RuntimeManagementSummary, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
-    TICKET_RELATIONS_QUERY_PATH, WorkspaceCatalogListResponse, WorkspaceCreateResponse,
-    WorkspaceExtensionPointState, WorkspaceExtensionPoints, WorkspacePermissionSummary,
-    WorkspaceRepositoryRecord, WorkspaceResponse, WorkspaceRuntimeResource, WorkspaceSummary,
-    WorkspaceWorkerDiscoveryItem, WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
+    TICKET_RELATIONS_QUERY_PATH,
+    WorkingDirectoryCreateRequest as BrowserWorkingDirectoryCreateRequest,
+    WorkingDirectoryCreateResponse as BrowserWorkingDirectoryCreateResponse,
+    WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
+    WorkingDirectoryListResponse as BrowserWorkingDirectoryListResponse,
+    WorkspaceCatalogListResponse, WorkspaceCreateResponse, WorkspaceExtensionPointState,
+    WorkspaceExtensionPoints, WorkspacePermissionSummary, WorkspaceRepositoryRecord,
+    WorkspaceResponse, WorkspaceRuntimeResource, WorkspaceSummary, WorkspaceWorkerDiscoveryItem,
+    WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
 };
 
 use crate::auth::{
@@ -3006,18 +3008,6 @@ pub struct WorkingDirectoryRepositoryOption {
     pub display_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_selector: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BrowserWorkingDirectoryCreateRequest {
-    #[serde(default)]
-    pub runtime_id: Option<String>,
-    pub repository_id: String,
-    #[serde(default)]
-    pub selector: Option<String>,
-    #[serde(default)]
-    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -8816,15 +8806,15 @@ async fn scoped_get_worker_launch_options(
 
 fn working_directory_diagnostics(
     diagnostics: Vec<RuntimeDiagnostic>,
-) -> Vec<WorkingDirectoryDiagnostic> {
+) -> Vec<workspace_api::Diagnostic> {
     diagnostics
         .into_iter()
-        .map(|diagnostic| WorkingDirectoryDiagnostic {
+        .map(|diagnostic| workspace_api::Diagnostic {
             code: diagnostic.code,
             severity: match diagnostic.severity {
-                DiagnosticSeverity::Info => WorkingDirectoryDiagnosticSeverity::Info,
-                DiagnosticSeverity::Warning => WorkingDirectoryDiagnosticSeverity::Warning,
-                DiagnosticSeverity::Error => WorkingDirectoryDiagnosticSeverity::Error,
+                DiagnosticSeverity::Info => workspace_api::DiagnosticSeverity::Info,
+                DiagnosticSeverity::Warning => workspace_api::DiagnosticSeverity::Warning,
+                DiagnosticSeverity::Error => workspace_api::DiagnosticSeverity::Error,
             },
             message: diagnostic.message,
         })
@@ -8848,7 +8838,7 @@ async fn scoped_create_runtime_working_directory(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
     Json(request): Json<BrowserWorkingDirectoryCreateRequest>,
-) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryDetailResponse>)> {
+) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryCreateResponse>)> {
     create_workspace_working_directory(
         &api,
         &path.workspace_id,
@@ -8891,7 +8881,7 @@ async fn scoped_create_working_directory(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     Json(request): Json<BrowserWorkingDirectoryCreateRequest>,
-) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryDetailResponse>)> {
+) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryCreateResponse>)> {
     create_workspace_working_directory(&api, &path.workspace_id, None, request).await
 }
 
@@ -8984,7 +8974,7 @@ async fn create_workspace_working_directory(
     workspace_id: &str,
     route_runtime_id: Option<&str>,
     request: BrowserWorkingDirectoryCreateRequest,
-) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryDetailResponse>)> {
+) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryCreateResponse>)> {
     validate_workspace_scope(api, workspace_id)?;
     if let (Some(route_runtime_id), Some(request_runtime_id)) =
         (route_runtime_id, request.runtime_id.as_deref())
@@ -9147,7 +9137,17 @@ async fn create_workspace_working_directory(
             &reserved.resolved_runtime_id,
             &reserved.working_directory_id,
         )
-        .map(|response| (StatusCode::OK, response));
+        .map(|Json(response)| {
+            (
+                StatusCode::OK,
+                Json(BrowserWorkingDirectoryCreateResponse {
+                    workspace_id: response.workspace_id,
+                    runtime_id: response.runtime_id,
+                    item: response.item,
+                    diagnostics: response.diagnostics,
+                }),
+            )
+        });
     }
 
     let runtime = match api
@@ -9326,7 +9326,7 @@ async fn create_workspace_working_directory(
     apply_workdir_occupancy_projection(api, &mut summary)?;
     Ok((
         StatusCode::CREATED,
-        Json(BrowserWorkingDirectoryDetailResponse {
+        Json(BrowserWorkingDirectoryCreateResponse {
             workspace_id: workspace_id.to_string(),
             runtime_id: reserved.resolved_runtime_id,
             item: summary,
@@ -11090,33 +11090,31 @@ async fn get_workspace(
 fn companion_console_extension_point(
     status: &CompanionStatusResponse,
 ) -> WorkspaceExtensionPointState {
-    let completion = status.transport.completion.clone();
-    let note = match completion.as_str() {
-        "connected" => "Workspace Companion is input-capable and browser input is dispatched through the normal Worker runtime path.".to_string(),
-        "not_input_capable" => {
-            let diagnostic_codes = status
-                .diagnostics
-                .iter()
-                .map(|diagnostic| diagnostic.code.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            if diagnostic_codes.is_empty() {
-                "Workspace Companion is not input-capable; check provider, config, profile, secret, and authority diagnostics.".to_string()
-            } else {
-                format!(
-                    "Workspace Companion is not input-capable; check typed diagnostics: {diagnostic_codes}."
-                )
-            }
-        }
-        "disabled" => "Workspace Companion auto-start has been removed; create an explicit Worker instead.".to_string(),
-        other => format!(
-            "Workspace Companion transport reports {other}; browser input follows the Companion Worker runtime capability state."
-        ),
+    let extension_status = match status.state {
+        workspace_api::CompanionLifecycleState::Idle => "idle",
+        workspace_api::CompanionLifecycleState::Running => "running",
+        workspace_api::CompanionLifecycleState::Stopped => "stopped",
+    }
+    .to_string();
+    let diagnostic_codes = status
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.code.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let note = if status.transport.available {
+        "Workspace Companion is input-capable and browser input is dispatched through the normal Worker runtime path."
+            .to_string()
+    } else if diagnostic_codes.is_empty() {
+        "Workspace Companion is unavailable; create or select an explicit Worker instead."
+            .to_string()
+    } else {
+        format!("Workspace Companion is unavailable; check typed diagnostics: {diagnostic_codes}.")
     };
     WorkspaceExtensionPointState {
-        status: completion,
+        status: extension_status,
         note,
-        diagnostics: status.diagnostics.iter().cloned().map(Into::into).collect(),
+        diagnostics: status.diagnostics.clone(),
     }
 }
 
@@ -14147,7 +14145,8 @@ fn merge_worker_registry_projection(
             .map(|workdir| {
                 let mut workdir_summary = workdir_summary_from_record(workdir);
                 workdir_summary.occupied_by = Some(WorkingDirectoryOccupancy {
-                    worker: record.worker.clone(),
+                    runtime_id: record.worker.runtime_id.clone(),
+                    worker_id: record.worker.worker_id.clone(),
                     display_name: record.display_name.clone(),
                     linked_at: link.linked_at.clone(),
                 });
@@ -14496,7 +14495,8 @@ fn apply_workdir_occupancy_projection(
         })?;
     summary.primary_worker_id = None;
     summary.occupied_by = Some(WorkingDirectoryOccupancy {
-        worker: link.worker.clone(),
+        runtime_id: link.worker.runtime_id.clone(),
+        worker_id: link.worker.worker_id.clone(),
         display_name: worker.display_name,
         linked_at: link.linked_at.clone(),
     });
@@ -15933,7 +15933,8 @@ mod tests {
         assert_eq!(working_directory.current_selector, None);
         assert_eq!(working_directory.current_ref.as_deref(), Some("fedcba"));
         let occupied_by = working_directory.occupied_by.as_ref().unwrap();
-        assert_eq!(occupied_by.worker, RuntimeWorkerRef::new("embedded", "1"));
+        assert_eq!(occupied_by.runtime_id, "embedded");
+        assert_eq!(occupied_by.worker_id, "1");
         assert!(working_directory.primary_worker_id.is_none());
         let occupancy = serde_json::to_value(occupied_by).unwrap();
         assert_eq!(occupancy["runtime_id"], "embedded");
@@ -17138,10 +17139,8 @@ mod tests {
             .find(|summary| summary.working_directory_id == "managed")
             .unwrap();
         let occupied_by = managed.occupied_by.as_ref().unwrap();
-        assert_eq!(
-            occupied_by.worker,
-            RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, "7")
-        );
+        assert_eq!(occupied_by.runtime_id, EMBEDDED_WORKER_RUNTIME_ID);
+        assert_eq!(occupied_by.worker_id, "7");
         assert_eq!(occupied_by.display_name, "Worker Seven");
         assert_eq!(occupied_by.linked_at, "3");
 
@@ -22992,6 +22991,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_workspace_workdir_create_rejects_stale_json_before_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let token = seed_test_api_token(api.store.as_ref(), "stale-workdir-create-json");
+
+        let response = request_json_authenticated(
+            build_router(api.clone()),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
+            Some(serde_json::json!({
+                "runtime_id": "missing-runtime",
+                "repository_id": TEST_REPOSITORY_ID,
+                "selector": "HEAD",
+                "operation_id": "stale-workdir-create",
+                "path": "/tmp/legacy-workdir",
+            })),
+            &token,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+        .await;
+        assert!(
+            response["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown field")
+        );
+        assert!(
+            api.config_store
+                .load_workdir_create_operation(TEST_WORKSPACE_ID, "stale-workdir-create")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_workspace_workdir_create_rejects_unconfigured_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let token = seed_test_api_token(api.store.as_ref(), "missing-workdir-repository");
+
+        let response = request_json_authenticated(
+            build_router(api.clone()),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
+            Some(serde_json::json!({
+                "runtime_id": EMBEDDED_WORKER_RUNTIME_ID,
+                "repository_id": "foreign-or-missing-repository",
+                "selector": "HEAD",
+                "operation_id": "missing-workdir-repository",
+            })),
+            &token,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert!(
+            response["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown local repository")
+        );
+        assert!(
+            api.config_store
+                .load_workdir_create_operation(TEST_WORKSPACE_ID, "missing-workdir-repository")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn browser_workspace_workdir_create_delegates_and_records_default_runtime_failure() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
@@ -24151,10 +24221,10 @@ mod tests {
         );
 
         let companion_status = get_json(app.clone(), "/api/companion/status").await;
-        assert_eq!(companion_status["state"], "disabled");
+        assert_eq!(companion_status["state"], "stopped");
         assert!(companion_status["worker"].is_null());
-        assert_eq!(companion_status["transport"]["kind"], "none");
-        assert_eq!(companion_status["transport"]["completion"], "disabled");
+        assert_eq!(companion_status["transport"]["mode"], "disabled");
+        assert_eq!(companion_status["transport"]["available"], false);
         assert!(!companion_status.to_string().contains("/workspace/demo"));
 
         let companion_message = post_json(
@@ -24164,16 +24234,26 @@ mod tests {
         )
         .await;
         assert_eq!(companion_message["state"], "rejected");
-        assert_eq!(
-            companion_message["diagnostics"][0]["code"],
-            "companion_disabled"
-        );
-        assert!(companion_message["user_item"].is_null());
-        assert!(companion_message["assistant_item"].is_null());
+        assert!(companion_message.get("accepted").is_none());
+        assert!(companion_message.get("diagnostics").is_none());
+        assert!(companion_message.get("user_item").is_none());
+        assert!(companion_message.get("assistant_item").is_none());
         assert!(!companion_message.to_string().contains("/workspace/demo"));
 
         let companion_transcript = get_json(app.clone(), "/api/companion/transcript").await;
-        assert_eq!(companion_transcript["total_items"], 0);
+        assert_eq!(companion_transcript["total"], 0);
+        let empty_window = get_json(app.clone(), "/api/companion/transcript?start=0&limit=0").await;
+        assert_eq!(
+            empty_window,
+            json!({
+                "state": "stopped",
+                "start": 0,
+                "limit": 0,
+                "total": 0,
+                "next": null,
+                "items": [],
+            })
+        );
 
         let host_workers = get_json(app.clone(), &format!("/api/hosts/{host_id}/workers")).await;
         assert!(
@@ -24278,7 +24358,7 @@ mod tests {
 
         let workspace = get_json(app.clone(), "/api/workspace").await;
         let workspace_companion = &workspace["extension_points"]["companion_console"];
-        assert_eq!(workspace_companion["status"], "disabled");
+        assert_eq!(workspace_companion["status"], "stopped");
         assert_eq!(
             workspace_companion["diagnostics"][0]["code"],
             "companion_disabled"
@@ -24287,12 +24367,13 @@ mod tests {
             workspace_companion["note"]
                 .as_str()
                 .unwrap()
-                .contains("auto-start has been removed")
+                .contains("typed diagnostics")
         );
 
         let status = get_json(app.clone(), "/api/companion/status").await;
-        assert_eq!(status["state"], "disabled");
-        assert_eq!(status["transport"]["completion"], "disabled");
+        assert_eq!(status["state"], "stopped");
+        assert_eq!(status["transport"]["mode"], "disabled");
+        assert_eq!(status["transport"]["available"], false);
         assert!(status["worker"].is_null());
 
         let response = post_json(
@@ -24302,13 +24383,14 @@ mod tests {
         )
         .await;
         assert_eq!(response["state"], "rejected");
-        assert_eq!(response["diagnostics"][0]["code"], "companion_disabled");
-        assert!(response["user_item"].is_null());
-        assert!(response["assistant_item"].is_null());
+        assert!(response.get("accepted").is_none());
+        assert!(response.get("diagnostics").is_none());
+        assert!(response.get("user_item").is_none());
+        assert!(response.get("assistant_item").is_none());
 
         let transcript = get_json(app.clone(), "/api/companion/transcript").await;
-        assert_eq!(transcript["state"], "disabled");
-        assert_eq!(transcript["total_items"], 0);
+        assert_eq!(transcript["state"], "stopped");
+        assert_eq!(transcript["total"], 0);
 
         let workers = get_json(app, "/api/workers").await;
         assert!(
@@ -25435,7 +25517,8 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
                 cleanliness: Some("clean".to_string()),
                 primary_worker_id: None,
                 occupied_by: Some(WorkingDirectoryOccupancy {
-                    worker: RuntimeWorkerRef::new("arcadia", "worker-opaque-64"),
+                    runtime_id: "arcadia".to_string(),
+                    worker_id: "worker-opaque-64".to_string(),
                     display_name: "Coder".to_string(),
                     linked_at: "2026-08-12T00:00:00Z".to_string(),
                 }),

@@ -1,77 +1,14 @@
-use serde::{Deserialize, Serialize};
+use workspace_api::{
+    CompanionLifecycleState, CompanionMessageDisposition, CompanionTransportSummary, Diagnostic,
+    DiagnosticSeverity,
+};
 
-use crate::hosts::{DiagnosticSeverity, RuntimeDiagnostic, WorkerSummary};
+pub use workspace_api::{
+    CompanionCancelRequest, CompanionMessageRequest, CompanionMessageResponse,
+    CompanionStatusResponse, CompanionTranscriptProjection,
+};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CompanionState {
-    Disabled,
-    Rejected,
-    Cancelled,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CompanionStatusResponse {
-    pub state: CompanionState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker: Option<WorkerSummary>,
-    pub transport: CompanionTransportSummary,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CompanionTransportSummary {
-    pub kind: String,
-    pub completion: String,
-    pub limitation: String,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct CompanionMessageRequest {
-    pub content: String,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
-pub struct CompanionCancelRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CompanionMessageResponse {
-    pub state: CompanionState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker: Option<WorkerSummary>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user_item: Option<CompanionTranscriptItem>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub assistant_item: Option<CompanionTranscriptItem>,
-    pub transcript: CompanionTranscriptProjection,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CompanionTranscriptProjection {
-    pub state: CompanionState,
-    pub start: usize,
-    pub limit: usize,
-    pub total_items: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_start: Option<usize>,
-    pub items: Vec<CompanionTranscriptItem>,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CompanionTranscriptItem {
-    pub sequence: u64,
-    pub role: String,
-    pub content: String,
-    pub created_at: String,
-    pub source: String,
-    pub status: String,
-}
-
+#[derive(Clone, Default)]
 pub struct CompanionConsole;
 
 impl CompanionConsole {
@@ -81,68 +18,50 @@ impl CompanionConsole {
 
     pub fn status(&self) -> CompanionStatusResponse {
         CompanionStatusResponse {
-            state: CompanionState::Disabled,
+            state: CompanionLifecycleState::Stopped,
             worker: None,
-            transport: disabled_transport(),
+            transport: CompanionTransportSummary {
+                mode: "disabled".to_string(),
+                available: false,
+            },
             diagnostics: vec![disabled_diagnostic()],
         }
     }
 
     pub fn transcript(&self, start: usize, limit: usize) -> CompanionTranscriptProjection {
         CompanionTranscriptProjection {
-            state: CompanionState::Disabled,
+            state: CompanionLifecycleState::Stopped,
             start,
             limit,
-            total_items: 0,
-            next_start: None,
+            total: 0,
+            next: None,
             items: Vec::new(),
-            diagnostics: vec![disabled_diagnostic()],
         }
     }
 
     pub fn send_message(&self, _request: CompanionMessageRequest) -> CompanionMessageResponse {
-        disabled_message_response(CompanionState::Rejected)
+        disabled_message_response()
     }
 
     pub fn cancel(&self, _request: CompanionCancelRequest) -> CompanionMessageResponse {
-        disabled_message_response(CompanionState::Cancelled)
+        disabled_message_response()
     }
 }
 
-fn disabled_message_response(state: CompanionState) -> CompanionMessageResponse {
+fn disabled_message_response() -> CompanionMessageResponse {
     CompanionMessageResponse {
-        state,
-        worker: None,
-        user_item: None,
-        assistant_item: None,
-        transcript: CompanionTranscriptProjection {
-            state: CompanionState::Disabled,
-            start: 0,
-            limit: 200,
-            total_items: 0,
-            next_start: None,
-            items: Vec::new(),
-            diagnostics: vec![disabled_diagnostic()],
-        },
-        diagnostics: vec![disabled_diagnostic()],
+        state: CompanionMessageDisposition::Rejected,
+        message: "Workspace Companion auto-start is disabled; create or select an explicit Worker instead."
+            .to_string(),
     }
 }
 
-fn disabled_transport() -> CompanionTransportSummary {
-    CompanionTransportSummary {
-        kind: "none".to_string(),
-        completion: "disabled".to_string(),
-        limitation:
-            "Workspace Companion auto-start has been removed; create an explicit Worker instead."
-                .to_string(),
-    }
-}
-
-fn disabled_diagnostic() -> RuntimeDiagnostic {
-    RuntimeDiagnostic {
+fn disabled_diagnostic() -> Diagnostic {
+    Diagnostic {
         code: "companion_disabled".to_string(),
         severity: DiagnosticSeverity::Info,
-        message: "Workspace Companion auto-start is disabled; create an explicit Worker instead."
-            .to_string(),
+        message:
+            "Workspace Companion auto-start was removed; use the explicit Worker lifecycle instead."
+                .to_string(),
     }
 }

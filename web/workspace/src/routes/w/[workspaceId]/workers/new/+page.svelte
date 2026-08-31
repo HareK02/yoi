@@ -2,11 +2,14 @@
   import { goto } from '$app/navigation';
   import { untrack } from 'svelte';
   import { workspaceApiPath } from '$lib/workspace/api/http';
+  import {
+    parseWorkingDirectoryCreateResponse,
+    validateWorkingDirectoryCreateRequest,
+  } from '$lib/workspace/api/workdirs';
   import { formatCurrentWorkdirRevision } from '$lib/workspace/settings/workdir-revision';
   import { buildCreateWorkspaceWorkerRequest, defaultWorkerLaunchForm } from '$lib/workspace/sidebar/worker-launch';
   import type {
     BrowserCreateWorkerResponse,
-    BrowserWorkingDirectoryCreateResponse,
     Diagnostic,
     WorkerLaunchOptionsResponse,
     WorkingDirectorySummary,
@@ -160,22 +163,23 @@
     creatingWorkingDirectory = true;
     submitError = null;
     try {
+      const request = validateWorkingDirectoryCreateRequest({
+        runtime_id: runtimeId,
+        repository_id: workingDirectoryRepositoryId,
+        ...(workingDirectorySelector ? { selector: workingDirectorySelector } : {}),
+      });
       const response = await fetch(
         workerApiPath(`/runtimes/${encodeURIComponent(runtimeId)}/working-directories`), {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            runtime_id: runtimeId,
-            repository_id: workingDirectoryRepositoryId,
-            selector: workingDirectorySelector || null,
-          }),
+          body: JSON.stringify(request),
         },
       );
       if (!response.ok) {
         submitError = await responseDisplayError(response, 'workdir create failed');
         return;
       }
-      const payload = (await response.json()) as BrowserWorkingDirectoryCreateResponse;
+      const payload = parseWorkingDirectoryCreateResponse(await response.json());
       const items = options?.working_directories ?? [];
       options = options
         ? {

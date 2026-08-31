@@ -1,4 +1,12 @@
 import type {
+  WorkingDirectoryCreateRequest,
+  WorkingDirectoryCreateResponse,
+  WorkingDirectoryDetailResponse,
+  WorkingDirectoryListResponse,
+  WorkingDirectoryOccupancy,
+  WorkingDirectorySummary,
+} from "$lib/generated/workdir-api";
+import type {
   Event as PodProtocolEvent,
   Method as PodProtocolMethod,
   Segment as PodProtocolSegment,
@@ -14,7 +22,17 @@ import type {
   WorkspaceResponse as SharedWorkspaceResponse,
 } from "$lib/workspace/api/workspace-model";
 
-export type { PodProtocolEvent, PodProtocolMethod, PodProtocolSegment };
+export type {
+  PodProtocolEvent,
+  PodProtocolMethod,
+  PodProtocolSegment,
+  WorkingDirectoryCreateRequest,
+  WorkingDirectoryCreateResponse,
+  WorkingDirectoryDetailResponse,
+  WorkingDirectoryListResponse,
+  WorkingDirectoryOccupancy,
+  WorkingDirectorySummary,
+};
 export type WorkspaceResponse = SharedWorkspaceResponse;
 
 export type Diagnostic = {
@@ -105,44 +123,6 @@ export type WorkingDirectoryRepositoryOption = {
   default_selector?: string | null;
 };
 
-export type WorkingDirectoryOccupancy = {
-  runtime_id: string;
-  worker_id: string;
-  display_name: string;
-  linked_at: string;
-};
-
-export type WorkingDirectorySummary = {
-  working_directory_id: string;
-  repository_id: string;
-  creation_selector?: string | null;
-  creation_ref?: string | null;
-  current_selector?: string | null;
-  current_ref?: string | null;
-  materializer_kind: string;
-  status: string;
-  cleanliness?: string | null;
-  primary_worker_id?: string | null;
-  occupied_by?: WorkingDirectoryOccupancy | null;
-  cleanup_target: {
-    kind: string;
-    working_directory_id: string;
-    repository_id: string;
-  };
-};
-
-export type BrowserWorkingDirectoryCreateResponse = {
-  workspace_id: string;
-  item: WorkingDirectorySummary;
-  diagnostics: Diagnostic[];
-};
-
-export type BrowserWorkingDirectoryListResponse = {
-  workspace_id: string;
-  items: WorkingDirectorySummary[];
-  diagnostics: Diagnostic[];
-};
-
 export type CleanupTargetKind =
   | "worker_delete"
   | "workdir_clean_cleanup"
@@ -209,12 +189,6 @@ export type RuntimeCleanupExecutionResponse = {
 export type BrowserWorkerWorkingDirectorySelection = {
   working_directory_id: string;
   relative_cwd?: string | null;
-};
-
-export type BrowserWorkingDirectoryCreateRequest = {
-  runtime_id: string;
-  repository_id: string;
-  selector?: string | null;
 };
 
 export type WorkerLaunchOptionsResponse = {
@@ -385,56 +359,15 @@ export type ObjectiveListResponse = {
   record_authority: string;
 };
 
-export type CompanionState =
-  | "ready"
-  | "busy"
-  | "error"
-  | "timeout"
-  | "cancelled"
-  | "accepted"
-  | "rejected";
-
-export type CompanionTransportSummary = {
-  kind: string;
-  completion: string;
-  limitation: string;
-};
-
-export type CompanionStatusResponse = {
-  state: CompanionState;
-  worker?: Worker | null;
-  transport: CompanionTransportSummary;
-  diagnostics: Diagnostic[];
-};
-
-export type CompanionTranscriptItem = {
-  sequence: number;
-  role: "user" | "assistant" | "system" | string;
-  content: string;
-  created_at: string;
-  source: string;
-  status: string;
-};
-
-export type CompanionTranscriptProjection = {
-  state: CompanionState;
-  start: number;
-  limit: number;
-  total_items: number;
-  next_start?: number | null;
-  items: CompanionTranscriptItem[];
-  diagnostics: Diagnostic[];
-};
-
-export type CompanionMessageRequest = {
-  content: string;
-};
-
-export type CompanionMessageResponse = {
-  state: CompanionState;
-  worker?: Worker | null;
-  user_item?: CompanionTranscriptItem | null;
-  assistant_item?: CompanionTranscriptItem | null;
-  transcript: CompanionTranscriptProjection;
-  diagnostics: Diagnostic[];
-};
+export type {
+  CompanionCancelRequest,
+  CompanionLifecycleState,
+  CompanionMessageDisposition,
+  CompanionMessageRequest,
+  CompanionMessageResponse,
+  CompanionStatusResponse,
+  CompanionTranscriptItem,
+  CompanionTranscriptProjection,
+  CompanionTranscriptRole,
+  CompanionTransportSummary,
+} from "$lib/generated/companion-api";

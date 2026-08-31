@@ -113,6 +113,7 @@ export async function loadJson<T>(
   fetchFn: typeof fetch,
   path: string,
   init?: RequestInit,
+  parse: (value: unknown) => T = (value) => value as T,
 ): Promise<ApiResult<T>> {
   try {
     const response = await fetchFn(path, init);
@@ -123,7 +124,8 @@ export async function loadJson<T>(
         error: text || `${path} request failed (${response.status})`,
       };
     }
-    return { data: (await response.json()) as T, error: null };
+    const payload: unknown = await response.json();
+    return { data: parse(payload), error: null };
   } catch (error) {
     return {
       data: null,

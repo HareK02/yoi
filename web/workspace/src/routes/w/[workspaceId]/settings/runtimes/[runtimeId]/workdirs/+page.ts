@@ -1,6 +1,6 @@
 import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
+import { parseWorkingDirectoryListResponse } from "$lib/workspace/api/workdirs";
 import type {
-  BrowserWorkingDirectoryListResponse,
   ListResponse,
   Runtime,
   RuntimeCleanupPlanResponse,
@@ -14,12 +14,14 @@ export const load: PageLoad = async ({ fetch, params }) => {
       fetch,
       workspaceApiPath(params.workspaceId, "/runtimes"),
     ),
-    loadJson<BrowserWorkingDirectoryListResponse>(
+    loadJson(
       fetch,
       workspaceApiPath(
         params.workspaceId,
         `/runtimes/${encodeURIComponent(runtimeId)}/working-directories`,
       ),
+      undefined,
+      parseWorkingDirectoryListResponse,
     ),
     loadJson<RuntimeCleanupPlanResponse>(
       fetch,
