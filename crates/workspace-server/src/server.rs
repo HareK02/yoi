@@ -8839,7 +8839,7 @@ async fn scoped_list_runtime_working_directories(
     let (items, diagnostics) = runtime_working_directory_summaries(&api, &path.runtime_id)?;
     Ok(Json(BrowserWorkingDirectoryListResponse {
         workspace_id: api.config.workspace_id.clone(),
-        items: items.into_iter().map(crate::workdir_api::summary).collect(),
+        items,
         diagnostics: working_directory_diagnostics(diagnostics),
     }))
 }
@@ -8882,7 +8882,7 @@ async fn scoped_list_working_directories(
     let items = working_directory_summaries(&api)?;
     Ok(Json(BrowserWorkingDirectoryListResponse {
         workspace_id: api.config.workspace_id.clone(),
-        items: items.into_iter().map(crate::workdir_api::summary).collect(),
+        items,
         diagnostics: Vec::new(),
     }))
 }
@@ -9339,7 +9339,7 @@ async fn create_workspace_working_directory(
         Json(BrowserWorkingDirectoryCreateResponse {
             workspace_id: workspace_id.to_string(),
             runtime_id: reserved.resolved_runtime_id,
-            item: crate::workdir_api::summary(summary),
+            item: summary,
             diagnostics: working_directory_diagnostics(result.diagnostics),
         }),
     ))
@@ -9362,7 +9362,7 @@ fn working_directory_detail_for_runtime(
         return Ok(Json(BrowserWorkingDirectoryDetailResponse {
             workspace_id: api.config.workspace_id.clone(),
             runtime_id: runtime_id.to_string(),
-            item: crate::workdir_api::summary(summary),
+            item: summary,
             diagnostics: working_directory_diagnostics(result.diagnostics),
         }));
     }
@@ -9373,9 +9373,7 @@ fn working_directory_detail_for_runtime(
         return Ok(Json(BrowserWorkingDirectoryDetailResponse {
             workspace_id: api.config.workspace_id.clone(),
             runtime_id: runtime_id.to_string(),
-            item: crate::workdir_api::summary(projected_workdir_summary_from_record(
-                &api, &record,
-            )?),
+            item: projected_workdir_summary_from_record(&api, &record)?,
             diagnostics: working_directory_diagnostics(result.diagnostics),
         }));
     }
@@ -9434,7 +9432,7 @@ fn cleanup_working_directory_for_runtime(
     Ok(Json(BrowserWorkingDirectoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
         runtime_id: runtime_id.to_string(),
-        item: crate::workdir_api::summary(summary),
+        item: summary,
         diagnostics: working_directory_diagnostics(result.diagnostics),
     }))
 }
@@ -14152,7 +14150,8 @@ fn merge_worker_registry_projection(
             .map(|workdir| {
                 let mut workdir_summary = workdir_summary_from_record(workdir);
                 workdir_summary.occupied_by = Some(WorkingDirectoryOccupancy {
-                    worker: record.worker.clone(),
+                    runtime_id: record.worker.runtime_id.clone(),
+                    worker_id: record.worker.worker_id.clone(),
                     display_name: record.display_name.clone(),
                     linked_at: link.linked_at.clone(),
                 });
@@ -14501,7 +14500,8 @@ fn apply_workdir_occupancy_projection(
         })?;
     summary.primary_worker_id = None;
     summary.occupied_by = Some(WorkingDirectoryOccupancy {
-        worker: link.worker.clone(),
+        runtime_id: link.worker.runtime_id.clone(),
+        worker_id: link.worker.worker_id.clone(),
         display_name: worker.display_name,
         linked_at: link.linked_at.clone(),
     });
@@ -15955,7 +15955,8 @@ mod tests {
         assert_eq!(working_directory.current_selector, None);
         assert_eq!(working_directory.current_ref.as_deref(), Some("fedcba"));
         let occupied_by = working_directory.occupied_by.as_ref().unwrap();
-        assert_eq!(occupied_by.worker, RuntimeWorkerRef::new("embedded", "1"));
+        assert_eq!(occupied_by.runtime_id, "embedded");
+        assert_eq!(occupied_by.worker_id, "1");
         assert!(working_directory.primary_worker_id.is_none());
         let occupancy = serde_json::to_value(occupied_by).unwrap();
         assert_eq!(occupancy["runtime_id"], "embedded");
@@ -17160,10 +17161,8 @@ mod tests {
             .find(|summary| summary.working_directory_id == "managed")
             .unwrap();
         let occupied_by = managed.occupied_by.as_ref().unwrap();
-        assert_eq!(
-            occupied_by.worker,
-            RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, "7")
-        );
+        assert_eq!(occupied_by.runtime_id, EMBEDDED_WORKER_RUNTIME_ID);
+        assert_eq!(occupied_by.worker_id, "7");
         assert_eq!(occupied_by.display_name, "Worker Seven");
         assert_eq!(occupied_by.linked_at, "3");
 
@@ -25499,7 +25498,7 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
     fn workspace_workdir_response_serializes_shared_occupied_contract() {
         let response = BrowserWorkingDirectoryListResponse {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
-            items: vec![crate::workdir_api::summary(WorkingDirectorySummary {
+            items: vec![WorkingDirectorySummary {
                 working_directory_id: "wd-1".to_string(),
                 repository_id: "main".to_string(),
                 creation_selector: None,
@@ -25515,11 +25514,12 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
                 cleanliness: Some("clean".to_string()),
                 primary_worker_id: None,
                 occupied_by: Some(WorkingDirectoryOccupancy {
-                    worker: RuntimeWorkerRef::new("arcadia", "worker-opaque-64"),
+                    runtime_id: "arcadia".to_string(),
+                    worker_id: "worker-opaque-64".to_string(),
                     display_name: "Coder".to_string(),
                     linked_at: "2026-08-12T00:00:00Z".to_string(),
                 }),
-            })],
+            }],
             diagnostics: vec![],
         };
 

@@ -29,7 +29,6 @@ pub mod runtime_subscription;
 pub mod server;
 pub mod skills;
 pub mod store;
-mod workdir_api;
 pub mod workdir_create_operations;
 pub mod worker_source;
 pub mod workspace_catalog;
