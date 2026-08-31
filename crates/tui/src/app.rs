@@ -284,6 +284,9 @@ pub struct App {
     /// records the instant; a second press within the timeout exits the
     /// TUI (the Worker itself stays alive).
     pub quit_confirm: Option<std::time::Instant>,
+    /// Independent 2-tap guard for `Ctrl-X` when the Worker is idle or
+    /// stopped. A second press within the timeout shuts down the Worker.
+    pub shutdown_confirm: Option<std::time::Instant>,
     /// Full display history in render order.
     pub blocks: Vec<Block>,
     /// Turn/protocol errors retained when a real `SegmentStart` replaces the
@@ -373,6 +376,7 @@ impl App {
             command_completion_selected: None,
             quit: false,
             quit_confirm: None,
+            shutdown_confirm: None,
             blocks: Vec::new(),
             run_error_messages: Vec::new(),
             internal_workers: Vec::new(),
@@ -566,6 +570,7 @@ impl App {
                 self.run_started_at = Some(Instant::now());
             }
             self.quit_confirm = None;
+            self.shutdown_confirm = None;
         } else {
             self.run_started_at = None;
         }

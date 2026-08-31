@@ -824,13 +824,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             Some(None)
         }
         KeyCode::Char('c') if ctrl => Some(handle_pause_or_quit(app)),
-        KeyCode::Char('x') if ctrl => Some(match app.worker_status {
-            WorkerStatus::Running | WorkerStatus::Paused => {
-                app.clear_queued_inputs();
-                Some(Method::Cancel)
-            }
-            WorkerStatus::Idle | WorkerStatus::Stopped => Some(Method::Shutdown),
-        }),
+        KeyCode::Char('x') if ctrl => Some(handle_cancel_or_shutdown(app)),
         KeyCode::Char('d') if ctrl => {
             app.quit = true;
             Some(None)
@@ -1086,6 +1080,33 @@ fn handle_command_key(app: &mut App, key: KeyEvent) -> Option<Method> {
 }
 
 const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Running / Paused → send `Method::Cancel` immediately.
+/// Idle / Stopped → 2-tap to shut down the Worker.
+fn handle_cancel_or_shutdown(app: &mut App) -> Option<Method> {
+    if matches!(
+        app.worker_status,
+        WorkerStatus::Running | WorkerStatus::Paused
+    ) {
+        app.shutdown_confirm = None;
+        app.clear_queued_inputs();
+        return Some(Method::Cancel);
+    }
+    if let Some(pressed_at) = app.shutdown_confirm
+        && pressed_at.elapsed() < CONFIRM_TIMEOUT
+    {
+        app.shutdown_confirm = None;
+        return Some(Method::Shutdown);
+    }
+    app.shutdown_confirm = Some(std::time::Instant::now());
+    app.flash_actionbar_notice(
+        "Press Ctrl-X again within 3 s to shut down the Worker.",
+        ActionbarNoticeLevel::Warn,
+        ActionbarNoticeSource::Tui,
+        CONFIRM_TIMEOUT,
+    );
+    None
+}
 
 /// Running → send `Method::Pause`.
 /// Idle / Paused → 2-tap to quit the TUI (the Worker keeps running).
@@ -1472,15 +1493,53 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_x_shutdown_while_idle_is_unchanged() {
+    fn ctrl_x_requires_confirmation_before_shutdown_while_idle() {
+        let mut app = App::new("agent".to_string());
+        app.set_worker_status(WorkerStatus::Idle);
+        let ctrl_x = || KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+
+        assert!(handle_key(&mut app, ctrl_x()).is_none());
+        assert!(app.shutdown_confirm.is_some());
+        let notice = app
+            .current_actionbar_notice(std::time::Instant::now())
+            .expect("first Ctrl-X should arm shutdown confirmation");
+        assert_eq!(notice.level, ActionbarNoticeLevel::Warn);
+        assert_eq!(notice.source, ActionbarNoticeSource::Tui);
+        assert!(notice.text.contains("Ctrl-X"));
+        assert!(notice.text.contains("shut down the Worker"));
+        assert!(!has_alert(&app, "shut down the Worker"));
+
+        assert!(matches!(
+            handle_key(&mut app, ctrl_x()),
+            Some(Method::Shutdown)
+        ));
+        assert!(app.shutdown_confirm.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_and_ctrl_x_confirmations_do_not_authorize_each_other() {
         let mut app = App::new("agent".to_string());
         app.set_worker_status(WorkerStatus::Idle);
 
-        let shutdown = handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            )
+            .is_none()
         );
-        assert!(matches!(shutdown, Some(Method::Shutdown)));
+        assert!(app.quit_confirm.is_some());
+        assert!(app.shutdown_confirm.is_none());
+
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            )
+            .is_none()
+        );
+        assert!(!app.quit);
+        assert!(app.shutdown_confirm.is_some());
     }
 
     #[test]
@@ -2196,12 +2255,17 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Tab));
         assert_eq!(app.selected_worker_view().worker_name, "subworker-hoge");
 
-        let method = handle_key(
+        let first = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        );
+        let second = handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
         );
 
-        assert!(matches!(method, Some(Method::Shutdown)));
+        assert!(first.is_none());
+        assert!(matches!(second, Some(Method::Shutdown)));
         assert_eq!(app.worker_status, WorkerStatus::Idle);
     }
 
