@@ -147,9 +147,21 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
   assert(
     !sidebar.includes("CompanionNavSection") &&
       sidebar.includes("TicketsNavSection") &&
-      sidebar.includes("MemoryNavSection") &&
-      sidebar.includes("WorkersNavSection"),
-    "standalone Companion/Console navigation should not remain canonical and Tickets should be primary workspace navigation",
+      sidebar.includes("MergeRequestsNavSection") &&
+      sidebar.lastIndexOf("MergeRequestsNavSection") <
+        sidebar.lastIndexOf("MemoryNavSection") &&
+      sidebar.includes("WorkersNavSection") &&
+      sidebarCss.includes("gap: var(--space-1)") &&
+      sidebarCss.includes(".sidebar-nav-section--category > .sidebar-link") &&
+      sidebarCss.includes("padding-block: var(--space-1)") &&
+      sidebarCss.includes("margin-left: var(--space-3)") &&
+      sidebarCss.includes("--sidebar-item-hover: oklch(24% 0 0)") &&
+      sidebarCss.includes("--sidebar-item-active: oklch(32% 0 0)") &&
+      sidebarCss.includes("background: var(--sidebar-item-hover)") &&
+      sidebarCss.includes("background: var(--sidebar-item-active)") &&
+      !sidebarCss.includes("background: var(--interactive-selected)") &&
+      !sidebarCss.includes("margin-inline: calc(-1"),
+    "workspace navigation should place Merge Requests before an indented compact Memory category",
   );
 });
 
@@ -159,6 +171,9 @@ Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", as
   );
   const objectivesNav = await Deno.readTextFile(
     new URL("../sidebar/ObjectivesNavSection.svelte", import.meta.url),
+  );
+  const mergeRequestsNav = await Deno.readTextFile(
+    new URL("../sidebar/MergeRequestsNavSection.svelte", import.meta.url),
   );
   const ticketsLoad = await Deno.readTextFile(
     new URL(
@@ -205,15 +220,22 @@ Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", as
 
   assert(
     ticketsNav.includes("workspaceRoute(workspaceId, '/tickets')") &&
-      ticketsNav.includes('class="primary-nav-link"') &&
+      ticketsNav.includes("sidebar-nav-section--resource") &&
+      ticketsNav.includes('class="sidebar-link"') &&
       ticketsNav.includes(">Tickets</a>") &&
       !ticketsNav.includes("Open Tickets") &&
       !ticketsNav.includes("workspace tickets") &&
-      objectivesNav.includes('class="primary-nav-link"') &&
+      objectivesNav.includes("sidebar-nav-section--resource") &&
+      objectivesNav.includes('class="sidebar-link"') &&
       objectivesNav.includes(">Objectives</a>") &&
       !objectivesNav.includes("Open Objectives") &&
-      !objectivesNav.includes("workspace objectives"),
-    "Tickets and Objectives should each be a single sidebar link",
+      !objectivesNav.includes("workspace objectives") &&
+      mergeRequestsNav.includes("sidebar-nav-section--resource") &&
+      mergeRequestsNav.includes('class="sidebar-link"') &&
+      mergeRequestsNav.includes(">Merge Requests</a>") &&
+      !mergeRequestsNav.includes("All Merge Requests") &&
+      !mergeRequestsNav.includes("review and integration resources"),
+    "Tickets, Objectives, and Merge Requests should each be a single primary sidebar link",
   );
   assert(
     ticketsLoad.includes("Object.entries(LANE_STATES)") &&
@@ -295,11 +317,19 @@ Deno.test("workspace Memory surfaces use read-only scoped memory APIs", async ()
   );
 
   assert(
-    memoryNav.includes("workspaceRoute(workspaceId, '/memory')") &&
-      memoryNav.includes("durable workspace memory") &&
-      memoryNav.includes("workspaceRoute(workspaceId, '/memory/staging')") &&
-      memoryNav.includes("pending extraction candidates"),
-    "Memory sidebar section should link to Document and Staging surfaces",
+    memoryNav.includes('workspaceRoute(workspaceId, "/memory")') &&
+      memoryNav.includes(
+        '<h2 class="sidebar-nav-section__header">Memory</h2>',
+      ) &&
+      memoryNav.includes("Document</a>") &&
+      memoryNav.includes("sidebar-nav-section--category") &&
+      memoryNav.includes('class="sidebar-link"') &&
+      memoryNav.includes('workspaceRoute(workspaceId, "/memory/staging")') &&
+      memoryNav.includes("Staging</a>") &&
+      !memoryNav.includes("item-meta") &&
+      !memoryNav.includes("durable workspace memory") &&
+      !memoryNav.includes("pending extraction candidates"),
+    "Memory sidebar section should show Document and Staging as compact single-line links",
   );
   assert(
     memoryDocumentLoad.includes("workspaceApiPath(params.workspaceId") &&
@@ -430,7 +460,7 @@ Deno.test("Worker Console expands uncapped tool body from the hover detail actio
       "return detailOpen ? (line.expandedBody ?? line.body) : line.body",
     ) &&
       consoleLine.includes("line.toolCallLabel ?? line.toolCall?.name") &&
-      consoleLine.includes('class={`tool-status') &&
+      consoleLine.includes("class={`tool-status") &&
       consoleLine.includes('class="tool-detail-button"') &&
       consoleLine.includes("aria-expanded={detailOpen}") &&
       consoleLine.includes("detailOpen = !detailOpen") &&
@@ -513,7 +543,7 @@ Deno.test("Worker Console removes redundant chrome and uses shared alerts", asyn
         "padding: var(--space-3) var(--space-6) var(--space-4)",
       ) &&
       !page.includes("margin-inline: calc(-1 * var(--space-6))") &&
-      page.includes('import { pushWorkspaceAlert }') &&
+      page.includes("import { pushWorkspaceAlert }") &&
       page.includes('title: "Worker control"') &&
       page.includes('title: "Rewind targets"') &&
       page.includes('pushWorkspaceAlert("error"') &&
@@ -698,7 +728,9 @@ Deno.test("Worker Console page is routed by runtime_id and worker_id through bac
   assert(
     consolePage.includes("const token = advanceReloadToken();") &&
       consolePage.includes("worker = targetWorker;") &&
-      consolePage.includes("if (!targetWorker) void loadWorker(target, token);") &&
+      consolePage.includes(
+        "if (!targetWorker) void loadWorker(target, token);",
+      ) &&
       !consolePage.includes("void refreshConsole();\n  });\n\n  $effect"),
     "target-change effect should install route data and guard fallback loading with the new target token",
   );
@@ -789,18 +821,21 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     rootLayout.includes("SIDEBAR_CONTEXT") &&
       rootLayout.includes("GlobalSidebar") &&
       rootLayout.includes("SidebarFrame") &&
-      rootLayout.includes("{@render sidebar()}") &&
+      rootLayout.includes("content={sidebar}") &&
       !rootLayout.includes("WorkspaceSidebar") &&
-      rootLayout.includes("workspace-topbar") &&
-      rootLayout.includes("topbar-icon-button") &&
+      rootLayout.includes('class="app-shell"') &&
+      rootLayout.includes('class="app-shell__main"') &&
+      rootLayout.includes("app-shell__topbar") &&
+      rootLayout.includes("app-shell__icon-button") &&
       rootLayout.includes('href="/account"') &&
       rootLayout.includes("Open Account") &&
       !sidebar.includes("accountHref") &&
       !sidebar.includes("Open Account"),
-    "Root layout chrome should render a registered sidebar snippet or default global sidebar while account navigation stays in the header",
+    "Root layout chrome should keep GlobalSidebar as the root slot owner while account navigation stays in the header",
   );
   assert(
-    globalSidebar.includes("Global") &&
+    globalSidebar.includes('aria-label="Global pages"') &&
+      !globalSidebar.includes('<p class="sidebar-section-label">') &&
       globalSidebar.includes("/account") &&
       globalSidebar.includes("/login/device") &&
       !globalSidebar.includes("Tickets") &&
@@ -810,12 +845,11 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
   assert(
     workspaceLayout.includes("{#snippet workspaceSidebar()}") &&
       workspaceLayout.includes("WorkspaceSidebar") &&
-      workspaceLayout.includes(
-        "<SidebarOverride sidebar={workspaceSidebar} />",
-      ) &&
+      workspaceLayout.includes("controller={parentSidebarController}") &&
+      workspaceLayout.includes("sidebar={workspaceSidebar}") &&
       workspaceLayoutLoad.includes("params.workspaceId") &&
       workspaceLayoutLoad.includes("workspaceApiPath(workspaceId"),
-    "Workspace layout should load workspace data and register a WorkspaceSidebar snippet",
+    "Workspace layout should load workspace data, register with the parent slot, and provide the same slot contract to children",
   );
   assert(
     sidebarFrame.includes("let folded = $state(false)") &&
@@ -872,8 +906,8 @@ Deno.test("Workspace Worker list and Console share the multiplexed connection", 
     "Sidebar and Console should share one Workspace multiplexer and route Worker methods through a subscription lane",
   );
   assert(
-    multiplexer.includes('nextMultiplexerId') &&
-      !multiplexer.includes('crypto.randomUUID'),
+    multiplexer.includes("nextMultiplexerId") &&
+      !multiplexer.includes("crypto.randomUUID"),
     "Workspace subscription correlation IDs should not require secure-context crypto APIs",
   );
   assert(
@@ -881,7 +915,9 @@ Deno.test("Workspace Worker list and Console share the multiplexed connection", 
       multiplexer.includes("this.#sendSubscribe(subscription)") &&
       consolePage.includes("const targetWorker = data.worker") &&
       consolePage.includes("worker = targetWorker") &&
-      consolePage.includes("const consoleTarget = $derived({ workspaceId, runtimeId, workerId })"),
+      consolePage.includes(
+        "const consoleTarget = $derived({ workspaceId, runtimeId, workerId })",
+      ),
     "A reused Console route should subscribe immediately on the live Workspace socket and install the new route Worker",
   );
 });
@@ -945,7 +981,9 @@ Deno.test("Web Console switches main and direct SubWorker views from the Tasks r
       consolePage.includes("selectedConsoleProjection.lines") &&
       consolePage.includes("selectedConsoleProjection.tasks") &&
       consolePage.includes("onSelectWorkerView") &&
-      consolePage.includes("selectConsoleWorkerView(resolvedSessionId, false)") &&
+      consolePage.includes(
+        "selectConsoleWorkerView(resolvedSessionId, false)",
+      ) &&
       consolePage.includes("consoleWorkerViewSelectionIsResolved") &&
       !consolePage.includes("internal-worker-pane") &&
       !consolePage.includes("flattenInternalWorkers"),
