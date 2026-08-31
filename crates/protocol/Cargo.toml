@@ -14,6 +14,7 @@ json-schema = ["dep:schemars"]
 schemars = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2.workspace = true
 tokio = { workspace = true, features = ["io-util"], optional = true }
 ts-rs = { version = "12.0.1", optional = true }
-uuid = { workspace = true, features = ["serde"] }
+uuid = { workspace = true, features = ["serde", "v7"] }

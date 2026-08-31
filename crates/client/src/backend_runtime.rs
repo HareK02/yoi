@@ -1,13 +1,7 @@
-use crate::{BackendApiClient, BackendApiClientError};
-use futures::{SinkExt, StreamExt};
-use protocol::stream::{decode_event, encode_method};
-use protocol::{ErrorCode, Event, Method};
+use crate::transport::websocket::{Socket as WebSocket, SocketError as WebSocketError};
+use crate::{BackendApiClient, BackendApiClientError, Client};
 use reqwest::Method as HttpMethod;
-use std::collections::VecDeque;
 use std::fmt;
-use tokio::sync::mpsc;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
@@ -107,19 +101,11 @@ impl BackendRuntimeListTarget {
 }
 
 #[derive(Debug)]
-pub struct BackendRuntimeClient {
-    target: BackendRuntimeTarget,
-    command_tx: mpsc::UnboundedSender<Method>,
-    events: mpsc::UnboundedReceiver<Event>,
-    diagnostics: VecDeque<Event>,
-    _protocol_task: tokio::task::JoinHandle<()>,
-}
-
-#[derive(Debug)]
 pub enum BackendRuntimeClientError {
     InvalidTarget(String),
     Api(BackendApiClientError),
     Http(reqwest::Error),
+    Protocol(String),
 }
 
 impl fmt::Display for BackendRuntimeClientError {
@@ -128,6 +114,7 @@ impl fmt::Display for BackendRuntimeClientError {
             Self::InvalidTarget(message) => f.write_str(message),
             Self::Api(error) => write!(f, "{error}"),
             Self::Http(error) => write!(f, "{error}"),
+            Self::Protocol(message) => f.write_str(message),
         }
     }
 }
@@ -282,151 +269,22 @@ pub async fn restore_backend_worker(
     Ok(response.json::<BackendWorkerRestoreResponse>().await?)
 }
 
-impl BackendRuntimeClient {
-    pub async fn connect(target: BackendRuntimeTarget) -> Result<Self, BackendRuntimeClientError> {
-        validate_target(&target)?;
-        let api = BackendApiClient::from_stored_token(&target.base_url)?;
-        let (event_tx, rx) = mpsc::unbounded_channel();
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
-
-        let protocol_target = target.clone();
-        let protocol_event_tx = event_tx.clone();
-        let protocol_task = tokio::spawn(async move {
-            run_worker_protocol_transport(protocol_target, api, command_rx, protocol_event_tx)
-                .await;
-        });
-
-        Ok(Self {
-            target,
-            command_tx,
-            events: rx,
-            diagnostics: VecDeque::new(),
-            _protocol_task: protocol_task,
-        })
-    }
-
-    pub fn try_next_event(&mut self) -> Option<Event> {
-        if let Some(event) = self.diagnostics.pop_front() {
-            return Some(event);
-        }
-        self.events.try_recv().ok()
-    }
-
-    pub async fn next_event(&mut self) -> Option<Event> {
-        if let Some(event) = self.diagnostics.pop_front() {
-            return Some(event);
-        }
-        self.events.recv().await
-    }
-
-    pub async fn send(&mut self, method: &Method) -> Result<(), BackendRuntimeClientError> {
-        self.command_tx.send(method.clone()).map_err(|_| {
-            BackendRuntimeClientError::InvalidTarget(format!(
-                "Backend protocol command stream is closed for {}",
-                self.target.display_label()
-            ))
-        })?;
-        Ok(())
-    }
-}
-
-impl Drop for BackendRuntimeClient {
-    fn drop(&mut self) {
-        self._protocol_task.abort();
-    }
-}
-
-async fn run_worker_protocol_transport(
+pub async fn connect_backend_runtime(
     target: BackendRuntimeTarget,
-    api: BackendApiClient,
-    mut commands: mpsc::UnboundedReceiver<Method>,
-    tx: mpsc::UnboundedSender<Event>,
-) {
-    let request = match protocol_ws_request(&target, &api) {
-        Ok(request) => request,
-        Err(error) => {
-            let _ = tx.send(diagnostic_event(format!(
-                "Backend protocol request could not be constructed for {}: {error}",
-                target.display_label()
-            )));
-            return;
-        }
-    };
-    match connect_async(request).await {
-        Ok((ws, _)) => {
-            let (mut sink, mut stream) = ws.split();
-            loop {
-                tokio::select! {
-                    maybe_method = commands.recv() => {
-                        let Some(method) = maybe_method else {
-                            break;
-                        };
-                        match encode_method(&method) {
-                            Ok(text) => {
-                                if let Err(error) = sink.send(TungsteniteMessage::Text(text.into())).await {
-                                    let _ = tx.send(diagnostic_event(format!(
-                                        "Backend protocol command send failed for {}: {error}",
-                                        target.display_label()
-                                    )));
-                                    break;
-                                }
-                            }
-                            Err(error) => {
-                                let _ = tx.send(diagnostic_event(format!(
-                                    "Backend protocol command could not serialize method for {}: {error}",
-                                    target.display_label()
-                                )));
-                            }
-                        }
-                    }
-                    frame = stream.next() => {
-                        match frame {
-                            Some(Ok(TungsteniteMessage::Text(text))) => {
-                                match decode_event(&text) {
-                                    Ok(event) => {
-                                        let _ = tx.send(event);
-                                    }
-                                    Err(error) => {
-                                        let _ = tx.send(diagnostic_event(format!(
-                                            "Backend protocol response was not valid Event JSON for {}: {error}",
-                                            target.display_label()
-                                        )));
-                                    }
-                                }
-                            }
-                            Some(Ok(TungsteniteMessage::Close(_))) | None => {
-                                let _ = tx.send(diagnostic_event(format!(
-                                    "Backend protocol command stream closed for {}",
-                                    target.display_label()
-                                )));
-                                break;
-                            }
-                            Some(Ok(TungsteniteMessage::Ping(_)))
-                            | Some(Ok(TungsteniteMessage::Pong(_)))
-                            | Some(Ok(TungsteniteMessage::Binary(_)))
-                            | Some(Ok(TungsteniteMessage::Frame(_))) => {}
-                            Some(Err(error)) => {
-                                let _ = tx.send(diagnostic_event(format!(
-                                    "Backend protocol WebSocket error for {}: {error}",
-                                    target.display_label()
-                                )));
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Err(error) => {
-            let message = protocol_connect_error_message(&target, &api, &error);
-            let _ = tx.send(diagnostic_event(message));
-            while commands.recv().await.is_some() {
-                let _ = tx.send(diagnostic_event(format!(
-                    "Backend protocol command was not sent because command stream is unavailable for {}",
-                    target.display_label()
-                )));
-            }
-        }
+) -> Result<Client<WebSocket>, BackendRuntimeClientError> {
+    validate_target(&target)?;
+    let api = BackendApiClient::from_stored_token(&target.base_url)?;
+    let request = protocol_ws_request(&target, &api).map_err(|error| {
+        BackendRuntimeClientError::Protocol(format!(
+            "Backend protocol request could not be constructed for {}: {error}",
+            target.display_label()
+        ))
+    })?;
+    match WebSocket::connect(request).await {
+        Ok(socket) => Ok(Client::new(socket)),
+        Err(WebSocketError::WebSocket(error)) => Err(BackendRuntimeClientError::Protocol(
+            protocol_connect_error_message(&target, &api, &error),
+        )),
     }
 }
 
@@ -451,13 +309,6 @@ fn protocol_connect_error_message(
         "Backend protocol WebSocket connect failed for {}: {error}",
         target.display_label()
     )
-}
-
-fn diagnostic_event(message: impl Into<String>) -> Event {
-    Event::Error {
-        code: ErrorCode::Internal,
-        message: message.into(),
-    }
 }
 
 fn validate_target(target: &BackendRuntimeTarget) -> Result<(), BackendRuntimeClientError> {

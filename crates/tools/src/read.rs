@@ -13,14 +13,14 @@ use workdir::{ReadRequest, WorkdirPath, WorkdirSessionHandle};
 const DESCRIPTION: &str = "Read a text file from the local filesystem. \
 Supports offset/limit for large files. Returns line-numbered output (1-based). \
 Directories cannot be read. The file must be read before Write or Edit can \
-modify it. Paths are relative to the bound Workdir.";
+modify it. Paths are Workdir-relative unless an absolute path is explicitly readable.";
 
 const DEFAULT_LIMIT: usize = 2000;
 const PROVIDER_BYTE_LIMIT: usize = 256 * 1024;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ReadParams {
-    /// Logical path relative to the bound Workdir root.
+    /// Workdir-relative path, or an absolute path covered by readable scope.
     pub file_path: String,
     /// 0-based line offset from the start. Defaults to 0.
     #[serde(default)]
@@ -47,7 +47,7 @@ impl Tool for ReadTool {
         let offset = params.offset.unwrap_or(0);
         let limit = params.limit.unwrap_or(DEFAULT_LIMIT).max(1);
 
-        let path = WorkdirPath::new(&params.file_path).map_err(ToolsError::from)?;
+        let path = WorkdirPath::new_scoped(&params.file_path).map_err(ToolsError::from)?;
         tracing::debug!(path = %path, offset, limit, "Read");
 
         let result = self

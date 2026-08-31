@@ -51,7 +51,7 @@ struct SinkInner {
     /// survives session swaps so existing subscribers keep their
     /// receiver — they observe the swap as a freshly broadcast
     /// `LogEntry::AnnotatedSegmentStart` and reset their view accordingly.
-    broadcast_tx: broadcast::Sender<LogEntry>,
+    session_entry_tx: broadcast::Sender<LogEntry>,
 }
 
 impl SegmentLogSink {
@@ -59,11 +59,11 @@ impl SegmentLogSink {
     /// has been written (deferred SegmentStart) or as a placeholder in
     /// tests.
     pub fn new() -> Self {
-        let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (session_entry_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             inner: Arc::new(SinkInner {
                 mirror: StdMutex::new(Vec::new()),
-                broadcast_tx,
+                session_entry_tx,
             }),
         }
     }
@@ -72,11 +72,11 @@ impl SegmentLogSink {
     /// Used by restore / fork-at-restore code paths that materialise
     /// the existing log before the sink starts taking new commits.
     pub fn with_initial(entries: Vec<LogEntry>) -> Self {
-        let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (session_entry_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             inner: Arc::new(SinkInner {
                 mirror: StdMutex::new(entries),
-                broadcast_tx,
+                session_entry_tx,
             }),
         }
     }
@@ -111,7 +111,7 @@ impl SegmentLogSink {
             // SendError means there are zero subscribers; harmless. The
             // mirror lock is held across `send` so subscribers cannot
             // observe an inconsistent (snapshot, receiver) pair.
-            let _ = self.inner.broadcast_tx.send(entry);
+            let _ = self.inner.session_entry_tx.send(entry);
         }
     }
 
@@ -144,7 +144,7 @@ impl SegmentLogSink {
             .expect("session log mirror mutex poisoned");
         mirror.clear();
         mirror.push(initial.clone());
-        let _ = self.inner.broadcast_tx.send(initial);
+        let _ = self.inner.session_entry_tx.send(initial);
     }
 
     /// Atomically swap the mirror to the supplied replacement-session prefix
@@ -161,7 +161,7 @@ impl SegmentLogSink {
             .expect("session log mirror mutex poisoned");
         *mirror = entries;
         if let Some(initial) = first {
-            let _ = self.inner.broadcast_tx.send(initial);
+            let _ = self.inner.session_entry_tx.send(initial);
         }
     }
 
@@ -199,7 +199,7 @@ impl SegmentLogSink {
             .lock()
             .expect("session log mirror mutex poisoned");
         let snapshot = mirror.clone();
-        let rx = self.inner.broadcast_tx.subscribe();
+        let rx = self.inner.session_entry_tx.subscribe();
         (snapshot, rx)
     }
 

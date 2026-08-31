@@ -8,11 +8,13 @@ use agen::llm_client::error::ClientError;
 use agen::llm_client::event::{Event as LlmEvent, StopReason};
 use agen::llm_client::types::Request;
 use async_trait::async_trait;
+use client::Client;
+use client::transport::in_process::Socket as InProcessSocket;
 use futures::{Stream, stream};
 use protocol::{Event, Method};
 use standalone::{
     StaleLeasePolicy, StandaloneHost, StandaloneLaunchConfig, StandaloneListScope,
-    StandaloneSessionStatus, StandaloneSessionStore, StandaloneStartupError, StandaloneStoreError,
+    StandaloneStartupError, StandaloneStoreError, StandaloneWorkerStatus, StandaloneWorkerStore,
 };
 use uuid::Uuid;
 
@@ -88,17 +90,35 @@ async fn in_process_host_runs_text_and_read_tool_then_shuts_down() {
     let host = StandaloneHost::start_with_model_client(launch, client)
         .await
         .expect("start in-process host");
-    let mut events = host.subscribe();
+    assert_eq!(host.record().worker_name, worker_name);
+    assert_eq!(host.record().manifest.worker.name, worker_name);
+    assert_eq!(
+        host.record().storage_key,
+        format!("standalone-{}", host.worker_id())
+    );
+    let mut protocol_client = host.connect();
 
-    host.send(Method::run_text("read the probe"))
+    protocol_client
+        .send(&Method::run_text("read the probe"))
         .await
         .expect("submit input");
 
     tokio::time::timeout(Duration::from_secs(30), async {
+        let mut saw_user_message = false;
         let mut saw_text = false;
         let mut saw_tool_result = false;
         loop {
-            match events.recv().await.expect("worker event") {
+            match protocol_client
+                .next_event()
+                .await
+                .expect("protocol event")
+                .expect("worker event")
+            {
+                Event::UserMessage { segments }
+                    if format!("{segments:?}").contains("read the probe") =>
+                {
+                    saw_user_message = true;
+                }
                 Event::TextDelta { text } if text.contains("standalone response") => {
                     saw_text = true;
                 }
@@ -106,6 +126,10 @@ async fn in_process_host_runs_text_and_read_tool_then_shuts_down() {
                     saw_tool_result = true;
                 }
                 Event::RunEnd { .. } => {
+                    assert!(
+                        saw_user_message,
+                        "stream must expose the committed user message"
+                    );
                     assert!(saw_text, "stream must expose the model text delta");
                     assert!(saw_tool_result, "stream must expose the tool result");
                     break;
@@ -220,7 +244,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 async fn standalone_restore_preserves_history_tasks_notifications_and_cwd_scope() -> TestResult {
     let temp = tempfile::tempdir()?;
     let cwd = temp.path().join("project");
-    let state_dir = temp.path().join("client").join("standalone-sessions");
+    let state_dir = temp.path().join("client").join("standalone-workers");
     std::fs::create_dir_all(&cwd)?;
     let launch = StandaloneLaunchConfig::new(
         &cwd,
@@ -250,23 +274,26 @@ async fn standalone_restore_preserves_history_tasks_notifications_and_cwd_scope(
         ],
     ]);
     let host = StandaloneHost::start_with_model_client(launch, first_client).await?;
-    let session_id = host.session_id();
-    let mut events = host.subscribe();
-    host.send(Method::run_text("first request")).await?;
-    wait_for_run_end(&mut events).await?;
-    host.send(Method::Notify {
-        message: "persisted notification".to_string(),
-        auto_run: true,
-    })
-    .await?;
-    wait_for_run_end(&mut events).await?;
+    let worker_id = host.worker_id();
+    let mut protocol_client = host.connect();
+    protocol_client
+        .send(&Method::run_text("first request"))
+        .await?;
+    wait_for_run_end(&mut protocol_client).await?;
+    protocol_client
+        .send(&Method::Notify {
+            message: "persisted notification".to_string(),
+            auto_run: true,
+        })
+        .await?;
+    wait_for_run_end(&mut protocol_client).await?;
     host.shutdown().await?;
 
-    let store = StandaloneSessionStore::open(&state_dir)?;
+    let store = StandaloneWorkerStore::open(&state_dir)?;
     let current = store.list(&cwd, StandaloneListScope::CurrentCwd, 100)?;
     assert_eq!(current.len(), 1);
-    assert_eq!(current[0].session_id, session_id);
-    assert_eq!(current[0].status, StandaloneSessionStatus::Stopped);
+    assert_eq!(current[0].worker_id, worker_id);
+    assert_eq!(current[0].status, StandaloneWorkerStatus::Stopped);
     let other_cwd = temp.path().join("other");
     std::fs::create_dir(&other_cwd)?;
     assert!(
@@ -286,18 +313,31 @@ async fn standalone_restore_preserves_history_tasks_notifications_and_cwd_scope(
     ]]);
     let second_inspection = second_client.clone();
     let host =
-        StandaloneHost::restore_with_model_client(state_dir.clone(), session_id, second_client)
+        StandaloneHost::restore_with_model_client(state_dir.clone(), worker_id, second_client)
             .await?;
-    let snapshot = format!("{:?}", host.snapshot());
+    assert_eq!(
+        host.record().worker_name,
+        "display-name-is-not-session-identity"
+    );
+    assert_eq!(host.record().storage_key, format!("standalone-{worker_id}"));
+    let mut protocol_client = host.connect();
+    let snapshot = format!(
+        "{:?}",
+        protocol_client
+            .next_event()
+            .await
+            .expect("restored protocol stream")
+            .expect("restored snapshot")
+    );
     assert!(snapshot.contains("first request"), "{snapshot}");
     assert!(snapshot.contains("first answer"), "{snapshot}");
     assert!(snapshot.contains("persisted task"), "{snapshot}");
     assert!(snapshot.contains("persisted notification"), "{snapshot}");
 
-    let mut events = host.subscribe();
-    host.send(Method::run_text("continue after restore"))
+    protocol_client
+        .send(&Method::run_text("continue after restore"))
         .await?;
-    wait_for_run_end(&mut events).await?;
+    wait_for_run_end(&mut protocol_client).await?;
     let request = second_inspection
         .requests()
         .into_iter()
@@ -309,11 +349,11 @@ async fn standalone_restore_preserves_history_tasks_notifications_and_cwd_scope(
     assert!(projected.contains("persisted task"), "{projected}");
     host.shutdown().await?;
 
-    store.delete(session_id)?;
+    store.delete(worker_id)?;
     assert!(cwd.exists(), "deleting session state must not mutate cwd");
     assert!(matches!(
-        store.load(session_id),
-        Err(StandaloneStoreError::SessionNotFound(_))
+        store.load(worker_id),
+        Err(StandaloneStoreError::WorkerNotFound(_))
     ));
     Ok(())
 }
@@ -334,28 +374,25 @@ async fn standalone_restore_rejects_concurrent_lease_and_missing_cwd() -> TestRe
     .resolve()?;
     let host =
         StandaloneHost::start_with_model_client(launch, ScriptedClient::new(Vec::new())).await?;
-    let session_id = host.session_id();
-    let store = StandaloneSessionStore::open(&state_dir)?;
+    let worker_id = host.worker_id();
+    let store = StandaloneWorkerStore::open(&state_dir)?;
     assert!(matches!(
-        store.acquire_lease(session_id, StaleLeasePolicy::Recover),
-        Err(StandaloneStoreError::SessionLeased(id)) if id == session_id
+        store.acquire_lease(worker_id, StaleLeasePolicy::Recover),
+        Err(StandaloneStoreError::WorkerLeased(id)) if id == worker_id
     ));
     let restore = StandaloneHost::restore_with_model_client(
         state_dir.clone(),
-        session_id,
+        worker_id,
         ScriptedClient::new(Vec::new()),
     )
     .await;
-    assert!(matches!(
-        restore,
-        Err(StandaloneStartupError::SessionActive)
-    ));
+    assert!(matches!(restore, Err(StandaloneStartupError::WorkerActive)));
     host.shutdown().await?;
 
     std::fs::rename(&cwd, &moved)?;
     let restore = StandaloneHost::restore_with_model_client(
         state_dir,
-        session_id,
+        worker_id,
         ScriptedClient::new(Vec::new()),
     )
     .await;
@@ -392,11 +429,11 @@ async fn standalone_restore_recovers_only_a_proven_stale_lease() -> TestResult {
     });
     let host =
         StandaloneHost::start_with_model_client(launch, ScriptedClient::new(Vec::new())).await?;
-    let session_id = host.session_id();
+    let worker_id = host.worker_id();
     host.shutdown().await?;
-    let store = StandaloneSessionStore::open(&state_dir)?;
+    let store = StandaloneWorkerStore::open(&state_dir)?;
     assert!(matches!(
-        store.load(session_id)?.manifest.profile,
+        store.load(worker_id)?.manifest.profile,
         Some(manifest::ProfileManifestSnapshot {
             source: manifest::ProfileSource::Registry {
                 source: manifest::ProfileRegistrySource::User,
@@ -405,9 +442,9 @@ async fn standalone_restore_recovers_only_a_proven_stale_lease() -> TestResult {
             ..
         })
     ));
-    let session_dir = state_dir.join(session_id.to_string());
+    let worker_dir = state_dir.join(worker_id.to_string());
     std::fs::write(
-        session_dir.join("lease.json"),
+        worker_dir.join("lease.json"),
         serde_json::to_vec(&serde_json::json!({
             "lease_id": uuid::Uuid::now_v7(),
             "pid": u32::MAX,
@@ -418,7 +455,7 @@ async fn standalone_restore_recovers_only_a_proven_stale_lease() -> TestResult {
 
     let host = StandaloneHost::restore_with_model_client(
         state_dir,
-        session_id,
+        worker_id,
         ScriptedClient::new(Vec::new()),
     )
     .await?;
@@ -439,11 +476,11 @@ async fn standalone_restore_rejects_lease_with_missing_start_marker() -> TestRes
     .resolve()?;
     let host =
         StandaloneHost::start_with_model_client(launch, ScriptedClient::new(Vec::new())).await?;
-    let session_id = host.session_id();
+    let worker_id = host.worker_id();
     host.shutdown().await?;
-    let session_dir = state_dir.join(session_id.to_string());
+    let worker_dir = state_dir.join(worker_id.to_string());
     std::fs::write(
-        session_dir.join("lease.json"),
+        worker_dir.join("lease.json"),
         serde_json::to_vec(&serde_json::json!({
             "lease_id": uuid::Uuid::now_v7(),
             "pid": std::process::id(),
@@ -451,14 +488,14 @@ async fn standalone_restore_rejects_lease_with_missing_start_marker() -> TestRes
         }))?,
     )?;
 
-    let store = StandaloneSessionStore::open(&state_dir)?;
+    let store = StandaloneWorkerStore::open(&state_dir)?;
     assert!(matches!(
-        store.acquire_lease(session_id, StaleLeasePolicy::Recover),
-        Err(StandaloneStoreError::LeaseLivenessUnknown(id)) if id == session_id
+        store.acquire_lease(worker_id, StaleLeasePolicy::Recover),
+        Err(StandaloneStoreError::LeaseLivenessUnknown(id)) if id == worker_id
     ));
     let restore = StandaloneHost::restore_with_model_client(
         state_dir,
-        session_id,
+        worker_id,
         ScriptedClient::new(Vec::new()),
     )
     .await;
@@ -482,31 +519,31 @@ async fn standalone_metadata_fails_closed_on_incomplete_or_newer_records() -> Te
     .resolve()?;
     let host =
         StandaloneHost::start_with_model_client(launch, ScriptedClient::new(Vec::new())).await?;
-    let session_id = host.session_id();
+    let worker_id = host.worker_id();
     host.shutdown().await?;
-    let store = StandaloneSessionStore::open(&state_dir)?;
-    let session_dir = state_dir.join(session_id.to_string());
-    std::fs::write(session_dir.join("commit.pending"), b"interrupted\n")?;
+    let store = StandaloneWorkerStore::open(&state_dir)?;
+    let worker_dir = state_dir.join(worker_id.to_string());
+    std::fs::write(worker_dir.join("commit.pending"), b"interrupted\n")?;
     assert!(matches!(
-        store.load(session_id),
-        Err(StandaloneStoreError::IncompleteCommit(id)) if id == session_id
+        store.load(worker_id),
+        Err(StandaloneStoreError::IncompleteCommit(id)) if id == worker_id
     ));
-    std::fs::remove_file(session_dir.join("commit.pending"))?;
-    let record_path = session_dir.join("record.json");
+    std::fs::remove_file(worker_dir.join("commit.pending"))?;
+    let record_path = worker_dir.join("record.json");
     let mut record: serde_json::Value = serde_json::from_slice(&std::fs::read(&record_path)?)?;
     record["schema_version"] = serde_json::json!(u32::MAX);
     std::fs::write(&record_path, serde_json::to_vec_pretty(&record)?)?;
     assert!(matches!(
-        store.load(session_id),
-        Err(StandaloneStoreError::NewerSchema { id, .. }) if id == session_id
+        store.load(worker_id),
+        Err(StandaloneStoreError::NewerSchema { id, .. }) if id == worker_id
     ));
     Ok(())
 }
 
-async fn wait_for_run_end(events: &mut tokio::sync::broadcast::Receiver<Event>) -> TestResult {
+async fn wait_for_run_end(client: &mut Client<InProcessSocket>) -> TestResult {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if matches!(events.recv().await, Ok(Event::RunEnd { .. })) {
+            if matches!(client.next_event().await, Ok(Some(Event::RunEnd { .. }))) {
                 break;
             }
         }

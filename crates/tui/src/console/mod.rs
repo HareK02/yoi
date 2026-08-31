@@ -21,10 +21,11 @@ use protocol::{Greeting, RewindSummary, RewindTarget, RewindTargetId, Segment};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use standalone::{StandaloneHost, StandaloneLaunchConfig};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use client::{BackendRuntimeClient, BackendRuntimeTarget, StandaloneSessionResumeIntent};
+use client::transport::Socket;
+use client::{BackendRuntimeTarget, Client, StandaloneWorkerResumeIntent, connect_backend_runtime};
 
 use crate::app::{ActionbarNoticeLevel, ActionbarNoticeSource, App};
 use crate::composer_keys::{ComposerEditAction, composer_edit_action};
@@ -119,74 +120,40 @@ fn copy_selection_to_terminal(app: &mut App) -> bool {
     copy_selection_to_writer(app, &mut stdout)
 }
 
-enum ConsoleConnection {
-    BackendRuntime(BackendRuntimeClient),
-    Standalone {
-        host: Option<StandaloneHost>,
-        events: broadcast::Receiver<Event>,
-        initial_snapshot: Option<Event>,
-    },
+struct ConsoleConnection<T> {
+    client: Client<T>,
+    standalone_host: Option<StandaloneHost>,
 }
 
-impl ConsoleConnection {
-    fn standalone(host: StandaloneHost) -> Self {
-        let events = host.subscribe();
-        let initial_snapshot = Some(host.snapshot());
-        Self::Standalone {
-            host: Some(host),
-            events,
-            initial_snapshot,
+impl<T: Socket> ConsoleConnection<T> {
+    fn new(client: Client<T>) -> Self {
+        Self {
+            client,
+            standalone_host: None,
         }
     }
 
-    fn try_next_event(&mut self) -> Option<Event> {
-        match self {
-            Self::BackendRuntime(client) => client.try_next_event(),
-            Self::Standalone {
-                events,
-                initial_snapshot,
-                ..
-            } => initial_snapshot.take().or_else(|| events.try_recv().ok()),
+    fn with_standalone_host(client: Client<T>, host: StandaloneHost) -> Self {
+        Self {
+            client,
+            standalone_host: Some(host),
         }
     }
 
-    async fn next_event(&mut self) -> Option<Event> {
-        match self {
-            Self::BackendRuntime(client) => client.next_event().await,
-            Self::Standalone { host, events, .. } => loop {
-                match events.recv().await {
-                    Ok(event) => break Some(event),
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let Some(host) = host.as_ref() else {
-                            break None;
-                        };
-                        break Some(host.snapshot());
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break None,
-                }
-            },
-        }
+    fn try_next_event(&mut self) -> Result<Option<Event>, Box<dyn std::error::Error>> {
+        Ok(self.client.try_next_event()?)
+    }
+
+    async fn next_event(&mut self) -> Result<Option<Event>, Box<dyn std::error::Error>> {
+        Ok(self.client.next_event().await?)
     }
 
     async fn send(&mut self, method: &Method) -> Result<(), Box<dyn std::error::Error>> {
-        match self {
-            Self::BackendRuntime(client) => Ok(client.send(method).await?),
-            Self::Standalone { host, .. } => {
-                let host = host.as_ref().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "Standalone Worker has already shut down",
-                    )
-                })?;
-                Ok(host.send(method.clone()).await?)
-            }
-        }
+        Ok(self.client.send(method).await?)
     }
 
     async fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Self::Standalone { host, .. } = self
-            && let Some(host) = host.take()
-        {
+        if let Some(host) = self.standalone_host.take() {
             host.shutdown().await?;
         }
         Ok(())
@@ -224,18 +191,18 @@ pub(crate) async fn run_standalone(
 }
 
 pub(crate) async fn run_standalone_restore(
-    intent: StandaloneSessionResumeIntent,
+    intent: StandaloneWorkerResumeIntent,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let session_id = intent.session_id.parse().map_err(|error| {
+    let worker_id = intent.worker_id.parse().map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("Invalid standalone session ID: {error}"),
+            format!("Invalid standalone Worker ID: {error}"),
         )
     })?;
-    let host = StandaloneHost::restore(intent.state_dir, session_id)
+    let host = StandaloneHost::restore(intent.state_dir, worker_id)
         .await
         .map_err(|error| io::Error::other(format!("Standalone restore failed: {error}")))?;
-    let worker_label = format!("standalone-{}", session_id.short());
+    let worker_label = host.record().worker_name.clone();
     let history_root = host.record().cwd.canonical_path.clone();
     run_standalone_host(host, worker_label, history_root).await
 }
@@ -251,7 +218,8 @@ async fn run_standalone_host(
     worker_label: String,
     history_root: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = ConsoleConnection::standalone(host);
+    let client = host.connect();
+    let mut connection = ConsoleConnection::with_standalone_host(client, host);
 
     let mut terminal = match enter_fullscreen() {
         Ok(terminal) => terminal,
@@ -280,12 +248,12 @@ pub(crate) async fn run_backend_runtime(
     target: BackendRuntimeTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let worker_label = target.display_label();
-    let client = BackendRuntimeClient::connect(target).await?;
+    let client = connect_backend_runtime(target).await?;
     let mut terminal = enter_fullscreen()?;
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut app = App::new_with_persistent_input_history(worker_label, &workspace_root);
     app.connected = true;
-    let mut connection = ConsoleConnection::BackendRuntime(client);
+    let mut connection = ConsoleConnection::new(client);
     let result = run_loop(&mut terminal, &mut app, &mut connection).await;
     let _ = leave_fullscreen(&mut terminal);
     result
@@ -560,16 +528,20 @@ enum E2eRewindInput {
 
 enum LoopInput<P> {
     Terminal(TerminalEventResult),
-    Worker(Option<P>),
+    Worker(P),
+    Tick,
 }
 
-async fn next_loop_input<P, F>(
+async fn next_loop_input<P, F, T>(
     term_rx: &mut mpsc::UnboundedReceiver<TerminalEventResult>,
     connected: bool,
     pod_next: F,
+    animate: bool,
+    animation_tick: T,
 ) -> LoopInput<P>
 where
-    F: Future<Output = Option<P>>,
+    F: Future<Output = P>,
+    T: Future,
 {
     tokio::select! {
         biased;
@@ -583,12 +555,13 @@ where
             }))
         }
         event = pod_next, if connected => LoopInput::Worker(event),
+        _ = animation_tick, if animate => LoopInput::Tick,
     }
 }
 
-async fn drain_terminal_events(
+async fn drain_terminal_events<T: Socket>(
     app: &mut App,
-    client: &mut ConsoleConnection,
+    client: &mut ConsoleConnection<T>,
     term_rx: &mut mpsc::UnboundedReceiver<TerminalEventResult>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut handled = false;
@@ -613,13 +586,13 @@ async fn drain_terminal_events(
     Ok(handled)
 }
 
-async fn drain_worker_events(
+async fn drain_worker_events<T: Socket>(
     app: &mut App,
-    client: &mut ConsoleConnection,
+    client: &mut ConsoleConnection<T>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut handled = false;
     for _ in 0..POD_EVENT_DRAIN_LIMIT {
-        match client.try_next_event() {
+        match client.try_next_event()? {
             Some(ev) => {
                 handled = true;
                 if let Some(method) = app.handle_worker_event(ev) {
@@ -632,12 +605,14 @@ async fn drain_worker_events(
     Ok(handled)
 }
 
-async fn run_loop(
+async fn run_loop<T: Socket>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    client: &mut ConsoleConnection,
+    client: &mut ConsoleConnection<T>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_terminal_reader, mut term_rx) = TerminalEventReader::spawn()?;
+    let mut animation_tick = tokio::time::interval(Duration::from_millis(80));
+    animation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     terminal.draw(|f| ui::draw(f, app))?;
 
@@ -656,11 +631,19 @@ async fn run_loop(
             continue;
         }
 
-        match next_loop_input(&mut term_rx, app.connected, client.next_event()).await {
+        match next_loop_input(
+            &mut term_rx,
+            app.connected,
+            client.next_event(),
+            app.running,
+            animation_tick.tick(),
+        )
+        .await
+        {
             LoopInput::Terminal(term_event) => {
                 handle_terminal_event(app, client, term_event?).await?;
             }
-            LoopInput::Worker(event) => match event {
+            LoopInput::Worker(event) => match event? {
                 Some(ev) => {
                     if let Some(method) = app.handle_worker_event(ev) {
                         client.send(&method).await?;
@@ -672,6 +655,7 @@ async fn run_loop(
                     app.push_error("Connection lost");
                 }
             },
+            LoopInput::Tick => {}
         }
 
         terminal.draw(|f| ui::draw(f, app))?;
@@ -680,9 +664,9 @@ async fn run_loop(
     Ok(())
 }
 
-async fn handle_terminal_event(
+async fn handle_terminal_event<T: Socket>(
     app: &mut App,
-    client: &mut ConsoleConnection,
+    client: &mut ConsoleConnection<T>,
     event: TermEvent,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match event {
@@ -838,13 +822,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             Some(None)
         }
         KeyCode::Char('c') if ctrl => Some(handle_pause_or_quit(app)),
-        KeyCode::Char('x') if ctrl => Some(match app.worker_status {
-            WorkerStatus::Running | WorkerStatus::Paused => {
-                app.clear_queued_inputs();
-                Some(Method::Cancel)
-            }
-            WorkerStatus::Idle | WorkerStatus::Stopped => Some(Method::Shutdown),
-        }),
+        KeyCode::Char('x') if ctrl => Some(handle_cancel_or_shutdown(app)),
         KeyCode::Char('d') if ctrl => {
             app.quit = true;
             Some(None)
@@ -1101,6 +1079,33 @@ fn handle_command_key(app: &mut App, key: KeyEvent) -> Option<Method> {
 
 const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Running / Paused → send `Method::Cancel` immediately.
+/// Idle / Stopped → 2-tap to shut down the Worker.
+fn handle_cancel_or_shutdown(app: &mut App) -> Option<Method> {
+    if matches!(
+        app.worker_status,
+        WorkerStatus::Running | WorkerStatus::Paused
+    ) {
+        app.shutdown_confirm = None;
+        app.clear_queued_inputs();
+        return Some(Method::Cancel);
+    }
+    if let Some(pressed_at) = app.shutdown_confirm
+        && pressed_at.elapsed() < CONFIRM_TIMEOUT
+    {
+        app.shutdown_confirm = None;
+        return Some(Method::Shutdown);
+    }
+    app.shutdown_confirm = Some(std::time::Instant::now());
+    app.flash_actionbar_notice(
+        "Press Ctrl-X again within 3 s to shut down the Worker.",
+        ActionbarNoticeLevel::Warn,
+        ActionbarNoticeSource::Tui,
+        CONFIRM_TIMEOUT,
+    );
+    None
+}
+
 /// Running → send `Method::Pause`.
 /// Idle / Paused → 2-tap to quit the TUI (the Worker keeps running).
 fn handle_pause_or_quit(app: &mut App) -> Option<Method> {
@@ -1247,6 +1252,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn animation_tick_wakes_loop_while_running() {
+        let (_tx, mut rx) = mpsc::unbounded_channel::<TerminalEventResult>();
+
+        assert!(matches!(
+            next_loop_input(
+                &mut rx,
+                true,
+                std::future::pending::<Option<u8>>(),
+                true,
+                std::future::ready(()),
+            )
+            .await,
+            LoopInput::Tick
+        ));
+    }
+
+    #[tokio::test]
     async fn terminal_event_is_selected_before_ready_worker_event() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         tx.send(Ok(TermEvent::Key(KeyEvent::new(
@@ -1255,7 +1277,15 @@ mod tests {
         ))))
         .unwrap();
 
-        match next_loop_input(&mut rx, true, std::future::ready(Some(()))).await {
+        match next_loop_input(
+            &mut rx,
+            true,
+            std::future::ready(Some(())),
+            false,
+            std::future::pending::<()>(),
+        )
+        .await
+        {
             LoopInput::Terminal(Ok(TermEvent::Key(key))) => {
                 assert_eq!(key.code, KeyCode::Char('x'));
             }
@@ -1267,7 +1297,15 @@ mod tests {
     async fn terminal_event_is_preserved_after_worker_event_wins() {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        match next_loop_input(&mut rx, true, std::future::ready(Some(1_u8))).await {
+        match next_loop_input(
+            &mut rx,
+            true,
+            std::future::ready(Some(1_u8)),
+            false,
+            std::future::pending::<()>(),
+        )
+        .await
+        {
             LoopInput::Worker(Some(1)) => {}
             _ => panic!("expected the first ready Worker event to win before any terminal input"),
         }
@@ -1278,7 +1316,15 @@ mod tests {
         ))))
         .unwrap();
 
-        match next_loop_input(&mut rx, true, std::future::ready(Some(2_u8))).await {
+        match next_loop_input(
+            &mut rx,
+            true,
+            std::future::ready(Some(2_u8)),
+            false,
+            std::future::pending::<()>(),
+        )
+        .await
+        {
             LoopInput::Terminal(Ok(TermEvent::Key(key))) => {
                 assert_eq!(key.code, KeyCode::Char('y'));
             }
@@ -1445,15 +1491,53 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_x_shutdown_while_idle_is_unchanged() {
+    fn ctrl_x_requires_confirmation_before_shutdown_while_idle() {
+        let mut app = App::new("agent".to_string());
+        app.set_worker_status(WorkerStatus::Idle);
+        let ctrl_x = || KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+
+        assert!(handle_key(&mut app, ctrl_x()).is_none());
+        assert!(app.shutdown_confirm.is_some());
+        let notice = app
+            .current_actionbar_notice(std::time::Instant::now())
+            .expect("first Ctrl-X should arm shutdown confirmation");
+        assert_eq!(notice.level, ActionbarNoticeLevel::Warn);
+        assert_eq!(notice.source, ActionbarNoticeSource::Tui);
+        assert!(notice.text.contains("Ctrl-X"));
+        assert!(notice.text.contains("shut down the Worker"));
+        assert!(!has_alert(&app, "shut down the Worker"));
+
+        assert!(matches!(
+            handle_key(&mut app, ctrl_x()),
+            Some(Method::Shutdown)
+        ));
+        assert!(app.shutdown_confirm.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_and_ctrl_x_confirmations_do_not_authorize_each_other() {
         let mut app = App::new("agent".to_string());
         app.set_worker_status(WorkerStatus::Idle);
 
-        let shutdown = handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            )
+            .is_none()
         );
-        assert!(matches!(shutdown, Some(Method::Shutdown)));
+        assert!(app.quit_confirm.is_some());
+        assert!(app.shutdown_confirm.is_none());
+
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            )
+            .is_none()
+        );
+        assert!(!app.quit);
+        assert!(app.shutdown_confirm.is_some());
     }
 
     #[test]
@@ -2169,12 +2253,17 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Tab));
         assert_eq!(app.selected_worker_view().worker_name, "subworker-hoge");
 
-        let method = handle_key(
+        let first = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        );
+        let second = handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
         );
 
-        assert!(matches!(method, Some(Method::Shutdown)));
+        assert!(first.is_none());
+        assert!(matches!(second, Some(Method::Shutdown)));
         assert_eq!(app.worker_status, WorkerStatus::Idle);
     }
 

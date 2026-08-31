@@ -224,20 +224,23 @@ async fn very_long_single_line() {
 }
 
 #[tokio::test]
-async fn absolute_path_is_rejected() {
-    let (dir, _spill, reg) = setup();
+async fn absolute_path_requires_matching_read_scope() {
+    let (_dir, _spill, reg) = setup();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("outside.txt");
+    std::fs::write(&outside_file, "secret").unwrap();
     let read = reg.get("Read");
     let err = read
         .execute(
-            &json!({ "file_path": dir.path().join("outside.txt") }).to_string(),
+            &json!({ "file_path": outside_file }).to_string(),
             Default::default(),
         )
         .await
         .unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("invalid logical filesystem path"),
-        "absolute path was not rejected as invalid: {msg}"
+        msg.contains("outside allowed scope"),
+        "absolute path escaped readable scope: {msg}"
     );
 }
 

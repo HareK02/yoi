@@ -798,7 +798,7 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
         }
         if session.is_some() {
             return Err(ParseError(
-                "--local does not accept legacy --session; use --local --resume for Standalone session restore"
+                "--local does not accept legacy --session; use --local --resume for Standalone Worker restore"
                     .to_string(),
             ));
         }
@@ -834,7 +834,7 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
 
     if target.kind() == TargetKind::Standalone && (session.is_some() || socket_override.is_some()) {
         return Err(ParseError(
-            "Standalone does not accept legacy Worker session or socket selectors; use --resume for the standalone session store"
+            "Standalone does not accept legacy Worker session or socket selectors; use --resume for the standalone Worker store"
                 .to_string(),
         ));
     }
@@ -951,7 +951,7 @@ fn parse_workers_args<R: CliConnectionResolver + ?Sized>(
     )?;
     if target.kind() != TargetKind::Backend {
         return Err(ParseError(
-            "yoi workers requires a Backend connection target; use yoi --local --resume for Standalone sessions"
+            "yoi workers requires a Backend connection target; use yoi --local --resume for Standalone Workers"
                 .to_string(),
         ));
     }
@@ -1750,8 +1750,8 @@ Usage:
 
 Target selection:
       --local              Use the client-owned one-process Standalone host
-      --resume             With --local, restore from the Standalone session store
-      --all                With Standalone restore, include sessions from every cwd identity
+      --resume             With --local, restore from the Standalone Worker store
+      --all                With Standalone restore, include Workers from every cwd identity
       --backend <URL>      Use a Workspace Backend explicitly
       --workspace-id <ID>  Scope Backend routes to a Workspace id
 
@@ -1761,7 +1761,7 @@ Target selection:
 
 Connection-aware commands:
   yoi                         Standalone: new Console. Backend: Worker picker.
-  yoi resume                  Standalone session picker or stopped Backend Worker picker.
+  yoi resume                  Standalone Worker picker or stopped Backend Worker picker.
   yoi workers                 Backend Workspace Worker picker.
   yoi panel                   Backend Workspace dashboard.
 
@@ -1800,7 +1800,7 @@ Usage:
   yoi --backend <URL> [--workspace-id <ID>] workers [-r|--stopped] [--workspace <PATH>] [--runtime-id <ID>]
 
 Authority:
-  Lists Workers from the selected Backend Workspace. Standalone sessions are restored with
+  Lists Workers from the selected Backend Workspace. Standalone Workers are restored with
   `yoi --local --resume` and are not part of the Workspace Worker catalog.
 
 Options:
@@ -1822,13 +1822,13 @@ Usage:
   yoi [TARGET] resume [--workspace <PATH>|--all] [--runtime-id <ID>]
 
 Target options:
-      --local              Restore from the client-owned Standalone session store
+      --local              Restore from the client-owned Standalone Worker store
       --backend <URL>      Restore a stopped Backend Workspace Worker
       --workspace-id <ID>  Scope Backend routes to a Workspace id
 
 Options:
-      --workspace <PATH>   Scope Standalone sessions to this cwd identity (defaults to cwd)
-      --all                Include Standalone sessions from every cwd identity
+      --workspace <PATH>   Scope Standalone Workers to this cwd identity (defaults to cwd)
+      --all                Include Standalone Workers from every cwd identity
       --runtime-id <ID>    Restrict the Backend stopped-Worker picker to a Runtime id
   -h, --help               Print help
 "#;
@@ -2222,8 +2222,8 @@ backend = "shared"
             mode,
             LaunchMode::StandaloneResume { include_all: false }
         ));
-        let intent = target.standalone_session_list(false).unwrap();
-        assert!(intent.state_dir.ends_with("client/standalone/sessions"));
+        let intent = target.standalone_worker_list(false).unwrap();
+        assert!(intent.state_dir.ends_with("client/standalone/workers"));
         assert!(!intent.include_all);
 
         let mode = parse_args_from(["--local", "--resume", "--all"]).unwrap();
@@ -2264,7 +2264,7 @@ backend = "shared"
         let err = parse_args_slice_with_connection_resolver(&session_args, &resolver).unwrap_err();
         assert_eq!(
             err.0,
-            "--local does not accept legacy --session; use --local --resume for Standalone session restore"
+            "--local does not accept legacy --session; use --local --resume for Standalone Worker restore"
         );
 
         let socket_args = [
@@ -2903,12 +2903,12 @@ backend = "shared"
     }
 
     #[test]
-    fn parse_resume_help_uses_standalone_session_store_terminology() {
+    fn parse_resume_help_uses_standalone_worker_store_terminology() {
         match parse_args_from(["resume", "--help"]).unwrap() {
             Mode::ResumeHelp => {}
             _ => panic!("expected ResumeHelp mode"),
         }
-        assert!(RESUME_HELP.contains("Standalone session store"));
+        assert!(RESUME_HELP.contains("Standalone Worker store"));
         assert!(RESUME_HELP.contains("Backend stopped-Worker picker"));
         assert!(!RESUME_HELP.contains("local Worker records"));
         assert!(!RESUME_HELP.contains("local workspace"));

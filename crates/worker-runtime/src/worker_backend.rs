@@ -60,6 +60,7 @@ use worker::{
     Worker, WorkerBootstrap, WorkerBootstrapError, WorkerBootstrapLayout,
     WorkerControllerTransport, WorkerError, WorkerFilesystemAuthority, WorkerHandle,
     WorkerSharedState, WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
+    bash_output_dir_for_worker_id,
 };
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
@@ -886,6 +887,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         let run_dir = worker_aggregate_dir
             .join("runs")
             .join(request.run_generation.to_string());
+        let bash_output_dir = bash_output_dir_for_worker_id(&request.worker_ref.worker_id);
         let mut prepared = WorkerBootstrap::new(
             manifest,
             store,
@@ -894,6 +896,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             filesystem_authority,
             WorkerBootstrapLayout::RuntimeManagedRun {
                 run_dir: run_dir.clone(),
+                bash_output_dir,
             },
             self.controller_transport,
         )
@@ -1131,10 +1134,12 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         let run_dir = worker_aggregate_dir
             .join("runs")
             .join(request.run_generation.to_string());
+        let bash_output_dir = bash_output_dir_for_worker_id(&request.worker_ref.worker_id);
         let started = PreparedWorker::new(
             worker,
             WorkerBootstrapLayout::RuntimeManagedRun {
                 run_dir: run_dir.clone(),
+                bash_output_dir,
             },
             self.controller_transport,
         )
@@ -2552,10 +2557,14 @@ mod tests {
             )
             .await
             .map_err(|err| err.to_string())?;
-            let (handle, shutdown_rx) =
-                WorkerController::spawn_runtime_managed(worker, &self.runtime_base)
-                    .await
-                    .map_err(|err| err.to_string())?;
+            let bash_output_dir = self.runtime_base.join("bash-output");
+            let (handle, shutdown_rx) = WorkerController::spawn_runtime_managed(
+                worker,
+                &self.runtime_base,
+                &bash_output_dir,
+            )
+            .await
+            .map_err(|err| err.to_string())?;
             Ok(RuntimeWorkerController {
                 handle,
                 shutdown: Arc::new(tokio::sync::Mutex::new(Some(shutdown_rx))),

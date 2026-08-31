@@ -22,7 +22,7 @@ enum OutputMode {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GrepParams {
     pattern: String,
-    /// Logical Workdir-relative file or directory to search. Defaults to the Workdir root.
+    /// Workdir-relative path, or an absolute path covered by readable scope. Defaults to the Workdir root.
     #[serde(default)]
     path: Option<String>,
     #[serde(default)]
@@ -61,7 +61,7 @@ impl Tool for GrepTool {
         let params: GrepParams = serde_json::from_str(input_json)
             .map_err(|error| ToolError::InvalidArgument(format!("invalid Grep input: {error}")))?;
         let path = match params.path {
-            Some(path) => WorkdirPath::new(&path).map_err(ToolsError::from)?,
+            Some(path) => WorkdirPath::new_scoped(&path).map_err(ToolsError::from)?,
             None => WorkdirPath::root(),
         };
         let mode = match params.output_mode.unwrap_or_default() {

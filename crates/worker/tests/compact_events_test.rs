@@ -382,7 +382,7 @@ async fn compact_emits_session_start_carrying_summary_and_task_snapshot() {
     let mut worker = make_worker(client).await;
 
     let (tx, _rx_keep) = broadcast::channel::<Event>(64);
-    worker.attach_event_tx(tx);
+    worker.attach_working_event_tx(tx);
 
     worker.run_text("first").await.unwrap();
     let session_id = worker.session_id();
@@ -429,7 +429,7 @@ async fn pre_run_compact_success_broadcasts_start_and_done() {
     let mut worker = make_worker(client).await;
 
     let (tx, mut rx) = broadcast::channel::<Event>(64);
-    worker.attach_event_tx(tx);
+    worker.attach_working_event_tx(tx);
 
     worker.run_text("first").await.unwrap();
     // Drain run events so only compact events remain in `rx`.
@@ -539,7 +539,7 @@ async fn mid_turn_compact_success_broadcasts_start_and_done() {
     let mut worker = make_worker_with_manifest(MID_TURN_MANIFEST_TOML, client).await;
 
     let (tx, mut rx) = broadcast::channel::<Event>(64);
-    worker.attach_event_tx(tx);
+    worker.attach_working_event_tx(tx);
 
     // First run populates usage_history above the request threshold.
     worker.run_text("first").await.unwrap();
@@ -718,7 +718,7 @@ async fn pre_run_compact_failure_broadcasts_start_and_failed() {
     let mut worker = make_worker(client).await;
 
     let (tx, mut rx) = broadcast::channel::<Event>(64);
-    worker.attach_event_tx(tx);
+    worker.attach_working_event_tx(tx);
 
     worker.run_text("first").await.unwrap();
     let _ = drain(&mut rx);
@@ -861,7 +861,8 @@ async fn controller_compact_method_emits_start_and_done() {
     ]);
     let worker = make_worker_with_manifest(POST_RUN_MANIFEST_TOML, client).await;
     let runtime_tmp = tempfile::tempdir().unwrap();
-    let (handle, _shutdown) = WorkerController::spawn(worker, runtime_tmp.path())
+    let bash_output_dir = runtime_tmp.path().join("bash-output");
+    let (handle, _shutdown) = WorkerController::spawn(worker, runtime_tmp.path(), &bash_output_dir)
         .await
         .unwrap();
     let mut rx = handle.subscribe();

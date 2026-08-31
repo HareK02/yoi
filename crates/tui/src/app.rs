@@ -249,6 +249,9 @@ pub struct App {
     pub running: bool,
     /// True while the Worker is in `WorkerStatus::Paused`.
     pub paused: bool,
+    /// Local observation time for the current run. Used only for live UI
+    /// elapsed time and spinner animation; it is not persisted in history.
+    pub run_started_at: Option<Instant>,
     pub run_requests: usize,
     /// Sum of `input_tokens - cache_read_input_tokens` across the
     /// current turn's LLM requests — i.e. the net tokens this turn
@@ -281,6 +284,9 @@ pub struct App {
     /// records the instant; a second press within the timeout exits the
     /// TUI (the Worker itself stays alive).
     pub quit_confirm: Option<std::time::Instant>,
+    /// Independent 2-tap guard for `Ctrl-X` when the Worker is idle or
+    /// stopped. A second press within the timeout shuts down the Worker.
+    pub shutdown_confirm: Option<std::time::Instant>,
     /// Full display history in render order.
     pub blocks: Vec<Block>,
     /// Turn/protocol errors retained when a real `SegmentStart` replaces the
@@ -352,6 +358,7 @@ impl App {
             worker_status: WorkerStatus::Idle,
             running: false,
             paused: false,
+            run_started_at: None,
             run_requests: 0,
             run_upload_tokens: 0,
             run_output_tokens: 0,
@@ -369,6 +376,7 @@ impl App {
             command_completion_selected: None,
             quit: false,
             quit_confirm: None,
+            shutdown_confirm: None,
             blocks: Vec::new(),
             run_error_messages: Vec::new(),
             internal_workers: Vec::new(),
@@ -553,11 +561,18 @@ impl App {
     }
 
     pub fn set_worker_status(&mut self, status: WorkerStatus) {
+        let was_running = self.running;
         self.worker_status = status;
         self.running = status == WorkerStatus::Running;
         self.paused = status == WorkerStatus::Paused;
         if self.running {
+            if !was_running {
+                self.run_started_at = Some(Instant::now());
+            }
             self.quit_confirm = None;
+            self.shutdown_confirm = None;
+        } else {
+            self.run_started_at = None;
         }
     }
 
@@ -1121,11 +1136,13 @@ impl App {
                 self.latest_llm_wait_event = None;
                 self.assistant_streaming = false;
             }
-            // UI consumers of Invoke / LlmCall semantics are out of scope
-            // for `tickets/invoke-turn-llmcall-semantics.md`; events flow
-            // through to subscribers but the TUI currently derives its
-            // turn header from `UserMessage` / `SystemItem` arrivals.
-            Event::InvokeStart { .. } | Event::LlmCallStart { .. } | Event::LlmCallEnd { .. } => {
+            Event::InvokeStart { .. } => {
+                self.set_worker_status(WorkerStatus::Running);
+            }
+            // UI consumers of per-attempt LlmCall semantics remain out of scope;
+            // the run-level status starts at InvokeStart and TurnStart counts each
+            // LLM request within that run.
+            Event::LlmCallStart { .. } | Event::LlmCallEnd { .. } => {
                 self.latest_llm_wait_event = None;
             }
             Event::LlmRetry {
@@ -3375,6 +3392,17 @@ mod completion_flow_tests {
             assert!(!warning_contains(&app, "Rolled back empty assistant turn"));
             assert!(app.last_rolled_back_input.is_none());
         }
+    }
+
+    #[test]
+    fn running_status_starts_and_stops_live_run_clock() {
+        let mut app = App::new("test".into());
+
+        app.set_worker_status(WorkerStatus::Running);
+        assert!(app.run_started_at.is_some());
+
+        app.set_worker_status(WorkerStatus::Idle);
+        assert!(app.run_started_at.is_none());
     }
 
     #[test]

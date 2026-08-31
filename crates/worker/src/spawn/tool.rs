@@ -22,7 +22,7 @@ use manifest::{
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use workdir::{
-    WorkdirDelegationPermission, WorkdirDelegationRequest, WorkdirDelegationRule,
+    WorkdirDelegationPermission, WorkdirDelegationRequest, WorkdirDelegationRule, WorkdirPath,
     WorkdirSessionHandle,
 };
 
@@ -258,9 +258,10 @@ pub struct SubWorkerSpawnTool {
     spawner_name: String,
     workspace_context: crate::worker::WorkerWorkspaceContext,
     parent_notifications: ParentNotificationTarget,
-    /// Runtime-owned root used only for bounded Internal Worker tool artifacts such as Bash spill
-    /// output. It is not an Internal Worker identity or catalog location.
+    /// Runtime-owned root used for Internal Worker controller state.
     runtime_base: PathBuf,
+    /// Parent Worker-owned temporary root used for bounded Bash spill output.
+    bash_output_dir: PathBuf,
     /// Inherited runtime workspace root for Profile/project/Ticket/workflow/
     /// memory context. SubWorkerSpawn `cwd` must not affect this value.
     workspace_root: PathBuf,
@@ -292,6 +293,7 @@ impl SubWorkerSpawnTool {
         workspace_context: crate::worker::WorkerWorkspaceContext,
         parent_notifications: ParentNotificationTarget,
         runtime_base: PathBuf,
+        bash_output_dir: PathBuf,
         workspace_root: PathBuf,
         source_workdir_session: Option<WorkdirSessionHandle>,
         registry: Arc<SpawnedWorkerRegistry>,
@@ -304,6 +306,7 @@ impl SubWorkerSpawnTool {
             workspace_context,
             parent_notifications,
             runtime_base,
+            bash_output_dir,
             workspace_root,
             source_workdir_session,
             registry,
@@ -367,7 +370,22 @@ impl Tool for SubWorkerSpawnTool {
             .reserve_internal_name(input.name.clone())
             .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
 
-        let workdir_rules = parse_workdir_scope(&input.scope)?;
+        let mut workdir_rules = parse_workdir_scope(&input.scope)?;
+        let child_bash_output_dir = self.bash_output_dir.join("sub-workers").join(&input.name);
+        tokio::fs::create_dir_all(&child_bash_output_dir)
+            .await
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!(
+                    "create Internal Worker Bash output directory {}: {error}",
+                    child_bash_output_dir.display()
+                ))
+            })?;
+        workdir_rules.push(WorkdirDelegationRule {
+            target: WorkdirPath::new_scoped(child_bash_output_dir.to_string_lossy())
+                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?,
+            permission: WorkdirDelegationPermission::Read,
+            recursive: true,
+        });
         let source_workdir_session =
             require_active_workdir_session(self.source_workdir_session.as_ref())?;
         let delegation_request = workdir_delegation_request(input.cwd.as_deref(), workdir_rules)?;
@@ -464,14 +482,22 @@ impl Tool for SubWorkerSpawnTool {
         .await
         .map_err(|error| ToolError::ExecutionFailed(format!("build Internal Worker: {error}")))?;
         child.bind_workdir_session(Some(workdir_delegation.scoped_session.clone()));
+        child
+            .add_scope_rules([ScopeRule {
+                target: child_bash_output_dir.clone(),
+                permission: manifest::Permission::Read,
+                recursive: true,
+            }])
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!(
+                    "grant Internal Worker Bash output scope: {error}"
+                ))
+            })?;
         let child_scope = child.scope().clone();
         let child_registry = SpawnedWorkerRegistry::new_internal(input.name.clone(), child_scope);
         register_worker_tools(
             &mut child,
-            self.runtime_base
-                .join("internal-workers")
-                .join(&input.name)
-                .join("bash-output"),
+            child_bash_output_dir,
             self.runtime_base.clone(),
             child_registry.clone(),
             None,
@@ -883,6 +909,7 @@ pub(crate) fn sub_worker_spawn_tool(
     workspace_context: crate::worker::WorkerWorkspaceContext,
     parent_notifications: ParentNotificationTarget,
     runtime_base: PathBuf,
+    bash_output_dir: PathBuf,
     workspace_root: PathBuf,
     source_workdir_session: Option<WorkdirSessionHandle>,
     registry: Arc<SpawnedWorkerRegistry>,
@@ -894,6 +921,7 @@ pub(crate) fn sub_worker_spawn_tool(
         workspace_context,
         parent_notifications,
         runtime_base,
+        bash_output_dir,
         workspace_root,
         source_workdir_session,
         registry,
@@ -907,6 +935,7 @@ fn sub_worker_spawn_tool_impl(
     workspace_context: crate::worker::WorkerWorkspaceContext,
     parent_notifications: ParentNotificationTarget,
     runtime_base: PathBuf,
+    bash_output_dir: PathBuf,
     workspace_root: PathBuf,
     source_workdir_session: Option<WorkdirSessionHandle>,
     registry: Arc<SpawnedWorkerRegistry>,
@@ -938,6 +967,7 @@ fn sub_worker_spawn_tool_impl(
             workspace_context.clone(),
             parent_notifications.clone(),
             runtime_base.clone(),
+            bash_output_dir.clone(),
             workspace_root.clone(),
             source_workdir_session.clone(),
             registry.clone(),
@@ -1082,12 +1112,17 @@ extract_threshold = 4000
     async fn reviewer_profile_write_scope_exposes_command_tools_and_notifies_parent_controller() {
         let runtime = TempDir::new().unwrap();
         let workspace_root = runtime.path().join("project");
+        let bash_output_dir = runtime.path().join("bash-output");
         let available_profiles = write_project_profile_registry(
             &workspace_root,
             Some("reviewer"),
             &[("reviewer", "reviewer.toml", INTERNAL_REVIEWER_PROFILE)],
         );
         let mut manifest = parent_manifest(&workspace_root, None);
+        manifest
+            .scope
+            .allow
+            .push(abs_rule(&bash_output_dir, Permission::Read));
         manifest.delegation_scope = ScopeConfig {
             allow: vec![abs_rule(&workspace_root, Permission::Write)],
             deny: Vec::new(),
@@ -1118,6 +1153,7 @@ extract_threshold = 4000
             workspace_context,
             ParentNotificationTarget::Controller(parent_method_tx.downgrade()),
             runtime.path().to_path_buf(),
+            bash_output_dir.clone(),
             workspace_root.clone(),
             Some(source_workdir_session),
             registry.clone(),
@@ -1167,6 +1203,12 @@ extract_threshold = 4000
             .await
             .expect("spawn project reviewer as Internal Worker");
         assert!(output.summary.contains("internal worker `reviewer-child`"));
+        assert!(
+            bash_output_dir
+                .join("sub-workers")
+                .join("reviewer-child")
+                .is_dir()
+        );
         assert!(spawner_scope.snapshot().is_writable(&workspace_root));
         let record = registry
             .get_internal("reviewer-child")

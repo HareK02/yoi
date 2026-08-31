@@ -1149,7 +1149,7 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// etc.). Attached by the Controller alongside `alerter`. Unlike
     /// notifications, events sent here are NOT replayed to clients that
     /// connect after the fact — they are fire-and-forget broadcasts.
-    event_tx: Option<broadcast::Sender<Event>>,
+    working_event_tx: Option<broadcast::Sender<Event>>,
     /// Parent-owned projection/control boundary for observable Internal service Workers.
     /// Service Workers are never exposed through the model-facing SubWorker control surface.
     internal_worker_registry: Option<Arc<crate::spawn::registry::SpawnedWorkerRegistry>>,
@@ -1304,7 +1304,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
             system_prompt_template: None,
             feature_instructions: self.feature_instructions.clone(),
             alerter: self.alerter.clone(),
-            event_tx: self.event_tx.clone(),
+            working_event_tx: self.working_event_tx.clone(),
             internal_worker_registry: self.internal_worker_registry.clone(),
             in_flight: self.in_flight.clone(),
             ai_activity_counter: self.ai_activity_counter.clone(),
@@ -1497,7 +1497,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             system_prompt_template: None,
             feature_instructions: Vec::new(),
             alerter: None,
-            event_tx: None,
+            working_event_tx: None,
             internal_worker_registry: None,
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
@@ -2190,13 +2190,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// The Controller wires this alongside [`attach_alerter`] so that
     /// Worker-internal operations (currently: compaction) can surface
     /// progress to connected clients.
-    pub fn attach_event_tx(&mut self, event_tx: broadcast::Sender<Event>) {
+    pub fn attach_working_event_tx(&mut self, working_event_tx: broadcast::Sender<Event>) {
         let session_id = self.session_id().to_string();
         let registry = self.internal_worker_registry.get_or_insert_with(
             crate::spawn::registry::SpawnedWorkerRegistry::new_for_internal_services,
         );
-        registry.attach_parent_protocol(event_tx.clone(), session_id);
-        self.event_tx = Some(event_tx);
+        registry.attach_parent_protocol(working_event_tx.clone(), session_id);
+        self.working_event_tx = Some(working_event_tx);
     }
 
     pub(crate) fn attach_internal_worker_registry(
@@ -2240,10 +2240,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     }
 
     /// Broadcast a typed `Event` to connected clients. No-op when no
-    /// `event_tx` is attached (tests / direct `Worker::new` usage) or when
+    /// `working_event_tx` is attached (tests / direct `Worker::new` usage) or when
     /// no clients are currently subscribed.
     fn send_event(&self, event: Event) {
-        if let Some(tx) = self.event_tx.as_ref() {
+        if let Some(tx) = self.working_event_tx.as_ref() {
             let _ = tx.send(event);
         }
     }
@@ -4407,7 +4407,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .with_memory_settings(&memory_cfg)
             .emit(
                 self.workspace_client(),
-                self.event_tx.as_ref(),
+                self.working_event_tx.as_ref(),
                 memory::audit::WorkerLifecycleStatus::Skipped,
                 "extract_threshold_disabled",
                 None,
@@ -4438,7 +4438,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 .with_memory_settings(&memory_cfg)
                 .emit(
                     self.workspace_client(),
-                    self.event_tx.as_ref(),
+                    self.working_event_tx.as_ref(),
                     memory::audit::WorkerLifecycleStatus::Skipped,
                     "extract_already_in_flight",
                     None,
@@ -4503,7 +4503,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             Some(model_audit_from_manifest(model)),
         )
         .with_memory_settings(memory_cfg);
-        let event_tx = self.event_tx.as_ref();
+        let working_event_tx = self.working_event_tx.as_ref();
 
         let pointer_snapshot = self
             .extract_pointer
@@ -4519,7 +4519,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         if tokens_since < threshold {
             audit.emit(
                 self.workspace_client(),
-                event_tx,
+                working_event_tx,
                 memory::audit::WorkerLifecycleStatus::Skipped,
                 format!(
                     "token_threshold_not_reached tokens_since={tokens_since} threshold={threshold}"
@@ -4536,7 +4536,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             audit
                 .emit(
                     self.workspace_client(),
-                    event_tx,
+                    working_event_tx,
                     memory::audit::WorkerLifecycleStatus::Skipped,
                     "no_new_history_items",
                     None,
@@ -4564,7 +4564,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             audit
                 .emit(
                     self.workspace_client(),
-                    event_tx,
+                    working_event_tx,
                     memory::audit::WorkerLifecycleStatus::Skipped,
                     "empty_segment_log",
                     None,
@@ -4583,7 +4583,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             audit
                 .emit(
                     self.workspace_client(),
-                    event_tx,
+                    working_event_tx,
                     memory::audit::WorkerLifecycleStatus::Skipped,
                     "no_new_segment_entries",
                     None,
@@ -4613,7 +4613,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         audit
             .emit(
                 self.workspace_client(),
-                event_tx,
+                working_event_tx,
                 memory::audit::WorkerLifecycleStatus::Started,
                 format!(
                     "token_threshold_reached tokens_since={tokens_since} threshold={threshold}"
@@ -4637,7 +4637,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 audit
                     .emit(
                         self.workspace_client(),
-                        event_tx,
+                        working_event_tx,
                         memory::audit::WorkerLifecycleStatus::Failed,
                         format!("client_build_failed: {err}"),
                         None,
@@ -4659,7 +4659,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 audit
                     .emit(
                         self.workspace_client(),
-                        event_tx,
+                        working_event_tx,
                         memory::audit::WorkerLifecycleStatus::Failed,
                         format!("prompt_render_failed: {err}"),
                         None,
@@ -4737,7 +4737,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     audit
                         .emit(
                             self.workspace_client(),
-                            event_tx,
+                            working_event_tx,
                             memory::audit::WorkerLifecycleStatus::Cancelled,
                             "worker_cancelled: internal Worker run rolled back before AI output",
                             usage,
@@ -4760,7 +4760,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 audit
                     .emit(
                         self.workspace_client(),
-                        event_tx,
+                        working_event_tx,
                         lifecycle_status_for_worker_error(&err.source),
                         format!("worker_failed: {}", err.source),
                         usage,
@@ -4812,7 +4812,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         audit
             .emit(
                 self.workspace_client(),
-                event_tx,
+                working_event_tx,
                 memory::audit::WorkerLifecycleStatus::Completed,
                 reason,
                 usage,
@@ -4847,7 +4847,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .with_memory_settings(&memory_cfg)
             .emit(
                 self.workspace_client(),
-                self.event_tx.as_ref(),
+                self.working_event_tx.as_ref(),
                 memory::audit::WorkerLifecycleStatus::Skipped,
                 "consolidation_threshold_disabled",
                 None,
@@ -4889,7 +4889,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 .with_memory_settings(&memory_cfg)
                 .emit(
                     self.workspace_client(),
-                    self.event_tx.as_ref(),
+                    self.working_event_tx.as_ref(),
                     memory::audit::WorkerLifecycleStatus::Skipped,
                     "consolidation_backend_operation_failed",
                     None,
@@ -4942,18 +4942,18 @@ fn model_audit_from_manifest(model: &manifest::ModelManifest) -> memory::audit::
 }
 
 fn emit_memory_worker_event(
-    event_tx: Option<&broadcast::Sender<Event>>,
+    working_event_tx: Option<&broadcast::Sender<Event>>,
     run_id: uuid::Uuid,
     worker: memory::audit::AuditWorker,
     status: memory::audit::WorkerLifecycleStatus,
     trigger: memory::audit::AuditTrigger,
     reason: &str,
 ) {
-    let Some(event_tx) = event_tx else {
+    let Some(working_event_tx) = working_event_tx else {
         return;
     };
     let message = format!("memory {} {}: {reason}", worker.label(), status.label());
-    let _ = event_tx.send(Event::MemoryWorker(protocol::MemoryWorkerEvent {
+    let _ = working_event_tx.send(Event::MemoryWorker(protocol::MemoryWorkerEvent {
         worker: worker.label().to_string(),
         status: status.label().to_string(),
         run_id: run_id.to_string(),
@@ -5003,7 +5003,7 @@ impl WorkerAuditBase {
     async fn emit(
         &self,
         workspace_client: &dyn WorkspaceClient,
-        event_tx: Option<&broadcast::Sender<Event>>,
+        working_event_tx: Option<&broadcast::Sender<Event>>,
         status: memory::audit::WorkerLifecycleStatus,
         reason: impl Into<String>,
         usage: Option<memory::audit::UsageAudit>,
@@ -5034,7 +5034,7 @@ impl WorkerAuditBase {
             .await;
         if should_emit_memory_worker_event(self.worker, status, &reason) {
             emit_memory_worker_event(
-                event_tx,
+                working_event_tx,
                 self.run_id,
                 self.worker,
                 status,
@@ -5218,7 +5218,7 @@ where
             system_prompt_template: common.system_prompt_template,
             feature_instructions: common.feature_instructions,
             alerter: None,
-            event_tx: None,
+            working_event_tx: None,
             internal_worker_registry: None,
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
@@ -5302,7 +5302,7 @@ where
             system_prompt_template: common.system_prompt_template,
             feature_instructions: common.feature_instructions,
             alerter: None,
-            event_tx: None,
+            working_event_tx: None,
             internal_worker_registry: None,
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
@@ -5421,7 +5421,7 @@ where
             system_prompt_template: common.system_prompt_template,
             feature_instructions: common.feature_instructions,
             alerter: None,
-            event_tx: None,
+            working_event_tx: None,
             internal_worker_registry: None,
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
@@ -5797,7 +5797,7 @@ where
             system_prompt_template: None,
             feature_instructions: common.feature_instructions,
             alerter: None,
-            event_tx: None,
+            working_event_tx: None,
             internal_worker_registry: None,
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),

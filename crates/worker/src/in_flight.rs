@@ -15,7 +15,7 @@ pub struct InFlightBlockId(u64);
 #[derive(Debug, Clone)]
 pub struct InFlightEvents {
     inner: Arc<Mutex<InFlightInner>>,
-    event_tx: broadcast::Sender<Event>,
+    working_event_tx: broadcast::Sender<Event>,
 }
 
 #[derive(Debug)]
@@ -47,14 +47,14 @@ enum TrackedBlock {
 }
 
 impl InFlightEvents {
-    pub(crate) fn new(event_tx: broadcast::Sender<Event>) -> Self {
+    pub(crate) fn new(working_event_tx: broadcast::Sender<Event>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(InFlightInner {
                 next_block_id: 1,
                 blocks: Vec::new(),
                 commands: Vec::new(),
             })),
-            event_tx,
+            working_event_tx,
         }
     }
 
@@ -84,7 +84,7 @@ impl InFlightEvents {
             current.push_str(&text);
             *finished = false;
         }
-        let _ = self.event_tx.send(Event::TextDelta { text });
+        let _ = self.working_event_tx.send(Event::TextDelta { text });
     }
 
     pub(crate) fn text_done(&self, block_id: InFlightBlockId, text: String) {
@@ -100,7 +100,7 @@ impl InFlightEvents {
             }
             *finished = true;
         }
-        let _ = self.event_tx.send(Event::TextDone { text });
+        let _ = self.working_event_tx.send(Event::TextDone { text });
     }
 
     pub(crate) fn thinking_start(&self) -> InFlightBlockId {
@@ -111,7 +111,7 @@ impl InFlightEvents {
             text: String::new(),
             finished: false,
         });
-        let _ = self.event_tx.send(Event::ThinkingStart);
+        let _ = self.working_event_tx.send(Event::ThinkingStart);
         block_id
     }
 
@@ -126,7 +126,7 @@ impl InFlightEvents {
             current.push_str(&text);
             *finished = false;
         }
-        let _ = self.event_tx.send(Event::ThinkingDelta { text });
+        let _ = self.working_event_tx.send(Event::ThinkingDelta { text });
     }
 
     pub(crate) fn thinking_done(&self, block_id: InFlightBlockId, text: String) {
@@ -142,7 +142,7 @@ impl InFlightEvents {
             }
             *finished = true;
         }
-        let _ = self.event_tx.send(Event::ThinkingDone { text });
+        let _ = self.working_event_tx.send(Event::ThinkingDone { text });
     }
 
     pub(crate) fn tool_call_start(&self, id: String, name: String) -> InFlightBlockId {
@@ -155,7 +155,9 @@ impl InFlightEvents {
             args: String::new(),
             state: InFlightToolCallState::Pending,
         });
-        let _ = self.event_tx.send(Event::ToolCallStart { id, name });
+        let _ = self
+            .working_event_tx
+            .send(Event::ToolCallStart { id, name });
         block_id
     }
 
@@ -171,7 +173,7 @@ impl InFlightEvents {
             *state = InFlightToolCallState::StreamingArgs;
         }
         let _ = self
-            .event_tx
+            .working_event_tx
             .send(Event::ToolCallArgsDelta { id, json: delta });
     }
 
@@ -191,7 +193,7 @@ impl InFlightEvents {
             }
             *state = InFlightToolCallState::Done;
         }
-        let _ = self.event_tx.send(Event::ToolCallDone {
+        let _ = self.working_event_tx.send(Event::ToolCallDone {
             id,
             name,
             arguments: args,
@@ -210,7 +212,7 @@ impl InFlightEvents {
 
     pub(crate) fn publish_command_event(&self, event: CommandEvent) {
         self.lock().apply_command_event(&event);
-        let _ = self.event_tx.send(Event::Command { event });
+        let _ = self.working_event_tx.send(Event::Command { event });
     }
 
     pub(crate) fn replace_command_snapshot(&self, commands: Vec<CommandSnapshot>) {
@@ -492,13 +494,13 @@ mod tests {
 
     #[test]
     fn snapshot_boundary_does_not_duplicate_or_gap_delta_sent_after_subscribe() {
-        let (event_tx, _) = broadcast::channel(16);
-        let in_flight = InFlightEvents::new(event_tx.clone());
+        let (working_event_tx, _) = broadcast::channel(16);
+        let in_flight = InFlightEvents::new(working_event_tx.clone());
         let block_id = in_flight.start_text_block();
         in_flight.text_delta(block_id, "hel".into());
 
         let guard = in_flight.snapshot_guard();
-        let mut rx = event_tx.subscribe();
+        let mut rx = working_event_tx.subscribe();
         let snapshot = snapshot_from_guard(&guard);
         drop(guard);
 
@@ -526,9 +528,9 @@ mod tests {
         use crate::segment_log_sink::SegmentLogSink;
         use session_store::{LogEntry, LoggedRole};
 
-        let (event_tx, _) = broadcast::channel(16);
+        let (working_event_tx, _) = broadcast::channel(16);
         let sink = SegmentLogSink::new();
-        let in_flight = InFlightEvents::new(event_tx);
+        let in_flight = InFlightEvents::new(working_event_tx);
         let block_id = in_flight.start_text_block();
         in_flight.text_delta(block_id, "done".into());
         in_flight.text_done(block_id, "done".into());
@@ -580,9 +582,9 @@ mod tests {
         use crate::segment_log_sink::SegmentLogSink;
         use session_store::{LogEntry, LoggedRole};
 
-        let (event_tx, _) = broadcast::channel(16);
+        let (working_event_tx, _) = broadcast::channel(16);
         let sink = SegmentLogSink::new();
-        let in_flight = InFlightEvents::new(event_tx);
+        let in_flight = InFlightEvents::new(working_event_tx);
         let block_id = in_flight.start_text_block();
         in_flight.text_delta(block_id, "done".into());
         in_flight.text_done(block_id, "done".into());
@@ -615,8 +617,8 @@ mod tests {
 
     #[test]
     fn committed_item_clears_matching_in_flight_block() {
-        let (event_tx, _) = broadcast::channel(16);
-        let in_flight = InFlightEvents::new(event_tx);
+        let (working_event_tx, _) = broadcast::channel(16);
+        let in_flight = InFlightEvents::new(working_event_tx);
         let block_id = in_flight.start_text_block();
         in_flight.text_delta(block_id, "done".into());
         in_flight.clear_for_committed_item_then(
@@ -635,8 +637,8 @@ mod tests {
 
     #[test]
     fn committed_reasoning_summary_clears_matching_in_flight_thinking_blocks() {
-        let (event_tx, _) = broadcast::channel(16);
-        let in_flight = InFlightEvents::new(event_tx);
+        let (working_event_tx, _) = broadcast::channel(16);
+        let in_flight = InFlightEvents::new(working_event_tx);
         let first = in_flight.thinking_start();
         in_flight.thinking_delta(first, "summary A".into());
         in_flight.thinking_done(first, "".into());
@@ -660,8 +662,8 @@ mod tests {
 
     #[test]
     fn committed_encrypted_only_reasoning_clears_empty_finished_thinking_block() {
-        let (event_tx, _) = broadcast::channel(16);
-        let in_flight = InFlightEvents::new(event_tx);
+        let (working_event_tx, _) = broadcast::channel(16);
+        let in_flight = InFlightEvents::new(working_event_tx);
         let first = in_flight.thinking_start();
         in_flight.thinking_done(first, "".into());
         let second = in_flight.thinking_start();
@@ -689,9 +691,9 @@ mod tests {
 
     #[test]
     fn command_events_are_bounded_and_recoverable_from_snapshot() {
-        let (event_tx, _) = broadcast::channel(16);
-        let mut rx = event_tx.subscribe();
-        let in_flight = InFlightEvents::new(event_tx);
+        let (working_event_tx, _) = broadcast::channel(16);
+        let mut rx = working_event_tx.subscribe();
+        let in_flight = InFlightEvents::new(working_event_tx);
         in_flight.publish_command_event(CommandEvent::Started {
             command_id: "command-1".into(),
             tool_call_id: Some("tool-1".into()),
@@ -740,9 +742,9 @@ mod tests {
 
     #[test]
     fn clear_discards_uncommitted_blocks_without_protocol_event() {
-        let (event_tx, _) = broadcast::channel(16);
-        let mut rx = event_tx.subscribe();
-        let in_flight = InFlightEvents::new(event_tx);
+        let (working_event_tx, _) = broadcast::channel(16);
+        let mut rx = working_event_tx.subscribe();
+        let in_flight = InFlightEvents::new(working_event_tx);
         let text = in_flight.start_text_block();
         in_flight.text_delta(text, "stale".into());
         let tool = in_flight.tool_call_start("call-1".into(), "Bash".into());
@@ -770,8 +772,8 @@ mod tests {
 
     #[test]
     fn snapshot_omits_empty_finished_thinking_blocks() {
-        let (event_tx, _) = broadcast::channel(16);
-        let in_flight = InFlightEvents::new(event_tx);
+        let (working_event_tx, _) = broadcast::channel(16);
+        let in_flight = InFlightEvents::new(working_event_tx);
         let empty_finished = in_flight.thinking_start();
         in_flight.thinking_done(empty_finished, "".into());
         let empty_running = in_flight.thinking_start();

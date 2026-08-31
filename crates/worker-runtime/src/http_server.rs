@@ -703,6 +703,7 @@ async fn run_workdir_session_operation(
                     content: String::new(),
                     next_cursor: Some(cursor),
                     truncated: false,
+                    output_path: None,
                 },
             };
             WorkdirSessionOperationResult::CommandOutput(output)

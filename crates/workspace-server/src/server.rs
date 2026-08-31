@@ -15551,6 +15551,7 @@ mod tests {
                 command: "printf ready; sleep 30".to_string(),
                 timeout_secs: 60,
                 output_limit: 4096,
+                spill_dir: None,
                 tool_call_id: Some("tool-call-command-session".to_string()),
             })
             .await

@@ -637,6 +637,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 name = "client"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "futures",
  "protocol",
@@ -3507,6 +3508,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
  "ts-rs",
  "uuid",
@@ -4622,6 +4624,7 @@ version = "0.1.0"
 dependencies = [
  "agen",
  "async-trait",
+ "client",
  "fs4",
  "futures",
  "manifest",

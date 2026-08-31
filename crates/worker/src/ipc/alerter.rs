@@ -28,15 +28,15 @@ pub struct Alerter {
 }
 
 struct Inner {
-    event_tx: broadcast::Sender<Event>,
+    working_event_tx: broadcast::Sender<Event>,
     buffer: Mutex<VecDeque<Alert>>,
 }
 
 impl Alerter {
-    pub fn new(event_tx: broadcast::Sender<Event>) -> Self {
+    pub fn new(working_event_tx: broadcast::Sender<Event>) -> Self {
         Self {
             inner: Arc::new(Inner {
-                event_tx,
+                working_event_tx,
                 buffer: Mutex::new(VecDeque::with_capacity(MAX_BUFFERED_ALERTS)),
             }),
         }
@@ -66,7 +66,7 @@ impl Alerter {
                 buf.pop_front();
             }
             buf.push_back(alert.clone());
-            let _ = self.inner.event_tx.send(Event::Alert(alert));
+            let _ = self.inner.working_event_tx.send(Event::Alert(alert));
         }
     }
 
@@ -81,7 +81,7 @@ impl Alerter {
             .buffer
             .lock()
             .expect("alerter buffer mutex poisoned");
-        let rx = self.inner.event_tx.subscribe();
+        let rx = self.inner.working_event_tx.subscribe();
         let snapshot: Vec<Alert> = buf.iter().cloned().collect();
         (snapshot, rx)
     }

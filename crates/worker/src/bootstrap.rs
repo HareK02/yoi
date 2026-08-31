@@ -17,9 +17,28 @@ use manifest::WorkerManifest;
 #[derive(Debug, Clone)]
 pub enum WorkerBootstrapLayout {
     /// A direct Worker rooted below the supplied runtime base directory.
-    Direct { runtime_base: PathBuf },
+    Direct {
+        runtime_base: PathBuf,
+        bash_output_dir: PathBuf,
+    },
     /// A runtime-managed Worker with an exact persisted run directory.
-    RuntimeManagedRun { run_dir: PathBuf },
+    RuntimeManagedRun {
+        run_dir: PathBuf,
+        bash_output_dir: PathBuf,
+    },
+}
+
+/// Return the temporary Bash spill directory owned by a stable Worker identity.
+///
+/// The directory deliberately lives outside session/run-generation storage so a
+/// restarted controller for the same Worker keeps the same readable artifact
+/// boundary.
+pub fn bash_output_dir_for_worker_id(worker_id: impl std::fmt::Display) -> PathBuf {
+    std::env::temp_dir()
+        .join("yoi")
+        .join("workers")
+        .join(worker_id.to_string())
+        .join("bash-output")
 }
 
 /// Construction and controller inputs that are stable for one Worker launch.
@@ -204,12 +223,29 @@ where
 {
     let cleanup_session = worker.workdir_session().cloned();
     let controller = match layout {
-        WorkerBootstrapLayout::Direct { runtime_base } => {
-            WorkerController::spawn_with_transport(worker, &runtime_base, transport).await
+        WorkerBootstrapLayout::Direct {
+            runtime_base,
+            bash_output_dir,
+        } => {
+            WorkerController::spawn_with_transport(
+                worker,
+                &runtime_base,
+                &bash_output_dir,
+                transport,
+            )
+            .await
         }
-        WorkerBootstrapLayout::RuntimeManagedRun { run_dir } => {
-            WorkerController::spawn_runtime_managed_run_with_transport(worker, &run_dir, transport)
-                .await
+        WorkerBootstrapLayout::RuntimeManagedRun {
+            run_dir,
+            bash_output_dir,
+        } => {
+            WorkerController::spawn_runtime_managed_run_with_transport(
+                worker,
+                &run_dir,
+                &bash_output_dir,
+                transport,
+            )
+            .await
         }
     };
 
@@ -225,5 +261,24 @@ where
                 cleanup_failed,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bash_output_dir_for_worker_id;
+
+    #[test]
+    fn bash_output_directory_is_stable_per_worker_below_system_temp() {
+        let path = bash_output_dir_for_worker_id("019c1234-worker");
+
+        assert_eq!(
+            path,
+            std::env::temp_dir()
+                .join("yoi")
+                .join("workers")
+                .join("019c1234-worker")
+                .join("bash-output")
+        );
     }
 }
