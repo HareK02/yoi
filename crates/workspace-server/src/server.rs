@@ -1116,6 +1116,7 @@ async fn authorize_scoped_workspace_request(
             return Err(StatusCode::FORBIDDEN.into_response());
         }
     }
+    request.extensions_mut().insert(actor);
     Ok(())
 }
 
@@ -17722,6 +17723,7 @@ mod tests {
                 revoked_at: None,
             })
             .unwrap();
+        let non_owner_token = seed_test_api_token(store.as_ref(), "repository-access-non-owner");
         let app = build_workspace_server_router(config, store).await.unwrap();
         let uri = format!("/api/w/{}/workspace", workspace.workspace.workspace_id);
 
@@ -17864,6 +17866,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(authenticated.status(), StatusCode::OK);
+
+        for resource in ["credentials", "host-trusts"] {
+            let repository_access_uri = format!(
+                "/api/w/{}/settings/repository-access/{resource}",
+                workspace.workspace.workspace_id
+            );
+            let owner = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&repository_access_uri)
+                        .header(
+                            axum::http::header::COOKIE,
+                            "yoi_workspace_session=browser-session-auth",
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                owner.status(),
+                StatusCode::OK,
+                "{repository_access_uri} must receive the authenticated Browser actor"
+            );
+
+            let non_owner = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&repository_access_uri)
+                        .header(
+                            axum::http::header::AUTHORIZATION,
+                            format!("Bearer {non_owner_token}"),
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                non_owner.status(),
+                StatusCode::FORBIDDEN,
+                "{repository_access_uri} must retain owner-only authorization"
+            );
+        }
 
         let settings_uri = format!(
             "/api/w/{}/settings/workspace",
