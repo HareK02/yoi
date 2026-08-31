@@ -7,6 +7,7 @@ export type Diagnostic = {
 export type SettingsSectionId =
   | "runtimes"
   | "configuration-sources"
+  | "repositories"
   | "repository-access"
   | "profile-sources"
   | "workspace-identity";
@@ -52,6 +53,18 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
       "Virtual paths and imports resolve inside the committed Workspace tree, never from browser or Server host paths.",
       "Browser analysis is advisory; Server evaluation is required before an atomic revision commit.",
       "Profile launch data is projected from this active revision; remaining Skill, Prompt, and Plugin consumers migrate in their follow-up cutovers.",
+    ],
+  },
+  {
+    id: "repositories",
+    label: "Repositories",
+    status: "editable",
+    summary:
+      "Register the local and remote Git repositories available to this Workspace.",
+    bullets: [
+      "Repository identity and source registration are Workspace-scoped Server authority.",
+      "Adding a Repository performs validation and persistence without network access.",
+      "SSH credentials and pinned host trust remain separate Repository Access resources.",
     ],
   },
   {
@@ -116,6 +129,8 @@ export function settingsSectionHref(id: SettingsSectionId): string {
       return `${SETTINGS_ROUTE}/runtimes`;
     case "configuration-sources":
       return `${SETTINGS_ROUTE}/configuration`;
+    case "repositories":
+      return `${SETTINGS_ROUTE}/repositories`;
     case "repository-access":
       return `${SETTINGS_ROUTE}/repository-access`;
     case "profile-sources":

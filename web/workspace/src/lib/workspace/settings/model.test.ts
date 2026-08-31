@@ -53,6 +53,19 @@ Deno.test("settings shell advertises scoped account authority", () => {
   );
 });
 
+Deno.test("Repository settings expose the canonical list and Add route", () => {
+  const section = SETTINGS_SECTIONS.find((entry) => entry.id === "repositories");
+  assert(section?.status === "editable", "Repositories should be editable");
+  assert(
+    settingsSectionHref("repositories") === "/settings/repositories",
+    "Repositories should have a dedicated settings route",
+  );
+  assert(
+    section?.bullets.join("\n").includes("without network access"),
+    "Repository registration copy should preserve the no-network boundary",
+  );
+});
+
 Deno.test("Repository access settings are editable and canonically routed", () => {
   const section = SETTINGS_SECTIONS.find((entry) =>
     entry.id === "repository-access"
