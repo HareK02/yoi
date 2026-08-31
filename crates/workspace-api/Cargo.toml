@@ -14,5 +14,9 @@ serde = { workspace = true, features = ["derive"] }
 ts-rs = { version = "12.0.1", optional = true }
 workdir.workspace = true
 
+[[example]]
+name = "generate_typescript"
+required-features = ["typescript"]
+
 [dev-dependencies]
 serde_json.workspace = true

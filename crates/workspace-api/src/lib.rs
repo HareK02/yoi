@@ -12,6 +12,7 @@ use workdir::workspace::WorkingDirectorySummary;
 /// Local paths remain distinct from network Git transports so callers cannot
 /// accidentally treat an unmaterialized remote as a server-local filesystem path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RepositorySourceKind {
     LocalPath,
@@ -55,6 +56,7 @@ impl RepositorySourceKind {
 
 /// Stable Repository source identity stored by Workspace authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct RepositorySource {
     pub kind: RepositorySourceKind,
     /// Canonical source representation. This is an absolute local path for
@@ -63,6 +65,7 @@ pub struct RepositorySource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryObservedStatus {
     Unverified,
@@ -89,10 +92,216 @@ impl RepositoryObservedStatus {
     }
 }
 
+/// Public Workspace catalog item returned by `GET /api/workspaces`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceSummary {
+    pub workspace_id: String,
+    pub owner_account_id: Option<String>,
+    pub display_name: String,
+    pub state: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Public Repository record embedded in Workspace creation responses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRepositoryRecord {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub name: String,
+    pub kind: String,
+    pub provider: Option<String>,
+    pub source: RepositorySource,
+    pub default_ref: Option<String>,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub source_revision: u64,
+    pub source_fingerprint: String,
+    pub observed_status: RepositoryObservedStatus,
+    pub observed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Response returned after atomically creating a Workspace and its first Repository.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceCreateResponse {
+    pub workspace: WorkspaceSummary,
+    pub repository: WorkspaceRepositoryRecord,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub config_revision: u64,
+    pub request_fingerprint: String,
+    pub replayed: bool,
+}
+
+/// Browser authentication configuration exposed by the scoped Workspace summary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub enum WorkspaceAuthConfig {
+    Passkey {
+        rp_id: String,
+        origin: String,
+        public_base_url: String,
+        cookie_name: String,
+    },
+}
+
+/// Backend-authoritative permissions for the current Workspace actor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspacePermissionSummary {
+    pub manage_repositories: bool,
+    pub manage_secrets: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceExtensionPointState {
+    pub status: String,
+    pub note: String,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceExtensionPoints {
+    pub store: String,
+    pub event_stream: WorkspaceExtensionPointState,
+    pub host_worker_bridge: WorkspaceExtensionPointState,
+    pub companion_console: WorkspaceExtensionPointState,
+}
+
+/// Scoped Workspace metadata and current-actor permission projection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceResponse {
+    pub workspace_id: String,
+    pub display_name: String,
+    pub record_authority: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub schema_version: i64,
+    pub auth: WorkspaceAuthConfig,
+    pub permissions: WorkspacePermissionSummary,
+    pub extension_points: WorkspaceExtensionPoints,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryDiagnostic {
+    pub severity: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct GitRemoteSummary {
+    pub name: String,
+    pub fetch_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct GitRepositorySummary {
+    pub status: String,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub dirty: bool,
+    pub remotes: Vec<GitRemoteSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RepositorySummary {
+    pub id: String,
+    pub display_name: String,
+    pub kind: String,
+    pub provider: String,
+    pub source: RepositorySource,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub source_revision: u64,
+    pub source_fingerprint: String,
+    pub observed_status: RepositoryObservedStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub observed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub default_selector: Option<String>,
+    pub record_authority: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub git: Option<GitRepositorySummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub diagnostics: Option<Vec<RepositoryDiagnostic>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct GitCommitSummary {
+    pub hash: String,
+    pub short_hash: String,
+    pub summary: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub author_date: String,
+    pub parents: Vec<String>,
+    pub refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryListResponse {
+    pub workspace_id: String,
+    pub items: Vec<RepositorySummary>,
+    pub source: String,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryDetailResponse {
+    pub workspace_id: String,
+    pub item: RepositorySummary,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryLogResponse {
+    pub workspace_id: String,
+    pub repository_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub default_selector: Option<String>,
+    pub limit: usize,
+    pub items: Vec<GitCommitSummary>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
 pub const TICKET_RELATIONS_QUERY_PATH: &str = "/tickets/relations/search";
 pub const TICKET_ORCHESTRATION_PLANS_QUERY_PATH: &str = "/tickets/orchestration-plans/search";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticSeverity {
     Info,
@@ -101,6 +310,7 @@ pub enum DiagnosticSeverity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct Diagnostic {
     pub code: String,
     pub severity: DiagnosticSeverity,
@@ -537,9 +747,126 @@ pub struct RepositoryAccessProjection {
     pub bindings: Vec<RepositorySshAccessBinding>,
 }
 
+#[cfg(feature = "typescript")]
+pub fn catalog_typescript() -> String {
+    use ts_rs::TS;
+
+    let config = ts_rs::Config::default();
+    let declarations = [
+        WorkspaceSummary::decl(&config),
+        WorkspaceRepositoryRecord::decl(&config),
+        WorkspaceCreateResponse::decl(&config),
+        WorkspaceAuthConfig::decl(&config),
+        WorkspacePermissionSummary::decl(&config),
+        DiagnosticSeverity::decl(&config),
+        Diagnostic::decl(&config),
+        WorkspaceExtensionPointState::decl(&config),
+        WorkspaceExtensionPoints::decl(&config),
+        WorkspaceResponse::decl(&config),
+        RepositorySourceKind::decl(&config),
+        RepositorySource::decl(&config),
+        RepositoryObservedStatus::decl(&config),
+        RepositoryDiagnostic::decl(&config),
+        GitRemoteSummary::decl(&config),
+        GitRepositorySummary::decl(&config),
+        RepositorySummary::decl(&config),
+        GitCommitSummary::decl(&config),
+        RepositoryListResponse::decl(&config),
+        RepositoryDetailResponse::decl(&config),
+        RepositoryLogResponse::decl(&config),
+    ]
+    .map(|declaration| format!("export {declaration}"));
+
+    format!(
+        "// This file is generated by `cargo run -p workspace-api --features typescript --example generate_typescript | deno fmt -`.\n// Do not edit this file directly.\n\n{}\n",
+        declarations.join("\n\n")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_and_repository_response_shapes_round_trip() {
+        let workspace = serde_json::json!({
+            "workspace_id": "workspace-test",
+            "display_name": "Test",
+            "record_authority": "workspace-control-plane",
+            "schema_version": 46,
+            "auth": {"Passkey": {
+                "rp_id": "example.test",
+                "origin": "https://example.test",
+                "public_base_url": "https://example.test",
+                "cookie_name": "yoi_session"
+            }},
+            "permissions": {
+                "manage_repositories": true,
+                "manage_secrets": true
+            },
+            "extension_points": {
+                "store": "sqlite",
+                "event_stream": {"status": "available", "note": "ready", "diagnostics": []},
+                "host_worker_bridge": {"status": "available", "note": "ready", "diagnostics": []},
+                "companion_console": {"status": "available", "note": "ready", "diagnostics": []}
+            }
+        });
+        let parsed: WorkspaceResponse = serde_json::from_value(workspace.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), workspace);
+
+        let repositories = serde_json::json!({
+            "workspace_id": "workspace-test",
+            "items": [{
+                "id": "main",
+                "display_name": "main",
+                "kind": "git",
+                "provider": "git",
+                "source": {"kind": "local_path", "uri": "/srv/project"},
+                "source_revision": 1,
+                "source_fingerprint": "sha256:test",
+                "observed_status": "ready",
+                "record_authority": "workspace-control-plane"
+            }],
+            "source": "workspace-control-plane",
+            "diagnostics": []
+        });
+        let parsed: RepositoryListResponse = serde_json::from_value(repositories.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), repositories);
+    }
+
+    #[test]
+    fn repository_response_rejects_stale_field_aliases() {
+        let stale = serde_json::json!({
+            "workspace_id": "workspace-test",
+            "items": [{
+                "repository_id": "main",
+                "display_name": "main",
+                "kind": "git",
+                "provider": "git",
+                "source": {"kind": "local_path", "uri": "/srv/project"},
+                "source_revision": 1,
+                "source_fingerprint": "sha256:test",
+                "observed_status": "ready",
+                "record_authority": "workspace-control-plane"
+            }],
+            "source": "workspace-control-plane",
+            "diagnostics": []
+        });
+
+        assert!(serde_json::from_value::<RepositoryListResponse>(stale).is_err());
+    }
+
+    #[cfg(feature = "typescript")]
+    #[test]
+    fn generated_catalog_typescript_keeps_public_wrappers_and_nullability() {
+        let output = catalog_typescript();
+        assert!(output.contains("export type WorkspaceResponse ="));
+        assert!(output.contains("permissions: WorkspacePermissionSummary"));
+        assert!(output.contains("export type RepositoryListResponse ="));
+        assert!(output.contains("items: Array<RepositorySummary>"));
+        assert!(output.contains("observed_at?: string | null"));
+        assert!(!output.contains("repository_id: string, display_name"));
+    }
 
     #[test]
     fn worker_resource_key_is_required() {
