@@ -16,6 +16,7 @@ mod markdown;
 mod scroll;
 pub mod setup_model;
 mod standalone_picker;
+mod standalone_spawn;
 mod task;
 mod text_selection;
 mod tool;
@@ -136,17 +137,21 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
         LaunchMode::Spawn {
             worker_name,
             profile,
-        } => match target.spawn_worker() {
-            Ok(spawn) => {
-                console::run_standalone(
-                    workspace_root.clone(),
-                    spawn.state_dir,
-                    worker_name,
-                    profile,
-                )
-                .await
-            }
-            Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
+        } => match standalone_spawn::select(&workspace_root, worker_name, profile) {
+            Ok(Some(selection)) => match target.spawn_worker() {
+                Ok(spawn) => {
+                    console::run_standalone(
+                        workspace_root.clone(),
+                        spawn.state_dir,
+                        Some(selection.worker_name),
+                        Some(selection.profile),
+                    )
+                    .await
+                }
+                Err(error) => Err(Box::new(error) as Box<dyn std::error::Error>),
+            },
+            Ok(None) => Ok(()),
+            Err(error) => Err(Box::new(error) as Box<dyn std::error::Error>),
         },
         LaunchMode::StandaloneResume { include_all } => {
             match standalone_picker::pick(target.as_ref(), include_all) {
