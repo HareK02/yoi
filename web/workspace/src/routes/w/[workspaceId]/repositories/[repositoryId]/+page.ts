@@ -1,29 +1,59 @@
 import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
-import type {
-  RepositoryDetailResponse,
-  RepositoryLogResponse,
-} from "$lib/workspace/sidebar/types";
+import {
+  parseRepositoryDetailResponse,
+  parseRepositoryLogResponse,
+} from "$lib/workspace/api/workspace-model";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {
-  const apiPath = (path: string) => workspaceApiPath(params.workspaceId, path);
+  const workspaceId = params.workspaceId;
   const repositoryId = params.repositoryId;
-  const [repository, log] = await Promise.all([
-    loadJson<RepositoryDetailResponse>(
+  const [repositoryResult, logResult] = await Promise.all([
+    loadJson<unknown>(
       fetch,
-      apiPath(`/repositories/${encodeURIComponent(repositoryId)}`),
+      workspaceApiPath(
+        workspaceId,
+        `/repositories/${encodeURIComponent(repositoryId)}`,
+      ),
     ),
-    loadJson<RepositoryLogResponse>(
+    loadJson<unknown>(
       fetch,
-      apiPath(`/repositories/${encodeURIComponent(repositoryId)}/log`),
+      workspaceApiPath(
+        workspaceId,
+        `/repositories/${encodeURIComponent(repositoryId)}/log`,
+      ),
     ),
   ]);
 
+  let repository = null;
+  let repositoryError = repositoryResult.error;
+  if (repositoryResult.data !== null) {
+    try {
+      repository = parseRepositoryDetailResponse(repositoryResult.data);
+    } catch (cause) {
+      repositoryError = cause instanceof Error
+        ? cause.message
+        : "invalid repository detail response";
+    }
+  }
+
+  let log = null;
+  let logError = logResult.error;
+  if (logResult.data !== null) {
+    try {
+      log = parseRepositoryLogResponse(logResult.data);
+    } catch (cause) {
+      logError = cause instanceof Error
+        ? cause.message
+        : "invalid repository log response";
+    }
+  }
+
   return {
     repositoryId,
-    repository: repository.data,
-    repositoryError: repository.error,
-    repositoryLog: log.data,
-    repositoryLogError: log.error,
+    repository,
+    repositoryError,
+    repositoryLog: log,
+    repositoryLogError: logError,
   };
 };

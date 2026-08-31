@@ -3,25 +3,19 @@ import type {
   Method as PodProtocolMethod,
   Segment as PodProtocolSegment,
 } from "$lib/generated/protocol";
+import type {
+  GitCommitSummary as SharedGitCommitSummary,
+  GitRemoteSummary as SharedGitRemoteSummary,
+  GitRepositorySummary as SharedGitRepositorySummary,
+  RepositoryDetailResponse as SharedRepositoryDetailResponse,
+  RepositoryListResponse as SharedRepositoryListResponse,
+  RepositoryLogResponse as SharedRepositoryLogResponse,
+  RepositorySummary as SharedRepositorySummary,
+  WorkspaceResponse as SharedWorkspaceResponse,
+} from "$lib/workspace/api/workspace-model";
 
 export type { PodProtocolEvent, PodProtocolMethod, PodProtocolSegment };
-
-export type ExtensionPoint = {
-  status: string;
-  note: string;
-  diagnostics: Diagnostic[];
-};
-
-export type WorkspaceResponse = {
-  workspace_id: string;
-  display_name: string;
-  record_authority: string;
-  extension_points: {
-    event_stream: ExtensionPoint;
-    host_worker_bridge: ExtensionPoint;
-    companion_console: ExtensionPoint;
-  };
-};
+export type WorkspaceResponse = SharedWorkspaceResponse;
 
 export type Diagnostic = {
   code: string;
@@ -257,70 +251,13 @@ export type ListResponse<T> = {
   diagnostics: Diagnostic[];
 };
 
-export type RepositorySummary = {
-  id: string;
-  display_name: string;
-  kind: string;
-  provider: string;
-  source: {
-    kind: "local_path" | "file" | "ssh" | "http" | "https" | "invalid";
-    uri: string;
-  };
-  source_revision: number;
-  source_fingerprint: string;
-  observed_status: "unverified" | "ready" | "invalid";
-  observed_at?: string | null;
-  default_selector?: string | null;
-  record_authority: string;
-  git?: GitRepositorySummary | null;
-  diagnostics?: Diagnostic[];
-};
-
-export type GitRepositorySummary = {
-  status: string;
-  branch?: string | null;
-  head?: string | null;
-  dirty: boolean;
-  remotes: GitRemoteSummary[];
-};
-
-export type GitRemoteSummary = {
-  name: string;
-  fetch_url: string;
-};
-
-export type GitCommitSummary = {
-  hash: string;
-  short_hash: string;
-  summary: string;
-  author_name: string;
-  author_email: string;
-  author_date: string;
-  parents: string[];
-  refs: string[];
-};
-
-export type RepositoryListResponse = {
-  workspace_id: string;
-  items: RepositorySummary[];
-  source: string;
-  diagnostics: Diagnostic[];
-};
-
-export type RepositoryDetailResponse = {
-  workspace_id: string;
-  item: RepositorySummary;
-  source: string;
-};
-
-export type RepositoryLogResponse = {
-  workspace_id: string;
-  repository_id: string;
-  default_selector?: string | null;
-  limit: number;
-  items: GitCommitSummary[];
-  diagnostics: Diagnostic[];
-};
+export type RepositorySummary = SharedRepositorySummary;
+export type GitRepositorySummary = SharedGitRepositorySummary;
+export type GitRemoteSummary = SharedGitRemoteSummary;
+export type GitCommitSummary = SharedGitCommitSummary;
+export type RepositoryListResponse = SharedRepositoryListResponse;
+export type RepositoryDetailResponse = SharedRepositoryDetailResponse;
+export type RepositoryLogResponse = SharedRepositoryLogResponse;
 
 export type MemoryDocumentResponse = {
   body_md: string;
