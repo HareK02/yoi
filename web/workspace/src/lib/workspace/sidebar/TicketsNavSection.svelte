@@ -10,9 +10,9 @@
   let ticketsHref = $derived(workspaceId ? workspaceRoute(workspaceId, '/tickets') : '/');
 </script>
 
-<section class="nav-section">
+<section class="sidebar-nav-section sidebar-nav-section--resource">
   <a
-    class="primary-nav-link"
+    class="sidebar-link"
     class:active={currentPath.startsWith(ticketsHref)}
     href={ticketsHref}
     aria-current={currentPath.startsWith(ticketsHref) ? 'page' : undefined}

@@ -25,34 +25,30 @@
 
 <WorkspaceAlerts />
 
-<div class="workspace-layout">
+<div class="app-shell">
   <SidebarFrame>
-    {#if sidebar}
-      {@render sidebar()}
-    {:else}
-      <GlobalSidebar currentPath={page.url.pathname} />
-    {/if}
+    <GlobalSidebar currentPath={page.url.pathname} content={sidebar} />
   </SidebarFrame>
-  <header class="workspace-topbar">
-    <div class="workspace-topbar-location">
+  <header class="app-shell__topbar">
+    <div class="app-shell__topbar-location">
       {#if headerController.content}{@render headerController.content()}{/if}
     </div>
-    <nav class="workspace-topbar-actions" aria-label="Global navigation">
-      <a class="topbar-icon-button" href="/account" aria-label="Open Account" title="Account">
-        <svg class="topbar-icon" aria-hidden="true" viewBox="0 0 24 24">
+    <nav class="app-shell__topbar-actions" aria-label="Global navigation">
+      <a class="app-shell__icon-button" href="/account" aria-label="Open Account" title="Account">
+        <svg class="app-shell__icon" aria-hidden="true" viewBox="0 0 24 24">
           <path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2" />
           <circle cx="12" cy="7" r="4" />
         </svg>
       </a>
     </nav>
   </header>
-  <main class="shell">
+  <main class="app-shell__main">
     {@render children()}
   </main>
 </div>
 
 <style>
-  .workspace-layout {
+  .app-shell {
     display: grid;
     grid-template-columns: auto minmax(0, 1fr);
     grid-template-rows: auto minmax(0, 1fr);
@@ -64,7 +60,9 @@
     min-width: 0;
   }
 
-  .workspace-topbar {
+  .app-shell__topbar {
+    position: relative;
+    z-index: 30;
     grid-column: 2;
     grid-row: 1;
     display: flex;
@@ -79,18 +77,19 @@
     backdrop-filter: blur(14px);
   }
 
-  .workspace-topbar-location {
+  .app-shell__topbar-location {
+    flex: 1 1 auto;
     min-width: 0;
-    overflow: hidden;
+    overflow: visible;
   }
 
-  .workspace-topbar-actions {
+  .app-shell__topbar-actions {
     display: inline-flex;
     align-items: center;
     gap: var(--space-2);
   }
 
-  .topbar-icon-button {
+  .app-shell__icon-button {
     display: inline-flex;
     width: 2.35rem;
     height: 2.35rem;
@@ -101,13 +100,13 @@
     text-decoration: none;
   }
 
-  .topbar-icon-button:hover,
-  .topbar-icon-button:focus-visible {
+  .app-shell__icon-button:hover,
+  .app-shell__icon-button:focus-visible {
     background: var(--interactive-hover);
     color: var(--text-muted);
   }
 
-  .topbar-icon {
+  .app-shell__icon {
     width: 1.1rem;
     height: 1.1rem;
     fill: none;
@@ -117,7 +116,7 @@
     stroke-linejoin: round;
   }
 
-  .shell {
+  .app-shell__main {
     grid-column: 2;
     grid-row: 2;
     display: flex;
@@ -133,7 +132,7 @@
   }
 
   @media (max-width: 760px) {
-    .workspace-layout {
+    .app-shell {
       grid-template-columns: 1fr;
       grid-template-rows: auto auto 1fr;
       width: 100vw;
@@ -142,13 +141,13 @@
       overflow: visible;
     }
 
-    .workspace-topbar {
+    .app-shell__topbar {
       grid-column: 1;
       grid-row: 2;
       padding: 0 var(--space-4);
     }
 
-    .shell {
+    .app-shell__main {
       grid-column: 1;
       grid-row: 3;
       overflow: visible;

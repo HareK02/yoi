@@ -37,7 +37,7 @@
   });
 </script>
 
-<section class="nav-section" aria-labelledby="workers-heading">
+<section class="sidebar-nav-section" aria-labelledby="workers-heading">
   <div class="section-heading-row">
     <h2 id="workers-heading">
       <a

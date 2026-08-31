@@ -1,14 +1,16 @@
 <script lang="ts">
-  import { setContext, type Snippet } from 'svelte';
+  import { setContext } from 'svelte';
   import { page } from '$app/state';
   import HeaderOverride from '$lib/workspace/header/HeaderOverride.svelte';
   import WorkspaceBreadcrumbs from '$lib/workspace/header/WorkspaceBreadcrumbs.svelte';
   import SidebarOverride from '$lib/workspace/sidebar/SidebarOverride.svelte';
-  import { createOverrideStack } from '$lib/workspace/sidebar/override-stack';
   import {
-    WORKSPACE_SIDEBAR_CONTENT_CONTEXT,
-    type WorkspaceSidebarContentController,
-  } from '$lib/workspace/sidebar/workspace-content-context';
+    getSidebarController,
+    SIDEBAR_CONTEXT,
+    type SidebarController,
+    type SidebarSnippet,
+  } from '$lib/workspace/sidebar/context';
+  import { createOverrideStack } from '$lib/workspace/sidebar/override-stack';
   import { disposeWorkspaceMultiplexer } from '$lib/workspace/multiplexer';
   import WorkspaceSidebar from '$lib/workspace/sidebar/WorkspaceSidebar.svelte';
   import '$lib/workspace/styles/workspace-pages.css';
@@ -17,13 +19,14 @@
   import type { LayoutProps } from './$types';
 
   let { data, children }: LayoutProps = $props();
-  let sidebarContent = $state<Snippet | null>(null);
-  const sidebarContentOverrides = createOverrideStack<Snippet>((activeContent) => {
+  const parentSidebarController = getSidebarController();
+  let sidebarContent = $state<SidebarSnippet | null>(null);
+  const sidebarContentOverrides = createOverrideStack<SidebarSnippet>((activeContent) => {
     sidebarContent = activeContent;
   });
 
-  setContext<WorkspaceSidebarContentController>(WORKSPACE_SIDEBAR_CONTENT_CONTEXT, {
-    registerContent: sidebarContentOverrides.register,
+  setContext<SidebarController>(SIDEBAR_CONTEXT, {
+    registerSidebar: sidebarContentOverrides.register,
   });
 
   $effect(() => {
@@ -34,7 +37,11 @@
 </script>
 
 {#snippet workspaceHeader()}
-  <WorkspaceBreadcrumbs workspaceId={page.params.workspaceId ?? data.workspace?.workspace_id ?? ''} />
+  <WorkspaceBreadcrumbs
+    workspaceId={page.params.workspaceId ?? data.workspace?.workspace_id ?? ''}
+    workspace={data.workspace ?? null}
+    workspaceError={data.workspaceError ?? null}
+  />
 {/snippet}
 
 {#snippet workspaceSidebar()}
@@ -47,6 +54,6 @@
 {/snippet}
 
 <HeaderOverride content={workspaceHeader} />
-<SidebarOverride sidebar={workspaceSidebar} />
+<SidebarOverride controller={parentSidebarController} sidebar={workspaceSidebar} />
 
 {@render children()}

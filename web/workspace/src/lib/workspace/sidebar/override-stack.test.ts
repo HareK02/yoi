@@ -75,58 +75,95 @@ Deno.test("sidebar disposers remove only their own registration", () => {
   );
 });
 
-Deno.test("settings replaces only WorkspaceSidebar content", async () => {
-  const layoutUrl = new URL(
-    "../../../routes/w/[workspaceId]/settings/+layout.svelte",
+Deno.test("Global, Workspace, and Settings use one recursive sidebar slot contract", async () => {
+  const rootLayoutUrl = new URL(
+    "../../../routes/+layout.svelte",
     import.meta.url,
   );
   const workspaceLayoutUrl = new URL(
     "../../../routes/w/[workspaceId]/+layout.svelte",
     import.meta.url,
   );
+  const settingsLayoutUrl = new URL(
+    "../../../routes/w/[workspaceId]/settings/+layout.svelte",
+    import.meta.url,
+  );
+  const globalSidebarUrl = new URL("./GlobalSidebar.svelte", import.meta.url);
   const workspaceSidebarUrl = new URL(
     "./WorkspaceSidebar.svelte",
     import.meta.url,
   );
-  const settingsContentUrl = new URL(
-    "./SettingsSidebarContent.svelte",
+  const settingsSidebarUrl = new URL(
+    "./SettingsSidebar.svelte",
     import.meta.url,
   );
-  const [layout, workspaceLayout, workspaceSidebar, settingsContent] =
-    await Promise.all([
-      Deno.readTextFile(layoutUrl),
-      Deno.readTextFile(workspaceLayoutUrl),
-      Deno.readTextFile(workspaceSidebarUrl),
-      Deno.readTextFile(settingsContentUrl),
-    ]);
+  const settingsErrorUrl = new URL(
+    "../../../routes/w/[workspaceId]/settings/+error.svelte",
+    import.meta.url,
+  );
+  const [
+    rootLayout,
+    workspaceLayout,
+    settingsLayout,
+    globalSidebar,
+    workspaceSidebar,
+    settingsSidebar,
+    settingsError,
+  ] = await Promise.all([
+    Deno.readTextFile(rootLayoutUrl),
+    Deno.readTextFile(workspaceLayoutUrl),
+    Deno.readTextFile(settingsLayoutUrl),
+    Deno.readTextFile(globalSidebarUrl),
+    Deno.readTextFile(workspaceSidebarUrl),
+    Deno.readTextFile(settingsSidebarUrl),
+    Deno.readTextFile(settingsErrorUrl),
+  ]);
 
   assert(
-    layout.includes(
-      "<WorkspaceSidebarContentOverride content={settingsSidebarContent} />",
-    ),
-    "settings layout should override the WorkspaceSidebar content slot",
+    rootLayout.includes("<GlobalSidebar") &&
+      rootLayout.includes("content={sidebar}"),
+    "root layout should always render GlobalSidebar as the root slot owner",
+  );
+  for (
+    const [name, layout] of [
+      ["Workspace", workspaceLayout],
+      ["Settings", settingsLayout],
+    ] as const
+  ) {
+    assert(
+      layout.includes(
+        "const parentSidebarController = getSidebarController();",
+      ) &&
+        layout.includes("setContext<SidebarController>(SIDEBAR_CONTEXT") &&
+        layout.includes("controller={parentSidebarController}"),
+      `${name} layout should register with its parent and provide the same slot contract to children`,
+    );
+  }
+  assert(
+    !workspaceLayout.includes("WORKSPACE_SIDEBAR_CONTENT_CONTEXT") &&
+      !settingsLayout.includes("WorkspaceSidebarContentOverride"),
+    "recursive slots should not retain Workspace-specific context or override components",
   );
   assert(
-    !layout.includes("<SidebarOverride") && !layout.includes("settings-nav"),
-    "settings layout should not replace the whole sidebar or retain inline navigation",
+    globalSidebar.includes("{@render content()}") &&
+      workspaceSidebar.includes("{@render content()}") &&
+      settingsSidebar.includes("{@render content()}"),
+    "every sidebar layer should render its child through the same content contract",
   );
   assert(
-    workspaceLayout.includes(
-      "registerContent: sidebarContentOverrides.register",
-    ) &&
-      workspaceLayout.includes("content={sidebarContent}"),
-    "workspace layout should provide and project the active child content",
+    workspaceSidebar.includes('aria-label="Workspace shortcuts"') &&
+      workspaceSidebar.indexOf('aria-label="Workspace shortcuts"') <
+        workspaceSidebar.indexOf("{#if content}"),
+    "WorkspaceSidebar should keep its shortcuts above the recursive child slot",
   );
   assert(
-    workspaceSidebar.includes("<WorkspaceSwitcher") &&
-      workspaceSidebar.indexOf("<WorkspaceSwitcher") <
-        workspaceSidebar.indexOf("{#if content}") &&
-      workspaceSidebar.includes("{@render content()}"),
-    "WorkspaceSidebar should retain its header and render child content below it",
+    settingsSidebar.includes("SETTINGS_SECTIONS") &&
+      settingsSidebar.includes('aria-label="Settings sections"'),
+    "SettingsSidebar should render the authoritative settings catalog as its fallback",
   );
   assert(
-    settingsContent.includes("SETTINGS_SECTIONS") &&
-      settingsContent.includes('aria-label="Settings sections"'),
-    "SettingsSidebarContent should render the authoritative settings section catalog",
+    settingsError.includes("This settings page could not be loaded") &&
+      settingsError.includes("Back to Settings"),
+    "settings load failures should stay inside the Settings layout and preserve its sidebar",
   );
 });

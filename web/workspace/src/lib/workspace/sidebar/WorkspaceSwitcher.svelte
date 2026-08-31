@@ -8,9 +8,11 @@
   let {
     currentWorkspaceId,
     currentWorkspaceName,
+    variant = "sidebar",
   }: {
     currentWorkspaceId: string;
     currentWorkspaceName: string;
+    variant?: "sidebar" | "header";
   } = $props();
 
   let workspaces = $state<WorkspaceCatalogRecord[]>([]);
@@ -20,6 +22,7 @@
   let root = $state.raw<HTMLDivElement>();
   let trigger = $state.raw<HTMLButtonElement>();
   let menu = $state.raw<HTMLDivElement>();
+  const menuId = $derived(`workspace-menu-popover-${variant}`);
 
   const menuWorkspaces = $derived.by(() => {
     const entries = workspaces.map((workspace) => ({
@@ -112,14 +115,14 @@
   });
 </script>
 
-<div class="workspace-menu" bind:this={root}>
+<div class="workspace-menu" class:workspace-menu-header={variant === "header"} bind:this={root}>
   <button
     bind:this={trigger}
     type="button"
     class="workspace-menu-trigger"
     aria-haspopup="menu"
     aria-expanded={open}
-    aria-controls="workspace-menu-popover"
+    aria-controls={menuId}
     onclick={toggleMenu}
     onkeydown={handleTriggerKeydown}
   >
@@ -132,7 +135,7 @@
   {#if open}
     <div
       bind:this={menu}
-      id="workspace-menu-popover"
+      id={menuId}
       class="workspace-menu-popover"
       role="menu"
       tabindex="-1"

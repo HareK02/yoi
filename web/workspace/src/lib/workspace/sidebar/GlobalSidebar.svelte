@@ -1,11 +1,13 @@
 <script lang="ts">
+  import type { SidebarSnippet } from './context';
   import './sidebar.css';
 
   type Props = {
     currentPath: string;
+    content?: SidebarSnippet | null;
   };
 
-  const { currentPath }: Props = $props();
+  const { currentPath, content = null }: Props = $props();
 
   const items = [
     { href: '/', label: 'Workspaces' },
@@ -15,20 +17,23 @@
   ];
 </script>
 
-<div class="global-sidebar" aria-label="Global navigation">
-  <div class="global-sidebar-section">
-    <p class="sidebar-section-label">Global</p>
-    <nav class="sidebar-list" aria-label="Global pages">
-      {#each items as item}
-        <a
-          class="sidebar-link"
-          class:active={currentPath === item.href}
-          href={item.href}
-          aria-current={currentPath === item.href ? 'page' : undefined}
-        >
-          <span>{item.label}</span>
-        </a>
-      {/each}
-    </nav>
+{#if content}
+  {@render content()}
+{:else}
+  <div class="global-sidebar" aria-label="Global navigation">
+    <div class="global-sidebar-section">
+      <nav class="sidebar-list" aria-label="Global pages">
+        {#each items as item}
+          <a
+            class="sidebar-link"
+            class:active={currentPath === item.href}
+            href={item.href}
+            aria-current={currentPath === item.href ? 'page' : undefined}
+          >
+            <span>{item.label}</span>
+          </a>
+        {/each}
+      </nav>
+    </div>
   </div>
-</div>
+{/if}

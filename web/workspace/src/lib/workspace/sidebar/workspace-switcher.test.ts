@@ -13,6 +13,15 @@ const switcherSource = await Deno.readTextFile(
 const sidebarSource = await Deno.readTextFile(
   new URL("./WorkspaceSidebar.svelte", import.meta.url),
 );
+const sidebarStyles = await Deno.readTextFile(
+  new URL("./sidebar.css", import.meta.url),
+);
+const headerSource = await Deno.readTextFile(
+  new URL("../header/WorkspaceBreadcrumbs.svelte", import.meta.url),
+);
+const workspaceLayoutSource = await Deno.readTextFile(
+  new URL("../../../routes/w/[workspaceId]/+layout.svelte", import.meta.url),
+);
 
 Deno.test("workspace name opens the settings and workspace menu", () => {
   assert(
@@ -39,6 +48,10 @@ Deno.test("workspace name opens the settings and workspace menu", () => {
     switcherSource.includes("currentWorkspaceName"),
     "trigger does not use the name",
   );
+  assert(
+    switcherSource.includes("workspace-menu-popover-${variant}"),
+    "sidebar and header instances should use distinct menu ids",
+  );
   assert(!switcherSource.includes("<select"), "legacy select switcher remains");
 });
 
@@ -61,14 +74,51 @@ Deno.test("workspace menu lists catalog entries and marks the current workspace"
   );
 });
 
-Deno.test("workspace sidebar uses the workspace name menu as its header", () => {
+Deno.test("workspace header prefixes breadcrumbs with the same Workspace menu", () => {
   assert(
-    sidebarSource.includes("<WorkspaceSwitcher"),
-    "sidebar omits the menu",
+    headerSource.includes("<WorkspaceSwitcher") &&
+      headerSource.includes('variant="header"') &&
+      headerSource.includes("currentWorkspaceName"),
+    "header should render the shared Workspace selector before breadcrumbs",
   );
   assert(
-    sidebarSource.includes("currentWorkspaceName={workspace.display_name}"),
-    "sidebar does not pass the current Workspace name",
+    headerSource.indexOf("<WorkspaceSwitcher") <
+      headerSource.indexOf('<nav class="workspace-breadcrumbs"'),
+    "Workspace selector should precede the breadcrumb trail",
+  );
+  assert(
+    workspaceLayoutSource.includes("workspace={data.workspace ?? null}") &&
+      workspaceLayoutSource.includes(
+        "workspaceError={data.workspaceError ?? null}",
+      ),
+    "Workspace layout should pass the authoritative Workspace name to the header selector",
+  );
+});
+
+Deno.test("WorkspaceSidebar exposes icon-only home and settings shortcuts", () => {
+  assert(
+    sidebarSource.includes('aria-label="Workspace shortcuts"') &&
+      sidebarSource.includes('aria-label="Workspace home"') &&
+      sidebarSource.includes('aria-label="Workspace settings"') &&
+      sidebarSource.includes("workspaceRoute(workspaceId)") &&
+      sidebarSource.includes("workspaceRoute(workspaceId, '/settings')") &&
+      sidebarStyles.includes(".workspace-sidebar-shortcut.active"),
+    "Workspace Sidebar should expose accessible Home and Settings icon links",
+  );
+  assert(
+    !headerSource.includes("workspace-sidebar-shortcut"),
+    "Workspace shortcuts should remain specific to the Sidebar",
+  );
+});
+
+Deno.test("Workspace selector remains in the Header only", () => {
+  assert(
+    !sidebarSource.includes("<WorkspaceSwitcher"),
+    "Workspace Sidebar should not render the Workspace selector",
+  );
+  assert(
+    headerSource.includes("<WorkspaceSwitcher"),
+    "Header should retain the shared Workspace selector",
   );
   assert(
     !sidebarSource.includes('class="sidebar-actions-row"'),
