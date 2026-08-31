@@ -15932,8 +15932,48 @@ mod tests {
                 StatusCode::BAD_REQUEST,
             ),
             (
+                workdir::http::WorkdirTransportErrorCode::Denied,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                workdir::http::WorkdirTransportErrorCode::OutOfScope,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                workdir::http::WorkdirTransportErrorCode::SymlinkOutOfScope,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                workdir::http::WorkdirTransportErrorCode::BrokenSymlink,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                workdir::http::WorkdirTransportErrorCode::SymlinkTargetIsDirectory,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                workdir::http::WorkdirTransportErrorCode::ReadOnly,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                workdir::http::WorkdirTransportErrorCode::IsDirectory,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                workdir::http::WorkdirTransportErrorCode::SymlinkDirectoryNotTraversed,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
                 workdir::http::WorkdirTransportErrorCode::Unavailable,
                 StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                workdir::http::WorkdirTransportErrorCode::Io,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                workdir::http::WorkdirTransportErrorCode::Transport,
+                StatusCode::BAD_GATEWAY,
             ),
             (
                 workdir::http::WorkdirTransportErrorCode::Internal,
@@ -15991,7 +16031,7 @@ mod tests {
     async fn workdir_operation_error_response_redacts_provider_internal_details() {
         let error = workdir::WorkdirError::Io {
             path: PathBuf::from("/host/private/worktree/secret.txt"),
-            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "token=secret"),
+            source: std::io::Error::other("token=secret"),
         };
         let public = current_worker_workdir_operation_error(
             &RuntimeWorkerRef::new("runtime", "worker"),
@@ -16003,10 +16043,14 @@ mod tests {
         assert!(!text.contains("/host/private"));
         assert!(!text.contains("token=secret"));
         let decoded: WorkdirTransportError = serde_json::from_str(&text).unwrap();
-        assert_eq!(
-            decoded.code,
-            workdir::http::WorkdirTransportErrorCode::Internal
+        assert_eq!(decoded.code, workdir::http::WorkdirTransportErrorCode::Io);
+
+        let remote = current_worker_workdir_operation_error(
+            &RuntimeWorkerRef::new("runtime", "worker"),
+            workdir::WorkdirError::OperationFailed,
         );
+        let response = WorkdirOperationApiError::Provider(remote).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

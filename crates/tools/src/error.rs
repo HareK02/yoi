@@ -42,6 +42,7 @@ impl From<ToolsError> for ToolError {
                 workdir::WorkdirError::NotFound(_)
                 | workdir::WorkdirError::Io { .. }
                 | workdir::WorkdirError::Unavailable(_)
+                | workdir::WorkdirError::OperationFailed
                 | workdir::WorkdirError::Transport(_),
             ) => ToolError::ExecutionFailed(err.to_string()),
             ToolsError::FileSystem(_)

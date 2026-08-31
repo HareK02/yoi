@@ -234,6 +234,9 @@ pub enum WorkdirError {
     #[error("Workdir session is unavailable: {0}")]
     Unavailable(String),
 
+    #[error("Workdir operation failed")]
+    OperationFailed,
+
     #[error("Workdir transport failed: {0}")]
     Transport(String),
 

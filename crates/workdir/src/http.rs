@@ -102,8 +102,18 @@ pub enum WorkdirTransportErrorCode {
     Conflict,
     Unsupported,
     InvalidRequest,
+    Denied,
+    OutOfScope,
+    SymlinkOutOfScope,
+    BrokenSymlink,
+    SymlinkTargetIsDirectory,
+    ReadOnly,
+    IsDirectory,
+    SymlinkDirectoryNotTraversed,
     UnknownCommand,
     Unavailable,
+    Io,
+    Transport,
     Internal,
 }
 
@@ -114,8 +124,18 @@ impl WorkdirTransportErrorCode {
             Self::Conflict => "conflict",
             Self::Unsupported => "unsupported",
             Self::InvalidRequest => "invalid_request",
+            Self::Denied => "denied",
+            Self::OutOfScope => "out_of_scope",
+            Self::SymlinkOutOfScope => "symlink_out_of_scope",
+            Self::BrokenSymlink => "broken_symlink",
+            Self::SymlinkTargetIsDirectory => "symlink_target_is_directory",
+            Self::ReadOnly => "read_only",
+            Self::IsDirectory => "is_directory",
+            Self::SymlinkDirectoryNotTraversed => "symlink_directory_not_traversed",
             Self::UnknownCommand => "unknown_command",
             Self::Unavailable => "unavailable",
+            Self::Io => "io",
+            Self::Transport => "transport",
             Self::Internal => "internal",
         }
     }
@@ -125,9 +145,16 @@ impl WorkdirTransportErrorCode {
         match self {
             Self::NotFound | Self::UnknownCommand => 404,
             Self::Conflict => 409,
-            Self::Unsupported | Self::InvalidRequest => 400,
+            Self::Denied | Self::OutOfScope | Self::SymlinkOutOfScope | Self::ReadOnly => 403,
+            Self::Unsupported
+            | Self::InvalidRequest
+            | Self::BrokenSymlink
+            | Self::SymlinkTargetIsDirectory
+            | Self::IsDirectory
+            | Self::SymlinkDirectoryNotTraversed => 400,
             Self::Unavailable => 503,
-            Self::Internal => 500,
+            Self::Io | Self::Internal => 500,
+            Self::Transport => 502,
         }
     }
 }
@@ -160,8 +187,41 @@ impl WorkdirTransportError {
             WorkdirError::Unavailable(_) | WorkdirError::SessionClosed => {
                 (Code::Unavailable, "Workdir session is unavailable")
             }
-            WorkdirError::Denied(_) => (Code::InvalidRequest, "Workdir operation was denied"),
-            WorkdirError::Transport(_) => (Code::Internal, "Workdir transport failed"),
+            WorkdirError::Denied(_) => (Code::Denied, "Workdir operation was denied"),
+            WorkdirError::OutOfScope(_) => (Code::OutOfScope, "Workdir path is out of scope"),
+            WorkdirError::SymlinkOutOfScope { .. } => (
+                Code::SymlinkOutOfScope,
+                "Workdir symlink target is out of scope",
+            ),
+            WorkdirError::BrokenSymlink { .. } => {
+                (Code::BrokenSymlink, "Workdir symlink target does not exist")
+            }
+            WorkdirError::SymlinkTargetIsDirectory { .. } => (
+                Code::SymlinkTargetIsDirectory,
+                "Workdir symlink target is a directory",
+            ),
+            WorkdirError::ReadOnly(_) => (Code::ReadOnly, "Workdir path is read-only"),
+            WorkdirError::IsDirectory(_) => (Code::IsDirectory, "Workdir path is a directory"),
+            WorkdirError::SymlinkDirectoryNotTraversed { .. } => (
+                Code::SymlinkDirectoryNotTraversed,
+                "Workdir symlink directory was not traversed",
+            ),
+            WorkdirError::Io { source, .. } => match source.kind() {
+                std::io::ErrorKind::NotFound => (Code::NotFound, "Workdir path was not found"),
+                std::io::ErrorKind::PermissionDenied => {
+                    (Code::Denied, "Workdir operation was denied")
+                }
+                std::io::ErrorKind::AlreadyExists => {
+                    (Code::Conflict, "Workdir resource already exists")
+                }
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => {
+                    (Code::InvalidRequest, "Workdir operation request is invalid")
+                }
+                std::io::ErrorKind::TimedOut => (Code::Unavailable, "Workdir operation timed out"),
+                _ => (Code::Io, "Workdir I/O operation failed"),
+            },
+            WorkdirError::OperationFailed => (Code::Internal, "Workdir operation failed"),
+            WorkdirError::Transport(_) => (Code::Transport, "Workdir transport failed"),
             WorkdirError::InvalidPath(_)
             | WorkdirError::RelativePath(_)
             | WorkdirError::InvalidGlob(_)
@@ -169,14 +229,6 @@ impl WorkdirTransportError {
             | WorkdirError::InvalidArgument(_) => {
                 (Code::InvalidRequest, "Workdir operation request is invalid")
             }
-            WorkdirError::OutOfScope(_)
-            | WorkdirError::SymlinkOutOfScope { .. }
-            | WorkdirError::BrokenSymlink { .. }
-            | WorkdirError::SymlinkTargetIsDirectory { .. }
-            | WorkdirError::ReadOnly(_)
-            | WorkdirError::IsDirectory(_)
-            | WorkdirError::SymlinkDirectoryNotTraversed { .. }
-            | WorkdirError::Io { .. } => (Code::Internal, "Workdir operation failed"),
         };
         Self {
             code,
@@ -190,10 +242,38 @@ impl WorkdirTransportError {
             Code::NotFound => WorkdirError::NotFound("<remote>".into()),
             Code::Conflict => WorkdirError::Conflict(self.message),
             Code::Unsupported => WorkdirError::UnsupportedOperation(self.message),
-            Code::UnknownCommand => WorkdirError::UnknownCommand("<remote>".to_string()),
             Code::InvalidRequest => WorkdirError::InvalidArgument(self.message),
+            Code::Denied => WorkdirError::Denied(self.message),
+            Code::OutOfScope => WorkdirError::OutOfScope("<remote>".into()),
+            Code::SymlinkOutOfScope => WorkdirError::SymlinkOutOfScope {
+                path: "<remote>".into(),
+                target: "<remote-target>".into(),
+                required_permission: "requested",
+            },
+            Code::BrokenSymlink => WorkdirError::BrokenSymlink {
+                path: "<remote>".into(),
+                link: "<remote-link>".into(),
+                target: "<remote-target>".into(),
+            },
+            Code::SymlinkTargetIsDirectory => WorkdirError::SymlinkTargetIsDirectory {
+                path: "<remote>".into(),
+                target: "<remote-target>".into(),
+            },
+            Code::ReadOnly => WorkdirError::ReadOnly("<remote>".into()),
+            Code::IsDirectory => WorkdirError::IsDirectory("<remote>".into()),
+            Code::SymlinkDirectoryNotTraversed => WorkdirError::SymlinkDirectoryNotTraversed {
+                tool: "remote operation",
+                path: "<remote>".into(),
+                target: "<remote-target>".into(),
+            },
+            Code::UnknownCommand => WorkdirError::UnknownCommand("<remote>".to_string()),
             Code::Unavailable => WorkdirError::Unavailable(self.message),
-            Code::Internal => WorkdirError::Transport(self.message),
+            Code::Io => WorkdirError::Io {
+                path: "<remote>".into(),
+                source: std::io::Error::other(self.message),
+            },
+            Code::Transport => WorkdirError::Transport(self.message),
+            Code::Internal => WorkdirError::OperationFailed,
         }
     }
 }
@@ -584,8 +664,42 @@ mod tests {
                 "modified externally",
             ),
             (WorkdirTransportErrorCode::Unsupported, 400, "unsupported"),
+            (WorkdirTransportErrorCode::Denied, 403, "denied"),
+            (
+                WorkdirTransportErrorCode::OutOfScope,
+                403,
+                "outside allowed scope",
+            ),
+            (
+                WorkdirTransportErrorCode::SymlinkOutOfScope,
+                403,
+                "outside allowed requested scope",
+            ),
+            (
+                WorkdirTransportErrorCode::BrokenSymlink,
+                400,
+                "broken symlink",
+            ),
+            (
+                WorkdirTransportErrorCode::SymlinkTargetIsDirectory,
+                400,
+                "symlink to a directory",
+            ),
+            (WorkdirTransportErrorCode::ReadOnly, 403, "read-only"),
+            (WorkdirTransportErrorCode::IsDirectory, 400, "expected file"),
+            (
+                WorkdirTransportErrorCode::SymlinkDirectoryNotTraversed,
+                400,
+                "does not follow symlink directories",
+            ),
             (WorkdirTransportErrorCode::Unavailable, 503, "unavailable"),
-            (WorkdirTransportErrorCode::Internal, 500, "transport failed"),
+            (WorkdirTransportErrorCode::Io, 500, "I/O error"),
+            (
+                WorkdirTransportErrorCode::Transport,
+                502,
+                "transport failed",
+            ),
+            (WorkdirTransportErrorCode::Internal, 500, "operation failed"),
         ] {
             let transport = WorkdirTransportError {
                 code,
@@ -620,7 +734,8 @@ mod tests {
         let transport = WorkdirTransportError::from_workdir_error(&WorkdirError::Transport(
             "Workspace API request timed out".to_string(),
         ));
-        assert_eq!(transport.code, WorkdirTransportErrorCode::Internal);
+        assert_eq!(transport.code, WorkdirTransportErrorCode::Transport);
+        assert_eq!(transport.code.http_status(), 502);
         assert_eq!(transport.message, "Workdir transport failed");
         assert!(matches!(
             transport.into_workdir_error(),
@@ -635,8 +750,25 @@ mod tests {
             source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "host detail"),
         };
         let transport = WorkdirTransportError::from_workdir_error(&error);
-        assert_eq!(transport.code, WorkdirTransportErrorCode::Internal);
+        assert_eq!(transport.code, WorkdirTransportErrorCode::Denied);
         assert!(!transport.message.contains("/secret"));
         assert!(!transport.message.contains("host detail"));
+        assert!(matches!(
+            transport.into_workdir_error(),
+            WorkdirError::Denied(_)
+        ));
+
+        let error = WorkdirError::Io {
+            path: "/secret/runtime/root/file".into(),
+            source: std::io::Error::other("host detail"),
+        };
+        let transport = WorkdirTransportError::from_workdir_error(&error);
+        assert_eq!(transport.code, WorkdirTransportErrorCode::Io);
+        assert!(!transport.message.contains("/secret"));
+        assert!(!transport.message.contains("host detail"));
+        assert!(matches!(
+            transport.into_workdir_error(),
+            WorkdirError::Io { .. }
+        ));
     }
 }
