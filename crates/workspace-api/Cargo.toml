@@ -16,3 +16,7 @@ workdir.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+
+[[example]]
+name = "generate_repository_access_types"
+required-features = ["typescript"]

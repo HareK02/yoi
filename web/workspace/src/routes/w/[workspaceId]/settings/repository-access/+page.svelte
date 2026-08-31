@@ -1,11 +1,24 @@
 <script lang="ts">
   import { untrack } from 'svelte';
+  import type {
+    CreateRepositorySshCredentialRequest,
+    DeleteRepositorySshCredentialRequest,
+    DeleteRepositorySshHostTrustRequest,
+    PutRepositorySshHostTrustRequest,
+    RepositorySshCredential,
+    RepositorySshHostTrust,
+    RotateRepositorySshCredentialRequest,
+  } from '$lib/generated/repository-access-api';
+  import {
+    parseRepositorySshCredential,
+    parseRepositorySshHostTrust,
+  } from '$lib/workspace/api/repository-access';
   import type { PageProps } from './$types';
-  import type { RepositorySshCredential, RepositorySshHostTrust } from './+page';
 
   let { data }: PageProps = $props();
   let credentials = $state<RepositorySshCredential[]>(untrack(() => data.credentials));
   let hostTrusts = $state<RepositorySshHostTrust[]>(untrack(() => data.hostTrusts));
+  const accessProjection = untrack(() => data.accessProjection);
   let message = $state<string | null>(null);
   let pending = $state(false);
 
@@ -29,37 +42,52 @@
     return `${prefix}-${crypto.randomUUID()}`;
   }
 
-  async function request<T>(path: string, method: string, body: unknown): Promise<T> {
+  function request<T>(
+    path: string,
+    method: string,
+    body: unknown,
+    parse: (value: unknown) => T
+  ): Promise<T>;
+  function request(path: string, method: string, body: unknown, parse: null): Promise<void>;
+  async function request<T>(
+    path: string,
+    method: string,
+    body: unknown,
+    parse: ((value: unknown) => T) | null
+  ): Promise<T | undefined> {
     const response = await fetch(`${base}${path}`, {
       method,
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body)
     });
     if (!response.ok) {
-      let detail = `request failed (${response.status})`;
-      try {
-        const payload = (await response.json()) as { error?: string; message?: string };
-        detail = payload.message ?? payload.error ?? detail;
-      } catch {
-        // Do not surface submitted secret values from response bodies.
-      }
-      throw new Error(detail);
+      throw new Error(`Repository Access request failed with status ${response.status}.`);
     }
-    if (response.status === 204) return undefined as T;
-    return (await response.json()) as T;
+    if (response.status === 204) return undefined;
+    const payload: unknown = await response.json();
+    if (parse === null) {
+      throw new Error('Repository Access returned an unexpected response body.');
+    }
+    return parse(payload);
   }
 
   async function createCredential() {
     pending = true;
     message = null;
     try {
-      const created = await request<RepositorySshCredential>('/credentials', 'POST', {
+      const body: CreateRepositorySshCredentialRequest = {
         operation_id: operationId('credential-create'),
         credential_id: credentialId,
         name: credentialName,
         private_key: privateKey,
         passphrase: passphrase || null
-      });
+      };
+      const created = await request<RepositorySshCredential>(
+        '/credentials',
+        'POST',
+        body,
+        parseRepositorySshCredential
+      );
       credentials = [...credentials, created].sort((a, b) => a.credential_id.localeCompare(b.credential_id));
       credentialId = '';
       credentialName = '';
@@ -77,15 +105,17 @@
     pending = true;
     message = null;
     try {
+      const body: RotateRepositorySshCredentialRequest = {
+        operation_id: operationId('credential-rotate'),
+        expected_revision: credential.current_revision,
+        private_key: rotatePrivateKey,
+        passphrase: rotatePassphrase || null
+      };
       const rotated = await request<RepositorySshCredential>(
         `/credentials/${encodeURIComponent(credential.credential_id)}/rotate`,
         'POST',
-        {
-          operation_id: operationId('credential-rotate'),
-          expected_revision: credential.current_revision,
-          private_key: rotatePrivateKey,
-          passphrase: rotatePassphrase || null
-        }
+        body,
+        parseRepositorySshCredential
       );
       credentials = credentials.map((entry) => entry.credential_id === rotated.credential_id ? rotated : entry);
       rotateCredentialId = null;
@@ -104,10 +134,16 @@
     pending = true;
     message = null;
     try {
-      await request(`/credentials/${encodeURIComponent(credential.credential_id)}`, 'DELETE', {
+      const body: DeleteRepositorySshCredentialRequest = {
         operation_id: operationId('credential-delete'),
         expected_revision: credential.current_revision
-      });
+      };
+      await request(
+        `/credentials/${encodeURIComponent(credential.credential_id)}`,
+        'DELETE',
+        body,
+        null
+      );
       credentials = credentials.filter((entry) => entry.credential_id !== credential.credential_id);
       message = `Credential ${credential.credential_id} deleted.`;
     } catch (error) {
@@ -121,14 +157,20 @@
     pending = true;
     message = null;
     try {
-      const created = await request<RepositorySshHostTrust>('/host-trusts', 'POST', {
+      const body: PutRepositorySshHostTrustRequest = {
         operation_id: operationId('host-trust-create'),
         host_trust_id: hostTrustId,
         hostname,
         port,
         host_key: hostKey,
         expected_revision: hostExpectedRevision
-      });
+      };
+      const created = await request<RepositorySshHostTrust>(
+        '/host-trusts',
+        'POST',
+        body,
+        parseRepositorySshHostTrust
+      );
       hostTrusts = hostExpectedRevision === null
         ? [...hostTrusts, created].sort((a, b) => a.host_trust_id.localeCompare(b.host_trust_id))
         : hostTrusts.map((entry) => entry.host_trust_id === created.host_trust_id ? created : entry);
@@ -158,10 +200,16 @@
     pending = true;
     message = null;
     try {
-      await request(`/host-trusts/${encodeURIComponent(hostTrust.host_trust_id)}`, 'DELETE', {
+      const body: DeleteRepositorySshHostTrustRequest = {
         operation_id: operationId('host-trust-delete'),
         expected_revision: hostTrust.current_revision
-      });
+      };
+      await request(
+        `/host-trusts/${encodeURIComponent(hostTrust.host_trust_id)}`,
+        'DELETE',
+        body,
+        null
+      );
       hostTrusts = hostTrusts.filter((entry) => entry.host_trust_id !== hostTrust.host_trust_id);
       message = `Host trust ${hostTrust.host_trust_id} deleted.`;
     } catch (error) {
@@ -181,6 +229,18 @@
   </header>
   <p>Manage Workspace-scoped SSH credentials and pinned host keys. Private keys and passphrases are write-only and never returned by this page.</p>
   {#if message}<p class="status-message">{message}</p>{/if}
+
+  <div class="settings-runtime-list">
+    <h3>Active access projection</h3>
+    <p>Config revision {accessProjection.config_revision} · <code>{accessProjection.projection_digest}</code></p>
+    {#if accessProjection.bindings.length === 0}<p>No repository access bindings are active.</p>{/if}
+    {#each accessProjection.bindings as binding (binding.repository_id)}
+      <div class="card">
+        <strong>{binding.repository_id}</strong>
+        <p>{binding.access} · credential <code>{binding.credential_id}</code> · host trust <code>{binding.host_trust_id}</code></p>
+      </div>
+    {/each}
+  </div>
 
   <div class="settings-runtime-list">
     <h3>SSH credentials</h3>

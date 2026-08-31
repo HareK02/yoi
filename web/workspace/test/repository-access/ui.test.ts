@@ -13,6 +13,58 @@ const source = await Deno.readTextFile(
     import.meta.url,
   ),
 );
+const loaderSource = await Deno.readTextFile(
+  new URL(
+    "../../src/routes/w/[workspaceId]/settings/repository-access/+page.ts",
+    import.meta.url,
+  ),
+);
+
+test("Repository Access Web code consumes workspace-api generated DTOs", () => {
+  assert(
+    source.includes("$lib/generated/repository-access-api"),
+    "mutation code should import generated request and response contracts",
+  );
+  assert(
+    loaderSource.includes("parseRepositorySshCredentials") &&
+      loaderSource.includes("parseRepositorySshHostTrusts") &&
+      loaderSource.includes("parseRepositoryAccessProjection"),
+    "loader should validate unknown JSON before exposing generated DTOs to Svelte",
+  );
+  assert(
+    loaderSource.indexOf('"/settings/repository-access"') <
+      loaderSource.indexOf("Promise.all"),
+    "loader should check Repository Access permission before starting list preloads",
+  );
+  for (
+    const duplicate of [
+      "interface RepositorySshCredential",
+      "interface RepositorySshHostTrust",
+      "interface RepositoryAccessProjection",
+    ]
+  ) {
+    assert(
+      !loaderSource.includes(duplicate) && !source.includes(duplicate),
+      `Web code must not redeclare ${duplicate}`,
+    );
+  }
+});
+
+test("Repository Access renders the shared access projection fields", () => {
+  for (
+    const field of [
+      "accessProjection.config_revision",
+      "accessProjection.projection_digest",
+      "accessProjection.bindings",
+      "binding.repository_id",
+      "binding.credential_id",
+      "binding.host_trust_id",
+      "binding.access",
+    ]
+  ) {
+    assert(source.includes(field), `missing access projection field ${field}`);
+  }
+});
 
 test("Repository credential submissions clear write-only fields in finally blocks", () => {
   const createStart = source.indexOf("async function createCredential()");

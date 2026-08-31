@@ -431,6 +431,7 @@ pub struct UpdateWorkspaceMemorySettingsRequest {
 ///
 /// Secret references and secret material are deliberately not part of this DTO.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositorySshCredential {
     pub credential_id: String,
@@ -438,6 +439,7 @@ pub struct RepositorySshCredential {
     pub name: String,
     pub public_key_algorithm: String,
     pub public_key_fingerprint: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
     pub current_revision: u64,
     pub status: String,
     pub created_at: String,
@@ -447,6 +449,7 @@ pub struct RepositorySshCredential {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct CreateRepositorySshCredentialRequest {
     pub operation_id: String,
@@ -458,9 +461,11 @@ pub struct CreateRepositorySshCredentialRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RotateRepositorySshCredentialRequest {
     pub operation_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
     pub expected_revision: u64,
     pub private_key: String,
     #[serde(default)]
@@ -468,14 +473,17 @@ pub struct RotateRepositorySshCredentialRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct DeleteRepositorySshCredentialRequest {
     pub operation_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
     pub expected_revision: u64,
 }
 
 /// Public metadata for an explicitly pinned SSH host key.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositorySshHostTrust {
     pub host_trust_id: String,
@@ -485,6 +493,7 @@ pub struct RepositorySshHostTrust {
     pub key_algorithm: String,
     pub host_key: String,
     pub fingerprint: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
     pub current_revision: u64,
     pub created_at: String,
     pub updated_at: String,
@@ -493,6 +502,7 @@ pub struct RepositorySshHostTrust {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct PutRepositorySshHostTrustRequest {
     pub operation_id: String,
@@ -501,17 +511,22 @@ pub struct PutRepositorySshHostTrustRequest {
     pub port: u16,
     pub host_key: String,
     #[serde(default)]
+    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
     pub expected_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct DeleteRepositorySshHostTrustRequest {
     pub operation_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
     pub expected_revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(rename_all = "snake_case"))]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryAccessMode {
     ReadOnly,
@@ -519,6 +534,7 @@ pub enum RepositoryAccessMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositorySshAccessBinding {
     pub repository_id: String,
@@ -529,12 +545,41 @@ pub struct RepositorySshAccessBinding {
 
 /// Secret-free active Repository access projection consumed by later Runtime work.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryAccessProjection {
     pub workspace_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
     pub config_revision: u64,
     pub projection_digest: String,
     pub bindings: Vec<RepositorySshAccessBinding>,
+}
+
+#[cfg(feature = "typescript")]
+pub fn repository_access_api_typescript() -> String {
+    use ts_rs::TS;
+
+    let config = ts_rs::Config::default();
+    let declarations = [
+        RepositorySshCredential::decl(&config),
+        CreateRepositorySshCredentialRequest::decl(&config),
+        RotateRepositorySshCredentialRequest::decl(&config),
+        DeleteRepositorySshCredentialRequest::decl(&config),
+        RepositorySshHostTrust::decl(&config),
+        PutRepositorySshHostTrustRequest::decl(&config),
+        DeleteRepositorySshHostTrustRequest::decl(&config),
+        RepositoryAccessMode::decl(&config),
+        RepositorySshAccessBinding::decl(&config),
+        RepositoryAccessProjection::decl(&config),
+    ];
+    format!(
+        "// Generated from workspace-api. Do not edit by hand.\n// Regenerate: cargo run -q -p workspace-api --features typescript --example generate_repository_access_types > web/workspace/src/lib/generated/repository-access-api.ts\n\n{}\n",
+        declarations
+            .into_iter()
+            .map(|declaration| format!("export {declaration}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    )
 }
 
 #[cfg(test)]
@@ -559,5 +604,52 @@ mod tests {
         });
 
         assert!(serde_json::from_value::<WorkerSummary>(payload).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "typescript"))]
+mod typescript_tests {
+    #[test]
+    fn generated_repository_access_contract_is_current() {
+        let expected = super::repository_access_api_typescript();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/workspace/src/lib/generated/repository-access-api.ts");
+        let actual = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        assert_eq!(
+            normalize(&actual),
+            normalize(&expected),
+            "regenerate Repository Access TypeScript types with `cargo run -q -p workspace-api --features typescript --example generate_repository_access_types > web/workspace/src/lib/generated/repository-access-api.ts` and format the generated file",
+        );
+    }
+
+    #[test]
+    fn generated_repository_access_responses_remain_secret_free() {
+        use ts_rs::TS;
+
+        let config = ts_rs::Config::default();
+        for declaration in [
+            super::RepositorySshCredential::decl(&config),
+            super::RepositorySshHostTrust::decl(&config),
+            super::RepositoryAccessProjection::decl(&config),
+        ] {
+            for forbidden in ["private_key", "passphrase", "secret_ref"] {
+                assert!(
+                    !declaration.contains(forbidden),
+                    "Repository Access response declaration must not expose `{forbidden}`"
+                );
+            }
+        }
+    }
+
+    fn normalize(value: &str) -> String {
+        value
+            .chars()
+            .filter_map(|character| match character {
+                character if character.is_whitespace() => None,
+                ',' => Some(';'),
+                character => Some(character),
+            })
+            .collect()
     }
 }
