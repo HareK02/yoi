@@ -38,5 +38,10 @@ pub use target::{
     WorkerConnection, WorkerConnectionSelector, WorkerList, WorkerListRequest, WorkerSpawn,
 };
 pub use worker_client::WorkerClient;
-pub use workspace_api::{ObjectiveDetail, ObjectiveSummary};
+pub use workspace_api::{
+    CompanionCancelRequest, CompanionLifecycleState, CompanionMessageDisposition,
+    CompanionMessageRequest, CompanionMessageResponse, CompanionStatusResponse,
+    CompanionTranscriptItem, CompanionTranscriptProjection, CompanionTranscriptRole,
+    CompanionTransportSummary, ObjectiveDetail, ObjectiveSummary,
+};
 pub use workspace_product::BackendWorkspaceProductClient;
