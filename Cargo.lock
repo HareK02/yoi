@@ -6683,6 +6683,7 @@ dependencies = [
  "serde",
  "serde_json",
  "ts-rs",
+ "url",
 ]
 
 [[package]]

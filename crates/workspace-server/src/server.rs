@@ -11085,33 +11085,43 @@ async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<Worksp
 }
 
 fn companion_console_extension_point(status: &CompanionStatusResponse) -> ExtensionPointState {
-    let completion = status.transport.completion.clone();
-    let note = match completion.as_str() {
-        "connected" => "Workspace Companion is input-capable and browser input is dispatched through the normal Worker runtime path.".to_string(),
-        "not_input_capable" => {
-            let diagnostic_codes = status
-                .diagnostics
-                .iter()
-                .map(|diagnostic| diagnostic.code.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            if diagnostic_codes.is_empty() {
-                "Workspace Companion is not input-capable; check provider, config, profile, secret, and authority diagnostics.".to_string()
-            } else {
-                format!(
-                    "Workspace Companion is not input-capable; check typed diagnostics: {diagnostic_codes}."
-                )
-            }
-        }
-        "disabled" => "Workspace Companion auto-start has been removed; create an explicit Worker instead.".to_string(),
-        other => format!(
-            "Workspace Companion transport reports {other}; browser input follows the Companion Worker runtime capability state."
-        ),
+    let extension_status = match status.state {
+        workspace_api::CompanionLifecycleState::Idle => "idle",
+        workspace_api::CompanionLifecycleState::Running => "running",
+        workspace_api::CompanionLifecycleState::Stopped => "stopped",
+    }
+    .to_string();
+    let diagnostic_codes = status
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.code.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let note = if status.transport.available {
+        "Workspace Companion is input-capable and browser input is dispatched through the normal Worker runtime path."
+            .to_string()
+    } else if diagnostic_codes.is_empty() {
+        "Workspace Companion is unavailable; create or select an explicit Worker instead."
+            .to_string()
+    } else {
+        format!("Workspace Companion is unavailable; check typed diagnostics: {diagnostic_codes}.")
     };
     ExtensionPointState {
-        status: completion,
+        status: extension_status,
         note,
-        diagnostics: status.diagnostics.clone(),
+        diagnostics: status
+            .diagnostics
+            .iter()
+            .map(|diagnostic| RuntimeDiagnostic {
+                code: diagnostic.code.clone(),
+                severity: match diagnostic.severity {
+                    workspace_api::DiagnosticSeverity::Info => DiagnosticSeverity::Info,
+                    workspace_api::DiagnosticSeverity::Warning => DiagnosticSeverity::Warning,
+                    workspace_api::DiagnosticSeverity::Error => DiagnosticSeverity::Error,
+                },
+                message: diagnostic.message.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -24209,10 +24219,10 @@ mod tests {
         );
 
         let companion_status = get_json(app.clone(), "/api/companion/status").await;
-        assert_eq!(companion_status["state"], "disabled");
+        assert_eq!(companion_status["state"], "stopped");
         assert!(companion_status["worker"].is_null());
-        assert_eq!(companion_status["transport"]["kind"], "none");
-        assert_eq!(companion_status["transport"]["completion"], "disabled");
+        assert_eq!(companion_status["transport"]["mode"], "disabled");
+        assert_eq!(companion_status["transport"]["available"], false);
         assert!(!companion_status.to_string().contains("/workspace/demo"));
 
         let companion_message = post_json(
@@ -24222,16 +24232,26 @@ mod tests {
         )
         .await;
         assert_eq!(companion_message["state"], "rejected");
-        assert_eq!(
-            companion_message["diagnostics"][0]["code"],
-            "companion_disabled"
-        );
-        assert!(companion_message["user_item"].is_null());
-        assert!(companion_message["assistant_item"].is_null());
+        assert!(companion_message.get("accepted").is_none());
+        assert!(companion_message.get("diagnostics").is_none());
+        assert!(companion_message.get("user_item").is_none());
+        assert!(companion_message.get("assistant_item").is_none());
         assert!(!companion_message.to_string().contains("/workspace/demo"));
 
         let companion_transcript = get_json(app.clone(), "/api/companion/transcript").await;
-        assert_eq!(companion_transcript["total_items"], 0);
+        assert_eq!(companion_transcript["total"], 0);
+        let empty_window = get_json(app.clone(), "/api/companion/transcript?start=0&limit=0").await;
+        assert_eq!(
+            empty_window,
+            json!({
+                "state": "stopped",
+                "start": 0,
+                "limit": 0,
+                "total": 0,
+                "next": null,
+                "items": [],
+            })
+        );
 
         let host_workers = get_json(app.clone(), &format!("/api/hosts/{host_id}/workers")).await;
         assert!(
@@ -24336,7 +24356,7 @@ mod tests {
 
         let workspace = get_json(app.clone(), "/api/workspace").await;
         let workspace_companion = &workspace["extension_points"]["companion_console"];
-        assert_eq!(workspace_companion["status"], "disabled");
+        assert_eq!(workspace_companion["status"], "stopped");
         assert_eq!(
             workspace_companion["diagnostics"][0]["code"],
             "companion_disabled"
@@ -24345,12 +24365,13 @@ mod tests {
             workspace_companion["note"]
                 .as_str()
                 .unwrap()
-                .contains("auto-start has been removed")
+                .contains("typed diagnostics")
         );
 
         let status = get_json(app.clone(), "/api/companion/status").await;
-        assert_eq!(status["state"], "disabled");
-        assert_eq!(status["transport"]["completion"], "disabled");
+        assert_eq!(status["state"], "stopped");
+        assert_eq!(status["transport"]["mode"], "disabled");
+        assert_eq!(status["transport"]["available"], false);
         assert!(status["worker"].is_null());
 
         let response = post_json(
@@ -24360,13 +24381,14 @@ mod tests {
         )
         .await;
         assert_eq!(response["state"], "rejected");
-        assert_eq!(response["diagnostics"][0]["code"], "companion_disabled");
-        assert!(response["user_item"].is_null());
-        assert!(response["assistant_item"].is_null());
+        assert!(response.get("accepted").is_none());
+        assert!(response.get("diagnostics").is_none());
+        assert!(response.get("user_item").is_none());
+        assert!(response.get("assistant_item").is_none());
 
         let transcript = get_json(app.clone(), "/api/companion/transcript").await;
-        assert_eq!(transcript["state"], "disabled");
-        assert_eq!(transcript["total_items"], 0);
+        assert_eq!(transcript["state"], "stopped");
+        assert_eq!(transcript["total"], 0);
 
         let workers = get_json(app, "/api/workers").await;
         assert!(
