@@ -1,10 +1,28 @@
 import type {
+  WorkingDirectoryCreateRequest,
+  WorkingDirectoryCreateResponse,
+  WorkingDirectoryDetailResponse,
+  WorkingDirectoryListResponse,
+  WorkingDirectoryOccupancy,
+  WorkingDirectorySummary,
+} from "$lib/generated/workdir-api";
+import type {
   Event as PodProtocolEvent,
   Method as PodProtocolMethod,
   Segment as PodProtocolSegment,
 } from "$lib/generated/protocol";
 
-export type { PodProtocolEvent, PodProtocolMethod, PodProtocolSegment };
+export type {
+  PodProtocolEvent,
+  PodProtocolMethod,
+  PodProtocolSegment,
+  WorkingDirectoryCreateRequest,
+  WorkingDirectoryCreateResponse,
+  WorkingDirectoryDetailResponse,
+  WorkingDirectoryListResponse,
+  WorkingDirectoryOccupancy,
+  WorkingDirectorySummary,
+};
 
 export type ExtensionPoint = {
   status: string;
@@ -111,44 +129,6 @@ export type WorkingDirectoryRepositoryOption = {
   default_selector?: string | null;
 };
 
-export type WorkingDirectoryOccupancy = {
-  runtime_id: string;
-  worker_id: string;
-  display_name: string;
-  linked_at: string;
-};
-
-export type WorkingDirectorySummary = {
-  working_directory_id: string;
-  repository_id: string;
-  creation_selector?: string | null;
-  creation_ref?: string | null;
-  current_selector?: string | null;
-  current_ref?: string | null;
-  materializer_kind: string;
-  status: string;
-  cleanliness?: string | null;
-  primary_worker_id?: string | null;
-  occupied_by?: WorkingDirectoryOccupancy | null;
-  cleanup_target: {
-    kind: string;
-    working_directory_id: string;
-    repository_id: string;
-  };
-};
-
-export type BrowserWorkingDirectoryCreateResponse = {
-  workspace_id: string;
-  item: WorkingDirectorySummary;
-  diagnostics: Diagnostic[];
-};
-
-export type BrowserWorkingDirectoryListResponse = {
-  workspace_id: string;
-  items: WorkingDirectorySummary[];
-  diagnostics: Diagnostic[];
-};
-
 export type CleanupTargetKind =
   | "worker_delete"
   | "workdir_clean_cleanup"
@@ -215,12 +195,6 @@ export type RuntimeCleanupExecutionResponse = {
 export type BrowserWorkerWorkingDirectorySelection = {
   working_directory_id: string;
   relative_cwd?: string | null;
-};
-
-export type BrowserWorkingDirectoryCreateRequest = {
-  runtime_id: string;
-  repository_id: string;
-  selector?: string | null;
 };
 
 export type WorkerLaunchOptionsResponse = {
