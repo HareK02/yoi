@@ -132,6 +132,18 @@ pub enum WorkingDirectoryStatusKind {
     Unknown,
 }
 
+impl std::fmt::Display for WorkingDirectoryStatusKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Active => "active",
+            Self::CleanupPending => "cleanup_pending",
+            Self::Corrupted => "corrupted",
+            Self::NotFound => "not_found",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
