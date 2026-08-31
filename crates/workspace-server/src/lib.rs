@@ -117,6 +117,8 @@ pub enum Error {
     WorkspacePermissionDenied(String),
     #[error("Workspace config update conflict: {0}")]
     WorkspaceConfigConflict(String),
+    #[error("Repository conflict: {0}")]
+    RepositoryConflict(String),
     #[error("Registry inconsistency: {0}")]
     RegistryInconsistency(String),
     #[error("Worker source identity is invalid: {0}")]

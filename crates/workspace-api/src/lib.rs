@@ -62,6 +62,27 @@ pub struct RepositorySource {
     pub uri: String,
 }
 
+/// Browser/user intent for registering one Repository in a Workspace.
+///
+/// The Server parses and canonicalizes `source`; callers cannot assert a
+/// transport classification or supply credential material through this DTO.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CreateWorkspaceRepositoryRequest {
+    pub repository_id: String,
+    pub display_name: String,
+    pub source: String,
+    #[serde(default)]
+    pub default_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateWorkspaceRepositoryResponse {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub replayed: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryObservedStatus {

@@ -61,6 +61,7 @@ use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 use workspace_api::{
     CreateRemoteRuntimeRequest, CreateRepositorySshCredentialRequest,
+    CreateWorkspaceRepositoryRequest, CreateWorkspaceRepositoryResponse,
     DeleteRepositorySshCredentialRequest, DeleteRepositorySshHostTrustRequest,
     ObjectiveCreateRequest, ObjectiveEditRequest, ObjectiveLinkTicketRequest,
     ObjectiveStateRequest, PutRepositorySshHostTrustRequest, RepositoryAccessProjection,
@@ -121,14 +122,15 @@ use crate::repository_access::{
     RepositoryAccessConfigSchemaProvider, RepositorySecretService,
     project_repository_access_candidate, project_repository_access_state,
 };
+use crate::repository_source::{parse_repository_source, repository_source_fingerprint};
 use crate::resource_broker::BackendResourceBroker;
 use crate::runtime_settings::RuntimeConfigSchemaProvider;
 use crate::runtime_subscription::RuntimeSubscriptionBroker;
 use crate::skills;
 use crate::store::{
     AccountRecord, ApiTokenRecord, AuthChallengeRecord, BrowserSessionRecord, ControlPlaneStore,
-    DeviceLoginFlowRecord, FlowSourceRecord, PasskeyCredentialRecord, RepositoryRecord,
-    TicketAssignmentPrincipal, TicketAssignmentRole, TicketCoderAssignmentRecord,
+    DeviceLoginFlowRecord, FlowSourceRecord, PasskeyCredentialRecord, RepositoryInsertOutcome,
+    RepositoryRecord, TicketAssignmentPrincipal, TicketAssignmentRole, TicketCoderAssignmentRecord,
     TicketRoleAssignmentRecord, UserRecord, WorkdirCreateOperationRecord, WorkdirRegistryRecord,
     WorkerControlGrantRecord, WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord,
     WorkspaceResourceKind,
@@ -1898,6 +1900,12 @@ impl WorkspaceApi {
         RepositoryRegistryReader::new(self.config.repositories.clone())
     }
 
+    fn live_repository_reader(&self) -> Result<RepositoryRegistryReader> {
+        Ok(RepositoryRegistryReader::new(
+            load_configured_repositories_from_store(self.config_store.as_ref(), &self.config)?,
+        ))
+    }
+
     fn require_workspace_repository(&self, repository_id: &str) -> ApiResult<RepositoryRecord> {
         self.store
             .get_repository(&self.config.workspace_id, repository_id)?
@@ -2397,7 +2405,7 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         .route("/api/repositories", get(list_repositories))
         .route(
             "/api/w/{workspace_id}/repositories",
-            get(scoped_list_repositories),
+            get(scoped_list_repositories).post(scoped_create_repository),
         )
         .route("/api/repositories/{repository_id}", get(repository_detail))
         .route(
@@ -3480,10 +3488,11 @@ async fn scoped_update_workspace_memory_settings(
     }))
 }
 
-async fn require_manage_repository_secrets(
+async fn require_workspace_owner(
     api: &WorkspaceApi,
     workspace_id: &str,
     actor: &RequestActor,
+    permission: &str,
 ) -> ApiResult<()> {
     validate_workspace_scope(api, workspace_id)?;
     let workspace = api
@@ -3492,12 +3501,20 @@ async fn require_manage_repository_secrets(
         .await?
         .ok_or(Error::WorkspaceIdMismatch)?;
     if workspace.owner_account_id.as_deref() != Some(actor.account_id.as_str()) {
-        return Err(Error::WorkspacePermissionDenied(
-            "ManageSecrets requires the Workspace owner account".to_string(),
-        )
+        return Err(Error::WorkspacePermissionDenied(format!(
+            "{permission} requires the Workspace owner account"
+        ))
         .into());
     }
     Ok(())
+}
+
+async fn require_manage_repository_secrets(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    actor: &RequestActor,
+) -> ApiResult<()> {
+    require_workspace_owner(api, workspace_id, actor, "ManageSecrets").await
 }
 
 fn active_repository_access_projection(
@@ -7888,6 +7905,108 @@ async fn scoped_list_repositories(
     list_repositories(State(api)).await
 }
 
+async fn scoped_create_repository(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Extension(actor): Extension<RequestActor>,
+    Json(request): Json<CreateWorkspaceRepositoryRequest>,
+) -> ApiResult<(StatusCode, Json<CreateWorkspaceRepositoryResponse>)> {
+    require_workspace_owner(&api, &path.workspace_id, &actor, "ManageRepositories").await?;
+
+    let repository_id = normalize_repository_identifier(&request.repository_id)?;
+    let display_name = normalize_repository_text(&request.display_name, "display_name", 256)?;
+    let default_ref = request
+        .default_ref
+        .as_deref()
+        .map(|value| normalize_repository_text(value, "default_ref", 512))
+        .transpose()?;
+    let source = parse_repository_source(&request.source)
+        .map_err(|error| Error::InvalidInput(format!("invalid repository source: {error}")))?;
+    let now = Utc::now().to_rfc3339();
+    let record = RepositoryRecord {
+        workspace_id: path.workspace_id.clone(),
+        repository_id: repository_id.clone(),
+        name: display_name,
+        kind: "git".to_string(),
+        provider: Some("git".to_string()),
+        source_fingerprint: repository_source_fingerprint(&source),
+        source,
+        default_ref,
+        source_revision: 1,
+        observed_status: workspace_api::RepositoryObservedStatus::Unverified,
+        observed_at: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+
+    let (status, replayed) = match api.config_store.insert_repository(&record)? {
+        RepositoryInsertOutcome::Created => (StatusCode::CREATED, false),
+        RepositoryInsertOutcome::Existing(existing)
+            if repository_create_intent_matches(&existing, &record) =>
+        {
+            (StatusCode::OK, true)
+        }
+        RepositoryInsertOutcome::Existing(_) => {
+            return Err(Error::RepositoryConflict(format!(
+                "repository_id {repository_id} already exists with different registration intent"
+            ))
+            .into());
+        }
+    };
+
+    Ok((
+        status,
+        Json(CreateWorkspaceRepositoryResponse {
+            workspace_id: path.workspace_id,
+            repository_id,
+            replayed,
+        }),
+    ))
+}
+
+fn normalize_repository_identifier(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 {
+        return Err(Error::InvalidInput(
+            "repository_id must contain 1..=128 characters".to_string(),
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(Error::InvalidInput(
+            "repository_id must contain only ASCII letters, digits, '-', '_', or '.'".to_string(),
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_repository_text(value: &str, field: &str, max_len: usize) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > max_len || value.chars().any(char::is_control) {
+        return Err(Error::InvalidInput(format!(
+            "{field} must contain 1..={max_len} non-control characters"
+        )));
+    }
+    Ok(value.to_string())
+}
+
+fn repository_create_intent_matches(
+    existing: &RepositoryRecord,
+    requested: &RepositoryRecord,
+) -> bool {
+    existing.workspace_id == requested.workspace_id
+        && existing.repository_id == requested.repository_id
+        && existing.name == requested.name
+        && existing.kind == requested.kind
+        && existing.provider == requested.provider
+        && existing.source == requested.source
+        && existing.default_ref == requested.default_ref
+        && existing.source_revision == requested.source_revision
+        && existing.source_fingerprint == requested.source_fingerprint
+}
+
 async fn scoped_repository_detail(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRepositoryPath>,
@@ -11189,7 +11308,7 @@ async fn get_objective(
 async fn list_repositories(
     State(api): State<WorkspaceApi>,
 ) -> ApiResult<Json<RepositoryListResponse>> {
-    let RepositoryListProjection { items, diagnostics } = api.repository_reader().list();
+    let RepositoryListProjection { items, diagnostics } = api.live_repository_reader()?.list();
     Ok(Json(RepositoryListResponse {
         workspace_id: api.config.workspace_id,
         items,
@@ -11202,7 +11321,7 @@ async fn repository_detail(
     State(api): State<WorkspaceApi>,
     AxumPath(repository_id): AxumPath<String>,
 ) -> ApiResult<Json<RepositoryDetailResponse>> {
-    let item = repository_lookup(api.repository_reader().summary(&repository_id))?;
+    let item = repository_lookup(api.live_repository_reader()?.summary(&repository_id))?;
     Ok(Json(RepositoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
         item,
@@ -11222,7 +11341,7 @@ async fn repository_log(
         commits,
         diagnostics,
     } = repository_lookup(
-        api.repository_reader()
+        api.live_repository_reader()?
             .recent_log(&repository_id, query.limit),
     )?;
     Ok(Json(RepositoryLogResponse {
@@ -15247,7 +15366,8 @@ impl IntoResponse for ApiError {
             }
             Error::TicketAssignmentConflict(_)
             | Error::WorkdirAttachmentConflict(_)
-            | Error::WorkspaceConfigConflict(_) => StatusCode::CONFLICT,
+            | Error::WorkspaceConfigConflict(_)
+            | Error::RepositoryConflict(_) => StatusCode::CONFLICT,
             Error::WorkerSourceIdentity(_) | Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
             Error::InvalidRuntimeIdentifier { .. } | Error::ReservedWorkerName(_) => {
                 StatusCode::BAD_REQUEST
@@ -17912,6 +18032,96 @@ mod tests {
                 "{repository_access_uri} must retain owner-only authorization"
             );
         }
+
+        let repositories_uri = format!("/api/w/{}/repositories", workspace.workspace.workspace_id);
+        let repository_request = serde_json::json!({
+            "repository_id": "documentation",
+            "display_name": "Documentation",
+            "source": temp.path().join("documentation").display().to_string(),
+            "default_ref": "main"
+        });
+        let create_repository = |body: serde_json::Value| {
+            Request::builder()
+                .method(Method::POST)
+                .uri(&repositories_uri)
+                .header(
+                    axum::http::header::COOKIE,
+                    "yoi_workspace_session=browser-session-auth",
+                )
+                .header(ORIGIN, &expected_origin)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let created = app
+            .clone()
+            .oneshot(create_repository(repository_request.clone()))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let replayed = app
+            .clone()
+            .oneshot(create_repository(repository_request.clone()))
+            .await
+            .unwrap();
+        assert_eq!(replayed.status(), StatusCode::OK);
+
+        let conflict = app
+            .clone()
+            .oneshot(create_repository(serde_json::json!({
+                "repository_id": "documentation",
+                "display_name": "Different registration",
+                "source": temp.path().join("documentation").display().to_string(),
+                "default_ref": "main"
+            })))
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+        let non_owner_create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&repositories_uri)
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {non_owner_token}"),
+                    )
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "repository_id": "foreign-owner",
+                            "display_name": "Foreign owner",
+                            "source": temp.path().join("foreign-owner").display().to_string()
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(non_owner_create.status(), StatusCode::FORBIDDEN);
+
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&repositories_uri)
+                    .header(
+                        axum::http::header::COOKIE,
+                        "yoi_workspace_session=browser-session-auth",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = axum::body::to_bytes(listed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&listed_body).contains("documentation"));
 
         let settings_uri = format!(
             "/api/w/{}/settings/workspace",
@@ -23816,6 +24026,26 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
             })
             .await
+            .unwrap();
+        let configured_repository = config.repositories[0].clone();
+        sqlite_store
+            .upsert_repository(&RepositoryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                repository_id: configured_repository.id,
+                name: configured_repository
+                    .display_name
+                    .unwrap_or_else(|| "Test Repository".to_string()),
+                kind: "git".to_string(),
+                provider: Some(configured_repository.provider),
+                source: configured_repository.source,
+                default_ref: configured_repository.default_selector,
+                source_revision: configured_repository.source_revision,
+                source_fingerprint: configured_repository.source_fingerprint,
+                observed_status: configured_repository.observed_status,
+                observed_at: configured_repository.observed_at,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            })
             .unwrap();
         let ticket_id = write_ticket(
             &config.database_path,

@@ -326,6 +326,12 @@ pub struct RepositoryRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryInsertOutcome {
+    Created,
+    Existing(RepositoryRecord),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceBootstrapRecord {
     pub operation_key: String,
@@ -860,6 +866,7 @@ pub trait ControlPlaneStore: Send + Sync {
     }
     fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>>;
     fn upsert_repository(&self, record: &RepositoryRecord) -> Result<()>;
+    fn insert_repository(&self, record: &RepositoryRecord) -> Result<RepositoryInsertOutcome>;
     fn get_repository(
         &self,
         workspace_id: &str,
@@ -2172,6 +2179,54 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    fn insert_repository(&self, record: &RepositoryRecord) -> Result<RepositoryInsertOutcome> {
+        self.with_conn_mut(|conn| {
+            let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let existing = transaction
+                .query_row(
+                    r#"SELECT workspace_id, repository_id, name, kind, provider,
+                              source_kind, source_uri, default_ref, source_revision,
+                              source_fingerprint, observed_status, observed_at, created_at, updated_at
+                       FROM repositories
+                       WHERE workspace_id = ?1 AND repository_id = ?2"#,
+                    params![record.workspace_id, record.repository_id],
+                    read_repository_record,
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                transaction.commit()?;
+                return Ok(RepositoryInsertOutcome::Existing(existing));
+            }
+
+            transaction.execute(
+                r#"INSERT INTO repositories (
+                    workspace_id, repository_id, name, kind, provider, uri,
+                    source_kind, source_uri, default_ref, source_revision,
+                    source_fingerprint, observed_status, observed_at, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
+                params![
+                    record.workspace_id,
+                    record.repository_id,
+                    record.name,
+                    record.kind,
+                    record.provider,
+                    record.source.uri,
+                    record.source.kind.as_str(),
+                    record.source.uri,
+                    record.default_ref,
+                    record.source_revision,
+                    record.source_fingerprint,
+                    record.observed_status.as_str(),
+                    record.observed_at,
+                    record.created_at,
+                    record.updated_at,
+                ],
+            )?;
+            transaction.commit()?;
+            Ok(RepositoryInsertOutcome::Created)
         })
     }
 
