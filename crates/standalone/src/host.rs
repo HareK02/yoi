@@ -4,6 +4,7 @@ use std::time::Duration;
 use agen::llm_client::client::LlmClient;
 use client::Client;
 use client::transport::in_process::{Peer as InProcessPeer, Socket as InProcessSocket};
+use manifest::ScopeRule;
 use protocol::stream::{decode_method, encode_event};
 use protocol::{Event, Method, WorkerId};
 use session_store::{
@@ -18,6 +19,7 @@ use worker::ipc::protocol_session::{
     WorkerProtocolSessionStreams, dispatch_worker_protocol_method, live_log_entry_event,
     subscribe_worker_protocol_session,
 };
+use worker::runtime::worker_allocation::ScopeLockError;
 use worker::{BootstrappedWorker, WorkerError, WorkerFilesystemAuthority, WorkerWorkspaceContext};
 
 use crate::launch::ResolvedStandaloneLaunch;
@@ -43,7 +45,7 @@ pub struct StandaloneHost {
     lease: Option<StandaloneWorkerLease>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum StandaloneStartupError {
     #[error("the standalone state store could not be opened or validated")]
     StateStore,
@@ -53,6 +55,16 @@ pub enum StandaloneStartupError {
     LeaseLivenessUnknown,
     #[error("the standalone Worker working directory is unavailable or changed")]
     WorkingDirectoryUnavailable,
+    #[error(
+        "requested scope `{}` conflicts with worker allocation `{competitor}` rule `{}`",
+        requested_rule.target.display(),
+        competitor_rule.target.display()
+    )]
+    ScopeConflict {
+        competitor: String,
+        requested_rule: ScopeRule,
+        competitor_rule: ScopeRule,
+    },
     #[error("the resolved Worker configuration or persisted history is invalid")]
     WorkerConfiguration,
     #[error("the configured model provider is unavailable")]
@@ -509,6 +521,15 @@ fn classify_store_startup_error(error: StandaloneStoreError) -> StandaloneStartu
 
 fn classify_startup_error(error: WorkerBootstrapError) -> StandaloneStartupError {
     match error {
+        WorkerBootstrapError::Worker(WorkerError::ScopeLock(ScopeLockError::WriteConflict {
+            competitor,
+            rule,
+            competitor_rule,
+        })) => StandaloneStartupError::ScopeConflict {
+            competitor,
+            requested_rule: rule,
+            competitor_rule,
+        },
         WorkerBootstrapError::Worker(WorkerError::Provider(_)) => {
             StandaloneStartupError::ModelProvider
         }

@@ -165,6 +165,65 @@ async fn in_process_host_runs_text_and_read_tool_then_shuts_down() {
 }
 
 #[tokio::test]
+async fn startup_preserves_occupied_scope_conflict_details() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("project");
+    std::fs::create_dir(&cwd).expect("create project");
+
+    let first_launch = StandaloneLaunchConfig::new(
+        &cwd,
+        temp.path().join("first-state"),
+        manifest::ProfileSelector::Default,
+        "first-worker",
+    )
+    .resolve()
+    .expect("resolve first launch");
+    let first_host =
+        StandaloneHost::start_with_model_client(first_launch, ScriptedClient::new(Vec::new()))
+            .await
+            .expect("start first host");
+    let competitor = first_host.record().storage_key.clone();
+
+    let second_launch = StandaloneLaunchConfig::new(
+        &cwd,
+        temp.path().join("second-state"),
+        manifest::ProfileSelector::Default,
+        "second-worker",
+    )
+    .resolve()
+    .expect("resolve second launch");
+    let error =
+        StandaloneHost::start_with_model_client(second_launch, ScriptedClient::new(Vec::new()))
+            .await
+            .err()
+            .expect("occupied scope rejected");
+
+    first_host.shutdown().await.expect("shutdown first host");
+
+    let canonical_cwd = cwd.canonicalize().expect("canonical cwd");
+    match &error {
+        StandaloneStartupError::ScopeConflict {
+            competitor: actual_competitor,
+            requested_rule,
+            competitor_rule,
+        } => {
+            assert_eq!(actual_competitor, &competitor);
+            assert_eq!(requested_rule.target, canonical_cwd);
+            assert_eq!(competitor_rule.target, canonical_cwd);
+        }
+        other => panic!("expected scope conflict, got {other:?}"),
+    }
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "requested scope `{}` conflicts with worker allocation `{competitor}` rule `{}`",
+            canonical_cwd.display(),
+            canonical_cwd.display()
+        )
+    );
+}
+
+#[tokio::test]
 async fn state_store_failure_is_redacted_and_starts_no_controller() {
     let temp = tempfile::tempdir().expect("tempdir");
     let state_path = temp.path().join("state-file-with-secret-name");
