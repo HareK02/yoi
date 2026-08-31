@@ -752,7 +752,7 @@ pub(crate) async fn prepare_internal_worker_session(
     }
     let actor_in_flight = in_flight.clone();
     worker.attach_alerter(alerter.clone());
-    worker.attach_event_tx(event_tx.clone());
+    worker.attach_working_event_tx(event_tx.clone());
     worker.attach_in_flight_events(in_flight.clone());
     wire_event_bridges_on_engine(&mut worker, &event_tx, &alerter, &in_flight);
 

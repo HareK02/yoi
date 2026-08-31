@@ -1515,7 +1515,7 @@ async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
     // after that.
     wait_for_status(&handle, WorkerStatus::Idle).await;
     // The live echo arrives via the sink's `Event::SystemItem` lane,
-    // not on the `event_tx` broadcast that `handle.subscribe()` taps.
+    // not on the `working_event_tx` broadcast that `handle.subscribe()` taps.
     // Verify the notification landed on the sink mirror instead.
     let (entries, _) = handle.sink.subscribe_with_snapshot();
     let saw_notify_in_mirror = entries.iter().any(|e| {
@@ -1899,7 +1899,7 @@ async fn socket_worker_event_turn_ended_while_idle_auto_starts_turn() {
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     // The SystemItem and TurnEnd events arrive through independent
-    // broadcast lanes (sink fan-out vs `event_tx`), so their relative
+    // broadcast lanes (sink fan-out vs `working_event_tx`), so their relative
     // order on the wire is non-deterministic. Keep reading until both
     // are observed (or the deadline trips), rather than breaking on
     // the first TurnEnd.

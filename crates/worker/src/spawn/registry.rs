@@ -414,10 +414,10 @@ impl SpawnedWorkerRegistry {
 
     pub(crate) fn attach_parent_protocol(
         &self,
-        event_tx: broadcast::Sender<Event>,
+        working_event_tx: broadcast::Sender<Event>,
         parent_session_id: String,
     ) {
-        *self.parent_protocol.lock().unwrap() = Some((event_tx, parent_session_id));
+        *self.parent_protocol.lock().unwrap() = Some((working_event_tx, parent_session_id));
         for record in self.internal_records.lock().unwrap().clone() {
             self.start_protocol_forwarding(record);
         }
