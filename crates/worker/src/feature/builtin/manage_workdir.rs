@@ -339,7 +339,13 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
         }
     }
 
-    async fn start_command(&self, request: CommandRequest) -> Result<CommandHandle, WorkdirError> {
+    async fn start_command(
+        &self,
+        mut request: CommandRequest,
+    ) -> Result<CommandHandle, WorkdirError> {
+        // `spill_dir` belongs to the Worker host running BashTool. This remote
+        // WorkdirSession provider cannot safely resolve or write that host path.
+        request.spill_dir = None;
         match self.operate(WorkdirSessionOperation::CommandStart(request))? {
             WorkdirSessionOperationResult::CommandStart(result) => Ok(result),
             _ => Err(Self::mismatch("command_start")),
@@ -1116,6 +1122,42 @@ mod tests {
         assert!(body.get("expected_session_fence").is_none());
         assert!(body.get("runtime_id").is_none());
         assert!(body.get("session_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn attached_session_does_not_send_worker_local_bash_spill_path() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
+            "operation": "command_start",
+            "result": "command-1"
+        }))]));
+        let session = WorkspaceAttachedWorkdirSession::handle(client.clone());
+
+        let handle = session
+            .start_command(CommandRequest {
+                command: "true".to_string(),
+                timeout_secs: 120,
+                output_limit: 1024,
+                spill_dir: Some("/worker-local/bash-output".into()),
+                tool_call_id: Some("call-1".to_string()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(handle, CommandHandle("command-1".to_string()));
+        let requests = client.requests();
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["operation"]["operation"], "command_start");
+        assert_eq!(body["operation"]["request"]["command"], "true");
+        assert!(body["operation"]["request"]["spill_dir"].is_null());
+        assert_eq!(body["operation"]["request"]["tool_call_id"], "call-1");
+        assert!(
+            !requests[0]
+                .body
+                .as_deref()
+                .unwrap()
+                .contains("/worker-local/bash-output")
+        );
     }
 
     #[tokio::test]
