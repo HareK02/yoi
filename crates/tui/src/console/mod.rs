@@ -1,7 +1,7 @@
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -240,6 +240,12 @@ pub(crate) async fn run_standalone_restore(
     run_standalone_host(host, worker_label, history_root).await
 }
 
+fn standalone_console_app(worker_label: String, history_root: &Path) -> App {
+    let mut app = App::new_with_persistent_input_history(worker_label, history_root);
+    app.connected = true;
+    app
+}
+
 async fn run_standalone_host(
     host: StandaloneHost,
     worker_label: String,
@@ -254,7 +260,7 @@ async fn run_standalone_host(
             return Err(error);
         }
     };
-    let mut app = App::new_with_persistent_input_history(worker_label, &history_root);
+    let mut app = standalone_console_app(worker_label, &history_root);
     let run_result = run_loop(&mut terminal, &mut app, &mut connection).await;
     let shutdown_result = connection
         .shutdown()
@@ -1124,6 +1130,14 @@ mod tests {
     use super::*;
     use crate::text_selection::{HistoryViewport, SelectionRow};
     use protocol::{Event, RewindTarget, RewindTargetId, Segment};
+
+    #[test]
+    fn standalone_console_starts_with_in_process_connection_ready() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let app = standalone_console_app("standalone".to_string(), temp.path());
+
+        assert!(app.connected);
+    }
 
     #[test]
     fn single_worker_mouse_capture_avoids_drag_and_all_motion_modes() {
