@@ -36,6 +36,9 @@ use crate::task::{TaskCounts, TaskEntry, TaskStatus, TaskStore};
 use crate::text_selection::{HistoryViewport, SelectionRow};
 use crate::view_mode::Mode;
 
+const RUN_SPINNER_FRAMES: [&str; 8] = ["⣷", "⣯", "⣟", "⡿", "⢿", "⣻", "⣽", "⣾"];
+const RUN_SPINNER_FRAME_MS: u128 = 80;
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     // Input content starts after the prompt (`> ` or `: `), so the width
@@ -57,19 +60,27 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let tabs = app.worker_view_tabs();
     let show_tabs = tabs.len() > 1;
     let mini_view_h = task_mini_view_height(&app.selected_worker_view().task_store, show_tabs);
-    // One blank row separates the history tail from the mini-view so
-    // the latest message doesn't visually crash into the task summary.
-    // Folds away with the mini-view when there are no tasks.
-    let mini_view_gap = if mini_view_h > 0 { 1 } else { 0 };
+    let run_status_h = u16::from(app.running);
+    let run_status_gap = run_status_h;
+    // One blank row separates the history tail from the run/task mini-view so
+    // the latest message doesn't visually crash into operational status.
+    // Folds away when neither run status nor tasks are visible.
+    let mini_view_gap = if mini_view_h > 0 || run_status_h > 0 {
+        1
+    } else {
+        0
+    };
 
     let chunks = Layout::vertical([
-        Constraint::Min(0),                // history view
-        Constraint::Length(mini_view_gap), // gap above mini-view
-        Constraint::Length(mini_view_h),   // task mini-view (0 when empty)
-        Constraint::Length(1),             // separator
-        Constraint::Length(1),             // status
-        Constraint::Length(input_height),  // input area
-        Constraint::Length(1),             // actionbar
+        Constraint::Min(0),                 // history view
+        Constraint::Length(mini_view_gap),  // gap above run/task mini-view
+        Constraint::Length(run_status_h),   // active run status
+        Constraint::Length(run_status_gap), // gap below active run status
+        Constraint::Length(mini_view_h),    // task mini-view (0 when empty)
+        Constraint::Length(1),              // separator
+        Constraint::Length(1),              // status
+        Constraint::Length(input_height),   // input area
+        Constraint::Length(1),              // actionbar
     ])
     .split(area);
 
@@ -82,24 +93,27 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         draw_history(frame, app, chunks[0]);
     }
+    if run_status_h > 0 {
+        draw_run_status(frame, app, chunks[2]);
+    }
     if mini_view_h > 0 {
         draw_task_mini_view(
             frame,
             &app.selected_worker_view().task_store,
             &tabs,
-            chunks[2],
+            chunks[4],
         );
     }
-    draw_separator(frame, chunks[3]);
+    draw_separator(frame, chunks[5]);
     // Status/composer/control surfaces remain parent-owned. View selection changes
     // only transcript/task presentation and never implies SubWorker control.
-    draw_status(frame, app, chunks[4]);
-    draw_input(frame, app, &input_render, chunks[5]);
-    draw_actionbar(frame, app, chunks[6]);
+    draw_status(frame, app, chunks[6]);
+    draw_input(frame, app, &input_render, chunks[7]);
+    draw_actionbar(frame, app, chunks[8]);
     if app.is_command_mode() {
-        draw_command_popup(frame, app, chunks[5]);
+        draw_command_popup(frame, app, chunks[7]);
     } else if let Some(state) = app.completion.as_ref().filter(|c| c.is_active()) {
-        draw_completion_popup(frame, state, chunks[5]);
+        draw_completion_popup(frame, state, chunks[7]);
     }
 }
 
@@ -118,6 +132,65 @@ fn task_mini_view_height(store: &TaskStore, show_tabs: bool) -> u16 {
     let active_shown = store.counts().active().min(MINI_VIEW_MAX_ACTIVE);
     // active rows + 1 summary/tab line
     (active_shown as u16).saturating_add(1)
+}
+
+fn draw_run_status(frame: &mut Frame, app: &App, area: Rect) {
+    frame.render_widget(Paragraph::new(run_status_line(app, Instant::now())), area);
+}
+
+fn run_status_line(app: &App, now: Instant) -> Line<'static> {
+    let elapsed = app
+        .run_started_at
+        .and_then(|started_at| now.checked_duration_since(started_at))
+        .unwrap_or_default();
+    let spinner_index =
+        ((elapsed.as_millis() / RUN_SPINNER_FRAME_MS) as usize) % RUN_SPINNER_FRAMES.len();
+    let request_label = if app.run_requests == 1 {
+        "1 req".to_owned()
+    } else {
+        format!("{} reqs", app.run_requests)
+    };
+
+    Line::from(vec![
+        Span::styled(
+            RUN_SPINNER_FRAMES[spinner_index],
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            fmt_run_elapsed(elapsed.as_secs()),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::styled(" ・ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(request_label, Style::default().fg(Color::Gray)),
+        Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+        Span::styled("↑", Style::default().fg(Color::Green)),
+        Span::styled(
+            fmt_tokens(app.run_upload_tokens),
+            Style::default().fg(Color::Green),
+        ),
+        Span::styled("/", Style::default().fg(Color::DarkGray)),
+        Span::styled("↓", Style::default().fg(Color::Yellow)),
+        Span::styled(
+            fmt_tokens(app.run_output_tokens),
+            Style::default().fg(Color::Yellow),
+        ),
+    ])
+}
+
+fn fmt_run_elapsed(secs: u64) -> String {
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn draw_task_mini_view(frame: &mut Frame, store: &TaskStore, tabs: &[WorkerViewTab], area: Rect) {
@@ -1726,32 +1799,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         ),
     ];
 
-    if app.running {
-        let status = if let Some(wait_event) = &app.latest_llm_wait_event {
-            format!(
-                "request: {} | ↑{}/↓{} | {wait_event}",
-                app.run_requests,
-                fmt_tokens(app.run_upload_tokens),
-                fmt_tokens(app.run_output_tokens),
-            )
-        } else if let Some(tool) = &app.current_tool {
-            format!(
-                "request: {} | ↑{}/↓{} | tool: {tool}",
-                app.run_requests,
-                fmt_tokens(app.run_upload_tokens),
-                fmt_tokens(app.run_output_tokens),
-            )
-        } else {
-            format!(
-                "request: {} | ↑{}/↓{}",
-                app.run_requests,
-                fmt_tokens(app.run_upload_tokens),
-                fmt_tokens(app.run_output_tokens),
-            )
-        };
-        spans.push(Span::raw(" | "));
-        spans.push(Span::styled(status, Style::default().fg(Color::Yellow)));
-    } else if app.paused {
+    if app.paused {
         spans.push(Span::raw(" | "));
         spans.push(Span::styled(
             "paused",
@@ -1763,7 +1811,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             " — Enter to resume, Ctrl-X to cancel, type to start new turn",
             Style::default().fg(Color::DarkGray),
         ));
-    } else {
+    } else if !app.running {
         spans.push(Span::styled(" idle", Style::default().fg(Color::DarkGray)));
     }
 
@@ -2052,6 +2100,28 @@ mod tests {
     use crate::block::{ToolCallBlock, ToolCallState};
     use protocol::WorkerStatus;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn run_status_line_matches_console_metrics_and_spinner_frame() {
+        let now = Instant::now();
+        let mut app = App::new("worker".into());
+        app.run_started_at = now.checked_sub(Duration::from_millis(160));
+        app.run_requests = 1;
+        app.run_upload_tokens = 1_200;
+        app.run_output_tokens = 45;
+
+        assert_eq!(
+            line_text(&run_status_line(&app, now)),
+            "⣟ 0s ・ 1 req | ↑1.2k/↓45"
+        );
+    }
+
+    #[test]
+    fn run_elapsed_uses_console_style_units() {
+        assert_eq!(fmt_run_elapsed(9), "9s");
+        assert_eq!(fmt_run_elapsed(65), "1m 05s");
+        assert_eq!(fmt_run_elapsed(3_726), "1h 2m 06s");
+    }
 
     #[test]
     fn task_summary_right_aligns_worker_tabs_and_highlights_selection() {

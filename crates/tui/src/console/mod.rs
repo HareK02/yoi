@@ -531,15 +531,19 @@ enum E2eRewindInput {
 enum LoopInput<P> {
     Terminal(TerminalEventResult),
     Worker(P),
+    Tick,
 }
 
-async fn next_loop_input<P, F>(
+async fn next_loop_input<P, F, T>(
     term_rx: &mut mpsc::UnboundedReceiver<TerminalEventResult>,
     connected: bool,
     pod_next: F,
+    animate: bool,
+    animation_tick: T,
 ) -> LoopInput<P>
 where
     F: Future<Output = P>,
+    T: Future,
 {
     tokio::select! {
         biased;
@@ -553,6 +557,7 @@ where
             }))
         }
         event = pod_next, if connected => LoopInput::Worker(event),
+        _ = animation_tick, if animate => LoopInput::Tick,
     }
 }
 
@@ -608,6 +613,8 @@ async fn run_loop<T: Socket>(
     client: &mut ConsoleConnection<T>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_terminal_reader, mut term_rx) = TerminalEventReader::spawn()?;
+    let mut animation_tick = tokio::time::interval(Duration::from_millis(80));
+    animation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     terminal.draw(|f| ui::draw(f, app))?;
 
@@ -626,7 +633,15 @@ async fn run_loop<T: Socket>(
             continue;
         }
 
-        match next_loop_input(&mut term_rx, app.connected, client.next_event()).await {
+        match next_loop_input(
+            &mut term_rx,
+            app.connected,
+            client.next_event(),
+            app.running,
+            animation_tick.tick(),
+        )
+        .await
+        {
             LoopInput::Terminal(term_event) => {
                 handle_terminal_event(app, client, term_event?).await?;
             }
@@ -642,6 +657,7 @@ async fn run_loop<T: Socket>(
                     app.push_error("Connection lost");
                 }
             },
+            LoopInput::Tick => {}
         }
 
         terminal.draw(|f| ui::draw(f, app))?;
@@ -1217,6 +1233,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn animation_tick_wakes_loop_while_running() {
+        let (_tx, mut rx) = mpsc::unbounded_channel::<TerminalEventResult>();
+
+        assert!(matches!(
+            next_loop_input(
+                &mut rx,
+                true,
+                std::future::pending::<Option<u8>>(),
+                true,
+                std::future::ready(()),
+            )
+            .await,
+            LoopInput::Tick
+        ));
+    }
+
+    #[tokio::test]
     async fn terminal_event_is_selected_before_ready_worker_event() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         tx.send(Ok(TermEvent::Key(KeyEvent::new(
@@ -1225,7 +1258,15 @@ mod tests {
         ))))
         .unwrap();
 
-        match next_loop_input(&mut rx, true, std::future::ready(Some(()))).await {
+        match next_loop_input(
+            &mut rx,
+            true,
+            std::future::ready(Some(())),
+            false,
+            std::future::pending::<()>(),
+        )
+        .await
+        {
             LoopInput::Terminal(Ok(TermEvent::Key(key))) => {
                 assert_eq!(key.code, KeyCode::Char('x'));
             }
@@ -1237,7 +1278,15 @@ mod tests {
     async fn terminal_event_is_preserved_after_worker_event_wins() {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        match next_loop_input(&mut rx, true, std::future::ready(Some(1_u8))).await {
+        match next_loop_input(
+            &mut rx,
+            true,
+            std::future::ready(Some(1_u8)),
+            false,
+            std::future::pending::<()>(),
+        )
+        .await
+        {
             LoopInput::Worker(Some(1)) => {}
             _ => panic!("expected the first ready Worker event to win before any terminal input"),
         }
@@ -1248,7 +1297,15 @@ mod tests {
         ))))
         .unwrap();
 
-        match next_loop_input(&mut rx, true, std::future::ready(Some(2_u8))).await {
+        match next_loop_input(
+            &mut rx,
+            true,
+            std::future::ready(Some(2_u8)),
+            false,
+            std::future::pending::<()>(),
+        )
+        .await
+        {
             LoopInput::Terminal(Ok(TermEvent::Key(key))) => {
                 assert_eq!(key.code, KeyCode::Char('y'));
             }
