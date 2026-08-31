@@ -209,12 +209,12 @@ pub struct WorkingDirectorySummary {
 #[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectoryCreateRequest {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_id: Option<String>,
     pub repository_id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
 }
 
@@ -765,6 +765,9 @@ mod tests {
         assert_eq!(request.runtime_id, None);
         assert_eq!(request.selector, None);
         assert_eq!(request.operation_id, None);
+
+        let serialized = serde_json::to_value(request).expect("serialize create request");
+        assert_eq!(serialized, serde_json::json!({"repository_id": "main"}));
     }
 
     #[test]
