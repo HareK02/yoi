@@ -268,7 +268,7 @@ impl SqliteWorkspaceStore {
             operation_id,
             request_fingerprint,
             owner,
-            false,
+            None,
         )
     }
 
@@ -278,14 +278,15 @@ impl SqliteWorkspaceStore {
         operation_id: &str,
         request_fingerprint: &str,
         owner: WorkdirRemovalAttemptOwner,
-        prior_owner_is_orphaned: bool,
+        expected_prior_owner: Option<WorkdirRemovalAttemptOwner>,
+        expected_attempt_count: u64,
     ) -> Result<WorkdirRemovalOperation> {
         self.begin_workdir_removal_attempt_inner(
             workspace_id,
             operation_id,
             request_fingerprint,
             owner,
-            prior_owner_is_orphaned,
+            Some((expected_prior_owner, expected_attempt_count)),
         )
     }
 
@@ -295,7 +296,7 @@ impl SqliteWorkspaceStore {
         operation_id: &str,
         request_fingerprint: &str,
         owner: WorkdirRemovalAttemptOwner,
-        prior_owner_is_orphaned: bool,
+        recovery_expected: Option<(Option<WorkdirRemovalAttemptOwner>, u64)>,
     ) -> Result<WorkdirRemovalOperation> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -310,9 +311,17 @@ impl SqliteWorkspaceStore {
                     "Workdir removal operation `{operation_id}` is not retryable"
                 )));
             }
-            if operation.state == WorkdirRemovalOperationState::Pending
+            if let Some((expected_owner, expected_attempt_count)) = recovery_expected {
+                if operation.state != WorkdirRemovalOperationState::Pending
+                    || operation.attempt_owner != expected_owner
+                    || operation.attempt_count != expected_attempt_count
+                {
+                    return Err(Error::WorkdirAttachmentConflict(format!(
+                        "Workdir removal operation `{operation_id}` changed after orphan proof"
+                    )));
+                }
+            } else if operation.state == WorkdirRemovalOperationState::Pending
                 && operation.attempt_count > 0
-                && !prior_owner_is_orphaned
             {
                 return Err(Error::WorkdirAttachmentConflict(format!(
                     "Workdir removal operation `{operation_id}` already has an active attempt"

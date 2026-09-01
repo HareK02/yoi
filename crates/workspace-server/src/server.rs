@@ -9737,19 +9737,21 @@ fn execute_reserved_workdir_removal_with_provider(
     if operation.state == WorkdirRemovalOperationState::Completed {
         return Ok(operation);
     }
-    let operation = if recovery {
-        let prior_owner_is_orphaned = if operation.state == WorkdirRemovalOperationState::Pending {
-            workdir_removal_attempt_is_orphaned(&operation)?
-        } else {
-            false
-        };
+    let operation = if recovery && operation.state == WorkdirRemovalOperationState::Pending {
+        if !workdir_removal_attempt_is_orphaned(&operation)? {
+            return Err(Error::WorkdirAttachmentConflict(format!(
+                "Workdir removal operation `{}` still has a live attempt owner",
+                operation.operation_id
+            )));
+        }
         api.config_store
             .reclaim_workdir_removal_attempt_for_recovery(
                 &operation.workspace_id,
                 &operation.operation_id,
                 &operation.request_fingerprint,
                 api.workdir_remove_attempt_owner,
-                prior_owner_is_orphaned,
+                operation.attempt_owner,
+                operation.attempt_count,
             )?
     } else {
         api.config_store.begin_workdir_removal_attempt(
@@ -22471,6 +22473,7 @@ mod tests {
             >,
         >,
         cleanup_calls: std::sync::atomic::AtomicUsize,
+        observation_delay: std::time::Duration,
     }
 
     impl FakeWorkdirRemovalProvider {
@@ -22482,7 +22485,13 @@ mod tests {
                 observation: Mutex::new(Some(Ok(observation))),
                 cleanup: Mutex::new(Some(Ok(cleanup))),
                 cleanup_calls: std::sync::atomic::AtomicUsize::new(0),
+                observation_delay: std::time::Duration::ZERO,
             }
+        }
+
+        fn with_observation_delay(mut self, delay: std::time::Duration) -> Self {
+            self.observation_delay = delay;
+            self
         }
 
         fn cleanup_calls(&self) -> usize {
@@ -22497,6 +22506,7 @@ mod tests {
             _working_directory_id: &str,
         ) -> std::result::Result<crate::hosts::RuntimeWorkingDirectoryResult, RuntimeRegistryError>
         {
+            std::thread::sleep(self.observation_delay);
             self.observation
                 .lock()
                 .unwrap()
@@ -22698,6 +22708,78 @@ mod tests {
             Some("unsupported_target")
         );
         assert_eq!(unsupported_provider.cleanup_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_orphan_recovery_runs_delayed_provider_cleanup_once() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let (reserved, clean_summary) = reserve_removal_fixture(&api, "orphan-race");
+        let interrupted = api
+            .config_store
+            .begin_workdir_removal_attempt(
+                &reserved.workspace_id,
+                &reserved.operation_id,
+                &reserved.request_fingerprint,
+                WorkdirRemovalAttemptOwner {
+                    process_id: u32::MAX,
+                    process_start_marker: 1,
+                },
+            )
+            .unwrap();
+        let provider = Arc::new(
+            FakeWorkdirRemovalProvider::new(
+                workdir_removal_result(
+                    WorkerOperationState::Accepted,
+                    Some(clean_summary),
+                    Vec::new(),
+                ),
+                workdir_removal_result(WorkerOperationState::Accepted, None, Vec::new()),
+            )
+            .with_observation_delay(std::time::Duration::from_millis(100)),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut callers = Vec::new();
+        for _ in 0..2 {
+            let api = api.clone();
+            let operation = interrupted.clone();
+            let provider = provider.clone();
+            let barrier = barrier.clone();
+            callers.push(std::thread::spawn(move || {
+                barrier.wait();
+                execute_reserved_workdir_removal_with_provider(
+                    &api,
+                    operation,
+                    true,
+                    provider.as_ref(),
+                )
+            }));
+        }
+        barrier.wait();
+        let results = callers
+            .into_iter()
+            .map(|caller| caller.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    result.as_ref().is_ok_and(|operation| {
+                        operation.disposition == Some(WorkdirRemovalDisposition::Removed)
+                    })
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(Error::WorkdirAttachmentConflict(_))))
+                .count(),
+            1
+        );
+        assert_eq!(provider.cleanup_calls(), 1);
     }
 
     #[test]
