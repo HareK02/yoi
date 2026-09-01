@@ -1,22 +1,21 @@
 <script lang="ts">
-    import { tick, untrack } from "svelte";
+    import { tick, untrack, type SvelteComponent } from "svelte";
     import ConsoleLineItem from "$lib/workspace/console/ConsoleLineItem.svelte";
     import ConsoleTasks from "$lib/workspace/console/ConsoleTasks.svelte";
     import ConsoleTimeline from "$lib/workspace/console/ConsoleTimeline.svelte";
-    import { chatSubmit } from "$lib/workspace/console/chat-submit";
+    import ComposerInput from "$lib/workspace/console/ComposerInput.svelte";
+    import type { ComposerDraftSnapshot } from "$lib/workspace/console/composer-draft";
     import {
-        buildComposerRequest,
+        buildComposerSegmentsRequest,
         type WorkerConsoleInputRequest,
     } from "$lib/workspace/console/composer-command";
     import {
-        applyCompletion,
         completionTokenAt,
         localCommandCompletions,
         type ComposerCompletionEntry,
         type ComposerCompletionToken,
     } from "$lib/workspace/console/composer-completion";
     import WorkerRunStatus from "$lib/workspace/console/WorkerRunStatus.svelte";
-    import { fitTextarea } from "$lib/workspace/console/textarea-fit";
     import { resolveWorkerControlShortcut } from "$lib/workspace/console/worker-control-shortcuts";
     import {
         consoleWorkerViews,
@@ -103,7 +102,33 @@
         untrack(() => data.worker?.state ?? null),
     );
     let workerError = $state<string | null>(untrack(() => data.workerError));
-    let draft = $state("");
+    type ComposerInputHandle = {
+        snapshot(): ComposerDraftSnapshot;
+        focus(): void;
+        containsTarget(target: EventTarget | null): boolean;
+        cursor(): number;
+        replaceRange(from: number, to: number, content: string): void;
+        clear(): void;
+        restoreSegments(
+            segments: readonly Segment[],
+            preserveExactText?: boolean,
+        ): void;
+    };
+
+    type ComposerDraftCache = {
+        segments: Segment[];
+        preserveExactText: boolean;
+    };
+
+    const EMPTY_DRAFT: ComposerDraftSnapshot = {
+        document: "",
+        content: "",
+        segments: [],
+        pastes: [],
+        textPastes: [],
+    };
+
+    let draft = $state<ComposerDraftSnapshot>(EMPTY_DRAFT);
     let completionEntries = $state<ComposerCompletionEntry[]>([]);
     let completionToken = $state<ComposerCompletionToken | null>(null);
     let completionBusy = $state(false);
@@ -130,7 +155,13 @@
     let timelineOpen = $state(false);
     let consoleViewMode = $state<ConsoleViewMode>("overview");
     let consoleBodyElement: HTMLElement | null = null;
-    let composerTextareaElement: HTMLTextAreaElement | null = null;
+    let composerInputElement = $state<
+        (SvelteComponent & ComposerInputHandle) | null
+    >(null);
+    const composerDrafts = new Map<string, ComposerDraftCache>();
+    let activeComposerTargetKey = untrack(
+        () => `${workspaceId}:${runtimeId}:${workerId}`,
+    );
     let timelineRailDragCleanup: (() => void) | null = null;
     let autoFollowConsole = $state(true);
     let consoleScroll = $state<ScrollMetrics>({ top: 0, height: 1, client: 1 });
@@ -196,7 +227,7 @@
     const inputReady = $derived(workerState === "idle");
     const composerEditable = $derived(protocolState === "open" && !sending);
     const canSubmitDraft = $derived(inputReady && composerEditable);
-    const canSend = $derived(canSubmitDraft && draft.trim().length > 0);
+    const canSend = $derived(canSubmitDraft && draft.content.trim().length > 0);
     const canStopFromComposer = $derived(workerRunning && composerEditable);
     const composerSubmitDisabled = $derived(
         workerRunning ? !canStopFromComposer : !canSend,
@@ -321,14 +352,14 @@
         scheduleObservationFlush();
     }
 
-    async function applyComposerCompletion(event: KeyboardEvent) {
-        const target = event.currentTarget;
-        if (!(target instanceof HTMLTextAreaElement)) {
-            return;
-        }
+    async function applyComposerCompletion() {
+        if (!composerEditable || !composerInputElement) return;
+        const input = composerInputElement;
+        const targetKey = activeComposerTargetKey;
+        const document = draft.document;
         const token = completionTokenAt(
-            draft,
-            target.selectionStart ?? draft.length,
+            document,
+            input.cursor(),
         );
         completionToken = token;
         completionError = null;
@@ -340,15 +371,24 @@
         completionBusy = true;
         try {
             const entries = await resolveCompletionEntries(token);
+            if (
+                !composerEditable ||
+                composerInputElement !== input ||
+                activeComposerTargetKey !== targetKey ||
+                draft.document !== document
+            ) {
+                return;
+            }
             completionEntries = entries;
             if (entries.length === 0) {
                 completionError = `No completions for ${token.sigil}${token.prefix}`;
                 return;
             }
-            const applied = applyCompletion(draft, token, entries[0]);
-            draft = applied.value;
-            await tick();
-            target.setSelectionRange(applied.cursor, applied.cursor);
+            input.replaceRange(
+                token.start,
+                token.end,
+                `${entries[0].value} `,
+            );
             composerNotice =
                 entries.length > 1
                     ? `Completed ${token.sigil}${entries[0].value}; ${entries.length - 1} more candidate(s)`
@@ -404,7 +444,8 @@
             return;
         }
         event.preventDefault();
-        void applyComposerCompletion(event);
+        if (!composerEditable) return;
+        void applyComposerCompletion();
     }
 
     function scrollConsoleByPage(direction: 1 | -1) {
@@ -465,13 +506,13 @@
     }
 
     function handleWorkerControlShortcut(event: KeyboardEvent) {
-        const composerFocused = event.target === composerTextareaElement;
+        const composerFocused = composerInputElement?.containsTarget(event.target) ?? false;
         const command = resolveWorkerControlShortcut(event, {
             protocolOpen: protocolState === "open",
             running: workerRunning,
             paused: workerPaused,
             composerFocused,
-            draftBlank: draft.trim().length === 0,
+            draftBlank: draft.content.trim().length === 0,
             editableTarget: isEditableTarget(event.target) && !composerFocused,
             hasSelection: targetHasSelection(event.target),
         });
@@ -529,16 +570,53 @@
         }
     }
 
-    function handleComposerSubmit(value = draft) {
+    function cachedComposerDraft(snapshot: ComposerDraftSnapshot): ComposerDraftCache {
+        return {
+            segments: [...snapshot.segments],
+            preserveExactText: snapshot.textPastes.length > 0,
+        };
+    }
+
+    function handleComposerChange(snapshot: ComposerDraftSnapshot) {
+        draft = snapshot;
+        composerDrafts.set(activeComposerTargetKey, cachedComposerDraft(snapshot));
+    }
+
+    function switchComposerTarget(target: ConsoleTarget) {
+        const nextKey = `${target.workspaceId}:${target.runtimeId}:${target.workerId}`;
+        if (nextKey === activeComposerTargetKey) return;
+        if (composerInputElement) {
+            composerDrafts.set(
+                activeComposerTargetKey,
+                cachedComposerDraft(composerInputElement.snapshot()),
+            );
+        }
+        activeComposerTargetKey = nextKey;
+        const restored = composerDrafts.get(nextKey) ?? {
+            segments: [],
+            preserveExactText: false,
+        };
+        void tick().then(() => {
+            if (activeComposerTargetKey !== nextKey) return;
+            composerInputElement?.restoreSegments(
+                restored.segments,
+                restored.preserveExactText,
+            );
+        });
+    }
+
+    function handleComposerSubmit() {
         if (workerRunning) {
             sendControl({ method: "cancel" }, "Stop");
             return;
         }
-        void submitDraft(value);
+        void submitDraft(composerInputElement?.snapshot() ?? draft);
     }
 
-    async function submitDraft(value = draft) {
-        const command = buildComposerRequest(value);
+    async function submitDraft(value: ComposerDraftSnapshot) {
+        const command = buildComposerSegmentsRequest(value.segments, {
+            preserveExactText: value.textPastes.length > 0,
+        });
         if (!command.ok) {
             composerNotice = null;
             sendError = command.message;
@@ -546,7 +624,7 @@
         }
         composerNotice = command.notice ?? null;
         if (!command.request) {
-            draft = "";
+            composerInputElement?.clear();
             return;
         }
         if (sending || !inputReady) {
@@ -558,7 +636,7 @@
         try {
             const method = composerRequestToProtocolMethod(command.request);
             sendProtocolMethod(method);
-            draft = "";
+            composerInputElement?.clear();
             if (method.method === "run" || method.method === "notify") {
                 liveWorkerState = "running";
             }
@@ -1242,6 +1320,7 @@
 
     $effect(() => {
         const target = consoleTarget;
+        switchComposerTarget(target);
         const targetWorker = data.worker;
         const targetWorkerError = data.workerError;
         workerViewSelectionGeneration += 1;
@@ -1521,19 +1600,15 @@
 
     <form class="console-composer" onsubmit={sendMessage}>
         <div class="composer-input-shell">
-            <textarea
-                id="worker-console-message"
-                aria-label="Console input"
-                aria-keyshortcuts="Meta+Enter Control+Enter"
-                bind:this={composerTextareaElement}
-                bind:value={draft}
-                use:chatSubmit={{
-                    enabled: canSubmitDraft,
-                    onSubmit: (value) => handleComposerSubmit(value),
-                }}
-                use:fitTextarea={{ value: draft, maxRows: 10 }}
+            <ComposerInput
+                bind:this={composerInputElement}
+                ariaLabel="Console input"
+                ariaKeyShortcuts="Meta+Enter Control+Enter"
+                disabled={!composerEditable}
+                onchange={handleComposerChange}
                 onkeydown={handleComposerKeydown}
-                disabled={!composerEditable}></textarea>
+                onsubmit={handleComposerSubmit}
+            />
             <div class="composer-input-footer">
                 <div class="composer-footer-slot">
                     {#if completionBusy || completionError || completionEntries.length > 0}
@@ -1873,27 +1948,6 @@
 
     .composer-footer-slot {
         min-width: 0;
-    }
-
-    .console-composer textarea {
-        box-sizing: border-box;
-        width: 100%;
-        min-height: 5.35rem;
-        resize: none;
-        overflow-y: hidden;
-        border: 0;
-        border-radius: 14px;
-        background: transparent;
-        padding: 0.55rem 3.4rem 3rem 0.65rem;
-        font: inherit;
-        line-height: 1.45;
-        color: var(--text-strong);
-        outline: none;
-        cursor: text;
-    }
-
-    .console-composer textarea:disabled {
-        color: var(--text-muted);
     }
 
     .composer-send-button {

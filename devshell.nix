@@ -4,10 +4,14 @@ pkgs.mkShell {
     nixfmt
     deno
     git
+    playwright-driver.browsers
     rustc
     cargo
     pkgs.sccache
   ];
+
+  PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
 
   # sccache is additive to Cargo's shared build-dir, so keep its disk usage bounded.
   RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
