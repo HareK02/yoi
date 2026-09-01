@@ -15,6 +15,64 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
+pub const MAX_PLAIN_TEXT_PASTE_CHARS: usize = 50;
+pub const MAX_PLAIN_TEXT_PASTE_LOGICAL_LINES: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasteMeasurement {
+    pub chars: usize,
+    pub logical_lines: usize,
+}
+
+impl PasteMeasurement {
+    pub fn presentation(self) -> PastePresentation {
+        if self.chars <= MAX_PLAIN_TEXT_PASTE_CHARS
+            && self.logical_lines <= MAX_PLAIN_TEXT_PASTE_LOGICAL_LINES
+        {
+            PastePresentation::Text
+        } else {
+            PastePresentation::Chip
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PastePresentation {
+    Text,
+    Chip,
+}
+
+pub fn measure_paste(content: &str) -> PasteMeasurement {
+    PasteMeasurement {
+        chars: content.chars().count(),
+        logical_lines: logical_line_count(content),
+    }
+}
+
+/// Empty content has zero logical lines. Otherwise LF, lone CR, and CRLF each
+/// advance one line; a CRLF pair is one break rather than two.
+pub fn logical_line_count(content: &str) -> usize {
+    if content.is_empty() {
+        return 0;
+    }
+
+    let mut lines = 1;
+    let mut chars = content.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                lines += 1;
+            }
+            '\n' => lines += 1,
+            _ => {}
+        }
+    }
+    lines
+}
+
 #[derive(Debug, Clone)]
 pub struct PasteRef {
     pub id: u32,
@@ -262,16 +320,21 @@ impl InputBuffer {
     }
 
     pub fn insert_paste(&mut self, content: String) {
+        let measurement = measure_paste(&content);
+        if measurement.presentation() == PastePresentation::Text {
+            let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+            self.insert_str(&normalized);
+            return;
+        }
+
         let id = self.next_paste_id;
         self.next_paste_id = self.next_paste_id.wrapping_add(1);
-        let chars = content.chars().count();
-        let lines = content.lines().count().max(1);
         self.atoms.insert(
             self.cursor,
             Atom::Paste(PasteRef {
                 id,
-                chars,
-                lines,
+                chars: measurement.chars,
+                lines: measurement.logical_lines,
                 content,
             }),
         );
@@ -880,6 +943,136 @@ mod render_viewport_tests {
 }
 
 #[cfg(test)]
+mod paste_policy_tests {
+    use super::*;
+    use protocol::Segment;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct Fixture {
+        max_plain_text_chars: usize,
+        max_plain_text_logical_lines: usize,
+        cases: Vec<FixtureCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct FixtureCase {
+        name: String,
+        parts: Vec<FixturePart>,
+        char_count: usize,
+        logical_line_count: usize,
+        presentation: FixturePresentation,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct FixturePart {
+        value: String,
+        repeat: usize,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "lowercase")]
+    enum FixturePresentation {
+        Text,
+        Chip,
+    }
+
+    fn fixture() -> Fixture {
+        serde_json::from_str(include_str!(
+            "../../../tests/fixtures/composer-paste-policy.json"
+        ))
+        .expect("shared composer paste policy fixture must be valid")
+    }
+
+    fn fixture_content(case: &FixtureCase) -> String {
+        case.parts
+            .iter()
+            .map(|part| part.value.repeat(part.repeat))
+            .collect()
+    }
+
+    #[test]
+    fn tui_follows_shared_paste_presentation_contract() {
+        let fixture = fixture();
+        assert_eq!(fixture.max_plain_text_chars, MAX_PLAIN_TEXT_PASTE_CHARS);
+        assert_eq!(
+            fixture.max_plain_text_logical_lines,
+            MAX_PLAIN_TEXT_PASTE_LOGICAL_LINES
+        );
+
+        for case in fixture.cases {
+            let content = fixture_content(&case);
+            let measurement = measure_paste(&content);
+            let expected_presentation = match case.presentation {
+                FixturePresentation::Text => PastePresentation::Text,
+                FixturePresentation::Chip => PastePresentation::Chip,
+            };
+            assert_eq!(measurement.chars, case.char_count, "{} chars", case.name);
+            assert_eq!(
+                measurement.logical_lines, case.logical_line_count,
+                "{} logical lines",
+                case.name
+            );
+            assert_eq!(
+                measurement.presentation(),
+                expected_presentation,
+                "{} presentation",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn short_paste_is_editable_text_at_the_cursor() {
+        let mut buffer = InputBuffer::new();
+        buffer.insert_str("ac");
+        buffer.move_left();
+        buffer.insert_paste("b".to_owned());
+
+        assert_eq!(buffer.plain_text(), "abc");
+        assert!(
+            buffer
+                .atoms
+                .iter()
+                .all(|atom| matches!(atom, Atom::Char(_)))
+        );
+        assert_eq!(
+            buffer.submit_segments(),
+            vec![Segment::text("abc".to_owned())]
+        );
+    }
+
+    #[test]
+    fn short_multiline_paste_normalizes_line_endings_as_text() {
+        let mut buffer = InputBuffer::new();
+        buffer.insert_paste("a\r\nb\rc".to_owned());
+
+        assert_eq!(buffer.plain_text(), "a\nb\nc");
+        assert!(
+            buffer
+                .atoms
+                .iter()
+                .all(|atom| matches!(atom, Atom::Char(_)))
+        );
+        assert_eq!(
+            buffer.submit_segments(),
+            vec![Segment::text("a\nb\nc".to_owned())]
+        );
+    }
+
+    #[test]
+    fn empty_paste_is_a_noop() {
+        let mut buffer = InputBuffer::new();
+        buffer.insert_str("unchanged");
+        let paste_id = buffer.next_paste_id;
+        buffer.insert_paste(String::new());
+
+        assert_eq!(buffer.plain_text(), "unchanged");
+        assert_eq!(buffer.next_paste_id, paste_id);
+    }
+}
+
+#[cfg(test)]
 mod submit_segments_tests {
     use super::*;
     use protocol::Segment;
@@ -904,7 +1097,8 @@ mod submit_segments_tests {
         for c in "see ".chars() {
             buf.insert_char(c);
         }
-        buf.insert_paste("line1\nline2".into());
+        let pasted = "line1\nline2\nline3\nline4";
+        buf.insert_paste(pasted.into());
         for c in " end".chars() {
             buf.insert_char(c);
         }
@@ -921,9 +1115,9 @@ mod submit_segments_tests {
                 content,
                 ..
             } => {
-                assert_eq!(content, "line1\nline2");
-                assert_eq!(*chars, "line1\nline2".chars().count() as u32);
-                assert_eq!(*lines, 2);
+                assert_eq!(content, pasted);
+                assert_eq!(*chars, pasted.chars().count() as u32);
+                assert_eq!(*lines, 4);
             }
             other => panic!("expected Paste, got {other:?}"),
         }
@@ -931,6 +1125,20 @@ mod submit_segments_tests {
             Segment::Text { content } => assert_eq!(content, " end"),
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn restored_direct_paste_remains_a_typed_segment_without_reclassification() {
+        let original = Segment::Paste {
+            id: 7,
+            chars: 1,
+            lines: 1,
+            content: "x".to_owned(),
+        };
+        let mut buf = InputBuffer::new();
+        buf.replace_with_segments(std::slice::from_ref(&original));
+
+        assert_eq!(buf.submit_segments(), vec![original]);
     }
 
     #[test]
@@ -967,7 +1175,7 @@ mod submit_segments_tests {
     #[test]
     fn leading_paste_does_not_emit_empty_text() {
         let mut buf = InputBuffer::new();
-        buf.insert_paste("X".into());
+        buf.insert_paste("X".repeat(MAX_PLAIN_TEXT_PASTE_CHARS + 1));
         let segs = buf.submit_segments();
         assert_eq!(segs.len(), 1);
         assert!(matches!(segs[0], Segment::Paste { .. }));
@@ -1067,7 +1275,7 @@ mod completion_prefix_tests {
     #[test]
     fn trigger_after_chip_atom() {
         let mut buf = InputBuffer::new();
-        buf.insert_paste("X".into());
+        buf.insert_paste("X".repeat(MAX_PLAIN_TEXT_PASTE_CHARS + 1));
         for c in "@sr".chars() {
             buf.insert_char(c);
         }
@@ -1176,7 +1384,7 @@ mod word_motion_tests {
         for c in "foo ".chars() {
             buf.insert_char(c);
         }
-        buf.insert_paste("anything".into());
+        buf.insert_paste("anything".repeat(MAX_PLAIN_TEXT_PASTE_CHARS + 1));
         for c in " bar".chars() {
             buf.insert_char(c);
         }
@@ -1335,7 +1543,7 @@ mod word_motion_tests {
         for c in "foo ".chars() {
             buf.insert_char(c);
         }
-        buf.insert_paste("anything".into());
+        buf.insert_paste("anything".repeat(MAX_PLAIN_TEXT_PASTE_CHARS + 1));
         for c in " bar".chars() {
             buf.insert_char(c);
         }
