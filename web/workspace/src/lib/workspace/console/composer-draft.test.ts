@@ -134,6 +134,70 @@ Deno.test("mixed composer request preserves Paste and parsed file-ref boundaries
   });
 });
 
+Deno.test("short-paste Text preserves CRLF, trailing newline, and surrounding whitespace", () => {
+  const original = "  short\r\npaste\r\n  ";
+  const rendered = "  short\npaste\n  ";
+  const snapshot = snapshotComposerDraft(rendered, new Map(), [{
+    from: 0,
+    to: rendered.length,
+    rendered,
+    content: original,
+  }]);
+
+  assertEquals(snapshot.content, original);
+  assertEquals(snapshot.segments, [{ kind: "text", content: original }]);
+  assertEquals(snapshot.textPastes.length, 1);
+
+  const result = buildComposerSegmentsRequest(snapshot.segments, {
+    preserveExactText: snapshot.textPastes.length > 0,
+  });
+  assert(result.ok);
+  assertEquals(result.request, {
+    kind: "user",
+    content: original,
+    segments: [{ kind: "text", content: original }],
+  });
+});
+
+Deno.test("edited short-paste provenance falls back to visible Text", () => {
+  const snapshot = snapshotComposerDraft("changed", new Map(), [{
+    from: 0,
+    to: 5,
+    rendered: "short",
+    content: "short\r\n",
+  }]);
+
+  assertEquals(snapshot.content, "changed");
+  assertEquals(snapshot.segments, [{ kind: "text", content: "changed" }]);
+  assertEquals(snapshot.textPastes, []);
+});
+
+Deno.test("Paste content beginning with a colon remains opaque user input", () => {
+  const directPaste: Segment = {
+    kind: "paste",
+    id: 3,
+    content: ":not-a-command\r\n",
+    chars: 16,
+    lines: 2,
+  };
+  const direct = buildComposerSegmentsRequest([directPaste]);
+  assert(direct.ok);
+  assertEquals(direct.request, {
+    kind: "user",
+    content: ":not-a-command\r\n",
+    segments: [directPaste],
+  });
+
+  const afterWhitespace = buildComposerSegmentsRequest([
+    { kind: "text", content: "  " },
+    directPaste,
+  ]);
+  assert(afterWhitespace.ok);
+  assert(afterWhitespace.request);
+  assertEquals(afterWhitespace.request.kind, "user");
+  assertEquals(afterWhitespace.request.content, "  :not-a-command\r\n");
+});
+
 Deno.test("plain short-paste Text retains the existing composer request path", () => {
   const result = buildComposerSegmentsRequest([
     { kind: "text", content: "  short\r\npaste\r\n  " },

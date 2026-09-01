@@ -18,12 +18,13 @@
     defaultKeymap,
     history,
     historyKeymap,
+    invertedEffects,
     isolateHistory,
   } from "@codemirror/commands";
   import { onMount } from "svelte";
   import type { Segment } from "$lib/generated/protocol.ts";
   import {
-    handleComposerPaste,
+    measureComposerPaste,
     type ComposerPasteMeasurement,
   } from "$lib/workspace/console/composer-paste.ts";
   import {
@@ -33,6 +34,7 @@
     snapshotComposerDraft,
     type ComposerDraftSnapshot,
     type ComposerPaste,
+    type ComposerTextPaste,
   } from "$lib/workspace/console/composer-draft.ts";
   import { shouldSubmitChatKey } from "$lib/workspace/console/chat-submit.ts";
 
@@ -71,6 +73,37 @@
         next.set(addition.value.key, addition.value.paste);
       }
       return next;
+    },
+  });
+
+  const registerTextPaste = StateEffect.define<ComposerTextPaste>();
+  const restoreTextPastes = StateEffect.define<readonly ComposerTextPaste[]>();
+  const textPasteState = StateField.define<readonly ComposerTextPaste[]>({
+    create: () => [],
+    update(textPastes, transaction) {
+      const restored = transaction.effects.find((effect) =>
+        effect.is(restoreTextPastes)
+      );
+      if (restored) return restored.value;
+      const retained: ComposerTextPaste[] = [];
+      for (const paste of textPastes) {
+        let touched = false;
+        transaction.changes.iterChangedRanges((from, to) => {
+          const replacesContent = from < paste.to && to > paste.from;
+          const insertsInside = from === to && from > paste.from && from < paste.to;
+          if (replacesContent || insertsInside) touched = true;
+        });
+        if (touched) continue;
+        retained.push({
+          ...paste,
+          from: transaction.changes.mapPos(paste.from, 1),
+          to: transaction.changes.mapPos(paste.to, -1),
+        });
+      }
+      for (const effect of transaction.effects) {
+        if (effect.is(registerTextPaste)) retained.push(effect.value);
+      }
+      return retained;
     },
   });
 
@@ -120,15 +153,25 @@
 
   const pasteChips = [
     pasteRegistry,
+    textPasteState,
+    invertedEffects.of((transaction) =>
+      transaction.docChanged
+        ? [restoreTextPastes.of(transaction.startState.field(textPasteState))]
+        : []
+    ),
     EditorView.decorations.of((currentView) => pasteDecorations(currentView.state)),
     EditorView.atomicRanges.of((currentView) => pasteDecorations(currentView.state)),
   ];
 
   function currentSnapshot(state = view?.state): ComposerDraftSnapshot {
     if (!state) {
-      return { document: "", content: "", segments: [], pastes: [] };
+      return { document: "", content: "", segments: [], pastes: [], textPastes: [] };
     }
-    return snapshotComposerDraft(state.doc.toString(), state.field(pasteRegistry));
+    return snapshotComposerDraft(
+      state.doc.toString(),
+      state.field(pasteRegistry),
+      state.field(textPasteState),
+    );
   }
 
   function emitChange(): void {
@@ -155,6 +198,37 @@
     });
   }
 
+  function insertTextPaste(content: string): void {
+    if (!view) return;
+    const selection = view.state.selection.main;
+    const rendered = view.state.toText(content).toString();
+    view.dispatch({
+      changes: { from: selection.from, to: selection.to, insert: rendered },
+      selection: EditorSelection.cursor(selection.from + rendered.length),
+      effects: registerTextPaste.of({
+        from: selection.from,
+        to: selection.from + rendered.length,
+        rendered,
+        content,
+      }),
+      annotations: isolateHistory.of("full"),
+      userEvent: "input.paste",
+    });
+  }
+
+  function handlePasteEvent(event: ClipboardEvent): boolean {
+    const content = event.clipboardData?.getData("text/plain");
+    if (!content) return false;
+    const measurement = measureComposerPaste(content);
+    event.preventDefault();
+    if (measurement.presentation === "chip") {
+      insertPasteChip(content, measurement);
+    } else {
+      insertTextPaste(content);
+    }
+    return true;
+  }
+
   function selectedClipboardContent(state: EditorState): string | null {
     const selection = state.selection.main;
     if (selection.empty) return null;
@@ -166,7 +240,14 @@
         selectedRegistry.set(atom.key, atom);
       }
     }
-    return snapshotComposerDraft(document, selectedRegistry).content;
+    const selectedTextPastes = state.field(textPasteState)
+      .filter((paste) => paste.from >= selection.from && paste.to <= selection.to)
+      .map((paste) => ({
+        ...paste,
+        from: paste.from - selection.from,
+        to: paste.to - selection.from,
+      }));
+    return snapshotComposerDraft(document, selectedRegistry, selectedTextPastes).content;
   }
 
   function deleteAdjacentPasteFromView(
@@ -229,7 +310,7 @@
           }),
           Prec.high(EditorView.domEventHandlers({
             paste(event) {
-              return handleComposerPaste(event, insertPasteChip);
+              return handlePasteEvent(event);
             },
             copy(event, currentView) {
               const content = selectedClipboardContent(currentView.state);
@@ -327,14 +408,28 @@
     });
   }
 
-  export function restoreSegments(segments: readonly Segment[]): void {
+  export function restoreSegments(
+    segments: readonly Segment[],
+    preserveExactText = false,
+  ): void {
     if (!view) return;
     let document = "";
-    const effects: StateEffect<{ key: number; paste: ComposerPaste }>[] = [];
+    const pasteEffects: StateEffect<{ key: number; paste: ComposerPaste }>[] = [];
+    const textEffects: StateEffect<ComposerTextPaste>[] = [];
     let highestPasteId = nextPasteId - 1;
     for (const segment of segments) {
       if (segment.kind === "text") {
-        document += segment.content;
+        const rendered = view.state.toText(segment.content).toString();
+        const from = document.length;
+        document += rendered;
+        if (preserveExactText) {
+          textEffects.push(registerTextPaste.of({
+            from,
+            to: from + rendered.length,
+            rendered,
+            content: segment.content,
+          }));
+        }
       } else if (segment.kind === "paste") {
         const key = nextPasteKey++;
         const paste: ComposerPaste = {
@@ -345,7 +440,7 @@
         };
         highestPasteId = Math.max(highestPasteId, paste.id);
         document += composerPasteToken(key);
-        effects.push(registerPaste.of({ key, paste }));
+        pasteEffects.push(registerPaste.of({ key, paste }));
       } else if (segment.kind === "file_ref") {
         document += `@${segment.path}`;
       }
@@ -354,7 +449,7 @@
     view.dispatch({
       changes: { from: 0, to: view.state.doc.length, insert: document },
       selection: EditorSelection.cursor(document.length),
-      effects,
+      effects: [...pasteEffects, ...textEffects],
       userEvent: "input.restore",
     });
   }

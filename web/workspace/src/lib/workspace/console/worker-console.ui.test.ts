@@ -599,13 +599,15 @@ Deno.test("Worker Console paste chips preserve typed draft and target authority"
     new URL("./ComposerInput.svelte", import.meta.url),
   );
   assert(
-    composerInput.includes("handleComposerPaste(event, insertPasteChip)") &&
+    composerInput.includes('measurement.presentation === "chip"') &&
+      composerInput.includes("registerTextPaste") &&
       composerInput.includes("EditorView.atomicRanges") &&
       composerInput.includes('key: "Backspace"') &&
       composerInput.includes('key: "Delete"') &&
       composerInput.includes('chip.setAttribute("aria-label", label)') &&
-      composerInput.includes("restoreSegments(segments: readonly Segment[])") &&
-      consolePage.includes("buildComposerSegmentsRequest(value.segments)") &&
+      composerInput.includes("preserveExactText = false") &&
+      consolePage.includes("buildComposerSegmentsRequest(value.segments, {") &&
+      consolePage.includes("preserveExactText: value.textPastes.length > 0") &&
       consolePage.includes("composerDrafts.set(activeComposerTargetKey") &&
       consolePage.includes("switchComposerTarget(target)") &&
       consolePage.includes('sendControl({ method: "cancel" }, "Stop")'),

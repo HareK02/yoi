@@ -17,11 +17,19 @@ export interface ComposerPasteAtom extends ComposerPaste {
   to: number;
 }
 
+export interface ComposerTextPaste {
+  from: number;
+  to: number;
+  rendered: string;
+  content: string;
+}
+
 export interface ComposerDraftSnapshot {
   document: string;
   content: string;
   segments: Segment[];
   pastes: ComposerPasteAtom[];
+  textPastes: ComposerTextPaste[];
 }
 
 export function composerPasteToken(key: number): string {
@@ -60,32 +68,60 @@ function appendTextSegment(segments: Segment[], content: string): void {
 export function snapshotComposerDraft(
   document: string,
   registry: ReadonlyMap<number, ComposerPaste>,
+  candidateTextPastes: readonly ComposerTextPaste[] = [],
 ): ComposerDraftSnapshot {
   const pastes = composerPasteAtoms(document, registry);
+  const textPastes = candidateTextPastes
+    .filter((paste) =>
+      paste.from >= 0 &&
+      paste.to <= document.length &&
+      document.slice(paste.from, paste.to) === paste.rendered
+    )
+    .sort((left, right) => left.from - right.from);
+  const events = [
+    ...pastes.map((paste) => ({
+      kind: "paste" as const,
+      from: paste.from,
+      to: paste.to,
+      paste,
+    })),
+    ...textPastes.map((paste) => ({
+      kind: "text_paste" as const,
+      from: paste.from,
+      to: paste.to,
+      paste,
+    })),
+  ].sort((left, right) => left.from - right.from);
   const segments: Segment[] = [];
   let content = "";
   let cursor = 0;
 
-  for (const paste of pastes) {
-    const text = document.slice(cursor, paste.from);
+  for (const event of events) {
+    if (event.from < cursor) continue;
+    const text = document.slice(cursor, event.from);
     appendTextSegment(segments, text);
     content += text;
-    segments.push({
-      kind: "paste",
-      id: paste.id,
-      content: paste.content,
-      chars: paste.chars,
-      lines: paste.lines,
-    });
-    content += paste.content;
-    cursor = paste.to;
+
+    if (event.kind === "paste") {
+      segments.push({
+        kind: "paste",
+        id: event.paste.id,
+        content: event.paste.content,
+        chars: event.paste.chars,
+        lines: event.paste.lines,
+      });
+    } else {
+      appendTextSegment(segments, event.paste.content);
+    }
+    content += event.paste.content;
+    cursor = event.to;
   }
 
   const trailingText = document.slice(cursor);
   appendTextSegment(segments, trailingText);
   content += trailingText;
 
-  return { document, content, segments, pastes };
+  return { document, content, segments, pastes, textPastes };
 }
 
 export function pasteChipLabel(paste: ComposerPaste): string {

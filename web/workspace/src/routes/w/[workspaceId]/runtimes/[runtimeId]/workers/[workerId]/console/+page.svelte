@@ -109,7 +109,15 @@
         cursor(): number;
         replaceRange(from: number, to: number, content: string): void;
         clear(): void;
-        restoreSegments(segments: readonly Segment[]): void;
+        restoreSegments(
+            segments: readonly Segment[],
+            preserveExactText?: boolean,
+        ): void;
+    };
+
+    type ComposerDraftCache = {
+        segments: Segment[];
+        preserveExactText: boolean;
     };
 
     const EMPTY_DRAFT: ComposerDraftSnapshot = {
@@ -117,6 +125,7 @@
         content: "",
         segments: [],
         pastes: [],
+        textPastes: [],
     };
 
     let draft = $state<ComposerDraftSnapshot>(EMPTY_DRAFT);
@@ -149,7 +158,7 @@
     let composerInputElement = $state<
         (SvelteComponent & ComposerInputHandle) | null
     >(null);
-    const composerDrafts = new Map<string, Segment[]>();
+    const composerDrafts = new Map<string, ComposerDraftCache>();
     let activeComposerTargetKey = untrack(
         () => `${workspaceId}:${runtimeId}:${workerId}`,
     );
@@ -549,9 +558,16 @@
         }
     }
 
+    function cachedComposerDraft(snapshot: ComposerDraftSnapshot): ComposerDraftCache {
+        return {
+            segments: [...snapshot.segments],
+            preserveExactText: snapshot.textPastes.length > 0,
+        };
+    }
+
     function handleComposerChange(snapshot: ComposerDraftSnapshot) {
         draft = snapshot;
-        composerDrafts.set(activeComposerTargetKey, [...snapshot.segments]);
+        composerDrafts.set(activeComposerTargetKey, cachedComposerDraft(snapshot));
     }
 
     function switchComposerTarget(target: ConsoleTarget) {
@@ -560,14 +576,20 @@
         if (composerInputElement) {
             composerDrafts.set(
                 activeComposerTargetKey,
-                [...composerInputElement.snapshot().segments],
+                cachedComposerDraft(composerInputElement.snapshot()),
             );
         }
         activeComposerTargetKey = nextKey;
-        const restored = composerDrafts.get(nextKey) ?? [];
+        const restored = composerDrafts.get(nextKey) ?? {
+            segments: [],
+            preserveExactText: false,
+        };
         void tick().then(() => {
             if (activeComposerTargetKey !== nextKey) return;
-            composerInputElement?.restoreSegments(restored);
+            composerInputElement?.restoreSegments(
+                restored.segments,
+                restored.preserveExactText,
+            );
         });
     }
 
@@ -580,7 +602,9 @@
     }
 
     async function submitDraft(value: ComposerDraftSnapshot) {
-        const command = buildComposerSegmentsRequest(value.segments);
+        const command = buildComposerSegmentsRequest(value.segments, {
+            preserveExactText: value.textPastes.length > 0,
+        });
         if (!command.ok) {
             composerNotice = null;
             sendError = command.message;

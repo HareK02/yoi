@@ -80,20 +80,44 @@ export function buildComposerRequest(value: string): ComposerCommandResult {
   };
 }
 
+export interface ComposerSegmentsRequestOptions {
+  preserveExactText?: boolean;
+}
+
 export function buildComposerSegmentsRequest(
   sourceSegments: readonly Segment[],
+  options: ComposerSegmentsRequestOptions = {},
 ): ComposerCommandResult {
   const hasPaste = sourceSegments.some((segment) => segment.kind === "paste");
   if (!hasPaste) {
     const content = sourceSegments.map(segmentContent).join("");
-    return buildComposerRequest(content);
+    if (!options.preserveExactText || content.trimStart().startsWith(":")) {
+      return buildComposerRequest(content);
+    }
+    if (!content.trim()) {
+      return { ok: false, message: "Input is empty." };
+    }
+    const segments = coalesceTextSegments(
+      sourceSegments.flatMap((segment) =>
+        segment.kind === "text"
+          ? parseSigilSegments(segment.content)
+          : [segment]
+      ),
+    );
+    return {
+      ok: true,
+      request: { kind: "user", content, segments },
+    };
   }
 
   const content = sourceSegments.map(segmentContent).join("");
   if (!content.trim()) {
     return { ok: false, message: "Input is empty." };
   }
-  if (content.trimStart().startsWith(":")) {
+  const leadingText = sourceSegments[0]?.kind === "text"
+    ? sourceSegments[0].content
+    : "";
+  if (leadingText.trimStart().startsWith(":")) {
     return {
       ok: false,
       message:
