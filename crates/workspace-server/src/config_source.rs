@@ -874,7 +874,7 @@ mod tests {
     fn workspace() -> WorkspaceRecord {
         WorkspaceRecord {
             workspace_id: "w-config".into(),
-            owner_account_id: None,
+            owner_account_id: "owner-account".to_string(),
             display_name: "Config".into(),
             state: "active".into(),
             created_at: "2026-08-13T00:00:00Z".into(),

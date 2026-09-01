@@ -1056,8 +1056,13 @@ mod tests {
         let s = SqliteWorkspaceStore::in_memory().unwrap();
         s.with_conn(|c| {
             c.execute(
-                "INSERT INTO workspaces(workspace_id,display_name,state,created_at,updated_at) \
-                 VALUES('w','W','active','t','t')",
+                "INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at) \
+                 VALUES('owner-account','user','owner-account','Owner Account','t','t')",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO workspaces(workspace_id,display_name,state,created_at,updated_at,owner_account_id) \
+                 VALUES('w','W','active','t','t','owner-account')",
                 [],
             )?;
             c.execute(
@@ -1730,9 +1735,17 @@ mod tests {
             crate::store::apply_migrations_through(&connection, 27).unwrap();
             connection
                 .execute(
+                    "INSERT INTO accounts(
+                        account_id, kind, handle, display_name, created_at, updated_at
+                     ) VALUES ('owner-account', 'user', 'owner-account', 'Owner Account', 'old', 'old')",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
                     "INSERT INTO workspaces(
-                        workspace_id, display_name, state, created_at, updated_at
-                     ) VALUES ('legacy', 'Legacy', 'active', 'old', 'old')",
+                        workspace_id, display_name, state, created_at, updated_at, owner_account_id
+                     ) VALUES ('legacy', 'Legacy', 'active', 'old', 'old', 'owner-account')",
                     [],
                 )
                 .unwrap();

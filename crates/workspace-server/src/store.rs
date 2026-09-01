@@ -262,6 +262,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "bind Workdir create repository access evidence",
         apply: bind_workdir_create_repository_access_evidence,
     },
+    Migration {
+        version: 48,
+        name: "require one account owner for every Workspace",
+        apply: require_workspace_account_owner,
+    },
 ];
 
 struct Migration {
@@ -284,9 +289,9 @@ pub struct WorkspaceStoreMigrationPlan {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceRecord {
     pub workspace_id: String,
-    /// Account/namespace owner abstraction. `None` is allowed for legacy/local
-    /// workspaces until a user account is bootstrapped.
-    pub owner_account_id: Option<String>,
+    /// Existing user Account that owns this Workspace. Owner transfer is a separate
+    /// audited domain operation; ordinary upserts must preserve this identity.
+    pub owner_account_id: String,
     pub display_name: String,
     pub state: String,
     pub created_at: String,
@@ -1784,12 +1789,52 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     async fn upsert_workspace(&self, record: &WorkspaceRecord) -> Result<()> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            #[cfg(test)]
+            if record.owner_account_id == "owner-account" {
+                // Unrelated store tests use this explicit fixture identity. Keep the
+                // production owner contract strict while giving those fixtures a real
+                // User Account row instead of reviving ownerless Workspace setup.
+                tx.execute(
+                    "INSERT OR IGNORE INTO accounts (
+                         account_id, kind, handle, display_name, created_at, updated_at
+                     ) VALUES (?1, 'user', 'owner-account', 'Owner Account', ?2, ?2)",
+                    params![record.owner_account_id.as_str(), record.created_at.as_str()],
+                )?;
+            }
+            let owner_kind = tx
+                .query_row(
+                    "SELECT kind FROM accounts WHERE account_id = ?1",
+                    params![record.owner_account_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if owner_kind.as_deref() != Some("user") {
+                return Err(Error::Store(format!(
+                    "Workspace owner `{}` must reference an existing User Account",
+                    record.owner_account_id
+                )));
+            }
+            let current_owner = tx
+                .query_row(
+                    "SELECT owner_account_id FROM workspaces WHERE workspace_id = ?1",
+                    params![record.workspace_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if current_owner
+                .as_deref()
+                .is_some_and(|owner| owner != record.owner_account_id)
+            {
+                return Err(Error::Store(format!(
+                    "Workspace `{}` owner is immutable through upsert",
+                    record.workspace_id
+                )));
+            }
             tx.execute(
                 r#"INSERT INTO workspaces (
                     workspace_id, owner_account_id, display_name, state, created_at, updated_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                 ON CONFLICT(workspace_id) DO UPDATE SET
-                    owner_account_id = COALESCE(excluded.owner_account_id, workspaces.owner_account_id),
                     display_name = excluded.display_name,
                     state = excluded.state,
                     updated_at = excluded.updated_at"#,
@@ -1833,6 +1878,19 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<WorkspaceBootstrapResult> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let owner_kind = tx
+                .query_row(
+                    "SELECT kind FROM accounts WHERE account_id = ?1",
+                    params![record.workspace.owner_account_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if owner_kind.as_deref() != Some("user") {
+                return Err(Error::Store(format!(
+                    "Workspace owner `{}` must reference an existing User Account",
+                    record.workspace.owner_account_id
+                )));
+            }
             if let Some((fingerprint, workspace_id)) = tx
                 .query_row(
                     "SELECT request_fingerprint, workspace_id FROM workspace_create_operations WHERE operation_key = ?1",
@@ -6946,6 +7004,72 @@ fn bind_workdir_create_repository_access_evidence(conn: &Connection) -> Result<(
     Ok(())
 }
 
+fn require_workspace_account_owner(conn: &Connection) -> Result<()> {
+    let workspace_schema_objects = {
+        let mut statement = conn.prepare(
+            "SELECT sql FROM sqlite_schema \
+             WHERE tbl_name = 'workspaces' \
+               AND type IN ('index', 'trigger') \
+               AND sql IS NOT NULL \
+             ORDER BY type, name",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let invalid_workspace_owners = conn.query_row(
+        "SELECT COUNT(*) \
+         FROM workspaces AS workspace \
+         LEFT JOIN accounts AS owner ON owner.account_id = workspace.owner_account_id \
+         WHERE workspace.owner_account_id IS NULL \
+            OR owner.account_id IS NULL \
+            OR owner.kind <> 'user'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_workspace_owners != 0 {
+        return Err(Error::Store(format!(
+            "Workspace owner migration requires one explicit User Account owner for every Workspace; found {invalid_workspace_owners} Workspace record(s) without a valid User Account owner"
+        )));
+    }
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE workspaces_v48 (
+            workspace_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            state TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            owner_account_id TEXT NOT NULL,
+            FOREIGN KEY (owner_account_id) REFERENCES accounts(account_id) ON DELETE RESTRICT
+        );
+        INSERT INTO workspaces_v48 (
+            workspace_id,
+            display_name,
+            state,
+            created_at,
+            updated_at,
+            owner_account_id
+        )
+        SELECT
+            workspace_id,
+            display_name,
+            state,
+            created_at,
+            updated_at,
+            owner_account_id
+        FROM workspaces;
+        DROP TABLE workspaces;
+        ALTER TABLE workspaces_v48 RENAME TO workspaces;
+        "#,
+    )?;
+    for sql in workspace_schema_objects {
+        conn.execute_batch(&sql)?;
+    }
+    Ok(())
+}
+
 fn create_workspace_catalog_operations(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -9293,6 +9417,64 @@ pub(crate) fn apply_migrations_through(conn: &Connection, through_version: i64) 
             continue;
         }
 
+        if migration.version == 48 {
+            // Rebuilding the parent Workspace table requires FK enforcement to be disabled
+            // outside the transaction. The migration, verification, and schema marker still
+            // commit atomically as one exclusive operation.
+            conn.execute_batch(
+                "PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON; BEGIN EXCLUSIVE;",
+            )?;
+            let result = (|| -> Result<()> {
+                (migration.apply)(conn)?;
+                let dangling_reference: Option<(String, String)> = conn
+                    .query_row(
+                        "SELECT name, sql FROM sqlite_schema \
+                         WHERE sql LIKE '%workspaces_v48%' LIMIT 1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((object, sql)) = dangling_reference {
+                    return Err(Error::Store(format!(
+                        "migration 48 left a temporary Workspace reference in `{object}`: {sql}"
+                    )));
+                }
+                let foreign_key_failures: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get(0)
+                    })?;
+                if foreign_key_failures != 0 {
+                    return Err(Error::Store(format!(
+                        "migration 48 found {foreign_key_failures} foreign key violation(s)"
+                    )));
+                }
+                conn.execute(
+                    "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+                    params![migration.version, migration.name],
+                )?;
+                conn.execute_batch("COMMIT;")?;
+                Ok(())
+            })();
+            if result.is_err() && !conn.is_autocommit() {
+                conn.execute_batch("ROLLBACK;")?;
+            }
+            conn.execute_batch("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;")
+                .map_err(|error| {
+                    Error::Store(format!(
+                        "migration 48 could not restore FK enforcement: {error}"
+                    ))
+                })?;
+            let foreign_keys_enabled =
+                conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))?;
+            if foreign_keys_enabled != 1 {
+                return Err(Error::Store(
+                    "migration 48 did not restore foreign key enforcement".to_string(),
+                ));
+            }
+            result?;
+            continue;
+        }
+
         let tx = conn.unchecked_transaction()?;
         if migration.version == 37 {
             crate::retention::repair_worker_diagnostics_archive_table(&tx)?;
@@ -9799,6 +9981,22 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    fn assign_explicit_test_workspace_owner(conn: &Connection) {
+        conn.execute(
+            "INSERT OR IGNORE INTO accounts (
+                 account_id, kind, handle, display_name, created_at, updated_at
+             ) VALUES ('owner-account', 'user', 'owner-account', 'Owner Account', '1', '1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE workspaces SET owner_account_id = 'owner-account' \
+             WHERE owner_account_id IS NULL",
+            [],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn schema_v44_migrates_repository_sources_without_promoting_legacy_auth_refs() {
         let conn = Connection::open_in_memory().unwrap();
@@ -9829,9 +10027,10 @@ mod tests {
             .unwrap();
         }
 
+        assign_explicit_test_workspace_owner(&conn);
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 47);
+        assert_eq!(current_schema_version(&conn).unwrap(), 48);
         let remote = conn
             .query_row(
                 "SELECT source_kind, source_uri, source_revision, source_fingerprint, observed_status \
@@ -9905,11 +10104,12 @@ mod tests {
                  ) VALUES ('workspace-a', 'runtime-a', 7, 'Worker 7', 'normal', '1', '1');",
             )
             .unwrap();
+            assign_explicit_test_workspace_owner(&conn);
         }
         let before = std::fs::read(&path).unwrap();
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 36);
-        assert_eq!(plan.target_schema_version, 47);
+        assert_eq!(plan.target_schema_version, 48);
         assert!(plan.migration_required);
         assert_eq!(plan.worker_count, 1);
         assert_eq!(plan.mappings[0].legacy_worker_id, 7);
@@ -9923,7 +10123,7 @@ mod tests {
         store
             .with_conn(|conn| {
                 assert!(table_exists(conn, "worker_diagnostics_archives")?);
-                assert_eq!(current_schema_version(conn)?, 47);
+                assert_eq!(current_schema_version(conn)?, 48);
                 Ok(())
             })
             .unwrap();
@@ -9939,9 +10139,12 @@ mod tests {
             apply_migrations(&conn).unwrap();
             conn.execute_batch(
                 r#"
+                INSERT INTO accounts (
+                    account_id, kind, handle, display_name, created_at, updated_at
+                ) VALUES ('owner-account', 'user', 'owner-account', 'Owner Account', '1', '1');
                 INSERT INTO workspaces (
-                    workspace_id, display_name, state, created_at, updated_at
-                ) VALUES ('workspace-a', 'Workspace A', 'active', '1', '1');
+                    workspace_id, owner_account_id, display_name, state, created_at, updated_at
+                ) VALUES ('workspace-a', 'owner-account', 'Workspace A', 'active', '1', '1');
                 INSERT INTO typed_tickets (
                     workspace_id, ticket_id, slug, title, status, kind, priority, body,
                     workflow_state, workflow_state_explicit
@@ -10024,6 +10227,7 @@ mod tests {
         }
 
         ticket::migrate_sqlite_ticket_schema_through(&conn, 5).unwrap();
+        assign_explicit_test_workspace_owner(&conn);
         apply_migrations(&conn).unwrap();
         let mut statement = conn
             .prepare(
@@ -10059,7 +10263,7 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(current_schema_version(&conn).unwrap(), 47);
+        assert_eq!(current_schema_version(&conn).unwrap(), 48);
         let foreign_key_error: Option<String> = conn
             .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
             .optional()
@@ -10186,9 +10390,10 @@ INSERT INTO worker_orphan_diagnostics (
         assert_eq!(current_schema_version(&conn).unwrap(), 34);
         assert!(table_exists(&conn, "worker_control_delegation_operations").unwrap());
 
+        assign_explicit_test_workspace_owner(&conn);
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 47);
+        assert_eq!(current_schema_version(&conn).unwrap(), 48);
         assert!(!table_exists(&conn, "worker_control_delegation_operations").unwrap());
         let controller_worker_id: String = conn
             .query_row(
@@ -10306,7 +10511,7 @@ INSERT INTO worker_orphan_diagnostics (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 47);
+        assert_eq!(current_schema_version(&conn).unwrap(), 48);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
     }
 
@@ -10322,9 +10527,10 @@ INSERT INTO worker_orphan_diagnostics (
         )
         .unwrap();
 
+        assign_explicit_test_workspace_owner(&conn);
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 47);
+        assert_eq!(current_schema_version(&conn).unwrap(), 48);
         let settings = conn
             .query_row(
                 "SELECT settings_revision, language FROM workspace_memory_settings \
@@ -10365,7 +10571,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 47);
+        assert_eq!(current_schema_version(&conn).unwrap(), 48);
         assert!(table_exists(&conn, "flow_sources").unwrap());
         assert!(table_exists(&conn, "flow_source_revisions").unwrap());
         assert!(!table_exists(&conn, "flow_instances").unwrap());
@@ -10430,9 +10636,10 @@ INSERT INTO worker_workdir_attachment_reservations (
         )
         .unwrap();
 
+        assign_explicit_test_workspace_owner(&conn);
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 47);
+        assert_eq!(current_schema_version(&conn).unwrap(), 48);
         let repositories_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",
@@ -10561,7 +10768,7 @@ INSERT INTO workdir_registry (
             store
                 .upsert_workspace(&WorkspaceRecord {
                     workspace_id: workspace_id.to_string(),
-                    owner_account_id: None,
+                    owner_account_id: "owner-account".to_string(),
                     display_name: workspace_id.to_string(),
                     state: "active".to_string(),
                     created_at: "1".to_string(),
@@ -10615,7 +10822,7 @@ INSERT INTO workdir_registry (
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 47);
+        assert_eq!(store.schema_version().await.unwrap(), 48);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -10623,7 +10830,7 @@ INSERT INTO workdir_registry (
         );
         let record = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
-            owner_account_id: None,
+            owner_account_id: "owner-account".to_string(),
             display_name: "Yoi Dev".to_string(),
             state: "active".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -10632,7 +10839,7 @@ INSERT INTO workdir_registry (
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 47);
+        assert_eq!(reopened.schema_version().await.unwrap(), 48);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -10646,7 +10853,7 @@ INSERT INTO workdir_registry (
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-a".into(),
-                owner_account_id: None,
+                owner_account_id: "owner-account".to_string(),
                 display_name: "Workspace A".into(),
                 state: "active".into(),
                 created_at: "1".into(),
@@ -10692,7 +10899,7 @@ INSERT INTO workdir_registry (
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-a".to_string(),
-                owner_account_id: None,
+                owner_account_id: "owner-account".to_string(),
                 display_name: "Workspace A".to_string(),
                 state: "active".to_string(),
                 created_at: "2026-08-06T00:00:00Z".to_string(),
@@ -10865,7 +11072,7 @@ INSERT INTO workdir_registry (
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-a".to_string(),
-                owner_account_id: None,
+                owner_account_id: "owner-account".to_string(),
                 display_name: "Workspace A".to_string(),
                 state: "active".to_string(),
                 created_at: "2026-08-06T00:00:00Z".to_string(),
@@ -10941,7 +11148,7 @@ INSERT INTO workdir_registry (
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-a".to_string(),
-                owner_account_id: None,
+                owner_account_id: "owner-account".to_string(),
                 display_name: "Workspace A".to_string(),
                 state: "active".to_string(),
                 created_at: "2026-07-32T00:00:00Z".to_string(),
@@ -11231,7 +11438,7 @@ INSERT INTO worker_registry (
                 workspace_id: "workspace-legacy".to_string(),
                 display_name: "Legacy".to_string(),
                 state: "active".to_string(),
-                owner_account_id: None,
+                owner_account_id: "owner-account".to_string(),
                 created_at: "2026-09-01T00:00:00Z".to_string(),
                 updated_at: "2026-09-01T00:00:00Z".to_string(),
             })
@@ -11378,6 +11585,7 @@ INSERT INTO worker_registry (
             "#,
         )
         .unwrap();
+        assign_explicit_test_workspace_owner(&conn);
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM ticket_current_worker_assignments",
@@ -11397,7 +11605,7 @@ INSERT INTO worker_registry (
         let migrated = SqliteWorkspaceStore::open(&db_path).unwrap();
         migrated
             .with_conn(|conn| {
-                assert_eq!(current_schema_version(conn)?, 47);
+                assert_eq!(current_schema_version(conn)?, 48);
                 assert_eq!(
                     conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))?,
                     1,
@@ -11474,7 +11682,7 @@ INSERT INTO worker_registry (
                 workspace_id: "workspace-role".to_string(),
                 display_name: "Role Workspace".to_string(),
                 state: "active".to_string(),
-                owner_account_id: None,
+                owner_account_id: "owner-account".to_string(),
                 created_at: "2026-09-01T00:00:00Z".to_string(),
                 updated_at: "2026-09-01T00:00:00Z".to_string(),
             })
@@ -11757,13 +11965,13 @@ INSERT INTO worker_registry (
              ALTER TABLE workdir_registry DROP COLUMN creation_tree;
              ALTER TABLE workdir_registry DROP COLUMN current_tree;
              ALTER TABLE workdir_registry DROP COLUMN observed_at_epoch_seconds;
-             DELETE FROM __yoi_schema_migrations WHERE version IN (45, 46, 47);",
+             DELETE FROM __yoi_schema_migrations WHERE version IN (45, 46, 47, 48);",
         )
         .unwrap();
         assert_eq!(current_schema_version(&conn).unwrap(), 44);
 
         apply_migrations(&conn).unwrap();
-        assert_eq!(current_schema_version(&conn).unwrap(), 47);
+        assert_eq!(current_schema_version(&conn).unwrap(), 48);
         assert!(table_exists(&conn, "workdir_create_operations").unwrap());
         let columns = table_columns(&conn, "workdir_create_operations").unwrap();
         for required in [
@@ -11808,13 +12016,13 @@ INSERT INTO worker_registry (
              ALTER TABLE workdir_create_operations DROP COLUMN host_trust_revision;
              ALTER TABLE workdir_create_operations DROP COLUMN repository_access_mode;
              ALTER TABLE workdir_create_operations DROP COLUMN cache_generation;
-             DELETE FROM __yoi_schema_migrations WHERE version IN (46, 47);",
+             DELETE FROM __yoi_schema_migrations WHERE version IN (46, 47, 48);",
         )
         .unwrap();
         assert_eq!(current_schema_version(&conn).unwrap(), 45);
 
         apply_migrations(&conn).unwrap();
-        assert_eq!(current_schema_version(&conn).unwrap(), 47);
+        assert_eq!(current_schema_version(&conn).unwrap(), 48);
         for table in [
             "repository_ssh_credentials",
             "repository_ssh_credential_revisions",
@@ -11852,13 +12060,13 @@ INSERT INTO worker_registry (
              ALTER TABLE workdir_create_operations DROP COLUMN host_trust_revision;
              ALTER TABLE workdir_create_operations DROP COLUMN repository_access_mode;
              ALTER TABLE workdir_create_operations DROP COLUMN cache_generation;
-             DELETE FROM __yoi_schema_migrations WHERE version = 47;",
+             DELETE FROM __yoi_schema_migrations WHERE version IN (47, 48);",
         )
         .unwrap();
         assert_eq!(current_schema_version(&conn).unwrap(), 46);
 
         apply_migrations(&conn).unwrap();
-        assert_eq!(current_schema_version(&conn).unwrap(), 47);
+        assert_eq!(current_schema_version(&conn).unwrap(), 48);
         let columns = table_columns(&conn, "workdir_create_operations").unwrap();
         for required in [
             "source_kind",
@@ -11892,13 +12100,13 @@ INSERT INTO worker_registry (
         configure_sqlite(&conn).unwrap();
         apply_migrations(&conn).unwrap();
         conn.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (48, 'future')",
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (49, 'future')",
             [],
         )
         .unwrap();
 
         let error = apply_migrations(&conn).unwrap_err().to_string();
-        assert!(error.contains("schema version 48 is newer"), "{error}");
+        assert!(error.contains("schema version 49 is newer"), "{error}");
         assert!(error.contains("refusing to serve"), "{error}");
     }
 
@@ -11936,8 +12144,10 @@ INSERT INTO worker_registry (
             .with_conn(|conn| {
                 conn.execute_batch(
                     r#"
-INSERT INTO workspaces (workspace_id, display_name, state, created_at, updated_at)
-VALUES ('workspace-a', 'A', 'active', '2026-01-01', '2026-01-01');
+INSERT INTO accounts (account_id, kind, handle, display_name, created_at, updated_at)
+VALUES ('owner-account', 'user', 'owner-account', 'Owner Account', '2026-01-01', '2026-01-01');
+INSERT INTO workspaces (workspace_id, owner_account_id, display_name, state, created_at, updated_at)
+VALUES ('workspace-a', 'owner-account', 'A', 'active', '2026-01-01', '2026-01-01');
 INSERT INTO typed_tickets (
     workspace_id, ticket_id, slug, title, status, kind, priority, body,
     workflow_state, workflow_state_explicit
@@ -11958,8 +12168,8 @@ DELETE FROM worker_registry
 WHERE workspace_id = 'workspace-a' AND worker_id = '00000000-0000-7000-8000-000000000001';
 DELETE FROM typed_tickets
 WHERE workspace_id = 'workspace-a' AND ticket_id = 'ticket-a';
-INSERT INTO workspaces (workspace_id, display_name, state, created_at, updated_at)
-VALUES ('workspace-b', 'B', 'active', '2026-01-01', '2026-01-01');
+INSERT INTO workspaces (workspace_id, owner_account_id, display_name, state, created_at, updated_at)
+VALUES ('workspace-b', 'owner-account', 'B', 'active', '2026-01-01', '2026-01-01');
 INSERT INTO typed_tickets (
     workspace_id, ticket_id, slug, title, status, kind, priority, body,
     workflow_state, workflow_state_explicit
@@ -12117,9 +12327,10 @@ VALUES ('workspace-b', 'ticket-b', 'related', 'ticket-a', NULL, 'tester', '2026-
         )
         .unwrap();
 
+        assign_explicit_test_workspace_owner(&conn);
         apply_migrations(&mut conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 47);
+        assert_eq!(current_schema_version(&conn).unwrap(), 48);
         let workspace_id: Option<String> = conn
             .query_row(
                 "SELECT workspace_id FROM trusted_runtime_records WHERE runtime_id = 'runtime-a'",
@@ -12469,6 +12680,7 @@ WHERE workspace_id = 'workspace-a'
 "#,
         )
         .unwrap();
+        assign_explicit_test_workspace_owner(&conn);
 
         assert_eq!(
             legacy_assignment_worker_tombstone_repairs(&conn)
@@ -12743,9 +12955,11 @@ WHERE workspace_id = 'workspace-a'
             [],
         )
         .unwrap();
+        apply_migrations_through(&conn, 47).unwrap();
+        assign_explicit_test_workspace_owner(&conn);
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 47);
+        assert_eq!(store.schema_version().await.unwrap(), 48);
 
         store
             .with_conn(|conn| {
@@ -12825,7 +13039,7 @@ WHERE workspace_id = 'workspace-a'
             store.get_workspace("legacy-workspace").await.unwrap(),
             Some(WorkspaceRecord {
                 workspace_id: "legacy-workspace".to_string(),
-                owner_account_id: None,
+                owner_account_id: "owner-account".to_string(),
                 display_name: "Legacy Workspace".to_string(),
                 state: "active".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -12835,7 +13049,7 @@ WHERE workspace_id = 'workspace-a'
 
         let new_record = WorkspaceRecord {
             workspace_id: "new-workspace".to_string(),
-            owner_account_id: None,
+            owner_account_id: "owner-account".to_string(),
             display_name: "New Workspace".to_string(),
             state: "active".to_string(),
             created_at: "2026-02-01T00:00:00Z".to_string(),
@@ -12934,10 +13148,10 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 47);
+        assert_eq!(store.schema_version().await.unwrap(), 48);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
-            owner_account_id: None,
+            owner_account_id: "owner-account".to_string(),
             display_name: "Local Dev".to_string(),
             state: "active".to_string(),
             created_at: "1".to_string(),
@@ -12984,7 +13198,7 @@ CREATE TABLE ticket_assignment_operations (
 
         let other_workspace = WorkspaceRecord {
             workspace_id: "other-workspace".to_string(),
-            owner_account_id: None,
+            owner_account_id: "owner-account".to_string(),
             display_name: "Other Workspace".to_string(),
             state: "active".to_string(),
             created_at: "3".to_string(),
@@ -13012,10 +13226,10 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 47);
+        assert_eq!(store.schema_version().await.unwrap(), 48);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
-            owner_account_id: None,
+            owner_account_id: "owner-account".to_string(),
             display_name: "Local Dev".to_string(),
             state: "active".to_string(),
             created_at: "1".to_string(),
@@ -13091,7 +13305,7 @@ CREATE TABLE ticket_assignment_operations (
         let store = SqliteWorkspaceStore::open(&db).unwrap();
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
-            owner_account_id: None,
+            owner_account_id: "owner-account".to_string(),
             display_name: "Local Dev".to_string(),
             state: "active".to_string(),
             created_at: "1".to_string(),
@@ -13302,7 +13516,7 @@ CREATE TABLE ticket_assignment_operations (
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-control".to_string(),
-                owner_account_id: None,
+                owner_account_id: "owner-account".to_string(),
                 display_name: "Control grants".to_string(),
                 state: "active".to_string(),
                 created_at: "2026-07-27T00:00:00Z".to_string(),
@@ -13425,7 +13639,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 47);
+        assert_eq!(store.schema_version().await.unwrap(), 48);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),
@@ -13456,7 +13670,7 @@ CREATE TABLE ticket_assignment_operations (
 
         let workspace = WorkspaceRecord {
             workspace_id: "workspace".to_string(),
-            owner_account_id: Some(account.account_id.clone()),
+            owner_account_id: account.account_id.clone(),
             display_name: "Workspace".to_string(),
             state: "active".to_string(),
             created_at: now.clone(),
@@ -13707,6 +13921,191 @@ CREATE TABLE ticket_assignment_operations (
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_upsert_preserves_owner_identity() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        for (account_id, handle) in [("owner-a", "owner-a"), ("owner-b", "owner-b")] {
+            store
+                .upsert_account(&AccountRecord {
+                    account_id: account_id.to_string(),
+                    kind: "user".to_string(),
+                    handle: handle.to_string(),
+                    display_name: handle.to_string(),
+                    created_at: "2026-09-01T00:00:00Z".to_string(),
+                    updated_at: "2026-09-01T00:00:00Z".to_string(),
+                })
+                .unwrap();
+        }
+        let mut workspace = WorkspaceRecord {
+            workspace_id: "workspace-owner-immutable".to_string(),
+            display_name: "Original".to_string(),
+            state: "active".to_string(),
+            owner_account_id: "owner-a".to_string(),
+            created_at: "2026-09-01T00:00:00Z".to_string(),
+            updated_at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        store.upsert_workspace(&workspace).await.unwrap();
+        workspace.display_name = "Updated".to_string();
+        store.upsert_workspace(&workspace).await.unwrap();
+        workspace.owner_account_id = "owner-b".to_string();
+        let error = store
+            .upsert_workspace(&workspace)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("owner is immutable"), "{error}");
+        let persisted = store
+            .get_workspace("workspace-owner-immutable")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.owner_account_id, "owner-a");
+        assert_eq!(persisted.display_name, "Updated");
+    }
+
+    #[test]
+    fn workspace_owner_migration_fails_closed_for_ownerless_records() {
+        let conn = workspace_owner_schema_47();
+        conn.execute(
+            "INSERT INTO workspaces (workspace_id, display_name, state, created_at, updated_at, owner_account_id) \
+             VALUES ('workspace-ownerless', 'Ownerless', 'active', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z', NULL)",
+            [],
+        )
+        .unwrap();
+
+        let error = apply_migrations(&conn).unwrap_err().to_string();
+        assert!(error.contains("explicit User Account owner"), "{error}");
+        assert_eq!(
+            conn.query_row(
+                "SELECT MAX(version) FROM __yoi_schema_migrations",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            47
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM workspaces WHERE owner_account_id IS NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        let owner_not_null = conn
+            .prepare("PRAGMA table_info(workspaces)")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .into_iter()
+            .find_map(|(name, not_null)| (name == "owner_account_id").then_some(not_null))
+            .unwrap();
+        assert_eq!(owner_not_null, 0);
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn workspace_owner_migration_rejects_non_user_account_owner() {
+        let conn = workspace_owner_schema_47();
+        conn.execute(
+            "INSERT INTO accounts (account_id, kind, handle, display_name, created_at, updated_at) \
+             VALUES ('organization-owner', 'organization', 'organization-owner', 'Organization Owner', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workspaces (workspace_id, display_name, state, created_at, updated_at, owner_account_id) \
+             VALUES ('workspace-organization', 'Organization Workspace', 'active', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z', 'organization-owner')",
+            [],
+        )
+        .unwrap();
+
+        let error = apply_migrations(&conn).unwrap_err().to_string();
+        assert!(error.contains("explicit User Account owner"), "{error}");
+        assert_eq!(current_schema_version(&conn).unwrap(), 47);
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn workspace_owner_migration_requires_owner_and_restricts_account_deletion() {
+        let conn = workspace_owner_schema_47();
+        conn.execute(
+            "INSERT INTO accounts (account_id, kind, handle, display_name, created_at, updated_at) \
+             VALUES ('owner-account', 'user', 'owner', 'Owner', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workspaces (workspace_id, display_name, state, created_at, updated_at, owner_account_id) \
+             VALUES ('workspace-owned', 'Owned', 'active', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z', 'owner-account')",
+            [],
+        )
+        .unwrap();
+
+        apply_migrations(&conn).unwrap();
+
+        let owner_not_null = conn
+            .prepare("PRAGMA table_info(workspaces)")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .into_iter()
+            .find_map(|(name, not_null)| (name == "owner_account_id").then_some(not_null))
+            .unwrap();
+        assert_eq!(owner_not_null, 1);
+        let owner_delete_action = conn
+            .prepare("PRAGMA foreign_key_list(workspaces)")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(3)?, row.get::<_, String>(6)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .into_iter()
+            .find_map(|(from, on_delete)| (from == "owner_account_id").then_some(on_delete))
+            .unwrap();
+        assert_eq!(owner_delete_action, "RESTRICT");
+        assert!(
+            conn.execute(
+                "DELETE FROM accounts WHERE account_id = 'owner-account'",
+                []
+            )
+            .is_err()
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+                .optional()
+                .unwrap(),
+            None
+        );
+    }
+
+    fn workspace_owner_schema_47() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        apply_migrations_through(&conn, 47).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 47);
+        conn
     }
 
     fn table_names(conn: &Connection) -> BTreeSet<String> {

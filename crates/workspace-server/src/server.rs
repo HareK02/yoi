@@ -981,8 +981,8 @@ async fn list_server_workspaces(
     headers: HeaderMap,
     Query(query): Query<WorkspaceListQuery>,
 ) -> Response {
-    let owner = match resolve_server_actor(&api, &headers).await {
-        Ok(Some(actor)) => Some(actor.account_id),
+    let owner_account_id = match resolve_server_actor(&api, &headers).await {
+        Ok(Some(actor)) => actor.account_id,
         Ok(None) => match api.catalog.is_empty() {
             Ok(true) => {
                 return Json(WorkspaceCatalogListResponse(Vec::new())).into_response();
@@ -994,7 +994,7 @@ async fn list_server_workspaces(
     };
     match api
         .catalog
-        .list(owner.as_deref(), query.limit.unwrap_or(100))
+        .list(&owner_account_id, query.limit.unwrap_or(100))
     {
         Ok(workspaces) => Json(WorkspaceCatalogListResponse(
             workspaces.into_iter().map(workspace_summary).collect(),
@@ -1426,7 +1426,7 @@ async fn seed_test_registered_workspace(
     store
         .upsert_workspace(&WorkspaceRecord {
             workspace_id: config.workspace_id.clone(),
-            owner_account_id: Some(account_id),
+            owner_account_id: account_id,
             display_name: config.workspace_display_name.clone(),
             state: "active".to_owned(),
             created_at: config.workspace_created_at.clone(),
@@ -3479,7 +3479,7 @@ async fn require_workspace_owner(
         .get_workspace(workspace_id)
         .await?
         .ok_or(Error::WorkspaceIdMismatch)?;
-    if workspace.owner_account_id.as_deref() != Some(actor.account_id.as_str()) {
+    if workspace.owner_account_id != actor.account_id {
         return Err(Error::WorkspacePermissionDenied(format!(
             "{permission} requires the Workspace owner account"
         ))
@@ -11171,8 +11171,7 @@ async fn get_workspace(
     let is_owner = actor.as_ref().is_some_and(|actor| {
         stored
             .as_ref()
-            .and_then(|workspace| workspace.owner_account_id.as_ref())
-            == Some(&actor.account_id)
+            .is_some_and(|workspace| workspace.owner_account_id == actor.account_id)
     });
     let display_name = stored
         .as_ref()
@@ -16233,7 +16232,7 @@ mod tests {
         let api = test_api(dir.path()).await;
         let other_workspace = WorkspaceRecord {
             workspace_id: "other-workspace".to_string(),
-            owner_account_id: None,
+            owner_account_id: "owner-account".to_string(),
             display_name: "Other Workspace".to_string(),
             state: "active".to_string(),
             created_at: "1".to_string(),
@@ -17632,7 +17631,7 @@ mod tests {
             workspace_id: "remote-workspace".to_string(),
             display_name: "Remote Workspace".to_string(),
             state: "active".to_string(),
-            owner_account_id: None,
+            owner_account_id: "owner-account".to_string(),
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
         };
@@ -17955,6 +17954,39 @@ mod tests {
             typed_catalog.0[0].workspace_id,
             workspace.workspace.workspace_id
         );
+        assert_eq!(typed_catalog.0[0].owner_account_id, "account-auth");
+
+        let created_repository = temp.path().join("created-repository");
+        std::fs::create_dir_all(&created_repository).unwrap();
+        let create_request = WorkspaceCreateRequest {
+            operation_key: "create-authenticated-workspace".to_owned(),
+            display_name: "Authenticated Workspace".to_owned(),
+            repository: crate::workspace_catalog::InitialRepositoryIntent {
+                uri: created_repository.display().to_string(),
+                display_name: Some("Main".to_owned()),
+                default_ref: Some("develop".to_owned()),
+            },
+        };
+        let created_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/workspaces")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer api-token-auth")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&create_request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created_response.status(), StatusCode::CREATED);
+        let created_body = to_bytes(created_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: workspace_api::WorkspaceCreateResponse =
+            serde_json::from_slice(&created_body).unwrap();
+        assert_eq!(created.workspace.owner_account_id, "account-auth");
 
         for path in ["/api/workspaces", "/api/auth/device-login/approve"] {
             let cross_site = app
@@ -21074,29 +21106,11 @@ mod tests {
     async fn repository_secret_management_is_owner_only() {
         let temp = tempfile::tempdir().unwrap();
         let api = test_api(temp.path()).await;
-        let timestamp = Utc::now().to_rfc3339();
-        api.store
-            .upsert_account(&crate::store::AccountRecord {
-                account_id: "owner-account".to_string(),
-                kind: "user".to_string(),
-                handle: "owner".to_string(),
-                display_name: "Owner".to_string(),
-                created_at: timestamp.clone(),
-                updated_at: timestamp,
-            })
-            .unwrap();
-        let mut workspace = api
-            .store
-            .get_workspace(TEST_WORKSPACE_ID)
-            .await
-            .unwrap()
-            .unwrap();
-        workspace.owner_account_id = Some("owner-account".to_string());
-        api.store.upsert_workspace(&workspace).await.unwrap();
+        let owner_account_id = format!("account-{TEST_WORKSPACE_ID}");
 
         let owner = RequestActor {
             user_id: "owner-user".to_string(),
-            account_id: "owner-account".to_string(),
+            account_id: owner_account_id,
             handle: "owner".to_string(),
             display_name: "Owner".to_string(),
             auth_method: ActorAuthMethod::BrowserSession,
@@ -21583,10 +21597,21 @@ mod tests {
             timeout: std::time::Duration::from_secs(1),
         });
         let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        let owner_account_id = format!("account-{TEST_WORKSPACE_ID}");
+        store
+            .upsert_account(&crate::store::AccountRecord {
+                account_id: owner_account_id.clone(),
+                kind: "user".to_string(),
+                handle: format!("owner-{TEST_WORKSPACE_ID}"),
+                display_name: "Workspace Owner".to_string(),
+                created_at: "2026-08-11T00:00:00Z".to_string(),
+                updated_at: "2026-08-11T00:00:00Z".to_string(),
+            })
+            .unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
-                owner_account_id: None,
+                owner_account_id,
                 display_name: "Test Workspace".to_string(),
                 state: "active".to_string(),
                 created_at: "2026-08-11T00:00:00Z".to_string(),
@@ -24138,7 +24163,7 @@ mod tests {
         sqlite_store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
-                owner_account_id: None,
+                owner_account_id: "owner-account".to_string(),
                 display_name: "Test Workspace".to_string(),
                 state: "active".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -24176,7 +24201,7 @@ mod tests {
         sqlite_store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
-                owner_account_id: None,
+                owner_account_id: "owner-account".to_string(),
                 display_name: "Test Workspace".to_string(),
                 state: "active".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -25677,10 +25702,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = test_server_config(dir.path());
         let store = Arc::new(SqliteWorkspaceStore::open(&config.database_path).unwrap());
+        let owner_account_id = format!("account-{TEST_WORKSPACE_ID}");
+        store
+            .upsert_account(&crate::store::AccountRecord {
+                account_id: owner_account_id.clone(),
+                kind: "user".to_string(),
+                handle: format!("owner-{TEST_WORKSPACE_ID}"),
+                display_name: "Workspace Owner".to_string(),
+                created_at: TEST_CREATED_AT.to_string(),
+                updated_at: TEST_CREATED_AT.to_string(),
+            })
+            .unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
-                owner_account_id: None,
+                owner_account_id,
                 display_name: "Test Workspace".to_string(),
                 state: "active".to_string(),
                 created_at: TEST_CREATED_AT.to_string(),

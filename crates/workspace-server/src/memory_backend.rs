@@ -396,9 +396,16 @@ mod tests {
         let authority = SqliteWorkspaceAuthority::new(&db_path, "workspace").unwrap();
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         conn.execute(
+            "INSERT INTO accounts (
+                account_id, kind, handle, display_name, created_at, updated_at
+            ) VALUES ('owner-account', 'user', 'owner-account', 'Owner Account', ?1, ?1)",
+            ["2026-01-01T00:00:00Z"],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO workspaces (
                 workspace_id, owner_account_id, display_name, state, created_at, updated_at
-            ) VALUES (?1, NULL, ?2, ?3, ?4, ?4)",
+            ) VALUES (?1, 'owner-account', ?2, ?3, ?4, ?4)",
             rusqlite::params!["workspace", "Workspace", "active", "2026-01-01T00:00:00Z"],
         )
         .unwrap();

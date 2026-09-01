@@ -58,21 +58,13 @@ impl WorkspaceCatalogService {
         Ok(self.store.list_workspaces()?.is_empty())
     }
 
-    pub fn list(
-        &self,
-        owner_account_id: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<WorkspaceRecord>> {
+    pub fn list(&self, owner_account_id: &str, limit: usize) -> Result<Vec<WorkspaceRecord>> {
         let limit = limit.clamp(1, 200);
         Ok(self
             .store
             .list_workspaces()?
             .into_iter()
-            .filter(|workspace| {
-                workspace.owner_account_id.is_none()
-                    || owner_account_id
-                        .is_some_and(|owner| workspace.owner_account_id.as_deref() == Some(owner))
-            })
+            .filter(|workspace| workspace.owner_account_id == owner_account_id)
             .take(limit)
             .collect())
     }
@@ -91,6 +83,16 @@ impl WorkspaceCatalogService {
         owner_account_id: String,
         requested_workspace_id: Option<String>,
     ) -> Result<WorkspaceCreateResult> {
+        let owner = self.store.get_account(&owner_account_id)?.ok_or_else(|| {
+            Error::InvalidInput(
+                "Workspace owner must reference an existing user account".to_string(),
+            )
+        })?;
+        if owner.kind != "user" {
+            return Err(Error::InvalidInput(
+                "Workspace owner must be a user account".to_string(),
+            ));
+        }
         let operation_key = normalize_required(
             "operation_key",
             request.operation_key,
@@ -143,7 +145,7 @@ impl WorkspaceCatalogService {
                 require_empty_catalog: false,
                 workspace: WorkspaceRecord {
                     workspace_id: workspace_id.clone(),
-                    owner_account_id: Some(owner_account_id),
+                    owner_account_id,
                     display_name,
                     state: "active".to_string(),
                     created_at: now.clone(),
@@ -330,6 +332,102 @@ mod tests {
         assert_eq!(file.kind, RepositorySourceKind::File);
 
         assert!(validate_repository_source("relative/repository").is_err());
+    }
+
+    #[test]
+    fn create_rejects_non_user_account_owners() {
+        let store = Arc::new(SqliteWorkspaceStore::in_memory().unwrap());
+        store
+            .upsert_account(&AccountRecord {
+                account_id: "organization-owner".to_string(),
+                kind: "organization".to_string(),
+                handle: "organization-owner".to_string(),
+                display_name: "Organization Owner".to_string(),
+                created_at: "2026-07-03T00:00:00Z".to_string(),
+                updated_at: "2026-07-03T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        let service = WorkspaceCatalogService::new(store);
+        let repository = git_repository();
+        let error = service
+            .create(
+                WorkspaceCreateRequest {
+                    operation_key: "organization-owner-create".to_string(),
+                    display_name: "Organization Workspace".to_string(),
+                    repository: InitialRepositoryIntent {
+                        uri: repository.path().display().to_string(),
+                        display_name: None,
+                        default_ref: None,
+                    },
+                },
+                "organization-owner".to_string(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must be a user account"), "{error}");
+    }
+
+    #[test]
+    fn catalog_list_is_scoped_to_the_required_owner_account() {
+        let store = Arc::new(SqliteWorkspaceStore::in_memory().unwrap());
+        let owner_a = owner_account(store.as_ref());
+        let owner_b = "account-owner-b".to_string();
+        store
+            .upsert_account(&AccountRecord {
+                account_id: owner_b.clone(),
+                kind: "user".to_string(),
+                handle: "owner-b".to_string(),
+                display_name: "Owner B".to_string(),
+                created_at: "2026-07-03T00:00:00Z".to_string(),
+                updated_at: "2026-07-03T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        let service = WorkspaceCatalogService::new(store);
+        let repository_a = git_repository();
+        let repository_b = git_repository();
+        let created_a = service
+            .create(
+                WorkspaceCreateRequest {
+                    operation_key: "owner-a-create".to_string(),
+                    display_name: "Owner A Workspace".to_string(),
+                    repository: InitialRepositoryIntent {
+                        uri: repository_a.path().display().to_string(),
+                        display_name: None,
+                        default_ref: None,
+                    },
+                },
+                owner_a.clone(),
+            )
+            .unwrap();
+        service
+            .create(
+                WorkspaceCreateRequest {
+                    operation_key: "owner-b-create".to_string(),
+                    display_name: "Owner B Workspace".to_string(),
+                    repository: InitialRepositoryIntent {
+                        uri: repository_b.path().display().to_string(),
+                        display_name: None,
+                        default_ref: None,
+                    },
+                },
+                owner_b.clone(),
+            )
+            .unwrap();
+
+        let owner_a_workspaces = service.list(&owner_a, 100).unwrap();
+        assert_eq!(owner_a_workspaces.len(), 1);
+        assert_eq!(
+            owner_a_workspaces[0].workspace_id,
+            created_a.workspace.workspace_id
+        );
+        assert_eq!(owner_a_workspaces[0].owner_account_id, owner_a);
+        assert!(
+            service
+                .list(&owner_b, 100)
+                .unwrap()
+                .into_iter()
+                .all(|workspace| workspace.owner_account_id == owner_b)
+        );
     }
 
     #[test]

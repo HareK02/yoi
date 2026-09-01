@@ -3,7 +3,7 @@
 
 export type WorkspaceSummary = {
   workspace_id: string;
-  owner_account_id: string | null;
+  owner_account_id: string;
   display_name: string;
   state: string;
   created_at: string;

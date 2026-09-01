@@ -243,7 +243,7 @@ function workspaceSummary(value: unknown, path: string): WorkspaceSummary {
   );
   return {
     workspace_id: string(item.workspace_id, `${path}.workspace_id`),
-    owner_account_id: nullableString(
+    owner_account_id: string(
       item.owner_account_id,
       `${path}.owner_account_id`,
     ),

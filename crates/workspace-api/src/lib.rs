@@ -118,7 +118,7 @@ impl RepositoryObservedStatus {
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceSummary {
     pub workspace_id: String,
-    pub owner_account_id: Option<String>,
+    pub owner_account_id: String,
     pub display_name: String,
     pub state: String,
     pub created_at: String,

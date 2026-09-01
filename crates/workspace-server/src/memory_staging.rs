@@ -218,7 +218,7 @@ mod tests {
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-test".to_string(),
-                owner_account_id: None,
+                owner_account_id: "owner-account".to_string(),
                 display_name: "Workspace Test".to_string(),
                 state: "active".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),

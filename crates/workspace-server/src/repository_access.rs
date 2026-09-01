@@ -1669,7 +1669,7 @@ mod tests {
         for workspace_id in ["workspace-a", "workspace-b"] {
             futures::executor::block_on(store.upsert_workspace(&WorkspaceRecord {
                 workspace_id: workspace_id.to_string(),
-                owner_account_id: None,
+                owner_account_id: "owner-account".to_string(),
                 display_name: workspace_id.to_string(),
                 state: "active".to_string(),
                 created_at: timestamp.clone(),

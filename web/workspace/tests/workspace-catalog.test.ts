@@ -38,7 +38,7 @@ Deno.test("workspace catalog enriches each visible workspace without dropping si
       return Promise.resolve(Response.json([
         {
           workspace_id: "w-a",
-          owner_account_id: null,
+          owner_account_id: "account-1",
           display_name: "Alpha",
           state: "active",
           created_at: "1",
@@ -46,7 +46,7 @@ Deno.test("workspace catalog enriches each visible workspace without dropping si
         },
         {
           workspace_id: "w-b",
-          owner_account_id: null,
+          owner_account_id: "account-1",
           display_name: "Beta",
           state: "active",
           created_at: "1",
