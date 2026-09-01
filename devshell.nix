@@ -6,7 +6,11 @@ pkgs.mkShell {
     git
     rustc
     cargo
+    pkgs.sccache
   ];
+  RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
+  # sccache is additive to Cargo's shared build-dir, so keep its disk usage bounded.
+  SCCACHE_CACHE_SIZE = "5G";
   buildInputs = with pkgs; [
     pkg-config
     openssl
