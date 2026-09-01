@@ -1,27 +1,39 @@
 import type {
+  WorkingDirectoryCreateRequest,
+  WorkingDirectoryCreateResponse,
+  WorkingDirectoryDetailResponse,
+  WorkingDirectoryListResponse,
+  WorkingDirectoryOccupancy,
+  WorkingDirectorySummary,
+} from "$lib/generated/workdir-api";
+import type {
   Event as PodProtocolEvent,
   Method as PodProtocolMethod,
   Segment as PodProtocolSegment,
 } from "$lib/generated/protocol";
+import type {
+  GitCommitSummary as SharedGitCommitSummary,
+  GitRemoteSummary as SharedGitRemoteSummary,
+  GitRepositorySummary as SharedGitRepositorySummary,
+  RepositoryDetailResponse as SharedRepositoryDetailResponse,
+  RepositoryListResponse as SharedRepositoryListResponse,
+  RepositoryLogResponse as SharedRepositoryLogResponse,
+  RepositorySummary as SharedRepositorySummary,
+  WorkspaceResponse as SharedWorkspaceResponse,
+} from "$lib/workspace/api/workspace-model";
 
-export type { PodProtocolEvent, PodProtocolMethod, PodProtocolSegment };
-
-export type ExtensionPoint = {
-  status: string;
-  note: string;
-  diagnostics: Diagnostic[];
+export type {
+  PodProtocolEvent,
+  PodProtocolMethod,
+  PodProtocolSegment,
+  WorkingDirectoryCreateRequest,
+  WorkingDirectoryCreateResponse,
+  WorkingDirectoryDetailResponse,
+  WorkingDirectoryListResponse,
+  WorkingDirectoryOccupancy,
+  WorkingDirectorySummary,
 };
-
-export type WorkspaceResponse = {
-  workspace_id: string;
-  display_name: string;
-  record_authority: string;
-  extension_points: {
-    event_stream: ExtensionPoint;
-    host_worker_bridge: ExtensionPoint;
-    companion_console: ExtensionPoint;
-  };
-};
+export type WorkspaceResponse = SharedWorkspaceResponse;
 
 export type Diagnostic = {
   code: string;
@@ -111,44 +123,6 @@ export type WorkingDirectoryRepositoryOption = {
   default_selector?: string | null;
 };
 
-export type WorkingDirectoryOccupancy = {
-  runtime_id: string;
-  worker_id: string;
-  display_name: string;
-  linked_at: string;
-};
-
-export type WorkingDirectorySummary = {
-  working_directory_id: string;
-  repository_id: string;
-  creation_selector?: string | null;
-  creation_ref?: string | null;
-  current_selector?: string | null;
-  current_ref?: string | null;
-  materializer_kind: string;
-  status: string;
-  cleanliness?: string | null;
-  primary_worker_id?: string | null;
-  occupied_by?: WorkingDirectoryOccupancy | null;
-  cleanup_target: {
-    kind: string;
-    working_directory_id: string;
-    repository_id: string;
-  };
-};
-
-export type BrowserWorkingDirectoryCreateResponse = {
-  workspace_id: string;
-  item: WorkingDirectorySummary;
-  diagnostics: Diagnostic[];
-};
-
-export type BrowserWorkingDirectoryListResponse = {
-  workspace_id: string;
-  items: WorkingDirectorySummary[];
-  diagnostics: Diagnostic[];
-};
-
 export type CleanupTargetKind =
   | "worker_delete"
   | "workdir_clean_cleanup"
@@ -217,12 +191,6 @@ export type BrowserWorkerWorkingDirectorySelection = {
   relative_cwd?: string | null;
 };
 
-export type BrowserWorkingDirectoryCreateRequest = {
-  runtime_id: string;
-  repository_id: string;
-  selector?: string | null;
-};
-
 export type WorkerLaunchOptionsResponse = {
   workspace_id: string;
   runtimes: WorkerLaunchRuntimeOption[];
@@ -257,70 +225,13 @@ export type ListResponse<T> = {
   diagnostics: Diagnostic[];
 };
 
-export type RepositorySummary = {
-  id: string;
-  display_name: string;
-  kind: string;
-  provider: string;
-  source: {
-    kind: "local_path" | "file" | "ssh" | "http" | "https" | "invalid";
-    uri: string;
-  };
-  source_revision: number;
-  source_fingerprint: string;
-  observed_status: "unverified" | "ready" | "invalid";
-  observed_at?: string | null;
-  default_selector?: string | null;
-  record_authority: string;
-  git?: GitRepositorySummary | null;
-  diagnostics?: Diagnostic[];
-};
-
-export type GitRepositorySummary = {
-  status: string;
-  branch?: string | null;
-  head?: string | null;
-  dirty: boolean;
-  remotes: GitRemoteSummary[];
-};
-
-export type GitRemoteSummary = {
-  name: string;
-  fetch_url: string;
-};
-
-export type GitCommitSummary = {
-  hash: string;
-  short_hash: string;
-  summary: string;
-  author_name: string;
-  author_email: string;
-  author_date: string;
-  parents: string[];
-  refs: string[];
-};
-
-export type RepositoryListResponse = {
-  workspace_id: string;
-  items: RepositorySummary[];
-  source: string;
-  diagnostics: Diagnostic[];
-};
-
-export type RepositoryDetailResponse = {
-  workspace_id: string;
-  item: RepositorySummary;
-  source: string;
-};
-
-export type RepositoryLogResponse = {
-  workspace_id: string;
-  repository_id: string;
-  default_selector?: string | null;
-  limit: number;
-  items: GitCommitSummary[];
-  diagnostics: Diagnostic[];
-};
+export type RepositorySummary = SharedRepositorySummary;
+export type GitRepositorySummary = SharedGitRepositorySummary;
+export type GitRemoteSummary = SharedGitRemoteSummary;
+export type GitCommitSummary = SharedGitCommitSummary;
+export type RepositoryListResponse = SharedRepositoryListResponse;
+export type RepositoryDetailResponse = SharedRepositoryDetailResponse;
+export type RepositoryLogResponse = SharedRepositoryLogResponse;
 
 export type MemoryDocumentResponse = {
   body_md: string;
@@ -448,56 +359,15 @@ export type ObjectiveListResponse = {
   record_authority: string;
 };
 
-export type CompanionState =
-  | "ready"
-  | "busy"
-  | "error"
-  | "timeout"
-  | "cancelled"
-  | "accepted"
-  | "rejected";
-
-export type CompanionTransportSummary = {
-  kind: string;
-  completion: string;
-  limitation: string;
-};
-
-export type CompanionStatusResponse = {
-  state: CompanionState;
-  worker?: Worker | null;
-  transport: CompanionTransportSummary;
-  diagnostics: Diagnostic[];
-};
-
-export type CompanionTranscriptItem = {
-  sequence: number;
-  role: "user" | "assistant" | "system" | string;
-  content: string;
-  created_at: string;
-  source: string;
-  status: string;
-};
-
-export type CompanionTranscriptProjection = {
-  state: CompanionState;
-  start: number;
-  limit: number;
-  total_items: number;
-  next_start?: number | null;
-  items: CompanionTranscriptItem[];
-  diagnostics: Diagnostic[];
-};
-
-export type CompanionMessageRequest = {
-  content: string;
-};
-
-export type CompanionMessageResponse = {
-  state: CompanionState;
-  worker?: Worker | null;
-  user_item?: CompanionTranscriptItem | null;
-  assistant_item?: CompanionTranscriptItem | null;
-  transcript: CompanionTranscriptProjection;
-  diagnostics: Diagnostic[];
-};
+export type {
+  CompanionCancelRequest,
+  CompanionLifecycleState,
+  CompanionMessageDisposition,
+  CompanionMessageRequest,
+  CompanionMessageResponse,
+  CompanionStatusResponse,
+  CompanionTranscriptItem,
+  CompanionTranscriptProjection,
+  CompanionTranscriptRole,
+  CompanionTransportSummary,
+} from "$lib/generated/companion-api";

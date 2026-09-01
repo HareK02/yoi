@@ -12,16 +12,19 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use workdir::http::{WorkdirSessionOperation, WorkdirSessionOperationResult};
-use workdir::workspace::{
-    WorkingDirectoryDetailResponse as WorkdirDetailResponse,
-    WorkingDirectoryListResponse as WorkdirListResponse, WorkspaceWorkdirSessionFence,
-    WorkspaceWorkdirSessionOperationRequest,
-};
+use workdir::workspace::{WorkspaceWorkdirSessionFence, WorkspaceWorkdirSessionOperationRequest};
 use workdir::{
     CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
     EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
     ReadRequest, ReadResult, StatRequest, StatResult, Workdir, WorkdirError, WorkdirSession,
     WorkdirSessionCapabilities, WorkdirSessionHandle, WriteRequest, WriteResult,
+};
+
+use workspace_api::{
+    WorkingDirectoryCreateRequest as WorkdirCreateRequest,
+    WorkingDirectoryCreateResponse as WorkdirCreateResponse,
+    WorkingDirectoryDetailResponse as WorkdirDetailResponse,
+    WorkingDirectoryListResponse as WorkdirListResponse,
 };
 
 use crate::feature::{
@@ -426,9 +429,9 @@ impl WorkspaceHttpWorkdirBackend {
             runtime_id: runtime_id.map(str::to_string),
             repository_id: repository_id.to_string(),
             selector,
-            operation_id,
+            operation_id: Some(operation_id),
         };
-        let response = self.execute_json::<WorkdirDetailResponse>(WorkspaceRequest::json(
+        let response = self.execute_json::<WorkdirCreateResponse>(WorkspaceRequest::json(
             WorkspaceRequestMethod::Post,
             format!("/api/w/{workspace_id}/working-directories"),
             serde_json::to_string(&request).map_err(decode_error)?,
@@ -705,16 +708,6 @@ struct WorkdirCreateInput {
     repository_id: String,
     #[serde(default)]
     selector: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct WorkdirCreateRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    runtime_id: Option<String>,
-    repository_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    selector: Option<String>,
-    operation_id: String,
 }
 
 #[derive(Debug, Deserialize)]

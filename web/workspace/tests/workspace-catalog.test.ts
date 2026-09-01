@@ -55,21 +55,30 @@ Deno.test("workspace catalog enriches each visible workspace without dropping si
       ]));
     }
     if (url.includes("w-a")) {
-      return Promise.resolve(Response.json([{
+      return Promise.resolve(Response.json({
         workspace_id: "w-a",
-        repository_id: "main",
-        name: "Main",
-        kind: "local_path",
-        uri: "/srv/alpha",
-        default_ref: "develop",
-      }]));
+        items: [{
+          id: "main",
+          display_name: "Main",
+          kind: "git",
+          provider: "git",
+          source: { kind: "local_path", uri: "/srv/alpha" },
+          source_revision: 1,
+          source_fingerprint: "sha256:alpha",
+          observed_status: "ready",
+          default_selector: "develop",
+          record_authority: "workspace-control-plane",
+        }],
+        source: "workspace-control-plane",
+        diagnostics: [],
+      }));
     }
     return Promise.resolve(new Response("unavailable", { status: 503 }));
   };
 
   const items = await loadWorkspaceCatalog(fetcher as typeof fetch);
   assertEquals(items.length, 2);
-  assertEquals(items[0].repositories[0].repository_id, "main");
+  assertEquals(items[0].repositories[0].id, "main");
   assertEquals(items[1].repositories, []);
   assertEquals(typeof items[1].repository_error, "string");
 });

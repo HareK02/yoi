@@ -1,41 +1,18 @@
-export type WorkspaceCatalogRecord = {
-  workspace_id: string;
-  owner_account_id: string | null;
-  display_name: string;
-  state: string;
-  created_at: string;
-  updated_at: string;
-};
+import {
+  parseRepositoryListResponse,
+  parseWorkspaceCatalogResponse,
+  parseWorkspaceCreateResponse,
+  type RepositorySummary,
+  type WorkspaceCreateResponse,
+  type WorkspaceSummary,
+} from "$lib/workspace/api/workspace-model";
 
-export type RepositorySourceKind =
-  | "local_path"
-  | "file"
-  | "ssh"
-  | "http"
-  | "https"
-  | "invalid";
-
-export type WorkspaceRepositoryRecord = {
-  workspace_id: string;
-  repository_id: string;
-  name: string;
-  kind: string;
-  provider: string | null;
-  source: {
-    kind: RepositorySourceKind;
-    uri: string;
-  };
-  default_ref: string | null;
-  source_revision: number;
-  source_fingerprint: string;
-  observed_status: "unverified" | "ready" | "invalid";
-  observed_at: string | null;
-};
-
+export type WorkspaceCatalogRecord = WorkspaceSummary;
 export type WorkspaceCatalogItem = WorkspaceCatalogRecord & {
-  repositories: WorkspaceRepositoryRecord[];
+  repositories: RepositorySummary[];
   repository_error?: string;
 };
+export type CreateWorkspaceResponse = WorkspaceCreateResponse;
 
 export type CreateWorkspaceRequest = {
   operation_key: string;
@@ -45,14 +22,6 @@ export type CreateWorkspaceRequest = {
     display_name: string | null;
     default_ref: string | null;
   };
-};
-
-export type CreateWorkspaceResponse = {
-  workspace: WorkspaceCatalogRecord;
-  repository: WorkspaceRepositoryRecord;
-  config_revision: number;
-  request_fingerprint: string;
-  replayed: boolean;
 };
 
 export class WorkspaceCatalogError extends Error {
@@ -70,20 +39,21 @@ type Fetch = typeof globalThis.fetch;
 export async function listWorkspaces(
   fetcher: Fetch,
 ): Promise<WorkspaceCatalogRecord[]> {
-  return await fetchJson<WorkspaceCatalogRecord[]>(
-    fetcher,
-    "/api/workspaces?limit=200",
+  return parseWorkspaceCatalogResponse(
+    await fetchJson(fetcher, "/api/workspaces?limit=200"),
   );
 }
 
 export async function listWorkspaceRepositories(
   fetcher: Fetch,
   workspaceId: string,
-): Promise<WorkspaceRepositoryRecord[]> {
-  return await fetchJson<WorkspaceRepositoryRecord[]>(
-    fetcher,
-    `/api/w/${encodeURIComponent(workspaceId)}/repositories`,
-  );
+): Promise<RepositorySummary[]> {
+  return parseRepositoryListResponse(
+    await fetchJson(
+      fetcher,
+      `/api/w/${encodeURIComponent(workspaceId)}/repositories`,
+    ),
+  ).items;
 }
 
 export async function loadWorkspaceCatalog(
@@ -115,11 +85,13 @@ export async function createWorkspace(
   fetcher: Fetch,
   request: CreateWorkspaceRequest,
 ): Promise<CreateWorkspaceResponse> {
-  return await fetchJson<CreateWorkspaceResponse>(fetcher, "/api/workspaces", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(request),
-  });
+  return parseWorkspaceCreateResponse(
+    await fetchJson(fetcher, "/api/workspaces", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request),
+    }),
+  );
 }
 
 export function creationErrorMessage(error: unknown): string {
@@ -150,11 +122,11 @@ export function createOperationKey(): string {
   }`;
 }
 
-async function fetchJson<T>(
+async function fetchJson(
   fetcher: Fetch,
   input: string,
   init?: RequestInit,
-): Promise<T> {
+): Promise<unknown> {
   let response: Response;
   try {
     response = await fetcher(input, init);
@@ -172,7 +144,7 @@ async function fetchJson<T>(
     }
     throw new WorkspaceCatalogError(response.status, detail);
   }
-  return await response.json() as T;
+  return await response.json() as unknown;
 }
 
 function errorMessage(error: unknown): string {

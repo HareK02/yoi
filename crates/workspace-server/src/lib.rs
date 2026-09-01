@@ -42,18 +42,18 @@ pub use authority::{
 pub use config::{BackendRuntimesConfigFile, ResolvedWorkspaceBackendConfig, ServerHostConfigFile};
 pub use identity::{WORKSPACE_IDENTITY_RELATIVE_PATH, WorkspaceIdentity};
 pub use records::{ObjectiveDetail, ObjectiveSummary, TicketDetail, TicketSummary};
-pub use repositories::{
-    ConfiguredRepository, GitCommitSummary, GitRemoteSummary, GitRepositorySummary,
-    RepositoryLogRead, RepositoryRegistryReader, RepositorySummary,
-};
+pub use repositories::{ConfiguredRepository, RepositoryLogRead, RepositoryRegistryReader};
 pub use server::{
     AuthConfig, ServerConfig, WorkspaceApi, WorkspaceServerApi, build_router,
     build_workspace_server_router, serve, serve_workspace_catalog,
 };
 pub use store::{ControlPlaneStore, SqliteWorkspaceStore, WorkspaceRecord};
-pub use workspace_catalog::{
-    InitialRepositoryIntent, WorkspaceCatalogService, WorkspaceCreateRequest,
+pub use workspace_api::{
+    GitCommitSummary, GitRemoteSummary, GitRepositorySummary, RepositorySummary,
     WorkspaceCreateResponse,
+};
+pub use workspace_catalog::{
+    InitialRepositoryIntent, WorkspaceCatalogService, WorkspaceCreateRequest, WorkspaceCreateResult,
 };
 
 use worker_runtime::identity::RuntimeWorkerRef;

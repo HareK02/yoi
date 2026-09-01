@@ -650,7 +650,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.29.0",
  "uuid",
- "workdir",
  "workspace-api",
 ]
 
@@ -6594,6 +6593,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "workspace-api",
 ]
 
 [[package]]
@@ -6687,7 +6687,6 @@ dependencies = [
  "serde",
  "serde_json",
  "ts-rs",
- "workdir",
 ]
 
 [[package]]

@@ -132,9 +132,9 @@
             <code>{workspace.workspace_id}</code>
             {#if workspace.repositories[0]}
               <span class="workspace-repository-summary">
-                {workspace.repositories[0].name}
+                {workspace.repositories[0].display_name}
                 <small>
-                  {workspace.repositories[0].default_ref ?? "repository default"} ·
+                  {workspace.repositories[0].default_selector ?? "repository default"} ·
                   {workspace.repositories[0].kind}
                 </small>
               </span>

@@ -48,10 +48,7 @@ use workdir::http::{
     WorkdirSessionOperation, WorkdirSessionOperationResult, WorkdirTransportError,
 };
 use workdir::workspace::{
-    MaterializerKind, WorkingDirectoryCleanupTarget,
-    WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
-    WorkingDirectoryDiagnostic, WorkingDirectoryDiagnosticSeverity,
-    WorkingDirectoryListResponse as BrowserWorkingDirectoryListResponse, WorkingDirectoryOccupancy,
+    MaterializerKind, WorkingDirectoryCleanupTarget, WorkingDirectoryOccupancy,
     WorkingDirectoryStatusKind, WorkingDirectorySummary, WorkspaceWorkdirSessionFence,
     WorkspaceWorkdirSessionOperationRequest,
 };
@@ -65,9 +62,17 @@ use workspace_api::{
     DeleteRepositorySshCredentialRequest, DeleteRepositorySshHostTrustRequest,
     ObjectiveCreateRequest, ObjectiveEditRequest, ObjectiveLinkTicketRequest,
     ObjectiveStateRequest, PutRepositorySshHostTrustRequest, RepositoryAccessProjection,
+    RepositoryDetailResponse, RepositoryListResponse, RepositoryLogResponse,
     RepositorySshCredential, RepositorySshHostTrust, RotateRepositorySshCredentialRequest,
     RuntimeConnectionTestResponse, RuntimeManagementSummary, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
-    TICKET_RELATIONS_QUERY_PATH, WorkspaceRuntimeResource, WorkspaceWorkerDiscoveryItem,
+    TICKET_RELATIONS_QUERY_PATH,
+    WorkingDirectoryCreateRequest as BrowserWorkingDirectoryCreateRequest,
+    WorkingDirectoryCreateResponse as BrowserWorkingDirectoryCreateResponse,
+    WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
+    WorkingDirectoryListResponse as BrowserWorkingDirectoryListResponse,
+    WorkspaceCatalogListResponse, WorkspaceCreateResponse, WorkspaceExtensionPointState,
+    WorkspaceExtensionPoints, WorkspacePermissionSummary, WorkspaceRepositoryRecord,
+    WorkspaceResponse, WorkspaceRuntimeResource, WorkspaceSummary, WorkspaceWorkerDiscoveryItem,
     WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
 };
 
@@ -116,7 +121,7 @@ use crate::records::{
 };
 use crate::repositories::{
     ConfiguredRepository, RepositoryListProjection, RepositoryLogRead, RepositoryLookupError,
-    RepositoryRegistryReader, RepositorySummary,
+    RepositoryRegistryReader,
 };
 use crate::repository_access::{
     RepositoryAccessConfigSchemaProvider, RepositorySecretService,
@@ -152,17 +157,7 @@ use worker_runtime::identity::{RuntimeWorkerRef, WorkerId};
 
 const EMBEDDED_WORKER_RUNTIME_ID: &str = "embedded-worker-runtime";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum AuthConfig {
-    /// Browser human auth uses Passkey ceremonies and HttpOnly cookie sessions;
-    /// CLI/TUI auth uses API tokens obtained through the device login flow.
-    Passkey {
-        rp_id: String,
-        origin: String,
-        public_base_url: String,
-        cookie_name: String,
-    },
-}
+pub use workspace_api::WorkspaceAuthConfig as AuthConfig;
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -989,7 +984,9 @@ async fn list_server_workspaces(
     let owner = match resolve_server_actor(&api, &headers).await {
         Ok(Some(actor)) => Some(actor.account_id),
         Ok(None) => match api.catalog.is_empty() {
-            Ok(true) => return Json(Vec::<WorkspaceRecord>::new()).into_response(),
+            Ok(true) => {
+                return Json(WorkspaceCatalogListResponse(Vec::new())).into_response();
+            }
             Ok(false) => return StatusCode::UNAUTHORIZED.into_response(),
             Err(error) => return server_error_response(error),
         },
@@ -999,7 +996,10 @@ async fn list_server_workspaces(
         .catalog
         .list(owner.as_deref(), query.limit.unwrap_or(100))
     {
-        Ok(workspaces) => Json(workspaces).into_response(),
+        Ok(workspaces) => Json(WorkspaceCatalogListResponse(
+            workspaces.into_iter().map(workspace_summary).collect(),
+        ))
+        .into_response(),
         Err(error) => server_error_response(error),
     }
 }
@@ -1031,7 +1031,48 @@ async fn create_server_workspace(
     } else {
         StatusCode::CREATED
     };
-    (status, Json(created)).into_response()
+    (status, Json(workspace_create_response(created))).into_response()
+}
+
+fn workspace_summary(record: WorkspaceRecord) -> WorkspaceSummary {
+    WorkspaceSummary {
+        workspace_id: record.workspace_id,
+        owner_account_id: record.owner_account_id,
+        display_name: record.display_name,
+        state: record.state,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    }
+}
+
+fn workspace_repository_record(record: RepositoryRecord) -> WorkspaceRepositoryRecord {
+    WorkspaceRepositoryRecord {
+        workspace_id: record.workspace_id,
+        repository_id: record.repository_id,
+        name: record.name,
+        kind: record.kind,
+        provider: record.provider,
+        source: record.source,
+        default_ref: record.default_ref,
+        source_revision: record.source_revision,
+        source_fingerprint: record.source_fingerprint,
+        observed_status: record.observed_status,
+        observed_at: record.observed_at,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    }
+}
+
+fn workspace_create_response(
+    created: crate::workspace_catalog::WorkspaceCreateResult,
+) -> WorkspaceCreateResponse {
+    WorkspaceCreateResponse {
+        workspace: workspace_summary(created.workspace),
+        repository: workspace_repository_record(created.repository),
+        config_revision: created.config_revision,
+        request_fingerprint: created.request_fingerprint,
+        replayed: created.replayed,
+    }
 }
 
 async fn resolve_server_actor(
@@ -2744,31 +2785,6 @@ pub async fn serve(
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct WorkspaceResponse {
-    pub workspace_id: String,
-    pub display_name: String,
-    pub record_authority: String,
-    pub schema_version: i64,
-    pub auth: AuthConfig,
-    pub extension_points: ExtensionPoints,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ExtensionPoints {
-    pub store: String,
-    pub event_stream: ExtensionPointState,
-    pub host_worker_bridge: ExtensionPointState,
-    pub companion_console: ExtensionPointState,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ExtensionPointState {
-    pub status: String,
-    pub note: String,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ListResponse<T> {
     pub workspace_id: String,
     pub limit: usize,
@@ -3003,18 +3019,6 @@ pub struct WorkingDirectoryRepositoryOption {
     pub default_selector: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BrowserWorkingDirectoryCreateRequest {
-    #[serde(default)]
-    pub runtime_id: Option<String>,
-    pub repository_id: String,
-    #[serde(default)]
-    pub selector: Option<String>,
-    #[serde(default)]
-    pub operation_id: Option<String>,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserWorkerWorkingDirectorySelection {
@@ -3068,32 +3072,6 @@ pub struct BrowserCreateWorkerResponse {
     pub worker_ref: RuntimeWorkerRef,
     pub console_href: String,
     pub worker: WorkerSummary,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RepositoryListResponse {
-    pub workspace_id: String,
-    pub items: Vec<RepositorySummary>,
-    pub source: String,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RepositoryDetailResponse {
-    pub workspace_id: String,
-    pub item: RepositorySummary,
-    pub source: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RepositoryLogResponse {
-    pub workspace_id: String,
-    pub repository_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_selector: Option<String>,
-    pub limit: usize,
-    pub items: Vec<crate::repositories::GitCommitSummary>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -3361,11 +3339,12 @@ async fn scoped_get_flow(
 }
 
 async fn scoped_get_workspace(
+    headers: HeaderMap,
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
 ) -> ApiResult<Json<WorkspaceResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    get_workspace(State(api)).await
+    get_workspace(headers, State(api)).await
 }
 
 async fn scoped_get_workspace_settings(
@@ -8947,15 +8926,15 @@ async fn scoped_get_worker_launch_options(
 
 fn working_directory_diagnostics(
     diagnostics: Vec<RuntimeDiagnostic>,
-) -> Vec<WorkingDirectoryDiagnostic> {
+) -> Vec<workspace_api::Diagnostic> {
     diagnostics
         .into_iter()
-        .map(|diagnostic| WorkingDirectoryDiagnostic {
+        .map(|diagnostic| workspace_api::Diagnostic {
             code: diagnostic.code,
             severity: match diagnostic.severity {
-                DiagnosticSeverity::Info => WorkingDirectoryDiagnosticSeverity::Info,
-                DiagnosticSeverity::Warning => WorkingDirectoryDiagnosticSeverity::Warning,
-                DiagnosticSeverity::Error => WorkingDirectoryDiagnosticSeverity::Error,
+                DiagnosticSeverity::Info => workspace_api::DiagnosticSeverity::Info,
+                DiagnosticSeverity::Warning => workspace_api::DiagnosticSeverity::Warning,
+                DiagnosticSeverity::Error => workspace_api::DiagnosticSeverity::Error,
             },
             message: diagnostic.message,
         })
@@ -8979,7 +8958,7 @@ async fn scoped_create_runtime_working_directory(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
     Json(request): Json<BrowserWorkingDirectoryCreateRequest>,
-) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryDetailResponse>)> {
+) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryCreateResponse>)> {
     create_workspace_working_directory(
         &api,
         &path.workspace_id,
@@ -9022,7 +9001,7 @@ async fn scoped_create_working_directory(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     Json(request): Json<BrowserWorkingDirectoryCreateRequest>,
-) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryDetailResponse>)> {
+) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryCreateResponse>)> {
     create_workspace_working_directory(&api, &path.workspace_id, None, request).await
 }
 
@@ -9115,7 +9094,7 @@ async fn create_workspace_working_directory(
     workspace_id: &str,
     route_runtime_id: Option<&str>,
     request: BrowserWorkingDirectoryCreateRequest,
-) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryDetailResponse>)> {
+) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryCreateResponse>)> {
     validate_workspace_scope(api, workspace_id)?;
     if let (Some(route_runtime_id), Some(request_runtime_id)) =
         (route_runtime_id, request.runtime_id.as_deref())
@@ -9278,7 +9257,17 @@ async fn create_workspace_working_directory(
             &reserved.resolved_runtime_id,
             &reserved.working_directory_id,
         )
-        .map(|response| (StatusCode::OK, response));
+        .map(|Json(response)| {
+            (
+                StatusCode::OK,
+                Json(BrowserWorkingDirectoryCreateResponse {
+                    workspace_id: response.workspace_id,
+                    runtime_id: response.runtime_id,
+                    item: response.item,
+                    diagnostics: response.diagnostics,
+                }),
+            )
+        });
     }
 
     let runtime = match api
@@ -9457,7 +9446,7 @@ async fn create_workspace_working_directory(
     apply_workdir_occupancy_projection(api, &mut summary)?;
     Ok((
         StatusCode::CREATED,
-        Json(BrowserWorkingDirectoryDetailResponse {
+        Json(BrowserWorkingDirectoryCreateResponse {
             workspace_id: workspace_id.to_string(),
             runtime_id: reserved.resolved_runtime_id,
             item: summary,
@@ -11171,9 +11160,20 @@ async fn require_actor(api: &ServerAuthApi, headers: &HeaderMap) -> ApiResult<Re
     })
 }
 
-async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<WorkspaceResponse>> {
+async fn get_workspace(
+    headers: HeaderMap,
+    State(api): State<WorkspaceApi>,
+) -> ApiResult<Json<WorkspaceResponse>> {
+    let cookie_name = auth_public_config(&api.config).cookie_name;
+    let actor = resolve_request_actor(api.store.as_ref(), &headers, &cookie_name).await?;
     let schema_version = api.store.schema_version().await?;
     let stored = api.store.get_workspace(api.workspace_id()).await?;
+    let is_owner = actor.as_ref().is_some_and(|actor| {
+        stored
+            .as_ref()
+            .and_then(|workspace| workspace.owner_account_id.as_ref())
+            == Some(&actor.account_id)
+    });
     let display_name = stored
         .as_ref()
         .map(|record| record.display_name.clone())
@@ -11186,14 +11186,18 @@ async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<Worksp
         record_authority: "local_yoi_project_records".to_string(),
         schema_version,
         auth: api.config.auth.clone(),
-        extension_points: ExtensionPoints {
+        permissions: WorkspacePermissionSummary {
+            manage_repositories: is_owner,
+            manage_secrets: is_owner,
+        },
+        extension_points: WorkspaceExtensionPoints {
             store: "sqlite".to_string(),
-            event_stream: ExtensionPointState {
+            event_stream: WorkspaceExtensionPointState {
                 status: "backend_proxy".to_string(),
                 note: "Worker observation streams are exposed only through the Workspace server proxy keyed by runtime_id + worker_id; browser clients never receive raw Runtime endpoints or socket paths.".to_string(),
                 diagnostics: Vec::new(),
             },
-            host_worker_bridge: ExtensionPointState {
+            host_worker_bridge: WorkspaceExtensionPointState {
                 status: "runtime_registry".to_string(),
                 note: "Hosts and Workers are projected from the Workspace RuntimeRegistry; raw Runtime endpoints, sockets, and local metadata paths are not exposed.".to_string(),
                 diagnostics: Vec::new(),
@@ -11203,32 +11207,32 @@ async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<Worksp
     }))
 }
 
-fn companion_console_extension_point(status: &CompanionStatusResponse) -> ExtensionPointState {
-    let completion = status.transport.completion.clone();
-    let note = match completion.as_str() {
-        "connected" => "Workspace Companion is input-capable and browser input is dispatched through the normal Worker runtime path.".to_string(),
-        "not_input_capable" => {
-            let diagnostic_codes = status
-                .diagnostics
-                .iter()
-                .map(|diagnostic| diagnostic.code.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            if diagnostic_codes.is_empty() {
-                "Workspace Companion is not input-capable; check provider, config, profile, secret, and authority diagnostics.".to_string()
-            } else {
-                format!(
-                    "Workspace Companion is not input-capable; check typed diagnostics: {diagnostic_codes}."
-                )
-            }
-        }
-        "disabled" => "Workspace Companion auto-start has been removed; create an explicit Worker instead.".to_string(),
-        other => format!(
-            "Workspace Companion transport reports {other}; browser input follows the Companion Worker runtime capability state."
-        ),
+fn companion_console_extension_point(
+    status: &CompanionStatusResponse,
+) -> WorkspaceExtensionPointState {
+    let extension_status = match status.state {
+        workspace_api::CompanionLifecycleState::Idle => "idle",
+        workspace_api::CompanionLifecycleState::Running => "running",
+        workspace_api::CompanionLifecycleState::Stopped => "stopped",
+    }
+    .to_string();
+    let diagnostic_codes = status
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.code.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let note = if status.transport.available {
+        "Workspace Companion is input-capable and browser input is dispatched through the normal Worker runtime path."
+            .to_string()
+    } else if diagnostic_codes.is_empty() {
+        "Workspace Companion is unavailable; create or select an explicit Worker instead."
+            .to_string()
+    } else {
+        format!("Workspace Companion is unavailable; check typed diagnostics: {diagnostic_codes}.")
     };
-    ExtensionPointState {
-        status: completion,
+    WorkspaceExtensionPointState {
+        status: extension_status,
         note,
         diagnostics: status.diagnostics.clone(),
     }
@@ -11313,7 +11317,7 @@ async fn list_repositories(
         workspace_id: api.config.workspace_id,
         items,
         source: "workspace-control-plane".to_string(),
-        diagnostics: repository_diagnostics(diagnostics),
+        diagnostics,
     }))
 }
 
@@ -11350,7 +11354,7 @@ async fn repository_log(
         default_selector,
         limit,
         items: commits,
-        diagnostics: repository_diagnostics(diagnostics),
+        diagnostics,
     }))
 }
 
@@ -14261,7 +14265,8 @@ fn merge_worker_registry_projection(
             .map(|workdir| {
                 let mut workdir_summary = workdir_summary_from_record(workdir);
                 workdir_summary.occupied_by = Some(WorkingDirectoryOccupancy {
-                    worker: record.worker.clone(),
+                    runtime_id: record.worker.runtime_id.clone(),
+                    worker_id: record.worker.worker_id.clone(),
                     display_name: record.display_name.clone(),
                     linked_at: link.linked_at.clone(),
                 });
@@ -14610,7 +14615,8 @@ fn apply_workdir_occupancy_projection(
         })?;
     summary.primary_worker_id = None;
     summary.occupied_by = Some(WorkingDirectoryOccupancy {
-        worker: link.worker.clone(),
+        runtime_id: link.worker.runtime_id.clone(),
+        worker_id: link.worker.worker_id.clone(),
         display_name: worker.display_name,
         linked_at: link.linked_at.clone(),
     });
@@ -15055,23 +15061,6 @@ fn settings_diagnostic(
 
 fn sanitize_backend_error(message: &str) -> String {
     message.to_string()
-}
-
-fn repository_diagnostics(
-    diagnostics: Vec<crate::repositories::RepositoryDiagnostic>,
-) -> Vec<RuntimeDiagnostic> {
-    diagnostics
-        .into_iter()
-        .map(|diagnostic| RuntimeDiagnostic {
-            code: diagnostic.code,
-            severity: match diagnostic.severity.as_str() {
-                "error" => DiagnosticSeverity::Error,
-                "warning" => DiagnosticSeverity::Warning,
-                _ => DiagnosticSeverity::Info,
-            },
-            message: diagnostic.message,
-        })
-        .collect()
 }
 
 fn repository_lookup<T>(result: std::result::Result<T, RepositoryLookupError>) -> ApiResult<T> {
@@ -16110,7 +16099,8 @@ mod tests {
         assert_eq!(working_directory.current_selector, None);
         assert_eq!(working_directory.current_ref.as_deref(), Some("fedcba"));
         let occupied_by = working_directory.occupied_by.as_ref().unwrap();
-        assert_eq!(occupied_by.worker, RuntimeWorkerRef::new("embedded", "1"));
+        assert_eq!(occupied_by.runtime_id, "embedded");
+        assert_eq!(occupied_by.worker_id, "1");
         assert!(working_directory.primary_worker_id.is_none());
         let occupancy = serde_json::to_value(occupied_by).unwrap();
         assert_eq!(occupancy["runtime_id"], "embedded");
@@ -17315,10 +17305,8 @@ mod tests {
             .find(|summary| summary.working_directory_id == "managed")
             .unwrap();
         let occupied_by = managed.occupied_by.as_ref().unwrap();
-        assert_eq!(
-            occupied_by.worker,
-            RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, "7")
-        );
+        assert_eq!(occupied_by.runtime_id, EMBEDDED_WORKER_RUNTIME_ID);
+        assert_eq!(occupied_by.worker_id, "7");
         assert_eq!(occupied_by.display_name, "Worker Seven");
         assert_eq!(occupied_by.linked_at, "3");
 
@@ -17928,6 +17916,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(authenticated_legacy.status(), StatusCode::OK);
+        let workspace_body = to_bytes(authenticated_legacy.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let typed_workspace: workspace_api::WorkspaceResponse =
+            serde_json::from_slice(&workspace_body).unwrap();
+        assert!(typed_workspace.permissions.manage_repositories);
 
         let anonymous_catalog = app
             .clone()
@@ -17952,6 +17946,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(authenticated_catalog.status(), StatusCode::OK);
+        let catalog_body = to_bytes(authenticated_catalog.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let typed_catalog: workspace_api::WorkspaceCatalogListResponse =
+            serde_json::from_slice(&catalog_body).unwrap();
+        assert_eq!(
+            typed_catalog.0[0].workspace_id,
+            workspace.workspace.workspace_id
+        );
 
         for path in ["/api/workspaces", "/api/auth/device-login/approve"] {
             let cross_site = app
@@ -23291,6 +23294,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_workspace_workdir_create_rejects_stale_json_before_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let token = seed_test_api_token(api.store.as_ref(), "stale-workdir-create-json");
+
+        let response = request_json_authenticated(
+            build_router(api.clone()),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
+            Some(serde_json::json!({
+                "runtime_id": "missing-runtime",
+                "repository_id": TEST_REPOSITORY_ID,
+                "selector": "HEAD",
+                "operation_id": "stale-workdir-create",
+                "path": "/tmp/legacy-workdir",
+            })),
+            &token,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+        .await;
+        assert!(
+            response["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown field")
+        );
+        assert!(
+            api.config_store
+                .load_workdir_create_operation(TEST_WORKSPACE_ID, "stale-workdir-create")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_workspace_workdir_create_rejects_unconfigured_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let token = seed_test_api_token(api.store.as_ref(), "missing-workdir-repository");
+
+        let response = request_json_authenticated(
+            build_router(api.clone()),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
+            Some(serde_json::json!({
+                "runtime_id": EMBEDDED_WORKER_RUNTIME_ID,
+                "repository_id": "foreign-or-missing-repository",
+                "selector": "HEAD",
+                "operation_id": "missing-workdir-repository",
+            })),
+            &token,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert!(
+            response["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown local repository")
+        );
+        assert!(
+            api.config_store
+                .load_workdir_create_operation(TEST_WORKSPACE_ID, "missing-workdir-repository")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn browser_workspace_workdir_create_delegates_and_records_default_runtime_failure() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
@@ -24188,6 +24262,9 @@ mod tests {
         let workspace = get_json(app.clone(), "/api/workspace").await;
         assert_eq!(workspace["workspace_id"], TEST_WORKSPACE_ID);
         assert_eq!(workspace["display_name"], "Test Workspace");
+        let typed_workspace: workspace_api::WorkspaceResponse =
+            serde_json::from_value(workspace.clone()).unwrap();
+        assert!(!typed_workspace.permissions.manage_repositories);
         assert_eq!(workspace["record_authority"], "local_yoi_project_records");
         assert_eq!(
             workspace["extension_points"]["host_worker_bridge"]["status"],
@@ -24374,6 +24451,9 @@ mod tests {
         );
 
         let repositories = get_json(app.clone(), "/api/repositories").await;
+        let typed_repositories: workspace_api::RepositoryListResponse =
+            serde_json::from_value(repositories.clone()).unwrap();
+        assert_eq!(typed_repositories.items[0].id, TEST_REPOSITORY_ID);
         assert_eq!(repositories["items"][0]["id"], TEST_REPOSITORY_ID);
         assert_eq!(repositories["items"][0]["kind"], "git");
         assert_eq!(
@@ -24387,6 +24467,8 @@ mod tests {
         );
 
         let repository_detail = get_json(app.clone(), "/api/repositories/main").await;
+        let _: workspace_api::RepositoryDetailResponse =
+            serde_json::from_value(repository_detail.clone()).unwrap();
         assert_eq!(repository_detail["item"]["id"], TEST_REPOSITORY_ID);
         let scoped_repository_detail = get_json(
             app.clone(),
@@ -24396,6 +24478,8 @@ mod tests {
         assert_eq!(scoped_repository_detail["item"]["id"], TEST_REPOSITORY_ID);
 
         let repository_log = get_json(app.clone(), "/api/repositories/main/log?limit=3").await;
+        let _: workspace_api::RepositoryLogResponse =
+            serde_json::from_value(repository_log.clone()).unwrap();
         assert_eq!(repository_log["repository_id"], TEST_REPOSITORY_ID);
         assert_eq!(repository_log["default_selector"], "HEAD");
         assert_eq!(repository_log["limit"], 3);
@@ -24460,10 +24544,10 @@ mod tests {
         );
 
         let companion_status = get_json(app.clone(), "/api/companion/status").await;
-        assert_eq!(companion_status["state"], "disabled");
+        assert_eq!(companion_status["state"], "stopped");
         assert!(companion_status["worker"].is_null());
-        assert_eq!(companion_status["transport"]["kind"], "none");
-        assert_eq!(companion_status["transport"]["completion"], "disabled");
+        assert_eq!(companion_status["transport"]["mode"], "disabled");
+        assert_eq!(companion_status["transport"]["available"], false);
         assert!(!companion_status.to_string().contains("/workspace/demo"));
 
         let companion_message = post_json(
@@ -24473,16 +24557,26 @@ mod tests {
         )
         .await;
         assert_eq!(companion_message["state"], "rejected");
-        assert_eq!(
-            companion_message["diagnostics"][0]["code"],
-            "companion_disabled"
-        );
-        assert!(companion_message["user_item"].is_null());
-        assert!(companion_message["assistant_item"].is_null());
+        assert!(companion_message.get("accepted").is_none());
+        assert!(companion_message.get("diagnostics").is_none());
+        assert!(companion_message.get("user_item").is_none());
+        assert!(companion_message.get("assistant_item").is_none());
         assert!(!companion_message.to_string().contains("/workspace/demo"));
 
         let companion_transcript = get_json(app.clone(), "/api/companion/transcript").await;
-        assert_eq!(companion_transcript["total_items"], 0);
+        assert_eq!(companion_transcript["total"], 0);
+        let empty_window = get_json(app.clone(), "/api/companion/transcript?start=0&limit=0").await;
+        assert_eq!(
+            empty_window,
+            json!({
+                "state": "stopped",
+                "start": 0,
+                "limit": 0,
+                "total": 0,
+                "next": null,
+                "items": [],
+            })
+        );
 
         let host_workers = get_json(app.clone(), &format!("/api/hosts/{host_id}/workers")).await;
         assert!(
@@ -24587,7 +24681,7 @@ mod tests {
 
         let workspace = get_json(app.clone(), "/api/workspace").await;
         let workspace_companion = &workspace["extension_points"]["companion_console"];
-        assert_eq!(workspace_companion["status"], "disabled");
+        assert_eq!(workspace_companion["status"], "stopped");
         assert_eq!(
             workspace_companion["diagnostics"][0]["code"],
             "companion_disabled"
@@ -24596,12 +24690,13 @@ mod tests {
             workspace_companion["note"]
                 .as_str()
                 .unwrap()
-                .contains("auto-start has been removed")
+                .contains("typed diagnostics")
         );
 
         let status = get_json(app.clone(), "/api/companion/status").await;
-        assert_eq!(status["state"], "disabled");
-        assert_eq!(status["transport"]["completion"], "disabled");
+        assert_eq!(status["state"], "stopped");
+        assert_eq!(status["transport"]["mode"], "disabled");
+        assert_eq!(status["transport"]["available"], false);
         assert!(status["worker"].is_null());
 
         let response = post_json(
@@ -24611,13 +24706,14 @@ mod tests {
         )
         .await;
         assert_eq!(response["state"], "rejected");
-        assert_eq!(response["diagnostics"][0]["code"], "companion_disabled");
-        assert!(response["user_item"].is_null());
-        assert!(response["assistant_item"].is_null());
+        assert!(response.get("accepted").is_none());
+        assert!(response.get("diagnostics").is_none());
+        assert!(response.get("user_item").is_none());
+        assert!(response.get("assistant_item").is_none());
 
         let transcript = get_json(app.clone(), "/api/companion/transcript").await;
-        assert_eq!(transcript["state"], "disabled");
-        assert_eq!(transcript["total_items"], 0);
+        assert_eq!(transcript["state"], "stopped");
+        assert_eq!(transcript["total"], 0);
 
         let workers = get_json(app, "/api/workers").await;
         assert!(
@@ -25744,7 +25840,8 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
                 cleanliness: Some("clean".to_string()),
                 primary_worker_id: None,
                 occupied_by: Some(WorkingDirectoryOccupancy {
-                    worker: RuntimeWorkerRef::new("arcadia", "worker-opaque-64"),
+                    runtime_id: "arcadia".to_string(),
+                    worker_id: "worker-opaque-64".to_string(),
                     display_name: "Coder".to_string(),
                     linked_at: "2026-08-12T00:00:00Z".to_string(),
                 }),

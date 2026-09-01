@@ -5,7 +5,6 @@ use std::fmt;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
-pub use workdir::workspace::WorkingDirectorySummary as BackendWorkingDirectorySummary;
 pub use workspace_api::{
     Diagnostic as BackendDiagnostic, DiagnosticSeverity as BackendDiagnosticSeverity,
     ListResponse as BackendRuntimeListResponse, RuntimeSummary as BackendRuntimeSummary,
@@ -14,6 +13,11 @@ pub use workspace_api::{
     WorkerRestoreResponse as BackendWorkerRestoreResponse,
     WorkerRestoreResult as BackendWorkerRestoreResult, WorkerSummary as BackendWorkerSummary,
     WorkerWorkspaceSummary as BackendWorkerWorkspaceSummary,
+    WorkingDirectoryCreateRequest as BackendWorkingDirectoryCreateRequest,
+    WorkingDirectoryCreateResponse as BackendWorkingDirectoryCreateResponse,
+    WorkingDirectoryDetailResponse as BackendWorkingDirectoryDetailResponse,
+    WorkingDirectoryListResponse as BackendWorkingDirectoryListResponse,
+    WorkingDirectorySummary as BackendWorkingDirectorySummary,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -526,8 +530,8 @@ mod tests {
             .unwrap()
             .occupied_by
             .expect("occupied Workdir");
-        assert_eq!(occupied_by.worker.runtime_id, "arcadia");
-        assert_eq!(occupied_by.worker.worker_id, "worker-opaque-64");
+        assert_eq!(occupied_by.runtime_id, "arcadia");
+        assert_eq!(occupied_by.worker_id, "worker-opaque-64");
 
         let mut stale = payload;
         stale["working_directory"]["occupied_by"]["runtime_worker_id"] = serde_json::json!(64);

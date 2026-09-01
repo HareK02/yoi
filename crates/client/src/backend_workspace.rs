@@ -2,19 +2,16 @@ use crate::{BackendApiClient, BackendApiClientError};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use workspace_api::{RepositoryObservedStatus, RepositorySource};
+use workspace_api::{
+    WorkspaceCatalogListResponse, WorkspaceCreateResponse, WorkspaceRepositoryRecord,
+    WorkspaceSummary,
+};
 
 const DEFAULT_WORKSPACE_LIMIT: usize = 200;
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct BackendWorkspace {
-    pub workspace_id: String,
-    pub owner_account_id: Option<String>,
-    pub display_name: String,
-    pub state: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
+pub type BackendWorkspace = WorkspaceSummary;
+pub type CreateBackendWorkspaceResponse = WorkspaceCreateResponse;
+pub type CreateBackendWorkspaceRepositoryRecord = WorkspaceRepositoryRecord;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -30,30 +27,6 @@ pub struct CreateBackendWorkspaceRepository {
     pub uri: String,
     pub display_name: Option<String>,
     pub default_ref: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct CreateBackendWorkspaceResponse {
-    pub workspace: BackendWorkspace,
-    pub repository: CreateBackendWorkspaceRepositoryRecord,
-    pub config_revision: u64,
-    pub request_fingerprint: String,
-    pub replayed: bool,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct CreateBackendWorkspaceRepositoryRecord {
-    pub workspace_id: String,
-    pub repository_id: String,
-    pub name: String,
-    pub kind: String,
-    pub provider: Option<String>,
-    pub source: RepositorySource,
-    pub default_ref: Option<String>,
-    pub source_revision: u64,
-    pub source_fingerprint: String,
-    pub observed_status: RepositoryObservedStatus,
-    pub observed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,7 +91,7 @@ async fn list_backend_workspaces_with_client(
         .send()
         .await?;
     client.check_status(response.status())?;
-    Ok(response.json::<Vec<BackendWorkspace>>().await?)
+    Ok(response.json::<WorkspaceCatalogListResponse>().await?.0)
 }
 
 pub async fn create_backend_workspace(

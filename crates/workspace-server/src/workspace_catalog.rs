@@ -35,8 +35,8 @@ pub struct WorkspaceCreateRequest {
     pub repository: InitialRepositoryIntent,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkspaceCreateResponse {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceCreateResult {
     pub workspace: WorkspaceRecord,
     pub repository: RepositoryRecord,
     pub config_revision: u64,
@@ -81,7 +81,7 @@ impl WorkspaceCatalogService {
         &self,
         request: WorkspaceCreateRequest,
         owner_account_id: String,
-    ) -> Result<WorkspaceCreateResponse> {
+    ) -> Result<WorkspaceCreateResult> {
         self.create_internal(request, owner_account_id, None)
     }
 
@@ -90,7 +90,7 @@ impl WorkspaceCatalogService {
         request: WorkspaceCreateRequest,
         owner_account_id: String,
         requested_workspace_id: Option<String>,
-    ) -> Result<WorkspaceCreateResponse> {
+    ) -> Result<WorkspaceCreateResult> {
         let operation_key = normalize_required(
             "operation_key",
             request.operation_key,
@@ -165,7 +165,7 @@ impl WorkspaceCatalogService {
                     updated_at: now,
                 },
             })?;
-        Ok(WorkspaceCreateResponse {
+        Ok(WorkspaceCreateResult {
             workspace: result.workspace,
             repository: result.repository,
             config_revision: result.config_revision,

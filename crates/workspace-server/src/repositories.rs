@@ -4,8 +4,10 @@ use std::{
     process::Command,
 };
 
-use serde::{Deserialize, Serialize};
-use workspace_api::{RepositoryObservedStatus, RepositorySource};
+use workspace_api::{
+    Diagnostic, DiagnosticSeverity, GitCommitSummary, GitRemoteSummary, GitRepositorySummary,
+    RepositoryDiagnostic, RepositoryObservedStatus, RepositorySource, RepositorySummary,
+};
 
 pub type RepositoryId = String;
 pub type RepositorySelector = String;
@@ -24,74 +26,19 @@ pub struct ConfiguredRepository {
     pub default_selector: Option<RepositorySelector>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepositorySummary {
-    pub id: RepositoryId,
-    pub display_name: String,
-    pub kind: String,
-    pub provider: String,
-    pub source: RepositorySource,
-    pub source_revision: u64,
-    pub source_fingerprint: String,
-    pub observed_status: RepositoryObservedStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub observed_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_selector: Option<RepositorySelector>,
-    pub record_authority: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub git: Option<GitRepositorySummary>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub diagnostics: Vec<RepositoryDiagnostic>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GitRepositorySummary {
-    pub status: String,
-    pub head: Option<String>,
-    pub branch: Option<String>,
-    pub dirty: bool,
-    pub remotes: Vec<GitRemoteSummary>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GitRemoteSummary {
-    pub name: String,
-    pub fetch_url: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepositoryDiagnostic {
-    pub severity: String,
-    pub code: String,
-    pub message: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryListProjection {
     pub items: Vec<RepositorySummary>,
-    pub diagnostics: Vec<RepositoryDiagnostic>,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryLogRead {
     pub repository_id: RepositoryId,
     pub default_selector: Option<RepositorySelector>,
     pub limit: usize,
     pub commits: Vec<GitCommitSummary>,
-    pub diagnostics: Vec<RepositoryDiagnostic>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GitCommitSummary {
-    pub hash: String,
-    pub short_hash: String,
-    pub summary: String,
-    pub author_name: String,
-    pub author_email: String,
-    pub author_date: String,
-    pub parents: Vec<String>,
-    pub refs: Vec<String>,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,8 +78,8 @@ impl RepositoryRegistryReader {
         if self.repositories.is_empty() {
             return RepositoryListProjection {
                 items: Vec::new(),
-                diagnostics: vec![RepositoryDiagnostic {
-                    severity: "warning".to_string(),
+                diagnostics: vec![Diagnostic {
+                    severity: DiagnosticSeverity::Warning,
                     code: "repository_config_empty".to_string(),
                     message: "No repositories are configured for this workspace backend."
                         .to_string(),
@@ -177,8 +124,8 @@ impl RepositoryRegistryReader {
         let commits = match self.git_log(repository, limit) {
             Ok(commits) => commits,
             Err(message) => {
-                diagnostics.push(RepositoryDiagnostic {
-                    severity: "warning".to_string(),
+                diagnostics.push(Diagnostic {
+                    severity: DiagnosticSeverity::Warning,
                     code: "repository_git_log_unavailable".to_string(),
                     message,
                 });
@@ -379,7 +326,7 @@ impl RepositoryRegistryReader {
             default_selector: repository.default_selector.clone(),
             record_authority: "workspace-control-plane".to_string(),
             git,
-            diagnostics,
+            diagnostics: (!diagnostics.is_empty()).then_some(diagnostics),
         }
     }
 
@@ -675,7 +622,10 @@ mod tests {
             RepositoryObservedStatus::Unverified
         );
         assert!(summary.git.is_none());
-        assert_eq!(summary.diagnostics[0].code, "repository_source_unverified");
+        assert_eq!(
+            summary.diagnostics.as_ref().unwrap()[0].code,
+            "repository_source_unverified"
+        );
 
         let repository = reader.merge_repository("remote").unwrap();
         let error = merge_git_stdout(&repository, "inspect", &["rev-parse", "HEAD"]).unwrap_err();
