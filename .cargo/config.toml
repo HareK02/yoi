@@ -1,6 +1,3 @@
-# Keep intermediate build artifacts outside individual worktrees and reuse them
-# across parallel development of this repository. Final artifacts remain in each
-# worktree's target directory.
 [build]
-build-dir = "{cargo-cache-home}/build/yoi"
+build-dir = "{cargo-cache-home}/build/{workspace-path-hash}"
 incremental = false
