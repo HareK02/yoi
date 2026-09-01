@@ -67,10 +67,9 @@ Deno.test("toolchain converts reactive-like proxies to plain Worker messages", a
   );
 });
 
-Deno.test("toolchain adapts WASM completion items and byte offsets for CodeMirror", () => {
-  const source = "let 名 = tru";
-  const result = toCodeMirrorCompletion(source, {
-    from: new TextEncoder().encode("let 名 = ").length,
+Deno.test("toolchain preserves WASM UTF-16 completion ranges for CodeMirror", () => {
+  const result = toCodeMirrorCompletion({
+    from: "let 名 = ".length,
     items: [
       {
         label: "true",
@@ -84,7 +83,7 @@ Deno.test("toolchain adapts WASM completion items and byte offsets for CodeMirro
   assert(result !== null, "WASM completion should produce a CodeMirror result");
   assert(
     result.from === "let 名 = ".length,
-    "byte offsets should become UTF-16 offsets",
+    "WASM UTF-16 offsets should be preserved for CodeMirror",
   );
   assert(
     result.options.length === 1,

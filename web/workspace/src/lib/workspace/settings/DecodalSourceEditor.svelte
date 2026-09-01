@@ -1,6 +1,13 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import { autocompletion, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete';
+  import {
+    autocompletion,
+    completionKeymap,
+    completionStatus,
+    startCompletion,
+    type CompletionContext,
+    type CompletionResult,
+  } from '@codemirror/autocomplete';
   import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
   import { Compartment, EditorState } from '@codemirror/state';
   import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } from '@codemirror/view';
@@ -69,6 +76,18 @@
     '.cm-tooltip-autocomplete > ul > li[aria-selected]': { background: 'var(--interactive-selected)', color: 'var(--text-strong)' },
   });
 
+  function scheduleCompletion(editor: EditorView) {
+    queueMicrotask(() => {
+      if (
+        editor.hasFocus &&
+        !editor.state.facet(EditorState.readOnly) &&
+        completionStatus(editor.state) === null
+      ) {
+        startCompletion(editor);
+      }
+    });
+  }
+
   $effect(() => {
     if (!host || untrack(() => view)) return;
     const initialValue = untrack(() => value);
@@ -86,11 +105,16 @@
           highlightActiveLine(),
           decodal({ highlight: false }),
           syntaxHighlighting(syntaxTheme),
-          ...(handleComplete ? [autocompletion({ override: [async (context: CompletionContext) => {
-            const doc = context.state.doc.toString();
-            return await handleComplete(doc, context.pos, context.explicit);
-          }] })] : []),
-          keymap.of([]),
+          autocompletion({
+            override: [
+              async (context: CompletionContext) => {
+                if (!handleComplete) return null;
+                const doc = context.state.doc.toString();
+                return await handleComplete(doc, context.pos, context.explicit);
+              },
+            ],
+          }),
+          keymap.of(completionKeymap),
           fixedSchemaWrapperCompartment.of(
             initialFixedSchemaWrapper ? fixedSchemaWrapperExtension() : [],
           ),
@@ -98,7 +122,16 @@
             EditorState.readOnly.of(initialReadonly),
             EditorView.editable.of(!initialReadonly),
           ]),
+          EditorView.domEventHandlers({
+            focus: (_event, editor) => {
+              scheduleCompletion(editor);
+              return false;
+            },
+          }),
           EditorView.updateListener.of((update) => {
+            if (update.selectionSet && !update.docChanged) {
+              scheduleCompletion(update.view);
+            }
             if (update.docChanged) handleChange(update.state.doc.toString());
           }),
           theme,
@@ -123,6 +156,7 @@
         EditorView.editable.of(!nextReadonly),
       ]),
     });
+    if (!nextReadonly) scheduleCompletion(editor);
   });
 
   $effect(() => {

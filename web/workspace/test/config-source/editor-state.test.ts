@@ -1,3 +1,5 @@
+import { CODEMIRROR_VITE_DEDUPE } from "../../src/lib/workspace/config-source/vite-dedupe.ts";
+
 declare const Deno: {
   test(name: string, fn: () => Promise<void> | void): void;
   readTextFile(path: URL): Promise<string>;
@@ -6,6 +8,23 @@ declare const Deno: {
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
+
+Deno.test("Vite deduplicates CodeMirror stateful packages", () => {
+  for (
+    const packageName of [
+      "@codemirror/autocomplete",
+      "@codemirror/language",
+      "@codemirror/state",
+      "@codemirror/view",
+      "@lezer/common",
+    ]
+  ) {
+    assert(
+      CODEMIRROR_VITE_DEDUPE.includes(packageName),
+      `Vite must deduplicate ${packageName}`,
+    );
+  }
+});
 
 Deno.test("config editor snapshots Svelte proxies before cloning baselines", async () => {
   const source = await Deno.readTextFile(
@@ -71,6 +90,13 @@ Deno.test("Decodal editor follows readonly prop changes after mount", async () =
       !source.includes("--text-primary") &&
       !source.includes("--border-subtle"),
     "CodeMirror theme must use workspace tokens that actually exist",
+  );
+  assert(
+    source.includes("keymap.of(completionKeymap)") &&
+      source.includes("startCompletion(editor)") &&
+      source.includes("update.selectionSet && !update.docChanged") &&
+      source.includes("completionStatus(editor.state) === null"),
+    "completion should be explicitly available and start when an editable cursor moves into an empty schema position",
   );
   assert(
     source.includes("fixedSchemaWrapperCompartment.reconfigure") &&

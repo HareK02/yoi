@@ -79,7 +79,7 @@ export class ConfigSourceToolchain {
       utf16Offset,
       explicit,
     });
-    return toCodeMirrorCompletion(source, result);
+    return toCodeMirrorCompletion(result);
   }
   format(source: string): Promise<string> {
     return this.#request({ kind: "format", source });
