@@ -28,6 +28,7 @@
     type ComposerPasteMeasurement,
   } from "$lib/workspace/console/composer-paste.ts";
   import {
+    composerDeletionRange,
     composerPasteAtoms,
     composerPasteToken,
     pasteChipLabel,
@@ -255,18 +256,15 @@
     direction: "backward" | "forward",
   ): boolean {
     const selection = currentView.state.selection.main;
-    if (!selection.empty) return false;
     const pastes = composerPasteAtoms(
       currentView.state.doc.toString(),
       currentView.state.field(pasteRegistry),
     );
-    const paste = direction === "backward"
-      ? pastes.find((candidate) => candidate.to === selection.head)
-      : pastes.find((candidate) => candidate.from === selection.head);
-    if (!paste) return false;
+    const deletion = composerDeletionRange(selection, pastes, direction);
+    if (!deletion) return false;
     currentView.dispatch({
-      changes: { from: paste.from, to: paste.to },
-      selection: EditorSelection.cursor(paste.from),
+      changes: deletion,
+      selection: EditorSelection.cursor(deletion.from),
       annotations: isolateHistory.of("full"),
       userEvent: "delete",
     });

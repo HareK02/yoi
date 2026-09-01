@@ -24,6 +24,26 @@ export interface ComposerTextPaste {
   content: string;
 }
 
+export interface ComposerSelection {
+  from: number;
+  to: number;
+  head: number;
+}
+
+export function composerDeletionRange(
+  selection: ComposerSelection,
+  pastes: readonly ComposerPasteAtom[],
+  direction: "backward" | "forward",
+): { from: number; to: number } | null {
+  if (selection.from !== selection.to) {
+    return { from: selection.from, to: selection.to };
+  }
+  const paste = direction === "backward"
+    ? pastes.find((candidate) => candidate.to === selection.head)
+    : pastes.find((candidate) => candidate.from === selection.head);
+  return paste ? { from: paste.from, to: paste.to } : null;
+}
+
 export interface ComposerDraftSnapshot {
   document: string;
   content: string;

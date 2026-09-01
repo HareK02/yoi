@@ -1,5 +1,6 @@
 import type { Segment } from "$lib/generated/protocol.ts";
 import {
+  composerDeletionRange,
   type ComposerPaste,
   composerPasteToken,
   pasteChipLabel,
@@ -74,6 +75,30 @@ Deno.test("composer draft preserves mixed Text and Paste order exactly", () => {
     { kind: "text", content: " after" },
   ]);
   assertEquals(snapshot.pastes.map((entry) => entry.key), [11, 12]);
+});
+
+Deno.test("selection deletion covers mixed Text and every selected paste chip", () => {
+  const pastes = [
+    { ...paste(1, "first"), key: 10, from: 2, to: 5 },
+    { ...paste(2, "second"), key: 11, from: 8, to: 11 },
+  ];
+
+  assertEquals(
+    composerDeletionRange({ from: 1, to: 12, head: 12 }, pastes, "backward"),
+    { from: 1, to: 12 },
+  );
+  assertEquals(
+    composerDeletionRange({ from: 2, to: 11, head: 2 }, pastes, "forward"),
+    { from: 2, to: 11 },
+  );
+  assertEquals(
+    composerDeletionRange({ from: 5, to: 5, head: 5 }, pastes, "backward"),
+    { from: 2, to: 5 },
+  );
+  assertEquals(
+    composerDeletionRange({ from: 8, to: 8, head: 8 }, pastes, "forward"),
+    { from: 8, to: 11 },
+  );
 });
 
 Deno.test("composer paste chip label is compact and accessible", () => {

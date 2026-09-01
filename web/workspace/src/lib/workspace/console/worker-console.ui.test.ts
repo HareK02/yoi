@@ -604,6 +604,9 @@ Deno.test("Worker Console paste chips preserve typed draft and target authority"
       composerInput.includes("EditorView.atomicRanges") &&
       composerInput.includes('key: "Backspace"') &&
       composerInput.includes('key: "Delete"') &&
+      composerInput.includes(
+        "composerDeletionRange(selection, pastes, direction)",
+      ) &&
       composerInput.includes('chip.setAttribute("aria-label", label)') &&
       composerInput.includes("preserveExactText = false") &&
       consolePage.includes("buildComposerSegmentsRequest(value.segments, {") &&
