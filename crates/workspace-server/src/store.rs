@@ -7005,6 +7005,59 @@ fn bind_workdir_create_repository_access_evidence(conn: &Connection) -> Result<(
 }
 
 fn require_workspace_account_owner(conn: &Connection) -> Result<()> {
+    let expected_columns = [
+        "workspace_id",
+        "display_name",
+        "state",
+        "created_at",
+        "updated_at",
+        "owner_account_id",
+    ];
+    let actual_columns = table_columns(conn, "workspaces")?;
+    if actual_columns
+        != expected_columns
+            .iter()
+            .map(|column| (*column).to_string())
+            .collect::<Vec<_>>()
+    {
+        return Err(Error::Store(format!(
+            "Workspace owner migration rejected workspaces schema drift: expected columns [{}], found [{}]",
+            expected_columns.join(", "),
+            actual_columns.join(", ")
+        )));
+    }
+    let owner_not_null = conn.query_row(
+        "SELECT \"notnull\" FROM pragma_table_info('workspaces') WHERE name = 'owner_account_id'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let owner_foreign_key = conn
+        .query_row(
+            "SELECT \"table\", \"to\", on_delete \
+             FROM pragma_foreign_key_list('workspaces') \
+             WHERE \"from\" = 'owner_account_id'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    if owner_not_null != 0
+        || owner_foreign_key
+            .as_ref()
+            .map(|(table, column, on_delete)| (table.as_str(), column.as_str(), on_delete.as_str()))
+            != Some(("accounts", "account_id", "SET NULL"))
+    {
+        return Err(Error::Store(
+            "Workspace owner migration rejected owner_account_id schema drift; expected nullable accounts(account_id) with ON DELETE SET NULL"
+                .to_string(),
+        ));
+    }
+
     let workspace_schema_objects = {
         let mut statement = conn.prepare(
             "SELECT sql FROM sqlite_schema \
@@ -7028,8 +7081,30 @@ fn require_workspace_account_owner(conn: &Connection) -> Result<()> {
         |row| row.get::<_, i64>(0),
     )?;
     if invalid_workspace_owners != 0 {
+        let invalid_workspace_ids = {
+            let mut statement = conn.prepare(
+                "SELECT workspace.workspace_id \
+                 FROM workspaces AS workspace \
+                 LEFT JOIN accounts AS owner ON owner.account_id = workspace.owner_account_id \
+                 WHERE workspace.owner_account_id IS NULL \
+                    OR owner.account_id IS NULL \
+                    OR owner.kind <> 'user' \
+                 ORDER BY workspace.workspace_id \
+                 LIMIT 20",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let omitted = invalid_workspace_owners.saturating_sub(invalid_workspace_ids.len() as i64);
+        let omitted_suffix = if omitted == 0 {
+            String::new()
+        } else {
+            format!("; {omitted} additional Workspace record(s) omitted")
+        };
         return Err(Error::Store(format!(
-            "Workspace owner migration requires one explicit User Account owner for every Workspace; found {invalid_workspace_owners} Workspace record(s) without a valid User Account owner"
+            "Workspace owner migration requires one explicit User Account owner for every Workspace; invalid Workspace IDs: [{}]{omitted_suffix}",
+            invalid_workspace_ids.join(", ")
         )));
     }
 
@@ -11952,22 +12027,7 @@ INSERT INTO worker_registry (
     fn schema_v45_adds_workdir_create_operations_to_v44_database() {
         let conn = Connection::open_in_memory().unwrap();
         configure_sqlite(&conn).unwrap();
-        apply_migrations(&conn).unwrap();
-        conn.execute_batch(
-            "DROP TABLE repository_secret_audit_events;
-             DROP TABLE repository_secret_operations;
-             DROP TABLE server_secret_versions;
-             DROP TABLE repository_ssh_credential_revisions;
-             DROP TABLE repository_ssh_credentials;
-             DROP TABLE repository_ssh_host_trust_revisions;
-             DROP TABLE repository_ssh_host_trusts;
-             DROP TABLE workdir_create_operations;
-             ALTER TABLE workdir_registry DROP COLUMN creation_tree;
-             ALTER TABLE workdir_registry DROP COLUMN current_tree;
-             ALTER TABLE workdir_registry DROP COLUMN observed_at_epoch_seconds;
-             DELETE FROM __yoi_schema_migrations WHERE version IN (45, 46, 47, 48);",
-        )
-        .unwrap();
+        apply_migrations_through(&conn, 44).unwrap();
         assert_eq!(current_schema_version(&conn).unwrap(), 44);
 
         apply_migrations(&conn).unwrap();
@@ -11994,31 +12054,7 @@ INSERT INTO worker_registry (
     fn schema_v46_adds_repository_ssh_secret_authority_to_v45_database() {
         let conn = Connection::open_in_memory().unwrap();
         configure_sqlite(&conn).unwrap();
-        apply_migrations(&conn).unwrap();
-        conn.execute_batch(
-            "DROP TABLE repository_secret_audit_events;
-             DROP TABLE repository_secret_operations;
-             DROP TABLE server_secret_versions;
-             DROP TABLE repository_ssh_credential_revisions;
-             DROP TABLE repository_ssh_credentials;
-             DROP TABLE repository_ssh_host_trust_revisions;
-             DROP TABLE repository_ssh_host_trusts;
-             ALTER TABLE workdir_registry DROP COLUMN creation_tree;
-             ALTER TABLE workdir_registry DROP COLUMN current_tree;
-             ALTER TABLE workdir_registry DROP COLUMN observed_at_epoch_seconds;
-             ALTER TABLE workdir_create_operations DROP COLUMN source_kind;
-             ALTER TABLE workdir_create_operations DROP COLUMN source_uri;
-             ALTER TABLE workdir_create_operations DROP COLUMN source_revision;
-             ALTER TABLE workdir_create_operations DROP COLUMN source_fingerprint;
-             ALTER TABLE workdir_create_operations DROP COLUMN credential_id;
-             ALTER TABLE workdir_create_operations DROP COLUMN credential_revision;
-             ALTER TABLE workdir_create_operations DROP COLUMN host_trust_id;
-             ALTER TABLE workdir_create_operations DROP COLUMN host_trust_revision;
-             ALTER TABLE workdir_create_operations DROP COLUMN repository_access_mode;
-             ALTER TABLE workdir_create_operations DROP COLUMN cache_generation;
-             DELETE FROM __yoi_schema_migrations WHERE version IN (46, 47, 48);",
-        )
-        .unwrap();
+        apply_migrations_through(&conn, 45).unwrap();
         assert_eq!(current_schema_version(&conn).unwrap(), 45);
 
         apply_migrations(&conn).unwrap();
@@ -12045,24 +12081,7 @@ INSERT INTO worker_registry (
     fn schema_v47_binds_workdir_create_repository_access_evidence() {
         let conn = Connection::open_in_memory().unwrap();
         configure_sqlite(&conn).unwrap();
-        apply_migrations(&conn).unwrap();
-        conn.execute_batch(
-            "ALTER TABLE workdir_registry DROP COLUMN creation_tree;
-             ALTER TABLE workdir_registry DROP COLUMN current_tree;
-             ALTER TABLE workdir_registry DROP COLUMN observed_at_epoch_seconds;
-             ALTER TABLE workdir_create_operations DROP COLUMN source_kind;
-             ALTER TABLE workdir_create_operations DROP COLUMN source_uri;
-             ALTER TABLE workdir_create_operations DROP COLUMN source_revision;
-             ALTER TABLE workdir_create_operations DROP COLUMN source_fingerprint;
-             ALTER TABLE workdir_create_operations DROP COLUMN credential_id;
-             ALTER TABLE workdir_create_operations DROP COLUMN credential_revision;
-             ALTER TABLE workdir_create_operations DROP COLUMN host_trust_id;
-             ALTER TABLE workdir_create_operations DROP COLUMN host_trust_revision;
-             ALTER TABLE workdir_create_operations DROP COLUMN repository_access_mode;
-             ALTER TABLE workdir_create_operations DROP COLUMN cache_generation;
-             DELETE FROM __yoi_schema_migrations WHERE version IN (47, 48);",
-        )
-        .unwrap();
+        apply_migrations_through(&conn, 46).unwrap();
         assert_eq!(current_schema_version(&conn).unwrap(), 46);
 
         apply_migrations(&conn).unwrap();
@@ -13966,6 +13985,24 @@ CREATE TABLE ticket_assignment_operations (
     }
 
     #[test]
+    fn workspace_owner_migration_rejects_schema_drift_before_rebuild() {
+        let conn = workspace_owner_schema_47();
+        conn.execute_batch(
+            "ALTER TABLE workspaces RENAME COLUMN owner_account_id TO legacy_owner_account_id;",
+        )
+        .unwrap();
+
+        let error = apply_migrations(&conn).unwrap_err().to_string();
+        assert!(error.contains("schema drift"), "{error}");
+        assert_eq!(current_schema_version(&conn).unwrap(), 47);
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn workspace_owner_migration_fails_closed_for_ownerless_records() {
         let conn = workspace_owner_schema_47();
         conn.execute(
@@ -13977,6 +14014,7 @@ CREATE TABLE ticket_assignment_operations (
 
         let error = apply_migrations(&conn).unwrap_err().to_string();
         assert!(error.contains("explicit User Account owner"), "{error}");
+        assert!(error.contains("workspace-ownerless"), "{error}");
         assert_eq!(
             conn.query_row(
                 "SELECT MAX(version) FROM __yoi_schema_migrations",
@@ -14033,6 +14071,7 @@ CREATE TABLE ticket_assignment_operations (
 
         let error = apply_migrations(&conn).unwrap_err().to_string();
         assert!(error.contains("explicit User Account owner"), "{error}");
+        assert!(error.contains("workspace-organization"), "{error}");
         assert_eq!(current_schema_version(&conn).unwrap(), 47);
         assert_eq!(
             conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
