@@ -145,7 +145,7 @@ pub(crate) enum StandalonePickerError {
     #[error("standalone Worker state is unavailable: {0}")]
     StateStore(#[source] standalone::StandaloneStoreError),
     #[error(
-        "no standalone Workers found for this cwd; use `yoi --local --resume --all` to include all cwd identities"
+        "no standalone Workers found for this cwd; use `yoi --local resume --all` to include all cwd identities"
     )]
     NoWorkers { include_all: bool },
     #[error("standalone Worker picker I/O failed: {0}")]
