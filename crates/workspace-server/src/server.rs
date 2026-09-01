@@ -142,8 +142,8 @@ use crate::store::{
     WorkspaceResourceKind,
 };
 use crate::workdir_removal::{
-    WorkdirRemovalDisposition, WorkdirRemovalOperation, WorkdirRemovalOperationState,
-    workdir_removal_intent,
+    WorkdirRemovalAttemptOwner, WorkdirRemovalDisposition, WorkdirRemovalOperation,
+    WorkdirRemovalOperationState, workdir_removal_intent,
 };
 use crate::workspace_catalog::{WorkspaceCatalogService, WorkspaceCreateRequest};
 use crate::{Error, Result};
@@ -519,6 +519,7 @@ pub struct WorkspaceApi {
     workdir_session_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
     worker_remove_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
     workdir_remove_locks: Arc<Mutex<HashMap<String, Arc<std::sync::Mutex<()>>>>>,
+    workdir_remove_attempt_owner: WorkdirRemovalAttemptOwner,
     worker_control_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
@@ -1640,6 +1641,7 @@ impl WorkspaceApi {
             workdir_session_locks: Arc::new(Mutex::new(HashMap::new())),
             worker_remove_locks: Arc::new(Mutex::new(HashMap::new())),
             workdir_remove_locks: Arc::new(Mutex::new(HashMap::new())),
+            workdir_remove_attempt_owner: current_workdir_removal_attempt_owner()?,
             worker_control_locks: Arc::new(Mutex::new(HashMap::new())),
         };
         if let Some(dispatcher) = worker_remove_dispatcher {
@@ -9320,6 +9322,16 @@ async fn create_workspace_working_directory(
             )
         });
     }
+    let reserved = if reserved.state == "failed" {
+        api.config_store.begin_failed_workdir_create_retry(
+            workspace_id,
+            &operation_id,
+            &request_fingerprint,
+            &now_registry_timestamp(),
+        )?
+    } else {
+        reserved
+    };
 
     let runtime = match api
         .runtime
@@ -9589,6 +9601,91 @@ fn classify_workdir_provider_error(error: &RuntimeRegistryError) -> (&'static st
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkdirRemovalOwnerObservation {
+    Running { process_start_marker: u64 },
+    Missing,
+    Unobservable,
+}
+
+fn current_workdir_removal_attempt_owner() -> Result<WorkdirRemovalAttemptOwner> {
+    let process_id = std::process::id();
+    match observe_workdir_removal_owner(process_id) {
+        WorkdirRemovalOwnerObservation::Running {
+            process_start_marker,
+        } => Ok(WorkdirRemovalAttemptOwner {
+            process_id,
+            process_start_marker,
+        }),
+        WorkdirRemovalOwnerObservation::Missing | WorkdirRemovalOwnerObservation::Unobservable => {
+            Err(Error::Config(
+                "current Server process identity is unavailable for durable Workdir removal"
+                    .to_string(),
+            ))
+        }
+    }
+}
+
+fn workdir_removal_attempt_is_orphaned(operation: &WorkdirRemovalOperation) -> Result<bool> {
+    let Some(owner) = operation.attempt_owner else {
+        return Ok(operation.attempt_count == 0);
+    };
+    match observe_workdir_removal_owner(owner.process_id) {
+        WorkdirRemovalOwnerObservation::Running {
+            process_start_marker,
+        } if process_start_marker == owner.process_start_marker => Ok(false),
+        WorkdirRemovalOwnerObservation::Running { .. }
+        | WorkdirRemovalOwnerObservation::Missing => Ok(true),
+        WorkdirRemovalOwnerObservation::Unobservable => Err(Error::RegistryInconsistency(
+            "prior Workdir removal attempt owner liveness is unobservable".to_string(),
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn observe_workdir_removal_owner(process_id: u32) -> WorkdirRemovalOwnerObservation {
+    let stat = match std::fs::read_to_string(format!("/proc/{process_id}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return if process_id != std::process::id()
+                && std::fs::read_to_string("/proc/self/stat")
+                    .ok()
+                    .and_then(|stat| parse_linux_process_start_marker(&stat))
+                    .is_some()
+            {
+                WorkdirRemovalOwnerObservation::Missing
+            } else {
+                WorkdirRemovalOwnerObservation::Unobservable
+            };
+        }
+        Err(_) => return WorkdirRemovalOwnerObservation::Unobservable,
+    };
+    parse_linux_process_start_marker(&stat)
+        .map(
+            |process_start_marker| WorkdirRemovalOwnerObservation::Running {
+                process_start_marker,
+            },
+        )
+        .unwrap_or(WorkdirRemovalOwnerObservation::Unobservable)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_process_start_marker(stat: &str) -> Option<u64> {
+    let (_, tail) = stat.rsplit_once(") ")?;
+    tail.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn observe_workdir_removal_owner(process_id: u32) -> WorkdirRemovalOwnerObservation {
+    if process_id == std::process::id() {
+        WorkdirRemovalOwnerObservation::Running {
+            process_start_marker: 0,
+        }
+    } else {
+        WorkdirRemovalOwnerObservation::Unobservable
+    }
+}
+
 trait WorkdirRemovalRuntimeProvider: Send + Sync {
     fn observe_workdir(
         &self,
@@ -9641,17 +9738,25 @@ fn execute_reserved_workdir_removal_with_provider(
         return Ok(operation);
     }
     let operation = if recovery {
+        let prior_owner_is_orphaned = if operation.state == WorkdirRemovalOperationState::Pending {
+            workdir_removal_attempt_is_orphaned(&operation)?
+        } else {
+            false
+        };
         api.config_store
             .reclaim_workdir_removal_attempt_for_recovery(
                 &operation.workspace_id,
                 &operation.operation_id,
                 &operation.request_fingerprint,
+                api.workdir_remove_attempt_owner,
+                prior_owner_is_orphaned,
             )?
     } else {
         api.config_store.begin_workdir_removal_attempt(
             &operation.workspace_id,
             &operation.operation_id,
             &operation.request_fingerprint,
+            api.workdir_remove_attempt_owner,
         )?
     };
     let guards = match api.config_store.workdir_removal_guards(&operation) {
@@ -22704,6 +22809,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_does_not_reclaim_live_attempt_owner() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        seed_cleanup_workdir(&api, "live-owner-workdir", "present", "clean");
+        let record = api
+            .store
+            .get_workdir_registry(&api.config.workspace_id, "live-owner-workdir")
+            .unwrap()
+            .unwrap();
+        let intent = workdir_removal_intent(
+            &record,
+            "account:owner",
+            "do not steal a live provider call",
+        )
+        .unwrap();
+        let reserved = api
+            .config_store
+            .reserve_workdir_removal_operation(&intent)
+            .unwrap();
+        api.config_store
+            .begin_workdir_removal_attempt(
+                &reserved.workspace_id,
+                &reserved.operation_id,
+                &reserved.request_fingerprint,
+                api.workdir_remove_attempt_owner,
+            )
+            .unwrap();
+
+        recover_workdir_removals(&api).unwrap();
+
+        let operation = api
+            .config_store
+            .get_workdir_removal_operation(&api.config.workspace_id, &intent.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.state, WorkdirRemovalOperationState::Pending);
+        assert_eq!(operation.attempt_count, 1);
+        assert_eq!(
+            operation.attempt_owner,
+            Some(api.workdir_remove_attempt_owner)
+        );
+    }
+
+    #[tokio::test]
     async fn recovery_retries_same_operation_and_retains_unknown_provider_result() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
@@ -22726,6 +22876,10 @@ mod tests {
                 &reserved.workspace_id,
                 &reserved.operation_id,
                 &reserved.request_fingerprint,
+                WorkdirRemovalAttemptOwner {
+                    process_id: u32::MAX,
+                    process_start_marker: 1,
+                },
             )
             .unwrap();
         assert_eq!(interrupted_attempt.attempt_count, 1);

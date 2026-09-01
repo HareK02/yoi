@@ -44,6 +44,12 @@ impl WorkdirRemovalDisposition {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkdirRemovalAttemptOwner {
+    pub process_id: u32,
+    pub process_start_marker: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkdirRemovalIntent {
     pub operation_id: String,
@@ -73,6 +79,7 @@ pub struct WorkdirRemovalOperation {
     pub retryable: bool,
     pub disposition: Option<WorkdirRemovalDisposition>,
     pub failure_category: Option<String>,
+    pub attempt_owner: Option<WorkdirRemovalAttemptOwner>,
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
@@ -102,6 +109,8 @@ CREATE TABLE workdir_removal_operations (
     retryable INTEGER NOT NULL CHECK (retryable IN (0, 1)),
     disposition TEXT CHECK (disposition IN ('removed', 'retained', 'attention_required')),
     failure_category TEXT,
+    attempt_owner_pid INTEGER CHECK (attempt_owner_pid > 0),
+    attempt_owner_start_marker INTEGER CHECK (attempt_owner_start_marker >= 0),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     completed_at TEXT,
@@ -252,11 +261,13 @@ impl SqliteWorkspaceStore {
         workspace_id: &str,
         operation_id: &str,
         request_fingerprint: &str,
+        owner: WorkdirRemovalAttemptOwner,
     ) -> Result<WorkdirRemovalOperation> {
         self.begin_workdir_removal_attempt_inner(
             workspace_id,
             operation_id,
             request_fingerprint,
+            owner,
             false,
         )
     }
@@ -266,12 +277,15 @@ impl SqliteWorkspaceStore {
         workspace_id: &str,
         operation_id: &str,
         request_fingerprint: &str,
+        owner: WorkdirRemovalAttemptOwner,
+        prior_owner_is_orphaned: bool,
     ) -> Result<WorkdirRemovalOperation> {
         self.begin_workdir_removal_attempt_inner(
             workspace_id,
             operation_id,
             request_fingerprint,
-            true,
+            owner,
+            prior_owner_is_orphaned,
         )
     }
 
@@ -280,7 +294,8 @@ impl SqliteWorkspaceStore {
         workspace_id: &str,
         operation_id: &str,
         request_fingerprint: &str,
-        recovery: bool,
+        owner: WorkdirRemovalAttemptOwner,
+        prior_owner_is_orphaned: bool,
     ) -> Result<WorkdirRemovalOperation> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -297,7 +312,7 @@ impl SqliteWorkspaceStore {
             }
             if operation.state == WorkdirRemovalOperationState::Pending
                 && operation.attempt_count > 0
-                && !recovery
+                && !prior_owner_is_orphaned
             {
                 return Err(Error::WorkdirAttachmentConflict(format!(
                     "Workdir removal operation `{operation_id}` already has an active attempt"
@@ -305,8 +320,19 @@ impl SqliteWorkspaceStore {
             }
             let now = Utc::now().to_rfc3339();
             tx.execute(
-                "UPDATE workdir_removal_operations SET state='pending', attempt_count=attempt_count+1, retryable=1, failure_category=NULL, disposition=NULL, updated_at=?1, completed_at=NULL WHERE workspace_id=?2 AND operation_id=?3 AND request_fingerprint=?4",
-                params![now, workspace_id, operation_id, request_fingerprint],
+                "UPDATE workdir_removal_operations SET state='pending', attempt_count=attempt_count+1, retryable=1, failure_category=NULL, disposition=NULL, attempt_owner_pid=?1, attempt_owner_start_marker=?2, updated_at=?3, completed_at=NULL WHERE workspace_id=?4 AND operation_id=?5 AND request_fingerprint=?6",
+                params![
+                    owner.process_id,
+                    i64::try_from(owner.process_start_marker).map_err(|_| {
+                        Error::InvalidInput(
+                            "process start marker is out of SQLite range".to_string(),
+                        )
+                    })?,
+                    now,
+                    workspace_id,
+                    operation_id,
+                    request_fingerprint,
+                ],
             )?;
             let operation =
                 require_operation(&tx, workspace_id, operation_id, request_fingerprint)?;
@@ -456,7 +482,7 @@ impl SqliteWorkspaceStore {
             }
             let now = Utc::now().to_rfc3339();
             tx.execute(
-                "UPDATE workdir_removal_operations SET state='failed', retryable=?1, disposition=?2, failure_category=?3, updated_at=?4 WHERE workspace_id=?5 AND operation_id=?6 AND request_fingerprint=?7",
+                "UPDATE workdir_removal_operations SET state='failed', retryable=?1, disposition=?2, failure_category=?3, attempt_owner_pid=NULL, attempt_owner_start_marker=NULL, updated_at=?4 WHERE workspace_id=?5 AND operation_id=?6 AND request_fingerprint=?7",
                 params![
                     retryable,
                     WorkdirRemovalDisposition::AttentionRequired.as_str(),
@@ -538,7 +564,7 @@ impl SqliteWorkspaceStore {
             }
             let now = Utc::now().to_rfc3339();
             tx.execute(
-                "UPDATE workdir_removal_operations SET state='completed', retryable=?1, disposition=?2, failure_category=?3, updated_at=?4, completed_at=?4 WHERE workspace_id=?5 AND operation_id=?6 AND request_fingerprint=?7",
+                "UPDATE workdir_removal_operations SET state='completed', retryable=?1, disposition=?2, failure_category=?3, attempt_owner_pid=NULL, attempt_owner_start_marker=NULL, updated_at=?4, completed_at=?4 WHERE workspace_id=?5 AND operation_id=?6 AND request_fingerprint=?7",
                 params![
                     retryable,
                     disposition.as_str(),
@@ -620,13 +646,16 @@ fn require_no_removal_blockers(
             UNION ALL
             SELECT 1 FROM worker_workdir_attachment_reservations
              WHERE workspace_id=?1 AND workdir_id=?2
+            UNION ALL
+            SELECT 1 FROM workdir_create_operations
+             WHERE workspace_id=?1 AND working_directory_id=?2 AND state='pending'
         )"#,
         params![workspace_id, workdir_id],
         |row| row.get(0),
     )?;
     if blocked {
         return Err(Error::WorkdirAttachmentConflict(format!(
-            "Workdir {workdir_id} acquired an active or pending attachment during removal"
+            "Workdir {workdir_id} acquired active attachment or materialization authority during removal"
         )));
     }
     Ok(())
@@ -784,6 +813,7 @@ fn operation_select_sql() -> &'static str {
     r#"SELECT operation_id, request_fingerprint, workspace_id, workdir_id, runtime_id,
               repository_id, materialization_fingerprint, source_actor, reason, state,
               attempt_count, retryable, disposition, failure_category,
+              attempt_owner_pid, attempt_owner_start_marker,
               created_at, updated_at, completed_at
        FROM workdir_removal_operations"#
 }
@@ -795,6 +825,26 @@ fn read_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkdirRemovalOpe
         .map(|value| parse_disposition(&value))
         .transpose()?;
     let attempt_count = row.get::<_, i64>(10)?;
+    let attempt_owner_pid = row.get::<_, Option<i64>>(14)?;
+    let attempt_owner_start_marker = row.get::<_, Option<i64>>(15)?;
+    let attempt_owner = match (attempt_owner_pid, attempt_owner_start_marker) {
+        (None, None) => None,
+        (Some(process_id), Some(process_start_marker)) => Some(WorkdirRemovalAttemptOwner {
+            process_id: process_id
+                .try_into()
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(14, process_id))?,
+            process_start_marker: process_start_marker
+                .try_into()
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(15, process_start_marker))?,
+        }),
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                14,
+                rusqlite::types::Type::Integer,
+                "incomplete Workdir removal attempt owner".into(),
+            ));
+        }
+    };
     Ok(WorkdirRemovalOperation {
         operation_id: row.get(0)?,
         request_fingerprint: row.get(1)?,
@@ -812,9 +862,10 @@ fn read_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkdirRemovalOpe
         retryable: row.get(11)?,
         disposition,
         failure_category: row.get(13)?,
-        created_at: row.get(14)?,
-        updated_at: row.get(15)?,
-        completed_at: row.get(16)?,
+        attempt_owner,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
+        completed_at: row.get(18)?,
     })
 }
 
@@ -856,6 +907,13 @@ mod tests {
     use super::*;
     use crate::store::{AccountRecord, ControlPlaneStore, RepositoryRecord, WorkspaceRecord};
     use workspace_api::{RepositoryObservedStatus, RepositorySource, RepositorySourceKind};
+
+    fn attempt_owner() -> WorkdirRemovalAttemptOwner {
+        WorkdirRemovalAttemptOwner {
+            process_id: 100,
+            process_start_marker: 200,
+        }
+    }
 
     async fn seeded_store() -> (SqliteWorkspaceStore, WorkdirRegistryRecord) {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
@@ -950,6 +1008,7 @@ mod tests {
                 &reserved.workspace_id,
                 &reserved.operation_id,
                 &reserved.request_fingerprint,
+                attempt_owner(),
             )
             .unwrap();
         assert_eq!(first.attempt_count, 1);
@@ -962,6 +1021,7 @@ mod tests {
                 &failed.workspace_id,
                 &failed.operation_id,
                 &failed.request_fingerprint,
+                attempt_owner(),
             )
             .unwrap();
         assert_eq!(retry.attempt_count, 2);
@@ -981,6 +1041,7 @@ mod tests {
                 &completed.workspace_id,
                 &completed.operation_id,
                 &completed.request_fingerprint,
+                attempt_owner(),
             )
             .unwrap();
         assert_eq!(replay, completed);
@@ -1009,6 +1070,7 @@ mod tests {
                     &operation.workspace_id,
                     &operation.operation_id,
                     &operation.request_fingerprint,
+                    attempt_owner(),
                 );
                 if claim.is_ok() {
                     provider_calls.fetch_add(1, Ordering::SeqCst);
@@ -1040,6 +1102,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_workdir_create_retry_cannot_start_after_removal_claim() {
+        use crate::store::WorkdirCreateOperationRecord;
+
+        let (store, workdir) = seeded_store().await;
+        let create = WorkdirCreateOperationRecord {
+            workspace_id: "workspace-a".to_string(),
+            operation_id: "create-a".to_string(),
+            request_fingerprint: "create-fingerprint".to_string(),
+            repository_id: "repository-a".to_string(),
+            selector: Some("develop".to_string()),
+            requested_runtime_id: Some("runtime-a".to_string()),
+            resolved_runtime_id: "runtime-a".to_string(),
+            config_revision: 1,
+            config_projection_digest: "projection-a".to_string(),
+            source_kind: Some("local_path".to_string()),
+            source_uri: Some("/repository-a".to_string()),
+            source_revision: Some(1),
+            source_fingerprint: Some("source-a".to_string()),
+            credential_id: None,
+            credential_revision: None,
+            host_trust_id: None,
+            host_trust_revision: None,
+            repository_access_mode: None,
+            cache_generation: 0,
+            working_directory_id: "workdir-a".to_string(),
+            state: "pending".to_string(),
+            failure: None,
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        store.reserve_workdir_create_operation(&create).unwrap();
+        store
+            .finish_workdir_create_operation(
+                "workspace-a",
+                "create-a",
+                "create-fingerprint",
+                false,
+                Some("provider failed"),
+                "2",
+            )
+            .unwrap();
+        let intent =
+            workdir_removal_intent(&workdir, "workspace-api", "remove clean Workdir").unwrap();
+        store.reserve_workdir_removal_operation(&intent).unwrap();
+
+        let error = store
+            .begin_failed_workdir_create_retry("workspace-a", "create-a", "create-fingerprint", "3")
+            .unwrap_err();
+        assert!(matches!(error, Error::WorkdirAttachmentConflict(_)));
+        let create = store
+            .load_workdir_create_operation("workspace-a", "create-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(create.state, "failed");
+    }
+
+    #[tokio::test]
     async fn pending_removal_fences_new_attachment_and_retry_rereads_live_reservation() {
         let (store, workdir) = seeded_store().await;
         let intent =
@@ -1062,6 +1181,7 @@ mod tests {
                 &failed.workspace_id,
                 &failed.operation_id,
                 &failed.request_fingerprint,
+                attempt_owner(),
             )
             .unwrap();
         let guards = store.workdir_removal_guards(&retry).unwrap();

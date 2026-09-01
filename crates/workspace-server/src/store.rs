@@ -10104,48 +10104,117 @@ mod tests {
     }
 
     #[test]
-    fn schema_v49_upgrades_v48_with_durable_workdir_removal_authority() {
-        let conn = Connection::open_in_memory().unwrap();
-        configure_sqlite(&conn).unwrap();
-        apply_migrations_through(&conn, 48).unwrap();
-        assert_eq!(current_schema_version(&conn).unwrap(), 48);
-        assert!(!table_exists(&conn, "workdir_removal_operations").unwrap());
-
-        apply_migrations(&conn).unwrap();
-
-        assert_eq!(current_schema_version(&conn).unwrap(), 49);
-        assert!(table_exists(&conn, "workdir_removal_operations").unwrap());
-        let columns = table_columns(&conn, "workdir_removal_operations").unwrap();
-        for required in [
-            "workspace_id",
-            "operation_id",
-            "request_fingerprint",
-            "workdir_id",
-            "runtime_id",
-            "repository_id",
-            "materialization_fingerprint",
-            "source_actor",
-            "reason",
-            "state",
-            "attempt_count",
-            "retryable",
-            "disposition",
-            "failure_category",
-            "created_at",
-            "updated_at",
-            "completed_at",
-        ] {
-            assert!(
-                columns.iter().any(|column| column == required),
-                "missing {required}"
-            );
+    fn schema_v49_upgrades_persisted_v48_workdir_fixture() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server-v48.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            configure_sqlite(&conn).unwrap();
+            apply_migrations_through(&conn, 48).unwrap();
+            assert_eq!(current_schema_version(&conn).unwrap(), 48);
+            assert!(!table_exists(&conn, "workdir_removal_operations").unwrap());
+            conn.execute_batch(
+                r#"
+                INSERT INTO accounts (
+                    account_id, kind, handle, display_name, created_at, updated_at
+                ) VALUES ('owner-account', 'user', 'owner', 'Owner', '1', '1');
+                INSERT INTO workspaces (
+                    workspace_id, owner_account_id, display_name, state, created_at, updated_at
+                ) VALUES ('workspace-a', 'owner-account', 'Workspace A', 'active', '1', '1');
+                INSERT INTO repositories (
+                    workspace_id, repository_id, name, kind, provider, uri,
+                    source_kind, source_uri, default_ref, source_revision,
+                    source_fingerprint, observed_status, observed_at, created_at, updated_at
+                ) VALUES (
+                    'workspace-a', 'repository-a', 'Repository A', 'git', 'local', '/repo-a',
+                    'local_path', '/repo-a', 'develop', 1,
+                    'sha256:source-a', 'unverified', NULL, '1', '1'
+                );
+                INSERT INTO workdir_registry (
+                    workspace_id, workdir_id, runtime_id, repository_id,
+                    creation_selector, creation_ref, creation_tree,
+                    current_selector, current_ref, current_tree,
+                    observed_at_epoch_seconds, materialization_status, cleanliness,
+                    created_at, updated_at
+                ) VALUES (
+                    'workspace-a', 'workdir-a', 'runtime-a', 'repository-a',
+                    'refs/heads/develop', 'abc', 'tree-a',
+                    'refs/heads/work', 'def', 'tree-b',
+                    1, 'present', 'clean', '1', '1'
+                );
+                "#,
+            )
+            .unwrap();
         }
-        let foreign_key_failures: i64 = conn
-            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
-                row.get(0)
+
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        store
+            .with_conn(|conn| {
+                assert_eq!(current_schema_version(conn)?, 49);
+                assert!(table_exists(conn, "workdir_removal_operations")?);
+                let columns = table_columns(conn, "workdir_removal_operations")?;
+                for required in [
+                    "workspace_id",
+                    "operation_id",
+                    "request_fingerprint",
+                    "workdir_id",
+                    "runtime_id",
+                    "repository_id",
+                    "materialization_fingerprint",
+                    "source_actor",
+                    "reason",
+                    "state",
+                    "attempt_count",
+                    "retryable",
+                    "disposition",
+                    "failure_category",
+                    "attempt_owner_pid",
+                    "attempt_owner_start_marker",
+                    "created_at",
+                    "updated_at",
+                    "completed_at",
+                ] {
+                    assert!(
+                        columns.iter().any(|column| column == required),
+                        "missing {required}"
+                    );
+                }
+                let preserved: (String, String, String) = conn.query_row(
+                    "SELECT workspace_id, repository_id, materialization_status FROM workdir_registry WHERE workdir_id='workdir-a'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                assert_eq!(
+                    preserved,
+                    (
+                        "workspace-a".to_string(),
+                        "repository-a".to_string(),
+                        "present".to_string(),
+                    )
+                );
+                let foreign_key_failures: i64 = conn.query_row(
+                    "SELECT count(*) FROM pragma_foreign_key_check",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(foreign_key_failures, 0);
+                Ok(())
             })
             .unwrap();
-        assert_eq!(foreign_key_failures, 0);
+
+        let workdir = store
+            .get_workdir_registry("workspace-a", "workdir-a")
+            .unwrap()
+            .unwrap();
+        let intent = crate::workdir_removal::workdir_removal_intent(
+            &workdir,
+            "migration-test",
+            "remove migrated Workdir",
+        )
+        .unwrap();
+        let operation = store.reserve_workdir_removal_operation(&intent).unwrap();
+        assert_eq!(operation.workspace_id, "workspace-a");
+        assert_eq!(operation.working_directory_id, "workdir-a");
     }
 
     #[test]
