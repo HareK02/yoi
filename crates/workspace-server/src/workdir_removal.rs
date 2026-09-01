@@ -108,6 +108,9 @@ CREATE TABLE workdir_removal_operations (
     PRIMARY KEY (workspace_id, operation_id),
     FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
 );
+CREATE UNIQUE INDEX idx_workdir_removal_operations_one_pending
+    ON workdir_removal_operations(workspace_id, workdir_id)
+    WHERE state = 'pending';
 CREATE INDEX idx_workdir_removal_operations_recovery
     ON workdir_removal_operations(workspace_id, state, retryable, updated_at);
 CREATE INDEX idx_workdir_removal_operations_workdir
@@ -188,6 +191,18 @@ impl SqliteWorkspaceStore {
                 tx.commit()?;
                 return Ok(existing);
             }
+            let pending_operation: Option<String> = tx
+                .query_row(
+                    "SELECT operation_id FROM workdir_removal_operations WHERE workspace_id=?1 AND workdir_id=?2 AND state='pending' LIMIT 1",
+                    params![intent.workspace_id, intent.working_directory_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(pending_operation) = pending_operation {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Workdir removal operation `{pending_operation}` is already pending"
+                )));
+            }
             let current = load_workdir_record(&tx, &intent.workspace_id, &intent.working_directory_id)?
                 .ok_or_else(|| Error::InvalidInput(format!(
                     "Unknown Workdir `{}`",
@@ -238,9 +253,39 @@ impl SqliteWorkspaceStore {
         operation_id: &str,
         request_fingerprint: &str,
     ) -> Result<WorkdirRemovalOperation> {
+        self.begin_workdir_removal_attempt_inner(
+            workspace_id,
+            operation_id,
+            request_fingerprint,
+            false,
+        )
+    }
+
+    pub fn reclaim_workdir_removal_attempt_for_recovery(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        request_fingerprint: &str,
+    ) -> Result<WorkdirRemovalOperation> {
+        self.begin_workdir_removal_attempt_inner(
+            workspace_id,
+            operation_id,
+            request_fingerprint,
+            true,
+        )
+    }
+
+    fn begin_workdir_removal_attempt_inner(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        request_fingerprint: &str,
+        recovery: bool,
+    ) -> Result<WorkdirRemovalOperation> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let operation = require_operation(&tx, workspace_id, operation_id, request_fingerprint)?;
+            let operation =
+                require_operation(&tx, workspace_id, operation_id, request_fingerprint)?;
             if operation.state == WorkdirRemovalOperationState::Completed {
                 tx.commit()?;
                 return Ok(operation);
@@ -250,12 +295,21 @@ impl SqliteWorkspaceStore {
                     "Workdir removal operation `{operation_id}` is not retryable"
                 )));
             }
+            if operation.state == WorkdirRemovalOperationState::Pending
+                && operation.attempt_count > 0
+                && !recovery
+            {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Workdir removal operation `{operation_id}` already has an active attempt"
+                )));
+            }
             let now = Utc::now().to_rfc3339();
             tx.execute(
                 "UPDATE workdir_removal_operations SET state='pending', attempt_count=attempt_count+1, retryable=1, failure_category=NULL, disposition=NULL, updated_at=?1, completed_at=NULL WHERE workspace_id=?2 AND operation_id=?3 AND request_fingerprint=?4",
                 params![now, workspace_id, operation_id, request_fingerprint],
             )?;
-            let operation = require_operation(&tx, workspace_id, operation_id, request_fingerprint)?;
+            let operation =
+                require_operation(&tx, workspace_id, operation_id, request_fingerprint)?;
             tx.commit()?;
             Ok(operation)
         })
@@ -930,6 +984,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(replay, completed);
+    }
+
+    #[tokio::test]
+    async fn concurrent_claims_invoke_the_simulated_provider_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let (store, workdir) = seeded_store().await;
+        let intent =
+            workdir_removal_intent(&workdir, "workspace-api", "remove clean Workdir").unwrap();
+        let operation = store.reserve_workdir_removal_operation(&intent).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let mut callers = Vec::new();
+        for _ in 0..2 {
+            let store = store.clone();
+            let operation = operation.clone();
+            let barrier = barrier.clone();
+            let provider_calls = provider_calls.clone();
+            callers.push(std::thread::spawn(move || {
+                barrier.wait();
+                let claim = store.begin_workdir_removal_attempt(
+                    &operation.workspace_id,
+                    &operation.operation_id,
+                    &operation.request_fingerprint,
+                );
+                if claim.is_ok() {
+                    provider_calls.fetch_add(1, Ordering::SeqCst);
+                }
+                claim
+            }));
+        }
+        barrier.wait();
+        let results = callers
+            .into_iter()
+            .map(|caller| caller.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(Error::WorkdirAttachmentConflict(_))))
+                .count(),
+            1
+        );
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+
+        let claimed = results.into_iter().find_map(|result| result.ok()).unwrap();
+        let completed = store.commit_workdir_removal_removed(&claimed).unwrap();
+        assert_eq!(
+            completed.disposition,
+            Some(WorkdirRemovalDisposition::Removed)
+        );
     }
 
     #[tokio::test]

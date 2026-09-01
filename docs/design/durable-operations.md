@@ -13,7 +13,7 @@ The record stores only facts that affect identity, authorization, replay, or the
 - explicit retryability, bounded failure category, and bounded disposition;
 - a factual checkpoint only when a non-idempotent provider effect cannot be safely re-observed or repeated.
 
-A fingerprint excludes Server-generated result identifiers, attempt data, diagnostics, and fresh observations. Reusing one operation identity with a different fingerprint is an error. A completed exact retry replays the committed bounded result.
+A fingerprint excludes Server-generated result identifiers, attempt data, diagnostics, and fresh observations. Reusing one operation identity with a different fingerprint is an error. A completed exact retry replays the committed bounded result. A durable one-pending-operation constraint plus an atomic attempt claim prevents concurrent callers from entering the provider side effect for the same Workdir; the in-process resource lock is an additional serialization layer, not the sole authority.
 
 `pending` means only that the intent remains open. Function names, validation steps, and provider-call positions are not persisted as lifecycle stages. `failed` records the latest terminal attempt outcome; retryability remains separate metadata. `completed` means the required domain result and disposition are durably committed.
 
