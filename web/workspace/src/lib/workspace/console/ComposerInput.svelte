@@ -218,6 +218,7 @@
   }
 
   function handlePasteEvent(event: ClipboardEvent): boolean {
+    if (disabled || view?.state.readOnly) return false;
     const content = event.clipboardData?.getData("text/plain");
     if (!content) return false;
     const measurement = measureComposerPaste(content);
@@ -255,6 +256,7 @@
     currentView: EditorView,
     direction: "backward" | "forward",
   ): boolean {
+    if (currentView.state.readOnly) return false;
     const selection = currentView.state.selection.main;
     const pastes = composerPasteAtoms(
       currentView.state.doc.toString(),
@@ -291,7 +293,10 @@
           ])),
           keymap.of([...defaultKeymap, ...historyKeymap]),
           pasteChips,
-          editable.of(EditorView.editable.of(!disabled)),
+          editable.of([
+            EditorView.editable.of(!disabled),
+            EditorState.readOnly.of(disabled),
+          ]),
           EditorState.allowMultipleSelections.of(false),
           EditorView.lineWrapping,
           EditorView.contentAttributes.of({
@@ -368,7 +373,10 @@
   $effect(() => {
     const isDisabled = disabled;
     view?.dispatch({
-      effects: editable.reconfigure(EditorView.editable.of(!isDisabled)),
+      effects: editable.reconfigure([
+        EditorView.editable.of(!isDisabled),
+        EditorState.readOnly.of(isDisabled),
+      ]),
     });
   });
 

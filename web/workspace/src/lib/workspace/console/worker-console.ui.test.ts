@@ -607,6 +607,8 @@ Deno.test("Worker Console paste chips preserve typed draft and target authority"
       composerInput.includes(
         "composerDeletionRange(selection, pastes, direction)",
       ) &&
+      composerInput.includes("EditorState.readOnly.of(isDisabled)") &&
+      composerInput.includes("if (currentView.state.readOnly) return false") &&
       composerInput.includes('chip.setAttribute("aria-label", label)') &&
       composerInput.includes("preserveExactText = false") &&
       consolePage.includes("buildComposerSegmentsRequest(value.segments, {") &&
