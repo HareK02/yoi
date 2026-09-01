@@ -1,11 +1,15 @@
 import { dirname, isAbsolute, resolve } from "@std/path";
-import { bounded, redactText } from "./artifacts.ts";
+import { bounded, redactText, writePrivateJson } from "./artifacts.ts";
 import type { CaptureError, OwnedProcess } from "./types.ts";
+
+export const PROCESS_LOG_BYTE_LIMIT = 1024 * 1024;
+const PROCESS_STOP_TIMEOUT_MS = 3_000;
 
 export type RunningProcess = {
   id: string;
   pid: number;
   child: Deno.ChildProcess;
+  status: Promise<Deno.CommandStatus>;
   output: Promise<void>;
 };
 
@@ -20,15 +24,45 @@ async function appendOutput(
     write: true,
     mode: 0o600,
   });
+  const encoder = new TextEncoder();
+  const overlapCharacters = Math.max(512, ...secrets.map((secret) => secret.length + 128));
+  let pending = "";
+  let bytesObserved = 0;
+  let bytesWritten = 0;
+  let truncated = false;
+  const writeRedacted = async (value: string) => {
+    const encoded = encoder.encode(redactText(value, secrets));
+    const remaining = Math.max(0, PROCESS_LOG_BYTE_LIMIT - bytesWritten);
+    if (encoded.length > remaining) truncated = true;
+    if (remaining > 0) {
+      const output = encoded.subarray(0, remaining);
+      await file.write(output);
+      bytesWritten += output.length;
+    }
+  };
   try {
     const reader = stream.pipeThrough(new TextDecoderStream()).getReader();
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      await file.write(new TextEncoder().encode(redactText(value, secrets)));
+      bytesObserved += encoder.encode(value).length;
+      pending += value;
+      if (pending.length > overlapCharacters * 2) {
+        const splitAt = pending.length - overlapCharacters;
+        await writeRedacted(pending.slice(0, splitAt));
+        pending = pending.slice(splitAt);
+      }
     }
+    await writeRedacted(pending);
   } finally {
     file.close();
+    await writePrivateJson(`${destination}.meta.json`, {
+      schemaVersion: 1,
+      byteLimit: PROCESS_LOG_BYTE_LIMIT,
+      bytesObserved,
+      bytesWritten,
+      truncated,
+    });
   }
 }
 
@@ -83,17 +117,19 @@ export async function startOwnedProcesses(
         `${logsDirectory}/${specification.id}.stderr.log`,
         secrets,
       );
+      const status = child.status;
       const process = {
         id: specification.id,
         pid: child.pid,
         child,
+        status,
         output: Promise.all([stdout, stderr]).then(() => undefined),
       };
       running.push(process);
       if (specification.readyUrl) {
         await Promise.race([
           waitForReady(specification.readyUrl, specification.readyTimeoutMs ?? 30_000),
-          child.status.then((status) => {
+          status.then((status) => {
             throw new Error(
               `owned process ${specification.id} exited before readiness: ${status.code}`,
             );
@@ -145,23 +181,64 @@ function tryKill(pid: number, signal: Deno.Signal): void {
   }
 }
 
+async function livePids(pids: number[]): Promise<number[]> {
+  if (Deno.build.os === "windows") return [];
+  if (pids.length === 0) return [];
+  try {
+    const result = await new Deno.Command("ps", {
+      args: ["-o", "pid=", "-p", pids.join(",")],
+      stdout: "piped",
+      stderr: "null",
+    }).output();
+    if (!result.success && result.code !== 1) return pids;
+    const live = new Set(
+      new TextDecoder().decode(result.stdout).trim().split(/\s+/).map(Number).filter(
+        Number.isFinite,
+      ),
+    );
+    return pids.filter((pid) => live.has(pid));
+  } catch {
+    return pids;
+  }
+}
+
+async function waitForPidsToExit(pids: number[], timeoutMs: number): Promise<number[]> {
+  const deadline = Date.now() + timeoutMs;
+  let live = await livePids(pids);
+  while (live.length > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    live = await livePids(live);
+  }
+  return live;
+}
+
 export async function stopOwnedProcesses(processes: RunningProcess[]): Promise<CaptureError[]> {
   const diagnostics: CaptureError[] = [];
   for (const process of [...processes].reverse()) {
     try {
-      for (const pid of await descendantPids(process.pid)) tryKill(pid, "SIGTERM");
+      const descendants = await descendantPids(process.pid);
       tryKill(process.pid, "SIGTERM");
+      for (const pid of descendants) tryKill(pid, "SIGTERM");
       let timer: number | undefined;
-      const exited = await Promise.race([
-        process.child.status.then(() => true),
-        new Promise<boolean>((resolve) => {
-          timer = setTimeout(() => resolve(false), 3_000);
-        }),
-      ]).finally(() => clearTimeout(timer));
-      if (!exited) {
-        for (const pid of await descendantPids(process.pid)) tryKill(pid, "SIGKILL");
+      const [parentExited, liveDescendants] = await Promise.all([
+        Promise.race([
+          process.status.then(() => true),
+          new Promise<boolean>((resolve) => {
+            timer = setTimeout(() => resolve(false), PROCESS_STOP_TIMEOUT_MS);
+          }),
+        ]).finally(() => clearTimeout(timer)),
+        waitForPidsToExit(descendants, PROCESS_STOP_TIMEOUT_MS),
+      ]);
+      if (!parentExited || liveDescendants.length > 0) {
+        const lateDescendants = await descendantPids(process.pid);
+        const forceTargets = [...new Set([...liveDescendants, ...lateDescendants])];
+        for (const pid of forceTargets) tryKill(pid, "SIGKILL");
         tryKill(process.pid, "SIGKILL");
-        await process.child.status;
+        await process.status;
+        const survivors = await waitForPidsToExit(forceTargets, 1_000);
+        if (survivors.length > 0) {
+          throw new Error(`descendant processes did not exit: ${survivors.join(",")}`);
+        }
       }
       await process.output;
     } catch (error) {

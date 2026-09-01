@@ -3,12 +3,14 @@ import { type Browser, chromium, type Page, type Response } from "playwright";
 import { validateAuthState } from "./auth_state.ts";
 import {
   assertBundleIsSecretFree,
+  assertReviewBundleIsSecretFree,
   bounded,
   ensurePrivateDirectory,
   makePrivate,
   redactText,
   safeUrl,
   sha256File,
+  workdirLogicalPath,
 } from "./artifacts.ts";
 import { type RunningProcess, startOwnedProcesses, stopOwnedProcesses } from "./processes.ts";
 import {
@@ -21,7 +23,9 @@ import type {
   CaptureError,
   CaptureEvidence,
   CapturePoint,
+  DiagnosticSummary,
   Interaction,
+  InteractionEvidence,
   Persona,
   ReadyCondition,
   ReviewContext,
@@ -43,6 +47,32 @@ export type CaptureOptions = {
 };
 
 type SourceState = { revision: string | null; dirty: boolean | null };
+type ErrorCollector = { errors: CaptureError[]; observed: number; limit: number };
+
+const CAPTURE_ERROR_LIMIT = 100;
+
+function recordError(collector: ErrorCollector, error: CaptureError): void {
+  collector.observed++;
+  if (collector.errors.length < collector.limit) collector.errors.push(error);
+}
+
+function errorSummary(collector: ErrorCollector): DiagnosticSummary {
+  return {
+    observed: collector.observed,
+    retained: collector.errors.length,
+    truncated: collector.observed > collector.errors.length,
+    limit: collector.limit,
+  };
+}
+
+function interactionEvidence(interaction: Interaction): InteractionEvidence {
+  if (interaction.action === "wait") return { action: "wait", ready: interaction.ready };
+  if (interaction.action === "click") return { action: "click", selector: interaction.selector };
+  if (interaction.action === "fill") {
+    return { action: "fill", selector: interaction.selector, value: "[REDACTED]" };
+  }
+  return { action: "press", selector: interaction.selector, key: interaction.key };
+}
 
 function slug(value: string): string {
   return value.replaceAll(/[^a-zA-Z0-9.-]+/g, "-").replaceAll(/^-+|-+$/g, "").toLowerCase();
@@ -71,6 +101,20 @@ async function sourceState(): Promise<SourceState> {
   } catch {
     return { revision: null, dirty: null };
   }
+}
+
+async function repositoryRoot(): Promise<string> {
+  try {
+    const result = await new Deno.Command("git", {
+      args: ["rev-parse", "--show-toplevel"],
+      stdout: "piped",
+      stderr: "null",
+    }).output();
+    if (result.success) return resolve(new TextDecoder().decode(result.stdout).trim());
+  } catch {
+    // Fall back to the invocation directory outside a Git checkout.
+  }
+  return resolve(Deno.cwd());
 }
 
 function selectById<T extends { id: string }>(
@@ -162,7 +206,7 @@ export function isVisibleUiErrorText(content: string): boolean {
 
 async function collectVisibleUiErrors(
   page: Page,
-  errors: CaptureError[],
+  collector: ErrorCollector,
   secrets: string[],
 ): Promise<void> {
   const alerts = page.locator('[role="alert"], [aria-live="assertive"]');
@@ -172,8 +216,10 @@ async function collectVisibleUiErrors(
     const content = (await alert.innerText().catch(() => "")).trim();
     if (!isVisibleUiErrorText(content)) continue;
     const message = `visible UI error: ${bounded(redactText(content, secrets), 500)}`;
-    if (!errors.some((error) => error.kind === "document" && error.message === message)) {
-      errors.push({ kind: "document", message });
+    if (
+      !collector.errors.some((error) => error.kind === "document" && error.message === message)
+    ) {
+      recordError(collector, { kind: "document", message });
     }
   }
 }
@@ -181,19 +227,24 @@ async function collectVisibleUiErrors(
 async function capturePoint(
   page: Page,
   runDirectory: string,
+  repositoryRoot: string,
   persona: Persona,
   route: RouteScenario,
   viewport: Viewport,
   point: CapturePoint,
   documentResponse: Response | null,
-  errors: CaptureError[],
+  collector: ErrorCollector,
+  executedInteractions: InteractionEvidence[],
   scenario: Scenario,
 ): Promise<CaptureEvidence> {
   const startedAt = new Date().toISOString();
-  for (const interaction of point.interaction ?? []) await performInteraction(page, interaction);
+  for (const interaction of point.interaction ?? []) {
+    await performInteraction(page, interaction);
+    executedInteractions.push(interactionEvidence(interaction));
+  }
   if (point.ready) await waitReady(page, point.ready);
   await hideRedactedSelectors(page, scenario.redact?.selectors ?? []);
-  await collectVisibleUiErrors(page, errors, scenario.redact?.text ?? []);
+  await collectVisibleUiErrors(page, collector, scenario.redact?.text ?? []);
   const directory = join(
     runDirectory,
     "captures",
@@ -208,7 +259,8 @@ async function capturePoint(
   await makePrivate(viewportScreenshot);
   const screenshots: ScreenshotEvidence[] = [{
     kind: "viewport",
-    path: relative(runDirectory, viewportScreenshot),
+    bundlePath: relative(runDirectory, viewportScreenshot),
+    workdirPath: workdirLogicalPath(repositoryRoot, viewportScreenshot),
     sha256: await sha256File(viewportScreenshot),
   }];
   if (point.fullPage) {
@@ -217,19 +269,23 @@ async function capturePoint(
     await makePrivate(fullPageScreenshot);
     screenshots.push({
       kind: "full-page",
-      path: relative(runDirectory, fullPageScreenshot),
+      bundlePath: relative(runDirectory, fullPageScreenshot),
+      workdirPath: workdirLogicalPath(repositoryRoot, fullPageScreenshot),
       sha256: await sha256File(fullPageScreenshot),
     });
   }
-  let snapshotPath: string | null = null;
+  let snapshot: { bundlePath: string; workdirPath: string | null } | null = null;
   try {
-    const snapshot = await page.locator("body").ariaSnapshot({ timeout: 5_000 });
-    const redacted = redactText(snapshot, scenario.redact?.text ?? []);
+    const accessibility = await page.locator("body").ariaSnapshot({ timeout: 5_000 });
+    const redacted = redactText(accessibility, scenario.redact?.text ?? []);
     const target = join(directory, "accessibility.md");
     await Deno.writeTextFile(target, redacted, { mode: 0o600 });
-    snapshotPath = relative(runDirectory, target);
+    snapshot = {
+      bundlePath: relative(runDirectory, target),
+      workdirPath: workdirLogicalPath(repositoryRoot, target),
+    };
   } catch (error) {
-    errors.push({
+    recordError(collector, {
       kind: "tool",
       message: `accessibility snapshot failed: ${
         bounded(error instanceof Error ? error.message : String(error))
@@ -238,14 +294,22 @@ async function capturePoint(
   }
   return {
     persona: { id: persona.id, label: persona.label },
-    route: { id: route.id, path: route.path, goal: route.goal, dataState: route.dataState },
+    route: {
+      id: route.id,
+      path: route.path,
+      goal: route.goal,
+      dataState: route.dataState,
+      ready: route.ready,
+    },
     viewport,
     theme: scenario.colorScheme ?? "light",
-    capturePoint: { id: point.id, label: point.label },
+    capturePoint: { id: point.id, label: point.label, ready: point.ready ?? null },
+    interactions: [...executedInteractions],
     document: { url: safeUrl(page.url()), status: documentResponse?.status() ?? null },
     screenshots,
-    snapshotPath,
-    errors: [...errors],
+    snapshot,
+    errors: [...collector.errors],
+    errorSummary: errorSummary(collector),
     startedAt,
     finishedAt: new Date().toISOString(),
   };
@@ -267,14 +331,18 @@ function escapeHtml(value: string): string {
 async function createContactSheet(
   browser: Browser,
   runDirectory: string,
+  repositoryRoot: string,
   captures: CaptureEvidence[],
-): Promise<{ html: string | null; png: string | null }> {
+): Promise<{
+  html: { bundlePath: string; workdirPath: string | null } | null;
+  png: { bundlePath: string; workdirPath: string | null } | null;
+}> {
   const cells: string[] = [];
   for (const capture of captures) {
     const screenshot = capture.screenshots.find((item) => item.kind === "viewport") ??
       capture.screenshots[0];
     if (!screenshot) continue;
-    const bytes = await Deno.readFile(join(runDirectory, screenshot.path));
+    const bytes = await Deno.readFile(join(runDirectory, screenshot.bundlePath));
     cells.push(
       `<figure><img src="${screenshotDataUrl(bytes)}"><figcaption><strong>${
         escapeHtml(capture.persona.label)
@@ -305,11 +373,21 @@ async function createContactSheet(
   } finally {
     await page.close();
   }
-  return { html: relative(runDirectory, htmlPath), png: relative(runDirectory, pngPath) };
+  return {
+    html: {
+      bundlePath: relative(runDirectory, htmlPath),
+      workdirPath: workdirLogicalPath(repositoryRoot, htmlPath),
+    },
+    png: {
+      bundlePath: relative(runDirectory, pngPath),
+      workdirPath: workdirLogicalPath(repositoryRoot, pngPath),
+    },
+  };
 }
 
 export async function capture(options: CaptureOptions): Promise<ReviewContext> {
   const scenarioPath = resolve(options.scenarioPath);
+  const repository = await repositoryRoot();
   const scenario = await loadScenario(scenarioPath);
   const baseUrl = validateBaseUrl(
     interpolateEnvironment(
@@ -332,8 +410,13 @@ export async function capture(options: CaptureOptions): Promise<ReviewContext> {
   let browser: Browser | null = null;
   let processes: RunningProcess[] = [];
   const captures: CaptureEvidence[] = [];
-  const diagnostics: CaptureError[] = [];
-  let contactSheet = { html: null as string | null, png: null as string | null };
+  const globalCollector: ErrorCollector = {
+    errors: [],
+    observed: 0,
+    limit: CAPTURE_ERROR_LIMIT,
+  };
+  const diagnostics = globalCollector.errors;
+  let contactSheet: ReviewContext["contactSheet"] = { html: null, png: null };
   let browserVersion = "unknown";
   let status: ReviewContext["status"] = "completed";
   try {
@@ -362,11 +445,17 @@ export async function capture(options: CaptureOptions): Promise<ReviewContext> {
         });
         try {
           for (const route of routes) {
-            const routeErrors: CaptureError[] = [];
+            const routeCollector: ErrorCollector = {
+              errors: [],
+              observed: 0,
+              limit: CAPTURE_ERROR_LIMIT,
+            };
+            const routeErrors = routeCollector.errors;
+            const executedInteractions: InteractionEvidence[] = [];
             const page = await context.newPage();
             page.on("console", (message) => {
               if (message.type() === "error") {
-                routeErrors.push({
+                recordError(routeCollector, {
                   kind: "console",
                   message: bounded(redactText(message.text(), secrets)),
                 });
@@ -375,7 +464,7 @@ export async function capture(options: CaptureOptions): Promise<ReviewContext> {
             page.on(
               "pageerror",
               (error) =>
-                routeErrors.push({
+                recordError(routeCollector, {
                   kind: "page",
                   message: bounded(redactText(error.message, secrets)),
                 }),
@@ -383,7 +472,7 @@ export async function capture(options: CaptureOptions): Promise<ReviewContext> {
             page.on(
               "requestfailed",
               (request) =>
-                routeErrors.push({
+                recordError(routeCollector, {
                   kind: "request",
                   message: bounded(
                     redactText(request.failure()?.errorText ?? "request failed", secrets),
@@ -393,7 +482,7 @@ export async function capture(options: CaptureOptions): Promise<ReviewContext> {
             );
             page.on("response", (response) => {
               if (response.status() >= 400) {
-                routeErrors.push({
+                recordError(routeCollector, {
                   kind: "request",
                   message: `HTTP ${response.status()}`,
                   url: safeUrl(response.url()),
@@ -426,7 +515,7 @@ export async function capture(options: CaptureOptions): Promise<ReviewContext> {
                 }
               });
               if (response && response.status() >= 400) {
-                routeErrors.push({
+                recordError(routeCollector, {
                   kind: "document",
                   message: `document returned HTTP ${response.status()}`,
                   url: safeUrl(response.url()),
@@ -438,19 +527,21 @@ export async function capture(options: CaptureOptions): Promise<ReviewContext> {
                   await capturePoint(
                     page,
                     runDirectory,
+                    repository,
                     persona,
                     route,
                     viewport,
                     point,
                     response,
-                    routeErrors,
+                    routeCollector,
+                    executedInteractions,
                     scenario,
                   ),
                 );
               }
             } catch (error) {
               status = "completed-with-errors";
-              routeErrors.push({
+              recordError(routeCollector, {
                 kind: "tool",
                 message: bounded(
                   redactText(error instanceof Error ? error.message : String(error), secrets),
@@ -463,14 +554,17 @@ export async function capture(options: CaptureOptions): Promise<ReviewContext> {
                   path: route.path,
                   goal: route.goal,
                   dataState: route.dataState,
+                  ready: route.ready,
                 },
                 viewport,
                 theme: scenario.colorScheme ?? "light",
-                capturePoint: { id: "failed", label: "Capture failed" },
+                capturePoint: { id: "failed", label: "Capture failed", ready: null },
+                interactions: [...executedInteractions],
                 document: { url: safeUrl(page.url()), status: null },
                 screenshots: [],
-                snapshotPath: null,
-                errors: routeErrors,
+                snapshot: null,
+                errors: [...routeErrors],
+                errorSummary: errorSummary(routeCollector),
                 startedAt: new Date().toISOString(),
                 finishedAt: new Date().toISOString(),
               });
@@ -483,24 +577,24 @@ export async function capture(options: CaptureOptions): Promise<ReviewContext> {
         }
       }
     }
-    contactSheet = await createContactSheet(browser, runDirectory, captures);
+    contactSheet = await createContactSheet(browser, runDirectory, repository, captures);
     if (captures.some((capture) => capture.errors.length > 0)) status = "completed-with-errors";
   } catch (error) {
     status = "failed";
-    diagnostics.push({
+    recordError(globalCollector, {
       kind: "tool",
       message: bounded(redactText(error instanceof Error ? error.message : String(error), secrets)),
     });
   } finally {
     if (browser) {
       await browser.close().catch((error) =>
-        diagnostics.push({
+        recordError(globalCollector, {
           kind: "tool",
           message: `browser cleanup failed: ${bounded(String(error))}`,
         })
       );
     }
-    diagnostics.push(...await stopOwnedProcesses(processes));
+    for (const error of await stopOwnedProcesses(processes)) recordError(globalCollector, error);
   }
   if (diagnostics.length > 0 && status === "completed") status = "completed-with-errors";
   const manifest: ReviewContext = {
@@ -509,7 +603,7 @@ export async function capture(options: CaptureOptions): Promise<ReviewContext> {
     scenario: {
       id: scenario.id,
       title: scenario.title,
-      sourcePath: relative(Deno.cwd(), scenarioPath),
+      sourcePath: workdirLogicalPath(repository, scenarioPath),
     },
     source: await sourceState(),
     baseUrl: safeUrl(baseUrl),
@@ -524,10 +618,12 @@ export async function capture(options: CaptureOptions): Promise<ReviewContext> {
     captures,
     contactSheet,
     diagnostics,
+    diagnosticSummary: errorSummary(globalCollector),
   };
   const serialized = `${JSON.stringify(manifest, null, 2)}\n`;
   assertBundleIsSecretFree(serialized, secrets);
   await Deno.writeTextFile(join(runDirectory, "review-context.json"), serialized, { mode: 0o600 });
+  await assertReviewBundleIsSecretFree(runDirectory, secrets);
   if (status === "failed") {
     throw new Error(`capture failed; inspect ${join(runDirectory, "review-context.json")}`);
   }

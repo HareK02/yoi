@@ -15,13 +15,16 @@
     {
       "id": "owner",
       "label": "Workspace owner",
-      "auth": { "kind": "storage-state", "path": "../../../.web-ux/auth/owner.json" },
+      "auth": { "kind": "storage-state", "path": "${XDG_STATE_HOME}/yoi/web-ux/auth/owner.json" },
       "login": { "path": "/", "successUrl": "/w/" }
     },
     {
       "id": "non-owner",
       "label": "Authenticated non-owner",
-      "auth": { "kind": "storage-state", "path": "../../../.web-ux/auth/non-owner.json" },
+      "auth": {
+        "kind": "storage-state",
+        "path": "${XDG_STATE_HOME}/yoi/web-ux/auth/non-owner.json"
+      },
       "login": { "path": "/", "successUrl": "/w/" }
     }
   ],

@@ -70,6 +70,9 @@ function parseCapturePoint(value: unknown, at: string): CapturePoint {
   if (source.ready !== undefined) result.ready = parseReady(source.ready, `${at}.ready`);
   if (source.interaction !== undefined) {
     if (!Array.isArray(source.interaction)) throw new Error(`${at}.interaction must be an array`);
+    if (source.interaction.length > 20) {
+      throw new Error(`${at}.interaction must not exceed 20 items`);
+    }
     result.interaction = source.interaction.map((raw, index) => {
       const action = record(raw, `${at}.interaction[${index}]`);
       const name = text(action.action, `${at}.interaction[${index}].action`);
@@ -148,6 +151,9 @@ function parseRoute(value: unknown, at: string): RouteScenario {
   if (!Array.isArray(source.capturePoints) || source.capturePoints.length === 0) {
     throw new Error(`${at}.capturePoints must have at least one item`);
   }
+  if (source.capturePoints.length > 12) {
+    throw new Error(`${at}.capturePoints must not exceed 12 items`);
+  }
   return {
     id: identifier(source.id, `${at}.id`),
     label: text(source.label, `${at}.label`),
@@ -201,12 +207,15 @@ export async function loadScenario(sourcePath: string): Promise<Scenario> {
   if (!Array.isArray(source.personas) || source.personas.length === 0) {
     throw new Error("scenario.personas must have at least one item");
   }
+  if (source.personas.length > 8) throw new Error("scenario.personas must not exceed 8 items");
   if (!Array.isArray(source.viewports) || source.viewports.length === 0) {
     throw new Error("scenario.viewports must have at least one item");
   }
+  if (source.viewports.length > 8) throw new Error("scenario.viewports must not exceed 8 items");
   if (!Array.isArray(source.routes) || source.routes.length === 0) {
     throw new Error("scenario.routes must have at least one item");
   }
+  if (source.routes.length > 40) throw new Error("scenario.routes must not exceed 40 items");
   const personas = source.personas.map((value, index) =>
     parsePersona(value, `scenario.personas[${index}]`)
   );
@@ -239,6 +248,7 @@ export async function loadScenario(sourcePath: string): Promise<Scenario> {
   };
   if (source.processes !== undefined) {
     if (!Array.isArray(source.processes)) throw new Error("scenario.processes must be an array");
+    if (source.processes.length > 8) throw new Error("scenario.processes must not exceed 8 items");
     scenario.processes = source.processes.map((value, index) => {
       const at = `scenario.processes[${index}]`;
       const process = record(value, at);
@@ -266,5 +276,10 @@ export async function loadScenario(sourcePath: string): Promise<Scenario> {
   uniqueIds(personas, "scenario.personas");
   uniqueIds(routes, "scenario.routes");
   for (const route of routes) uniqueIds(route.capturePoints, `route ${route.id} capturePoints`);
+  const captureCount = personas.length * scenario.viewports.length *
+    routes.reduce((total, route) => total + route.capturePoints.length, 0);
+  if (captureCount > 200) {
+    throw new Error(`scenario capture matrix must not exceed 200 items (received ${captureCount})`);
+  }
   return scenario;
 }

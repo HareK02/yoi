@@ -1,7 +1,12 @@
 import { assertEquals, assertRejects, assertThrows } from "@std/assert";
 import { join } from "@std/path";
 import { cleanup } from "../src/lifecycle.ts";
-import { interpolateEnvironment, loadScenario, validateBaseUrl } from "../src/scenario.ts";
+import {
+  interpolateEnvironment,
+  loadScenario,
+  resolveScenarioPath,
+  validateBaseUrl,
+} from "../src/scenario.ts";
 
 function minimalScenario(extra = ""): string {
   return `{
@@ -75,6 +80,16 @@ Deno.test("environment interpolation fails closed", () => {
     Error,
     "required environment variable is missing",
   );
+});
+
+Deno.test("committed auth profiles resolve outside the repository", async () => {
+  const source = "scenarios/workspace-control-plane.json";
+  const scenario = await loadScenario(source);
+  for (const persona of scenario.personas) {
+    if (persona.auth.kind !== "storage-state") continue;
+    const statePath = resolveScenarioPath(source, persona.auth.path);
+    assertEquals(statePath.startsWith(Deno.cwd()), false);
+  }
 });
 
 Deno.test("cleanup removes only complete review bundles beyond retention", async () => {

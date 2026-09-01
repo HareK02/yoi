@@ -5,4 +5,3 @@
 .worktree
 *.local*
 .env
-.web-ux/

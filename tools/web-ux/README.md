@@ -51,15 +51,17 @@ screen-owned selector.
 ```sh
 export WEB_UX_BASE_URL='http://127.0.0.1:5173'
 export WORKSPACE_ID='<workspace-id>'
+export XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 ```
 
 ## Authentication fixtures
 
-Authentication state is local sensitive material. `.web-ux/` is gitignored, files are written with
-mode `0600`, state contents are never copied into a review bundle, and the CLI never prints cookies
-or credentials. Each profile has a sidecar binding it to the exact persona and base URL origin with
-a 12-hour default expiry. Capture fails explicitly when metadata is missing, the origin differs, or
-the profile has expired; it never silently reuses or refreshes that state.
+Authentication state is local sensitive material stored under `$XDG_STATE_HOME/yoi/web-ux/auth/`,
+outside the Repository and Workdir. Files are written with mode `0600`, state contents are never
+copied into a review bundle, and the CLI never prints cookies or credentials. Each profile has a
+sidecar binding it to the exact persona and base URL origin with a 12-hour default expiry. Capture
+fails explicitly when metadata is missing, the origin differs, or the profile has expired; it never
+silently reuses or refreshes that state.
 
 For an interactive Passkey/browser login:
 
@@ -125,11 +127,15 @@ The command exits `2` when it produced evidence but observed UI/tool errors, and
 capture itself failed. It continues other route/persona captures after a bounded route failure.
 Inspect:
 
-- `review-context.json` for the exact context, hashes, HTTP status, and failures;
-- `contact-sheet.png` with an image-capable reviewer for composition, hierarchy, density, clipping,
-  empty/error states, and permission-specific affordances;
-- each `accessibility.md` for landmark/name/state evidence that a screenshot cannot prove;
-- `process-logs/` when the scenario owns a server process. Logs are redacted before writing.
+- `review-context.json` for the exact context, hashes, HTTP status, retained/truncated diagnostic
+  counts, route and capture-point readiness, and the redacted interaction sequence;
+- `contact-sheet.png` through its manifest `workdirPath` with an image-capable reviewer for
+  composition, hierarchy, density, clipping, empty/error states, and permission-specific
+  affordances;
+- each `accessibility.md` through its manifest `workdirPath` for landmark/name/state evidence that a
+  screenshot cannot prove;
+- `process-logs/` when the scenario owns a server process. Each stdout/stderr stream is redacted,
+  capped at 1 MiB, and paired with truncation metadata.
 
 The implementing agent must inspect the actual contact sheet (for example with `ViewImage`), record
 concrete findings, fix them, recapture under the same persona/route/viewport filters, and inspect
@@ -166,10 +172,10 @@ deno task web-ux cleanup --output ../../target/web-ux --keep 5 --older-than-days
 deno task web-ux cleanup --output ../../target/web-ux --keep 5 --older-than-days 14
 ```
 
-Cleanup recognizes only directories containing `review-context.json`. `.web-ux/` and the repository
-`target/` tree are ignored by Git. `capture` defaults to `target/web-ux` when `--output` is omitted.
-Keep a bundle outside Git or publish it through the approved immutable artifact channel when durable
-review evidence is required.
+Cleanup recognizes only directories containing `review-context.json`. The repository `target/` tree
+is ignored by Git, while authentication state remains outside the repository. `capture` defaults to
+`target/web-ux` when `--output` is omitted. Keep a bundle outside Git or publish it through the
+approved immutable artifact channel when durable review evidence is required.
 
 ## Adding a scenario
 

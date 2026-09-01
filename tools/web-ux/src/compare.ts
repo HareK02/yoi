@@ -39,8 +39,8 @@ async function readManifest(path: string): Promise<ReviewContext> {
 }
 
 function viewportScreenshot(capture: CaptureEvidence): string | null {
-  return capture.screenshots.find((item) => item.kind === "viewport")?.path ??
-    capture.screenshots[0]?.path ?? null;
+  return capture.screenshots.find((item) => item.kind === "viewport")?.bundlePath ??
+    capture.screenshots[0]?.bundlePath ?? null;
 }
 
 function dataUrl(bytes: Uint8Array): string {

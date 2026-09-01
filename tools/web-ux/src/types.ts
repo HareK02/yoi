@@ -80,22 +80,51 @@ export type CaptureError = {
   status?: number;
 };
 
-export type ScreenshotEvidence = {
+export type ArtifactReference = {
+  bundlePath: string;
+  workdirPath: string | null;
+};
+
+export type ScreenshotEvidence = ArtifactReference & {
   kind: "viewport" | "full-page";
-  path: string;
   sha256: string;
+};
+
+export type InteractionEvidence =
+  | { action: "click"; selector: string }
+  | { action: "fill"; selector: string; value: "[REDACTED]" }
+  | { action: "press"; selector: string; key: string }
+  | { action: "wait"; ready: ReadyCondition };
+
+export type DiagnosticSummary = {
+  observed: number;
+  retained: number;
+  truncated: boolean;
+  limit: number;
 };
 
 export type CaptureEvidence = {
   persona: { id: string; label: string };
-  route: { id: string; path: string; goal: string; dataState: string };
+  route: {
+    id: string;
+    path: string;
+    goal: string;
+    dataState: string;
+    ready: ReadyCondition;
+  };
   viewport: Viewport;
   theme: string;
-  capturePoint: { id: string; label: string };
+  capturePoint: {
+    id: string;
+    label: string;
+    ready: ReadyCondition | null;
+  };
+  interactions: InteractionEvidence[];
   document: { url: string; status: number | null };
   screenshots: ScreenshotEvidence[];
-  snapshotPath: string | null;
+  snapshot: ArtifactReference | null;
   errors: CaptureError[];
+  errorSummary: DiagnosticSummary;
   startedAt: string;
   finishedAt: string;
 };
@@ -103,7 +132,7 @@ export type CaptureEvidence = {
 export type ReviewContext = {
   schemaVersion: 1;
   runId: string;
-  scenario: { id: string; title: string; sourcePath: string };
+  scenario: { id: string; title: string; sourcePath: string | null };
   source: { revision: string | null; dirty: boolean | null };
   baseUrl: string;
   browser: { name: "chromium"; version: string };
@@ -111,6 +140,10 @@ export type ReviewContext = {
   status: "completed" | "completed-with-errors" | "failed";
   filters: { personas: string[]; routes: string[]; viewports: string[] };
   captures: CaptureEvidence[];
-  contactSheet: { html: string | null; png: string | null };
+  contactSheet: {
+    html: ArtifactReference | null;
+    png: ArtifactReference | null;
+  };
   diagnostics: CaptureError[];
+  diagnosticSummary: DiagnosticSummary;
 };

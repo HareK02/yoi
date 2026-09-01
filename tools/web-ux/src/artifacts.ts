@@ -62,13 +62,70 @@ export async function writePrivateJson(path: string, value: unknown): Promise<vo
   if (Deno.build.os !== "windows") await Deno.chmod(path, 0o600);
 }
 
-export function logicalPath(repositoryRoot: string, path: string): string {
+export function workdirLogicalPath(repositoryRoot: string, path: string): string | null {
   const absolute = resolve(path);
   const logical = relative(repositoryRoot, absolute);
   if (logical === "" || (!logical.startsWith("..") && !logical.startsWith("/"))) {
     return logical || ".";
   }
-  return absolute;
+  return null;
+}
+
+const TEXT_ARTIFACT_EXTENSIONS = [".json", ".md", ".html", ".log", ".txt"];
+
+async function artifactFiles(root: string): Promise<string[]> {
+  const files: string[] = [];
+  const visit = async (directory: string) => {
+    for await (const entry of Deno.readDir(directory)) {
+      const path = resolve(directory, entry.name);
+      if (entry.isDirectory) await visit(path);
+      else if (entry.isFile) files.push(path);
+    }
+  };
+  await visit(root);
+  return files;
+}
+
+export async function assertReviewBundleIsSecretFree(
+  root: string,
+  exactSecrets: string[] = [],
+): Promise<void> {
+  const secrets = exactSecrets.filter(Boolean);
+  const overlapLength = Math.max(256, ...secrets.map((secret) => secret.length + 1));
+  for (const path of await artifactFiles(root)) {
+    const isText = TEXT_ARTIFACT_EXTENSIONS.some((extension) => path.endsWith(extension));
+    const file = await Deno.open(path, { read: true });
+    const decoder = new TextDecoder();
+    let overlap = "";
+    try {
+      const buffer = new Uint8Array(64 * 1024);
+      while (true) {
+        const count = await file.read(buffer);
+        if (count === null) break;
+        const content = overlap + decoder.decode(buffer.subarray(0, count), { stream: true });
+        for (const secret of secrets) {
+          if (content.includes(secret)) {
+            throw new Error(
+              `review bundle artifact contains configured secret text: ${relative(root, path)}`,
+            );
+          }
+        }
+        if (isText) assertBundleIsSecretFree(content, secrets);
+        overlap = content.slice(-overlapLength);
+      }
+      const final = overlap + decoder.decode();
+      for (const secret of secrets) {
+        if (final.includes(secret)) {
+          throw new Error(
+            `review bundle artifact contains configured secret text: ${relative(root, path)}`,
+          );
+        }
+      }
+      if (isText) assertBundleIsSecretFree(final, secrets);
+    } finally {
+      file.close();
+    }
+  }
 }
 
 export async function sha256File(path: string): Promise<string> {
