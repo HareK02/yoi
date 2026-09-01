@@ -62,11 +62,27 @@ pub(crate) fn metadata(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn history_entry(
     item: Item,
     origin: WorkerHistoryProvenance,
 ) -> HistoryEntry<SessionHistoryMetadata> {
     HistoryEntry::new(item, metadata(origin, None))
+}
+
+pub(crate) fn history_entry_with_id(
+    item: Item,
+    entry_id: SessionHistoryEntryId,
+    origin: WorkerHistoryProvenance,
+) -> HistoryEntry<SessionHistoryMetadata> {
+    HistoryEntry::new(
+        item,
+        SessionHistoryMetadata {
+            entry_id,
+            origin,
+            derivation: None,
+        },
+    )
 }
 
 pub(crate) fn to_logged_history_entry(

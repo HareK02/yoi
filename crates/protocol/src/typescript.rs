@@ -7,8 +7,9 @@ use crate::{
     CommandStreamSlice, CompactionLifecycle, CompactionLifecycleState, CompletionEntry,
     CompletionKind, ErrorCode, Event, Greeting, InFlightBlock, InFlightSnapshot,
     InFlightToolCallState, InternalWorkerKind, InternalWorkerRef, InternalWorkerSnapshot,
-    InvokeKind, MemoryWorkerEvent, Method, Permission, RewindSummary, RewindTarget, RewindTargetId,
-    RunResult, ScopeRule, Segment, SessionContentPart, SessionEntryProvenance, SessionMessageRole,
+    InvokeKind, MemoryWorkerEvent, Method, PasteArtifactAvailability, PasteArtifactMediaType,
+    PasteArtifactRef, Permission, RewindSummary, RewindTarget, RewindTargetId, RunResult,
+    ScopeRule, Segment, SessionContentPart, SessionEntryProvenance, SessionMessageRole,
     SessionSnapshot, SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment,
     ToolResultDisposition, TurnResult, WorkerEvent, WorkerStatus,
     subscription::{
@@ -78,6 +79,9 @@ pub fn generated_protocol_types() -> String {
     push_decl::<Greeting>(&cfg, &mut output);
     push_decl::<Alert>(&cfg, &mut output);
     push_decl::<MemoryWorkerEvent>(&cfg, &mut output);
+    push_decl::<PasteArtifactMediaType>(&cfg, &mut output);
+    push_decl::<PasteArtifactAvailability>(&cfg, &mut output);
+    push_decl::<PasteArtifactRef>(&cfg, &mut output);
     push_decl::<Segment>(&cfg, &mut output);
     push_decl::<WorkerEvent>(&cfg, &mut output);
     push_decl::<SubscriptionRequestId>(&cfg, &mut output);

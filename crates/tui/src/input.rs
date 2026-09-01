@@ -15,6 +15,64 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
+pub const MAX_PLAIN_TEXT_PASTE_CHARS: usize = 50;
+pub const MAX_PLAIN_TEXT_PASTE_LOGICAL_LINES: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasteMeasurement {
+    pub chars: usize,
+    pub logical_lines: usize,
+}
+
+impl PasteMeasurement {
+    pub fn presentation(self) -> PastePresentation {
+        if self.chars <= MAX_PLAIN_TEXT_PASTE_CHARS
+            && self.logical_lines <= MAX_PLAIN_TEXT_PASTE_LOGICAL_LINES
+        {
+            PastePresentation::Text
+        } else {
+            PastePresentation::Chip
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PastePresentation {
+    Text,
+    Chip,
+}
+
+pub fn measure_paste(content: &str) -> PasteMeasurement {
+    PasteMeasurement {
+        chars: content.chars().count(),
+        logical_lines: logical_line_count(content),
+    }
+}
+
+/// Empty content has zero logical lines. Otherwise LF, lone CR, and CRLF each
+/// advance one line; a CRLF pair is one break rather than two.
+pub fn logical_line_count(content: &str) -> usize {
+    if content.is_empty() {
+        return 0;
+    }
+
+    let mut lines = 1;
+    let mut chars = content.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                lines += 1;
+            }
+            '\n' => lines += 1,
+            _ => {}
+        }
+    }
+    lines
+}
+
 #[derive(Debug, Clone)]
 pub struct PasteRef {
     pub id: u32,
@@ -61,6 +119,7 @@ impl FlowRefAtom {
 pub enum Atom {
     Char(char),
     Paste(PasteRef),
+    PasteArtifact(protocol::PasteArtifactRef),
     FileRef(FileRefAtom),
     FlowRef(FlowRefAtom),
 }
@@ -72,6 +131,18 @@ impl Atom {
         match self {
             Atom::Char(_) => None,
             Atom::Paste(p) => Some((Style::default().fg(Color::Magenta), p.label())),
+            Atom::PasteArtifact(artifact) => Some((
+                Style::default().fg(Color::Magenta),
+                format!(
+                    "[Paste artifact {} | {} chars, {} lines, {}, {}, created {} ms]",
+                    artifact.artifact_id,
+                    artifact.char_count,
+                    artifact.line_count,
+                    artifact.media_type.as_str(),
+                    artifact.availability.as_str(),
+                    artifact.created_at_ms
+                ),
+            )),
             Atom::FileRef(r) => Some((Style::default().fg(Color::Cyan), r.label())),
             Atom::FlowRef(r) => Some((Style::default().fg(Color::Yellow), r.label())),
         }
@@ -102,7 +173,9 @@ enum WordKind {
 fn atom_class(atom: &Atom) -> AtomClass {
     match atom {
         Atom::Char(c) => char_class(*c),
-        Atom::Paste(_) | Atom::FileRef(_) | Atom::FlowRef(_) => AtomClass::Chip,
+        Atom::Paste(_) | Atom::PasteArtifact(_) | Atom::FileRef(_) | Atom::FlowRef(_) => {
+            AtomClass::Chip
+        }
     }
 }
 
@@ -190,6 +263,9 @@ impl InputBuffer {
                         content: content.clone(),
                     }));
                 }
+                protocol::Segment::PasteArtifact { artifact } => {
+                    self.atoms.push(Atom::PasteArtifact(artifact.clone()));
+                }
                 protocol::Segment::FileRef { path } => {
                     self.atoms
                         .push(Atom::FileRef(FileRefAtom { path: path.clone() }));
@@ -225,6 +301,13 @@ impl InputBuffer {
             match atom {
                 Atom::Char(c) => text.push(*c),
                 Atom::Paste(paste) => text.push_str(&paste.content),
+                Atom::PasteArtifact(artifact) => {
+                    text.push_str(&protocol::Segment::flatten_to_text(&[
+                        protocol::Segment::PasteArtifact {
+                            artifact: artifact.clone(),
+                        },
+                    ]))
+                }
                 Atom::FileRef(file) => text.push_str(&file.path),
                 Atom::FlowRef(flow) => text.push_str(&flow.selector),
             }
@@ -237,16 +320,20 @@ impl InputBuffer {
     }
 
     pub fn insert_paste(&mut self, content: String) {
+        let measurement = measure_paste(&content);
+        if measurement.presentation() == PastePresentation::Text {
+            self.insert_str(&content);
+            return;
+        }
+
         let id = self.next_paste_id;
         self.next_paste_id = self.next_paste_id.wrapping_add(1);
-        let chars = content.chars().count();
-        let lines = content.lines().count().max(1);
         self.atoms.insert(
             self.cursor,
             Atom::Paste(PasteRef {
                 id,
-                chars,
-                lines,
+                chars: measurement.chars,
+                lines: measurement.logical_lines,
                 content,
             }),
         );
@@ -395,80 +482,78 @@ impl InputBuffer {
         self.cursor = 0;
     }
 
-    pub fn move_home(&mut self) {
-        while self.cursor > 0 {
-            if matches!(self.atoms[self.cursor - 1], Atom::Char('\n')) {
-                break;
-            }
-            self.cursor -= 1;
+    fn logical_line_ranges(&self) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        let mut start = 0;
+        let mut index = 0;
+        while index < self.atoms.len() {
+            let break_len = match self.atoms[index] {
+                Atom::Char('\r') => {
+                    if matches!(self.atoms.get(index + 1), Some(Atom::Char('\n'))) {
+                        2
+                    } else {
+                        1
+                    }
+                }
+                Atom::Char('\n') => 1,
+                _ => {
+                    index += 1;
+                    continue;
+                }
+            };
+            ranges.push((start, index));
+            index += break_len;
+            start = index;
         }
+        ranges.push((start, self.atoms.len()));
+        ranges
+    }
+
+    fn logical_line_and_col(&self) -> (Vec<(usize, usize)>, usize, usize) {
+        let ranges = self.logical_line_ranges();
+        for (line, &(start, end)) in ranges.iter().enumerate() {
+            if self.cursor <= end {
+                return (ranges, line, self.cursor.saturating_sub(start));
+            }
+            if let Some(&(next_start, _)) = ranges.get(line + 1)
+                && self.cursor < next_start
+            {
+                return (ranges, line + 1, 0);
+            }
+        }
+        let line = ranges.len().saturating_sub(1);
+        let col = self.cursor.saturating_sub(ranges[line].0);
+        (ranges, line, col)
+    }
+
+    pub fn move_home(&mut self) {
+        let (ranges, line, _) = self.logical_line_and_col();
+        self.cursor = ranges[line].0;
     }
 
     pub fn move_end(&mut self) {
-        while self.cursor < self.atoms.len() {
-            if matches!(self.atoms[self.cursor], Atom::Char('\n')) {
-                break;
-            }
-            self.cursor += 1;
-        }
+        let (ranges, line, _) = self.logical_line_and_col();
+        self.cursor = ranges[line].1;
     }
 
     /// Move one logical line up, preserving column (atom count from
     /// current line start). No-op if already on the first line.
     pub fn move_up(&mut self) {
-        let (line_start, col) = self.line_start_and_col();
-        if line_start == 0 {
+        let (ranges, line, col) = self.logical_line_and_col();
+        if line == 0 {
             return;
         }
-        // `atoms[line_start - 1]` is the '\n' that opens the current
-        // line; find the previous line's start.
-        let prev_end = line_start - 1;
-        let mut prev_start = 0;
-        for i in (0..prev_end).rev() {
-            if matches!(self.atoms[i], Atom::Char('\n')) {
-                prev_start = i + 1;
-                break;
-            }
-        }
-        let prev_len = prev_end - prev_start;
-        self.cursor = prev_start + col.min(prev_len);
+        let (start, end) = ranges[line - 1];
+        self.cursor = start + col.min(end - start);
     }
 
     /// Move one logical line down, preserving column.
     pub fn move_down(&mut self) {
-        let (line_start, col) = self.line_start_and_col();
-        // End of current line.
-        let mut cur_end = self.atoms.len();
-        for i in line_start..self.atoms.len() {
-            if matches!(self.atoms[i], Atom::Char('\n')) {
-                cur_end = i;
-                break;
-            }
-        }
-        if cur_end == self.atoms.len() {
-            return; // no next line
-        }
-        let next_start = cur_end + 1;
-        let mut next_end = self.atoms.len();
-        for i in next_start..self.atoms.len() {
-            if matches!(self.atoms[i], Atom::Char('\n')) {
-                next_end = i;
-                break;
-            }
-        }
-        let next_len = next_end - next_start;
-        self.cursor = next_start + col.min(next_len);
-    }
-
-    fn line_start_and_col(&self) -> (usize, usize) {
-        let mut start = 0;
-        for i in (0..self.cursor).rev() {
-            if matches!(self.atoms[i], Atom::Char('\n')) {
-                start = i + 1;
-                break;
-            }
-        }
-        (start, self.cursor - start)
+        let (ranges, line, col) = self.logical_line_and_col();
+        let Some(&(start, end)) = ranges.get(line + 1) else {
+            return;
+        };
+        self.cursor = start + col.min(end - start);
     }
 
     /// Build the typed `Vec<Segment>` sent over the protocol. Adjacent
@@ -495,6 +580,12 @@ impl InputBuffer {
                         chars: p.chars as u32,
                         lines: p.lines as u32,
                         content: p.content.clone(),
+                    });
+                }
+                Atom::PasteArtifact(artifact) => {
+                    flush_text(&mut buf, &mut out);
+                    out.push(protocol::Segment::PasteArtifact {
+                        artifact: artifact.clone(),
                     });
                 }
                 Atom::FileRef(r) => {
@@ -535,6 +626,7 @@ impl InputBuffer {
         let mut cursor_row: u16 = 0;
         let mut cursor_col: u16 = 0;
         let mut cursor_set = false;
+        let mut previous_was_cr = false;
 
         // Record cursor once, at the point right before `atom` would be
         // placed — accounting for a wrap that the atom itself will cause.
@@ -558,7 +650,7 @@ impl InputBuffer {
         for (i, atom) in self.atoms.iter().enumerate() {
             if !cursor_set && i == self.cursor {
                 let leading = match atom {
-                    Atom::Char('\n') => 0,
+                    Atom::Char('\n' | '\r') => 0,
                     Atom::Char(c) => UnicodeWidthChar::width(*c).unwrap_or(0),
                     other => other
                         .chip()
@@ -573,6 +665,21 @@ impl InputBuffer {
             }
 
             match atom {
+                Atom::Char('\r') => {
+                    flush_pending(
+                        &mut pending,
+                        &mut pending_width,
+                        pending_style,
+                        &mut rows,
+                        &mut row_width,
+                    );
+                    rows.push(Vec::new());
+                    row_width = 0;
+                    previous_was_cr = true;
+                }
+                Atom::Char('\n') if previous_was_cr => {
+                    previous_was_cr = false;
+                }
                 Atom::Char('\n') => {
                     flush_pending(
                         &mut pending,
@@ -583,8 +690,10 @@ impl InputBuffer {
                     );
                     rows.push(Vec::new());
                     row_width = 0;
+                    previous_was_cr = false;
                 }
                 Atom::Char(c) => {
+                    previous_was_cr = false;
                     let cw = UnicodeWidthChar::width(*c).unwrap_or(0);
                     if pending_style != text_style && !pending.is_empty() {
                         flush_pending(
@@ -608,6 +717,7 @@ impl InputBuffer {
                     );
                 }
                 other => {
+                    previous_was_cr = false;
                     let (chip_style, label) = other.chip().expect("non-char atom has a chip");
                     if pending_style != chip_style && !pending.is_empty() {
                         flush_pending(
@@ -849,6 +959,161 @@ mod render_viewport_tests {
 }
 
 #[cfg(test)]
+mod paste_policy_tests {
+    use super::*;
+    use protocol::Segment;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct Fixture {
+        max_plain_text_chars: usize,
+        max_plain_text_logical_lines: usize,
+        cases: Vec<FixtureCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct FixtureCase {
+        name: String,
+        parts: Vec<FixturePart>,
+        char_count: usize,
+        logical_line_count: usize,
+        presentation: FixturePresentation,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct FixturePart {
+        value: String,
+        repeat: usize,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "lowercase")]
+    enum FixturePresentation {
+        Text,
+        Chip,
+    }
+
+    fn fixture() -> Fixture {
+        serde_json::from_str(include_str!(
+            "../../../tests/fixtures/composer-paste-policy.json"
+        ))
+        .expect("shared composer paste policy fixture must be valid")
+    }
+
+    fn fixture_content(case: &FixtureCase) -> String {
+        case.parts
+            .iter()
+            .map(|part| part.value.repeat(part.repeat))
+            .collect()
+    }
+
+    #[test]
+    fn tui_follows_shared_paste_presentation_contract() {
+        let fixture = fixture();
+        assert_eq!(fixture.max_plain_text_chars, MAX_PLAIN_TEXT_PASTE_CHARS);
+        assert_eq!(
+            fixture.max_plain_text_logical_lines,
+            MAX_PLAIN_TEXT_PASTE_LOGICAL_LINES
+        );
+
+        for case in fixture.cases {
+            let content = fixture_content(&case);
+            let measurement = measure_paste(&content);
+            let expected_presentation = match case.presentation {
+                FixturePresentation::Text => PastePresentation::Text,
+                FixturePresentation::Chip => PastePresentation::Chip,
+            };
+            assert_eq!(measurement.chars, case.char_count, "{} chars", case.name);
+            assert_eq!(
+                measurement.logical_lines, case.logical_line_count,
+                "{} logical lines",
+                case.name
+            );
+            assert_eq!(
+                measurement.presentation(),
+                expected_presentation,
+                "{} presentation",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn short_paste_is_editable_text_at_the_cursor() {
+        let mut buffer = InputBuffer::new();
+        buffer.insert_str("ac");
+        buffer.move_left();
+        buffer.insert_paste("b".to_owned());
+
+        assert_eq!(buffer.plain_text(), "abc");
+        assert!(
+            buffer
+                .atoms
+                .iter()
+                .all(|atom| matches!(atom, Atom::Char(_)))
+        );
+        assert_eq!(
+            buffer.submit_segments(),
+            vec![Segment::text("abc".to_owned())]
+        );
+    }
+
+    #[test]
+    fn short_multiline_paste_preserves_original_line_endings_as_text() {
+        let content = "ab\r\ncd\ref";
+        let mut buffer = InputBuffer::new();
+        buffer.insert_paste(content.to_owned());
+
+        assert_eq!(buffer.plain_text(), content);
+        assert!(
+            buffer
+                .atoms
+                .iter()
+                .all(|atom| matches!(atom, Atom::Char(_)))
+        );
+        assert_eq!(
+            buffer.submit_segments(),
+            vec![Segment::text(content.to_owned())]
+        );
+
+        let rendered: Vec<String> = buffer
+            .render(80)
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(rendered, vec!["ab", "cd", "ef"]);
+
+        buffer.move_up();
+        assert_eq!(buffer.cursor, 6);
+        buffer.move_up();
+        assert_eq!(buffer.cursor, 2);
+        buffer.move_down();
+        assert_eq!(buffer.cursor, 6);
+        buffer.move_home();
+        assert_eq!(buffer.cursor, 4);
+        buffer.move_end();
+        assert_eq!(buffer.cursor, 6);
+    }
+
+    #[test]
+    fn empty_paste_is_a_noop() {
+        let mut buffer = InputBuffer::new();
+        buffer.insert_str("unchanged");
+        let paste_id = buffer.next_paste_id;
+        buffer.insert_paste(String::new());
+
+        assert_eq!(buffer.plain_text(), "unchanged");
+        assert_eq!(buffer.next_paste_id, paste_id);
+    }
+}
+
+#[cfg(test)]
 mod submit_segments_tests {
     use super::*;
     use protocol::Segment;
@@ -873,7 +1138,8 @@ mod submit_segments_tests {
         for c in "see ".chars() {
             buf.insert_char(c);
         }
-        buf.insert_paste("line1\nline2".into());
+        let pasted = "line1\nline2\nline3\nline4";
+        buf.insert_paste(pasted.into());
         for c in " end".chars() {
             buf.insert_char(c);
         }
@@ -890,9 +1156,9 @@ mod submit_segments_tests {
                 content,
                 ..
             } => {
-                assert_eq!(content, "line1\nline2");
-                assert_eq!(*chars, "line1\nline2".chars().count() as u32);
-                assert_eq!(*lines, 2);
+                assert_eq!(content, pasted);
+                assert_eq!(*chars, pasted.chars().count() as u32);
+                assert_eq!(*lines, 4);
             }
             other => panic!("expected Paste, got {other:?}"),
         }
@@ -900,6 +1166,45 @@ mod submit_segments_tests {
             Segment::Text { content } => assert_eq!(content, " end"),
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn restored_direct_paste_remains_a_typed_segment_without_reclassification() {
+        let original = Segment::Paste {
+            id: 7,
+            chars: 1,
+            lines: 1,
+            content: "x".to_owned(),
+        };
+        let mut buf = InputBuffer::new();
+        buf.replace_with_segments(std::slice::from_ref(&original));
+
+        assert_eq!(buf.submit_segments(), vec![original]);
+    }
+
+    #[test]
+    fn restored_paste_artifact_remains_a_typed_segment() {
+        let artifact = protocol::PasteArtifactRef {
+            artifact_id: "019ca7c8-57b6-7f05-8edf-524147aba7b2".to_string(),
+            created_at_ms: 1_700_000_000_000,
+            media_type: protocol::PasteArtifactMediaType::TextPlainUtf8,
+            availability: protocol::PasteArtifactAvailability::Available,
+            byte_len: 65_536,
+            char_count: 65_530,
+            line_count: 200,
+            sha256: "a".repeat(64),
+            source_entry_id: "entry-1".to_string(),
+        };
+        let original = Segment::PasteArtifact {
+            artifact: artifact.clone(),
+        };
+        let mut buf = InputBuffer::new();
+        buf.replace_with_segments(std::slice::from_ref(&original));
+
+        assert_eq!(
+            buf.submit_segments(),
+            vec![Segment::PasteArtifact { artifact }]
+        );
     }
 
     #[test]
@@ -911,7 +1216,7 @@ mod submit_segments_tests {
     #[test]
     fn leading_paste_does_not_emit_empty_text() {
         let mut buf = InputBuffer::new();
-        buf.insert_paste("X".into());
+        buf.insert_paste("X".repeat(MAX_PLAIN_TEXT_PASTE_CHARS + 1));
         let segs = buf.submit_segments();
         assert_eq!(segs.len(), 1);
         assert!(matches!(segs[0], Segment::Paste { .. }));
@@ -1011,7 +1316,7 @@ mod completion_prefix_tests {
     #[test]
     fn trigger_after_chip_atom() {
         let mut buf = InputBuffer::new();
-        buf.insert_paste("X".into());
+        buf.insert_paste("X".repeat(MAX_PLAIN_TEXT_PASTE_CHARS + 1));
         for c in "@sr".chars() {
             buf.insert_char(c);
         }
@@ -1120,7 +1425,7 @@ mod word_motion_tests {
         for c in "foo ".chars() {
             buf.insert_char(c);
         }
-        buf.insert_paste("anything".into());
+        buf.insert_paste("anything".repeat(MAX_PLAIN_TEXT_PASTE_CHARS + 1));
         for c in " bar".chars() {
             buf.insert_char(c);
         }
@@ -1219,7 +1524,9 @@ mod word_motion_tests {
         for a in &buf.atoms {
             match a {
                 Atom::Char(c) => out.push(*c),
-                Atom::Paste(_) | Atom::FileRef(_) | Atom::FlowRef(_) => out.push_str("<P>"),
+                Atom::Paste(_) | Atom::PasteArtifact(_) | Atom::FileRef(_) | Atom::FlowRef(_) => {
+                    out.push_str("<P>")
+                }
             }
         }
         out
@@ -1277,7 +1584,7 @@ mod word_motion_tests {
         for c in "foo ".chars() {
             buf.insert_char(c);
         }
-        buf.insert_paste("anything".into());
+        buf.insert_paste("anything".repeat(MAX_PLAIN_TEXT_PASTE_CHARS + 1));
         for c in " bar".chars() {
             buf.insert_char(c);
         }

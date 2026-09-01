@@ -137,6 +137,30 @@ function snapshotEvent(cwd: string, entries: unknown[] = []): Event {
   };
 }
 
+Deno.test("large paste segments project compact artifact metadata", () => {
+  const body = "secret pasted body";
+  const text = segmentsToText([{
+    kind: "paste_artifact",
+    artifact: {
+      artifact_id: "019ca7c8-57b6-7f05-8edf-524147aba7b2",
+      created_at_ms: 1_700_000_000_000,
+      media_type: "text_plain_utf8",
+      availability: "available",
+      byte_len: 65536,
+      char_count: 65530,
+      line_count: 200,
+      sha256: "a".repeat(64),
+      source_entry_id: "entry-1",
+    },
+  }]);
+  assert(text.includes("019ca7c8-57b6-7f05-8edf-524147aba7b2"), "artifact id is visible");
+  assert(text.includes("65536 bytes"), "bounded size metadata is visible");
+  assert(text.includes("text_plain_utf8"), "media type is visible");
+  assert(text.includes("available"), "availability is visible");
+  assert(text.includes("1700000000000"), "creation time is visible");
+  assert(!text.includes(body), "artifact body is not projected");
+});
+
 Deno.test("console routing projects live errors but not completion replies", () => {
   const errorEvent = {
     event: "error",

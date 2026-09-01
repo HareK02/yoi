@@ -35,6 +35,7 @@ pub mod fs_store;
 pub mod history;
 mod legacy_session_log;
 pub mod logged_item;
+mod paste_artifact;
 pub mod public_snapshot;
 pub mod segment;
 pub mod segment_log;
@@ -53,6 +54,7 @@ pub use history::{
     LoggedWorkerSubject,
 };
 pub use logged_item::{LoggedContentPart, LoggedItem, LoggedRole, from_logged, to_logged};
+pub use paste_artifact::PasteArtifactLimits;
 pub use segment::{
     SegmentStartState, append_entry, append_system_item, classify_logged_history_entry,
     create_compacted_segment, create_segment, create_segment_with_ids, ensure_head_or_fork, fork,

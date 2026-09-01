@@ -1069,6 +1069,8 @@ export function segmentsToText(segments: Segment[]): string {
         case "paste":
           return segment.content ||
             `[paste ${segment.id}: ${segment.chars} chars / ${segment.lines} lines]`;
+        case "paste_artifact":
+          return `[Large paste artifact ${segment.artifact.artifact_id}: ${segment.artifact.byte_len} bytes, ${segment.artifact.media_type}, ${segment.artifact.availability}, created ${segment.artifact.created_at_ms} ms, sha256 ${segment.artifact.sha256}]`;
         case "file_ref":
           return `@file ${segment.path}`;
         case "unknown":

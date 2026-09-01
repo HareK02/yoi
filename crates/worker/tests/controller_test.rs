@@ -613,7 +613,19 @@ async fn feature_flags_default_to_core_tool_surface_only() {
 
     let request = wait_for_captured_request(&client_for_assert).await;
     let names = request_tool_names(&request);
-    assert_eq!(names, vec!["Bash", "Edit", "Glob", "Grep", "Read", "Write"]);
+    assert_eq!(
+        names,
+        vec![
+            "Bash",
+            "Edit",
+            "Glob",
+            "Grep",
+            "Read",
+            "ReadInputArtifact",
+            "SearchInputArtifact",
+            "Write",
+        ]
+    );
     assert!(!names.iter().any(|name| name == "TaskCreate"));
     assert!(!names.iter().any(|name| name == "WebSearch"));
     assert!(!names.iter().any(|name| name == "SubWorkerSpawn"));

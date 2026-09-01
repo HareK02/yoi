@@ -13,7 +13,8 @@
 
 use crate::event_trace::TraceEntry;
 use crate::segment_log::LogEntry;
-use crate::{SegmentId, SessionId};
+use crate::{PasteArtifactLimits, SegmentId, SessionId};
+use protocol::PasteArtifactRef;
 
 /// Errors from the persistence store.
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +30,18 @@ pub enum StoreError {
 
     #[error("log corrupted at line {line}: {message}")]
     Corrupt { line: usize, message: String },
+
+    #[error("paste artifact storage is unavailable")]
+    PasteArtifactUnsupported,
+
+    #[error("paste artifact not found: {0}")]
+    PasteArtifactNotFound(String),
+
+    #[error("paste artifact integrity check failed: {0}")]
+    PasteArtifactIntegrity(String),
+
+    #[error("paste artifact size limit exceeded: {0}")]
+    PasteArtifactLimit(String),
 }
 
 /// Sync persistence backend for segment logs.
@@ -116,6 +129,26 @@ pub trait Store: Send + Sync {
         session_id: SessionId,
         segment_id: SegmentId,
     ) -> Result<usize, StoreError>;
+
+    /// Store a large paste before its reference is committed to history.
+    fn write_paste_artifact(
+        &self,
+        _session_id: SessionId,
+        _source_entry_id: &str,
+        _content: &str,
+        _limits: PasteArtifactLimits,
+    ) -> Result<PasteArtifactRef, StoreError> {
+        Err(StoreError::PasteArtifactUnsupported)
+    }
+
+    /// Read and verify one artifact owned by `session_id`.
+    fn read_paste_artifact(
+        &self,
+        _session_id: SessionId,
+        _artifact_id: &str,
+    ) -> Result<(PasteArtifactRef, String), StoreError> {
+        Err(StoreError::PasteArtifactUnsupported)
+    }
 
     /// Append a trace entry to the debug event trace file.
     fn append_trace(

@@ -1,0 +1,147 @@
+{
+  "max_plain_text_chars": 50,
+  "max_plain_text_logical_lines": 3,
+  "cases": [
+    {
+      "name": "empty",
+      "parts": [],
+      "char_count": 0,
+      "logical_line_count": 0,
+      "presentation": "text"
+    },
+    {
+      "name": "ascii_50",
+      "parts": [{ "value": "a", "repeat": 50 }],
+      "char_count": 50,
+      "logical_line_count": 1,
+      "presentation": "text"
+    },
+    {
+      "name": "ascii_51",
+      "parts": [{ "value": "a", "repeat": 51 }],
+      "char_count": 51,
+      "logical_line_count": 1,
+      "presentation": "chip"
+    },
+    {
+      "name": "three_lines_50_scalars",
+      "parts": [
+        { "value": "a\nb\n", "repeat": 1 },
+        { "value": "x", "repeat": 46 }
+      ],
+      "char_count": 50,
+      "logical_line_count": 3,
+      "presentation": "text"
+    },
+    {
+      "name": "four_lines_50_scalars",
+      "parts": [
+        { "value": "a\nb\nc\n", "repeat": 1 },
+        { "value": "x", "repeat": 44 }
+      ],
+      "char_count": 50,
+      "logical_line_count": 4,
+      "presentation": "chip"
+    },
+    {
+      "name": "four_lines_51_scalars",
+      "parts": [
+        { "value": "a\nb\nc\n", "repeat": 1 },
+        { "value": "x", "repeat": 45 }
+      ],
+      "char_count": 51,
+      "logical_line_count": 4,
+      "presentation": "chip"
+    },
+    {
+      "name": "two_lines_51_scalars",
+      "parts": [
+        { "value": "a\n", "repeat": 1 },
+        { "value": "x", "repeat": 49 }
+      ],
+      "char_count": 51,
+      "logical_line_count": 2,
+      "presentation": "chip"
+    },
+    {
+      "name": "four_lines_10_scalars",
+      "parts": [
+        { "value": "a\nb\nc\n", "repeat": 1 },
+        { "value": "x", "repeat": 4 }
+      ],
+      "char_count": 10,
+      "logical_line_count": 4,
+      "presentation": "chip"
+    },
+    {
+      "name": "japanese",
+      "parts": [{ "value": "日本語の貼り付け", "repeat": 1 }],
+      "char_count": 8,
+      "logical_line_count": 1,
+      "presentation": "text"
+    },
+    {
+      "name": "combining_marks_50_scalars",
+      "parts": [{ "value": "é", "repeat": 25 }],
+      "char_count": 50,
+      "logical_line_count": 1,
+      "presentation": "text"
+    },
+    {
+      "name": "unicode_scalar_50",
+      "parts": [{ "value": "🦀", "repeat": 50 }],
+      "char_count": 50,
+      "logical_line_count": 1,
+      "presentation": "text"
+    },
+    {
+      "name": "unicode_scalar_51",
+      "parts": [{ "value": "🦀", "repeat": 51 }],
+      "char_count": 51,
+      "logical_line_count": 1,
+      "presentation": "chip"
+    },
+    {
+      "name": "three_lf_lines",
+      "parts": [{ "value": "alpha\nbeta\ngamma", "repeat": 1 }],
+      "char_count": 16,
+      "logical_line_count": 3,
+      "presentation": "text"
+    },
+    {
+      "name": "four_lf_lines",
+      "parts": [{ "value": "a\nb\nc\nd", "repeat": 1 }],
+      "char_count": 7,
+      "logical_line_count": 4,
+      "presentation": "chip"
+    },
+    {
+      "name": "three_crlf_lines",
+      "parts": [{ "value": "a\r\nb\r\nc", "repeat": 1 }],
+      "char_count": 7,
+      "logical_line_count": 3,
+      "presentation": "text"
+    },
+    {
+      "name": "mixed_line_endings",
+      "parts": [{ "value": "a\r\nb\rc\nd", "repeat": 1 }],
+      "char_count": 8,
+      "logical_line_count": 4,
+      "presentation": "chip"
+    },
+    {
+      "name": "trailing_newline",
+      "parts": [{ "value": "a\n", "repeat": 1 }],
+      "char_count": 2,
+      "logical_line_count": 2,
+      "presentation": "text"
+    },
+    {
+      "name": "whitespace_rich_50",
+      "parts": [{ "value": " \t", "repeat": 25 }],
+      "char_count": 50,
+      "logical_line_count": 1,
+      "presentation": "text"
+    }
+  ]
+}

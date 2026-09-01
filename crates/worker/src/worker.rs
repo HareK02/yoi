@@ -15,8 +15,8 @@ use agen::{
 };
 use arc_swap::ArcSwap;
 use session_store::{
-    LogEntry, PromptRenderProvenance, SegmentId, SessionExtension, SessionId, Store, StoreError,
-    SystemItem, segment_log,
+    LogEntry, PasteArtifactLimits, PromptRenderProvenance, SegmentId, SessionExtension, SessionId,
+    Store, StoreError, SystemItem, segment_log,
 };
 use session_store::{
     WorkerActiveSegmentRef, WorkerMetadata, WorkerMetadataStore, WorkerReclaimedChild,
@@ -25,10 +25,12 @@ use session_store::{
 use tracing::{info, warn};
 
 use crate::segment_log_sink::SegmentLogSink;
+#[cfg(test)]
+use crate::session_history::history_entry;
 use crate::session_history::{
-    SessionHistoryDerivation, SessionHistoryMetadata, WorkerHistoryProvenance, history_entry,
-    metadata as new_history_metadata, restore_history_entries, to_logged_history_entry,
-    worker_subject,
+    SessionHistoryDerivation, SessionHistoryEntryId, SessionHistoryMetadata,
+    WorkerHistoryProvenance, history_entry_with_id, metadata as new_history_metadata,
+    restore_history_entries, to_logged_history_entry, worker_subject,
 };
 
 use manifest::{
@@ -58,6 +60,7 @@ use crate::internal_worker::{
 };
 
 const COMPACTION_EXTENSION_DOMAIN: &str = "yoi.compaction";
+const LARGE_PASTE_INLINE_MAX_BYTES: usize = 32 * 1024;
 const WORKER_ORCHESTRATION_INSTRUCTION_ID: &str = "worker.orchestration";
 const WORKER_ORCHESTRATION_PROMPT_REF: &str = "common.worker_orchestration";
 
@@ -2797,7 +2800,15 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         St: Clone + 'static,
         F: FnOnce(),
     {
-        let (input, pending_flow_state, flow_projection) = self.prepare_flow_input(input)?;
+        let (mut input, pending_flow_state, flow_projection) = self.prepare_flow_input(input)?;
+        let projected_entry_ids = if flow_projection.is_some() {
+            (0..input.len())
+                .map(|_| SessionHistoryEntryId::new())
+                .collect::<Vec<_>>()
+        } else {
+            vec![SessionHistoryEntryId::new()]
+        };
+        self.materialize_large_pastes(&mut input, &projected_entry_ids, flow_projection.is_some())?;
         if let Some(state) = pending_flow_state.as_ref() {
             let payload = serde_json::to_value(state).map_err(|error| {
                 WorkerError::FlowInput(format!("serialize Flow runtime state: {error}"))
@@ -2830,7 +2841,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             trigger: protocol::InvokeKind::UserSend,
         })?;
 
-        let projected_input = self.projected_input_history(&input, flow_projection.as_ref());
+        let projected_input =
+            self.projected_input_history(&input, flow_projection.as_ref(), &projected_entry_ids);
 
         // Persist original typed segments together with the exact ordered
         // model-visible item+origin projection before any entry becomes live.
@@ -3064,17 +3076,61 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         Ok(())
     }
 
+    fn materialize_large_pastes(
+        &self,
+        input: &mut [Segment],
+        projected_entry_ids: &[SessionHistoryEntryId],
+        one_entry_per_segment: bool,
+    ) -> Result<(), WorkerError> {
+        for (index, segment) in input.iter_mut().enumerate() {
+            if let Segment::PasteArtifact { artifact } = segment {
+                let (stored, _) = self
+                    .store
+                    .read_paste_artifact(self.session_id(), &artifact.artifact_id)?;
+                if &stored != artifact {
+                    return Err(WorkerError::Store(StoreError::PasteArtifactIntegrity(
+                        artifact.artifact_id.clone(),
+                    )));
+                }
+                continue;
+            }
+            let Segment::Paste { content, .. } = segment else {
+                continue;
+            };
+            if content.len() <= LARGE_PASTE_INLINE_MAX_BYTES {
+                continue;
+            }
+            let entry_index = if one_entry_per_segment { index } else { 0 };
+            let source_entry_id = projected_entry_ids
+                .get(entry_index)
+                .expect("projected input id exists for every paste")
+                .0
+                .as_str();
+            let artifact = self.store.write_paste_artifact(
+                self.session_id(),
+                source_entry_id,
+                content,
+                PasteArtifactLimits::default(),
+            )?;
+            *segment = Segment::PasteArtifact { artifact };
+        }
+        Ok(())
+    }
+
     fn projected_input_history(
         &self,
         input: &[Segment],
         flow_projection: Option<&PreparedFlowProjection>,
+        entry_ids: &[SessionHistoryEntryId],
     ) -> Vec<HistoryEntry<SessionHistoryMetadata>> {
         if let Some(flow) = flow_projection {
             return input
                 .iter()
-                .map(|segment| match segment {
-                    Segment::Flow { .. } => history_entry(
+                .zip(entry_ids)
+                .map(|(segment, entry_id)| match segment {
+                    Segment::Flow { .. } => history_entry_with_id(
                         Item::user_message(flow.instructions.clone()),
+                        entry_id.clone(),
                         WorkerHistoryProvenance::FlowInstruction {
                             selector: flow.selector.clone(),
                             definition_id: flow.definition_id.clone(),
@@ -3083,8 +3139,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                             state_id: flow.state_id.clone(),
                         },
                     ),
-                    other => history_entry(
+                    other => history_entry_with_id(
                         Item::user_message(Segment::flatten_to_text(std::slice::from_ref(other))),
+                        entry_id.clone(),
                         // Current public submit transport does not carry a
                         // trusted account/Worker subject envelope. Fail closed
                         // instead of promoting role=user to HumanInput.
@@ -3094,8 +3151,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 .collect();
         }
 
-        vec![history_entry(
+        vec![history_entry_with_id(
             Item::user_message(Segment::flatten_to_text(input)),
+            entry_ids
+                .first()
+                .expect("projected Worker input always has one entry id")
+                .clone(),
             WorkerHistoryProvenance::LegacyUnknown,
         )]
     }
@@ -6405,6 +6466,11 @@ fn preview_segments(segments: &[Segment]) -> String {
         match segment {
             Segment::Text { content } => preview.push_str(content.trim()),
             Segment::Paste { content, .. } => preview.push_str(content.trim()),
+            Segment::PasteArtifact { artifact } => {
+                preview.push_str("[Large paste artifact: ");
+                preview.push_str(&artifact.artifact_id);
+                preview.push(']');
+            }
             Segment::FileRef { path } => {
                 preview.push('@');
                 preview.push_str(path);
@@ -7909,7 +7975,9 @@ mod build_summary_prompt_tests {
             FLOW_RUNTIME_EXTENSION_DOMAIN,
             serde_json::to_value(&state).unwrap(),
         );
-        let projected = worker.projected_input_history(&segments, projection.as_ref());
+        let projected_ids = vec![SessionHistoryEntryId::new(), SessionHistoryEntryId::new()];
+        let projected =
+            worker.projected_input_history(&segments, projection.as_ref(), &projected_ids);
         worker
             .commit_entry(LogEntry::AnnotatedUserInput {
                 ts: segment_log::now_millis(),
@@ -7978,6 +8046,144 @@ mod build_summary_prompt_tests {
         }]);
         assert!(
             matches!(unavailable, Err(WorkerError::FlowInput(message)) if message.contains("unavailable"))
+        );
+    }
+
+    #[tokio::test]
+    async fn large_paste_is_stored_before_compact_history_is_committed() {
+        let (_dir, worker) = rewind_test_worker().await;
+        let exact = "x".repeat(LARGE_PASTE_INLINE_MAX_BYTES);
+        let exact_ids = vec![SessionHistoryEntryId::new()];
+        let mut exact_input = vec![Segment::Paste {
+            id: 1,
+            chars: exact.len() as u32,
+            lines: 1,
+            content: exact.clone(),
+        }];
+        worker
+            .materialize_large_pastes(&mut exact_input, &exact_ids, false)
+            .unwrap();
+        assert!(matches!(&exact_input[0], Segment::Paste { content, .. } if content == &exact));
+        let mut empty_input = vec![Segment::Paste {
+            id: 0,
+            chars: 0,
+            lines: 0,
+            content: String::new(),
+        }];
+        worker
+            .materialize_large_pastes(&mut empty_input, &exact_ids, false)
+            .unwrap();
+        assert!(matches!(
+            &empty_input[0],
+            Segment::Paste { content, .. } if content.is_empty()
+        ));
+
+        let body = format!("{}\n終端\n", "多".repeat(12_000));
+        let entry_id = SessionHistoryEntryId::new();
+        let mut input = vec![Segment::Paste {
+            id: 2,
+            chars: body.chars().count() as u32,
+            lines: 3,
+            content: body.clone(),
+        }];
+        worker
+            .materialize_large_pastes(&mut input, std::slice::from_ref(&entry_id), false)
+            .unwrap();
+        let artifact = match &input[0] {
+            Segment::PasteArtifact { artifact } => artifact.clone(),
+            other => panic!("expected stored paste reference, got {other:?}"),
+        };
+        assert_eq!(artifact.source_entry_id, entry_id.0);
+        assert_eq!(artifact.byte_len, body.len() as u64);
+        assert_eq!(artifact.char_count, body.chars().count() as u64);
+        assert_eq!(
+            worker
+                .store
+                .read_paste_artifact(worker.session_id(), &artifact.artifact_id)
+                .unwrap()
+                .1,
+            body
+        );
+        worker
+            .materialize_large_pastes(&mut input, &[SessionHistoryEntryId::new()], false)
+            .unwrap();
+        assert!(matches!(
+            &input[0],
+            Segment::PasteArtifact { artifact: retained }
+                if retained.source_entry_id == artifact.source_entry_id
+        ));
+
+        let history = worker.projected_input_history(&input, None, &[entry_id]);
+        assert!(!history[0].item.as_text().unwrap().contains("終端"));
+        append_test_entry(
+            &worker,
+            LogEntry::Invoke {
+                ts: segment_log::now_millis(),
+                trigger: protocol::InvokeKind::UserSend,
+            },
+        );
+        worker
+            .commit_entry(LogEntry::AnnotatedUserInput {
+                ts: segment_log::now_millis(),
+                segments: input.clone(),
+                extensions: Vec::new(),
+                history: history.iter().map(to_logged_history_entry).collect(),
+            })
+            .unwrap();
+        let location = worker.segment_state.location();
+        let entries = worker
+            .store
+            .read_all(location.session_id, location.segment_id)
+            .unwrap();
+        let persisted = serde_json::to_string(&entries).unwrap();
+        assert!(!persisted.contains("終端"));
+        let state = session_store::collect_state(&entries);
+        assert!(matches!(
+            &state.user_segments[0][0],
+            Segment::PasteArtifact { artifact: restored }
+                if restored.artifact_id == artifact.artifact_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn large_paste_storage_failure_commits_no_input() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = session_store::FsStore::new(temp.path()).unwrap();
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store.clone(),
+            WorkerWorkspaceContext::unavailable(None, "test unavailable"),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        worker.ensure_segment_head().unwrap();
+        std::fs::write(
+            temp.path()
+                .join(worker.session_id().to_string())
+                .join("artifacts"),
+            "block artifact directory creation",
+        )
+        .unwrap();
+        let result = worker
+            .run(vec![Segment::Paste {
+                id: 1,
+                chars: (LARGE_PASTE_INLINE_MAX_BYTES + 1) as u32,
+                lines: 1,
+                content: "x".repeat(LARGE_PASTE_INLINE_MAX_BYTES + 1),
+            }])
+            .await;
+        assert!(matches!(result, Err(WorkerError::Store(StoreError::Io(_)))));
+        let location = worker.segment_state.location();
+        let entries = store
+            .read_all(location.session_id, location.segment_id)
+            .unwrap();
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| matches!(entry, LogEntry::AnnotatedUserInput { .. }))
         );
     }
 

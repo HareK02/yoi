@@ -80,6 +80,85 @@ export function buildComposerRequest(value: string): ComposerCommandResult {
   };
 }
 
+export interface ComposerSegmentsRequestOptions {
+  preserveExactText?: boolean;
+}
+
+export function buildComposerSegmentsRequest(
+  sourceSegments: readonly Segment[],
+  options: ComposerSegmentsRequestOptions = {},
+): ComposerCommandResult {
+  const hasPaste = sourceSegments.some((segment) => segment.kind === "paste");
+  if (!hasPaste) {
+    const content = sourceSegments.map(segmentContent).join("");
+    if (!options.preserveExactText || content.trimStart().startsWith(":")) {
+      return buildComposerRequest(content);
+    }
+    if (!content.trim()) {
+      return { ok: false, message: "Input is empty." };
+    }
+    const segments = coalesceTextSegments(
+      sourceSegments.flatMap((segment) =>
+        segment.kind === "text"
+          ? parseSigilSegments(segment.content)
+          : [segment]
+      ),
+    );
+    return {
+      ok: true,
+      request: { kind: "user", content, segments },
+    };
+  }
+
+  const content = sourceSegments.map(segmentContent).join("");
+  if (!content.trim()) {
+    return { ok: false, message: "Input is empty." };
+  }
+  const leadingText = sourceSegments[0]?.kind === "text"
+    ? sourceSegments[0].content
+    : "";
+  if (leadingText.trimStart().startsWith(":")) {
+    return {
+      ok: false,
+      message:
+        "Commands cannot include a paste chip. Remove the chip or send it as a message.",
+    };
+  }
+
+  const segments: Segment[] = [];
+  for (const segment of sourceSegments) {
+    if (segment.kind === "text") {
+      segments.push(...parseSigilSegments(segment.content));
+    } else {
+      segments.push(segment);
+    }
+  }
+  return {
+    ok: true,
+    request: {
+      kind: "user",
+      content,
+      segments: coalesceTextSegments(segments),
+    },
+  };
+}
+
+function segmentContent(segment: Segment): string {
+  switch (segment.kind) {
+    case "text":
+    case "paste":
+      return segment.content;
+    case "file_ref":
+      return `@${segment.path}`;
+    case "flow":
+      return segment.selector;
+    case "paste_artifact":
+      return "";
+    default:
+      return "";
+  }
+}
+
 function buildColonCommand(commandLine: string): ComposerCommandResult {
   const [name = "", ...argv] = commandLine.trim().split(/\s+/).filter(Boolean);
   if (!name) {
