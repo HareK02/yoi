@@ -341,9 +341,6 @@ pub enum RepositoryInsertOutcome {
 pub struct WorkspaceBootstrapRecord {
     pub operation_key: String,
     pub request_fingerprint: String,
-    /// When true, the transaction must prove that no Workspace exists before
-    /// it inserts this ownerless local-bootstrap Workspace.
-    pub require_empty_catalog: bool,
     pub workspace: WorkspaceRecord,
     pub repository: RepositoryRecord,
 }
@@ -1930,20 +1927,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     config_revision,
                     replayed: true,
                 });
-            }
-
-            if record.require_empty_catalog {
-                let workspace_exists = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM workspaces LIMIT 1)",
-                    [],
-                    |row| row.get::<_, bool>(0),
-                )?;
-                if workspace_exists {
-                    return Err(Error::WorkspaceConfigConflict(
-                        "ownerless local bootstrap is available only while the Workspace catalog is empty"
-                            .to_string(),
-                    ));
-                }
             }
 
             if let Some(existing) = tx
@@ -7004,33 +6987,64 @@ fn bind_workdir_create_repository_access_evidence(conn: &Connection) -> Result<(
     Ok(())
 }
 
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.split_ascii_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
 fn require_workspace_account_owner(conn: &Connection) -> Result<()> {
-    let expected_columns = [
-        "workspace_id",
-        "display_name",
-        "state",
-        "created_at",
-        "updated_at",
-        "owner_account_id",
+    let actual_columns = {
+        let mut statement = conn.prepare("PRAGMA table_info(workspaces)")?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let expected_columns = vec![
+        ("workspace_id".to_string(), "TEXT".to_string(), 0, None, 1),
+        ("display_name".to_string(), "TEXT".to_string(), 1, None, 0),
+        ("state".to_string(), "TEXT".to_string(), 1, None, 0),
+        ("created_at".to_string(), "TEXT".to_string(), 1, None, 0),
+        ("updated_at".to_string(), "TEXT".to_string(), 1, None, 0),
+        (
+            "owner_account_id".to_string(),
+            "TEXT".to_string(),
+            0,
+            None,
+            0,
+        ),
     ];
-    let actual_columns = table_columns(conn, "workspaces")?;
-    if actual_columns
-        != expected_columns
-            .iter()
-            .map(|column| (*column).to_string())
-            .collect::<Vec<_>>()
-    {
+    if actual_columns != expected_columns {
         return Err(Error::Store(format!(
-            "Workspace owner migration rejected workspaces schema drift: expected columns [{}], found [{}]",
-            expected_columns.join(", "),
-            actual_columns.join(", ")
+            "Workspace owner migration rejected workspaces column schema drift: expected {expected_columns:?}, found {actual_columns:?}"
         )));
     }
-    let owner_not_null = conn.query_row(
-        "SELECT \"notnull\" FROM pragma_table_info('workspaces') WHERE name = 'owner_account_id'",
+    let table_sql = conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'workspaces'",
         [],
-        |row| row.get::<_, i64>(0),
+        |row| row.get::<_, String>(0),
     )?;
+    let expected_table_sql = r#"CREATE TABLE workspaces (
+            workspace_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            state TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        , owner_account_id TEXT REFERENCES accounts(account_id) ON DELETE SET NULL)"#;
+    if normalize_schema_sql(&table_sql) != normalize_schema_sql(expected_table_sql) {
+        return Err(Error::Store(format!(
+            "Workspace owner migration rejected workspaces table SQL drift: found {table_sql}"
+        )));
+    }
     let owner_foreign_key = conn
         .query_row(
             "SELECT \"table\", \"to\", on_delete \
@@ -7046,11 +7060,10 @@ fn require_workspace_account_owner(conn: &Connection) -> Result<()> {
             },
         )
         .optional()?;
-    if owner_not_null != 0
-        || owner_foreign_key
-            .as_ref()
-            .map(|(table, column, on_delete)| (table.as_str(), column.as_str(), on_delete.as_str()))
-            != Some(("accounts", "account_id", "SET NULL"))
+    if owner_foreign_key
+        .as_ref()
+        .map(|(table, column, on_delete)| (table.as_str(), column.as_str(), on_delete.as_str()))
+        != Some(("accounts", "account_id", "SET NULL"))
     {
         return Err(Error::Store(
             "Workspace owner migration rejected owner_account_id schema drift; expected nullable accounts(account_id) with ON DELETE SET NULL"
@@ -13988,7 +14001,24 @@ CREATE TABLE ticket_assignment_operations (
     fn workspace_owner_migration_rejects_schema_drift_before_rebuild() {
         let conn = workspace_owner_schema_47();
         conn.execute_batch(
-            "ALTER TABLE workspaces RENAME COLUMN owner_account_id TO legacy_owner_account_id;",
+            r#"
+            PRAGMA foreign_keys = OFF;
+            PRAGMA legacy_alter_table = ON;
+            BEGIN EXCLUSIVE;
+            CREATE TABLE workspaces_drift (
+                workspace_id TEXT PRIMARY KEY,
+                display_name TEXT,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                owner_account_id TEXT REFERENCES accounts(account_id) ON DELETE SET NULL
+            );
+            DROP TABLE workspaces;
+            ALTER TABLE workspaces_drift RENAME TO workspaces;
+            COMMIT;
+            PRAGMA legacy_alter_table = OFF;
+            PRAGMA foreign_keys = ON;
+            "#,
         )
         .unwrap();
 

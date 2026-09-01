@@ -142,7 +142,6 @@ impl WorkspaceCatalogService {
             .create_workspace_bootstrap(&WorkspaceBootstrapRecord {
                 operation_key,
                 request_fingerprint: fingerprint.clone(),
-                require_empty_catalog: false,
                 workspace: WorkspaceRecord {
                     workspace_id: workspace_id.clone(),
                     owner_account_id,
