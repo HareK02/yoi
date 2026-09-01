@@ -1,5 +1,6 @@
 import { basename, dirname, join, relative, resolve } from "@std/path";
 import { type Browser, chromium, type Page, type Response } from "playwright";
+import { validateAuthState } from "./auth_state.ts";
 import {
   assertBundleIsSecretFree,
   bounded,
@@ -348,7 +349,7 @@ export async function capture(options: CaptureOptions): Promise<ReviewContext> {
       const storageState = persona.auth.kind === "storage-state"
         ? resolveScenarioPath(scenarioPath, persona.auth.path)
         : undefined;
-      if (storageState) await Deno.stat(storageState);
+      if (storageState) await validateAuthState(storageState, persona.id, baseUrl);
       for (const viewport of viewports) {
         const context = await browser.newContext({
           storageState,

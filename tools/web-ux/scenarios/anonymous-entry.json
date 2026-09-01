@@ -23,6 +23,15 @@
       "dataState": "Fresh browser context with no cookies, local storage, or session state.",
       "ready": { "kind": "network-idle", "timeoutMs": 15000 },
       "capturePoints": [{ "id": "initial", "label": "Anonymous entry", "fullPage": true }]
+    },
+    {
+      "id": "account",
+      "label": "Account entry",
+      "path": "/account",
+      "goal": "Understand current authentication state and the available account action without Workspace-private content.",
+      "dataState": "Fresh browser context with no cookies, local storage, or session state.",
+      "ready": { "kind": "network-idle", "timeoutMs": 15000 },
+      "capturePoints": [{ "id": "initial", "label": "Anonymous account screen", "fullPage": true }]
     }
   ]
 }

@@ -1,6 +1,7 @@
 import { dirname, resolve } from "@std/path";
 import { chromium } from "playwright";
-import { ensurePrivateDirectory, writePrivateJson } from "./artifacts.ts";
+import { ensurePrivateDirectory, makePrivate, writePrivateJson } from "./artifacts.ts";
+import { deleteAuthState, writeAuthMetadata } from "./auth_state.ts";
 import {
   interpolateEnvironment,
   loadScenario,
@@ -14,6 +15,8 @@ export type AuthOptions = {
   baseUrl?: string;
   importState?: string;
   timeoutMs?: number;
+  expiresInHours?: number;
+  delete?: boolean;
   headless?: boolean;
 };
 
@@ -37,22 +40,28 @@ export async function authenticate(options: AuthOptions): Promise<string> {
     throw new Error(`persona ${persona.id} is anonymous and has no auth state`);
   }
   const outputPath = resolveScenarioPath(scenarioPath, persona.auth.path);
-  await ensurePrivateDirectory(dirname(outputPath));
-  if (options.importState) {
-    const imported = validateStorageState(
-      JSON.parse(await Deno.readTextFile(resolve(options.importState))),
-    );
-    await writePrivateJson(outputPath, imported);
+  if (options.delete) {
+    await deleteAuthState(outputPath);
     return outputPath;
   }
-  if (!persona.login) {
-    throw new Error(`persona ${persona.id} needs login configuration or --import-state`);
-  }
+  await ensurePrivateDirectory(dirname(outputPath));
   const baseUrl = validateBaseUrl(
     interpolateEnvironment(
       options.baseUrl ?? Deno.env.get("WEB_UX_BASE_URL") ?? scenario.baseUrl ?? "",
     ),
   );
+  const expiresInHours = options.expiresInHours ?? 12;
+  if (options.importState) {
+    const imported = validateStorageState(
+      JSON.parse(await Deno.readTextFile(resolve(options.importState))),
+    );
+    await writePrivateJson(outputPath, imported);
+    await writeAuthMetadata(outputPath, persona.id, baseUrl, expiresInHours);
+    return outputPath;
+  }
+  if (!persona.login) {
+    throw new Error(`persona ${persona.id} needs login configuration or --import-state`);
+  }
   const browser = await chromium.launch({ headless: options.headless ?? false });
   try {
     const context = await browser.newContext();
@@ -67,7 +76,8 @@ export async function authenticate(options: AuthOptions): Promise<string> {
       });
     }
     await context.storageState({ path: outputPath });
-    if (Deno.build.os !== "windows") await Deno.chmod(outputPath, 0o600);
+    await makePrivate(outputPath);
+    await writeAuthMetadata(outputPath, persona.id, baseUrl, expiresInHours);
     return outputPath;
   } finally {
     await browser.close();

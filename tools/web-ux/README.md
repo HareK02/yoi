@@ -57,7 +57,9 @@ export WORKSPACE_ID='<workspace-id>'
 
 Authentication state is local sensitive material. `.web-ux/` is gitignored, files are written with
 mode `0600`, state contents are never copied into a review bundle, and the CLI never prints cookies
-or credentials.
+or credentials. Each profile has a sidecar binding it to the exact persona and base URL origin with
+a 12-hour default expiry. Capture fails explicitly when metadata is missing, the origin differs, or
+the profile has expired; it never silently reuses or refreshes that state.
 
 For an interactive Passkey/browser login:
 
@@ -78,7 +80,17 @@ without putting its value on the command line:
 deno task web-ux auth \
   --scenario scenarios/workspace-control-plane.json \
   --persona owner \
-  --import-state /private/path/owner-state.json
+  --import-state /private/path/owner-state.json \
+  --expires-in-hours 8
+```
+
+Delete both the profile and its metadata when it is no longer needed:
+
+```sh
+deno task web-ux auth \
+  --scenario scenarios/workspace-control-plane.json \
+  --persona owner \
+  --delete
 ```
 
 Do not place passwords, bearer tokens, private keys, WebAuthn material, or inline cookies in a
@@ -93,7 +105,7 @@ Capture a stable multi-persona bundle:
 ```sh
 deno task web-ux capture \
   --scenario scenarios/workspace-control-plane.json \
-  --output ../../artifacts/web-ux \
+  --output ../../target/web-ux \
   --run-id before-change
 ```
 
@@ -102,7 +114,7 @@ Use filters for a bounded feedback loop:
 ```sh
 deno task web-ux capture \
   --scenario scenarios/workspace-control-plane.json \
-  --output ../../artifacts/web-ux \
+  --output ../../target/web-ux \
   --run-id ticket-list-after \
   --personas owner,non-owner \
   --routes tickets \
@@ -127,9 +139,9 @@ the new evidence. Playwright success alone is not visual acceptance.
 
 ```sh
 deno task web-ux compare \
-  --before ../../artifacts/web-ux/before-change/review-context.json \
-  --after ../../artifacts/web-ux/after-change/review-context.json \
-  --output ../../artifacts/web-ux/before-vs-after
+  --before ../../target/web-ux/before-change/review-context.json \
+  --after ../../target/web-ux/after-change/review-context.json \
+  --output ../../target/web-ux/before-vs-after
 ```
 
 `comparison.html` and `comparison.png` show before, after, and pixel diff side by side.
@@ -150,13 +162,14 @@ that it did not start.
 Old complete review bundles can be removed without touching auth state or arbitrary directories:
 
 ```sh
-deno task web-ux cleanup --output ../../artifacts/web-ux --keep 5 --older-than-days 14 --dry-run
-deno task web-ux cleanup --output ../../artifacts/web-ux --keep 5 --older-than-days 14
+deno task web-ux cleanup --output ../../target/web-ux --keep 5 --older-than-days 14 --dry-run
+deno task web-ux cleanup --output ../../target/web-ux --keep 5 --older-than-days 14
 ```
 
-Cleanup recognizes only directories containing `review-context.json`. `.web-ux/` and
-`artifacts/web-ux/` are ignored by Git. Keep a bundle outside Git or publish it through the approved
-immutable artifact channel when durable review evidence is required.
+Cleanup recognizes only directories containing `review-context.json`. `.web-ux/` and the repository
+`target/` tree are ignored by Git. `capture` defaults to `target/web-ux` when `--output` is omitted.
+Keep a bundle outside Git or publish it through the approved immutable artifact channel when durable
+review evidence is required.
 
 ## Adding a scenario
 

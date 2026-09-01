@@ -58,6 +58,15 @@
       "capturePoints": [{ "id": "initial", "label": "Worker list", "fullPage": true }]
     },
     {
+      "id": "settings",
+      "label": "Workspace settings",
+      "path": "/w/${WORKSPACE_ID}/settings",
+      "goal": "Reach the relevant Workspace settings area without presenting owner-only destinations as usable actions to a non-owner.",
+      "dataState": "Current permission projection for the selected Workspace.",
+      "ready": { "kind": "selector", "selector": "main", "timeoutMs": 20000 },
+      "capturePoints": [{ "id": "initial", "label": "Workspace settings", "fullPage": true }]
+    },
+    {
       "id": "repositories",
       "label": "Repository settings",
       "path": "/w/${WORKSPACE_ID}/settings/repositories",
@@ -65,6 +74,17 @@
       "dataState": "Workspace repository catalog projected through current permissions.",
       "ready": { "kind": "selector", "selector": "main", "timeoutMs": 20000 },
       "capturePoints": [{ "id": "initial", "label": "Repository settings", "fullPage": true }]
+    },
+    {
+      "id": "repository-access",
+      "label": "Repository access",
+      "path": "/w/${WORKSPACE_ID}/settings/repository-access",
+      "goal": "Review credential and host-trust bindings as an owner and verify non-owner composition fails closed without secret material.",
+      "dataState": "Configured repository access bindings projected without credential bytes.",
+      "ready": { "kind": "selector", "selector": "main", "timeoutMs": 20000 },
+      "capturePoints": [
+        { "id": "initial", "label": "Repository access settings", "fullPage": true }
+      ]
     }
   ]
 }

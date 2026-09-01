@@ -1,13 +1,17 @@
 #!/usr/bin/env -S deno run --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys
+import { dirname, fromFileUrl, resolve } from "@std/path";
 import { authenticate, cleanup } from "./src/lifecycle.ts";
 import { capture, describeCapture } from "./src/capture.ts";
 import { compare } from "./src/compare.ts";
 
+const DEFAULT_OUTPUT = resolve(dirname(fromFileUrl(import.meta.url)), "../..", "target/web-ux");
+
 const HELP = `Web UX inspection workbench
 
 Usage:
-  deno task web-ux auth --scenario <file> --persona <id> [--base-url <url>] [--import-state <file>] [--headless]
-  deno task web-ux capture --scenario <file> --output <directory> [--base-url <url>] [--run-id <id>] [--personas <ids>] [--routes <ids>] [--viewports <ids>] [--headed]
+  deno task web-ux auth --scenario <file> --persona <id> [--base-url <url>] [--import-state <file>] [--expires-in-hours <hours>] [--headless]
+  deno task web-ux auth --scenario <file> --persona <id> --delete
+  deno task web-ux capture --scenario <file> [--output <directory>] [--base-url <url>] [--run-id <id>] [--personas <ids>] [--routes <ids>] [--viewports <ids>] [--headed]
   deno task web-ux compare --before <review-context.json> --after <review-context.json> --output <directory> [--threshold <0..1>]
   deno task web-ux cleanup --output <directory> [--keep <count>] [--older-than-days <days>] [--dry-run]
 
@@ -81,18 +85,26 @@ export async function main(rawArgs: string[]): Promise<number> {
     return 0;
   }
   if (args.command === "auth") {
-    rejectUnknown(args, ["scenario", "persona", "base-url", "import-state", "timeout-ms"], [
-      "headless",
-    ]);
+    rejectUnknown(
+      args,
+      ["scenario", "persona", "base-url", "import-state", "timeout-ms", "expires-in-hours"],
+      ["headless", "delete"],
+    );
+    const deleting = args.flags.has("delete");
+    if (deleting && optional(args, "import-state")) {
+      throw new Error("--delete cannot be combined with --import-state");
+    }
     const path = await authenticate({
       scenarioPath: required(args, "scenario"),
       personaId: required(args, "persona"),
       baseUrl: optional(args, "base-url"),
       importState: optional(args, "import-state"),
       timeoutMs: integer(args, "timeout-ms"),
+      expiresInHours: integer(args, "expires-in-hours"),
+      delete: deleting,
       headless: args.flags.has("headless"),
     });
-    console.log(`auth state saved: ${path}`);
+    console.log(`auth state ${deleting ? "deleted" : "saved"}: ${path}`);
     return 0;
   }
   if (args.command === "capture") {
@@ -105,7 +117,7 @@ export async function main(rawArgs: string[]): Promise<number> {
       "routes",
       "viewports",
     ], ["headed"]);
-    const outputDirectory = required(args, "output");
+    const outputDirectory = optional(args, "output") ?? DEFAULT_OUTPUT;
     const manifest = await capture({
       scenarioPath: required(args, "scenario"),
       outputDirectory,

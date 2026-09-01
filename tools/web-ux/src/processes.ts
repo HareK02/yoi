@@ -38,8 +38,10 @@ async function waitForReady(url: string, timeoutMs: number): Promise<void> {
   while (Date.now() < deadline) {
     try {
       const response = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(2_000) });
-      if (response.status < 500) return;
-      lastError = `HTTP ${response.status}`;
+      const status = response.status;
+      await response.body?.cancel();
+      if (status < 500) return;
+      lastError = `HTTP ${status}`;
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
     }

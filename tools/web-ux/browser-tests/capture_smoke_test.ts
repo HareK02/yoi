@@ -1,5 +1,6 @@
 import { assertEquals, assertRejects } from "@std/assert";
 import { join } from "@std/path";
+import { writeAuthMetadata } from "../src/auth_state.ts";
 import { capture } from "../src/capture.ts";
 
 async function freePort(): Promise<number> {
@@ -17,8 +18,9 @@ Deno.test("browser smoke captures distinct owner and non-owner evidence and clea
     const authDirectory = join(directory, "auth");
     await Deno.mkdir(authDirectory);
     for (const persona of ["owner", "non-owner"]) {
+      const storageState = join(authDirectory, `${persona}.json`);
       await Deno.writeTextFile(
-        join(authDirectory, `${persona}.json`),
+        storageState,
         JSON.stringify({
           cookies: [{
             name: "persona",
@@ -33,6 +35,7 @@ Deno.test("browser smoke captures distinct owner and non-owner evidence and clea
           origins: [],
         }),
       );
+      await writeAuthMetadata(storageState, persona, baseUrl, 1);
     }
     const scenarioPath = join(directory, "scenario.json");
     await Deno.writeTextFile(
