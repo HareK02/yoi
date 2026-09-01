@@ -269,7 +269,7 @@ pub async fn restore_backend_worker(
         .json(&serde_json::json!({}))
         .send()
         .await?;
-    api.check_status(response.status())?;
+    let response = api.require_success(response).await?;
     Ok(response.json::<BackendWorkerRestoreResponse>().await?)
 }
 
