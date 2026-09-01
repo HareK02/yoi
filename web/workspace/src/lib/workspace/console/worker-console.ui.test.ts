@@ -554,18 +554,22 @@ Deno.test("Worker Console removes redundant chrome and uses shared alerts", asyn
   );
 });
 
-Deno.test("Worker Console composer fits to content without manual resize", async () => {
+Deno.test("Worker Console composer keeps a compact bounded chip editor", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
       "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
       import.meta.url,
     ),
   );
+  const composerInput = await Deno.readTextFile(
+    new URL("./ComposerInput.svelte", import.meta.url),
+  );
   assert(
-    consolePage.includes("use:fitTextarea={{ value: draft, maxRows: 10 }}") &&
+    consolePage.includes("<ComposerInput") &&
       consolePage.includes('<div class="composer-input-shell">') &&
       !consolePage.includes("handleComposerShellClick") &&
-      consolePage.includes("bind:this={composerTextareaElement}") &&
+      consolePage.includes("bind:this={composerInputElement}") &&
+      consolePage.includes("onchange={handleComposerChange}") &&
       consolePage.includes(
         'event.key === "PageUp" || event.key === "PageDown"',
       ) &&
@@ -577,10 +581,35 @@ Deno.test("Worker Console composer fits to content without manual resize", async
       consolePage.includes("pointer-events: auto") &&
       consolePage.includes('class="composer-send-icon"') &&
       consolePage.includes('d="M8 6L12 2L16 6"') &&
-      consolePage.includes(".console-composer textarea") &&
-      consolePage.includes("resize: none") &&
-      consolePage.includes("overflow-y: hidden"),
-    "Console composer should autosize to content, cap at ten rows, wrap input and icon send button, and disable manual resize",
+      composerInput.includes("max-height: 10rem") &&
+      composerInput.includes("EditorView.lineWrapping") &&
+      composerInput.includes("overflow-y: auto"),
+    "Console composer should use the bounded chip-capable editor with wrapping, page scrolling, and the icon send button",
+  );
+});
+
+Deno.test("Worker Console paste chips preserve typed draft and target authority", async () => {
+  const consolePage = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const composerInput = await Deno.readTextFile(
+    new URL("./ComposerInput.svelte", import.meta.url),
+  );
+  assert(
+    composerInput.includes("handleComposerPaste(event, insertPasteChip)") &&
+      composerInput.includes("EditorView.atomicRanges") &&
+      composerInput.includes('key: "Backspace"') &&
+      composerInput.includes('key: "Delete"') &&
+      composerInput.includes('chip.setAttribute("aria-label", label)') &&
+      composerInput.includes("restoreSegments(segments: readonly Segment[])") &&
+      consolePage.includes("buildComposerSegmentsRequest(value.segments)") &&
+      consolePage.includes("composerDrafts.set(activeComposerTargetKey") &&
+      consolePage.includes("switchComposerTarget(target)") &&
+      consolePage.includes('sendControl({ method: "cancel" }, "Stop")'),
+    "Paste chips should use shared threshold classification, atomic keyboard behavior, accessible labels, typed restore, and per-Worker draft authority",
   );
 });
 
@@ -742,7 +771,7 @@ Deno.test("Worker Console page is routed by runtime_id and worker_id through bac
         'const composerEditable = $derived(protocolState === "open" && !sending);',
       ) &&
       consolePage.includes('sendControl({ method: "cancel" }, "Stop")') &&
-      consolePage.includes("enabled: canSubmitDraft") &&
+      consolePage.includes("onsubmit={handleComposerSubmit}") &&
       consolePage.includes("disabled={!composerEditable}") &&
       consolePage.includes("class:stop={workerRunning}") &&
       consolePage.includes('"Stop Worker"') &&
