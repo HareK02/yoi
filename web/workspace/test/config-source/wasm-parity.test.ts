@@ -299,6 +299,45 @@ Deno.test("generated WASM returns completion items for the editor adapter", () =
   assertEquals(result.items[0].kind, "file");
 });
 
+Deno.test("generated WASM completes blank nested schema positions after Unicode", () => {
+  const source =
+    '{ description = "日本語"; profile = {  }\n} as WorkspaceConfigSchema';
+  const cursor = source.indexOf("{  }") + 2;
+  set_snapshot({
+    ...snapshot,
+    entries: {
+      ...snapshot.entries,
+      "workspace.dcdl": {
+        ...snapshot.entries["workspace.dcdl"],
+        content: source,
+      },
+    },
+  });
+  set_schema_bundle({
+    contributions: [],
+    source: "{ profile = { default_profile = String; }; prompts = {}; }",
+    fingerprint: "sha256:test-schema",
+  });
+
+  const result = complete_current(
+    "workspace.dcdl",
+    source,
+    cursor,
+    true,
+  ) as {
+    from: number;
+    items: Array<{ label: string; kind: string }>;
+  };
+
+  assertEquals(result.from, cursor);
+  assertEquals(
+    result.items.some((item) => item.label === "default_profile"),
+    true,
+  );
+  assertEquals(result.items.some((item) => item.label === "profile"), false);
+  assertEquals(result.items.some((item) => item.label === "prompts"), false);
+});
+
 Deno.test("generated WASM completes asserted WorkspaceConfigSchema keys", () => {
   const bareSource = "{ pro }";
   const source = "{ pro } as WorkspaceConfigSchema";

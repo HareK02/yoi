@@ -1203,6 +1203,9 @@ impl SnapshotEnvironment {
         {
             let mut member_source = format!("{WORKSPACE_CONFIG_SCHEMA_GLOBAL}.");
             member_source.push_str(&context.schema_path.join("."));
+            if !context.schema_path.is_empty() && context.from == utf8_byte_offset {
+                member_source.push('.');
+            }
             let mut completion = LanguageService::new(self).complete(
                 entrypoint.as_str(),
                 &member_source,
@@ -1960,6 +1963,31 @@ mod tests {
                 .items
                 .iter()
                 .any(|item| item.label == "default_profile")
+        );
+
+        let blank_nested_source = "{ profile = {  } } as WorkspaceConfigSchema";
+        let blank_nested_cursor = blank_nested_source.find("{  }").unwrap() + 2;
+        let blank_nested = environment
+            .complete_config(
+                &path("main.dcdl"),
+                blank_nested_source,
+                blank_nested_cursor,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(blank_nested.from, blank_nested_cursor);
+        assert!(
+            blank_nested
+                .items
+                .iter()
+                .any(|item| item.label == "default_profile")
+        );
+        assert!(
+            !blank_nested
+                .items
+                .iter()
+                .any(|item| item.label == "profile")
         );
     }
 

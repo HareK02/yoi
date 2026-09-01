@@ -101,20 +101,24 @@ pub fn complete_current(
         let utf8_byte_offset = utf16_to_utf8_offset(&source, utf16_offset)?;
         let result = session_environment(snapshot.clone())
             .complete_config(&entrypoint, &source, utf8_byte_offset, explicit)
-            .map_err(|error| JsValue::from_str(&format!("{error:?}")))?
-            .map(|result| WasmCompletionResult {
-                from: result.from,
-                items: result
-                    .items
-                    .into_iter()
-                    .map(|item| WasmCompletionItem {
-                        label: item.label,
-                        kind: format!("{:?}", item.kind).to_lowercase(),
-                        detail: item.detail,
-                        priority: item.priority,
-                    })
-                    .collect(),
-            });
+            .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+        let result = result
+            .map(|result| {
+                Ok::<WasmCompletionResult, JsValue>(WasmCompletionResult {
+                    from: utf8_to_utf16_offset(&source, result.from)?,
+                    items: result
+                        .items
+                        .into_iter()
+                        .map(|item| WasmCompletionItem {
+                            label: item.label,
+                            kind: format!("{:?}", item.kind).to_lowercase(),
+                            detail: item.detail,
+                            priority: item.priority,
+                        })
+                        .collect(),
+                })
+            })
+            .transpose()?;
         encode(result)
     })
 }
@@ -175,6 +179,16 @@ fn utf16_to_utf8_offset(source: &str, utf16_offset: usize) -> Result<usize, JsVa
     } else {
         Err(JsValue::from_str("UTF-16 offset is outside the source"))
     }
+}
+
+fn utf8_to_utf16_offset(source: &str, utf8_offset: usize) -> Result<usize, JsValue> {
+    if utf8_offset > source.len() {
+        return Err(JsValue::from_str("UTF-8 offset is outside the source"));
+    }
+    if !source.is_char_boundary(utf8_offset) {
+        return Err(JsValue::from_str("UTF-8 offset splits a character"));
+    }
+    Ok(source[..utf8_offset].encode_utf16().count())
 }
 
 fn decode<T: serde::de::DeserializeOwned>(value: JsValue) -> Result<T, JsValue> {
