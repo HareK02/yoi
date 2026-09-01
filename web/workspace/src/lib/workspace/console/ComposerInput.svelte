@@ -281,6 +281,18 @@
           history(),
           Prec.highest(keymap.of([
             {
+              key: "Mod-z",
+              run: (currentView) => currentView.state.readOnly,
+            },
+            {
+              key: "Mod-Shift-z",
+              run: (currentView) => currentView.state.readOnly,
+            },
+            {
+              key: "Mod-y",
+              run: (currentView) => currentView.state.readOnly,
+            },
+            {
               key: "Backspace",
               run: (currentView) =>
                 deleteAdjacentPasteFromView(currentView, "backward"),
@@ -397,7 +409,7 @@
   }
 
   export function replaceRange(from: number, to: number, content: string): void {
-    if (!view) return;
+    if (!view || view.state.readOnly) return;
     view.dispatch({
       changes: { from, to, insert: content },
       selection: EditorSelection.cursor(from + content.length),

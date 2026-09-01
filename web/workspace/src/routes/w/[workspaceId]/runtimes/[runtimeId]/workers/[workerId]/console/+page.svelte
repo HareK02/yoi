@@ -353,10 +353,13 @@
     }
 
     async function applyComposerCompletion() {
-        if (!composerInputElement) return;
+        if (!composerEditable || !composerInputElement) return;
+        const input = composerInputElement;
+        const targetKey = activeComposerTargetKey;
+        const document = draft.document;
         const token = completionTokenAt(
-            draft.document,
-            composerInputElement.cursor(),
+            document,
+            input.cursor(),
         );
         completionToken = token;
         completionError = null;
@@ -368,12 +371,20 @@
         completionBusy = true;
         try {
             const entries = await resolveCompletionEntries(token);
+            if (
+                !composerEditable ||
+                composerInputElement !== input ||
+                activeComposerTargetKey !== targetKey ||
+                draft.document !== document
+            ) {
+                return;
+            }
             completionEntries = entries;
             if (entries.length === 0) {
                 completionError = `No completions for ${token.sigil}${token.prefix}`;
                 return;
             }
-            composerInputElement.replaceRange(
+            input.replaceRange(
                 token.start,
                 token.end,
                 `${entries[0].value} `,
@@ -433,6 +444,7 @@
             return;
         }
         event.preventDefault();
+        if (!composerEditable) return;
         void applyComposerCompletion();
     }
 
