@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "id": "workspace-control-plane",
+  "title": "Workspace control-plane owner and non-owner review",
+  "baseUrl": "${WEB_UX_BASE_URL}",
+  "locale": "en-US",
+  "timezone": "UTC",
+  "colorScheme": "light",
+  "reducedMotion": "reduce",
+  "redact": {
+    "selectors": ["[data-web-ux-redact]", "input[type=password]"],
+    "text": []
+  },
+  "personas": [
+    {
+      "id": "owner",
+      "label": "Workspace owner",
+      "auth": { "kind": "storage-state", "path": "../../../.web-ux/auth/owner.json" },
+      "login": { "path": "/", "successUrl": "/w/" }
+    },
+    {
+      "id": "non-owner",
+      "label": "Authenticated non-owner",
+      "auth": { "kind": "storage-state", "path": "../../../.web-ux/auth/non-owner.json" },
+      "login": { "path": "/", "successUrl": "/w/" }
+    }
+  ],
+  "viewports": [
+    { "label": "desktop", "width": 1440, "height": 1000, "deviceScaleFactor": 1 },
+    { "label": "narrow", "width": 900, "height": 900, "deviceScaleFactor": 1 }
+  ],
+  "routes": [
+    {
+      "id": "workspace-home",
+      "label": "Workspace overview",
+      "path": "/w/${WORKSPACE_ID}",
+      "goal": "Orient the user and expose the highest-value Workspace actions without internal authority noise.",
+      "dataState": "Dogfood Workspace with current Runtime and Ticket data.",
+      "ready": { "kind": "selector", "selector": "main", "timeoutMs": 20000 },
+      "capturePoints": [{ "id": "initial", "label": "Initial viewport", "fullPage": true }]
+    },
+    {
+      "id": "tickets",
+      "label": "Ticket lanes",
+      "path": "/w/${WORKSPACE_ID}/tickets",
+      "goal": "Scan actionable Ticket lanes and reach the primary authoring action in the initial viewport.",
+      "dataState": "Planning, ready, queued, in-progress, and completed Tickets from the selected Workspace.",
+      "ready": { "kind": "selector", "selector": "main", "timeoutMs": 30000 },
+      "capturePoints": [{ "id": "initial", "label": "Loaded Ticket lanes", "fullPage": true }]
+    },
+    {
+      "id": "workers",
+      "label": "Workers",
+      "path": "/w/${WORKSPACE_ID}/workers",
+      "goal": "Find current Worker state and the new-Worker action without exposing transport internals as the primary content.",
+      "dataState": "Current Workspace Worker projection with mixed lifecycle states.",
+      "ready": { "kind": "selector", "selector": "main", "timeoutMs": 20000 },
+      "capturePoints": [{ "id": "initial", "label": "Worker list", "fullPage": true }]
+    },
+    {
+      "id": "repositories",
+      "label": "Repository settings",
+      "path": "/w/${WORKSPACE_ID}/settings/repositories",
+      "goal": "Review repository access as an owner and verify non-owner composition does not expose unusable owner actions.",
+      "dataState": "Workspace repository catalog projected through current permissions.",
+      "ready": { "kind": "selector", "selector": "main", "timeoutMs": 20000 },
+      "capturePoints": [{ "id": "initial", "label": "Repository settings", "fullPage": true }]
+    }
+  ]
+}

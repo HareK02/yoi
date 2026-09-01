@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "anonymous-entry",
+  "title": "Anonymous entry and authentication review",
+  "baseUrl": "${WEB_UX_BASE_URL}",
+  "locale": "en-US",
+  "timezone": "UTC",
+  "colorScheme": "light",
+  "reducedMotion": "reduce",
+  "personas": [
+    { "id": "anonymous", "label": "Anonymous visitor", "auth": { "kind": "anonymous" } }
+  ],
+  "viewports": [
+    { "label": "desktop", "width": 1440, "height": 1000, "deviceScaleFactor": 1 },
+    { "label": "mobile", "width": 390, "height": 844, "deviceScaleFactor": 1 }
+  ],
+  "routes": [
+    {
+      "id": "entry",
+      "label": "Authentication entry",
+      "path": "/",
+      "goal": "Understand the product and begin authentication without seeing Workspace-private content.",
+      "dataState": "Fresh browser context with no cookies, local storage, or session state.",
+      "ready": { "kind": "network-idle", "timeoutMs": 15000 },
+      "capturePoints": [{ "id": "initial", "label": "Anonymous entry", "fullPage": true }]
+    }
+  ]
+}
