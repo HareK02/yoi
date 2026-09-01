@@ -106,9 +106,7 @@ CREATE TABLE workdir_removal_operations (
     updated_at TEXT NOT NULL,
     completed_at TEXT,
     PRIMARY KEY (workspace_id, operation_id),
-    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-    FOREIGN KEY (workspace_id, repository_id)
-        REFERENCES repositories(workspace_id, repository_id) ON DELETE RESTRICT
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
 );
 CREATE INDEX idx_workdir_removal_operations_recovery
     ON workdir_removal_operations(workspace_id, state, retryable, updated_at);
@@ -278,6 +276,16 @@ impl SqliteWorkspaceStore {
                 operation.working_directory_id
             )))?;
             require_operation_materialization(operation, &current)?;
+            let repository_exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM repositories WHERE workspace_id=?1 AND repository_id=?2)",
+                params![operation.workspace_id, operation.repository_id],
+                |row| row.get(0),
+            )?;
+            if !repository_exists {
+                return Err(Error::RegistryInconsistency(
+                    "Workdir Repository authority is missing".to_string(),
+                ));
+            }
             let active_attachment: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM worker_workdir_links WHERE workspace_id=?1 AND workdir_id=?2 AND unlinked_at IS NULL)",
                 params![operation.workspace_id, operation.working_directory_id],
@@ -590,7 +598,7 @@ fn validate_intent(intent: &WorkdirRemovalIntent) -> Result<()> {
 }
 
 fn validate_bounded(label: &str, value: &str, max: usize) -> Result<()> {
-    if value.trim().is_empty() || value.len() > max {
+    if value.trim().is_empty() || value.len() > max || value.chars().any(char::is_control) {
         return Err(Error::InvalidInput(format!(
             "{label} must be non-empty and at most {max} bytes"
         )));
@@ -922,6 +930,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(replay, completed);
+    }
+
+    #[tokio::test]
+    async fn pending_removal_fences_new_attachment_and_retry_rereads_live_reservation() {
+        let (store, workdir) = seeded_store().await;
+        let intent =
+            workdir_removal_intent(&workdir, "workspace-api", "remove clean Workdir").unwrap();
+        let pending = store.reserve_workdir_removal_operation(&intent).unwrap();
+
+        let error = store
+            .reserve_worker_workdir_attachment("workspace-a", "workdir-a", "reservation-a", "2")
+            .unwrap_err();
+        assert!(matches!(error, Error::WorkdirAttachmentConflict(_)));
+
+        let failed = store
+            .fail_workdir_removal_operation(&pending, "provider_unavailable", true)
+            .unwrap();
+        store
+            .reserve_worker_workdir_attachment("workspace-a", "workdir-a", "reservation-b", "3")
+            .unwrap();
+        let retry = store
+            .begin_workdir_removal_attempt(
+                &failed.workspace_id,
+                &failed.operation_id,
+                &failed.request_fingerprint,
+            )
+            .unwrap();
+        let guards = store.workdir_removal_guards(&retry).unwrap();
+        assert!(
+            guards
+                .iter()
+                .any(|guard| guard.category == "pending_attachment")
+        );
+        let retained = store
+            .complete_workdir_removal_retained(
+                &retry,
+                WorkdirRemovalDisposition::Retained,
+                "blocked_by_live_authority",
+            )
+            .unwrap();
+        assert_eq!(
+            retained.disposition,
+            Some(WorkdirRemovalDisposition::Retained)
+        );
     }
 
     #[tokio::test]

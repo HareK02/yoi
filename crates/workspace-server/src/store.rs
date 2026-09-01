@@ -4889,6 +4889,19 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     "Workdir {workdir_id} is not registered in Workspace {workspace_id}"
                 )));
             }
+            let removal_pending: bool = tx.query_row(
+                r#"SELECT EXISTS(
+                    SELECT 1 FROM workdir_removal_operations
+                    WHERE workspace_id = ?1 AND workdir_id = ?2 AND state = 'pending'
+                )"#,
+                params![workspace_id, workdir_id],
+                |row| row.get(0),
+            )?;
+            if removal_pending {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Workdir {workdir_id} has a pending durable removal operation"
+                )));
+            }
             let occupied: bool = tx.query_row(
                 r#"SELECT EXISTS(
                     SELECT 1 FROM worker_workdir_links
@@ -12182,13 +12195,13 @@ INSERT INTO worker_registry (
         configure_sqlite(&conn).unwrap();
         apply_migrations(&conn).unwrap();
         conn.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (49, 'future')",
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (50, 'future')",
             [],
         )
         .unwrap();
 
         let error = apply_migrations(&conn).unwrap_err().to_string();
-        assert!(error.contains("schema version 49 is newer"), "{error}");
+        assert!(error.contains("schema version 50 is newer"), "{error}");
         assert!(error.contains("refusing to serve"), "{error}");
     }
 

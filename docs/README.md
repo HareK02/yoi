@@ -17,13 +17,14 @@ It is not a dumping ground for external research, old plans, API inventories, or
 9. [`development/plugin-development.md`](development/plugin-development.md) — how to build, package, enable, and inspect Yoi Plugins.
 10. [`design/memory-knowledge.md`](design/memory-knowledge.md) — generated memory and audit records.
 11. [`design/workspace-kanban-orchestrator-runtime.md`](design/workspace-kanban-orchestrator-runtime.md) — how Kanban operations become durable orchestration events and backend-internal routing decisions.
-12. [`design/workspace-runtime-docker.md`](design/workspace-runtime-docker.md) — the WebUI / Backend / Runtime split, Docker image layout, worker launch path, and workdir materialization boundary.
-13. [`development/server-runtime-auth.md`](development/server-runtime-auth.md) — manual Workspace Server / Runtime public-key exchange and authenticated Runtime startup checks.
-14. [`development/work-items.md`](development/work-items.md) — how project work is recorded and reviewed.
-15. [`development/rust-testing-strategy.md`](development/rust-testing-strategy.md) — what Yoi Rust tests should prove, where they belong, and how to name them.
-16. [`development/validation.md`](development/validation.md) — how to check changes.
-17. [`development/workspace-schema-migrations.md`](development/workspace-schema-migrations.md) — how to preflight, apply, verify, and roll back control-plane SQLite schema changes.
-18. [`design/standalone-agent-host.md`](design/standalone-agent-host.md) — in-process standalone Worker host の依存方向、authority、lifecycle、非目標。
+12. [`design/durable-operations.md`](design/durable-operations.md) — durable Backend intents that cross Runtime/provider side-effect boundaries, including Workdir removal.
+13. [`design/workspace-runtime-docker.md`](design/workspace-runtime-docker.md) — the WebUI / Backend / Runtime split, Docker image layout, worker launch path, and workdir materialization boundary.
+14. [`development/server-runtime-auth.md`](development/server-runtime-auth.md) — manual Workspace Server / Runtime public-key exchange and authenticated Runtime startup checks.
+15. [`development/work-items.md`](development/work-items.md) — how project work is recorded and reviewed.
+16. [`development/rust-testing-strategy.md`](development/rust-testing-strategy.md) — what Yoi Rust tests should prove, where they belong, and how to name them.
+17. [`development/validation.md`](development/validation.md) — how to check changes.
+18. [`development/workspace-schema-migrations.md`](development/workspace-schema-migrations.md) — how to preflight, apply, verify, and roll back control-plane SQLite schema changes.
+19. [`design/standalone-agent-host.md`](design/standalone-agent-host.md) — in-process standalone Worker host の依存方向、authority、lifecycle、非目標。
 
 ## What belongs here
 
