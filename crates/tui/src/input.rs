@@ -322,8 +322,7 @@ impl InputBuffer {
     pub fn insert_paste(&mut self, content: String) {
         let measurement = measure_paste(&content);
         if measurement.presentation() == PastePresentation::Text {
-            let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
-            self.insert_str(&normalized);
+            self.insert_str(&content);
             return;
         }
 
@@ -483,80 +482,78 @@ impl InputBuffer {
         self.cursor = 0;
     }
 
-    pub fn move_home(&mut self) {
-        while self.cursor > 0 {
-            if matches!(self.atoms[self.cursor - 1], Atom::Char('\n')) {
-                break;
-            }
-            self.cursor -= 1;
+    fn logical_line_ranges(&self) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        let mut start = 0;
+        let mut index = 0;
+        while index < self.atoms.len() {
+            let break_len = match self.atoms[index] {
+                Atom::Char('\r') => {
+                    if matches!(self.atoms.get(index + 1), Some(Atom::Char('\n'))) {
+                        2
+                    } else {
+                        1
+                    }
+                }
+                Atom::Char('\n') => 1,
+                _ => {
+                    index += 1;
+                    continue;
+                }
+            };
+            ranges.push((start, index));
+            index += break_len;
+            start = index;
         }
+        ranges.push((start, self.atoms.len()));
+        ranges
+    }
+
+    fn logical_line_and_col(&self) -> (Vec<(usize, usize)>, usize, usize) {
+        let ranges = self.logical_line_ranges();
+        for (line, &(start, end)) in ranges.iter().enumerate() {
+            if self.cursor <= end {
+                return (ranges, line, self.cursor.saturating_sub(start));
+            }
+            if let Some(&(next_start, _)) = ranges.get(line + 1)
+                && self.cursor < next_start
+            {
+                return (ranges, line + 1, 0);
+            }
+        }
+        let line = ranges.len().saturating_sub(1);
+        let col = self.cursor.saturating_sub(ranges[line].0);
+        (ranges, line, col)
+    }
+
+    pub fn move_home(&mut self) {
+        let (ranges, line, _) = self.logical_line_and_col();
+        self.cursor = ranges[line].0;
     }
 
     pub fn move_end(&mut self) {
-        while self.cursor < self.atoms.len() {
-            if matches!(self.atoms[self.cursor], Atom::Char('\n')) {
-                break;
-            }
-            self.cursor += 1;
-        }
+        let (ranges, line, _) = self.logical_line_and_col();
+        self.cursor = ranges[line].1;
     }
 
     /// Move one logical line up, preserving column (atom count from
     /// current line start). No-op if already on the first line.
     pub fn move_up(&mut self) {
-        let (line_start, col) = self.line_start_and_col();
-        if line_start == 0 {
+        let (ranges, line, col) = self.logical_line_and_col();
+        if line == 0 {
             return;
         }
-        // `atoms[line_start - 1]` is the '\n' that opens the current
-        // line; find the previous line's start.
-        let prev_end = line_start - 1;
-        let mut prev_start = 0;
-        for i in (0..prev_end).rev() {
-            if matches!(self.atoms[i], Atom::Char('\n')) {
-                prev_start = i + 1;
-                break;
-            }
-        }
-        let prev_len = prev_end - prev_start;
-        self.cursor = prev_start + col.min(prev_len);
+        let (start, end) = ranges[line - 1];
+        self.cursor = start + col.min(end - start);
     }
 
     /// Move one logical line down, preserving column.
     pub fn move_down(&mut self) {
-        let (line_start, col) = self.line_start_and_col();
-        // End of current line.
-        let mut cur_end = self.atoms.len();
-        for i in line_start..self.atoms.len() {
-            if matches!(self.atoms[i], Atom::Char('\n')) {
-                cur_end = i;
-                break;
-            }
-        }
-        if cur_end == self.atoms.len() {
-            return; // no next line
-        }
-        let next_start = cur_end + 1;
-        let mut next_end = self.atoms.len();
-        for i in next_start..self.atoms.len() {
-            if matches!(self.atoms[i], Atom::Char('\n')) {
-                next_end = i;
-                break;
-            }
-        }
-        let next_len = next_end - next_start;
-        self.cursor = next_start + col.min(next_len);
-    }
-
-    fn line_start_and_col(&self) -> (usize, usize) {
-        let mut start = 0;
-        for i in (0..self.cursor).rev() {
-            if matches!(self.atoms[i], Atom::Char('\n')) {
-                start = i + 1;
-                break;
-            }
-        }
-        (start, self.cursor - start)
+        let (ranges, line, col) = self.logical_line_and_col();
+        let Some(&(start, end)) = ranges.get(line + 1) else {
+            return;
+        };
+        self.cursor = start + col.min(end - start);
     }
 
     /// Build the typed `Vec<Segment>` sent over the protocol. Adjacent
@@ -629,6 +626,7 @@ impl InputBuffer {
         let mut cursor_row: u16 = 0;
         let mut cursor_col: u16 = 0;
         let mut cursor_set = false;
+        let mut previous_was_cr = false;
 
         // Record cursor once, at the point right before `atom` would be
         // placed — accounting for a wrap that the atom itself will cause.
@@ -652,7 +650,7 @@ impl InputBuffer {
         for (i, atom) in self.atoms.iter().enumerate() {
             if !cursor_set && i == self.cursor {
                 let leading = match atom {
-                    Atom::Char('\n') => 0,
+                    Atom::Char('\n' | '\r') => 0,
                     Atom::Char(c) => UnicodeWidthChar::width(*c).unwrap_or(0),
                     other => other
                         .chip()
@@ -667,6 +665,21 @@ impl InputBuffer {
             }
 
             match atom {
+                Atom::Char('\r') => {
+                    flush_pending(
+                        &mut pending,
+                        &mut pending_width,
+                        pending_style,
+                        &mut rows,
+                        &mut row_width,
+                    );
+                    rows.push(Vec::new());
+                    row_width = 0;
+                    previous_was_cr = true;
+                }
+                Atom::Char('\n') if previous_was_cr => {
+                    previous_was_cr = false;
+                }
                 Atom::Char('\n') => {
                     flush_pending(
                         &mut pending,
@@ -677,8 +690,10 @@ impl InputBuffer {
                     );
                     rows.push(Vec::new());
                     row_width = 0;
+                    previous_was_cr = false;
                 }
                 Atom::Char(c) => {
+                    previous_was_cr = false;
                     let cw = UnicodeWidthChar::width(*c).unwrap_or(0);
                     if pending_style != text_style && !pending.is_empty() {
                         flush_pending(
@@ -702,6 +717,7 @@ impl InputBuffer {
                     );
                 }
                 other => {
+                    previous_was_cr = false;
                     let (chip_style, label) = other.chip().expect("non-char atom has a chip");
                     if pending_style != chip_style && !pending.is_empty() {
                         flush_pending(
@@ -1043,11 +1059,12 @@ mod paste_policy_tests {
     }
 
     #[test]
-    fn short_multiline_paste_normalizes_line_endings_as_text() {
+    fn short_multiline_paste_preserves_original_line_endings_as_text() {
+        let content = "ab\r\ncd\ref";
         let mut buffer = InputBuffer::new();
-        buffer.insert_paste("a\r\nb\rc".to_owned());
+        buffer.insert_paste(content.to_owned());
 
-        assert_eq!(buffer.plain_text(), "a\nb\nc");
+        assert_eq!(buffer.plain_text(), content);
         assert!(
             buffer
                 .atoms
@@ -1056,8 +1073,32 @@ mod paste_policy_tests {
         );
         assert_eq!(
             buffer.submit_segments(),
-            vec![Segment::text("a\nb\nc".to_owned())]
+            vec![Segment::text(content.to_owned())]
         );
+
+        let rendered: Vec<String> = buffer
+            .render(80)
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(rendered, vec!["ab", "cd", "ef"]);
+
+        buffer.move_up();
+        assert_eq!(buffer.cursor, 6);
+        buffer.move_up();
+        assert_eq!(buffer.cursor, 2);
+        buffer.move_down();
+        assert_eq!(buffer.cursor, 6);
+        buffer.move_home();
+        assert_eq!(buffer.cursor, 4);
+        buffer.move_end();
+        assert_eq!(buffer.cursor, 6);
     }
 
     #[test]

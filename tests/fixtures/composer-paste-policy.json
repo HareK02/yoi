@@ -24,6 +24,70 @@
       "presentation": "chip"
     },
     {
+      "name": "three_lines_50_scalars",
+      "parts": [
+        { "value": "a\nb\n", "repeat": 1 },
+        { "value": "x", "repeat": 46 }
+      ],
+      "char_count": 50,
+      "logical_line_count": 3,
+      "presentation": "text"
+    },
+    {
+      "name": "four_lines_50_scalars",
+      "parts": [
+        { "value": "a\nb\nc\n", "repeat": 1 },
+        { "value": "x", "repeat": 44 }
+      ],
+      "char_count": 50,
+      "logical_line_count": 4,
+      "presentation": "chip"
+    },
+    {
+      "name": "four_lines_51_scalars",
+      "parts": [
+        { "value": "a\nb\nc\n", "repeat": 1 },
+        { "value": "x", "repeat": 45 }
+      ],
+      "char_count": 51,
+      "logical_line_count": 4,
+      "presentation": "chip"
+    },
+    {
+      "name": "two_lines_51_scalars",
+      "parts": [
+        { "value": "a\n", "repeat": 1 },
+        { "value": "x", "repeat": 49 }
+      ],
+      "char_count": 51,
+      "logical_line_count": 2,
+      "presentation": "chip"
+    },
+    {
+      "name": "four_lines_10_scalars",
+      "parts": [
+        { "value": "a\nb\nc\n", "repeat": 1 },
+        { "value": "x", "repeat": 4 }
+      ],
+      "char_count": 10,
+      "logical_line_count": 4,
+      "presentation": "chip"
+    },
+    {
+      "name": "japanese",
+      "parts": [{ "value": "日本語の貼り付け", "repeat": 1 }],
+      "char_count": 8,
+      "logical_line_count": 1,
+      "presentation": "text"
+    },
+    {
+      "name": "combining_marks_50_scalars",
+      "parts": [{ "value": "é", "repeat": 25 }],
+      "char_count": 50,
+      "logical_line_count": 1,
+      "presentation": "text"
+    },
+    {
       "name": "unicode_scalar_50",
       "parts": [{ "value": "🦀", "repeat": 50 }],
       "char_count": 50,
