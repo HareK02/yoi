@@ -1439,6 +1439,28 @@ mod tests {
     }
 
     #[test]
+    fn builtin_orchestrator_keeps_cleanup_tool_providers_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let resolved = ProfileResolver::new()
+            .with_workspace_base(tmp.path())
+            .resolve(
+                &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "orchestrator"),
+                ProfileResolveOptions::with_worker_name("orchestrator-worker"),
+            )
+            .unwrap();
+        let feature = resolved.manifest.feature;
+
+        assert!(feature.worker.enabled);
+        assert!(!feature.worker.direct_spawn);
+        assert!(feature.manage_workdir.enabled);
+        assert!(feature.merge_request.show);
+        assert!(feature.merge_request.readiness_check);
+        assert!(feature.merge_request.complete);
+        assert!(!feature.merge_request.open);
+        assert!(!feature.merge_request.review);
+    }
+
+    #[test]
     fn profile_resolution_requires_runtime_worker_name() {
         let tmp = TempDir::new().unwrap();
         let err = ProfileResolver::new()

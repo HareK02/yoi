@@ -9,6 +9,7 @@ use agen::llm_client::{ClientError, LlmClient, Request};
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
+use manifest::{ProfileRegistrySource, ProfileResolveOptions, ProfileResolver, ProfileSelector};
 use session_store::{CombinedStore, FsWorkerStore};
 use session_store::{FsStore, LogEntry};
 use workdir::{
@@ -248,6 +249,14 @@ async fn make_worker_with_pwd_manifest_and_workspace_context(
     workspace_context: WorkerWorkspaceContext,
 ) -> (Worker<MockClient, TestStore>, std::path::PathBuf) {
     let manifest = WorkerManifest::from_toml(manifest_toml).unwrap();
+    make_worker_with_manifest_and_workspace_context(client, manifest, workspace_context).await
+}
+
+async fn make_worker_with_manifest_and_workspace_context(
+    client: MockClient,
+    manifest: WorkerManifest,
+    workspace_context: WorkerWorkspaceContext,
+) -> (Worker<MockClient, TestStore>, std::path::PathBuf) {
     let store_tmp = tempfile::tempdir().unwrap();
     let store = CombinedStore::new(
         FsStore::new(store_tmp.path()).unwrap(),
@@ -781,6 +790,37 @@ permission = "write"
             );
         }
     }
+}
+
+#[tokio::test]
+async fn builtin_orchestrator_exposes_worker_remove_and_workdir_delete() {
+    let workspace = tempfile::tempdir().unwrap();
+    let resolved = ProfileResolver::new()
+        .with_workspace_base(workspace.path())
+        .resolve(
+            &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "orchestrator"),
+            ProfileResolveOptions::with_worker_name("orchestrator-worker"),
+        )
+        .unwrap();
+    let workspace_context =
+        WorkerWorkspaceContext::with_client(None, Arc::new(NoopWorkspaceClient));
+    let client = MockClient::new(simple_text_events());
+    let client_for_assert = client.clone();
+    let (worker, _pwd) = make_worker_with_manifest_and_workspace_context(
+        client,
+        resolved.manifest,
+        workspace_context,
+    )
+    .await;
+    let handle = spawn_controller(worker).await;
+
+    handle.send(Method::run_text("Hello")).await.unwrap();
+    wait_for_status(&handle, WorkerStatus::Idle).await;
+    let request = wait_for_captured_request(&client_for_assert).await;
+    let installed = request_tool_names(&request);
+
+    assert!(installed.iter().any(|name| name == "WorkerRemove"));
+    assert!(installed.iter().any(|name| name == "WorkdirDelete"));
 }
 
 #[tokio::test]
