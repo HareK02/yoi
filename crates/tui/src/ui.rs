@@ -1299,8 +1299,13 @@ fn chip_span_for(seg: &Segment, fallback: Style) -> (Style, String) {
         Segment::PasteArtifact { artifact } => (
             Style::default().fg(Color::Magenta),
             format!(
-                "[Paste artifact {} | {} chars, {} lines]",
-                artifact.artifact_id, artifact.char_count, artifact.line_count
+                "[Paste artifact {} | {} chars, {} lines, {}, {}, created {} ms]",
+                artifact.artifact_id,
+                artifact.char_count,
+                artifact.line_count,
+                artifact.media_type.as_str(),
+                artifact.availability.as_str(),
+                artifact.created_at_ms
             ),
         ),
         Segment::FileRef { path } => (Style::default().fg(Color::Cyan), format!("@{path}")),
@@ -1322,8 +1327,13 @@ fn segment_display_text(seg: &Segment) -> String {
             id, chars, lines, ..
         } => format!("[Clipboard #{id} | {chars} chars, {lines} lines]"),
         Segment::PasteArtifact { artifact } => format!(
-            "[Paste artifact {} | {} chars, {} lines]",
-            artifact.artifact_id, artifact.char_count, artifact.line_count
+            "[Paste artifact {} | {} chars, {} lines, {}, {}, created {} ms]",
+            artifact.artifact_id,
+            artifact.char_count,
+            artifact.line_count,
+            artifact.media_type.as_str(),
+            artifact.availability.as_str(),
+            artifact.created_at_ms
         ),
         Segment::FileRef { path } => format!("@{path}"),
         Segment::Flow { selector } => format!("[Flow: {selector}]"),

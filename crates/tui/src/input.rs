@@ -76,8 +76,13 @@ impl Atom {
             Atom::PasteArtifact(artifact) => Some((
                 Style::default().fg(Color::Magenta),
                 format!(
-                    "[Paste artifact {} | {} chars, {} lines]",
-                    artifact.artifact_id, artifact.char_count, artifact.line_count
+                    "[Paste artifact {} | {} chars, {} lines, {}, {}, created {} ms]",
+                    artifact.artifact_id,
+                    artifact.char_count,
+                    artifact.line_count,
+                    artifact.media_type.as_str(),
+                    artifact.availability.as_str(),
+                    artifact.created_at_ms
                 ),
             )),
             Atom::FileRef(r) => Some((Style::default().fg(Color::Cyan), r.label())),
@@ -932,6 +937,9 @@ mod submit_segments_tests {
     fn restored_paste_artifact_remains_a_typed_segment() {
         let artifact = protocol::PasteArtifactRef {
             artifact_id: "019ca7c8-57b6-7f05-8edf-524147aba7b2".to_string(),
+            created_at_ms: 1_700_000_000_000,
+            media_type: protocol::PasteArtifactMediaType::TextPlainUtf8,
+            availability: protocol::PasteArtifactAvailability::Available,
             byte_len: 65_536,
             char_count: 65_530,
             line_count: 200,

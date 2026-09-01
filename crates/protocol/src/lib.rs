@@ -193,6 +193,42 @@ impl WorkerEvent {
 /// variants — emits an alert and inserts a `[unknown input segment]`
 /// placeholder into the LLM context so neither user nor LLM is blind to
 /// the dropped intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PasteArtifactMediaType {
+    TextPlainUtf8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PasteArtifactAvailability {
+    Available,
+    Unavailable,
+    IntegrityFailed,
+}
+
+impl PasteArtifactMediaType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TextPlainUtf8 => "text/plain; charset=utf-8",
+        }
+    }
+}
+
+impl PasteArtifactAvailability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Unavailable => "unavailable",
+            Self::IntegrityFailed => "integrity_failed",
+        }
+    }
+}
+
 /// Session-owned reference to a large pasted-input artifact.
 ///
 /// The reference contains only bounded integrity and provenance metadata. The
@@ -203,6 +239,11 @@ impl WorkerEvent {
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct PasteArtifactRef {
     pub artifact_id: String,
+    pub created_at_ms: u64,
+    pub media_type: PasteArtifactMediaType,
+    /// Availability observed when this immutable reference was committed.
+    /// Reads revalidate storage and integrity rather than trusting this field.
+    pub availability: PasteArtifactAvailability,
     pub byte_len: u64,
     pub char_count: u64,
     pub line_count: u64,
@@ -275,11 +316,14 @@ impl Segment {
                     use std::fmt::Write as _;
                     let _ = write!(
                         out,
-                        "[Large paste stored as artifact {}: {} bytes, {} chars, {} lines, sha256 {}; use SearchInputArtifact and ReadInputArtifact to inspect it]",
+                        "[Large paste stored as artifact {}: {} bytes, {} chars, {} lines, {}, {}, created at {} ms, sha256 {}; use SearchInputArtifact and ReadInputArtifact to inspect it]",
                         artifact.artifact_id,
                         artifact.byte_len,
                         artifact.char_count,
                         artifact.line_count,
+                        artifact.media_type.as_str(),
+                        artifact.availability.as_str(),
+                        artifact.created_at_ms,
                         artifact.sha256
                     );
                 }
@@ -1239,6 +1283,9 @@ mod tests {
     fn paste_artifact_segment_roundtrips_without_body() {
         let artifact = PasteArtifactRef {
             artifact_id: "019ca7c8-57b6-7f05-8edf-524147aba7b2".to_string(),
+            created_at_ms: 1_700_000_000_000,
+            media_type: PasteArtifactMediaType::TextPlainUtf8,
+            availability: PasteArtifactAvailability::Available,
             byte_len: 65_536,
             char_count: 65_530,
             line_count: 200,

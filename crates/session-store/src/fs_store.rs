@@ -450,6 +450,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(reference.byte_len, content.len() as u64);
+        assert!(reference.created_at_ms > 0);
+        assert_eq!(
+            reference.media_type,
+            protocol::PasteArtifactMediaType::TextPlainUtf8
+        );
+        assert_eq!(
+            reference.availability,
+            protocol::PasteArtifactAvailability::Available
+        );
         assert_eq!(reference.char_count, content.chars().count() as u64);
         assert_eq!(reference.source_entry_id, "entry-1");
         assert_eq!(
@@ -491,6 +500,55 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_paste_writes_atomically_enforce_aggregate_caps() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_id = new_session_id();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let limits = PasteArtifactLimits {
+            max_artifact_bytes: 4,
+            max_session_bytes: 8,
+            max_session_artifacts: 1,
+        };
+        let mut handles = Vec::new();
+        for entry_id in ["entry-1", "entry-2"] {
+            let root = tmp.path().to_path_buf();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                let store = FsStore::new(root).unwrap();
+                barrier.wait();
+                store.write_paste_artifact(session_id, entry_id, "1234", limits)
+            }));
+        }
+        barrier.wait();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(StoreError::PasteArtifactLimit(_))))
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_dir(
+                FsStore::new(tmp.path())
+                    .unwrap()
+                    .paste_artifact_dir(session_id)
+            )
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(
+                |entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+            )
+            .count(),
+            1
+        );
+    }
+
+    #[test]
     fn paste_artifact_limits_and_corruption_fail_closed() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = FsStore::new(tmp.path()).unwrap();
@@ -498,6 +556,7 @@ mod tests {
         let limits = PasteArtifactLimits {
             max_artifact_bytes: 5,
             max_session_bytes: 8,
+            max_session_artifacts: 2,
         };
         let first = store
             .write_paste_artifact(session_id, "entry-1", "1234", limits)
