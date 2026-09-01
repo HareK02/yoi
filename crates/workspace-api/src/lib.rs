@@ -397,6 +397,34 @@ pub struct WorkingDirectoryCleanupTarget {
     pub repository_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectoryRemovalRequest {
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkingDirectoryRemovalDisposition {
+    Removed,
+    Retained,
+    AttentionRequired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectoryRemovalResponse {
+    pub working_directory_id: String,
+    pub disposition: WorkingDirectoryRemovalDisposition,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_category: Option<String>,
+}
+
 /// Durable Workspace occupancy projection for one Workdir.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]

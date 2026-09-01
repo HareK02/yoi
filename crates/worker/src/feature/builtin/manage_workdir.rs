@@ -23,8 +23,9 @@ use workdir::{
 use workspace_api::{
     WorkingDirectoryCreateRequest as WorkdirCreateRequest,
     WorkingDirectoryCreateResponse as WorkdirCreateResponse,
-    WorkingDirectoryDetailResponse as WorkdirDetailResponse,
     WorkingDirectoryListResponse as WorkdirListResponse,
+    WorkingDirectoryRemovalRequest as WorkdirRemovalRequest,
+    WorkingDirectoryRemovalResponse as WorkdirRemovalResponse,
 };
 
 use crate::feature::{
@@ -51,7 +52,7 @@ const LIST_DESCRIPTION: &str = "List persistent Workdirs in the current Workspac
 const CREATE_DESCRIPTION: &str = "Materialize a persistent Workdir on a selected Runtime from a Workspace repository and optional selector. This does not change this Worker's attachment; use WorkdirAttach explicitly after creation.";
 const ATTACH_DESCRIPTION: &str = "Attach this Worker to one existing Workdir. The Backend enforces one active Workdir per Worker and one active Worker per Workdir, then opens an ephemeral operation session.";
 const DETACH_DESCRIPTION: &str = "Detach this Worker from its active Workdir and release Workdir occupancy. Any ephemeral operation session is closed.";
-const DELETE_DESCRIPTION: &str = "Delete one persistent Workdir by id through Backend Workspace API authority. Occupied, blocked, or dirty Workdirs requiring confirmation are rejected.";
+const DELETE_DESCRIPTION: &str = "Request removal of one persistent Workdir by id through durable Backend Workspace authority. The input includes only the Workdir id and a bounded reason. The result reports removed, retained, or attention_required without exposing operation-table or provider internals.";
 
 #[derive(Clone, Debug)]
 pub struct ManageWorkdirFeature {
@@ -484,12 +485,21 @@ impl WorkspaceHttpWorkdirBackend {
         )?;
         let workspace_id = encode_path_segment(self.workspace_id()?);
         let workdir_path = encode_path_segment(workdir_id);
-        let response = self.execute_json::<WorkdirDetailResponse>(WorkspaceRequest {
-            method: WorkspaceRequestMethod::Delete,
-            path: format!("/api/w/{workspace_id}/working-directories/{workdir_path}"),
-            body: None,
-        })?;
-        workdir_output(format!("Deleted Workdir {workdir_id}"), &response)
+        let response = self.execute_json::<WorkdirRemovalResponse>(WorkspaceRequest::json(
+            WorkspaceRequestMethod::Delete,
+            format!("/api/w/{workspace_id}/working-directories/{workdir_path}"),
+            serde_json::to_string(&WorkdirRemovalRequest {
+                reason: validate_delete_reason(&input.reason)?.to_string(),
+            })
+            .map_err(decode_error)?,
+        ))?;
+        workdir_output(
+            format!(
+                "Workdir {workdir_id} removal disposition: {:?}",
+                response.disposition
+            ),
+            &response,
+        )
     }
 
     fn execute_json<T: for<'de> Deserialize<'de>>(
@@ -611,6 +621,17 @@ fn validate_identity<'a>(
     Ok(value)
 }
 
+fn validate_delete_reason(reason: &str) -> Result<&str, ToolError> {
+    let reason = reason.trim();
+    if reason.is_empty() || reason.len() > 500 || reason.chars().any(char::is_control) {
+        return Err(ToolError::InvalidArgument(
+            "WorkdirDelete reason must be non-empty, contain no control characters, and be at most 500 bytes"
+                .to_string(),
+        ));
+    }
+    Ok(reason)
+}
+
 fn validate_optional_selector(selector: Option<String>) -> Result<Option<String>, ToolError> {
     let Some(selector) = selector else {
         return Ok(None);
@@ -689,9 +710,10 @@ fn delete_schema() -> serde_json::Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["working_directory_id"],
+        "required": ["working_directory_id", "reason"],
         "properties": {
-            "working_directory_id": {"type": "string", "minLength": 1}
+            "working_directory_id": {"type": "string", "minLength": 1},
+            "reason": {"type": "string", "minLength": 1, "maxLength": 500}
         }
     })
 }
@@ -736,6 +758,7 @@ struct WorkdirAttachmentResponse {
 #[serde(deny_unknown_fields)]
 struct WorkdirDeleteInput {
     working_directory_id: String,
+    reason: String,
 }
 
 #[cfg(test)]
@@ -959,7 +982,10 @@ mod tests {
         assert!(create["properties"].get("session_id").is_none());
         assert_eq!(attach_schema()["required"], json!(["workdir_id"]));
         assert!(attach_schema()["properties"].get("session_id").is_none());
-        assert_eq!(delete_schema()["required"], json!(["working_directory_id"]));
+        assert_eq!(
+            delete_schema()["required"],
+            json!(["working_directory_id", "reason"])
+        );
     }
 
     #[test]
@@ -999,15 +1025,9 @@ mod tests {
                 "attached": false
             })),
             response(json!({
-                "workspace_id": "workspace/test",
-                "runtime_id": "runtime/one",
-                "item": {
-                    "working_directory_id": "wd-created",
-                    "repository_id": "main",
-                    "materializer_kind": "local_git_worktree",
-                    "status": "not_found"
-                },
-                "diagnostics": []
+                "working_directory_id": "wd-created",
+                "disposition": "removed",
+                "retryable": false
             })),
         ]));
         let backend = WorkspaceHttpWorkdirBackend::new(client.clone());
@@ -1052,6 +1072,7 @@ mod tests {
         backend
             .delete(WorkdirDeleteInput {
                 working_directory_id: "wd-created".to_string(),
+                reason: "remove stale Workdir".to_string(),
             })
             .unwrap();
 
@@ -1087,6 +1108,9 @@ mod tests {
             "/api/w/workspace%2Ftest/working-directories/wd-created"
         );
         assert_eq!(requests[4].method, WorkspaceRequestMethod::Delete);
+        let body: serde_json::Value =
+            serde_json::from_str(requests[4].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body, json!({"reason": "remove stale Workdir"}));
     }
 
     #[tokio::test]
