@@ -1,5 +1,6 @@
 declare const Deno: {
   test(name: string, fn: () => void | Promise<void>): void;
+  readTextFile(path: URL): Promise<string>;
 };
 
 import {
@@ -107,4 +108,46 @@ Deno.test("workspace response requires the permission projection", () => {
     () => parseWorkspaceResponse(stale),
     "permissions must be an object",
   );
+});
+
+Deno.test("Repository settings consume the validated shared wire shape", async () => {
+  const [loadSource, pageSource] = await Promise.all([
+    Deno.readTextFile(
+      new URL(
+        "../src/routes/w/[workspaceId]/settings/repositories/+page.ts",
+        import.meta.url,
+      ),
+    ),
+    Deno.readTextFile(
+      new URL(
+        "../src/routes/w/[workspaceId]/settings/repositories/+page.svelte",
+        import.meta.url,
+      ),
+    ),
+  ]);
+
+  for (
+    const token of [
+      "parseRepositoryListResponse",
+      "repository.id",
+      "repository.observed_status",
+      "sourceLabel(repository.source.kind)",
+      "supportsRepositoryAccess(repository.source.kind)",
+    ]
+  ) {
+    if (!loadSource.includes(token) && !pageSource.includes(token)) {
+      throw new Error(`Repository settings should include ${token}`);
+    }
+  }
+  for (
+    const staleToken of [
+      "repository.repository_id",
+      "repository.observed.status",
+      "repository.source.kind === 'remote_git'",
+    ]
+  ) {
+    if (loadSource.includes(staleToken) || pageSource.includes(staleToken)) {
+      throw new Error(`Repository settings must not use ${staleToken}`);
+    }
+  }
 });

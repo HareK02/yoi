@@ -1,9 +1,20 @@
 <script lang="ts">
   import { invalidateAll } from '$app/navigation';
   import { workspaceApiPath, workspaceRoute } from '$lib/workspace/api/http';
+  import type { RepositorySourceKind } from '$lib/generated/workspace-api';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
+
+  function sourceLabel(kind: RepositorySourceKind): string {
+    if (kind === 'local_path' || kind === 'file') return 'Local';
+    if (kind === 'invalid') return 'Invalid';
+    return 'Remote Git';
+  }
+
+  function supportsRepositoryAccess(kind: RepositorySourceKind): boolean {
+    return kind === 'ssh' || kind === 'http' || kind === 'https';
+  }
   let showAddRepository = $state(false);
   let repositoryId = $state('');
   let displayName = $state('');
@@ -122,22 +133,22 @@
           </tr>
         </thead>
         <tbody>
-          {#each data.repositories.items as repository (repository.repository_id)}
+          {#each data.repositories.items as repository (repository.id)}
             <tr>
               <td>
-                <a class="inline-link" href={workspaceRoute(data.workspaceId, `/repositories/${encodeURIComponent(repository.repository_id)}`)}>
+                <a class="inline-link" href={workspaceRoute(data.workspaceId, `/repositories/${encodeURIComponent(repository.id)}`)}>
                   <strong>{repository.display_name}</strong>
                 </a>
-                <small><code>{repository.repository_id}</code></small>
+                <small><code>{repository.id}</code></small>
               </td>
               <td>
-                <span>{repository.source.kind === 'local_path' ? 'Local' : 'Remote Git'}</span>
+                <span>{sourceLabel(repository.source.kind)}</span>
                 <small><code>{repository.source.uri}</code></small>
               </td>
               <td>{repository.default_selector ?? '—'}</td>
-              <td>{repository.observed.status}</td>
+              <td>{repository.observed_status}</td>
               <td>
-                {#if repository.source.kind === 'remote_git'}
+                {#if supportsRepositoryAccess(repository.source.kind)}
                   <a class="inline-link" href={workspaceRoute(data.workspaceId, '/settings/repository-access')}>Configure access</a>
                 {:else}
                   <span class="settings-muted-action">Not required</span>
