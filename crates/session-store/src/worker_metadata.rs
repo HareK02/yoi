@@ -608,6 +608,24 @@ where
     ) -> Result<usize, crate::StoreError> {
         self.session_store.read_entry_count(session_id, segment_id)
     }
+    fn write_paste_artifact(
+        &self,
+        session_id: SessionId,
+        source_entry_id: &str,
+        content: &str,
+        limits: crate::PasteArtifactLimits,
+    ) -> Result<protocol::PasteArtifactRef, crate::StoreError> {
+        self.session_store
+            .write_paste_artifact(session_id, source_entry_id, content, limits)
+    }
+    fn read_paste_artifact(
+        &self,
+        session_id: SessionId,
+        artifact_id: &str,
+    ) -> Result<(protocol::PasteArtifactRef, String), crate::StoreError> {
+        self.session_store
+            .read_paste_artifact(session_id, artifact_id)
+    }
     fn append_trace(
         &self,
         session_id: SessionId,

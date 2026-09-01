@@ -133,7 +133,9 @@ message: string,
  */
 timestamp_ms: number, };
 
-export type Segment = { "kind": "text", content: string, } | { "kind": "paste", id: number, chars: number, lines: number, content: string, } | { "kind": "file_ref", path: string, } | { "kind": "flow", selector: string, } | { "kind": "unknown" };
+export type PasteArtifactRef = { artifact_id: string, byte_len: number, char_count: number, line_count: number, sha256: string, source_entry_id: string, };
+
+export type Segment = { "kind": "text", content: string, } | { "kind": "paste", id: number, chars: number, lines: number, content: string, } | { "kind": "paste_artifact", artifact: PasteArtifactRef, } | { "kind": "file_ref", path: string, } | { "kind": "flow", selector: string, } | { "kind": "unknown" };
 
 export type WorkerEvent = { "kind": "turn_ended", worker_name: string, } | { "kind": "errored", worker_name: string, message: string, } | { "kind": "shut_down", worker_name: string, } | { "kind": "scope_sub_delegated",
 /**

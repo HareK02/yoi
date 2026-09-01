@@ -193,6 +193,23 @@ impl WorkerEvent {
 /// variants — emits an alert and inserts a `[unknown input segment]`
 /// placeholder into the LLM context so neither user nor LLM is blind to
 /// the dropped intent.
+/// Session-owned reference to a large pasted-input artifact.
+///
+/// The reference contains only bounded integrity and provenance metadata. The
+/// artifact body remains in session storage and is available to the model only
+/// through the scoped paste-artifact tools installed by Worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct PasteArtifactRef {
+    pub artifact_id: String,
+    pub byte_len: u64,
+    pub char_count: u64,
+    pub line_count: u64,
+    pub sha256: String,
+    pub source_entry_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -210,6 +227,10 @@ pub enum Segment {
         lines: u32,
         content: String,
     },
+    /// Internal reference produced when Worker stores a large `Paste` before
+    /// committing input. Clients may receive this in history/event projections;
+    /// the body is intentionally absent.
+    PasteArtifact { artifact: PasteArtifactRef },
     /// `@<path>` file-system reference. Worker resolves readable files to
     /// `[File: <path>]` attachments and readable normal directories to shallow
     /// `[Dir: <path>]` listings; the flattened user text keeps the literal
@@ -250,6 +271,18 @@ impl Segment {
             match seg {
                 Segment::Text { content } => out.push_str(content),
                 Segment::Paste { content, .. } => out.push_str(content),
+                Segment::PasteArtifact { artifact } => {
+                    use std::fmt::Write as _;
+                    let _ = write!(
+                        out,
+                        "[Large paste stored as artifact {}: {} bytes, {} chars, {} lines, sha256 {}; use SearchInputArtifact and ReadInputArtifact to inspect it]",
+                        artifact.artifact_id,
+                        artifact.byte_len,
+                        artifact.char_count,
+                        artifact.line_count,
+                        artifact.sha256
+                    );
+                }
                 Segment::FileRef { path } => {
                     out.push('@');
                     out.push_str(path);
@@ -1200,6 +1233,29 @@ mod tests {
             }
             other => panic!("expected Run, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn paste_artifact_segment_roundtrips_without_body() {
+        let artifact = PasteArtifactRef {
+            artifact_id: "019ca7c8-57b6-7f05-8edf-524147aba7b2".to_string(),
+            byte_len: 65_536,
+            char_count: 65_530,
+            line_count: 200,
+            sha256: "a".repeat(64),
+            source_entry_id: "entry-1".to_string(),
+        };
+        let segment = Segment::PasteArtifact {
+            artifact: artifact.clone(),
+        };
+        let json = serde_json::to_string(&segment).unwrap();
+        assert!(!json.contains("pasted body"));
+        assert_eq!(serde_json::from_str::<Segment>(&json).unwrap(), segment);
+        let projected = Segment::flatten_to_text(&[segment]);
+        assert!(projected.contains(&artifact.artifact_id));
+        assert!(projected.contains("SearchInputArtifact"));
+        assert!(projected.contains("ReadInputArtifact"));
+        assert!(!projected.contains("pasted body"));
     }
 
     #[test]

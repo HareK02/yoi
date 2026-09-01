@@ -10,9 +10,11 @@
 //! every later operation must use that same ID.
 
 use crate::event_trace::TraceEntry;
+use crate::paste_artifact::{read_from_dir, write_to_dir};
 use crate::segment_log::LogEntry;
 use crate::store::{Store, StoreError};
-use crate::{SegmentId, SessionId};
+use crate::{PasteArtifactLimits, SegmentId, SessionId};
+use protocol::PasteArtifactRef;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -25,6 +27,7 @@ const PREVIOUS_SESSION_SCHEMA_VERSION: u32 = 2;
 const LEGACY_SESSION_SCHEMA_VERSION: u32 = 1;
 const SESSION_FILE: &str = "session.json";
 const SEGMENTS_DIR: &str = "segments";
+const PASTE_ARTIFACTS_DIR: &str = "artifacts/paste";
 
 #[derive(Clone)]
 pub struct WorkerSessionStore {
@@ -317,6 +320,35 @@ impl Store for WorkerSessionStore {
             .count())
     }
 
+    fn write_paste_artifact(
+        &self,
+        session_id: SessionId,
+        source_entry_id: &str,
+        content: &str,
+        limits: PasteArtifactLimits,
+    ) -> Result<PasteArtifactRef, StoreError> {
+        self.ensure_session(session_id, true)?;
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("Worker Session append lock was poisoned"))?;
+        write_to_dir(
+            &self.root.join(PASTE_ARTIFACTS_DIR),
+            source_entry_id,
+            content,
+            limits,
+        )
+    }
+
+    fn read_paste_artifact(
+        &self,
+        session_id: SessionId,
+        artifact_id: &str,
+    ) -> Result<(PasteArtifactRef, String), StoreError> {
+        self.ensure_session(session_id, false)?;
+        read_from_dir(&self.root.join(PASTE_ARTIFACTS_DIR), artifact_id)
+    }
+
     fn append_trace(
         &self,
         session_id: SessionId,
@@ -599,6 +631,45 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("cannot attach or switch"));
         assert_eq!(store.list_sessions().unwrap(), vec![session_id]);
+    }
+
+    #[test]
+    fn worker_session_store_keeps_paste_artifacts_inside_retention_root() {
+        let root = tempfile::tempdir().unwrap();
+        let store = WorkerSessionStore::new(root.path().join("session")).unwrap();
+        let session_id = new_session_id();
+        store
+            .create_segment(session_id, new_segment_id(), &[])
+            .unwrap();
+        let content = "large paste body\n終端\n";
+        let reference = store
+            .write_paste_artifact(
+                session_id,
+                "entry-1",
+                content,
+                PasteArtifactLimits::default(),
+            )
+            .unwrap();
+
+        assert!(
+            root.path()
+                .join(format!(
+                    "session/{PASTE_ARTIFACTS_DIR}/{}.json",
+                    reference.artifact_id
+                ))
+                .is_file()
+        );
+        assert_eq!(
+            store
+                .read_paste_artifact(session_id, &reference.artifact_id)
+                .unwrap()
+                .1,
+            content
+        );
+        assert!(matches!(
+            store.read_paste_artifact(new_session_id(), &reference.artifact_id),
+            Err(StoreError::Corrupt { .. })
+        ));
     }
 
     #[test]

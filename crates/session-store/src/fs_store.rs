@@ -16,9 +16,11 @@
 //! enumerable by the picker.
 
 use crate::event_trace::TraceEntry;
+use crate::paste_artifact::{read_from_dir, write_to_dir};
 use crate::segment_log::LogEntry;
 use crate::store::{Store, StoreError};
-use crate::{SegmentId, SessionId};
+use crate::{PasteArtifactLimits, SegmentId, SessionId};
+use protocol::PasteArtifactRef;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -107,6 +109,16 @@ impl FsStore {
     fn trace_path(&self, session_id: SessionId, segment_id: SegmentId) -> PathBuf {
         self.session_dir(session_id)
             .join(format!("{segment_id}.trace.jsonl"))
+    }
+
+    fn paste_artifact_dir(&self, session_id: SessionId) -> PathBuf {
+        self.session_dir(session_id).join("artifacts").join("paste")
+    }
+
+    #[cfg(test)]
+    fn paste_artifact_path(&self, session_id: SessionId, artifact_id: &str) -> PathBuf {
+        self.paste_artifact_dir(session_id)
+            .join(format!("{artifact_id}.json"))
     }
 
     fn append_line(&self, path: &Path, line: &str) -> Result<(), StoreError> {
@@ -350,6 +362,33 @@ impl Store for FsStore {
         Ok(complete.lines().filter(|l| !l.trim().is_empty()).count())
     }
 
+    fn write_paste_artifact(
+        &self,
+        session_id: SessionId,
+        source_entry_id: &str,
+        content: &str,
+        limits: PasteArtifactLimits,
+    ) -> Result<PasteArtifactRef, StoreError> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("session store append lock was poisoned"))?;
+        write_to_dir(
+            &self.paste_artifact_dir(session_id),
+            source_entry_id,
+            content,
+            limits,
+        )
+    }
+
+    fn read_paste_artifact(
+        &self,
+        session_id: SessionId,
+        artifact_id: &str,
+    ) -> Result<(PasteArtifactRef, String), StoreError> {
+        read_from_dir(&self.paste_artifact_dir(session_id), artifact_id)
+    }
+
     fn append_trace(
         &self,
         session_id: SessionId,
@@ -397,5 +436,88 @@ mod tests {
         assert!(store.session_modified_at(session_id).unwrap().is_none());
         store.create_segment(session_id, segment_id, &[]).unwrap();
         assert!(store.session_modified_at(session_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn paste_artifacts_are_atomic_integrity_checked_and_session_scoped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FsStore::new(tmp.path()).unwrap();
+        let owner = new_session_id();
+        let other = new_session_id();
+        let content = "αβγ\nsecond line\n";
+        let reference = store
+            .write_paste_artifact(owner, "entry-1", content, PasteArtifactLimits::default())
+            .unwrap();
+
+        assert_eq!(reference.byte_len, content.len() as u64);
+        assert_eq!(reference.char_count, content.chars().count() as u64);
+        assert_eq!(reference.source_entry_id, "entry-1");
+        assert_eq!(
+            store
+                .read_paste_artifact(owner, &reference.artifact_id)
+                .unwrap()
+                .1,
+            content
+        );
+        assert!(matches!(
+            store.read_paste_artifact(other, &reference.artifact_id),
+            Err(StoreError::PasteArtifactNotFound(_))
+        ));
+        assert!(
+            self::fs::read_dir(store.paste_artifact_dir(owner))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp"))
+        );
+        let very_large = "z".repeat(1024 * 1024);
+        let very_large_ref = store
+            .write_paste_artifact(
+                owner,
+                "entry-2",
+                &very_large,
+                PasteArtifactLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .read_paste_artifact(owner, &very_large_ref.artifact_id)
+                .unwrap()
+                .1,
+            very_large
+        );
+    }
+
+    #[test]
+    fn paste_artifact_limits_and_corruption_fail_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FsStore::new(tmp.path()).unwrap();
+        let session_id = new_session_id();
+        let limits = PasteArtifactLimits {
+            max_artifact_bytes: 5,
+            max_session_bytes: 8,
+        };
+        let first = store
+            .write_paste_artifact(session_id, "entry-1", "1234", limits)
+            .unwrap();
+        assert!(matches!(
+            store.write_paste_artifact(session_id, "entry-2", "56789", limits),
+            Err(StoreError::PasteArtifactLimit(_))
+        ));
+        assert!(matches!(
+            store.write_paste_artifact(session_id, "entry-2", "5678", limits),
+            Ok(_)
+        ));
+        std::fs::write(
+            store.paste_artifact_path(session_id, &first.artifact_id),
+            b"{}",
+        )
+        .unwrap();
+        assert!(matches!(
+            store.read_paste_artifact(session_id, &first.artifact_id),
+            Err(StoreError::Serde(_)) | Err(StoreError::PasteArtifactIntegrity(_))
+        ));
     }
 }

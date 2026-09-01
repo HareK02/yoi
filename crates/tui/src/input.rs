@@ -61,6 +61,7 @@ impl FlowRefAtom {
 pub enum Atom {
     Char(char),
     Paste(PasteRef),
+    PasteArtifact(protocol::PasteArtifactRef),
     FileRef(FileRefAtom),
     FlowRef(FlowRefAtom),
 }
@@ -72,6 +73,13 @@ impl Atom {
         match self {
             Atom::Char(_) => None,
             Atom::Paste(p) => Some((Style::default().fg(Color::Magenta), p.label())),
+            Atom::PasteArtifact(artifact) => Some((
+                Style::default().fg(Color::Magenta),
+                format!(
+                    "[Paste artifact {} | {} chars, {} lines]",
+                    artifact.artifact_id, artifact.char_count, artifact.line_count
+                ),
+            )),
             Atom::FileRef(r) => Some((Style::default().fg(Color::Cyan), r.label())),
             Atom::FlowRef(r) => Some((Style::default().fg(Color::Yellow), r.label())),
         }
@@ -102,7 +110,9 @@ enum WordKind {
 fn atom_class(atom: &Atom) -> AtomClass {
     match atom {
         Atom::Char(c) => char_class(*c),
-        Atom::Paste(_) | Atom::FileRef(_) | Atom::FlowRef(_) => AtomClass::Chip,
+        Atom::Paste(_) | Atom::PasteArtifact(_) | Atom::FileRef(_) | Atom::FlowRef(_) => {
+            AtomClass::Chip
+        }
     }
 }
 
@@ -190,6 +200,9 @@ impl InputBuffer {
                         content: content.clone(),
                     }));
                 }
+                protocol::Segment::PasteArtifact { artifact } => {
+                    self.atoms.push(Atom::PasteArtifact(artifact.clone()));
+                }
                 protocol::Segment::FileRef { path } => {
                     self.atoms
                         .push(Atom::FileRef(FileRefAtom { path: path.clone() }));
@@ -225,6 +238,13 @@ impl InputBuffer {
             match atom {
                 Atom::Char(c) => text.push(*c),
                 Atom::Paste(paste) => text.push_str(&paste.content),
+                Atom::PasteArtifact(artifact) => {
+                    text.push_str(&protocol::Segment::flatten_to_text(&[
+                        protocol::Segment::PasteArtifact {
+                            artifact: artifact.clone(),
+                        },
+                    ]))
+                }
                 Atom::FileRef(file) => text.push_str(&file.path),
                 Atom::FlowRef(flow) => text.push_str(&flow.selector),
             }
@@ -495,6 +515,12 @@ impl InputBuffer {
                         chars: p.chars as u32,
                         lines: p.lines as u32,
                         content: p.content.clone(),
+                    });
+                }
+                Atom::PasteArtifact(artifact) => {
+                    flush_text(&mut buf, &mut out);
+                    out.push(protocol::Segment::PasteArtifact {
+                        artifact: artifact.clone(),
                     });
                 }
                 Atom::FileRef(r) => {
@@ -903,6 +929,28 @@ mod submit_segments_tests {
     }
 
     #[test]
+    fn restored_paste_artifact_remains_a_typed_segment() {
+        let artifact = protocol::PasteArtifactRef {
+            artifact_id: "019ca7c8-57b6-7f05-8edf-524147aba7b2".to_string(),
+            byte_len: 65_536,
+            char_count: 65_530,
+            line_count: 200,
+            sha256: "a".repeat(64),
+            source_entry_id: "entry-1".to_string(),
+        };
+        let original = Segment::PasteArtifact {
+            artifact: artifact.clone(),
+        };
+        let mut buf = InputBuffer::new();
+        buf.replace_with_segments(std::slice::from_ref(&original));
+
+        assert_eq!(
+            buf.submit_segments(),
+            vec![Segment::PasteArtifact { artifact }]
+        );
+    }
+
+    #[test]
     fn empty_buffer_yields_empty_segments() {
         let buf = InputBuffer::new();
         assert!(buf.submit_segments().is_empty());
@@ -1219,7 +1267,9 @@ mod word_motion_tests {
         for a in &buf.atoms {
             match a {
                 Atom::Char(c) => out.push(*c),
-                Atom::Paste(_) | Atom::FileRef(_) | Atom::FlowRef(_) => out.push_str("<P>"),
+                Atom::Paste(_) | Atom::PasteArtifact(_) | Atom::FileRef(_) | Atom::FlowRef(_) => {
+                    out.push_str("<P>")
+                }
             }
         }
         out

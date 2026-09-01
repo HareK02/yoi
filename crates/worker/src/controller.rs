@@ -898,6 +898,20 @@ where
             crate::spawn::tool::ParentNotificationTarget::Buffer(worker.notify_buffer_handle())
         });
     let prompts = worker.prompts().clone();
+    let paste_store = worker.store().clone();
+    let paste_session_id = worker.session_id();
+    worker
+        .engine_mut()
+        .register_tool(crate::paste_artifact_tool::search_input_artifact_tool(
+            paste_store.clone(),
+            paste_session_id,
+        ));
+    worker
+        .engine_mut()
+        .register_tool(crate::paste_artifact_tool::read_input_artifact_tool(
+            paste_store,
+            paste_session_id,
+        ));
     // Resolve the existing Worker–Workdir binding into the domain provider.
     // Tools only consume the provider handle; they do not own its root, cwd,
     // scope, or lifecycle. No-workdir Workers expose no local tools.

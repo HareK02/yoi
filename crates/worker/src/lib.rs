@@ -9,6 +9,7 @@ pub mod hook;
 pub(crate) mod in_flight;
 pub mod ipc;
 pub mod model_client;
+mod paste_artifact_tool;
 pub mod prompt;
 pub mod runtime;
 pub mod runtime_command;
