@@ -1,8 +1,8 @@
 <script lang="ts">
   import DiagnosticsList from "$lib/workspace/settings/DiagnosticsList.svelte";
   import { settingsSectionHref } from "$lib/workspace/settings/model";
+  import type { ProfileSettingsResponse } from "$lib/generated/workspace-api";
   import { fetchProfileSettings } from "$lib/workspace/settings/profile-api";
-  import type { ProfileSettingsResponse } from "$lib/workspace/settings/profile-types";
   import type { PageProps } from "./$types";
 
   let { data }: PageProps = $props();

@@ -1,8 +1,6 @@
-export type Diagnostic = {
-  severity: "info" | "warning" | "error";
-  code: string;
-  message: string;
-};
+import type { Diagnostic as WorkspaceApiDiagnostic } from "$lib/generated/workspace-api";
+
+export type Diagnostic = WorkspaceApiDiagnostic;
 
 export type SettingsSectionId =
   | "runtimes"
