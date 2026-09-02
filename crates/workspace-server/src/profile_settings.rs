@@ -12,11 +12,15 @@ use worker_runtime::config_bundle::{
     ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigProfileDescriptor,
 };
 use worker_runtime::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveInput};
+use workspace_api::{
+    Diagnostic, DiagnosticSeverity, ProfileSettingsResponse, UpdateWorkspaceMetadataRequest,
+    WorkspaceMetadataSettingsResponse, WorkspaceProfileSourceProvenance,
+    WorkspaceProfileSourceSummary, WorkspaceProfileSummary,
+};
 
 use crate::config_source::{
     WorkspaceConfigSchemaProvider, WorkspaceConfigState, evaluate_workspace_config_state,
 };
-use crate::hosts::{DiagnosticSeverity, RuntimeDiagnostic};
 use crate::{Error, Result};
 
 const PROFILE_SCHEMA_SOURCE: &str = r#"{
@@ -428,81 +432,6 @@ fn build_virtual_profile_archive(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkspaceMetadataSettingsResponse {
-    pub workspace_id: String,
-    pub display_name: String,
-    pub created_at: String,
-    pub revision: String,
-    pub source: String,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UpdateWorkspaceMetadataRequest {
-    pub display_name: String,
-    pub revision: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkspaceMetadataMutationResponse {
-    pub workspace: WorkspaceMetadataSettingsResponse,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProfileSettingsResponse {
-    pub workspace_id: String,
-    pub registry_revision: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config_revision: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tree_digest: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub projection_digest: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_profile: Option<String>,
-    pub profiles: Vec<WorkspaceProfileSummary>,
-    pub sources: Vec<WorkspaceProfileSourceSummary>,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkspaceProfileSummary {
-    pub profile_id: String,
-    pub selector: String,
-    pub label: String,
-    pub source_kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub profile_source_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub editable: bool,
-    pub is_default: bool,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkspaceProfileSourceSummary {
-    pub profile_source_id: String,
-    pub display_path: String,
-    pub kind: String,
-    pub content_type: String,
-    pub content_digest: String,
-    pub provenance: WorkspaceProfileSourceProvenance,
-    pub editable: bool,
-    pub revision: String,
-    pub size_bytes: u64,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkspaceProfileSourceProvenance {
-    ProjectProfileSourceTree,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkspaceIdentityFile {
     workspace_id: String,
@@ -804,8 +733,8 @@ fn diagnostic(
     code: impl Into<String>,
     severity: DiagnosticSeverity,
     message: impl Into<String>,
-) -> RuntimeDiagnostic {
-    RuntimeDiagnostic {
+) -> Diagnostic {
+    Diagnostic {
         code: code.into(),
         severity,
         message: message.into(),

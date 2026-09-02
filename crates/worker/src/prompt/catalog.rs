@@ -920,4 +920,22 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn builtin_orchestrator_cleanup_policy_renders_with_common_includes() {
+        let rendered = PromptCatalog::builtins_only()
+            .unwrap()
+            .render_name("role.orchestrator", Value::UNDEFINED)
+            .unwrap();
+
+        assert!(rendered.contains("This policy governs naming only"));
+        assert!(rendered.contains("Coder cleanup is a separate post-completion decision"));
+        assert!(rendered.contains("perform one cleanup pass before ending the orchestration turn"));
+        assert!(rendered.contains("Never predeclare `delete_on_completion`"));
+        assert!(rendered.contains("call `WorkerStop`"));
+        assert!(rendered.contains("call `WorkerRemove`"));
+        assert!(rendered.contains("only then call `WorkdirDelete`"));
+        assert!(rendered.contains("`CurrentAssignment` means unassign and reread"));
+        assert!(!rendered.contains("{% include"));
+    }
 }

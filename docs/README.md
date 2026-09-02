@@ -7,7 +7,7 @@ It is not a dumping ground for external research, old plans, API inventories, or
 ## Reading order
 
 1. [`design/overview.md`](design/overview.md) — the system map.
-2. [`design/durable-operations.md`](design/durable-operations.md) — cross-domain operation identity, checkpoints, retries, child operations, and disposition.
+2. [`design/durable-operations.md`](design/durable-operations.md) — cross-domain operation identity, checkpoints, retries, child operations, and disposition, including durable Workdir removal.
 3. [`design/context-history.md`](design/context-history.md) — the highest-risk invariant: inputs that affect the model must be committed to history before they enter context.
 4. [`design/worker-session-state.md`](design/worker-session-state.md) — Worker identity, replayable session logs, current metadata, and live process hints.
 5. [`design/session-observation.md`](design/session-observation.md) — common session captures, `SessionEntryRef`, Memory evidence, and host-authorized Worker observation.

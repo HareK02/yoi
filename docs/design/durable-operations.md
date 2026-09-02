@@ -254,6 +254,53 @@ compensation has its own external side effects or retry lifecycle, give it a
 stable child operation identity rather than expanding the parent into a list of
 cleanup stages.
 
+## Workdir removal application
+
+Workdir removal is one durable side-effect operation in the Workspace Server
+DB. It binds the Workspace, Workdir, owning Runtime,
+Repository/materialization identity, source actor, stable intent fingerprint,
+lifecycle, retry metadata, and bounded result. Runtime URL, provider handle,
+host path, credentials, and caller-selected Runtime are not operation inputs.
+
+A durable one-pending-operation constraint plus an atomic attempt claim prevents
+concurrent callers from entering the provider side effect for the same Workdir;
+the in-process resource lock is an additional serialization layer, not the sole
+authority. Each active attempt persists the Server process ID and process-start
+marker. Recovery reclaims only an owner proven missing or replaced; a live or
+unobservable owner is never stolen. The reclaim transaction compare-and-set
+checks the exact proved owner snapshot and attempt count so stale orphan proof
+cannot overwrite a newer live claim.
+
+Each attempt:
+
+1. resolves or revalidates the persisted same-Workspace Workdir, Runtime,
+   Repository, and materialization identity;
+2. checks current attachments, attachment reservations, current assignment
+   occupancy, retention/cleanup holds, and pending materialization authority; a
+   failed Workdir-create retry must atomically return to `pending` before
+   provider work and is rejected while removal is pending;
+3. retains dirty, occupied, blocked, or otherwise unknown Workdirs without
+   detaching a Worker or forcing deletion;
+4. observes the owning Runtime/provider and calls its existing Workdir cleanup
+   only for an eligible clean Workdir;
+5. treats only successful provider cleanup or exact
+   `working_directory_not_found` as removal evidence;
+6. deletes the Backend Workdir registry row and commits the operation's
+   `completed`/`removed` result in one SQLite transaction.
+
+A provider error leaves the registry intact and records a bounded
+`attention_required` result with explicit retryability. Startup recovery lists
+`pending` and retryable `failed` operations, then executes this same path after
+rereading live authority. `WorkdirDelete`, Workspace REST removal, Runtime
+cleanup execution, and recovery must not maintain separate inline
+provider-delete paths.
+
+The public request contains only `working_directory_id` plus a bounded reason.
+The public result contains only the Workdir ID,
+`removed | retained | attention_required`, retryability, and an optional bounded
+failure category. Internal operation identifiers, checkpoints, provider paths,
+and credentials are not public DTO fields.
+
 ## Diagnostics and audit
 
 Persist bounded error categories and identifiers needed to investigate or retry.

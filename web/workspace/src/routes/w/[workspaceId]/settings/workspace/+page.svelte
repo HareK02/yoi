@@ -1,11 +1,13 @@
 <script lang="ts">
+  import type {
+    Diagnostic,
+    WorkspaceMetadataSettingsResponse,
+  } from '$lib/generated/workspace-api';
   import DiagnosticsList from '$lib/workspace/settings/DiagnosticsList.svelte';
   import {
-    fetchWorkspaceMetadataSettings,
-    updateWorkspaceMetadataSettings
+    fetchWorkspaceMetadata,
+    updateWorkspaceMetadata,
   } from '$lib/workspace/settings/profile-api';
-  import type { Diagnostic } from '$lib/workspace/settings/model';
-  import type { WorkspaceMetadataSettingsResponse } from '$lib/workspace/settings/profile-types';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
@@ -28,7 +30,7 @@
       loading = true;
       message = null;
       try {
-        const response = await fetchWorkspaceMetadataSettings(workspaceId);
+        const response = await fetchWorkspaceMetadata(workspaceId);
         if (!cancelled) {
           workspaceMetadata = response;
           displayNameDraft = response.display_name;
@@ -53,7 +55,7 @@
     submitting = true;
     message = null;
     try {
-      const response = await updateWorkspaceMetadataSettings(workspaceId, {
+      const response = await updateWorkspaceMetadata(workspaceId, {
         display_name: displayNameDraft,
         revision: workspaceMetadata.revision
       });

@@ -1,4 +1,4 @@
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use crate::store::WorkdirCreateOperationRecord;
@@ -100,6 +100,65 @@ impl SqliteWorkspaceStore {
             }
             tx.commit()?;
             Ok(persisted)
+        })
+    }
+
+    pub fn begin_failed_workdir_create_retry(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        request_fingerprint: &str,
+        updated_at: &str,
+    ) -> Result<WorkdirCreateOperationRecord> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let operation = read_workdir_create_operation(&tx, workspace_id, operation_id)?
+                .ok_or_else(|| {
+                    Error::RegistryInconsistency(format!(
+                        "Workdir create operation `{operation_id}` disappeared before retry"
+                    ))
+                })?;
+            if operation.request_fingerprint != request_fingerprint {
+                return Err(Error::InvalidInput(format!(
+                    "Workdir create operation `{operation_id}` was reused with different input"
+                )));
+            }
+            if operation.state != "failed" {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Workdir create operation `{operation_id}` is not a failed retry"
+                )));
+            }
+            let removal_pending: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workdir_removal_operations WHERE workspace_id=?1 AND workdir_id=?2 AND state='pending')",
+                params![workspace_id, operation.working_directory_id],
+                |row| row.get(0),
+            )?;
+            if removal_pending {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Workdir {} has a pending durable removal operation",
+                    operation.working_directory_id
+                )));
+            }
+            let changed = tx.execute(
+                r#"UPDATE workdir_create_operations
+                   SET state='pending', failure=NULL, updated_at=?1
+                   WHERE workspace_id=?2 AND operation_id=?3
+                     AND request_fingerprint=?4 AND state='failed'"#,
+                params![updated_at, workspace_id, operation_id, request_fingerprint],
+            )?;
+            if changed != 1 {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Workdir create operation `{operation_id}` retry was claimed concurrently"
+                )));
+            }
+            let updated = read_workdir_create_operation(&tx, workspace_id, operation_id)?
+                .ok_or_else(|| {
+                    Error::RegistryInconsistency(format!(
+                        "Workdir create operation `{operation_id}` disappeared after retry claim"
+                    ))
+                })?;
+            tx.commit()?;
+            Ok(updated)
         })
     }
 
@@ -406,11 +465,32 @@ mod tests {
             .unwrap();
         assert_eq!(replayed, bound);
         assert_eq!(replayed.source_uri.as_deref(), Some("/tmp/repo"));
+        let failed = store
+            .finish_workdir_create_operation(
+                "workspace",
+                "call-1",
+                &record.request_fingerprint,
+                false,
+                Some("provider failed"),
+                "2026-08-24T00:00:03Z",
+            )
+            .unwrap();
+        assert_eq!(failed.state, "failed");
+        let retry = store
+            .begin_failed_workdir_create_retry(
+                "workspace",
+                "call-1",
+                &record.request_fingerprint,
+                "2026-08-24T00:00:04Z",
+            )
+            .unwrap();
+        assert_eq!(retry.state, "pending");
+        assert_eq!(retry.failure, None);
         assert_eq!(
             store
                 .load_workdir_create_operation("workspace", "call-1")
                 .unwrap(),
-            Some(bound.clone())
+            Some(retry.clone())
         );
         let mut changed_input = record.clone();
         changed_input.request_fingerprint =
