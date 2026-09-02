@@ -170,6 +170,7 @@ struct ConsoleConnection<T> {
     pending_attachments: Vec<UploadedFileRef>,
     awaiting_attachment_acceptance: Vec<UploadedFileRef>,
     upload_tasks: Vec<tokio::task::JoinHandle<()>>,
+    active_uploads: usize,
     upload_ids: HashMap<PathBuf, String>,
 }
 
@@ -241,6 +242,7 @@ impl<T: Socket> ConsoleConnection<T> {
             pending_attachments: Vec::new(),
             awaiting_attachment_acceptance: Vec::new(),
             upload_tasks: Vec::new(),
+            active_uploads: 0,
             upload_ids: HashMap::new(),
         }
     }
@@ -253,6 +255,7 @@ impl<T: Socket> ConsoleConnection<T> {
             pending_attachments: Vec::new(),
             awaiting_attachment_acceptance: Vec::new(),
             upload_tasks: Vec::new(),
+            active_uploads: 0,
             upload_ids: HashMap::new(),
         }
     }
@@ -301,6 +304,7 @@ impl<T: Socket> ConsoleConnection<T> {
             .entry(path.clone())
             .or_insert_with(|| uuid::Uuid::now_v7().to_string())
             .clone();
+        self.active_uploads = self.active_uploads.saturating_add(1);
         self.upload_tasks.push(tokio::spawn(async move {
             let result = upload_client_path(&target, &path, &upload_id)
                 .await
@@ -310,14 +314,25 @@ impl<T: Socket> ConsoleConnection<T> {
         Ok(())
     }
 
-    fn observe_worker_event(&mut self, event: &Event) {
-        if reconcile_attachment_submission(
+    fn finish_upload(&mut self) {
+        self.active_uploads = self.active_uploads.saturating_sub(1);
+        self.upload_tasks.retain(|task| !task.is_finished());
+    }
+
+    fn has_active_uploads(&self) -> bool {
+        self.active_uploads != 0
+    }
+
+    fn observe_worker_event(&mut self, event: &Event) -> bool {
+        let attachments_accepted = reconcile_attachment_submission(
             &mut self.pending_attachments,
             &mut self.awaiting_attachment_acceptance,
             event,
-        ) {
+        );
+        if attachments_accepted {
             self.upload_ids.clear();
         }
+        attachments_accepted
     }
 
     fn mark_attachments_awaiting_acceptance(&mut self) {
@@ -331,6 +346,7 @@ impl<T: Socket> ConsoleConnection<T> {
         for task in self.upload_tasks.drain(..) {
             task.abort();
         }
+        self.active_uploads = 0;
         let upload_ids = std::mem::take(&mut self.upload_ids)
             .into_values()
             .collect::<Vec<_>>();
@@ -798,7 +814,9 @@ async fn drain_worker_events<T: Socket>(
         match client.try_next_event()? {
             Some(ev) => {
                 handled = true;
-                client.observe_worker_event(&ev);
+                if client.observe_worker_event(&ev) {
+                    app.clear_actionbar_notice();
+                }
                 if let Some(method) = app.handle_worker_event(ev) {
                     client.send(&method).await?;
                 }
@@ -850,30 +868,35 @@ async fn run_loop<T: Socket>(
             LoopInput::Terminal(term_event) => {
                 handle_terminal_event(app, client, &upload_tx, term_event?).await?;
             }
-            LoopInput::Upload(result) => match result {
-                Ok(reference) => {
-                    app.flash_actionbar_notice(
-                        format!(
-                            "[{} · {} bytes · ready] Send a message or use /clear-attachments.",
-                            reference.file_name, reference.byte_len
-                        ),
-                        ActionbarNoticeLevel::Info,
-                        ActionbarNoticeSource::Tui,
-                        Duration::from_secs(60 * 60),
-                    );
-                    if !client
-                        .pending_attachments
-                        .iter()
-                        .any(|pending| pending.artifact_id == reference.artifact_id)
-                    {
-                        client.pending_attachments.push(reference);
+            LoopInput::Upload(result) => {
+                client.finish_upload();
+                match result {
+                    Ok(reference) => {
+                        app.flash_actionbar_notice(
+                            format!(
+                                "[{} · {} bytes · ready] Send a message or use /clear-attachments.",
+                                reference.file_name, reference.byte_len
+                            ),
+                            ActionbarNoticeLevel::Info,
+                            ActionbarNoticeSource::Tui,
+                            Duration::from_secs(60 * 60),
+                        );
+                        if !client
+                            .pending_attachments
+                            .iter()
+                            .any(|pending| pending.artifact_id == reference.artifact_id)
+                        {
+                            client.pending_attachments.push(reference);
+                        }
                     }
+                    Err(error) => app.push_error(format!("Attachment upload failed: {error}")),
                 }
-                Err(error) => app.push_error(format!("Attachment upload failed: {error}")),
-            },
+            }
             LoopInput::Worker(event) => match event? {
                 Some(ev) => {
-                    client.observe_worker_event(&ev);
+                    if client.observe_worker_event(&ev) {
+                        app.clear_actionbar_notice();
+                    }
                     if let Some(method) = app.handle_worker_event(ev) {
                         client.send(&method).await?;
                     }
@@ -914,6 +937,49 @@ fn is_clear_attachments_command(method: &Method) -> bool {
     )
 }
 
+async fn send_console_method<T: Socket>(
+    app: &mut App,
+    client: &mut ConsoleConnection<T>,
+    method: &Method,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if matches!(method, Method::Run { .. }) && client.has_active_uploads() {
+        app.flash_actionbar_notice(
+            "Attachment upload is still in progress; wait or use /clear-attachments.",
+            ActionbarNoticeLevel::Info,
+            ActionbarNoticeSource::Tui,
+            Duration::from_secs(60 * 60),
+        );
+        return Ok(());
+    }
+
+    let sends_attachments =
+        matches!(method, Method::Run { .. }) && !client.pending_attachments.is_empty();
+    if let Err(error) = client.send(method).await {
+        if sends_attachments {
+            app.push_error(format!(
+                "Attachment submission failed: {error}. Pending attachments were retained; retry Send."
+            ));
+            app.flash_actionbar_notice(
+                "Attachment submission failed; pending attachments are ready to retry.",
+                ActionbarNoticeLevel::Error,
+                ActionbarNoticeSource::Tui,
+                Duration::from_secs(60 * 60),
+            );
+            return Ok(());
+        }
+        return Err(error);
+    }
+    if sends_attachments {
+        app.flash_actionbar_notice(
+            "Submitting attachments; waiting for Worker acceptance…",
+            ActionbarNoticeLevel::Info,
+            ActionbarNoticeSource::Tui,
+            Duration::from_secs(60 * 60),
+        );
+    }
+    Ok(())
+}
+
 async fn handle_terminal_event<T: Socket>(
     app: &mut App,
     client: &mut ConsoleConnection<T>,
@@ -944,12 +1010,7 @@ async fn handle_terminal_event<T: Socket>(
                         Duration::from_secs(4),
                     );
                 } else {
-                    let sends_attachments = matches!(method, Method::Run { .. })
-                        && !client.pending_attachments.is_empty();
-                    client.send(&method).await?;
-                    if sends_attachments {
-                        app.clear_actionbar_notice();
-                    }
+                    send_console_method(app, client, &method).await?;
                 }
             }
         }
@@ -1497,24 +1558,30 @@ mod tests {
             pending_attachments: vec![file.clone()],
             awaiting_attachment_acceptance: Vec::new(),
             upload_tasks: Vec::new(),
+            active_uploads: 0,
             upload_ids: HashMap::new(),
         };
 
-        assert!(
-            connection
-                .send(&Method::Run {
-                    input: vec![Segment::text("inspect")],
-                })
-                .await
-                .is_err()
-        );
+        let mut app = App::new("worker".into());
+        let method = Method::Run {
+            input: vec![Segment::text("inspect")],
+        };
+
+        connection.active_uploads = 1;
+        send_console_method(&mut app, &mut connection, &method)
+            .await
+            .unwrap();
         assert_eq!(connection.pending_attachments, vec![file.clone()]);
         assert!(connection.awaiting_attachment_acceptance.is_empty());
 
-        connection
-            .send(&Method::Run {
-                input: vec![Segment::text("inspect")],
-            })
+        connection.active_uploads = 0;
+        send_console_method(&mut app, &mut connection, &method)
+            .await
+            .unwrap();
+        assert_eq!(connection.pending_attachments, vec![file.clone()]);
+        assert!(connection.awaiting_attachment_acceptance.is_empty());
+
+        send_console_method(&mut app, &mut connection, &method)
             .await
             .unwrap();
         assert!(connection.pending_attachments.is_empty());
