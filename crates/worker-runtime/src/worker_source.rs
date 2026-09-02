@@ -134,6 +134,8 @@ pub trait EmbeddedWorkerMutationDispatcher: Send + Sync {
 enum RuntimeWorkerMutationTransport {
     Remote {
         base_url: String,
+        request_source_signer: RuntimeRequestSourceSigner,
+        request_source_audience: String,
     },
     Embedded {
         dispatcher: Arc<dyn EmbeddedWorkerMutationDispatcher>,
@@ -157,10 +159,12 @@ impl RuntimeWorkerMutationForwarder {
     ) -> Self {
         Self {
             authority: RuntimeWorkerMutationSourceAuthority::remote(identity),
-            scope,
+            scope: scope.clone(),
             source_worker_id: source_worker_id.into(),
             transport: RuntimeWorkerMutationTransport::Remote {
                 base_url: base_url.into().trim_end_matches('/').to_string(),
+                request_source_signer: RuntimeRequestSourceSigner::from_identity(identity),
+                request_source_audience: scope.server_id,
             },
         }
     }
@@ -197,11 +201,18 @@ impl RuntimeWorkerMutationForwarder {
         )?;
         match (&self.transport, proof) {
             (
-                RuntimeWorkerMutationTransport::Remote { base_url },
+                RuntimeWorkerMutationTransport::Remote {
+                    base_url,
+                    request_source_signer,
+                    request_source_audience,
+                },
                 RuntimeOwnedWorkerMutationProof::Remote(token),
             ) => execute_remote_worker_remove_http(RemoteWorkerRemoveHttpRequest {
                 base_url: base_url.clone(),
                 workspace_id: self.scope.workspace_id.clone(),
+                source_worker_id: self.source_worker_id.clone(),
+                request_source_signer: request_source_signer.clone(),
+                request_source_audience: request_source_audience.clone(),
                 token,
                 target_runtime_id: target_runtime_id.to_string(),
                 target_worker_id: target_worker_id.to_string(),
@@ -224,6 +235,9 @@ impl RuntimeWorkerMutationForwarder {
 struct RemoteWorkerRemoveHttpRequest {
     base_url: String,
     workspace_id: String,
+    source_worker_id: String,
+    request_source_signer: RuntimeRequestSourceSigner,
+    request_source_audience: String,
     token: String,
     target_runtime_id: String,
     target_worker_id: String,
@@ -256,23 +270,35 @@ fn execute_remote_worker_remove_http(
 fn execute_remote_worker_remove_http_blocking(
     request: RemoteWorkerRemoveHttpRequest,
 ) -> Result<WorkspaceResponse, RuntimeWorkerMutationForwardError> {
-    let url = format!(
-        "{}/api/w/{}/workers/remove",
-        request.base_url, request.workspace_id
-    );
-    let body = serde_json::json!({
+    let path = format!("/api/w/{}/workers/remove", request.workspace_id);
+    let url = format!("{}{}", request.base_url, path);
+    let body = serde_json::to_string(&serde_json::json!({
         "target_runtime_id": request.target_runtime_id,
         "target_worker_id": request.target_worker_id,
         "reason": request.reason,
-    });
+    }))
+    .map_err(|error| RuntimeWorkerMutationForwardError::Transport(error.to_string()))?;
+    let request_source_proof = request.request_source_signer.issue(
+        &request.request_source_audience,
+        &request.workspace_id,
+        Some(&request.source_worker_id),
+        WORKSPACE_REQUEST_PERMISSION,
+        "POST",
+        &path,
+        body.as_bytes(),
+        i64::try_from(unix_now_seconds()).unwrap_or(i64::MAX),
+        30,
+    )?;
     let client = reqwest::blocking::Client::new();
     let response = client
         .post(url)
+        .header(RUNTIME_REQUEST_SOURCE_PROOF_HEADER, request_source_proof)
         .header(
             crate::auth::WORKER_MUTATION_SOURCE_PROOF_HEADER,
             request.token,
         )
-        .json(&body)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
         .send()
         .map_err(|error| RuntimeWorkerMutationForwardError::Transport(error.to_string()))?;
     let status = response.status().as_u16();
@@ -697,7 +723,8 @@ mod tests {
     use super::*;
     use crate::auth::{
         WorkerMutationSourceExpectation, decode_runtime_request_source_claims,
-        decode_worker_mutation_source_claims, verify_worker_mutation_source_proof,
+        decode_worker_mutation_source_claims, request_body_digest,
+        verify_worker_mutation_source_proof,
     };
 
     #[test]
@@ -1119,6 +1146,41 @@ mod tests {
         assert!(request.contains("\"target_worker_id\":\"worker-target\""));
         assert!(!request.contains("expected_worker_revision"));
         assert!(request.contains("\"reason\":\"retire obsolete Worker\""));
+        let request_source_token = request
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case(RUNTIME_REQUEST_SOURCE_PROOF_HEADER)
+                        .then(|| value.trim())
+                })
+            })
+            .expect("runtime request source proof header");
+        let request_source_claims =
+            decode_runtime_request_source_claims(request_source_token).unwrap();
+        assert_eq!(request_source_claims.iss, "runtime-a");
+        assert_eq!(request_source_claims.aud, "server-a");
+        assert_eq!(request_source_claims.workspace_id, "workspace-a");
+        assert_eq!(
+            request_source_claims.worker_id.as_deref(),
+            Some("worker-source")
+        );
+        assert_eq!(
+            request_source_claims.permission,
+            WORKSPACE_REQUEST_PERMISSION
+        );
+        assert_eq!(request_source_claims.method, "POST");
+        assert_eq!(
+            request_source_claims.path,
+            "/api/w/workspace-a/workers/remove"
+        );
+        let request_body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("WorkerRemove request body");
+        assert_eq!(
+            request_source_claims.body_digest,
+            request_body_digest(request_body.as_bytes())
+        );
         let token = request
             .lines()
             .find_map(|line| {
