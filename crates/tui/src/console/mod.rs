@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -120,11 +121,55 @@ fn copy_selection_to_terminal(app: &mut App) -> bool {
     copy_selection_to_writer(app, &mut stdout)
 }
 
+type AttachmentUploadResult = Result<UploadedFileRef, String>;
+
 struct ConsoleConnection<T> {
     client: Client<T>,
     standalone_host: Option<StandaloneHost>,
     backend_target: Option<BackendRuntimeTarget>,
     pending_attachments: Vec<UploadedFileRef>,
+    upload_tasks: Vec<tokio::task::JoinHandle<()>>,
+    upload_ids: HashMap<PathBuf, String>,
+}
+
+async fn upload_client_path(
+    target: &BackendRuntimeTarget,
+    path: &Path,
+    upload_id: &str,
+) -> Result<UploadedFileRef, Box<dyn std::error::Error>> {
+    let metadata = tokio::fs::metadata(path).await?;
+    if !metadata.is_file() {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidInput, "attachment path is not a file").into(),
+        );
+    }
+    if metadata.len() > 10 * 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "attachment exceeds the 10 MiB limit",
+        )
+        .into());
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "attachment file name is not valid UTF-8",
+            )
+        })?;
+    let media_type = attachment_media_type(path).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "attachment file type is not supported",
+        )
+    })?;
+    let bytes = tokio::fs::read(path).await?;
+    target
+        .upload_file_with_id(upload_id, file_name, media_type, bytes)
+        .await
+        .map_err(Into::into)
 }
 
 fn attachment_media_type(path: &Path) -> Option<&'static str> {
@@ -153,6 +198,8 @@ impl<T: Socket> ConsoleConnection<T> {
             standalone_host: Some(host),
             backend_target: None,
             pending_attachments: Vec::new(),
+            upload_tasks: Vec::new(),
+            upload_ids: HashMap::new(),
         }
     }
 
@@ -162,6 +209,8 @@ impl<T: Socket> ConsoleConnection<T> {
             standalone_host: None,
             backend_target: Some(target),
             pending_attachments: Vec::new(),
+            upload_tasks: Vec::new(),
+            upload_ids: HashMap::new(),
         }
     }
 
@@ -188,59 +237,49 @@ impl<T: Socket> ConsoleConnection<T> {
         self.client.send(&prepared).await?;
         if carries_attachments {
             self.pending_attachments.clear();
+            self.upload_ids.clear();
         }
         Ok(())
     }
 
-    async fn upload_path(
+    fn start_upload(
         &mut self,
-        path: &Path,
-    ) -> Result<UploadedFileRef, Box<dyn std::error::Error>> {
-        let target = self.backend_target.as_ref().ok_or_else(|| {
+        path: PathBuf,
+        result_tx: mpsc::UnboundedSender<AttachmentUploadResult>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let target = self.backend_target.clone().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
                 "client-local file upload is available only for Backend Workers",
             )
         })?;
-        let metadata = tokio::fs::metadata(path).await?;
-        if !metadata.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "attachment path is not a file",
-            )
-            .into());
-        }
-        if metadata.len() > 10 * 1024 * 1024 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "attachment exceeds the 10 MiB limit",
-            )
-            .into());
-        }
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "attachment file name is not valid UTF-8",
-                )
-            })?;
-        let media_type = attachment_media_type(path).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "attachment file type is not supported",
-            )
-        })?;
-        let bytes = tokio::fs::read(path).await?;
-        let reference = target.upload_file(file_name, media_type, bytes).await?;
-        self.pending_attachments.push(reference.clone());
-        Ok(reference)
+        self.upload_tasks.retain(|task| !task.is_finished());
+        let upload_id = self
+            .upload_ids
+            .entry(path.clone())
+            .or_insert_with(|| uuid::Uuid::now_v7().to_string())
+            .clone();
+        self.upload_tasks.push(tokio::spawn(async move {
+            let result = upload_client_path(&target, &path, &upload_id)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = result_tx.send(result);
+        }));
+        Ok(())
     }
 
     async fn clear_pending_attachments(&mut self) {
+        for task in self.upload_tasks.drain(..) {
+            task.abort();
+        }
+        let upload_ids = std::mem::take(&mut self.upload_ids)
+            .into_values()
+            .collect::<Vec<_>>();
         let references = std::mem::take(&mut self.pending_attachments);
         if let Some(target) = &self.backend_target {
+            for upload_id in upload_ids {
+                let _ = target.cancel_file_upload(&upload_id).await;
+            }
             for reference in references {
                 let _ = target.delete_uploaded_file(&reference.artifact_id).await;
             }
@@ -626,11 +665,13 @@ enum E2eRewindInput {
 enum LoopInput<P> {
     Terminal(TerminalEventResult),
     Worker(P),
+    Upload(AttachmentUploadResult),
     Tick,
 }
 
 async fn next_loop_input<P, F, T>(
     term_rx: &mut mpsc::UnboundedReceiver<TerminalEventResult>,
+    upload_rx: &mut mpsc::UnboundedReceiver<AttachmentUploadResult>,
     connected: bool,
     pod_next: F,
     animate: bool,
@@ -651,6 +692,9 @@ where
                 ))
             }))
         }
+        upload = upload_rx.recv() => {
+            LoopInput::Upload(upload.unwrap_or_else(|| Err("attachment upload queue stopped".into())))
+        }
         event = pod_next, if connected => LoopInput::Worker(event),
         _ = animation_tick, if animate => LoopInput::Tick,
     }
@@ -660,13 +704,14 @@ async fn drain_terminal_events<T: Socket>(
     app: &mut App,
     client: &mut ConsoleConnection<T>,
     term_rx: &mut mpsc::UnboundedReceiver<TerminalEventResult>,
+    upload_tx: &mpsc::UnboundedSender<AttachmentUploadResult>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut handled = false;
     for _ in 0..TERMINAL_EVENT_DRAIN_LIMIT {
         match term_rx.try_recv() {
             Ok(event) => {
                 handled = true;
-                handle_terminal_event(app, client, event?).await?;
+                handle_terminal_event(app, client, upload_tx, event?).await?;
                 if app.quit {
                     break;
                 }
@@ -708,6 +753,7 @@ async fn run_loop<T: Socket>(
     client: &mut ConsoleConnection<T>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_terminal_reader, mut term_rx) = TerminalEventReader::spawn()?;
+    let (upload_tx, mut upload_rx) = mpsc::unbounded_channel();
     let mut animation_tick = tokio::time::interval(Duration::from_millis(80));
     animation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -718,7 +764,8 @@ async fn run_loop<T: Socket>(
             break;
         }
 
-        let handled_term_event = drain_terminal_events(app, client, &mut term_rx).await?;
+        let handled_term_event =
+            drain_terminal_events(app, client, &mut term_rx, &upload_tx).await?;
         if app.quit {
             break;
         }
@@ -730,6 +777,7 @@ async fn run_loop<T: Socket>(
 
         match next_loop_input(
             &mut term_rx,
+            &mut upload_rx,
             app.connected,
             client.next_event(),
             app.running,
@@ -738,8 +786,29 @@ async fn run_loop<T: Socket>(
         .await
         {
             LoopInput::Terminal(term_event) => {
-                handle_terminal_event(app, client, term_event?).await?;
+                handle_terminal_event(app, client, &upload_tx, term_event?).await?;
             }
+            LoopInput::Upload(result) => match result {
+                Ok(reference) => {
+                    app.flash_actionbar_notice(
+                        format!(
+                            "[{} · {} bytes · ready] Send a message or use /clear-attachments.",
+                            reference.file_name, reference.byte_len
+                        ),
+                        ActionbarNoticeLevel::Info,
+                        ActionbarNoticeSource::Tui,
+                        Duration::from_secs(60 * 60),
+                    );
+                    if !client
+                        .pending_attachments
+                        .iter()
+                        .any(|pending| pending.artifact_id == reference.artifact_id)
+                    {
+                        client.pending_attachments.push(reference);
+                    }
+                }
+                Err(error) => app.push_error(format!("Attachment upload failed: {error}")),
+            },
             LoopInput::Worker(event) => match event? {
                 Some(ev) => {
                     if let Some(method) = app.handle_worker_event(ev) {
@@ -785,21 +854,19 @@ fn is_clear_attachments_command(method: &Method) -> bool {
 async fn handle_terminal_event<T: Socket>(
     app: &mut App,
     client: &mut ConsoleConnection<T>,
+    upload_tx: &mpsc::UnboundedSender<AttachmentUploadResult>,
     event: TermEvent,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match event {
         TermEvent::Key(key) => {
             if let Some(method) = handle_key(app, key) {
                 if let Some(path) = attachment_command_path(&method) {
-                    match client.upload_path(&path).await {
-                        Ok(reference) => app.flash_actionbar_notice(
-                            format!(
-                                "Attached {} ({} bytes); it will be sent with the next message.",
-                                reference.file_name, reference.byte_len
-                            ),
+                    match client.start_upload(path, upload_tx.clone()) {
+                        Ok(()) => app.flash_actionbar_notice(
+                            "Uploading attachment… Use /clear-attachments to cancel.",
                             ActionbarNoticeLevel::Info,
                             ActionbarNoticeSource::Tui,
-                            Duration::from_secs(6),
+                            Duration::from_secs(30),
                         ),
                         Err(error) => {
                             app.push_error(format!("Attachment upload failed: {error}"));
@@ -814,7 +881,12 @@ async fn handle_terminal_event<T: Socket>(
                         Duration::from_secs(4),
                     );
                 } else {
+                    let sends_attachments = matches!(method, Method::Run { .. })
+                        && !client.pending_attachments.is_empty();
                     client.send(&method).await?;
+                    if sends_attachments {
+                        app.clear_actionbar_notice();
+                    }
                 }
             }
         }
@@ -1420,10 +1492,12 @@ mod tests {
     #[tokio::test]
     async fn animation_tick_wakes_loop_while_running() {
         let (_tx, mut rx) = mpsc::unbounded_channel::<TerminalEventResult>();
+        let (_upload_tx, mut upload_rx) = mpsc::unbounded_channel();
 
         assert!(matches!(
             next_loop_input(
                 &mut rx,
+                &mut upload_rx,
                 true,
                 std::future::pending::<Option<u8>>(),
                 true,
@@ -1435,8 +1509,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attachment_upload_completion_wakes_console_loop() {
+        let (_terminal_tx, mut terminal_rx) = mpsc::unbounded_channel();
+        let (upload_tx, mut upload_rx) = mpsc::unbounded_channel();
+        let file = UploadedFileRef {
+            artifact_id: "019ca7c8-57b6-7f05-8edf-524147aba7b3".into(),
+            file_name: "notes.txt".into(),
+            media_type: "text/plain".into(),
+            created_at_ms: 1,
+            availability: protocol::UploadedFileAvailability::Available,
+            byte_len: 1,
+            sha256: "a".repeat(64),
+            source_entry_id: None,
+        };
+        upload_tx.send(Ok(file.clone())).unwrap();
+
+        match next_loop_input(
+            &mut terminal_rx,
+            &mut upload_rx,
+            true,
+            std::future::pending::<Option<u8>>(),
+            false,
+            std::future::pending::<()>(),
+        )
+        .await
+        {
+            LoopInput::Upload(Ok(received)) => assert_eq!(received, file),
+            _ => panic!("expected attachment upload result"),
+        }
+    }
+
+    #[tokio::test]
     async fn terminal_event_is_selected_before_ready_worker_event() {
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_upload_tx, mut upload_rx) = mpsc::unbounded_channel();
         tx.send(Ok(TermEvent::Key(KeyEvent::new(
             KeyCode::Char('x'),
             KeyModifiers::NONE,
@@ -1445,6 +1551,7 @@ mod tests {
 
         match next_loop_input(
             &mut rx,
+            &mut upload_rx,
             true,
             std::future::ready(Some(())),
             false,
@@ -1462,9 +1569,11 @@ mod tests {
     #[tokio::test]
     async fn terminal_event_is_preserved_after_worker_event_wins() {
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_upload_tx, mut upload_rx) = mpsc::unbounded_channel();
 
         match next_loop_input(
             &mut rx,
+            &mut upload_rx,
             true,
             std::future::ready(Some(1_u8)),
             false,
@@ -1484,6 +1593,7 @@ mod tests {
 
         match next_loop_input(
             &mut rx,
+            &mut upload_rx,
             true,
             std::future::ready(Some(2_u8)),
             false,

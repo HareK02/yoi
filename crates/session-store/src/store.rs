@@ -13,7 +13,9 @@
 
 use crate::event_trace::TraceEntry;
 use crate::segment_log::LogEntry;
-use crate::{PasteArtifactLimits, SegmentId, SessionId, UploadedFileLimits};
+use crate::{
+    PasteArtifactLimits, SegmentId, SessionId, UploadedFileLimits, UploadedFileUploadContext,
+};
 use protocol::{PasteArtifactRef, UploadedFileRef};
 
 /// Errors from the persistence store.
@@ -186,6 +188,18 @@ pub trait Store: Send + Sync {
         Err(StoreError::PasteArtifactUnsupported)
     }
 
+    fn write_uploaded_file_with_context(
+        &self,
+        session_id: SessionId,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+        _context: &UploadedFileUploadContext,
+        limits: UploadedFileLimits,
+    ) -> Result<UploadedFileRef, StoreError> {
+        self.write_uploaded_file(session_id, file_name, media_type, content, limits)
+    }
+
     /// Read and integrity-check an uploaded file owned by `session_id`.
     fn read_uploaded_file(
         &self,
@@ -222,6 +236,14 @@ pub trait Store: Send + Sync {
     }
 
     fn delete_uncommitted_uploaded_files(&self, _session_id: SessionId) -> Result<u64, StoreError> {
+        Ok(0)
+    }
+
+    fn copy_committed_uploaded_files(
+        &self,
+        _source_session_id: SessionId,
+        _target_session_id: SessionId,
+    ) -> Result<u64, StoreError> {
         Ok(0)
     }
 

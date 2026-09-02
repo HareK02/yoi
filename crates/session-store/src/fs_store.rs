@@ -20,10 +20,13 @@ use crate::paste_artifact::{read_from_dir, write_to_dir};
 use crate::segment_log::LogEntry;
 use crate::store::{Store, StoreError};
 use crate::uploaded_file::{
-    bind_uploaded_file, delete_uncommitted_uploaded_files, delete_uploaded_file,
+    bind_uploaded_file, clear_uploaded_file_binding, copy_committed_uploaded_files,
+    delete_uncommitted_uploaded_files, delete_uploaded_file, list_uploaded_file_refs,
     read_uploaded_file, read_uploaded_file_by_id, write_uploaded_file,
 };
-use crate::{PasteArtifactLimits, SegmentId, SessionId, UploadedFileLimits};
+use crate::{
+    PasteArtifactLimits, SegmentId, SessionId, UploadedFileLimits, UploadedFileUploadContext,
+};
 use protocol::{PasteArtifactRef, UploadedFileRef};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -117,6 +120,40 @@ impl FsStore {
 
     fn paste_artifact_dir(&self, session_id: SessionId) -> PathBuf {
         self.session_dir(session_id).join("artifacts").join("paste")
+    }
+
+    fn uploaded_file_is_referenced(
+        &self,
+        session_id: SessionId,
+        artifact_id: &str,
+    ) -> Result<bool, StoreError> {
+        fn segments_contain(segments: &[protocol::Segment], artifact_id: &str) -> bool {
+            segments.iter().any(|segment| {
+                matches!(
+                    segment,
+                    protocol::Segment::UploadedFile { file }
+                        if file.artifact_id == artifact_id
+                )
+            })
+        }
+
+        for segment_id in self.list_segments(session_id)? {
+            for entry in self.read_all(session_id, segment_id)? {
+                let referenced = match entry {
+                    LogEntry::AnnotatedUserInput { segments, .. } => {
+                        segments_contain(&segments, artifact_id)
+                    }
+                    LogEntry::InputSegmentsCheckpoint { user_segments, .. } => user_segments
+                        .iter()
+                        .any(|segments| segments_contain(segments, artifact_id)),
+                    _ => false,
+                };
+                if referenced {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     #[cfg(test)]
@@ -410,6 +447,30 @@ impl Store for FsStore {
             file_name,
             media_type,
             content,
+            None,
+            limits,
+        )
+    }
+
+    fn write_uploaded_file_with_context(
+        &self,
+        session_id: SessionId,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+        context: &UploadedFileUploadContext,
+        limits: UploadedFileLimits,
+    ) -> Result<UploadedFileRef, StoreError> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("session store append lock was poisoned"))?;
+        write_uploaded_file(
+            &self.paste_artifact_dir(session_id),
+            file_name,
+            media_type,
+            content,
+            Some(context),
             limits,
         )
     }
@@ -440,11 +501,21 @@ impl Store for FsStore {
             .append_lock
             .lock()
             .map_err(|_| std::io::Error::other("session store append lock was poisoned"))?;
-        bind_uploaded_file(
-            &self.paste_artifact_dir(session_id),
-            reference,
-            source_entry_id,
-        )
+        let dir = self.paste_artifact_dir(session_id);
+        match bind_uploaded_file(&dir, reference, source_entry_id) {
+            Err(StoreError::ArtifactAlreadyCommitted) => {
+                let (stored, _) = read_uploaded_file_by_id(&dir, &reference.artifact_id)?;
+                let previous_source = stored
+                    .source_entry_id
+                    .ok_or(StoreError::ArtifactIntegrityMismatch)?;
+                if self.uploaded_file_is_referenced(session_id, &reference.artifact_id)? {
+                    return Err(StoreError::ArtifactAlreadyCommitted);
+                }
+                clear_uploaded_file_binding(&dir, &reference.artifact_id, &previous_source)?;
+                bind_uploaded_file(&dir, reference, source_entry_id)
+            }
+            result => result,
+        }
     }
 
     fn delete_uploaded_file(
@@ -464,7 +535,37 @@ impl Store for FsStore {
             .append_lock
             .lock()
             .map_err(|_| std::io::Error::other("session store append lock was poisoned"))?;
-        delete_uncommitted_uploaded_files(&self.paste_artifact_dir(session_id))
+        let dir = self.paste_artifact_dir(session_id);
+        let mut removed = delete_uncommitted_uploaded_files(&dir)?;
+        for reference in list_uploaded_file_refs(&dir)? {
+            let Some(source_entry_id) = reference.source_entry_id.as_deref() else {
+                continue;
+            };
+            if !self.uploaded_file_is_referenced(session_id, &reference.artifact_id)? {
+                clear_uploaded_file_binding(&dir, &reference.artifact_id, source_entry_id)?;
+                if delete_uploaded_file(&dir, &reference.artifact_id)? {
+                    removed = removed
+                        .checked_add(1)
+                        .ok_or(StoreError::ArtifactQuotaExceeded)?;
+                }
+            }
+        }
+        Ok(removed)
+    }
+
+    fn copy_committed_uploaded_files(
+        &self,
+        source_session_id: SessionId,
+        target_session_id: SessionId,
+    ) -> Result<u64, StoreError> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("session store append lock was poisoned"))?;
+        copy_committed_uploaded_files(
+            &self.paste_artifact_dir(source_session_id),
+            &self.paste_artifact_dir(target_session_id),
+        )
     }
 
     fn append_trace(
@@ -627,6 +728,45 @@ mod tests {
     }
 
     #[test]
+    fn uploaded_file_persists_trusted_upload_context_without_projecting_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FsStore::new(tmp.path()).unwrap();
+        let session_id = new_session_id();
+        let context = UploadedFileUploadContext {
+            upload_id: "upload-1".into(),
+            principal_id: "account-1".into(),
+            workspace_id: "workspace-1".into(),
+            runtime_id: "runtime-1".into(),
+            worker_id: "worker-1".into(),
+        };
+        let reference = store
+            .write_uploaded_file_with_context(
+                session_id,
+                "notes.txt",
+                "text/plain",
+                b"hello",
+                &context,
+                UploadedFileLimits::default(),
+            )
+            .unwrap();
+        let raw = fs::read_to_string(
+            store
+                .paste_artifact_dir(session_id)
+                .join(format!("{}.file.json", reference.artifact_id)),
+        )
+        .unwrap();
+        assert!(raw.contains("account-1"));
+        assert!(raw.contains("workspace-1"));
+        assert!(raw.contains("runtime-1"));
+        assert!(raw.contains("worker-1"));
+        assert!(
+            !serde_json::to_string(&reference)
+                .unwrap()
+                .contains("account-1")
+        );
+    }
+
+    #[test]
     fn uploaded_files_are_session_scoped_integrity_checked_and_removable() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = FsStore::new(tmp.path()).unwrap();
@@ -715,18 +855,51 @@ mod tests {
             store.write_uploaded_file(session_id, "ＲＥＡＤＭＥ.txt", "text/plain", b"y", limits),
             Err(StoreError::InvalidUploadedFileName)
         ));
+        store
+            .bind_uploaded_file(session_id, &pending, "entry-from-failed-submit")
+            .unwrap();
         let bound = store
             .bind_uploaded_file(session_id, &pending, "entry-upload")
+            .unwrap();
+        store
+            .create_segment(
+                session_id,
+                new_segment_id(),
+                &[LogEntry::InputSegmentsCheckpoint {
+                    ts: 1,
+                    user_segments: vec![vec![protocol::Segment::UploadedFile {
+                        file: bound.clone(),
+                    }]],
+                }],
+            )
             .unwrap();
         let other = store
             .write_uploaded_file(session_id, "other.txt", "text/plain", b"z", limits)
             .unwrap();
+        let stale = store
+            .write_uploaded_file(session_id, "stale.txt", "text/plain", b"s", limits)
+            .unwrap();
+        store
+            .bind_uploaded_file(session_id, &stale, "entry-never-committed")
+            .unwrap();
         assert_eq!(
             store.delete_uncommitted_uploaded_files(session_id).unwrap(),
-            1
+            2
         );
         assert!(store.read_uploaded_file(session_id, &other).is_err());
+        assert!(store.read_uploaded_file(session_id, &stale).is_err());
         assert_eq!(store.read_uploaded_file(session_id, &bound).unwrap(), b"x");
+        let fork_session_id = new_session_id();
+        assert_eq!(
+            store
+                .copy_committed_uploaded_files(session_id, fork_session_id)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.read_uploaded_file(fork_session_id, &bound).unwrap(),
+            b"x"
+        );
         store
             .write_paste_artifact(
                 session_id,

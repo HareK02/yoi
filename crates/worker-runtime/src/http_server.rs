@@ -390,6 +390,16 @@ pub struct RuntimeHttpWorkerInputResponse {
 pub struct RuntimeHttpUploadFileQuery {
     pub file_name: String,
     pub media_type: String,
+    #[serde(default)]
+    pub upload_id: Option<String>,
+    #[serde(default)]
+    pub principal_id: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub runtime_id: Option<String>,
+    #[serde(default)]
+    pub owner_worker_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1455,14 +1465,74 @@ async fn upload_worker_file(
     body: Bytes,
 ) -> RestResult<RuntimeHttpUploadedFileResponse> {
     let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
+    let context = match (
+        query.upload_id,
+        query.principal_id,
+        query.workspace_id,
+        query.runtime_id,
+        query.owner_worker_id,
+    ) {
+        (None, None, None, None, None) => None,
+        (
+            Some(upload_id),
+            Some(principal_id),
+            Some(workspace_id),
+            Some(runtime_id),
+            Some(owner_worker_id),
+        ) => {
+            if owner_worker_id != worker_ref.worker_id.to_string() {
+                return Err(RuntimeHttpRestError::new(
+                    StatusCode::FORBIDDEN,
+                    "uploaded_file_owner_mismatch",
+                    "uploaded file context does not match the target Worker",
+                ));
+            }
+            Some(session_store::UploadedFileUploadContext {
+                upload_id,
+                principal_id,
+                workspace_id,
+                runtime_id,
+                worker_id: owner_worker_id,
+            })
+        }
+        _ => {
+            return Err(RuntimeHttpRestError::new(
+                StatusCode::BAD_REQUEST,
+                "uploaded_file_context_incomplete",
+                "uploaded file context fields must be provided together",
+            ));
+        }
+    };
     let file = match auth_workspace_scope(&state, auth.as_ref())? {
-        Some(scope) => state.runtime.upload_worker_file_scoped(
-            &scope,
-            &worker_ref,
-            &query.file_name,
-            &query.media_type,
-            &body,
-        ),
+        Some(scope) => {
+            if context
+                .as_ref()
+                .is_some_and(|context| context.workspace_id != scope.workspace_id)
+            {
+                return Err(RuntimeHttpRestError::new(
+                    StatusCode::FORBIDDEN,
+                    "uploaded_file_workspace_mismatch",
+                    "uploaded file context does not match the authenticated Workspace",
+                ));
+            }
+            match context.as_ref() {
+                Some(context) => state.runtime.upload_worker_file_with_context_scoped(
+                    &scope,
+                    &worker_ref,
+                    &query.file_name,
+                    &query.media_type,
+                    &body,
+                    context,
+                ),
+                None => state.runtime.upload_worker_file_scoped(
+                    &scope,
+                    &worker_ref,
+                    &query.file_name,
+                    &query.media_type,
+                    &body,
+                ),
+            }
+        }
         None => state.runtime.upload_worker_file(
             &worker_ref,
             &query.file_name,

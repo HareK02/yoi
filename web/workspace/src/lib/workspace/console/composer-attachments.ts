@@ -5,15 +5,18 @@ export const MAX_FILES_PER_SUBMISSION = 8;
 
 export type AttachmentUploadState = "uploading" | "uploaded" | "failed";
 
+export type AttachmentUploadHandle = { abort(): void };
+
 export type ComposerAttachment = {
   id: number;
   file: File;
   uploadPath: string;
+  uploadId: string;
   state: AttachmentUploadState;
   progress: number;
   reference: UploadedFileRef | null;
   error: string | null;
-  request: XMLHttpRequest | null;
+  request: AttachmentUploadHandle | null;
 };
 
 export function acceptedAttachmentMediaType(mediaType: string): boolean {
@@ -43,42 +46,97 @@ export type AttachmentUploadCallbacks = {
 };
 
 export function uploadAttachment(
-  path: string,
+  workerPath: string,
   file: File,
+  uploadId: string,
   callbacks: AttachmentUploadCallbacks,
-): XMLHttpRequest {
-  const request = new XMLHttpRequest();
+): AttachmentUploadHandle {
+  let activeRequest: XMLHttpRequest | null = null;
+  let aborted = false;
+  const handle: AttachmentUploadHandle = {
+    abort() {
+      aborted = true;
+      activeRequest?.abort();
+      void fetch(
+        `${workerPath}/attachment-uploads/${encodeURIComponent(uploadId)}`,
+        { method: "DELETE" },
+      ).catch(() => undefined);
+    },
+  };
   const query = new URLSearchParams({
     file_name: file.name,
     media_type: file.type,
+    upload_id: uploadId,
   });
-  request.open("POST", `${path}?${query.toString()}`);
-  request.setRequestHeader("content-type", "application/octet-stream");
-  request.upload.addEventListener("progress", (event) => {
-    if (event.lengthComputable && event.total > 0) {
-      callbacks.progress(Math.min(1, event.loaded / event.total));
-    }
-  });
-  request.addEventListener("load", () => {
-    if (request.status < 200 || request.status >= 300) {
-      callbacks.failed(`Upload failed (${request.status}).`);
+  const grantRequest = new XMLHttpRequest();
+  activeRequest = grantRequest;
+  grantRequest.open(
+    "POST",
+    `${workerPath}/attachment-upload-grants?${query.toString()}`,
+  );
+  grantRequest.addEventListener("load", () => {
+    if (aborted) return;
+    if (grantRequest.status < 200 || grantRequest.status >= 300) {
+      callbacks.failed(`Upload grant failed (${grantRequest.status}).`);
       return;
     }
+    let uploadId: string;
     try {
-      const parsed: unknown = JSON.parse(request.responseText);
-      if (!isUploadedFileResponse(parsed)) {
-        callbacks.failed("Upload returned an invalid attachment reference.");
+      const parsed: unknown = JSON.parse(grantRequest.responseText);
+      if (!isUploadGrantResponse(parsed)) {
+        callbacks.failed("Upload grant returned an invalid response.");
         return;
       }
-      callbacks.complete(parsed.file);
+      uploadId = parsed.upload_id;
     } catch {
-      callbacks.failed("Upload returned an invalid response.");
+      callbacks.failed("Upload grant returned an invalid response.");
+      return;
     }
+
+    const uploadRequest = new XMLHttpRequest();
+    activeRequest = uploadRequest;
+    uploadRequest.open(
+      "PUT",
+      `${workerPath}/attachment-uploads/${encodeURIComponent(uploadId)}`,
+    );
+    uploadRequest.setRequestHeader("content-type", "application/octet-stream");
+    uploadRequest.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable && event.total > 0) {
+        callbacks.progress(Math.min(1, event.loaded / event.total));
+      }
+    });
+    uploadRequest.addEventListener("load", () => {
+      if (uploadRequest.status < 200 || uploadRequest.status >= 300) {
+        callbacks.failed(`Upload failed (${uploadRequest.status}).`);
+        return;
+      }
+      try {
+        const parsed: unknown = JSON.parse(uploadRequest.responseText);
+        if (!isUploadedFileResponse(parsed)) {
+          callbacks.failed("Upload returned an invalid attachment reference.");
+          return;
+        }
+        callbacks.complete(parsed.file);
+      } catch {
+        callbacks.failed("Upload returned an invalid response.");
+      }
+    });
+    uploadRequest.addEventListener("error", () => callbacks.failed("Upload failed."));
+    uploadRequest.addEventListener("abort", () => callbacks.failed("Upload cancelled."));
+    uploadRequest.send(file);
   });
-  request.addEventListener("error", () => callbacks.failed("Upload failed."));
-  request.addEventListener("abort", () => callbacks.failed("Upload cancelled."));
-  request.send(file);
-  return request;
+  grantRequest.addEventListener("error", () => callbacks.failed("Upload grant failed."));
+  grantRequest.addEventListener("abort", () => callbacks.failed("Upload cancelled."));
+  grantRequest.send();
+  return handle;
+}
+
+function isUploadGrantResponse(
+  value: unknown,
+): value is { upload_id: string; expires_at_ms: number } {
+  return !!value && typeof value === "object" &&
+    "upload_id" in value && typeof value.upload_id === "string" &&
+    "expires_at_ms" in value && typeof value.expires_at_ms === "number";
 }
 
 function isUploadedFileResponse(

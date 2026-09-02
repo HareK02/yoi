@@ -599,7 +599,7 @@
             attachment.request?.abort();
             if (attachment.reference) {
                 void fetch(
-                    `${attachment.uploadPath}/${encodeURIComponent(attachment.reference.artifact_id)}`,
+                    `${attachment.uploadPath}/attachments/${encodeURIComponent(attachment.reference.artifact_id)}`,
                     { method: "DELETE" },
                 ).catch(() => undefined);
             }
@@ -639,7 +639,7 @@
     }
 
     function attachmentPath(): string {
-        return `/api/w/${encodeURIComponent(workspaceId)}/runtimes/${encodeURIComponent(runtimeId)}/workers/${encodeURIComponent(workerId)}/attachments`;
+        return `/api/w/${encodeURIComponent(workspaceId)}/runtimes/${encodeURIComponent(runtimeId)}/workers/${encodeURIComponent(workerId)}`;
     }
 
     function updateAttachment(id: number, update: Partial<ComposerAttachment>): void {
@@ -661,7 +661,11 @@
             error: null,
             request: null,
         });
-        const request = uploadAttachment(attachment.uploadPath, attachment.file, {
+        const request = uploadAttachment(
+            attachment.uploadPath,
+            attachment.file,
+            attachment.uploadId,
+            {
             progress: (progress) => updateAttachment(attachment.id, { progress }),
             complete: (reference) =>
                 updateAttachment(attachment.id, {
@@ -688,6 +692,7 @@
                 id: nextAttachmentId++,
                 file,
                 uploadPath: attachmentPath(),
+                uploadId: crypto.randomUUID(),
                 state: "uploading",
                 progress: 0,
                 reference: null,
@@ -703,7 +708,7 @@
         attachment.request?.abort();
         attachments = attachments.filter((candidate) => candidate.id !== attachment.id);
         if (attachment.reference) {
-            await fetch(`${attachment.uploadPath}/${encodeURIComponent(attachment.reference.artifact_id)}`, {
+            await fetch(`${attachment.uploadPath}/attachments/${encodeURIComponent(attachment.reference.artifact_id)}`, {
                 method: "DELETE",
             }).catch(() => undefined);
         }

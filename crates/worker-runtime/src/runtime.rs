@@ -1225,6 +1225,41 @@ impl Runtime {
         media_type: &str,
         content: &[u8],
     ) -> Result<protocol::UploadedFileRef, RuntimeError> {
+        self.upload_worker_file_inner(worker_ref, file_name, media_type, content, None)
+    }
+
+    pub fn upload_worker_file_with_context_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        worker_ref: &WorkerRef,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+        context: &session_store::UploadedFileUploadContext,
+    ) -> Result<protocol::UploadedFileRef, RuntimeError> {
+        self.ensure_worker_in_workspace(scope, worker_ref)?;
+        self.upload_worker_file_inner(worker_ref, file_name, media_type, content, Some(context))
+    }
+
+    pub fn upload_worker_file_with_context(
+        &self,
+        worker_ref: &WorkerRef,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+        context: &session_store::UploadedFileUploadContext,
+    ) -> Result<protocol::UploadedFileRef, RuntimeError> {
+        self.upload_worker_file_inner(worker_ref, file_name, media_type, content, Some(context))
+    }
+
+    fn upload_worker_file_inner(
+        &self,
+        worker_ref: &WorkerRef,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+        context: Option<&session_store::UploadedFileUploadContext>,
+    ) -> Result<protocol::UploadedFileRef, RuntimeError> {
         let (backend, handle) = {
             let state = self.lock()?;
             state.ensure_running()?;
@@ -1244,7 +1279,7 @@ impl Runtime {
             }
         };
         backend
-            .upload_file(&handle, file_name, media_type, content)
+            .upload_file(&handle, file_name, media_type, content, context)
             .map_err(|result| RuntimeError::WorkerExecutionRejected {
                 worker_id: worker_ref.worker_id.clone(),
                 operation: result.operation,

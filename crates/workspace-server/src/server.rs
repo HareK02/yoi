@@ -502,6 +502,73 @@ async fn close_worker_workdir_sessions(
     }
 }
 
+const ATTACHMENT_UPLOAD_GRANT_TTL_MS: u64 = 5 * 60 * 1_000;
+
+#[derive(Clone)]
+struct AttachmentUploadGrant {
+    workspace_id: String,
+    runtime_id: String,
+    worker_id: String,
+    account_id: String,
+    file_name: String,
+    media_type: String,
+    expires_at_ms: u64,
+    state: AttachmentUploadGrantState,
+}
+
+#[derive(Clone)]
+enum AttachmentUploadGrantState {
+    Pending,
+    Uploading,
+    Cancelled,
+    Completed(protocol::UploadedFileRef),
+}
+
+impl AttachmentUploadGrant {
+    fn claim(
+        &mut self,
+        workspace_id: &str,
+        runtime_id: &str,
+        worker_id: &str,
+        account_id: &str,
+        now_ms: u64,
+        body_sha256: &str,
+    ) -> Result<Option<protocol::UploadedFileRef>> {
+        if self.workspace_id != workspace_id
+            || self.runtime_id != runtime_id
+            || self.worker_id != worker_id
+            || self.account_id != account_id
+        {
+            return Err(Error::WorkspacePermissionDenied(
+                "attachment upload grant scope mismatch".into(),
+            ));
+        }
+        if self.expires_at_ms <= now_ms {
+            return Err(Error::InvalidInput(
+                "attachment upload grant expired".into(),
+            ));
+        }
+        match &self.state {
+            AttachmentUploadGrantState::Pending => {
+                self.state = AttachmentUploadGrantState::Uploading;
+                Ok(None)
+            }
+            AttachmentUploadGrantState::Uploading => Err(Error::RepositoryConflict(
+                "attachment upload is already in progress".into(),
+            )),
+            AttachmentUploadGrantState::Cancelled => Err(Error::RepositoryConflict(
+                "attachment upload grant was cancelled".into(),
+            )),
+            AttachmentUploadGrantState::Completed(file) if file.sha256 == body_sha256 => {
+                Ok(Some(file.clone()))
+            }
+            AttachmentUploadGrantState::Completed(_) => Err(Error::RepositoryConflict(
+                "attachment upload grant was already consumed".into(),
+            )),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WorkspaceApi {
     pub(crate) config: ServerConfig,
@@ -524,6 +591,7 @@ pub struct WorkspaceApi {
     workdir_remove_locks: Arc<Mutex<HashMap<String, Arc<std::sync::Mutex<()>>>>>,
     workdir_remove_attempt_owner: WorkdirRemovalAttemptOwner,
     worker_control_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    attachment_upload_grants: Arc<Mutex<HashMap<String, AttachmentUploadGrant>>>,
 }
 
 #[derive(Clone)]
@@ -1645,6 +1713,7 @@ impl WorkspaceApi {
             workdir_remove_locks: Arc::new(Mutex::new(HashMap::new())),
             workdir_remove_attempt_owner: current_workdir_removal_attempt_owner()?,
             worker_control_locks: Arc::new(Mutex::new(HashMap::new())),
+            attachment_upload_grants: Arc::new(Mutex::new(HashMap::new())),
         };
         if let Some(dispatcher) = worker_remove_dispatcher {
             dispatcher
@@ -2682,20 +2751,18 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
             post(send_runtime_worker_input),
         )
         .route(
-            "/api/runtimes/{runtime_id}/workers/{worker_id}/attachments",
-            post(upload_runtime_worker_file).layer(DefaultBodyLimit::max(MAX_WORKER_FILE_UPLOAD_BYTES)),
-        )
-        .route(
-            "/api/runtimes/{runtime_id}/workers/{worker_id}/attachments/{artifact_id}",
-            delete(delete_runtime_worker_uploaded_file),
-        )
-        .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/input",
             post(scoped_send_runtime_worker_input),
         )
         .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachments",
-            post(scoped_upload_runtime_worker_file).layer(DefaultBodyLimit::max(MAX_WORKER_FILE_UPLOAD_BYTES)),
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachment-upload-grants",
+            post(scoped_create_attachment_upload_grant),
+        )
+        .route(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachment-uploads/{upload_id}",
+            put(scoped_upload_runtime_worker_file)
+                .delete(scoped_cancel_attachment_upload)
+                .layer(DefaultBodyLimit::max(MAX_WORKER_FILE_UPLOAD_BYTES)),
         )
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachments/{artifact_id}",
@@ -10756,6 +10823,8 @@ async fn scoped_execute_runtime_cleanup(
 struct WorkerFileUploadQuery {
     file_name: String,
     media_type: String,
+    #[serde(default)]
+    upload_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -10768,20 +10837,225 @@ struct WorkerFileDeleteResponse {
     deleted: bool,
 }
 
-async fn scoped_upload_runtime_worker_file(
+#[derive(Debug, Serialize, Deserialize)]
+struct AttachmentUploadGrantResponse {
+    upload_id: String,
+    expires_at_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScopedAttachmentUploadPath {
+    workspace_id: String,
+    runtime_id: String,
+    worker_id: String,
+    upload_id: String,
+}
+
+fn attachment_body_sha256(body: &[u8]) -> String {
+    Sha256::digest(body)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn attachment_upload_now_ms() -> Result<u64> {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| Error::InvalidInput("system clock predates UNIX epoch".into()))?
+            .as_millis(),
+    )
+    .map_err(|_| Error::InvalidInput("attachment upload timestamp overflow".into()))
+}
+
+async fn scoped_create_attachment_upload_grant(
     State(api): State<WorkspaceApi>,
+    Extension(actor): Extension<RequestActor>,
     AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
     Query(query): Query<WorkerFileUploadQuery>,
+) -> ApiResult<Json<AttachmentUploadGrantResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    resolve_workspace_worker_reference(&api, &path.worker.runtime_id, &path.worker.worker_id)?;
+    let now = attachment_upload_now_ms()?;
+    let expires_at_ms = now.saturating_add(ATTACHMENT_UPLOAD_GRANT_TTL_MS);
+    let upload_id = match query.upload_id {
+        Some(upload_id) => Uuid::parse_str(&upload_id)
+            .map_err(|_| Error::InvalidInput("attachment upload id must be a UUID".into()))?
+            .to_string(),
+        None => Uuid::now_v7().to_string(),
+    };
+    let mut grants = api
+        .attachment_upload_grants
+        .lock()
+        .map_err(|_| Error::Store("attachment upload grant lock is poisoned".into()))?;
+    grants.retain(|_, grant| grant.expires_at_ms >= now);
+    if let Some(existing) = grants.get(&upload_id) {
+        if existing.workspace_id == path.workspace_id
+            && existing.runtime_id == path.worker.runtime_id
+            && existing.worker_id == path.worker.worker_id
+            && existing.account_id == actor.account_id
+            && existing.file_name == query.file_name
+            && existing.media_type == query.media_type
+        {
+            return Ok(Json(AttachmentUploadGrantResponse {
+                upload_id,
+                expires_at_ms: existing.expires_at_ms,
+            }));
+        }
+        return Err(Error::RepositoryConflict(
+            "attachment upload id was reused with different intent".into(),
+        )
+        .into());
+    }
+    grants.insert(
+        upload_id.clone(),
+        AttachmentUploadGrant {
+            workspace_id: path.workspace_id,
+            runtime_id: path.worker.runtime_id,
+            worker_id: path.worker.worker_id,
+            account_id: actor.account_id,
+            file_name: query.file_name,
+            media_type: query.media_type,
+            expires_at_ms,
+            state: AttachmentUploadGrantState::Pending,
+        },
+    );
+    Ok(Json(AttachmentUploadGrantResponse {
+        upload_id,
+        expires_at_ms,
+    }))
+}
+
+async fn scoped_upload_runtime_worker_file(
+    State(api): State<WorkspaceApi>,
+    Extension(actor): Extension<RequestActor>,
+    AxumPath(path): AxumPath<ScopedAttachmentUploadPath>,
     body: Bytes,
 ) -> ApiResult<Json<WorkerFileUploadResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    upload_runtime_worker_file(
-        State(api),
-        AxumPath((path.worker.runtime_id, path.worker.worker_id)),
-        Query(query),
-        body,
-    )
-    .await
+    let body_sha256 = attachment_body_sha256(&body);
+    let grant = {
+        let mut grants = api
+            .attachment_upload_grants
+            .lock()
+            .map_err(|_| Error::Store("attachment upload grant lock is poisoned".into()))?;
+        let grant = grants
+            .get_mut(&path.upload_id)
+            .ok_or_else(|| Error::InvalidInput("attachment upload grant is unknown".into()))?;
+        if let Some(file) = grant
+            .claim(
+                &path.workspace_id,
+                &path.runtime_id,
+                &path.worker_id,
+                &actor.account_id,
+                attachment_upload_now_ms()?,
+                &body_sha256,
+            )
+            .map_err(ApiError::from)?
+        {
+            return Ok(Json(WorkerFileUploadResponse { file }));
+        }
+        grant.clone()
+    };
+
+    let worker = resolve_workspace_worker_reference(&api, &path.runtime_id, &path.worker_id)?;
+    let upload_context = worker_runtime::UploadedFileUploadContext {
+        upload_id: path.upload_id.clone(),
+        principal_id: grant.account_id.clone(),
+        workspace_id: grant.workspace_id.clone(),
+        runtime_id: grant.runtime_id.clone(),
+        worker_id: grant.worker_id.clone(),
+    };
+    let uploaded = api.runtime.upload_worker_file(
+        &worker,
+        &grant.file_name,
+        &grant.media_type,
+        &body,
+        Some(&upload_context),
+    );
+    let mut grants = api
+        .attachment_upload_grants
+        .lock()
+        .map_err(|_| Error::Store("attachment upload grant lock is poisoned".into()))?;
+    let current = grants
+        .get_mut(&path.upload_id)
+        .ok_or_else(|| Error::RepositoryConflict("attachment upload grant disappeared".into()))?;
+    if matches!(current.state, AttachmentUploadGrantState::Cancelled) {
+        let uploaded_file = uploaded.ok();
+        grants.remove(&path.upload_id);
+        drop(grants);
+        if let Some(file) = uploaded_file {
+            api.runtime
+                .delete_worker_uploaded_file(&worker, &file.artifact_id)
+                .map_err(|error| error.into_error())?;
+        }
+        return Err(Error::RepositoryConflict("attachment upload was cancelled".into()).into());
+    }
+    match uploaded {
+        Ok(file) => {
+            current.state = AttachmentUploadGrantState::Completed(file.clone());
+            Ok(Json(WorkerFileUploadResponse { file }))
+        }
+        Err(error) => {
+            current.state = AttachmentUploadGrantState::Pending;
+            Err(error.into_error().into())
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AttachmentUploadCancelResponse {
+    cancelled: bool,
+}
+
+async fn scoped_cancel_attachment_upload(
+    State(api): State<WorkspaceApi>,
+    Extension(actor): Extension<RequestActor>,
+    AxumPath(path): AxumPath<ScopedAttachmentUploadPath>,
+) -> ApiResult<Json<AttachmentUploadCancelResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let completed = {
+        let mut grants = api
+            .attachment_upload_grants
+            .lock()
+            .map_err(|_| Error::Store("attachment upload grant lock is poisoned".into()))?;
+        let grant = grants
+            .get_mut(&path.upload_id)
+            .ok_or_else(|| Error::InvalidInput("attachment upload grant is unknown".into()))?;
+        if grant.workspace_id != path.workspace_id
+            || grant.runtime_id != path.runtime_id
+            || grant.worker_id != path.worker_id
+            || grant.account_id != actor.account_id
+        {
+            return Err(Error::WorkspacePermissionDenied(
+                "attachment upload grant scope mismatch".into(),
+            )
+            .into());
+        }
+        match &grant.state {
+            AttachmentUploadGrantState::Pending => {
+                grants.remove(&path.upload_id);
+                None
+            }
+            AttachmentUploadGrantState::Uploading => {
+                grant.state = AttachmentUploadGrantState::Cancelled;
+                None
+            }
+            AttachmentUploadGrantState::Cancelled => None,
+            AttachmentUploadGrantState::Completed(file) => {
+                let file = file.clone();
+                grants.remove(&path.upload_id);
+                Some(file)
+            }
+        }
+    };
+    if let Some(file) = completed {
+        let worker = resolve_workspace_worker_reference(&api, &path.runtime_id, &path.worker_id)?;
+        api.runtime
+            .delete_worker_uploaded_file(&worker, &file.artifact_id)
+            .map_err(|error| error.into_error())?;
+    }
+    Ok(Json(AttachmentUploadCancelResponse { cancelled: true }))
 }
 
 async fn scoped_delete_runtime_worker_uploaded_file(
@@ -13321,20 +13595,6 @@ async fn send_runtime_worker_input(
         .send_input(&worker, request)
         .map_err(|err| err.into_error())?;
     Ok(Json(result))
-}
-
-async fn upload_runtime_worker_file(
-    State(api): State<WorkspaceApi>,
-    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
-    Query(query): Query<WorkerFileUploadQuery>,
-    body: Bytes,
-) -> ApiResult<Json<WorkerFileUploadResponse>> {
-    let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
-    let file = api
-        .runtime
-        .upload_worker_file(&worker, &query.file_name, &query.media_type, &body)
-        .map_err(|err| err.into_error())?;
-    Ok(Json(WorkerFileUploadResponse { file }))
 }
 
 async fn delete_runtime_worker_uploaded_file(
@@ -16083,6 +16343,77 @@ mod tests {
         MemoryStagingRecord, ObjectiveRecord, ObjectiveResourceRecord, ObjectiveTicketLinkRecord,
         SqliteWorkspaceStore, TrustedRuntimeRecord, UserRecord, WorkspaceRecord,
     };
+
+    fn completed_upload_file(sha256: &str) -> protocol::UploadedFileRef {
+        protocol::UploadedFileRef {
+            artifact_id: "019ca7c8-57b6-7f05-8edf-524147aba7b3".into(),
+            file_name: "notes.txt".into(),
+            media_type: "text/plain".into(),
+            created_at_ms: 1,
+            availability: protocol::UploadedFileAvailability::Available,
+            byte_len: 1,
+            sha256: sha256.into(),
+            source_entry_id: None,
+        }
+    }
+
+    fn pending_upload_grant() -> AttachmentUploadGrant {
+        AttachmentUploadGrant {
+            workspace_id: "workspace-1".into(),
+            runtime_id: "runtime-1".into(),
+            worker_id: "worker-1".into(),
+            account_id: "account-1".into(),
+            file_name: "notes.txt".into(),
+            media_type: "text/plain".into(),
+            expires_at_ms: 100,
+            state: AttachmentUploadGrantState::Pending,
+        }
+    }
+
+    #[test]
+    fn attachment_upload_grant_is_scoped_expiring_and_idempotent() {
+        let mut grant = pending_upload_grant();
+        assert!(matches!(
+            grant.claim("workspace-2", "runtime-1", "worker-1", "account-1", 1, "a"),
+            Err(Error::WorkspacePermissionDenied(_))
+        ));
+        assert!(matches!(
+            pending_upload_grant().claim(
+                "workspace-1",
+                "runtime-1",
+                "worker-1",
+                "account-1",
+                101,
+                "a"
+            ),
+            Err(Error::InvalidInput(_))
+        ));
+
+        assert!(
+            grant
+                .claim("workspace-1", "runtime-1", "worker-1", "account-1", 1, "a")
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            grant.claim("workspace-1", "runtime-1", "worker-1", "account-1", 1, "a"),
+            Err(Error::RepositoryConflict(_))
+        ));
+
+        grant.state = AttachmentUploadGrantState::Completed(completed_upload_file("a"));
+        assert_eq!(
+            grant
+                .claim("workspace-1", "runtime-1", "worker-1", "account-1", 1, "a")
+                .unwrap()
+                .unwrap()
+                .artifact_id,
+            "019ca7c8-57b6-7f05-8edf-524147aba7b3"
+        );
+        assert!(matches!(
+            grant.claim("workspace-1", "runtime-1", "worker-1", "account-1", 1, "b"),
+            Err(Error::RepositoryConflict(_))
+        ));
+    }
 
     #[tokio::test]
     async fn command_session_survives_attachment_refresh_until_worker_revocation() {

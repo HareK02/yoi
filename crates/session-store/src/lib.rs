@@ -70,6 +70,7 @@ pub use system_item::{
 pub use uploaded_file::{
     DEFAULT_MAX_FILES_PER_SUBMISSION, DEFAULT_MAX_SESSION_ARTIFACT_BYTES,
     DEFAULT_MAX_SESSION_UPLOADED_FILES, DEFAULT_MAX_UPLOADED_FILE_BYTES, UploadedFileLimits,
+    UploadedFileUploadContext,
 };
 pub use worker_metadata::{
     CombinedStore, FsWorkerStore, WorkerActiveSegmentRef, WorkerAggregateStore, WorkerMetadata,

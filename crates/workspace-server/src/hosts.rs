@@ -1048,6 +1048,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         _file_name: &str,
         _media_type: &str,
         _content: &[u8],
+        _context: Option<&worker_runtime::UploadedFileUploadContext>,
     ) -> Result<protocol::UploadedFileRef, RuntimeRegistryError> {
         Err(RuntimeRegistryError::RuntimeOperationFailed {
             runtime_id: self.runtime_id().to_string(),
@@ -1578,6 +1579,7 @@ impl RuntimeRegistry {
         file_name: &str,
         media_type: &str,
         content: &[u8],
+        context: Option<&worker_runtime::UploadedFileUploadContext>,
     ) -> Result<protocol::UploadedFileRef, RuntimeRegistryError> {
         let runtime_id = worker.runtime_id.as_str();
         let worker_id = worker.worker_id.as_str();
@@ -1592,7 +1594,7 @@ impl RuntimeRegistry {
                 lookup.diagnostics,
             ));
         }
-        runtime.upload_worker_file(worker_id, file_name, media_type, content)
+        runtime.upload_worker_file(worker_id, file_name, media_type, content, context)
     }
 
     pub fn delete_worker_uploaded_file(
@@ -2588,19 +2590,30 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         file_name: &str,
         media_type: &str,
         content: &[u8],
+        context: Option<&worker_runtime::UploadedFileUploadContext>,
     ) -> Result<protocol::UploadedFileRef, RuntimeRegistryError> {
         let worker_ref =
             self.worker_ref(worker_id)
                 .ok_or_else(|| RuntimeRegistryError::UnknownWorker {
                     worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
                 })?;
-        self.runtime
-            .upload_worker_file(&worker_ref, file_name, media_type, content)
-            .map_err(|error| RuntimeRegistryError::RuntimeOperationFailed {
-                runtime_id: self.runtime_id.clone(),
-                code: "embedded_worker_file_upload_failed".to_string(),
-                message: error.to_string(),
-            })
+        let uploaded = match context {
+            Some(context) => self.runtime.upload_worker_file_with_context(
+                &worker_ref,
+                file_name,
+                media_type,
+                content,
+                context,
+            ),
+            None => self
+                .runtime
+                .upload_worker_file(&worker_ref, file_name, media_type, content),
+        };
+        uploaded.map_err(|error| RuntimeRegistryError::RuntimeOperationFailed {
+            runtime_id: self.runtime_id.clone(),
+            code: "embedded_worker_file_upload_failed".to_string(),
+            message: error.to_string(),
+        })
     }
 
     fn delete_worker_uploaded_file(
@@ -3665,13 +3678,24 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         file_name: &str,
         media_type: &str,
         content: &[u8],
+        context: Option<&worker_runtime::UploadedFileUploadContext>,
     ) -> Result<protocol::UploadedFileRef, RuntimeRegistryError> {
-        let path = format!(
+        let mut path = format!(
             "/v1/workers/{}/attachments?file_name={}&media_type={}",
             url_path_segment_encode(worker_id),
             url_query_value_encode(file_name),
             url_query_value_encode(media_type),
         );
+        if let Some(context) = context {
+            path.push_str(&format!(
+                "&upload_id={}&principal_id={}&workspace_id={}&runtime_id={}&owner_worker_id={}",
+                url_query_value_encode(&context.upload_id),
+                url_query_value_encode(&context.principal_id),
+                url_query_value_encode(&context.workspace_id),
+                url_query_value_encode(&context.runtime_id),
+                url_query_value_encode(&context.worker_id),
+            ));
+        }
         self.post_bytes::<RuntimeHttpUploadedFileResponse>(&path, content)
             .map(|response| response.file)
             .map_err(|diagnostic| RuntimeRegistryError::RuntimeOperationFailed {

@@ -33,3 +33,4 @@ pub mod working_directory;
 pub use fs_store::{FsRuntimeStore, FsRuntimeStoreOptions};
 pub use management::RuntimeOptions;
 pub use runtime::{Runtime, RuntimeWorkspaceScope};
+pub use session_store::UploadedFileUploadContext;

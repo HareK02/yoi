@@ -2031,19 +2031,24 @@ where
         file_name: &str,
         media_type: &str,
         content: &[u8],
+        context: Option<&session_store::UploadedFileUploadContext>,
     ) -> Result<protocol::UploadedFileRef, WorkerExecutionResult> {
         let (worker, _, _) = self.get_execution(handle).map_err(|mut result| {
             result.operation = WorkerExecutionOperation::UploadFile;
             result
         })?;
-        worker
-            .upload_file(file_name, media_type, content)
-            .map_err(|error| {
-                WorkerExecutionResult::rejected(
-                    WorkerExecutionOperation::UploadFile,
-                    format!("uploaded_file_rejected: {error}"),
-                )
-            })
+        let uploaded = match context {
+            Some(context) => {
+                worker.upload_file_with_context(file_name, media_type, content, context)
+            }
+            None => worker.upload_file(file_name, media_type, content),
+        };
+        uploaded.map_err(|error| {
+            WorkerExecutionResult::rejected(
+                WorkerExecutionOperation::UploadFile,
+                format!("uploaded_file_rejected: {error}"),
+            )
+        })
     }
 
     fn delete_uploaded_file(
@@ -2145,25 +2150,6 @@ where
                 ),
             );
         }
-        let cleanup_handle = match self.workers.lock() {
-            Ok(workers) => workers
-                .get(handle.worker_ref())
-                .map(|execution| execution.handle.clone()),
-            Err(_) => {
-                return WorkerExecutionResult::errored(
-                    WorkerExecutionOperation::Stop,
-                    "worker adapter registry lock is poisoned",
-                );
-            }
-        };
-        if let Some(worker) = cleanup_handle
-            && let Err(error) = worker.delete_uncommitted_uploaded_files()
-        {
-            return WorkerExecutionResult::errored(
-                WorkerExecutionOperation::Stop,
-                format!("uploaded_file_cleanup_failed: {error}"),
-            );
-        }
         let execution = match self.workers.lock() {
             Ok(mut workers) => workers.remove(handle.worker_ref()),
             Err(_) => {
@@ -2179,6 +2165,7 @@ where
                 "execution handle does not reference a live Worker",
             );
         };
+        let artifact_cleanup = execution.handle.clone();
         let shutdown = execution.shutdown.clone();
         let result = self.send_method(
             WorkerExecutionOperation::Stop,
@@ -2198,7 +2185,13 @@ where
             }
             Ok(())
         }) {
-            Ok(()) => result,
+            Ok(()) => match artifact_cleanup.delete_uncommitted_uploaded_files() {
+                Ok(_) => result,
+                Err(error) => WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Stop,
+                    format!("uploaded_file_cleanup_failed: {error}"),
+                ),
+            },
             Err(message) => WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message),
         }
     }

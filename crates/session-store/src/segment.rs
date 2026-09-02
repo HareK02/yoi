@@ -420,6 +420,7 @@ pub fn save_config_changed(
 /// [`fork_at`] or [`ensure_head_or_fork`] instead.
 pub fn fork(
     store: &impl Store,
+    source_session_id: SessionId,
     state: SegmentStartState<'_>,
 ) -> Result<(SessionId, SegmentId), StoreError> {
     let session_id = crate::new_session_id();
@@ -434,6 +435,7 @@ pub fn fork(
         compacted_from: None,
     };
     store.create_segment(session_id, fork_id, &[entry])?;
+    store.copy_committed_uploaded_files(source_session_id, session_id)?;
     Ok((session_id, fork_id))
 }
 

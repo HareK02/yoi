@@ -406,6 +406,7 @@ async fn session_fork_creates_new_session() {
     let original_history_len = worker.history().len();
     let (fork_sid, fork_segid) = session_store::fork(
         &store,
+        sid,
         SegmentStartState {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),

@@ -928,6 +928,10 @@ impl App {
         Some(self.method_for_run(queued.segments))
     }
 
+    pub fn clear_actionbar_notice(&mut self) {
+        self.actionbar_notice = None;
+    }
+
     pub fn push_error(&mut self, message: impl Into<String>) {
         self.blocks.push(Block::Alert {
             level: AlertLevel::Error,

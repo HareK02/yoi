@@ -80,6 +80,23 @@ impl WorkerHandle {
         )
     }
 
+    pub fn upload_file_with_context(
+        &self,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+        context: &session_store::UploadedFileUploadContext,
+    ) -> Result<UploadedFileRef, session_store::StoreError> {
+        self.artifact_store.write_uploaded_file_with_context(
+            self.session_id,
+            file_name,
+            media_type,
+            content,
+            context,
+            session_store::UploadedFileLimits::default(),
+        )
+    }
+
     pub fn delete_uploaded_file(
         &self,
         artifact_id: &str,

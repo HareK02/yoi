@@ -393,6 +393,7 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         _file_name: &str,
         _media_type: &str,
         _content: &[u8],
+        _context: Option<&session_store::UploadedFileUploadContext>,
     ) -> Result<UploadedFileRef, WorkerExecutionResult> {
         Err(WorkerExecutionResult::unsupported(
             WorkerExecutionOperation::UploadFile,
@@ -546,9 +547,10 @@ impl WorkerExecutionBackendRef {
         file_name: &str,
         media_type: &str,
         content: &[u8],
+        context: Option<&session_store::UploadedFileUploadContext>,
     ) -> Result<UploadedFileRef, WorkerExecutionResult> {
         self.backend
-            .upload_file(handle, file_name, media_type, content)
+            .upload_file(handle, file_name, media_type, content, context)
     }
 
     pub(crate) fn delete_uploaded_file(

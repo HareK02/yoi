@@ -38,6 +38,15 @@ impl Default for UploadedFileLimits {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadedFileUploadContext {
+    pub upload_id: String,
+    pub principal_id: String,
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub worker_id: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredUploadedFile {
     file_name: String,
@@ -47,6 +56,8 @@ struct StoredUploadedFile {
     sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_entry_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upload_context: Option<UploadedFileUploadContext>,
     content_base64: String,
 }
 
@@ -186,6 +197,7 @@ pub(crate) fn write_uploaded_file(
     file_name: &str,
     media_type: &str,
     content: &[u8],
+    context: Option<&UploadedFileUploadContext>,
     limits: UploadedFileLimits,
 ) -> Result<UploadedFileRef> {
     validate_file_name(file_name)?;
@@ -226,6 +238,7 @@ pub(crate) fn write_uploaded_file(
             if stored.media_type == media_type
                 && stored.byte_len == byte_len
                 && stored.sha256 == sha256
+                && stored.upload_context.as_ref() == context
             {
                 let artifact_id = path
                     .file_name()
@@ -264,6 +277,7 @@ pub(crate) fn write_uploaded_file(
         byte_len,
         sha256: sha256.clone(),
         source_entry_id: None,
+        upload_context: context.cloned(),
         content_base64: BASE64.encode(content),
     };
     let path = record_path(dir, &artifact_id)?;
@@ -324,6 +338,30 @@ pub(crate) fn read_uploaded_file(dir: &Path, reference: &UploadedFileRef) -> Res
     Ok(content)
 }
 
+pub(crate) fn clear_uploaded_file_binding(
+    dir: &Path,
+    artifact_id: &str,
+    expected_source_entry_id: &str,
+) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    let aggregate_lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(dir.join(".aggregate.lock"))?;
+    FileExt::lock_exclusive(&aggregate_lock)?;
+    let path = record_path(dir, artifact_id)?;
+    let mut stored: StoredUploadedFile = serde_json::from_slice(&fs::read(&path)?)?;
+    if stored.source_entry_id.as_deref() != Some(expected_source_entry_id) {
+        return Err(StoreError::ArtifactIntegrityMismatch);
+    }
+    stored.source_entry_id = None;
+    let temp = dir.join(format!(".{artifact_id}.file.unbind.tmp"));
+    fs::write(&temp, serde_json::to_vec(&stored)?)?;
+    fs::rename(temp, path)?;
+    Ok(())
+}
+
 pub(crate) fn bind_uploaded_file(
     dir: &Path,
     reference: &UploadedFileRef,
@@ -338,7 +376,15 @@ pub(crate) fn bind_uploaded_file(
         .write(true)
         .open(dir.join(".aggregate.lock"))?;
     FileExt::lock_exclusive(&aggregate_lock)?;
-    read_uploaded_file(dir, reference)?;
+    let (stored_reference, _) = read_uploaded_file_by_id(dir, &reference.artifact_id)?;
+    if stored_reference.file_name != reference.file_name
+        || stored_reference.media_type != reference.media_type
+        || stored_reference.created_at_ms != reference.created_at_ms
+        || stored_reference.byte_len != reference.byte_len
+        || stored_reference.sha256 != reference.sha256
+    {
+        return Err(StoreError::ArtifactIntegrityMismatch);
+    }
     let path = record_path(dir, &reference.artifact_id)?;
     let mut stored: StoredUploadedFile = serde_json::from_slice(&fs::read(&path)?)?;
     if stored.source_entry_id.is_some() {
@@ -351,6 +397,72 @@ pub(crate) fn bind_uploaded_file(
     let mut bound = reference.clone();
     bound.source_entry_id = Some(source_entry_id.to_owned());
     Ok(bound)
+}
+
+pub(crate) fn list_uploaded_file_refs(dir: &Path) -> Result<Vec<UploadedFileRef>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut refs = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(artifact_id) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".file.json"))
+        else {
+            continue;
+        };
+        refs.push(read_uploaded_file_by_id(dir, artifact_id)?.0);
+    }
+    Ok(refs)
+}
+
+pub(crate) fn copy_committed_uploaded_files(source_dir: &Path, target_dir: &Path) -> Result<u64> {
+    if !source_dir.exists() {
+        return Ok(0);
+    }
+    fs::create_dir_all(target_dir)?;
+    let target_lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(target_dir.join(".aggregate.lock"))?;
+    FileExt::lock_exclusive(&target_lock)?;
+    let mut copied = 0_u64;
+    for entry in fs::read_dir(source_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".file.json") {
+            continue;
+        }
+        let bytes = fs::read(&path)?;
+        let stored: StoredUploadedFile = serde_json::from_slice(&bytes)?;
+        if stored.source_entry_id.is_none() {
+            continue;
+        }
+        let target = target_dir.join(name);
+        if target.exists() {
+            let existing: StoredUploadedFile = serde_json::from_slice(&fs::read(&target)?)?;
+            if existing.sha256 != stored.sha256
+                || existing.file_name != stored.file_name
+                || existing.source_entry_id != stored.source_entry_id
+            {
+                return Err(StoreError::ArtifactIntegrityMismatch);
+            }
+            continue;
+        }
+        let temp = target_dir.join(format!(".{name}.copy.tmp"));
+        fs::write(&temp, &bytes)?;
+        fs::rename(temp, target)?;
+        copied = copied
+            .checked_add(1)
+            .ok_or(StoreError::ArtifactQuotaExceeded)?;
+    }
+    Ok(copied)
 }
 
 pub(crate) fn delete_uncommitted_uploaded_files(dir: &Path) -> Result<u64> {

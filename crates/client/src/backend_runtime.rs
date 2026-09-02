@@ -59,17 +59,51 @@ impl BackendRuntimeTarget {
         media_type: &str,
         content: Vec<u8>,
     ) -> Result<protocol::UploadedFileRef, BackendRuntimeClientError> {
+        self.upload_file_with_id(
+            &uuid::Uuid::now_v7().to_string(),
+            file_name,
+            media_type,
+            content,
+        )
+        .await
+    }
+
+    pub async fn upload_file_with_id(
+        &self,
+        upload_id: &str,
+        file_name: &str,
+        media_type: &str,
+        content: Vec<u8>,
+    ) -> Result<protocol::UploadedFileRef, BackendRuntimeClientError> {
         let api = BackendApiClient::from_stored_token(&self.base_url)?;
-        let path = format!(
-            "/api/w/{}/runtimes/{}/workers/{}/attachments?file_name={}&media_type={}",
+        let worker_path = format!(
+            "/api/w/{}/runtimes/{}/workers/{}",
             path_segment_encode(&self.workspace_id),
             path_segment_encode(&self.runtime_id),
             path_segment_encode(&self.worker_id),
+        );
+        let grant_path = format!(
+            "{worker_path}/attachment-upload-grants?file_name={}&media_type={}&upload_id={}",
             path_segment_encode(file_name),
             path_segment_encode(media_type),
+            path_segment_encode(&upload_id),
+        );
+        let grant_response = api
+            .request(HttpMethod::POST, &grant_path)?
+            .send()
+            .await
+            .map_err(BackendRuntimeClientError::Http)?;
+        api.check_status(grant_response.status())?;
+        let grant = grant_response
+            .json::<AttachmentUploadGrantResponse>()
+            .await
+            .map_err(BackendRuntimeClientError::Http)?;
+        let upload_path = format!(
+            "{worker_path}/attachment-uploads/{}",
+            path_segment_encode(&grant.upload_id),
         );
         let response = api
-            .request(HttpMethod::POST, &path)?
+            .request(HttpMethod::PUT, &upload_path)?
             .body(content)
             .send()
             .await
@@ -80,6 +114,27 @@ impl BackendRuntimeTarget {
             .await
             .map(|response| response.file)
             .map_err(BackendRuntimeClientError::Http)
+    }
+
+    pub async fn cancel_file_upload(
+        &self,
+        upload_id: &str,
+    ) -> Result<(), BackendRuntimeClientError> {
+        let api = BackendApiClient::from_stored_token(&self.base_url)?;
+        let path = format!(
+            "/api/w/{}/runtimes/{}/workers/{}/attachment-uploads/{}",
+            path_segment_encode(&self.workspace_id),
+            path_segment_encode(&self.runtime_id),
+            path_segment_encode(&self.worker_id),
+            path_segment_encode(upload_id),
+        );
+        let response = api
+            .request(HttpMethod::DELETE, &path)?
+            .send()
+            .await
+            .map_err(BackendRuntimeClientError::Http)?;
+        api.check_status(response.status())?;
+        Ok(())
     }
 
     pub async fn delete_uploaded_file(
@@ -102,6 +157,13 @@ impl BackendRuntimeTarget {
         api.check_status(response.status())?;
         Ok(())
     }
+}
+
+#[derive(Deserialize)]
+struct AttachmentUploadGrantResponse {
+    upload_id: String,
+    #[allow(dead_code)]
+    expires_at_ms: u64,
 }
 
 #[derive(Deserialize)]
