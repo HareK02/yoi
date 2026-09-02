@@ -3,7 +3,10 @@ declare const Deno: {
   readTextFile(path: URL): Promise<string>;
 };
 
-import { toCodeMirrorCompletion } from "../../src/lib/workspace/config-source/completion.ts";
+import {
+  shouldStartCompletionAfterTyping,
+  toCodeMirrorCompletion,
+} from "../../src/lib/workspace/config-source/completion.ts";
 import { jsonWorkerMessage } from "../../src/lib/workspace/config-source/toolchain-message.ts";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -64,6 +67,25 @@ Deno.test("toolchain converts reactive-like proxies to plain Worker messages", a
   assert(
     workerSource.includes("set_schema_bundle(request.schemaBundle)"),
     "Config Source worker should install the WorkspaceConfigSchema global contract",
+  );
+});
+
+Deno.test("completion starts only after non-whitespace typing", () => {
+  assert(
+    !shouldStartCompletionAfterTyping(" "),
+    "Space should not start completion",
+  );
+  assert(
+    !shouldStartCompletionAfterTyping("\n"),
+    "Enter should not start completion",
+  );
+  assert(
+    !shouldStartCompletionAfterTyping("\t"),
+    "other whitespace should not start completion",
+  );
+  assert(
+    shouldStartCompletionAfterTyping("p"),
+    "non-whitespace typing should start completion",
   );
 });
 

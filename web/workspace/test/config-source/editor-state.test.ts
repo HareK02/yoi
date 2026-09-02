@@ -1,3 +1,4 @@
+import denoConfig from "../../deno.json" with { type: "json" };
 import { CODEMIRROR_VITE_DEDUPE } from "../../src/lib/workspace/config-source/vite-dedupe.ts";
 
 declare const Deno: {
@@ -22,6 +23,13 @@ Deno.test("Vite deduplicates CodeMirror stateful packages", () => {
     assert(
       CODEMIRROR_VITE_DEDUPE.includes(packageName),
       `Vite must deduplicate ${packageName}`,
+    );
+  }
+
+  for (const packageName of CODEMIRROR_VITE_DEDUPE) {
+    assert(
+      packageName in (denoConfig.imports ?? {}),
+      `${packageName} must be a direct dependency so Vite can deduplicate it`,
     );
   }
 });
@@ -92,11 +100,15 @@ Deno.test("Decodal editor follows readonly prop changes after mount", async () =
     "CodeMirror theme must use workspace tokens that actually exist",
   );
   assert(
-    source.includes("keymap.of(completionKeymap)") &&
+    source.includes("keymap.of(completionKeymapWithoutEnter)") &&
+      source.includes("binding.key !== 'Enter'") &&
+      source.includes("activateOnTyping: false") &&
+      source.includes("shouldStartCompletionAfterTyping(insertedText)") &&
       source.includes("startCompletion(editor)") &&
-      source.includes("update.selectionSet && !update.docChanged") &&
+      !source.includes("EditorView.domEventHandlers") &&
+      !source.includes("update.selectionSet") &&
       source.includes("completionStatus(editor.state) === null"),
-    "completion should be explicitly available and start when an editable cursor moves into an empty schema position",
+    "completion should start only after non-whitespace typing, without using focus, cursor movement, Space, or Enter",
   );
   assert(
     source.includes("fixedSchemaWrapperCompartment.reconfigure") &&

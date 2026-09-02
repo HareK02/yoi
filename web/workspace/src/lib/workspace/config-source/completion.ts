@@ -12,6 +12,12 @@ type ConfigSourceCompletionItem = {
   priority: number;
 };
 
+export function shouldStartCompletionAfterTyping(
+  insertedText: string,
+): boolean {
+  return /\S/u.test(insertedText);
+}
+
 export function toCodeMirrorCompletion(
   result: ConfigSourceCompletionResult | null,
 ): CompletionResult | null {

@@ -2,6 +2,7 @@
   import { untrack } from 'svelte';
   import {
     autocompletion,
+    closeCompletion,
     completionKeymap,
     completionStatus,
     startCompletion,
@@ -10,9 +11,10 @@
   } from '@codemirror/autocomplete';
   import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
   import { Compartment, EditorState } from '@codemirror/state';
-  import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } from '@codemirror/view';
+  import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection, type ViewUpdate } from '@codemirror/view';
   import { tags } from '@lezer/highlight';
   import { decodal } from 'decodal-codemirror';
+  import { shouldStartCompletionAfterTyping } from '$lib/workspace/config-source/completion.ts';
   import {
     fixedSchemaWrapperExtension,
     moveSelectionIntoFixedWrapper,
@@ -88,6 +90,27 @@
     });
   }
 
+  function typedText(update: ViewUpdate): string | null {
+    let foundTyping = false;
+    let insertedText = '';
+    for (const transaction of update.transactions) {
+      if (!transaction.isUserEvent('input.type')) continue;
+      foundTyping = true;
+      transaction.changes.iterChanges((_fromA, _toA, _fromB, _toB, inserted) => {
+        insertedText += inserted.toString();
+      });
+    }
+    return foundTyping ? insertedText : null;
+  }
+
+  function dismissCompletion(editor: EditorView) {
+    queueMicrotask(() => {
+      if (completionStatus(editor.state) !== null) closeCompletion(editor);
+    });
+  }
+
+  const completionKeymapWithoutEnter = completionKeymap.filter((binding) => binding.key !== 'Enter');
+
   $effect(() => {
     if (!host || untrack(() => view)) return;
     const initialValue = untrack(() => value);
@@ -106,6 +129,7 @@
           decodal({ highlight: false }),
           syntaxHighlighting(syntaxTheme),
           autocompletion({
+            activateOnTyping: false,
             override: [
               async (context: CompletionContext) => {
                 if (!handleComplete) return null;
@@ -114,7 +138,7 @@
               },
             ],
           }),
-          keymap.of(completionKeymap),
+          keymap.of(completionKeymapWithoutEnter),
           fixedSchemaWrapperCompartment.of(
             initialFixedSchemaWrapper ? fixedSchemaWrapperExtension() : [],
           ),
@@ -122,17 +146,18 @@
             EditorState.readOnly.of(initialReadonly),
             EditorView.editable.of(!initialReadonly),
           ]),
-          EditorView.domEventHandlers({
-            focus: (_event, editor) => {
-              scheduleCompletion(editor);
-              return false;
-            },
-          }),
           EditorView.updateListener.of((update) => {
-            if (update.selectionSet && !update.docChanged) {
-              scheduleCompletion(update.view);
+            if (update.docChanged) {
+              handleChange(update.state.doc.toString());
+              const insertedText = typedText(update);
+              if (insertedText !== null) {
+                if (shouldStartCompletionAfterTyping(insertedText)) {
+                  scheduleCompletion(update.view);
+                } else {
+                  dismissCompletion(update.view);
+                }
+              }
             }
-            if (update.docChanged) handleChange(update.state.doc.toString());
           }),
           theme,
         ],
@@ -156,7 +181,6 @@
         EditorView.editable.of(!nextReadonly),
       ]),
     });
-    if (!nextReadonly) scheduleCompletion(editor);
   });
 
   $effect(() => {
