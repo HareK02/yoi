@@ -369,7 +369,7 @@ mod tests {
             .upsert_repository(&RepositoryRecord {
                 workspace_id: "workspace".to_string(),
                 repository_id: "main".to_string(),
-                name: "main".to_string(),
+                repository_key: "main".to_string(),
                 kind: "git".to_string(),
                 provider: Some("git".to_string()),
                 source: workspace_api::RepositorySource {

@@ -13,16 +13,14 @@ use crate::store::{
 };
 use crate::{Error, Result};
 
-const DEFAULT_REPOSITORY_ID: &str = "main";
 const MAX_DISPLAY_NAME_BYTES: usize = 200;
 const MAX_OPERATION_KEY_BYTES: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InitialRepositoryIntent {
+    pub repository_key: String,
     pub uri: String,
-    #[serde(default)]
-    pub display_name: Option<String>,
     #[serde(default)]
     pub default_ref: Option<String>,
 }
@@ -102,14 +100,9 @@ impl WorkspaceCatalogService {
             normalize_required("display_name", request.display_name, MAX_DISPLAY_NAME_BYTES)?;
         let repository_source = validate_repository_source(&request.repository.uri)?;
         let repository_uri = repository_source.uri.clone();
-        let repository_name = request
-            .repository
-            .display_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("Main repository")
-            .to_string();
+        workspace_api::validate_repository_key(&request.repository.repository_key)
+            .map_err(|error| Error::InvalidInput(format!("invalid Repository key: {error}")))?;
+        let repository_key = request.repository.repository_key.clone();
         let default_ref = request
             .repository
             .default_ref
@@ -132,8 +125,8 @@ impl WorkspaceCatalogService {
             requested_workspace_id.as_deref(),
             &display_name,
             Some(&owner_account_id),
+            &repository_key,
             &repository_uri,
-            &repository_name,
             &default_ref,
         );
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
@@ -152,8 +145,8 @@ impl WorkspaceCatalogService {
                 },
                 repository: RepositoryRecord {
                     workspace_id,
-                    repository_id: DEFAULT_REPOSITORY_ID.to_string(),
-                    name: repository_name,
+                    repository_id: Uuid::now_v7().to_string(),
+                    repository_key: repository_key.clone(),
                     kind: "git".to_string(),
                     provider: Some("git".to_string()),
                     source: repository_source.clone(),
@@ -194,8 +187,8 @@ fn workspace_create_fingerprint(
     requested_workspace_id: Option<&str>,
     display_name: &str,
     owner_account_id: Option<&str>,
+    repository_key: &str,
     repository_uri: &str,
-    repository_name: &str,
     default_ref: &str,
 ) -> String {
     let payload = serde_json::json!({
@@ -203,9 +196,8 @@ fn workspace_create_fingerprint(
         "display_name": display_name,
         "owner_account_id": owner_account_id,
         "repository": {
-            "repository_id": DEFAULT_REPOSITORY_ID,
+            "repository_key": repository_key,
             "uri": repository_uri,
-            "display_name": repository_name,
             "default_ref": default_ref,
             "kind": "git",
         }
@@ -258,7 +250,7 @@ mod tests {
             display_name: "Workspace A".to_string(),
             repository: InitialRepositoryIntent {
                 uri: repository.path().display().to_string(),
-                display_name: None,
+                repository_key: "main".to_string(),
                 default_ref: None,
             },
         };
@@ -302,7 +294,7 @@ mod tests {
             display_name: "Workspace A".to_string(),
             repository: InitialRepositoryIntent {
                 uri: repository.path().display().to_string(),
-                display_name: None,
+                repository_key: "main".to_string(),
                 default_ref: None,
             },
         };
@@ -355,7 +347,7 @@ mod tests {
                     display_name: "Organization Workspace".to_string(),
                     repository: InitialRepositoryIntent {
                         uri: repository.path().display().to_string(),
-                        display_name: None,
+                        repository_key: "main".to_string(),
                         default_ref: None,
                     },
                 },
@@ -391,7 +383,7 @@ mod tests {
                     display_name: "Owner A Workspace".to_string(),
                     repository: InitialRepositoryIntent {
                         uri: repository_a.path().display().to_string(),
-                        display_name: None,
+                        repository_key: "main".to_string(),
                         default_ref: None,
                     },
                 },
@@ -405,7 +397,7 @@ mod tests {
                     display_name: "Owner B Workspace".to_string(),
                     repository: InitialRepositoryIntent {
                         uri: repository_b.path().display().to_string(),
-                        display_name: None,
+                        repository_key: "main".to_string(),
                         default_ref: None,
                     },
                 },
@@ -441,7 +433,7 @@ mod tests {
                     display_name: "Remote Workspace".to_string(),
                     repository: InitialRepositoryIntent {
                         uri: "ssh://git@example.test/org/repository.git".to_string(),
-                        display_name: Some("Remote Repository".to_string()),
+                        repository_key: "remote".to_string(),
                         default_ref: Some("main".to_string()),
                     },
                 },

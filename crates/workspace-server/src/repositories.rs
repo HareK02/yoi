@@ -15,6 +15,7 @@ pub type RepositorySelector = String;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfiguredRepository {
     pub id: RepositoryId,
+    pub repository_key: String,
     pub provider: String,
     pub source: RepositorySource,
     pub source_revision: u64,
@@ -22,7 +23,6 @@ pub struct ConfiguredRepository {
     pub observed_status: RepositoryObservedStatus,
     pub observed_at: Option<String>,
     pub path: Option<PathBuf>,
-    pub display_name: Option<String>,
     pub default_selector: Option<RepositorySelector>,
 }
 
@@ -34,7 +34,7 @@ pub struct RepositoryListProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryLogRead {
-    pub repository_id: RepositoryId,
+    pub repository_key: String,
     pub default_selector: Option<RepositorySelector>,
     pub limit: usize,
     pub commits: Vec<GitCommitSummary>,
@@ -97,21 +97,28 @@ impl RepositoryRegistryReader {
         }
     }
 
-    pub fn summary(&self, id: &str) -> Result<RepositorySummary, RepositoryLookupError> {
-        let repository = self
-            .find(id)
-            .ok_or_else(|| RepositoryLookupError::UnknownRepository { id: id.to_string() })?;
+    pub fn summary(
+        &self,
+        repository_key: &str,
+    ) -> Result<RepositorySummary, RepositoryLookupError> {
+        let repository = self.find_by_key(repository_key).ok_or_else(|| {
+            RepositoryLookupError::UnknownRepository {
+                id: repository_key.to_string(),
+            }
+        })?;
         Ok(self.summary_for_config(repository))
     }
 
     pub fn recent_log(
         &self,
-        id: &str,
+        repository_key: &str,
         limit: Option<usize>,
     ) -> Result<RepositoryLogRead, RepositoryLookupError> {
-        let repository = self
-            .find(id)
-            .ok_or_else(|| RepositoryLookupError::UnknownRepository { id: id.to_string() })?;
+        let repository = self.find_by_key(repository_key).ok_or_else(|| {
+            RepositoryLookupError::UnknownRepository {
+                id: repository_key.to_string(),
+            }
+        })?;
         if repository.provider != "git" {
             return Err(RepositoryLookupError::UnsupportedProvider {
                 id: repository.id.clone(),
@@ -134,7 +141,7 @@ impl RepositoryRegistryReader {
         };
 
         Ok(RepositoryLogRead {
-            repository_id: repository.id.clone(),
+            repository_key: repository.repository_key.clone(),
             default_selector: repository.default_selector.clone(),
             limit,
             commits,
@@ -260,6 +267,12 @@ impl RepositoryRegistryReader {
         Ok(repository)
     }
 
+    fn find_by_key(&self, repository_key: &str) -> Option<&ConfiguredRepository> {
+        self.repositories
+            .iter()
+            .find(|repository| repository.repository_key == repository_key)
+    }
+
     fn find(&self, id: &str) -> Option<&ConfiguredRepository> {
         self.repositories
             .iter()
@@ -267,10 +280,6 @@ impl RepositoryRegistryReader {
     }
 
     fn summary_for_config(&self, repository: &ConfiguredRepository) -> RepositorySummary {
-        let display_name = repository
-            .display_name
-            .clone()
-            .unwrap_or_else(|| repository.id.clone());
         let mut diagnostics = Vec::new();
         if repository.source.kind == workspace_api::RepositorySourceKind::Http {
             diagnostics.push(RepositoryDiagnostic {
@@ -314,8 +323,7 @@ impl RepositoryRegistryReader {
         };
 
         RepositorySummary {
-            id: repository.id.clone(),
-            display_name,
+            repository_key: repository.repository_key.clone(),
             kind: repository.provider.clone(),
             provider: repository.provider.clone(),
             source: repository.source.clone(),
@@ -600,7 +608,7 @@ mod tests {
         };
         let reader = RepositoryRegistryReader::new(vec![ConfiguredRepository {
             id: "remote".into(),
-            display_name: Some("Remote".into()),
+            repository_key: "remote".into(),
             provider: "git".into(),
             source_fingerprint: crate::repository_source::repository_source_fingerprint(&source),
             source,
@@ -724,7 +732,7 @@ mod tests {
         };
         let reader = RepositoryRegistryReader::new(vec![ConfiguredRepository {
             id: "main".into(),
-            display_name: Some("Main".into()),
+            repository_key: "main".into(),
             provider: "git".into(),
             source_fingerprint: crate::repository_source::repository_source_fingerprint(
                 &source_descriptor,

@@ -272,6 +272,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create durable Workdir removal operations",
         apply: crate::workdir_removal::create_workdir_removal_operations,
     },
+    Migration {
+        version: 50,
+        name: "replace public Repository ids with immutable Workspace keys",
+        apply: migrate_repository_identity_to_keys,
+    },
 ];
 
 struct Migration {
@@ -323,7 +328,7 @@ pub struct WorkerCreateReservation {
 pub struct RepositoryRecord {
     pub workspace_id: String,
     pub repository_id: String,
-    pub name: String,
+    pub repository_key: String,
     pub kind: String,
     pub provider: Option<String>,
     pub source: RepositorySource,
@@ -879,6 +884,16 @@ pub trait ControlPlaneStore: Send + Sync {
         workspace_id: &str,
         repository_id: &str,
     ) -> Result<Option<RepositoryRecord>>;
+    fn get_repository_by_key(
+        &self,
+        workspace_id: &str,
+        repository_key: &str,
+    ) -> Result<Option<RepositoryRecord>> {
+        Ok(self
+            .list_repositories(workspace_id)?
+            .into_iter()
+            .find(|repository| repository.repository_key == repository_key))
+    }
     fn list_repositories(&self, workspace_id: &str) -> Result<Vec<RepositoryRecord>>;
 
     fn put_flow_source_for_kind(
@@ -1914,11 +1929,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     read_workspace_record,
                 )?;
                 let repository = tx.query_row(
-                    r#"SELECT workspace_id, repository_id, name, kind, provider,
+                    r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
                               source_kind, source_uri, default_ref, source_revision,
                               source_fingerprint, observed_status, observed_at, created_at, updated_at
-                       FROM repositories WHERE workspace_id = ?1 AND repository_id = ?2"#,
-                    params![workspace.workspace_id, record.repository.repository_id],
+                       FROM repositories WHERE workspace_id = ?1 AND repository_key = ?2"#,
+                    params![workspace.workspace_id, record.repository.repository_key],
                     read_repository_record,
                 )?;
                 let config_revision = crate::config_source::load_state(&tx, &workspace.workspace_id)?
@@ -1953,15 +1968,19 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 }
                 let existing_repository = tx
                     .query_row(
-                        r#"SELECT workspace_id, repository_id, name, kind, provider,
+                        r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
                                   source_kind, source_uri, default_ref, source_revision,
                                   source_fingerprint, observed_status, observed_at, created_at, updated_at
-                           FROM repositories WHERE workspace_id = ?1 AND repository_id = ?2"#,
-                        params![record.repository.workspace_id, record.repository.repository_id],
+                           FROM repositories WHERE workspace_id = ?1 AND repository_key = ?2"#,
+                        params![record.repository.workspace_id, record.repository.repository_key],
                         read_repository_record,
                     )
                     .optional()?;
-                if existing_repository.as_ref() != Some(&record.repository) {
+                if existing_repository.as_ref().is_none_or(|existing| {
+                    let mut requested = record.repository.clone();
+                    requested.repository_id.clone_from(&existing.repository_id);
+                    existing != &requested
+                }) {
                     return Err(Error::WorkspaceConfigConflict(
                         "Workspace initial repository already exists with different metadata"
                             .to_string(),
@@ -1993,14 +2012,14 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 )?;
                 tx.execute(
                     r#"INSERT INTO repositories (
-                        workspace_id, repository_id, name, kind, provider, uri,
+                        workspace_id, repository_id, repository_key, kind, provider, uri,
                         source_kind, source_uri, default_ref, source_revision,
                         source_fingerprint, observed_status, observed_at, created_at, updated_at
                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
                     params![
                         record.repository.workspace_id,
                         record.repository.repository_id,
-                        record.repository.name,
+                        record.repository.repository_key,
                         record.repository.kind,
                         record.repository.provider,
                         record.repository.source.uri,
@@ -2191,15 +2210,15 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     }
 
     fn upsert_repository(&self, record: &RepositoryRecord) -> Result<()> {
+        validate_repository_record_identity(record)?;
         self.with_conn(|conn| {
             conn.execute(
                 r#"INSERT INTO repositories (
-                    workspace_id, repository_id, name, kind, provider, uri,
+                    workspace_id, repository_id, repository_key, kind, provider, uri,
                     source_kind, source_uri, default_ref, source_revision,
                     source_fingerprint, observed_status, observed_at, created_at, updated_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-                ON CONFLICT(workspace_id, repository_id) DO UPDATE SET
-                    name = excluded.name,
+                ON CONFLICT(workspace_id, repository_key) DO UPDATE SET
                     kind = excluded.kind,
                     provider = excluded.provider,
                     default_ref = excluded.default_ref,
@@ -2209,7 +2228,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 params![
                     record.workspace_id,
                     record.repository_id,
-                    record.name,
+                    record.repository_key,
                     record.kind,
                     record.provider,
                     record.source.uri,
@@ -2229,16 +2248,17 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     }
 
     fn insert_repository(&self, record: &RepositoryRecord) -> Result<RepositoryInsertOutcome> {
+        validate_repository_record_identity(record)?;
         self.with_conn_mut(|conn| {
             let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let existing = transaction
                 .query_row(
-                    r#"SELECT workspace_id, repository_id, name, kind, provider,
+                    r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
                               source_kind, source_uri, default_ref, source_revision,
                               source_fingerprint, observed_status, observed_at, created_at, updated_at
                        FROM repositories
-                       WHERE workspace_id = ?1 AND repository_id = ?2"#,
-                    params![record.workspace_id, record.repository_id],
+                       WHERE workspace_id = ?1 AND repository_key = ?2"#,
+                    params![record.workspace_id, record.repository_key],
                     read_repository_record,
                 )
                 .optional()?;
@@ -2249,14 +2269,14 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
 
             transaction.execute(
                 r#"INSERT INTO repositories (
-                    workspace_id, repository_id, name, kind, provider, uri,
+                    workspace_id, repository_id, repository_key, kind, provider, uri,
                     source_kind, source_uri, default_ref, source_revision,
                     source_fingerprint, observed_status, observed_at, created_at, updated_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
                 params![
                     record.workspace_id,
                     record.repository_id,
-                    record.name,
+                    record.repository_key,
                     record.kind,
                     record.provider,
                     record.source.uri,
@@ -2283,7 +2303,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Option<RepositoryRecord>> {
         self.with_conn(|conn| {
             conn.query_row(
-                r#"SELECT workspace_id, repository_id, name, kind, provider,
+                r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
                           source_kind, source_uri, default_ref, source_revision,
                           source_fingerprint, observed_status, observed_at, created_at, updated_at
                    FROM repositories
@@ -2296,15 +2316,35 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn get_repository_by_key(
+        &self,
+        workspace_id: &str,
+        repository_key: &str,
+    ) -> Result<Option<RepositoryRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
+                          source_kind, source_uri, default_ref, source_revision,
+                          source_fingerprint, observed_status, observed_at, created_at, updated_at
+                   FROM repositories
+                   WHERE workspace_id = ?1 AND repository_key = ?2"#,
+                params![workspace_id, repository_key],
+                read_repository_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
     fn list_repositories(&self, workspace_id: &str) -> Result<Vec<RepositoryRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                r#"SELECT workspace_id, repository_id, name, kind, provider,
+                r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
                           source_kind, source_uri, default_ref, source_revision,
                           source_fingerprint, observed_status, observed_at, created_at, updated_at
                    FROM repositories
                    WHERE workspace_id = ?1
-                   ORDER BY repository_id ASC"#,
+                   ORDER BY repository_key ASC"#,
             )?;
             let rows = stmt.query_map(params![workspace_id], read_repository_record)?;
             rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -5332,6 +5372,12 @@ fn read_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceR
     })
 }
 
+fn validate_repository_record_identity(record: &RepositoryRecord) -> Result<()> {
+    workspace_api::validate_repository_key(&record.repository_key)
+        .map_err(|error| Error::InvalidInput(format!("invalid Repository key: {error}")))?;
+    Ok(())
+}
+
 fn read_repository_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepositoryRecord> {
     let source_kind_value = row.get::<_, String>(5)?;
     let source_kind = workspace_api::RepositorySourceKind::parse(&source_kind_value)
@@ -5354,7 +5400,7 @@ fn read_repository_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Repositor
     Ok(RepositoryRecord {
         workspace_id: row.get(0)?,
         repository_id: row.get(1)?,
-        name: row.get(2)?,
+        repository_key: row.get(2)?,
         kind: row.get(3)?,
         provider: row.get(4)?,
         source,
@@ -7010,6 +7056,179 @@ fn normalize_schema_sql(sql: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase()
+}
+
+fn migrate_repository_identity_to_keys(conn: &Connection) -> Result<()> {
+    const REPOSITORY_REFERENCE_TABLES: &[&str] = &[
+        "artifacts",
+        "merge_requests",
+        "typed_tickets",
+        "workdir_create_operations",
+        "workdir_registry",
+        "workdir_removal_operations",
+    ];
+
+    // Read-only preflight every legacy public id and every persisted relational
+    // reference before creating the mapping or mutating authority.
+    let legacy_repositories = {
+        let mut stmt = conn.prepare(
+            "SELECT workspace_id, repository_id FROM repositories ORDER BY workspace_id, repository_id",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (workspace_id, repository_key) in &legacy_repositories {
+        workspace_api::validate_repository_key(repository_key).map_err(|error| {
+            Error::Store(format!(
+                "repository identity migration rejected {workspace_id}/{repository_key:?}: {error}"
+            ))
+        })?;
+    }
+
+    let tables = {
+        let mut stmt = conn.prepare(
+            "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for table in &tables {
+        let quoted = table.replace('"', "\"\"");
+        let pragma = format!("PRAGMA table_info(\"{quoted}\")");
+        let mut stmt = conn.prepare(&pragma)?;
+        let has_repository_id = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "repository_id");
+        if has_repository_id
+            && table != "repositories"
+            && table != "legacy_repositories"
+            && !REPOSITORY_REFERENCE_TABLES.contains(&table.as_str())
+        {
+            return Err(Error::Store(format!(
+                "repository identity migration does not recognize repository_id authority in table {table}"
+            )));
+        }
+    }
+    for table in REPOSITORY_REFERENCE_TABLES {
+        if !tables.iter().any(|candidate| candidate == table) {
+            continue;
+        }
+        let sql = format!(
+            r#"SELECT COUNT(*)
+               FROM "{table}" AS child
+               LEFT JOIN repositories AS repository
+                 ON repository.workspace_id = child.workspace_id
+                AND repository.repository_id = child.repository_id
+               WHERE child.repository_id IS NOT NULL
+                 AND repository.repository_id IS NULL"#
+        );
+        let dangling: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
+        if dangling != 0 {
+            return Err(Error::Store(format!(
+                "repository identity migration found {dangling} dangling same-Workspace reference(s) in {table}"
+            )));
+        }
+    }
+
+    conn.execute_batch(
+        r#"
+        CREATE TEMP TABLE repository_identity_v50 (
+            workspace_id TEXT NOT NULL,
+            old_repository_id TEXT NOT NULL,
+            new_repository_id TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, old_repository_id),
+            UNIQUE (new_repository_id)
+        ) WITHOUT ROWID;
+        "#,
+    )?;
+    for (workspace_id, old_repository_id) in &legacy_repositories {
+        conn.execute(
+            r#"INSERT INTO repository_identity_v50 (
+                   workspace_id, old_repository_id, new_repository_id
+               ) VALUES (?1, ?2, ?3)"#,
+            params![workspace_id, old_repository_id, Uuid::now_v7().to_string()],
+        )?;
+    }
+
+    for table in REPOSITORY_REFERENCE_TABLES {
+        if !tables.iter().any(|candidate| candidate == table) {
+            continue;
+        }
+        let sql = format!(
+            r#"UPDATE "{table}" AS child
+               SET repository_id = (
+                   SELECT mapping.new_repository_id
+                   FROM repository_identity_v50 AS mapping
+                   WHERE mapping.workspace_id = child.workspace_id
+                     AND mapping.old_repository_id = child.repository_id
+               )
+               WHERE child.repository_id IS NOT NULL"#
+        );
+        conn.execute(&sql, [])?;
+    }
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE repositories_v50 (
+            workspace_id TEXT NOT NULL,
+            repository_id TEXT NOT NULL PRIMARY KEY,
+            repository_key TEXT NOT NULL
+                CHECK(length(repository_key) BETWEEN 1 AND 64)
+                CHECK(repository_key NOT GLOB '*[^a-z0-9-]*')
+                CHECK(substr(repository_key, 1, 1) <> '-')
+                CHECK(substr(repository_key, -1, 1) <> '-'),
+            kind TEXT NOT NULL,
+            provider TEXT,
+            uri TEXT NOT NULL,
+            default_ref TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            source_uri TEXT NOT NULL,
+            source_revision INTEGER NOT NULL DEFAULT 1,
+            source_fingerprint TEXT NOT NULL,
+            observed_status TEXT NOT NULL DEFAULT 'unverified',
+            observed_at TEXT,
+            UNIQUE(workspace_id, repository_key),
+            UNIQUE(workspace_id, repository_id),
+            FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+        INSERT INTO repositories_v50 (
+            workspace_id, repository_id, repository_key, kind, provider, uri,
+            default_ref, created_at, updated_at, source_kind, source_uri,
+            source_revision, source_fingerprint, observed_status, observed_at
+        )
+        SELECT repository.workspace_id,
+               mapping.new_repository_id,
+               repository.repository_id,
+               repository.kind,
+               repository.provider,
+               repository.uri,
+               repository.default_ref,
+               repository.created_at,
+               repository.updated_at,
+               repository.source_kind,
+               repository.source_uri,
+               repository.source_revision,
+               repository.source_fingerprint,
+               repository.observed_status,
+               repository.observed_at
+        FROM repositories AS repository
+        JOIN repository_identity_v50 AS mapping
+          ON mapping.workspace_id = repository.workspace_id
+         AND mapping.old_repository_id = repository.repository_id;
+        DROP TABLE repositories;
+        ALTER TABLE repositories_v50 RENAME TO repositories;
+        CREATE INDEX repositories_workspace_provider_idx
+            ON repositories(workspace_id, provider);
+        DROP TABLE repository_identity_v50;
+        "#,
+    )?;
+    Ok(())
 }
 
 fn require_workspace_account_owner(conn: &Connection) -> Result<()> {
@@ -9523,6 +9742,62 @@ pub(crate) fn apply_migrations_through(conn: &Connection, through_version: i64) 
             continue;
         }
 
+        if migration.version == 50 {
+            conn.execute_batch(
+                "PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON; BEGIN EXCLUSIVE;",
+            )?;
+            let result = (|| -> Result<()> {
+                (migration.apply)(conn)?;
+                let dangling_reference: Option<(String, String)> = conn
+                    .query_row(
+                        "SELECT name, sql FROM sqlite_schema \
+                         WHERE sql LIKE '%repositories_v50%' \
+                            OR sql LIKE '%repository_identity_v50%' LIMIT 1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((object, sql)) = dangling_reference {
+                    return Err(Error::Store(format!(
+                        "migration 50 left a temporary Repository reference in `{object}`: {sql}"
+                    )));
+                }
+                let foreign_key_failures: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get(0)
+                    })?;
+                if foreign_key_failures != 0 {
+                    return Err(Error::Store(format!(
+                        "migration 50 found {foreign_key_failures} foreign key violation(s)"
+                    )));
+                }
+                conn.execute(
+                    "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+                    params![migration.version, migration.name],
+                )?;
+                conn.execute_batch("COMMIT;")?;
+                Ok(())
+            })();
+            if result.is_err() && !conn.is_autocommit() {
+                conn.execute_batch("ROLLBACK;")?;
+            }
+            conn.execute_batch("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;")
+                .map_err(|error| {
+                    Error::Store(format!(
+                        "migration 50 could not restore FK enforcement: {error}"
+                    ))
+                })?;
+            let foreign_keys_enabled =
+                conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))?;
+            if foreign_keys_enabled != 1 {
+                return Err(Error::Store(
+                    "migration 50 did not restore foreign key enforcement".to_string(),
+                ));
+            }
+            result?;
+            continue;
+        }
+
         if migration.version == 48 {
             // Rebuilding the parent Workspace table requires FK enforcement to be disabled
             // outside the transaction. The migration, verification, and schema marker still
@@ -10150,7 +10425,7 @@ mod tests {
         let store = SqliteWorkspaceStore::open(&path).unwrap();
         store
             .with_conn(|conn| {
-                assert_eq!(current_schema_version(conn)?, 49);
+                assert_eq!(current_schema_version(conn)?, 50);
                 assert!(table_exists(conn, "workdir_removal_operations")?);
                 let columns = table_columns(conn, "workdir_removal_operations")?;
                 for required in [
@@ -10180,7 +10455,12 @@ mod tests {
                     );
                 }
                 let preserved: (String, String, String) = conn.query_row(
-                    "SELECT workspace_id, repository_id, materialization_status FROM workdir_registry WHERE workdir_id='workdir-a'",
+                    "SELECT workdir.workspace_id, repository.repository_key, workdir.materialization_status \
+                     FROM workdir_registry AS workdir \
+                     JOIN repositories AS repository \
+                       ON repository.workspace_id = workdir.workspace_id \
+                      AND repository.repository_id = workdir.repository_id \
+                     WHERE workdir.workdir_id='workdir-a'",
                     [],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )?;
@@ -10250,11 +10530,11 @@ mod tests {
         assign_explicit_test_workspace_owner(&conn);
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 49);
+        assert_eq!(current_schema_version(&conn).unwrap(), 50);
         let remote = conn
             .query_row(
                 "SELECT source_kind, source_uri, source_revision, source_fingerprint, observed_status \
-                 FROM repositories WHERE workspace_id = 'workspace-a' AND repository_id = 'remote'",
+                 FROM repositories WHERE workspace_id = 'workspace-a' AND repository_key = 'remote'",
                 [],
                 |row| {
                     Ok((
@@ -10276,7 +10556,7 @@ mod tests {
         let invalid = conn
             .query_row(
                 "SELECT source_kind, observed_status FROM repositories \
-                 WHERE workspace_id = 'workspace-a' AND repository_id = 'invalid'",
+                 WHERE workspace_id = 'workspace-a' AND repository_key = 'invalid'",
                 [],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
@@ -10329,7 +10609,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 36);
-        assert_eq!(plan.target_schema_version, 49);
+        assert_eq!(plan.target_schema_version, 50);
         assert!(plan.migration_required);
         assert_eq!(plan.worker_count, 1);
         assert_eq!(plan.mappings[0].legacy_worker_id, 7);
@@ -10343,7 +10623,7 @@ mod tests {
         store
             .with_conn(|conn| {
                 assert!(table_exists(conn, "worker_diagnostics_archives")?);
-                assert_eq!(current_schema_version(conn)?, 49);
+                assert_eq!(current_schema_version(conn)?, 50);
                 Ok(())
             })
             .unwrap();
@@ -10483,7 +10763,7 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(current_schema_version(&conn).unwrap(), 49);
+        assert_eq!(current_schema_version(&conn).unwrap(), 50);
         let foreign_key_error: Option<String> = conn
             .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
             .optional()
@@ -10613,7 +10893,7 @@ INSERT INTO worker_orphan_diagnostics (
         assign_explicit_test_workspace_owner(&conn);
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 49);
+        assert_eq!(current_schema_version(&conn).unwrap(), 50);
         assert!(!table_exists(&conn, "worker_control_delegation_operations").unwrap());
         let controller_worker_id: String = conn
             .query_row(
@@ -10731,7 +11011,7 @@ INSERT INTO worker_orphan_diagnostics (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 49);
+        assert_eq!(current_schema_version(&conn).unwrap(), 50);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
     }
 
@@ -10750,7 +11030,7 @@ INSERT INTO worker_orphan_diagnostics (
         assign_explicit_test_workspace_owner(&conn);
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 49);
+        assert_eq!(current_schema_version(&conn).unwrap(), 50);
         let settings = conn
             .query_row(
                 "SELECT settings_revision, language FROM workspace_memory_settings \
@@ -10791,7 +11071,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 49);
+        assert_eq!(current_schema_version(&conn).unwrap(), 50);
         assert!(table_exists(&conn, "flow_sources").unwrap());
         assert!(table_exists(&conn, "flow_source_revisions").unwrap());
         assert!(!table_exists(&conn, "flow_instances").unwrap());
@@ -10859,7 +11139,7 @@ INSERT INTO worker_workdir_attachment_reservations (
         assign_explicit_test_workspace_owner(&conn);
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 49);
+        assert_eq!(current_schema_version(&conn).unwrap(), 50);
         let repositories_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",
@@ -10867,7 +11147,8 @@ INSERT INTO worker_workdir_attachment_reservations (
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(repositories_sql.contains("PRIMARY KEY (workspace_id, repository_id)"));
+        assert!(repositories_sql.contains("repository_id TEXT NOT NULL PRIMARY KEY"));
+        assert!(repositories_sql.contains("UNIQUE(workspace_id, repository_key)"));
         let preserved: (i64, i64, i64) = (
             conn.query_row("SELECT COUNT(*) FROM artifacts", [], |row| row.get(0))
                 .unwrap(),
@@ -10891,14 +11172,20 @@ INSERT INTO worker_workdir_attachment_reservations (
         assert_eq!(foreign_key_violations, 0);
         conn.execute(
             r#"INSERT INTO repositories (
-                workspace_id, repository_id, name, kind, uri, created_at, updated_at
-            ) VALUES ('workspace-b', 'main', 'Other Main', 'git', '/repo-b', '2', '2')"#,
+                workspace_id, repository_id, repository_key, kind, provider, uri, default_ref,
+                created_at, updated_at, source_kind, source_uri, source_revision,
+                source_fingerprint, observed_status
+            ) VALUES (
+                'workspace-b', '01890f47-3c22-7cc0-98c4-dc0c0c07398f', 'main',
+                'git', 'local', '/repo-b', 'HEAD', '2', '2', 'local', '/repo-b', 1,
+                'sha256:test', 'unverified'
+            )"#,
             [],
         )
         .unwrap();
         assert_eq!(
             conn.query_row(
-                "SELECT COUNT(*) FROM repositories WHERE repository_id = 'main'",
+                "SELECT COUNT(*) FROM repositories WHERE repository_key = 'main'",
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -11001,7 +11288,7 @@ INSERT INTO workdir_registry (
             .upsert_repository(&RepositoryRecord {
                 workspace_id: "workspace-a".to_string(),
                 repository_id: "main".to_string(),
-                name: "Main".to_string(),
+                repository_key: "main".to_string(),
                 kind: "git".to_string(),
                 provider: Some("git".to_string()),
                 source: RepositorySource {
@@ -11042,7 +11329,7 @@ INSERT INTO workdir_registry (
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 49);
+        assert_eq!(store.schema_version().await.unwrap(), 50);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -11059,7 +11346,7 @@ INSERT INTO workdir_registry (
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 49);
+        assert_eq!(reopened.schema_version().await.unwrap(), 50);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -11825,7 +12112,7 @@ INSERT INTO worker_registry (
         let migrated = SqliteWorkspaceStore::open(&db_path).unwrap();
         migrated
             .with_conn(|conn| {
-                assert_eq!(current_schema_version(conn)?, 49);
+                assert_eq!(current_schema_version(conn)?, 50);
                 assert_eq!(
                     conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))?,
                     1,
@@ -11912,7 +12199,7 @@ INSERT INTO worker_registry (
             .upsert_repository(&RepositoryRecord {
                 workspace_id: "workspace-role".to_string(),
                 repository_id: "main".to_string(),
-                name: "Main".to_string(),
+                repository_key: "main".to_string(),
                 kind: "git".to_string(),
                 provider: Some("git".to_string()),
                 source: RepositorySource {
@@ -12176,7 +12463,7 @@ INSERT INTO worker_registry (
         assert_eq!(current_schema_version(&conn).unwrap(), 44);
 
         apply_migrations(&conn).unwrap();
-        assert_eq!(current_schema_version(&conn).unwrap(), 49);
+        assert_eq!(current_schema_version(&conn).unwrap(), 50);
         assert!(table_exists(&conn, "workdir_create_operations").unwrap());
         let columns = table_columns(&conn, "workdir_create_operations").unwrap();
         for required in [
@@ -12203,7 +12490,7 @@ INSERT INTO worker_registry (
         assert_eq!(current_schema_version(&conn).unwrap(), 45);
 
         apply_migrations(&conn).unwrap();
-        assert_eq!(current_schema_version(&conn).unwrap(), 49);
+        assert_eq!(current_schema_version(&conn).unwrap(), 50);
         for table in [
             "repository_ssh_credentials",
             "repository_ssh_credential_revisions",
@@ -12230,7 +12517,7 @@ INSERT INTO worker_registry (
         assert_eq!(current_schema_version(&conn).unwrap(), 46);
 
         apply_migrations(&conn).unwrap();
-        assert_eq!(current_schema_version(&conn).unwrap(), 49);
+        assert_eq!(current_schema_version(&conn).unwrap(), 50);
         let columns = table_columns(&conn, "workdir_create_operations").unwrap();
         for required in [
             "source_kind",
@@ -12259,18 +12546,172 @@ INSERT INTO worker_registry (
     }
 
     #[test]
+    fn schema_v50_rekeys_repositories_and_same_workspace_references() {
+        let conn = workspace_owner_schema_47();
+        apply_migrations_through(&conn, 49).unwrap();
+        conn.execute_batch(
+            r#"
+            INSERT INTO accounts (
+                account_id, kind, handle, display_name, created_at, updated_at
+            ) VALUES ('owner-account', 'user', 'owner', 'Owner', '1', '1');
+            INSERT INTO workspaces (
+                workspace_id, display_name, state, created_at, updated_at, owner_account_id
+            ) VALUES
+                ('workspace-a', 'Workspace A', 'active', '1', '1', 'owner-account'),
+                ('workspace-b', 'Workspace B', 'active', '1', '1', 'owner-account');
+            INSERT INTO repositories (
+                workspace_id, repository_id, name, kind, provider, uri, default_ref,
+                created_at, updated_at, source_kind, source_uri, source_revision,
+                source_fingerprint, observed_status
+            ) VALUES
+                ('workspace-a', 'main', 'Legacy A', 'git', 'git', '/repo-a', 'develop',
+                 '1', '1', 'local_path', '/repo-a', 1, 'sha256:a', 'unverified'),
+                ('workspace-b', 'main', 'Legacy B', 'git', 'git', '/repo-b', 'develop',
+                 '1', '1', 'local_path', '/repo-b', 1, 'sha256:b', 'unverified');
+            INSERT INTO artifacts (
+                workspace_id, artifact_id, kind, uri, created_at,
+                created_by_kind, created_by_key, created_by_display, repository_id
+            ) VALUES
+                ('workspace-a', 'artifact-a', 'report', 'artifact://a', '1',
+                 'worker', 'W-1', 'Worker 1', 'main'),
+                ('workspace-b', 'artifact-b', 'report', 'artifact://b', '1',
+                 'worker', 'W-2', 'Worker 2', 'main');
+            INSERT INTO workdir_registry (
+                workspace_id, workdir_id, runtime_id, repository_id,
+                materialization_status, cleanliness, created_at, updated_at
+            ) VALUES
+                ('workspace-a', 'workdir-a', 'runtime-a', 'main', 'present', 'clean', '1', '1'),
+                ('workspace-b', 'workdir-b', 'runtime-b', 'main', 'present', 'clean', '1', '1');
+            "#,
+        )
+        .unwrap();
+
+        apply_migrations(&conn).unwrap();
+
+        assert_eq!(current_schema_version(&conn).unwrap(), 50);
+        let repositories = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT workspace_id, repository_id, repository_key FROM repositories ORDER BY workspace_id",
+                )
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        assert_eq!(repositories.len(), 2);
+        assert_eq!(repositories[0].2, "main");
+        assert_eq!(repositories[1].2, "main");
+        assert_ne!(repositories[0].1, repositories[1].1);
+        for (_, repository_id, _) in &repositories {
+            assert_eq!(Uuid::parse_str(repository_id).unwrap().get_version_num(), 7);
+        }
+        for (workspace_id, repository_id, _) in &repositories {
+            let artifact_repository_id: String = conn
+                .query_row(
+                    "SELECT repository_id FROM artifacts WHERE workspace_id = ?1",
+                    params![workspace_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let workdir_repository_id: String = conn
+                .query_row(
+                    "SELECT repository_id FROM workdir_registry WHERE workspace_id = ?1",
+                    params![workspace_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(&artifact_repository_id, repository_id);
+            assert_eq!(&workdir_repository_id, repository_id);
+        }
+        assert!(
+            table_columns(&conn, "repositories")
+                .unwrap()
+                .iter()
+                .all(|column| column != "name")
+        );
+        let foreign_key_failures: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_failures, 0);
+    }
+
+    #[test]
+    fn schema_v50_preflight_rolls_back_invalid_legacy_repository_key() {
+        let conn = workspace_owner_schema_47();
+        apply_migrations_through(&conn, 49).unwrap();
+        conn.execute_batch(
+            r#"
+            INSERT INTO accounts (
+                account_id, kind, handle, display_name, created_at, updated_at
+            ) VALUES ('owner-account', 'user', 'owner', 'Owner', '1', '1');
+            INSERT INTO workspaces (
+                workspace_id, display_name, state, created_at, updated_at, owner_account_id
+            ) VALUES ('workspace-a', 'Workspace A', 'active', '1', '1', 'owner-account');
+            INSERT INTO repositories (
+                workspace_id, repository_id, name, kind, provider, uri, default_ref,
+                created_at, updated_at, source_kind, source_uri, source_revision,
+                source_fingerprint, observed_status
+            ) VALUES (
+                'workspace-a', 'Invalid_Key', 'Legacy', 'git', 'git', '/repo', 'develop',
+                '1', '1', 'local_path', '/repo', 1, 'sha256:a', 'unverified'
+            );
+            "#,
+        )
+        .unwrap();
+        let schema_before: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'repositories'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let error = apply_migrations(&conn).unwrap_err().to_string();
+
+        assert!(error.contains("Invalid_Key"), "{error}");
+        assert!(error.contains("lowercase ASCII"), "{error}");
+        assert_eq!(current_schema_version(&conn).unwrap(), 49);
+        let schema_after: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'repositories'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_after, schema_before);
+        let persisted: (String, String) = conn
+            .query_row(
+                "SELECT repository_id, name FROM repositories WHERE workspace_id = 'workspace-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, ("Invalid_Key".to_string(), "Legacy".to_string()));
+    }
+
+    #[test]
     fn server_refuses_a_database_from_a_newer_schema_generation() {
         let conn = Connection::open_in_memory().unwrap();
         configure_sqlite(&conn).unwrap();
         apply_migrations(&conn).unwrap();
         conn.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (50, 'future')",
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (51, 'future')",
             [],
         )
         .unwrap();
 
         let error = apply_migrations(&conn).unwrap_err().to_string();
-        assert!(error.contains("schema version 50 is newer"), "{error}");
+        assert!(error.contains("schema version 51 is newer"), "{error}");
         assert!(error.contains("refusing to serve"), "{error}");
     }
 
@@ -12494,7 +12935,7 @@ VALUES ('workspace-b', 'ticket-b', 'related', 'ticket-a', NULL, 'tester', '2026-
         assign_explicit_test_workspace_owner(&conn);
         apply_migrations(&mut conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 49);
+        assert_eq!(current_schema_version(&conn).unwrap(), 50);
         let workspace_id: Option<String> = conn
             .query_row(
                 "SELECT workspace_id FROM trusted_runtime_records WHERE runtime_id = 'runtime-a'",
@@ -12989,13 +13430,11 @@ WHERE workspace_id = 'workspace-a'
             [
                 "workspace_id",
                 "repository_id",
-                "name",
+                "repository_key",
                 "kind",
                 "provider",
                 "uri",
                 "default_ref",
-                "auth_ref_kind",
-                "auth_ref_key",
                 "created_at",
                 "updated_at",
                 "source_kind",
@@ -13123,7 +13562,7 @@ WHERE workspace_id = 'workspace-a'
         assign_explicit_test_workspace_owner(&conn);
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 49);
+        assert_eq!(store.schema_version().await.unwrap(), 50);
 
         store
             .with_conn(|conn| {
@@ -13312,7 +13751,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 49);
+        assert_eq!(store.schema_version().await.unwrap(), 50);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: "owner-account".to_string(),
@@ -13326,7 +13765,7 @@ CREATE TABLE ticket_assignment_operations (
         let repository = RepositoryRecord {
             workspace_id: "local-dev".to_string(),
             repository_id: "main".to_string(),
-            name: "Yoi".to_string(),
+            repository_key: "yoi".to_string(),
             kind: "git".to_string(),
             provider: Some("git".to_string()),
             source: RepositorySource {
@@ -13371,7 +13810,8 @@ CREATE TABLE ticket_assignment_operations (
         store.upsert_workspace(&other_workspace).await.unwrap();
         let mut other_repository = repository.clone();
         other_repository.workspace_id = other_workspace.workspace_id.clone();
-        other_repository.name = "Other Yoi".to_string();
+        other_repository.repository_id = "other-main".to_string();
+        other_repository.repository_key = "other-yoi".to_string();
         other_repository.source.uri = "/other/yoi".to_string();
         other_repository.source_fingerprint =
             crate::repository_source::repository_source_fingerprint(&other_repository.source);
@@ -13382,7 +13822,9 @@ CREATE TABLE ticket_assignment_operations (
             Some(repository)
         );
         assert_eq!(
-            store.get_repository("other-workspace", "main").unwrap(),
+            store
+                .get_repository("other-workspace", "other-main")
+                .unwrap(),
             Some(other_repository)
         );
     }
@@ -13390,7 +13832,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 49);
+        assert_eq!(store.schema_version().await.unwrap(), 50);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: "owner-account".to_string(),
@@ -13480,7 +13922,7 @@ CREATE TABLE ticket_assignment_operations (
             .upsert_repository(&RepositoryRecord {
                 workspace_id: workspace.workspace_id.clone(),
                 repository_id: "repo".to_string(),
-                name: "Repository".to_string(),
+                repository_key: "repository".to_string(),
                 kind: "git".to_string(),
                 provider: Some("git".to_string()),
                 source: RepositorySource {
@@ -13803,7 +14245,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 49);
+        assert_eq!(store.schema_version().await.unwrap(), 50);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

@@ -288,6 +288,7 @@ impl ServerConfig {
             .into_iter()
             .map(|repository| ConfiguredRepository {
                 id: repository.repository_id,
+                repository_key: repository.repository_key,
                 provider: repository.provider.unwrap_or(repository.kind),
                 path: repository_local_path(&repository.source),
                 source: repository.source,
@@ -295,7 +296,6 @@ impl ServerConfig {
                 source_fingerprint: repository.source_fingerprint,
                 observed_status: repository.observed_status,
                 observed_at: repository.observed_at,
-                display_name: Some(repository.name),
                 default_selector: repository.default_ref,
             })
             .collect();
@@ -1056,8 +1056,7 @@ fn workspace_summary(record: WorkspaceRecord) -> WorkspaceSummary {
 fn workspace_repository_record(record: RepositoryRecord) -> WorkspaceRepositoryRecord {
     WorkspaceRepositoryRecord {
         workspace_id: record.workspace_id,
-        repository_id: record.repository_id,
-        name: record.name,
+        repository_key: record.repository_key,
         kind: record.kind,
         provider: record.provider,
         source: record.source,
@@ -2061,13 +2060,14 @@ fn import_configured_repositories(
     }
     let now = crate::auth::now_rfc3339();
     for repository in &config.repositories {
+        let repository_id = store
+            .get_repository_by_key(&config.workspace_id, &repository.repository_key)?
+            .map(|record| record.repository_id)
+            .unwrap_or_else(|| Uuid::now_v7().to_string());
         store.upsert_repository(&RepositoryRecord {
             workspace_id: config.workspace_id.clone(),
-            repository_id: repository.id.clone(),
-            name: repository
-                .display_name
-                .clone()
-                .unwrap_or_else(|| repository.id.clone()),
+            repository_id,
+            repository_key: repository.repository_key.clone(),
             kind: repository.provider.clone(),
             provider: Some(repository.provider.clone()),
             source: repository.source.clone(),
@@ -2102,6 +2102,7 @@ fn configured_repository_from_record(
     let path = repository_local_path(&record.source);
     Ok(ConfiguredRepository {
         id: record.repository_id,
+        repository_key: record.repository_key,
         provider,
         path,
         source: record.source,
@@ -2109,7 +2110,6 @@ fn configured_repository_from_record(
         source_fingerprint: record.source_fingerprint,
         observed_status: record.observed_status,
         observed_at: record.observed_at,
-        display_name: Some(record.name),
         default_selector: record.default_ref,
     })
 }
@@ -7901,8 +7901,9 @@ async fn scoped_create_repository(
 ) -> ApiResult<(StatusCode, Json<CreateWorkspaceRepositoryResponse>)> {
     require_workspace_owner(&api, &path.workspace_id, &actor, "ManageRepositories").await?;
 
-    let repository_id = normalize_repository_identifier(&request.repository_id)?;
-    let display_name = normalize_repository_text(&request.display_name, "display_name", 256)?;
+    workspace_api::validate_repository_key(&request.repository_key)
+        .map_err(|error| Error::InvalidInput(format!("invalid Repository key: {error}")))?;
+    let repository_key = request.repository_key;
     let default_ref = request
         .default_ref
         .as_deref()
@@ -7913,8 +7914,8 @@ async fn scoped_create_repository(
     let now = Utc::now().to_rfc3339();
     let record = RepositoryRecord {
         workspace_id: path.workspace_id.clone(),
-        repository_id: repository_id.clone(),
-        name: display_name,
+        repository_id: Uuid::now_v7().to_string(),
+        repository_key: repository_key.clone(),
         kind: "git".to_string(),
         provider: Some("git".to_string()),
         source_fingerprint: repository_source_fingerprint(&source),
@@ -7936,7 +7937,7 @@ async fn scoped_create_repository(
         }
         RepositoryInsertOutcome::Existing(_) => {
             return Err(Error::RepositoryConflict(format!(
-                "repository_id {repository_id} already exists with different registration intent"
+                "Repository key {repository_key} already exists with different registration intent"
             ))
             .into());
         }
@@ -7946,28 +7947,10 @@ async fn scoped_create_repository(
         status,
         Json(CreateWorkspaceRepositoryResponse {
             workspace_id: path.workspace_id,
-            repository_id,
+            repository_key,
             replayed,
         }),
     ))
-}
-
-fn normalize_repository_identifier(value: &str) -> Result<String> {
-    let value = value.trim();
-    if value.is_empty() || value.len() > 128 {
-        return Err(Error::InvalidInput(
-            "repository_id must contain 1..=128 characters".to_string(),
-        ));
-    }
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        return Err(Error::InvalidInput(
-            "repository_id must contain only ASCII letters, digits, '-', '_', or '.'".to_string(),
-        ));
-    }
-    Ok(value.to_string())
 }
 
 fn normalize_repository_text(value: &str, field: &str, max_len: usize) -> Result<String> {
@@ -7985,8 +7968,7 @@ fn repository_create_intent_matches(
     requested: &RepositoryRecord,
 ) -> bool {
     existing.workspace_id == requested.workspace_id
-        && existing.repository_id == requested.repository_id
-        && existing.name == requested.name
+        && existing.repository_key == requested.repository_key
         && existing.kind == requested.kind
         && existing.provider == requested.provider
         && existing.source == requested.source
@@ -11643,9 +11625,14 @@ async fn list_repositories(
 
 async fn repository_detail(
     State(api): State<WorkspaceApi>,
-    AxumPath(repository_id): AxumPath<String>,
+    AxumPath(repository_key): AxumPath<String>,
 ) -> ApiResult<Json<RepositoryDetailResponse>> {
-    let item = repository_lookup(api.live_repository_reader()?.summary(&repository_id))?;
+    workspace_api::validate_repository_key(&repository_key).map_err(|error| {
+        ApiError::from(Error::InvalidInput(format!(
+            "invalid Repository key: {error}"
+        )))
+    })?;
+    let item = repository_lookup(api.live_repository_reader()?.summary(&repository_key))?;
     Ok(Json(RepositoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
         item,
@@ -11655,22 +11642,27 @@ async fn repository_detail(
 
 async fn repository_log(
     State(api): State<WorkspaceApi>,
-    AxumPath(repository_id): AxumPath<String>,
+    AxumPath(repository_key): AxumPath<String>,
     Query(query): Query<LogQuery>,
 ) -> ApiResult<Json<RepositoryLogResponse>> {
+    workspace_api::validate_repository_key(&repository_key).map_err(|error| {
+        ApiError::from(Error::InvalidInput(format!(
+            "invalid Repository key: {error}"
+        )))
+    })?;
     let RepositoryLogRead {
-        repository_id,
+        repository_key,
         default_selector,
         limit,
         commits,
         diagnostics,
     } = repository_lookup(
         api.live_repository_reader()?
-            .recent_log(&repository_id, query.limit),
+            .recent_log(&repository_key, query.limit),
     )?;
     Ok(Json(RepositoryLogResponse {
         workspace_id: api.config.workspace_id,
-        repository_id,
+        repository_key,
         default_selector,
         limit,
         items: commits,
@@ -14381,10 +14373,7 @@ fn working_directory_repository_options(
         .iter()
         .map(|repository| WorkingDirectoryRepositoryOption {
             id: repository.id.clone(),
-            display_name: repository
-                .display_name
-                .clone()
-                .unwrap_or_else(|| repository.id.clone()),
+            display_name: repository.repository_key.clone(),
             default_selector: repository.default_selector.clone(),
         })
         .collect()
@@ -16543,7 +16532,7 @@ mod tests {
             .upsert_repository(&RepositoryRecord {
                 workspace_id: other_workspace.workspace_id.clone(),
                 repository_id: "foreign".to_string(),
-                name: "Foreign".to_string(),
+                repository_key: "foreign".to_string(),
                 kind: "git".to_string(),
                 provider: Some("git".to_string()),
                 source: workspace_api::RepositorySource {
@@ -17942,7 +17931,7 @@ mod tests {
         let repositories = vec![RepositoryRecord {
             workspace_id: "remote-workspace".to_string(),
             repository_id: "main".to_string(),
-            name: "Main".to_string(),
+            repository_key: "main".to_string(),
             kind: "git".to_string(),
             provider: Some("git".to_string()),
             source_fingerprint: crate::repository_source::repository_source_fingerprint(&source),
@@ -17982,6 +17971,7 @@ mod tests {
         };
         config.repositories = vec![ConfiguredRepository {
             id: TEST_REPOSITORY_ID.to_string(),
+            repository_key: "test-repository".to_string(),
             provider: "git".to_string(),
             source_fingerprint: crate::repository_source::repository_source_fingerprint(&source),
             source,
@@ -17989,7 +17979,6 @@ mod tests {
             observed_status: workspace_api::RepositoryObservedStatus::Unverified,
             observed_at: None,
             path: Some(workspace_root),
-            display_name: Some("Test Repository".to_string()),
             default_selector: Some("HEAD".to_string()),
         }];
         config
@@ -18135,8 +18124,8 @@ mod tests {
                     operation_key: "create-auth".to_owned(),
                     display_name: "Auth Workspace".to_owned(),
                     repository: crate::workspace_catalog::InitialRepositoryIntent {
+                        repository_key: "main".to_string(),
                         uri: repository.display().to_string(),
-                        display_name: None,
                         default_ref: None,
                     },
                 },
@@ -18262,8 +18251,8 @@ mod tests {
             operation_key: "create-authenticated-workspace".to_owned(),
             display_name: "Authenticated Workspace".to_owned(),
             repository: crate::workspace_catalog::InitialRepositoryIntent {
+                repository_key: "main".to_string(),
                 uri: created_repository.display().to_string(),
-                display_name: Some("Main".to_owned()),
                 default_ref: Some("develop".to_owned()),
             },
         };
@@ -18415,8 +18404,7 @@ mod tests {
 
         let repositories_uri = format!("/api/w/{}/repositories", workspace.workspace.workspace_id);
         let repository_request = serde_json::json!({
-            "repository_id": "documentation",
-            "display_name": "Documentation",
+            "repository_key": "documentation",
             "source": temp.path().join("documentation").display().to_string(),
             "default_ref": "main"
         });
@@ -18730,8 +18718,8 @@ mod tests {
                     operation_key: "create-a".to_string(),
                     display_name: "Workspace A".to_string(),
                     repository: crate::workspace_catalog::InitialRepositoryIntent {
+                        repository_key: "main".to_string(),
                         uri: repository_a.display().to_string(),
-                        display_name: None,
                         default_ref: None,
                     },
                 },
@@ -18744,8 +18732,8 @@ mod tests {
                     operation_key: "create-b".to_string(),
                     display_name: "Workspace B".to_string(),
                     repository: crate::workspace_catalog::InitialRepositoryIntent {
+                        repository_key: "main".to_string(),
                         uri: repository_b.display().to_string(),
-                        display_name: None,
                         default_ref: None,
                     },
                 },
@@ -22217,7 +22205,7 @@ mod tests {
             .upsert_repository(&RepositoryRecord {
                 workspace_id: api.config.workspace_id.clone(),
                 repository_id: repository_id.to_string(),
-                name: repository_id.to_string(),
+                repository_key: repository_id.to_string(),
                 kind: "git".to_string(),
                 provider: Some("git".to_string()),
                 source: workspace_api::RepositorySource {
@@ -24987,9 +24975,7 @@ mod tests {
             .upsert_repository(&RepositoryRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 repository_id: configured_repository.id,
-                name: configured_repository
-                    .display_name
-                    .unwrap_or_else(|| "Test Repository".to_string()),
+                repository_key: configured_repository.repository_key,
                 kind: "git".to_string(),
                 provider: Some(configured_repository.provider),
                 source: configured_repository.source,
@@ -25289,7 +25275,10 @@ mod tests {
         let repositories = get_json(app.clone(), "/api/repositories").await;
         let typed_repositories: workspace_api::RepositoryListResponse =
             serde_json::from_value(repositories.clone()).unwrap();
-        assert_eq!(typed_repositories.items[0].id, TEST_REPOSITORY_ID);
+        assert_eq!(
+            typed_repositories.items[0].repository_key,
+            TEST_REPOSITORY_ID
+        );
         assert_eq!(repositories["items"][0]["id"], TEST_REPOSITORY_ID);
         assert_eq!(repositories["items"][0]["kind"], "git");
         assert_eq!(
@@ -25759,6 +25748,7 @@ mod tests {
         let mut config = test_server_config(root.path());
         config.repositories = vec![ConfiguredRepository {
             id: "files".to_string(),
+            repository_key: "files".to_string(),
             provider: "local_fs".to_string(),
             source: workspace_api::RepositorySource {
                 kind: workspace_api::RepositorySourceKind::LocalPath,
@@ -25769,7 +25759,6 @@ mod tests {
             observed_status: workspace_api::RepositoryObservedStatus::Unverified,
             observed_at: None,
             path: Some(root.path().to_path_buf()),
-            display_name: None,
             default_selector: None,
         }];
         let store = test_control_store(&config);

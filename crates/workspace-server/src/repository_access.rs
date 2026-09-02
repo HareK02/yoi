@@ -1846,7 +1846,7 @@ mod tests {
             .upsert_repository(&RepositoryRecord {
                 workspace_id: "workspace-a".to_string(),
                 repository_id: "remote".to_string(),
-                name: "Remote".to_string(),
+                repository_key: "remote".to_string(),
                 kind: "git".to_string(),
                 provider: Some("git".to_string()),
                 source,

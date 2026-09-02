@@ -6,6 +6,54 @@
 
 use serde::{Deserialize, Serialize};
 
+pub const REPOSITORY_KEY_MIN_LEN: usize = 1;
+pub const REPOSITORY_KEY_MAX_LEN: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryKeyError {
+    Length,
+    Character,
+    LeadingHyphen,
+    TrailingHyphen,
+}
+
+impl std::fmt::Display for RepositoryKeyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Length => "must contain between 1 and 64 ASCII bytes",
+            Self::Character => "must contain only lowercase ASCII letters, digits, and hyphens",
+            Self::LeadingHyphen => "must not start with a hyphen",
+            Self::TrailingHyphen => "must not end with a hyphen",
+        })
+    }
+}
+
+impl std::error::Error for RepositoryKeyError {}
+
+/// Validate one immutable Workspace-scoped Repository key.
+///
+/// Keys are deliberately not normalized: callers must submit the exact canonical
+/// lowercase ASCII spelling so idempotency and route identity cannot alias.
+pub fn validate_repository_key(value: &str) -> Result<(), RepositoryKeyError> {
+    let bytes = value.as_bytes();
+    if !(REPOSITORY_KEY_MIN_LEN..=REPOSITORY_KEY_MAX_LEN).contains(&bytes.len()) {
+        return Err(RepositoryKeyError::Length);
+    }
+    if bytes[0] == b'-' {
+        return Err(RepositoryKeyError::LeadingHyphen);
+    }
+    if bytes[bytes.len() - 1] == b'-' {
+        return Err(RepositoryKeyError::TrailingHyphen);
+    }
+    if !bytes
+        .iter()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+    {
+        return Err(RepositoryKeyError::Character);
+    }
+    Ok(())
+}
+
 /// Provider-neutral classification of an authoritative Repository source.
 ///
 /// Local paths remain distinct from network Git transports so callers cannot
@@ -70,8 +118,7 @@ pub struct RepositorySource {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CreateWorkspaceRepositoryRequest {
-    pub repository_id: String,
-    pub display_name: String,
+    pub repository_key: String,
     pub source: String,
     #[serde(default)]
     pub default_ref: Option<String>,
@@ -80,7 +127,7 @@ pub struct CreateWorkspaceRepositoryRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateWorkspaceRepositoryResponse {
     pub workspace_id: String,
-    pub repository_id: String,
+    pub repository_key: String,
     pub replayed: bool,
 }
 
@@ -139,8 +186,7 @@ pub struct WorkspaceCatalogListResponse(pub Vec<WorkspaceSummary>);
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceRepositoryRecord {
     pub workspace_id: String,
-    pub repository_id: String,
-    pub name: String,
+    pub repository_key: String,
     pub kind: String,
     pub provider: Option<String>,
     pub source: RepositorySource,
@@ -348,8 +394,7 @@ pub struct GitRepositorySummary {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositorySummary {
-    pub id: String,
-    pub display_name: String,
+    pub repository_key: String,
     pub kind: String,
     pub provider: String,
     pub source: RepositorySource,
@@ -410,7 +455,7 @@ pub struct RepositoryDetailResponse {
 #[serde(deny_unknown_fields)]
 pub struct RepositoryLogResponse {
     pub workspace_id: String,
-    pub repository_id: String,
+    pub repository_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
     pub default_selector: Option<String>,
@@ -1330,6 +1375,27 @@ mod workdir_typescript_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_key_validation_is_canonical_and_bounded() {
+        let max = "a".repeat(64);
+        for valid in ["a", "main", "repo-42", max.as_str()] {
+            assert_eq!(validate_repository_key(valid), Ok(()), "{valid}");
+        }
+        let too_long = "a".repeat(65);
+        for invalid in [
+            "",
+            "-main",
+            "main-",
+            "Main",
+            "main_repo",
+            "main.repo",
+            "日本語",
+            too_long.as_str(),
+        ] {
+            assert!(validate_repository_key(invalid).is_err(), "{invalid}");
+        }
+    }
 
     #[test]
     fn workspace_and_repository_response_shapes_round_trip() {
