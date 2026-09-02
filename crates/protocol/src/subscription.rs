@@ -170,6 +170,23 @@ fn validate_identifier(
     Ok(())
 }
 
+fn validate_repository_key(value: &str) -> Result<(), SubscriptionValidationError> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 64
+        || bytes.first() == Some(&b'-')
+        || bytes.last() == Some(&b'-')
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+    {
+        return Err(SubscriptionValidationError::InvalidIdentifier {
+            field: "repository_key",
+        });
+    }
+    Ok(())
+}
+
 fn validate_rejection_message(message: &str) -> Result<(), SubscriptionValidationError> {
     if message.is_empty() {
         return Err(SubscriptionValidationError::EmptyRejectionMessage);
@@ -567,6 +584,7 @@ pub struct SubscriptionWorker {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(skip))]
     pub repository_id: Option<String>,
     /// Workspace-facing Repository key. Runtime producers leave this unset and
     /// Workspace Server projections replace `repository_id` with this field.
@@ -588,6 +606,14 @@ impl SubscriptionWorker {
         if let Some(repository_id) = &self.repository_id {
             validate_identifier("repository_id", repository_id, MAX_RESOURCE_ID_BYTES)?;
         }
+        if let Some(repository_key) = &self.repository_key {
+            validate_repository_key(repository_key)?;
+        }
+        if self.repository_id.is_some() && self.repository_key.is_some() {
+            return Err(SubscriptionValidationError::InvalidIdentifier {
+                field: "repository_authority",
+            });
+        }
         if let Some(working_directory_id) = &self.working_directory_id {
             working_directory_id.validate()?;
         }
@@ -599,7 +625,13 @@ impl SubscriptionWorker {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct SubscriptionWorkdir {
     pub working_directory_id: SubscriptionWorkdirId,
-    pub repository_id: String,
+    /// Runtime-internal Repository id. Workspace-facing TypeScript contracts
+    /// omit this field and require `repository_key` from the Server projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(skip))]
+    pub repository_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_key: Option<String>,
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_worker_id: Option<SubscriptionWorkerId>,
@@ -608,7 +640,41 @@ pub struct SubscriptionWorkdir {
 impl SubscriptionWorkdir {
     pub fn validate(&self) -> Result<(), SubscriptionValidationError> {
         self.working_directory_id.validate()?;
-        validate_identifier("repository_id", &self.repository_id, MAX_RESOURCE_ID_BYTES)?;
+        match (&self.repository_id, &self.repository_key) {
+            (Some(repository_id), None) => {
+                validate_identifier("repository_id", repository_id, MAX_RESOURCE_ID_BYTES)?;
+            }
+            (None, Some(repository_key)) => validate_repository_key(repository_key)?,
+            _ => {
+                return Err(SubscriptionValidationError::InvalidIdentifier {
+                    field: "repository_authority",
+                });
+            }
+        }
+        validate_identifier("workdir_state", &self.state, MAX_RESOURCE_ID_BYTES)?;
+        if let Some(worker_id) = &self.primary_worker_id {
+            worker_id.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Workspace-facing Workdir summary. Backend-generated Repository UUIDs never
+/// enter this DTO; Workspace Server must resolve the required Repository key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct WorkspaceSubscriptionWorkdir {
+    pub working_directory_id: SubscriptionWorkdirId,
+    pub repository_key: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_worker_id: Option<SubscriptionWorkerId>,
+}
+
+impl WorkspaceSubscriptionWorkdir {
+    pub fn validate(&self) -> Result<(), SubscriptionValidationError> {
+        self.working_directory_id.validate()?;
+        validate_repository_key(&self.repository_key)?;
         validate_identifier("workdir_state", &self.state, MAX_RESOURCE_ID_BYTES)?;
         if let Some(worker_id) = &self.primary_worker_id {
             worker_id.validate()?;
@@ -629,7 +695,7 @@ pub enum SubscriptionSnapshot {
         events: Vec<WorkerProtocolEvent>,
     },
     WorkspaceWorkdirs {
-        workdirs: Vec<SubscriptionWorkdir>,
+        workdirs: Vec<WorkspaceSubscriptionWorkdir>,
     },
 }
 
@@ -697,7 +763,7 @@ pub enum SubscriptionEventPayload {
         event: WorkerProtocolEvent,
     },
     WorkdirUpserted {
-        workdir: SubscriptionWorkdir,
+        workdir: WorkspaceSubscriptionWorkdir,
     },
     WorkdirRemoved {
         working_directory_id: SubscriptionWorkdirId,
@@ -818,6 +884,37 @@ mod tests {
             repository_key: None,
             working_directory_id: None,
         }
+    }
+
+    #[test]
+    fn runtime_and_workspace_repository_identity_projections_do_not_alias() {
+        let mut runtime_worker = worker("worker-1");
+        runtime_worker.repository_id = Some("01890f47-3c22-7cc0-98c4-dc0c0c07398f".to_string());
+        runtime_worker.validate().unwrap();
+        let runtime_json = serde_json::to_value(&runtime_worker).unwrap();
+        assert_eq!(
+            runtime_json["repository_id"],
+            "01890f47-3c22-7cc0-98c4-dc0c0c07398f"
+        );
+        assert!(runtime_json.get("repository_key").is_none());
+
+        let mut workspace_worker = worker("worker-1");
+        workspace_worker.repository_key = Some("main".to_string());
+        workspace_worker.validate().unwrap();
+        let workspace_json = serde_json::to_value(&workspace_worker).unwrap();
+        assert_eq!(workspace_json["repository_key"], "main");
+        assert!(workspace_json.get("repository_id").is_none());
+
+        let workspace_workdir = WorkspaceSubscriptionWorkdir {
+            working_directory_id: SubscriptionWorkdirId::new("workdir-1").unwrap(),
+            repository_key: "main".to_string(),
+            state: "active".to_string(),
+            primary_worker_id: Some(worker_id("worker-1")),
+        };
+        workspace_workdir.validate().unwrap();
+        let workdir_json = serde_json::to_value(&workspace_workdir).unwrap();
+        assert_eq!(workdir_json["repository_key"], "main");
+        assert!(workdir_json.get("repository_id").is_none());
     }
 
     #[test]

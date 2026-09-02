@@ -192,18 +192,18 @@ resource_key?: string | null,
 /**
  * Producer-owned monotonic revision for this Worker subject.
  */
-subject_revision: number, state: SubscriptionWorkerState, has_running_internal_workers: boolean, workspace_id?: string | null, display_name?: string | null, profile?: string | null, repository_id?: string | null,
+subject_revision: number, state: SubscriptionWorkerState, has_running_internal_workers: boolean, workspace_id?: string | null, display_name?: string | null, profile?: string | null,
 /**
  * Workspace-facing Repository key. Runtime producers leave this unset and
  * Workspace Server projections replace `repository_id` with this field.
  */
 repository_key?: string | null, working_directory_id?: SubscriptionWorkdirId | null, };
 
-export type SubscriptionWorkdir = { working_directory_id: SubscriptionWorkdirId, repository_id: string, state: string, primary_worker_id?: SubscriptionWorkerId | null, };
+export type WorkspaceSubscriptionWorkdir = { working_directory_id: SubscriptionWorkdirId, repository_key: string, state: string, primary_worker_id?: SubscriptionWorkerId | null, };
 
-export type SubscriptionSnapshot = { "topic": "workers", "data": { workers: Array<SubscriptionWorker>, } } | { "topic": "worker_protocol", "data": { worker_id: SubscriptionWorkerId, events: Array<Event>, } } | { "topic": "workspace_workdirs", "data": { workdirs: Array<SubscriptionWorkdir>, } };
+export type SubscriptionSnapshot = { "topic": "workers", "data": { workers: Array<SubscriptionWorker>, } } | { "topic": "worker_protocol", "data": { worker_id: SubscriptionWorkerId, events: Array<Event>, } } | { "topic": "workspace_workdirs", "data": { workdirs: Array<WorkspaceSubscriptionWorkdir>, } };
 
-export type SubscriptionEventPayload = { "event": "worker_upserted", "data": { worker: SubscriptionWorker, } } | { "event": "worker_removed", "data": { worker_id: SubscriptionWorkerId, runtime_id?: string | null, } } | { "event": "worker_protocol", "data": { worker_id: SubscriptionWorkerId, event: Event, } } | { "event": "workdir_upserted", "data": { workdir: SubscriptionWorkdir, } } | { "event": "workdir_removed", "data": { working_directory_id: SubscriptionWorkdirId, } };
+export type SubscriptionEventPayload = { "event": "worker_upserted", "data": { worker: SubscriptionWorker, } } | { "event": "worker_removed", "data": { worker_id: SubscriptionWorkerId, runtime_id?: string | null, } } | { "event": "worker_protocol", "data": { worker_id: SubscriptionWorkerId, event: Event, } } | { "event": "workdir_upserted", "data": { workdir: WorkspaceSubscriptionWorkdir, } } | { "event": "workdir_removed", "data": { working_directory_id: SubscriptionWorkdirId, } };
 
 export type SubscriptionRejectionCode = "invalid_request" | "unsupported_protocol_version" | "unsupported_selector" | "unauthorized" | "resource_not_found" | "capacity_exceeded" | "internal";
 

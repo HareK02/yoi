@@ -16,9 +16,9 @@ use crate::{
         EventSubscriptionSelector, SubscriptionEvent, SubscriptionEventPayload, SubscriptionFrame,
         SubscriptionFramePayload, SubscriptionId, SubscriptionRejectionCode, SubscriptionRequest,
         SubscriptionRequestId, SubscriptionResponse, SubscriptionSnapshot,
-        SubscriptionTerminationCode, SubscriptionWorkdir, SubscriptionWorkdirId,
-        SubscriptionWorker, SubscriptionWorkerId, SubscriptionWorkerIds,
-        SubscriptionWorkerProtocolMethod, SubscriptionWorkerState,
+        SubscriptionTerminationCode, SubscriptionWorkdirId, SubscriptionWorker,
+        SubscriptionWorkerId, SubscriptionWorkerIds, SubscriptionWorkerProtocolMethod,
+        SubscriptionWorkerState, WorkspaceSubscriptionWorkdir,
     },
 };
 
@@ -92,7 +92,7 @@ pub fn generated_protocol_types() -> String {
     push_decl::<SubscriptionWorkerState>(&cfg, &mut output);
     push_decl::<EventSubscriptionSelector>(&cfg, &mut output);
     push_decl::<SubscriptionWorker>(&cfg, &mut output);
-    push_decl::<SubscriptionWorkdir>(&cfg, &mut output);
+    push_decl::<WorkspaceSubscriptionWorkdir>(&cfg, &mut output);
     push_decl::<SubscriptionSnapshot>(&cfg, &mut output);
     push_decl::<SubscriptionEventPayload>(&cfg, &mut output);
     push_decl::<SubscriptionRejectionCode>(&cfg, &mut output);
@@ -135,6 +135,14 @@ fn export_decl(decl: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_typescript_omits_runtime_repository_ids() {
+        let generated = generated_protocol_types();
+        assert!(!generated.contains("repository_id?:"), "{generated}");
+        assert!(!generated.contains("repository_id:"), "{generated}");
+        assert!(generated.contains("repository_key"), "{generated}");
+    }
 
     #[test]
     fn generated_protocol_types_are_current() {

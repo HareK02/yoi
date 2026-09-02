@@ -2054,8 +2054,7 @@ impl WorkspaceApi {
                 })?;
             if selected_repository_id.as_deref() != Some(repository_id) {
                 return Err(ApiError::from(Error::Config(format!(
-                    "Ticket `{ticket_id}` targets repository `{repository_key}`, but the Worker launch resolves `{}`",
-                    selected_repository_id.as_deref().unwrap_or("none")
+                    "Ticket `{ticket_id}` targets Repository `{repository_key}`, but the Worker launch resolves a different Repository"
                 ))));
             }
             if selected_ref_selector.as_deref() != Some(ref_selector) {

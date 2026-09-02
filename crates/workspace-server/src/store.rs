@@ -1903,6 +1903,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         &self,
         record: &WorkspaceBootstrapRecord,
     ) -> Result<WorkspaceBootstrapResult> {
+        validate_repository_record_identity(&record.repository)?;
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let owner_kind = tx
@@ -1959,43 +1960,18 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 });
             }
 
-            if let Some(existing) = tx
+            if tx
                 .query_row(
-                    r#"SELECT workspace_id, owner_account_id, display_name, state, created_at, updated_at
-                       FROM workspaces WHERE workspace_id = ?1"#,
+                    "SELECT 1 FROM workspaces WHERE workspace_id = ?1",
                     params![record.workspace.workspace_id],
-                    read_workspace_record,
+                    |row| row.get::<_, i64>(0),
                 )
                 .optional()?
+                .is_some()
             {
-                if existing.owner_account_id != record.workspace.owner_account_id
-                    || existing.display_name != record.workspace.display_name
-                    || existing.state != record.workspace.state
-                {
-                    return Err(Error::WorkspaceConfigConflict(
-                        "Workspace identity already exists with different metadata".to_string(),
-                    ));
-                }
-                let existing_repository = tx
-                    .query_row(
-                        r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
-                                  source_kind, source_uri, default_ref, source_revision,
-                                  source_fingerprint, observed_status, observed_at, created_at, updated_at
-                           FROM repositories WHERE workspace_id = ?1 AND repository_key = ?2"#,
-                        params![record.repository.workspace_id, record.repository.repository_key],
-                        read_repository_record,
-                    )
-                    .optional()?;
-                if existing_repository.as_ref().is_none_or(|existing| {
-                    let mut requested = record.repository.clone();
-                    requested.repository_id.clone_from(&existing.repository_id);
-                    existing != &requested
-                }) {
-                    return Err(Error::WorkspaceConfigConflict(
-                        "Workspace initial repository already exists with different metadata"
-                            .to_string(),
-                    ));
-                }
+                return Err(Error::WorkspaceConfigConflict(
+                    "Workspace identity already exists".to_string(),
+                ));
             } else {
                 tx.execute(
                     r#"INSERT INTO workspaces (
@@ -13783,6 +13759,103 @@ CREATE TABLE ticket_assignment_operations (
         assert!(column_exists(&conn, "workdir_registry", "current_ref").unwrap());
         assert!(
             column_exists(&conn, "ticket_assignment_operations", "request_fingerprint").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_bootstrap_validates_key_and_rejects_duplicate_workspace() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        store
+            .upsert_account(&AccountRecord {
+                account_id: "owner-account".to_string(),
+                kind: "user".to_string(),
+                handle: "owner".to_string(),
+                display_name: "Owner".to_string(),
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .unwrap();
+        let workspace = WorkspaceRecord {
+            workspace_id: "workspace-invalid-key".to_string(),
+            owner_account_id: "owner-account".to_string(),
+            display_name: "Invalid key".to_string(),
+            state: "active".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        let repository = RepositoryRecord {
+            workspace_id: workspace.workspace_id.clone(),
+            repository_id: Uuid::now_v7().to_string(),
+            repository_key: "Invalid_Key".to_string(),
+            kind: "git".to_string(),
+            provider: Some("git".to_string()),
+            source: workspace_api::RepositorySource {
+                kind: workspace_api::RepositorySourceKind::LocalPath,
+                uri: "/repo".to_string(),
+            },
+            default_ref: Some("develop".to_string()),
+            source_revision: 1,
+            source_fingerprint: "sha256:test".to_string(),
+            observed_status: RepositoryObservedStatus::Unverified,
+            observed_at: None,
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+
+        let error = store
+            .create_workspace_bootstrap(&WorkspaceBootstrapRecord {
+                operation_key: "invalid-key".to_string(),
+                request_fingerprint: "sha256:invalid-key".to_string(),
+                workspace: workspace.clone(),
+                repository,
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("invalid Repository key"), "{error}");
+        assert!(
+            store
+                .get_workspace(&workspace.workspace_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let valid_repository = RepositoryRecord {
+            workspace_id: workspace.workspace_id.clone(),
+            repository_id: Uuid::now_v7().to_string(),
+            repository_key: "main".to_string(),
+            kind: "git".to_string(),
+            provider: Some("git".to_string()),
+            source: workspace_api::RepositorySource {
+                kind: workspace_api::RepositorySourceKind::LocalPath,
+                uri: "/repo".to_string(),
+            },
+            default_ref: Some("develop".to_string()),
+            source_revision: 1,
+            source_fingerprint: "sha256:test".to_string(),
+            observed_status: RepositoryObservedStatus::Unverified,
+            observed_at: None,
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        let first = WorkspaceBootstrapRecord {
+            operation_key: "create-workspace".to_string(),
+            request_fingerprint: "sha256:create-workspace".to_string(),
+            workspace,
+            repository: valid_repository,
+        };
+        assert!(!store.create_workspace_bootstrap(&first).unwrap().replayed);
+        let mut duplicate = first;
+        duplicate.operation_key = "duplicate-workspace".to_string();
+        duplicate.repository.repository_id = Uuid::now_v7().to_string();
+        let error = store
+            .create_workspace_bootstrap(&duplicate)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Workspace identity already exists"),
+            "{error}"
         );
     }
 
