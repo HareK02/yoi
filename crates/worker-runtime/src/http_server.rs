@@ -32,7 +32,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 #[cfg(feature = "ws-server")]
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Extension, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::{Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -238,6 +238,14 @@ fn runtime_http_router_with_optional_auth(
             post(execute_worker_retention),
         )
         .route("/v1/workers/{worker_id}/input", post(send_worker_input))
+        .route(
+            "/v1/workers/{worker_id}/attachments",
+            post(upload_worker_file).layer(DefaultBodyLimit::max(MAX_WORKER_FILE_UPLOAD_BYTES)),
+        )
+        .route(
+            "/v1/workers/{worker_id}/attachments/{artifact_id}",
+            delete(delete_worker_uploaded_file),
+        )
         .route("/v1/workers/{worker_id}/restore", post(restore_worker))
         .route(
             "/v1/workers/{worker_id}/workspace-api",
@@ -262,6 +270,9 @@ fn runtime_http_router_with_optional_auth(
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, require_runtime_auth))
 }
+
+pub const MAX_WORKER_FILE_UPLOAD_BYTES: usize =
+    session_store::DEFAULT_MAX_UPLOADED_FILE_BYTES as usize;
 
 #[derive(Clone)]
 struct RuntimeHttpState {
@@ -373,6 +384,22 @@ pub struct RuntimeHttpWorkerDeleteResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeHttpWorkerInputResponse {
     pub ack: WorkerInteractionAck,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RuntimeHttpUploadFileQuery {
+    pub file_name: String,
+    pub media_type: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeHttpUploadedFileResponse {
+    pub file: protocol::UploadedFileRef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeHttpUploadedFileDeleteResponse {
+    pub deleted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1420,6 +1447,55 @@ async fn worker_completions(
     }))
 }
 
+async fn upload_worker_file(
+    State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
+    Path(worker_id): Path<String>,
+    Query(query): Query<RuntimeHttpUploadFileQuery>,
+    body: Bytes,
+) -> RestResult<RuntimeHttpUploadedFileResponse> {
+    let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
+    let file = match auth_workspace_scope(&state, auth.as_ref())? {
+        Some(scope) => state.runtime.upload_worker_file_scoped(
+            &scope,
+            &worker_ref,
+            &query.file_name,
+            &query.media_type,
+            &body,
+        ),
+        None => state.runtime.upload_worker_file(
+            &worker_ref,
+            &query.file_name,
+            &query.media_type,
+            &body,
+        ),
+    }
+    .map_err(RuntimeHttpRestError::runtime)?;
+    Ok(Json(RuntimeHttpUploadedFileResponse { file }))
+}
+
+async fn delete_worker_uploaded_file(
+    State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
+    Path((worker_id, artifact_id)): Path<(String, String)>,
+) -> RestResult<RuntimeHttpUploadedFileDeleteResponse> {
+    let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
+    match auth_workspace_scope(&state, auth.as_ref())? {
+        Some(scope) => {
+            state
+                .runtime
+                .delete_worker_uploaded_file_scoped(&scope, &worker_ref, &artifact_id)
+        }
+        None => state
+            .runtime
+            .delete_worker_uploaded_file(&worker_ref, &artifact_id),
+    }
+    .map_err(RuntimeHttpRestError::runtime)?;
+    Ok(Json(RuntimeHttpUploadedFileDeleteResponse {
+        deleted: true,
+    }))
+}
+
 async fn stop_worker(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1621,7 +1697,7 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     if path.ends_with("/workspace-api") {
         return Some("workers:create");
     }
-    if path.ends_with("/input") || path.ends_with("/restore") {
+    if path.ends_with("/input") || path.ends_with("/restore") || path.contains("/attachments") {
         return Some("workers:input");
     }
     if path.ends_with("/stop") || path.ends_with("/cancel") {
@@ -1881,6 +1957,21 @@ mod tests {
         GrepOutputMode, GrepRequest, LocalWorkdirSession, ReadRequest, StatRequest, Workdir,
         WorkdirPath, WorkdirSessionCapabilities,
     };
+
+    #[test]
+    fn attachment_routes_require_worker_input_permission() {
+        assert_eq!(
+            required_runtime_permission(&Method::POST, "/v1/workers/7/attachments"),
+            Some("workers:input")
+        );
+        assert_eq!(
+            required_runtime_permission(
+                &Method::DELETE,
+                "/v1/workers/7/attachments/019ca7c8-57b6-7f05-8edf-524147aba7b3"
+            ),
+            Some("workers:input")
+        );
+    }
 
     fn test_bundle(profile: ProfileSelector) -> ConfigBundle {
         ConfigBundle {

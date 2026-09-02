@@ -251,6 +251,48 @@ pub struct PasteArtifactRef {
     pub source_entry_id: String,
 }
 
+/// Availability recorded for an uploaded client-local file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UploadedFileAvailability {
+    Available,
+    Unavailable,
+    IntegrityFailed,
+}
+
+impl UploadedFileAvailability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Unavailable => "unavailable",
+            Self::IntegrityFailed => "integrity_failed",
+        }
+    }
+}
+
+/// Session-owned immutable reference to a client-local uploaded file.
+///
+/// Upload transports return an unbound reference. Worker fills
+/// `source_entry_id` immediately before the containing user input is committed;
+/// committed Session Log and public snapshot records therefore always retain
+/// the durable source-entry identity without storing the file body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct UploadedFileRef {
+    pub artifact_id: String,
+    pub file_name: String,
+    pub media_type: String,
+    pub created_at_ms: u64,
+    pub availability: UploadedFileAvailability,
+    pub byte_len: u64,
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_entry_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -272,6 +314,10 @@ pub enum Segment {
     /// committing input. Clients may receive this in history/event projections;
     /// the body is intentionally absent.
     PasteArtifact { artifact: PasteArtifactRef },
+    /// Client-local file uploaded into the owning Worker session before submit.
+    /// The Session Log stores only this immutable reference, never file bytes or
+    /// the client's local path.
+    UploadedFile { file: UploadedFileRef },
     /// `@<path>` file-system reference. Worker resolves readable files to
     /// `[File: <path>]` attachments and readable normal directories to shallow
     /// `[Dir: <path>]` listings; the flattened user text keeps the literal
@@ -325,6 +371,20 @@ impl Segment {
                         artifact.availability.as_str(),
                         artifact.created_at_ms,
                         artifact.sha256
+                    );
+                }
+                Segment::UploadedFile { file } => {
+                    use std::fmt::Write as _;
+                    let _ = write!(
+                        out,
+                        "[Attached file {} stored as input artifact {}: {} bytes, {}, {}, created at {} ms, sha256 {}; use SearchInputArtifact and ReadInputArtifact for supported text content]",
+                        file.file_name,
+                        file.artifact_id,
+                        file.byte_len,
+                        file.media_type,
+                        file.availability.as_str(),
+                        file.created_at_ms,
+                        file.sha256
                     );
                 }
                 Segment::FileRef { path } => {
@@ -1303,6 +1363,29 @@ mod tests {
         assert!(projected.contains("SearchInputArtifact"));
         assert!(projected.contains("ReadInputArtifact"));
         assert!(!projected.contains("pasted body"));
+    }
+
+    #[test]
+    fn uploaded_file_segment_roundtrips_without_path_or_body() {
+        let file = UploadedFileRef {
+            artifact_id: "019ca7c8-57b6-7f05-8edf-524147aba7b3".to_string(),
+            file_name: "notes.md".to_string(),
+            media_type: "text/markdown".to_string(),
+            created_at_ms: 1_700_000_000_001,
+            availability: UploadedFileAvailability::Available,
+            byte_len: 128,
+            sha256: "b".repeat(64),
+            source_entry_id: Some("entry-2".to_string()),
+        };
+        let segment = Segment::UploadedFile { file: file.clone() };
+        let json = serde_json::to_string(&segment).unwrap();
+        assert!(!json.contains("/home/user/private"));
+        assert!(!json.contains("file body"));
+        assert_eq!(serde_json::from_str::<Segment>(&json).unwrap(), segment);
+        let projected = Segment::flatten_to_text(&[segment]);
+        assert!(projected.contains("notes.md"));
+        assert!(projected.contains(&file.artifact_id));
+        assert!(projected.contains("ReadInputArtifact"));
     }
 
     #[test]

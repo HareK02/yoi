@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
 use async_trait::async_trait;
+use protocol::{PasteArtifactAvailability, PasteArtifactMediaType, PasteArtifactRef};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use session_store::{SessionId, Store, StoreError};
@@ -75,11 +76,8 @@ where
             .max_results
             .unwrap_or(DEFAULT_SEARCH_RESULTS)
             .clamp(1, MAX_SEARCH_RESULTS);
-        let (_, content) = self
-            .access
-            .store
-            .read_paste_artifact(self.access.session_id, &input.artifact_id)
-            .map_err(tool_store_error)?;
+        let (_, content) =
+            read_artifact_text(&self.access, &input.artifact_id).map_err(tool_store_error)?;
         let mut matches = Vec::new();
         let mut truncated = false;
         let mut byte_offset = 0_u64;
@@ -150,11 +148,8 @@ where
             .max_bytes
             .unwrap_or(DEFAULT_READ_BYTES)
             .clamp(4, MAX_READ_BYTES);
-        let (_, content) = self
-            .access
-            .store
-            .read_paste_artifact(self.access.session_id, &input.artifact_id)
-            .map_err(tool_store_error)?;
+        let (_, content) =
+            read_artifact_text(&self.access, &input.artifact_id).map_err(tool_store_error)?;
         let offset = usize::try_from(offset).map_err(|_| {
             ToolError::InvalidArgument("offset exceeds the artifact size".to_string())
         })?;
@@ -234,6 +229,47 @@ fn json_output(summary: String, value: &impl Serialize) -> Result<ToolOutput, To
     })
 }
 
+fn read_artifact_text<St: Store + Clone>(
+    access: &ArtifactAccess<St>,
+    artifact_id: &str,
+) -> Result<(PasteArtifactRef, String), StoreError> {
+    match access
+        .store
+        .read_paste_artifact(access.session_id, artifact_id)
+    {
+        Ok(result) => Ok(result),
+        Err(paste_error) => {
+            let (file, bytes) = match access
+                .store
+                .read_uploaded_file_by_id(access.session_id, artifact_id)
+            {
+                Ok(result) => result,
+                Err(_) => return Err(paste_error),
+            };
+            let content =
+                String::from_utf8(bytes).map_err(|_| StoreError::ArtifactIntegrityMismatch)?;
+            let char_count =
+                u64::try_from(content.chars().count()).map_err(|_| StoreError::ArtifactTooLarge)?;
+            let line_count =
+                u64::try_from(content.lines().count()).map_err(|_| StoreError::ArtifactTooLarge)?;
+            Ok((
+                PasteArtifactRef {
+                    artifact_id: file.artifact_id,
+                    created_at_ms: file.created_at_ms,
+                    media_type: PasteArtifactMediaType::TextPlainUtf8,
+                    availability: PasteArtifactAvailability::Available,
+                    byte_len: file.byte_len,
+                    char_count,
+                    line_count,
+                    sha256: file.sha256,
+                    source_entry_id: file.source_entry_id.unwrap_or_default(),
+                },
+                content,
+            ))
+        }
+    }
+}
+
 fn tool_store_error(error: StoreError) -> ToolError {
     let message = match error {
         StoreError::PasteArtifactNotFound(_) => "paste artifact not found",
@@ -262,6 +298,66 @@ mod tests {
     use session_store::{FsStore, PasteArtifactLimits, Store, new_session_id};
 
     use super::*;
+
+    #[tokio::test]
+    async fn read_input_artifact_reads_uploaded_text_but_rejects_binary_content() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = FsStore::new(temp.path()).unwrap();
+        let owner = new_session_id();
+        let text = store
+            .write_uploaded_file(
+                owner,
+                "notes.md",
+                "text/markdown",
+                b"alpha\nbeta",
+                session_store::UploadedFileLimits::default(),
+            )
+            .unwrap();
+        let read = ReadInputArtifactTool {
+            access: ArtifactAccess {
+                store: store.clone(),
+                session_id: owner,
+            },
+        };
+        let output = read
+            .execute(
+                &serde_json::json!({
+                    "artifact_id": text.artifact_id,
+                    "offset": 0,
+                    "max_bytes": 64
+                })
+                .to_string(),
+                ToolExecutionContext::default(),
+            )
+            .await
+            .unwrap();
+        let output: serde_json::Value =
+            serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+        assert_eq!(output["content"], "alpha\nbeta");
+
+        let binary = store
+            .write_uploaded_file(
+                owner,
+                "image.png",
+                "image/png",
+                &[0xff, 0xd8, 0x00],
+                session_store::UploadedFileLimits::default(),
+            )
+            .unwrap();
+        let error = read
+            .execute(
+                &serde_json::json!({
+                    "artifact_id": binary.artifact_id,
+                    "offset": 0,
+                    "max_bytes": 64
+                })
+                .to_string(),
+                ToolExecutionContext::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unavailable"));
+    }
 
     #[tokio::test]
     async fn search_and_read_are_bounded_and_owner_scoped() {

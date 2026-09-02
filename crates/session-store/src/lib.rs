@@ -41,6 +41,7 @@ pub mod segment;
 pub mod segment_log;
 pub mod store;
 pub mod system_item;
+pub mod uploaded_file;
 pub mod worker_metadata;
 pub mod worker_session_store;
 
@@ -65,6 +66,10 @@ pub use segment_log::{LogEntry, RestoredState, SegmentOrigin, SessionExtension, 
 pub use store::{Store, StoreError};
 pub use system_item::{
     PromptRenderProvenance, SystemItem, SystemReminder, SystemReminderSource, render_worker_event,
+};
+pub use uploaded_file::{
+    DEFAULT_MAX_FILES_PER_SUBMISSION, DEFAULT_MAX_SESSION_ARTIFACT_BYTES,
+    DEFAULT_MAX_UPLOADED_FILE_BYTES, UploadedFileLimits,
 };
 pub use worker_metadata::{
     CombinedStore, FsWorkerStore, WorkerActiveSegmentRef, WorkerAggregateStore, WorkerMetadata,

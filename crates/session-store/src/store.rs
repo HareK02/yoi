@@ -13,8 +13,8 @@
 
 use crate::event_trace::TraceEntry;
 use crate::segment_log::LogEntry;
-use crate::{PasteArtifactLimits, SegmentId, SessionId};
-use protocol::PasteArtifactRef;
+use crate::{PasteArtifactLimits, SegmentId, SessionId, UploadedFileLimits};
+use protocol::{PasteArtifactRef, UploadedFileRef};
 
 /// Errors from the persistence store.
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +42,30 @@ pub enum StoreError {
 
     #[error("paste artifact size limit exceeded: {0}")]
     PasteArtifactLimit(String),
+
+    #[error("uploaded file is too large")]
+    ArtifactTooLarge,
+
+    #[error("session artifact aggregate quota exceeded")]
+    ArtifactQuotaExceeded,
+
+    #[error("uploaded file reference integrity check failed")]
+    ArtifactIntegrityMismatch,
+
+    #[error("uploaded file name is invalid")]
+    InvalidUploadedFileName,
+
+    #[error("uploaded file media type is invalid")]
+    InvalidUploadedFileMediaType,
+
+    #[error("uploaded file is already committed to session history")]
+    ArtifactAlreadyCommitted,
+
+    #[error("artifact id is invalid")]
+    InvalidArtifactId,
+
+    #[error("artifact timestamp is invalid")]
+    InvalidTimestamp,
 }
 
 /// Sync persistence backend for segment logs.
@@ -147,6 +171,53 @@ pub trait Store: Send + Sync {
         _session_id: SessionId,
         _artifact_id: &str,
     ) -> Result<(PasteArtifactRef, String), StoreError> {
+        Err(StoreError::PasteArtifactUnsupported)
+    }
+
+    /// Persist a client-local file before a submission references it.
+    fn write_uploaded_file(
+        &self,
+        _session_id: SessionId,
+        _file_name: &str,
+        _media_type: &str,
+        _content: &[u8],
+        _limits: UploadedFileLimits,
+    ) -> Result<UploadedFileRef, StoreError> {
+        Err(StoreError::PasteArtifactUnsupported)
+    }
+
+    /// Read and integrity-check an uploaded file owned by `session_id`.
+    fn read_uploaded_file(
+        &self,
+        _session_id: SessionId,
+        _reference: &UploadedFileRef,
+    ) -> Result<Vec<u8>, StoreError> {
+        Err(StoreError::PasteArtifactUnsupported)
+    }
+
+    fn read_uploaded_file_by_id(
+        &self,
+        _session_id: SessionId,
+        _artifact_id: &str,
+    ) -> Result<(UploadedFileRef, Vec<u8>), StoreError> {
+        Err(StoreError::PasteArtifactUnsupported)
+    }
+
+    fn bind_uploaded_file(
+        &self,
+        _session_id: SessionId,
+        _reference: &UploadedFileRef,
+        _source_entry_id: &str,
+    ) -> Result<UploadedFileRef, StoreError> {
+        Err(StoreError::PasteArtifactUnsupported)
+    }
+
+    /// Delete an uncommitted uploaded file owned by `session_id`.
+    fn delete_uploaded_file(
+        &self,
+        _session_id: SessionId,
+        _artifact_id: &str,
+    ) -> Result<bool, StoreError> {
         Err(StoreError::PasteArtifactUnsupported)
     }
 

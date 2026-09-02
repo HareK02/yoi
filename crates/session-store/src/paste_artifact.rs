@@ -38,6 +38,34 @@ pub(crate) struct StoredPasteArtifact {
     pub content: String,
 }
 
+pub(crate) fn stored_paste_usage(artifact_dir: &Path) -> Result<(u64, u64), StoreError> {
+    if !artifact_dir.exists() {
+        return Ok((0, 0));
+    }
+    let mut aggregate = 0_u64;
+    let mut artifact_count = 0_u64;
+    for entry in fs::read_dir(artifact_dir)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".json") || name.ends_with(".file.json") {
+            continue;
+        }
+        let stored: StoredPasteArtifact = serde_json::from_slice(&fs::read(&path)?)?;
+        verify(&stored, &stored.reference.artifact_id)?;
+        artifact_count = artifact_count.checked_add(1).ok_or_else(|| {
+            StoreError::PasteArtifactLimit("session artifact count overflow".to_string())
+        })?;
+        aggregate = aggregate
+            .checked_add(stored.reference.byte_len)
+            .ok_or_else(|| {
+                StoreError::PasteArtifactLimit("session aggregate size overflow".to_string())
+            })?;
+    }
+    Ok((aggregate, artifact_count))
+}
+
 pub(crate) fn write_to_dir(
     artifact_dir: &Path,
     source_entry_id: &str,
@@ -58,24 +86,15 @@ pub(crate) fn write_to_dir(
         .write(true)
         .open(artifact_dir.join(".aggregate.lock"))?;
     FileExt::lock_exclusive(&aggregate_lock)?;
-    let mut aggregate = 0_u64;
-    let mut artifact_count = 0_u64;
-    for entry in fs::read_dir(artifact_dir)? {
-        let path = entry?.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        let stored: StoredPasteArtifact = serde_json::from_slice(&fs::read(&path)?)?;
-        verify(&stored, &stored.reference.artifact_id)?;
-        artifact_count = artifact_count.checked_add(1).ok_or_else(|| {
-            StoreError::PasteArtifactLimit("session artifact count overflow".to_string())
-        })?;
-        aggregate = aggregate
-            .checked_add(stored.reference.byte_len)
-            .ok_or_else(|| {
-                StoreError::PasteArtifactLimit("session aggregate size overflow".to_string())
-            })?;
-    }
+    let (paste_bytes, artifact_count) = stored_paste_usage(artifact_dir)?;
+    let (uploaded_bytes, uploaded_count) =
+        crate::uploaded_file::stored_uploaded_file_usage(artifact_dir)?;
+    let aggregate = paste_bytes.checked_add(uploaded_bytes).ok_or_else(|| {
+        StoreError::PasteArtifactLimit("session aggregate size overflow".to_string())
+    })?;
+    let artifact_count = artifact_count.checked_add(uploaded_count).ok_or_else(|| {
+        StoreError::PasteArtifactLimit("session artifact count overflow".to_string())
+    })?;
     let projected = aggregate.checked_add(byte_len).ok_or_else(|| {
         StoreError::PasteArtifactLimit("session aggregate size overflow".to_string())
     })?;

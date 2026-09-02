@@ -42,6 +42,10 @@ export type CompactionLifecycle = { schema_version: number, compaction_id: strin
  */
 started_at_ms: number, ended_at_ms?: number | null, summary?: string | null, error?: string | null, new_segment_id?: string | null, };
 
+export type UploadedFileAvailability = "available" | "unavailable" | "integrity_failed";
+
+export type UploadedFileRef = { artifact_id: string, file_name: string, media_type: string, created_at_ms: number, availability: UploadedFileAvailability, byte_len: number, sha256: string, source_entry_id?: string | null, };
+
 export type ScopeRule = {
 /**
  * Target path. Must be absolute by the time a `Scope` is built from
@@ -144,7 +148,7 @@ export type PasteArtifactRef = { artifact_id: string, created_at_ms: number, med
  */
 availability: PasteArtifactAvailability, byte_len: number, char_count: number, line_count: number, sha256: string, source_entry_id: string, };
 
-export type Segment = { "kind": "text", content: string, } | { "kind": "paste", id: number, chars: number, lines: number, content: string, } | { "kind": "paste_artifact", artifact: PasteArtifactRef, } | { "kind": "file_ref", path: string, } | { "kind": "flow", selector: string, } | { "kind": "unknown" };
+export type Segment = { "kind": "text", content: string, } | { "kind": "paste", id: number, chars: number, lines: number, content: string, } | { "kind": "paste_artifact", artifact: PasteArtifactRef, } | { "kind": "uploaded_file", file: UploadedFileRef, } | { "kind": "file_ref", path: string, } | { "kind": "flow", selector: string, } | { "kind": "unknown" };
 
 export type WorkerEvent = { "kind": "turn_ended", worker_name: string, } | { "kind": "errored", worker_name: string, message: string, } | { "kind": "shut_down", worker_name: string, } | { "kind": "scope_sub_delegated",
 /**

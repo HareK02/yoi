@@ -3082,7 +3082,32 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         projected_entry_ids: &[SessionHistoryEntryId],
         one_entry_per_segment: bool,
     ) -> Result<(), WorkerError> {
+        let uploaded_file_count = input
+            .iter()
+            .filter(|segment| matches!(segment, Segment::UploadedFile { .. }))
+            .count();
+        if uploaded_file_count > session_store::DEFAULT_MAX_FILES_PER_SUBMISSION {
+            return Err(WorkerError::Store(StoreError::ArtifactQuotaExceeded));
+        }
         for (index, segment) in input.iter_mut().enumerate() {
+            if let Segment::UploadedFile { file } = segment {
+                if file.source_entry_id.is_some()
+                    || file.availability != protocol::UploadedFileAvailability::Available
+                {
+                    return Err(WorkerError::Store(StoreError::ArtifactIntegrityMismatch));
+                }
+                let entry_index = if one_entry_per_segment { index } else { 0 };
+                let source_entry_id = projected_entry_ids
+                    .get(entry_index)
+                    .expect("projected input id exists for every uploaded file")
+                    .0
+                    .clone();
+                *file = self
+                    .store
+                    .bind_uploaded_file(self.session_id(), file, &source_entry_id)
+                    .map_err(WorkerError::Store)?;
+                continue;
+            }
             if let Segment::PasteArtifact { artifact } = segment {
                 let (stored, _) = self
                     .store
@@ -6471,6 +6496,11 @@ fn preview_segments(segments: &[Segment]) -> String {
                 preview.push_str(&artifact.artifact_id);
                 preview.push(']');
             }
+            Segment::UploadedFile { file } => {
+                preview.push_str("[Attached file: ");
+                preview.push_str(&file.file_name);
+                preview.push(']');
+            }
             Segment::FileRef { path } => {
                 preview.push('@');
                 preview.push_str(path);
@@ -8047,6 +8077,61 @@ mod build_summary_prompt_tests {
         assert!(
             matches!(unavailable, Err(WorkerError::FlowInput(message)) if message.contains("unavailable"))
         );
+    }
+
+    #[tokio::test]
+    async fn uploaded_file_is_verified_and_bound_to_projected_entry_before_commit() {
+        let (_dir, worker) = rewind_test_worker().await;
+        let reference = worker
+            .store
+            .write_uploaded_file(
+                worker.session_id(),
+                "notes.md",
+                "text/markdown",
+                b"# private body",
+                session_store::UploadedFileLimits::default(),
+            )
+            .unwrap();
+        let entry_id = SessionHistoryEntryId::new();
+        let mut input = vec![Segment::UploadedFile { file: reference }];
+
+        worker
+            .materialize_large_pastes(&mut input, std::slice::from_ref(&entry_id), false)
+            .unwrap();
+        let file = match &input[0] {
+            Segment::UploadedFile { file } => file,
+            other => panic!("expected uploaded file, got {other:?}"),
+        };
+        assert_eq!(file.source_entry_id.as_deref(), Some(entry_id.0.as_str()));
+        assert_eq!(
+            worker
+                .store
+                .read_uploaded_file(worker.session_id(), file)
+                .unwrap(),
+            b"# private body"
+        );
+        assert!(matches!(
+            worker
+                .store
+                .delete_uploaded_file(worker.session_id(), &file.artifact_id),
+            Err(StoreError::ArtifactAlreadyCommitted)
+        ));
+        let projected = worker.projected_input_history(&input, None, &[entry_id]);
+        let text = projected[0].item.as_text().unwrap();
+        assert!(text.contains("notes.md"));
+        assert!(text.contains(&file.artifact_id));
+        assert!(!text.contains("private body"));
+
+        let mut forged = input.clone();
+        let Segment::UploadedFile { file } = &mut forged[0] else {
+            unreachable!();
+        };
+        file.source_entry_id = None;
+        file.sha256 = "0".repeat(64);
+        assert!(matches!(
+            worker.materialize_large_pastes(&mut forged, &[SessionHistoryEntryId::new()], false),
+            Err(WorkerError::Store(StoreError::ArtifactIntegrityMismatch))
+        ));
     }
 
     #[tokio::test]

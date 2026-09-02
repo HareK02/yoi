@@ -31,7 +31,8 @@ use protocol::{
     AlertLevel, AlertSource, CommandEvent as ProtocolCommandEvent,
     CommandSnapshot as ProtocolCommandSnapshot, CommandStatus as ProtocolCommandStatus,
     CommandStream as ProtocolCommandStream, CommandStreamSlice as ProtocolCommandStreamSlice,
-    ErrorCode, Event, Method, RewindTargetId, RunResult, Segment, TurnResult, WorkerStatus,
+    ErrorCode, Event, Method, RewindTargetId, RunResult, Segment, TurnResult, UploadedFileRef,
+    WorkerStatus,
 };
 use workdir::{
     CommandEvent as WorkdirCommandEvent, CommandSnapshot as WorkdirCommandSnapshot,
@@ -55,11 +56,36 @@ pub struct WorkerHandle {
     /// subsequent commits (Event::Entry) on the receiver.
     pub sink: SegmentLogSink,
     spawned_registry: Arc<SpawnedWorkerRegistry>,
+    artifact_store: Arc<dyn Store>,
+    session_id: session_store::SessionId,
 }
 
 impl WorkerHandle {
     pub async fn send(&self, method: Method) -> Result<(), mpsc::error::SendError<Method>> {
         self.method_tx.send(method).await
+    }
+
+    pub fn upload_file(
+        &self,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+    ) -> Result<UploadedFileRef, session_store::StoreError> {
+        self.artifact_store.write_uploaded_file(
+            self.session_id,
+            file_name,
+            media_type,
+            content,
+            session_store::UploadedFileLimits::default(),
+        )
+    }
+
+    pub fn delete_uploaded_file(
+        &self,
+        artifact_id: &str,
+    ) -> Result<bool, session_store::StoreError> {
+        self.artifact_store
+            .delete_uploaded_file(self.session_id, artifact_id)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -503,6 +529,8 @@ impl WorkerController {
         runtime_dir.write_manifest(&manifest_toml).await?;
         runtime_dir.write_status(&shared_state).await?;
 
+        let artifact_store: Arc<dyn Store> = Arc::new(worker.store().clone());
+        let session_id = worker.session_id();
         let handle = WorkerHandle {
             method_tx,
             working_event_tx: working_event_tx.clone(),
@@ -512,6 +540,8 @@ impl WorkerController {
             in_flight: in_flight.clone(),
             sink: worker.sink(),
             spawned_registry: spawned_registry.clone(),
+            artifact_store,
+            session_id,
         };
 
         let socket_server = match transport {

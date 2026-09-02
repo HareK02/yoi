@@ -11,7 +11,8 @@ use crate::{
     PasteArtifactRef, Permission, RewindSummary, RewindTarget, RewindTargetId, RunResult,
     ScopeRule, Segment, SessionContentPart, SessionEntryProvenance, SessionMessageRole,
     SessionSnapshot, SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment,
-    ToolResultDisposition, TurnResult, WorkerEvent, WorkerStatus,
+    ToolResultDisposition, TurnResult, UploadedFileAvailability, UploadedFileRef, WorkerEvent,
+    WorkerStatus,
     subscription::{
         EventSubscriptionSelector, SubscriptionEvent, SubscriptionEventPayload, SubscriptionFrame,
         SubscriptionFramePayload, SubscriptionId, SubscriptionRejectionCode, SubscriptionRequest,
@@ -59,6 +60,8 @@ pub fn generated_protocol_types() -> String {
     push_decl::<CommandEvent>(&cfg, &mut output);
     push_decl::<CompactionLifecycleState>(&cfg, &mut output);
     push_decl::<CompactionLifecycle>(&cfg, &mut output);
+    push_decl::<UploadedFileAvailability>(&cfg, &mut output);
+    push_decl::<UploadedFileRef>(&cfg, &mut output);
     push_decl::<ScopeRule>(&cfg, &mut output);
     push_decl::<CompletionEntry>(&cfg, &mut output);
     push_decl::<RewindTargetId>(&cfg, &mut output);

@@ -1205,6 +1205,103 @@ impl Runtime {
         })
     }
 
+    /// Store a client-local file in the owning Worker session before input submit.
+    pub fn upload_worker_file_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        worker_ref: &WorkerRef,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+    ) -> Result<protocol::UploadedFileRef, RuntimeError> {
+        self.ensure_worker_in_workspace(scope, worker_ref)?;
+        self.upload_worker_file(worker_ref, file_name, media_type, content)
+    }
+
+    pub fn upload_worker_file(
+        &self,
+        worker_ref: &WorkerRef,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+    ) -> Result<protocol::UploadedFileRef, RuntimeError> {
+        let (backend, handle) = {
+            let state = self.lock()?;
+            state.ensure_running()?;
+            state.ensure_worker_ref(worker_ref)?;
+            let worker = state.worker(worker_ref)?;
+            match (
+                state.execution_backend.clone(),
+                worker.execution_handle.clone(),
+            ) {
+                (Some(backend), Some(handle)) => (backend, handle),
+                _ => {
+                    return Err(RuntimeError::WorkerExecutionUnavailable {
+                        worker_id: worker_ref.worker_id.clone(),
+                        message: "worker has no live execution handle".to_string(),
+                    });
+                }
+            }
+        };
+        backend
+            .upload_file(&handle, file_name, media_type, content)
+            .map_err(|result| RuntimeError::WorkerExecutionRejected {
+                worker_id: worker_ref.worker_id.clone(),
+                operation: result.operation,
+                outcome: result.outcome,
+                message: result.message_or_default(),
+                result,
+            })
+    }
+
+    /// Delete an unsubmitted uploaded file from the owning Worker session.
+    pub fn delete_worker_uploaded_file_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        worker_ref: &WorkerRef,
+        artifact_id: &str,
+    ) -> Result<(), RuntimeError> {
+        self.ensure_worker_in_workspace(scope, worker_ref)?;
+        self.delete_worker_uploaded_file(worker_ref, artifact_id)
+    }
+
+    pub fn delete_worker_uploaded_file(
+        &self,
+        worker_ref: &WorkerRef,
+        artifact_id: &str,
+    ) -> Result<(), RuntimeError> {
+        let (backend, handle) = {
+            let state = self.lock()?;
+            state.ensure_running()?;
+            state.ensure_worker_ref(worker_ref)?;
+            let worker = state.worker(worker_ref)?;
+            match (
+                state.execution_backend.clone(),
+                worker.execution_handle.clone(),
+            ) {
+                (Some(backend), Some(handle)) => (backend, handle),
+                _ => {
+                    return Err(RuntimeError::WorkerExecutionUnavailable {
+                        worker_id: worker_ref.worker_id.clone(),
+                        message: "worker has no live execution handle".to_string(),
+                    });
+                }
+            }
+        };
+        let result = backend.delete_uploaded_file(&handle, artifact_id);
+        if result.is_accepted() {
+            Ok(())
+        } else {
+            Err(RuntimeError::WorkerExecutionRejected {
+                worker_id: worker_ref.worker_id.clone(),
+                operation: result.operation,
+                outcome: result.outcome,
+                message: result.message_or_default(),
+                result,
+            })
+        }
+    }
+
     /// Return live completion entries through a workspace-scoped Runtime authorization context.
     pub fn worker_completions_scoped(
         &self,
@@ -1387,6 +1484,8 @@ impl Runtime {
             WorkerExecutionOperation::Spawn
             | WorkerExecutionOperation::Restore
             | WorkerExecutionOperation::Input
+            | WorkerExecutionOperation::UploadFile
+            | WorkerExecutionOperation::DeleteUploadedFile
             | WorkerExecutionOperation::ProtocolMethod => return Ok(()),
         };
         if result.is_accepted() {

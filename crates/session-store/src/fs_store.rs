@@ -19,8 +19,12 @@ use crate::event_trace::TraceEntry;
 use crate::paste_artifact::{read_from_dir, write_to_dir};
 use crate::segment_log::LogEntry;
 use crate::store::{Store, StoreError};
-use crate::{PasteArtifactLimits, SegmentId, SessionId};
-use protocol::PasteArtifactRef;
+use crate::uploaded_file::{
+    bind_uploaded_file, delete_uploaded_file, read_uploaded_file, read_uploaded_file_by_id,
+    write_uploaded_file,
+};
+use crate::{PasteArtifactLimits, SegmentId, SessionId, UploadedFileLimits};
+use protocol::{PasteArtifactRef, UploadedFileRef};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -389,6 +393,72 @@ impl Store for FsStore {
         read_from_dir(&self.paste_artifact_dir(session_id), artifact_id)
     }
 
+    fn write_uploaded_file(
+        &self,
+        session_id: SessionId,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+        limits: UploadedFileLimits,
+    ) -> Result<UploadedFileRef, StoreError> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("session store append lock was poisoned"))?;
+        write_uploaded_file(
+            &self.paste_artifact_dir(session_id),
+            file_name,
+            media_type,
+            content,
+            limits,
+        )
+    }
+
+    fn read_uploaded_file(
+        &self,
+        session_id: SessionId,
+        reference: &UploadedFileRef,
+    ) -> Result<Vec<u8>, StoreError> {
+        read_uploaded_file(&self.paste_artifact_dir(session_id), reference)
+    }
+
+    fn read_uploaded_file_by_id(
+        &self,
+        session_id: SessionId,
+        artifact_id: &str,
+    ) -> Result<(UploadedFileRef, Vec<u8>), StoreError> {
+        read_uploaded_file_by_id(&self.paste_artifact_dir(session_id), artifact_id)
+    }
+
+    fn bind_uploaded_file(
+        &self,
+        session_id: SessionId,
+        reference: &UploadedFileRef,
+        source_entry_id: &str,
+    ) -> Result<UploadedFileRef, StoreError> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("session store append lock was poisoned"))?;
+        bind_uploaded_file(
+            &self.paste_artifact_dir(session_id),
+            reference,
+            source_entry_id,
+        )
+    }
+
+    fn delete_uploaded_file(
+        &self,
+        session_id: SessionId,
+        artifact_id: &str,
+    ) -> Result<bool, StoreError> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("session store append lock was poisoned"))?;
+        delete_uploaded_file(&self.paste_artifact_dir(session_id), artifact_id)
+    }
+
     fn append_trace(
         &self,
         session_id: SessionId,
@@ -546,6 +616,84 @@ mod tests {
             .count(),
             1
         );
+    }
+
+    #[test]
+    fn uploaded_files_are_session_scoped_integrity_checked_and_removable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FsStore::new(tmp.path()).unwrap();
+        let owner = new_session_id();
+        let other = new_session_id();
+        let limits = UploadedFileLimits {
+            max_file_bytes: 16,
+            max_session_bytes: 16,
+        };
+        let reference = store
+            .write_uploaded_file(owner, "notes.txt", "text/plain", b"hello", limits)
+            .unwrap();
+
+        assert_eq!(reference.file_name, "notes.txt");
+        assert_eq!(reference.media_type, "text/plain");
+        assert_eq!(reference.byte_len, 5);
+        assert_eq!(reference.source_entry_id, None);
+        assert_eq!(
+            store.read_uploaded_file(owner, &reference).unwrap(),
+            b"hello"
+        );
+        assert!(store.read_uploaded_file(other, &reference).is_err());
+
+        let mut forged = reference.clone();
+        forged.file_name = "other.txt".to_string();
+        assert!(matches!(
+            store.read_uploaded_file(owner, &forged),
+            Err(StoreError::ArtifactIntegrityMismatch)
+        ));
+        assert!(
+            store
+                .delete_uploaded_file(owner, &reference.artifact_id)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .delete_uploaded_file(owner, &reference.artifact_id)
+                .unwrap()
+        );
+        assert!(store.read_uploaded_file(owner, &reference).is_err());
+    }
+
+    #[test]
+    fn uploaded_file_validation_and_shared_quota_fail_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FsStore::new(tmp.path()).unwrap();
+        let session_id = new_session_id();
+        let limits = UploadedFileLimits {
+            max_file_bytes: 8,
+            max_session_bytes: 8,
+        };
+        assert!(matches!(
+            store.write_uploaded_file(session_id, "../secret", "text/plain", b"x", limits),
+            Err(StoreError::InvalidUploadedFileName)
+        ));
+        assert!(matches!(
+            store.write_uploaded_file(session_id, "notes.txt", "not a type", b"x", limits),
+            Err(StoreError::InvalidUploadedFileMediaType)
+        ));
+        store
+            .write_paste_artifact(
+                session_id,
+                "entry-1",
+                "1234",
+                PasteArtifactLimits {
+                    max_artifact_bytes: 8,
+                    max_session_bytes: 8,
+                    max_session_artifacts: 4,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            store.write_uploaded_file(session_id, "notes.txt", "text/plain", b"56789", limits),
+            Err(StoreError::ArtifactQuotaExceeded)
+        ));
     }
 
     #[test]

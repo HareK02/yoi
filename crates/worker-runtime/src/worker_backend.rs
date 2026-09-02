@@ -2025,6 +2025,51 @@ where
         result
     }
 
+    fn upload_file(
+        &self,
+        handle: &WorkerExecutionHandle,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+    ) -> Result<protocol::UploadedFileRef, WorkerExecutionResult> {
+        let (worker, _, _) = self.get_execution(handle).map_err(|mut result| {
+            result.operation = WorkerExecutionOperation::UploadFile;
+            result
+        })?;
+        worker
+            .upload_file(file_name, media_type, content)
+            .map_err(|error| {
+                WorkerExecutionResult::rejected(
+                    WorkerExecutionOperation::UploadFile,
+                    format!("uploaded_file_rejected: {error}"),
+                )
+            })
+    }
+
+    fn delete_uploaded_file(
+        &self,
+        handle: &WorkerExecutionHandle,
+        artifact_id: &str,
+    ) -> WorkerExecutionResult {
+        let (worker, _, _) = match self.get_execution(handle) {
+            Ok(execution) => execution,
+            Err(mut result) => {
+                result.operation = WorkerExecutionOperation::DeleteUploadedFile;
+                return result;
+            }
+        };
+        match worker.delete_uploaded_file(artifact_id) {
+            Ok(_) => WorkerExecutionResult::accepted(
+                WorkerExecutionOperation::DeleteUploadedFile,
+                WorkerExecutionRunState::Idle,
+            ),
+            Err(error) => WorkerExecutionResult::rejected(
+                WorkerExecutionOperation::DeleteUploadedFile,
+                format!("uploaded_file_delete_rejected: {error}"),
+            ),
+        }
+    }
+
     fn dispatch_method(
         &self,
         handle: &WorkerExecutionHandle,

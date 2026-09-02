@@ -8,7 +8,7 @@ use crate::interaction::WorkerInput;
 #[cfg(feature = "ws-server")]
 use crate::observation::WorkerObservationEvent;
 use crate::working_directory::{WorkingDirectoryBinding, WorkingDirectoryDiagnostic};
-use protocol::Method;
+use protocol::{Method, UploadedFileRef};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
@@ -33,6 +33,8 @@ pub enum WorkerExecutionOperation {
     Spawn,
     Restore,
     Input,
+    UploadFile,
+    DeleteUploadedFile,
     ProtocolMethod,
     Stop,
     Cancel,
@@ -385,6 +387,30 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         input: WorkerInput,
     ) -> WorkerExecutionResult;
 
+    fn upload_file(
+        &self,
+        _handle: &WorkerExecutionHandle,
+        _file_name: &str,
+        _media_type: &str,
+        _content: &[u8],
+    ) -> Result<UploadedFileRef, WorkerExecutionResult> {
+        Err(WorkerExecutionResult::unsupported(
+            WorkerExecutionOperation::UploadFile,
+            "execution backend does not support file upload",
+        ))
+    }
+
+    fn delete_uploaded_file(
+        &self,
+        _handle: &WorkerExecutionHandle,
+        _artifact_id: &str,
+    ) -> WorkerExecutionResult {
+        WorkerExecutionResult::unsupported(
+            WorkerExecutionOperation::DeleteUploadedFile,
+            "execution backend does not support uploaded-file deletion",
+        )
+    }
+
     fn dispatch_method(
         &self,
         _handle: &WorkerExecutionHandle,
@@ -512,6 +538,25 @@ impl WorkerExecutionBackendRef {
         input: WorkerInput,
     ) -> WorkerExecutionResult {
         self.backend.dispatch_input(handle, input)
+    }
+
+    pub(crate) fn upload_file(
+        &self,
+        handle: &WorkerExecutionHandle,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+    ) -> Result<UploadedFileRef, WorkerExecutionResult> {
+        self.backend
+            .upload_file(handle, file_name, media_type, content)
+    }
+
+    pub(crate) fn delete_uploaded_file(
+        &self,
+        handle: &WorkerExecutionHandle,
+        artifact_id: &str,
+    ) -> WorkerExecutionResult {
+        self.backend.delete_uploaded_file(handle, artifact_id)
     }
 
     pub(crate) fn dispatch_method(

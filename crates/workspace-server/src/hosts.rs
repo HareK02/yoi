@@ -40,6 +40,7 @@ use worker_runtime::fs_store::FsRuntimeStoreOptions;
 use worker_runtime::http_server::{
     RuntimeHttpConfigBundleAvailabilityResponse, RuntimeHttpConfigBundleSyncRequest,
     RuntimeHttpErrorResponse, RuntimeHttpRepositoryAccessResponse, RuntimeHttpSummaryResponse,
+    RuntimeHttpUploadedFileDeleteResponse, RuntimeHttpUploadedFileResponse,
     RuntimeHttpWorkerCompletionsRequest, RuntimeHttpWorkerCompletionsResponse,
     RuntimeHttpWorkerDeleteResponse, RuntimeHttpWorkerInputResponse,
     RuntimeHttpWorkerLifecycleRequest, RuntimeHttpWorkerLifecycleResponse,
@@ -1041,6 +1042,34 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         }
     }
 
+    fn upload_worker_file(
+        &self,
+        worker_id: &str,
+        _file_name: &str,
+        _media_type: &str,
+        _content: &[u8],
+    ) -> Result<protocol::UploadedFileRef, RuntimeRegistryError> {
+        Err(RuntimeRegistryError::RuntimeOperationFailed {
+            runtime_id: self.runtime_id().to_string(),
+            code: "worker_file_upload_unsupported".to_string(),
+            message: format!("runtime does not support file upload for worker `{worker_id}`"),
+        })
+    }
+
+    fn delete_worker_uploaded_file(
+        &self,
+        worker_id: &str,
+        _artifact_id: &str,
+    ) -> Result<(), RuntimeRegistryError> {
+        Err(RuntimeRegistryError::RuntimeOperationFailed {
+            runtime_id: self.runtime_id().to_string(),
+            code: "worker_file_delete_unsupported".to_string(),
+            message: format!(
+                "runtime does not support uploaded-file deletion for worker `{worker_id}`"
+            ),
+        })
+    }
+
     fn worker_completions(
         &self,
         worker_id: &str,
@@ -1541,6 +1570,50 @@ impl RuntimeRegistry {
             ));
         }
         Ok(runtime.send_input(worker_id, request))
+    }
+
+    pub fn upload_worker_file(
+        &self,
+        worker: &RuntimeWorkerRef,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+    ) -> Result<protocol::UploadedFileRef, RuntimeRegistryError> {
+        let runtime_id = worker.runtime_id.as_str();
+        let worker_id = worker.worker_id.as_str();
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        validate_backend_identifier("worker_id", worker_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        let lookup = runtime.worker(worker_id);
+        if lookup.worker.is_none() {
+            return Err(operation_failed_or_unknown_worker(
+                runtime_id,
+                worker_id,
+                lookup.diagnostics,
+            ));
+        }
+        runtime.upload_worker_file(worker_id, file_name, media_type, content)
+    }
+
+    pub fn delete_worker_uploaded_file(
+        &self,
+        worker: &RuntimeWorkerRef,
+        artifact_id: &str,
+    ) -> Result<(), RuntimeRegistryError> {
+        let runtime_id = worker.runtime_id.as_str();
+        let worker_id = worker.worker_id.as_str();
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        validate_backend_identifier("worker_id", worker_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        let lookup = runtime.worker(worker_id);
+        if lookup.worker.is_none() {
+            return Err(operation_failed_or_unknown_worker(
+                runtime_id,
+                worker_id,
+                lookup.diagnostics,
+            ));
+        }
+        runtime.delete_worker_uploaded_file(worker_id, artifact_id)
     }
 
     pub fn worker_completions(
@@ -2509,6 +2582,46 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         }
     }
 
+    fn upload_worker_file(
+        &self,
+        worker_id: &str,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+    ) -> Result<protocol::UploadedFileRef, RuntimeRegistryError> {
+        let worker_ref =
+            self.worker_ref(worker_id)
+                .ok_or_else(|| RuntimeRegistryError::UnknownWorker {
+                    worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
+                })?;
+        self.runtime
+            .upload_worker_file(&worker_ref, file_name, media_type, content)
+            .map_err(|error| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: "embedded_worker_file_upload_failed".to_string(),
+                message: error.to_string(),
+            })
+    }
+
+    fn delete_worker_uploaded_file(
+        &self,
+        worker_id: &str,
+        artifact_id: &str,
+    ) -> Result<(), RuntimeRegistryError> {
+        let worker_ref =
+            self.worker_ref(worker_id)
+                .ok_or_else(|| RuntimeRegistryError::UnknownWorker {
+                    worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
+                })?;
+        self.runtime
+            .delete_worker_uploaded_file(&worker_ref, artifact_id)
+            .map_err(|error| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: "embedded_worker_file_delete_failed".to_string(),
+                message: error.to_string(),
+            })
+    }
+
     fn worker_completions(
         &self,
         worker_id: &str,
@@ -2846,6 +2959,16 @@ impl RemoteWorkerRuntime {
         T: DeserializeOwned + Send + 'static,
     {
         self.send_json(path, self.http.post(self.endpoint(path)).json(body))
+    }
+
+    fn post_bytes<T>(&self, path: &str, body: &[u8]) -> Result<T, RuntimeDiagnostic>
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        self.send_json(
+            path,
+            self.http.post(self.endpoint(path)).body(body.to_vec()),
+        )
     }
 
     fn delete_json<T>(&self, path: &str) -> Result<T, RuntimeDiagnostic>
@@ -3534,6 +3657,47 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             },
             Err(diagnostic) => remote_input_rejected(&self.runtime_id, worker_id, diagnostic),
         }
+    }
+
+    fn upload_worker_file(
+        &self,
+        worker_id: &str,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+    ) -> Result<protocol::UploadedFileRef, RuntimeRegistryError> {
+        let path = format!(
+            "/v1/workers/{}/attachments?file_name={}&media_type={}",
+            url_path_segment_encode(worker_id),
+            url_query_value_encode(file_name),
+            url_query_value_encode(media_type),
+        );
+        self.post_bytes::<RuntimeHttpUploadedFileResponse>(&path, content)
+            .map(|response| response.file)
+            .map_err(|diagnostic| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+            })
+    }
+
+    fn delete_worker_uploaded_file(
+        &self,
+        worker_id: &str,
+        artifact_id: &str,
+    ) -> Result<(), RuntimeRegistryError> {
+        let path = format!(
+            "/v1/workers/{}/attachments/{}",
+            url_path_segment_encode(worker_id),
+            url_path_segment_encode(artifact_id),
+        );
+        self.delete_json::<RuntimeHttpUploadedFileDeleteResponse>(&path)
+            .map(|_| ())
+            .map_err(|diagnostic| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+            })
     }
 
     fn worker_completions(

@@ -3,8 +3,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use axum::body::Bytes;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Extension, Path as AxumPath, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, Query, Request, State};
 use axum::http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, ORIGIN, SET_COOKIE};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
@@ -156,8 +157,9 @@ use worker_runtime::catalog::{
 };
 use worker_runtime::config_bundle::ConfigBundle;
 use worker_runtime::http_server::{
-    RuntimeHttpConfigBundleAvailabilityResponse, RuntimeHttpConfigBundlesResponse,
-    RuntimeHttpSummaryResponse, RuntimeHttpWorkerResponse, RuntimeHttpWorkersResponse,
+    MAX_WORKER_FILE_UPLOAD_BYTES, RuntimeHttpConfigBundleAvailabilityResponse,
+    RuntimeHttpConfigBundlesResponse, RuntimeHttpSummaryResponse, RuntimeHttpWorkerResponse,
+    RuntimeHttpWorkersResponse,
 };
 use worker_runtime::identity::{RuntimeWorkerRef, WorkerId};
 
@@ -2680,8 +2682,24 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
             post(send_runtime_worker_input),
         )
         .route(
+            "/api/runtimes/{runtime_id}/workers/{worker_id}/attachments",
+            post(upload_runtime_worker_file).layer(DefaultBodyLimit::max(MAX_WORKER_FILE_UPLOAD_BYTES)),
+        )
+        .route(
+            "/api/runtimes/{runtime_id}/workers/{worker_id}/attachments/{artifact_id}",
+            delete(delete_runtime_worker_uploaded_file),
+        )
+        .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/input",
             post(scoped_send_runtime_worker_input),
+        )
+        .route(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachments",
+            post(scoped_upload_runtime_worker_file).layer(DefaultBodyLimit::max(MAX_WORKER_FILE_UPLOAD_BYTES)),
+        )
+        .route(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachments/{artifact_id}",
+            delete(scoped_delete_runtime_worker_uploaded_file),
         )
         .route(
             "/api/runtimes/{runtime_id}/workers/{worker_id}/completions",
@@ -10733,6 +10751,51 @@ async fn scoped_execute_runtime_cleanup(
     Ok(Json(response))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerFileUploadQuery {
+    file_name: String,
+    media_type: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkerFileUploadResponse {
+    file: protocol::UploadedFileRef,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkerFileDeleteResponse {
+    deleted: bool,
+}
+
+async fn scoped_upload_runtime_worker_file(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
+    Query(query): Query<WorkerFileUploadQuery>,
+    body: Bytes,
+) -> ApiResult<Json<WorkerFileUploadResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    upload_runtime_worker_file(
+        State(api),
+        AxumPath((path.worker.runtime_id, path.worker.worker_id)),
+        Query(query),
+        body,
+    )
+    .await
+}
+
+async fn scoped_delete_runtime_worker_uploaded_file(
+    State(api): State<WorkspaceApi>,
+    AxumPath((path, artifact_id)): AxumPath<(ScopedRuntimeWorkerPath, String)>,
+) -> ApiResult<Json<WorkerFileDeleteResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    delete_runtime_worker_uploaded_file(
+        State(api),
+        AxumPath((path.worker.runtime_id, path.worker.worker_id, artifact_id)),
+    )
+    .await
+}
+
 async fn scoped_send_runtime_worker_input(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
@@ -13258,6 +13321,31 @@ async fn send_runtime_worker_input(
         .send_input(&worker, request)
         .map_err(|err| err.into_error())?;
     Ok(Json(result))
+}
+
+async fn upload_runtime_worker_file(
+    State(api): State<WorkspaceApi>,
+    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
+    Query(query): Query<WorkerFileUploadQuery>,
+    body: Bytes,
+) -> ApiResult<Json<WorkerFileUploadResponse>> {
+    let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
+    let file = api
+        .runtime
+        .upload_worker_file(&worker, &query.file_name, &query.media_type, &body)
+        .map_err(|err| err.into_error())?;
+    Ok(Json(WorkerFileUploadResponse { file }))
+}
+
+async fn delete_runtime_worker_uploaded_file(
+    State(api): State<WorkspaceApi>,
+    AxumPath((runtime_id, worker_id, artifact_id)): AxumPath<(String, String, String)>,
+) -> ApiResult<Json<WorkerFileDeleteResponse>> {
+    let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
+    api.runtime
+        .delete_worker_uploaded_file(&worker, &artifact_id)
+        .map_err(|err| err.into_error())?;
+    Ok(Json(WorkerFileDeleteResponse { deleted: true }))
 }
 
 async fn runtime_worker_completions(
