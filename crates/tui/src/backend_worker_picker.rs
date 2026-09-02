@@ -7,15 +7,15 @@ use client::{
     list_backend_workers, restore_backend_worker,
 };
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::backend::CrosstermBackend;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
 use crate::backend_workspace_picker::select_backend_workspace;
 use crate::console;
+use crate::inline_terminal::with_inline_terminal;
 
 const MAX_ROWS: usize = 10;
 const VIEWPORT_LINES: u16 = MAX_ROWS as u16 + 4;
@@ -127,31 +127,32 @@ fn pick_worker(
     workers.truncate(MAX_ROWS);
 
     let mut state = BackendWorkerPickerState::new(target, workers);
-    let mut terminal = make_inline_terminal()?;
-    loop {
-        terminal.draw(|frame| draw(frame, &state))?;
-        match poll_event()? {
-            None => continue,
-            Some(Action::Up) => state.previous(),
-            Some(Action::Down) => state.next(),
-            Some(Action::Submit) => {
-                close_viewport(&mut terminal)?;
-                return Ok(WorkerPickerResult::Selected(
-                    state.selected_worker().clone(),
-                ));
+    with_inline_terminal(
+        VIEWPORT_LINES,
+        |terminal| -> Result<_, Box<dyn std::error::Error>> {
+            loop {
+                terminal.draw(|frame| draw(frame, &state))?;
+                match poll_event()? {
+                    None => continue,
+                    Some(Action::Up) => state.previous(),
+                    Some(Action::Down) => state.next(),
+                    Some(Action::Submit) => {
+                        return Ok(WorkerPickerResult::Selected(
+                            state.selected_worker().clone(),
+                        ));
+                    }
+                    Some(Action::SwitchWorkspace) => {
+                        return Ok(WorkerPickerResult::SwitchWorkspace);
+                    }
+                    Some(Action::Cancel) => {
+                        return Err(Box::new(io::Error::other(
+                            "Backend worker picker cancelled",
+                        )));
+                    }
+                }
             }
-            Some(Action::SwitchWorkspace) => {
-                close_viewport(&mut terminal)?;
-                return Ok(WorkerPickerResult::SwitchWorkspace);
-            }
-            Some(Action::Cancel) => {
-                close_viewport(&mut terminal)?;
-                return Err(Box::new(io::Error::other(
-                    "Backend worker picker cancelled",
-                )));
-            }
-        }
-    }
+        },
+    )
 }
 
 struct BackendWorkerPickerState {
@@ -182,27 +183,6 @@ impl BackendWorkerPickerState {
     fn selected_worker(&self) -> &BackendWorkerSummary {
         &self.workers[self.selected]
     }
-}
-
-fn make_inline_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
-    let backend = CrosstermBackend::new(io::stdout());
-    Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(VIEWPORT_LINES),
-        },
-    )
-}
-
-fn close_viewport(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
-    let area = terminal.get_frame().area();
-    let last_row = area.bottom().saturating_sub(1);
-    terminal.set_cursor_position((0, last_row))?;
-    use std::io::Write;
-    let mut out = io::stdout();
-    out.write_all(b"\r\n")?;
-    out.flush()?;
-    Ok(())
 }
 
 enum Action {

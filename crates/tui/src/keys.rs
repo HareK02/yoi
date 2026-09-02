@@ -1,16 +1,16 @@
-use std::io::{self, Stdout, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use ratatui::backend::CrosstermBackend;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use secrets::{SecretStore, SecretValue};
+
+use crate::inline_terminal::{InlineTerminal, with_inline_terminal};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Mode {
@@ -235,7 +235,6 @@ pub async fn launch() -> ExitCode {
 }
 
 type UiResult<T> = Result<T, Box<dyn std::error::Error>>;
-type InlineTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 const MAX_ROWS: usize = 10;
 const VIEWPORT_LINES: u16 = MAX_ROWS as u16 + 5;
@@ -270,37 +269,9 @@ impl Drop for RawModeGuard {
 fn run(store: SecretStore) -> UiResult<()> {
     enable_raw_mode()?;
     let guard = RawModeGuard::new();
-    let mut terminal = make_inline_terminal()?;
-    let result = run_loop(&mut terminal, store);
-    let close_result = close_viewport(&mut terminal);
-    drop(terminal);
+    let result = with_inline_terminal(VIEWPORT_LINES, |terminal| run_loop(terminal, store));
     guard.restore();
-    result?;
-    close_result?;
-    Ok(())
-}
-
-fn make_inline_terminal() -> io::Result<InlineTerminal> {
-    let backend = CrosstermBackend::new(io::stdout());
-    Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(VIEWPORT_LINES),
-        },
-    )
-}
-
-/// Park the cursor at the very bottom of the inline viewport and emit one
-/// newline before dropping the terminal. This matches the resume picker and
-/// keeps the shell prompt (or a later inline viewport) from drawing over rows.
-fn close_viewport(terminal: &mut InlineTerminal) -> io::Result<()> {
-    let area = terminal.get_frame().area();
-    let last_row = area.bottom().saturating_sub(1);
-    terminal.set_cursor_position((0, last_row))?;
-    let mut out = io::stdout();
-    out.write_all(b"\r\n")?;
-    out.flush()?;
-    Ok(())
+    result
 }
 
 fn run_loop(terminal: &mut InlineTerminal, store: SecretStore) -> UiResult<()> {
