@@ -410,6 +410,91 @@
   a.sidebar-link.active {
     background: var(--sidebar-item-active);
   }
+  .worker-nav-item {
+    position: relative;
+    min-width: 0;
+  }
+  .worker-actions-trigger {
+    position: absolute;
+    z-index: 2;
+    top: 0.35rem;
+    right: 0.35rem;
+    display: grid;
+    width: 1.75rem;
+    height: 1.75rem;
+    place-items: center;
+    border: 0;
+    border-radius: var(--radius-soft);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 120ms ease, background 120ms ease, color 120ms ease;
+  }
+  .worker-actions-trigger svg {
+    width: 1rem;
+    height: 1rem;
+    fill: currentColor;
+  }
+  .worker-nav-item:hover .worker-actions-trigger,
+  .worker-nav-item:focus-within .worker-actions-trigger,
+  .worker-actions-trigger.open {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .worker-actions-trigger:hover,
+  .worker-actions-trigger:focus-visible,
+  .worker-actions-trigger.open {
+    background: var(--interactive-hover);
+    color: var(--text-strong);
+  }
+  .worker-actions-trigger:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .worker-actions-menu {
+    position: absolute;
+    z-index: 20;
+    top: 2rem;
+    right: 0.35rem;
+    display: grid;
+    min-width: 7rem;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-soft);
+    padding: var(--space-1);
+    background: var(--bg-raised);
+    box-shadow: var(--shadow-soft);
+  }
+  .worker-actions-menu button {
+    border: 0;
+    border-radius: var(--radius-soft);
+    padding: var(--space-2);
+    background: transparent;
+    color: var(--text-strong);
+    font: inherit;
+    font-size: 0.76rem;
+    font-weight: 650;
+    line-height: 1.2;
+    text-align: left;
+    cursor: pointer;
+  }
+  .worker-actions-menu button:hover:not(:disabled),
+  .worker-actions-menu button:focus-visible {
+    background: var(--sidebar-item-hover);
+  }
+  .worker-actions-menu button:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: -1px;
+  }
+  .worker-actions-menu button.danger {
+    color: var(--danger);
+  }
+  .worker-actions-menu button:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
   .worker-nav-link {
     display: grid;
     grid-template-columns: 0.75rem minmax(0, 1fr);
@@ -418,6 +503,7 @@
     row-gap: 0.1rem;
     margin: 0.0625rem 0;
     padding: var(--space-2);
+    padding-right: 2.35rem;
     border-radius: var(--radius-soft);
     color: var(--text-muted);
     text-decoration: none;
