@@ -43,17 +43,21 @@ Deno.test("root layout leaves Workspace selection explicit", async () => {
     new URL("./../../../routes/+layout.ts", import.meta.url),
   );
   assert(
-    !layout.includes("/api/workspace") &&
+    !layout.includes('"/api/workspace"') &&
       !layout.includes("redirect(") &&
-      layout.includes("Workspace selection is explicit"),
-    "root layout must not infer or redirect to a singleton Workspace",
+      layout.includes("listWorkspaces(fetch)") &&
+      layout.includes("accessibleWorkspaces"),
+    "root layout may list accessible Workspaces but must not infer or redirect to a singleton Workspace",
   );
 });
 
 Deno.test("Workspace route changes dispose old multiplexed subscription state", async () => {
   const [layout, multiplexer] = await Promise.all([
     Deno.readTextFile(
-      new URL("./../../../routes/w/[workspaceId]/+layout.svelte", import.meta.url),
+      new URL(
+        "./../../../routes/w/[workspaceId]/+layout.svelte",
+        import.meta.url,
+      ),
     ),
     Deno.readTextFile(new URL("./../multiplexer.ts", import.meta.url)),
   ]);

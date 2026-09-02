@@ -8,8 +8,6 @@
     type CreateWorkspaceRequest,
     type WorkspaceCatalogItem,
   } from "$lib/workspace/api/workspace-catalog";
-  import GlobalNavSections from "$lib/workspace/sidebar/GlobalNavSections.svelte";
-  import SidebarOverride from "$lib/workspace/sidebar/SidebarOverride.svelte";
   import "$lib/workspace/styles/workspace-catalog.css";
 
   let { data } = $props();
@@ -88,16 +86,6 @@
       }).format(timestamp);
   }
 </script>
-
-{#snippet homeSidebar()}
-  <GlobalNavSections
-    currentPath="/"
-    {workspaces}
-    workspaceError={catalogError}
-  />
-{/snippet}
-
-<SidebarOverride sidebar={homeSidebar} />
 
 <svelte:head>
   <title>Workspaces · Yoi</title>

@@ -358,9 +358,10 @@ Deno.test("root layout keeps Workspace selection explicit", async () => {
 
   assert(
     layoutLoad.includes("export const load") &&
-      layoutLoad.includes("() => ({})") &&
+      layoutLoad.includes("listWorkspaces(fetch)") &&
+      layoutLoad.includes("accessibleWorkspaces") &&
       !layoutLoad.includes("scopedCompatibilityRoute") &&
-      !layoutLoad.includes("/api/workspace") &&
+      !layoutLoad.includes('"/api/workspace"') &&
       !layoutLoad.includes("workspaceRoute") &&
       !layoutLoad.includes("redirect("),
     "root layout should not infer, bootstrap, or redirect through a singleton Workspace",
@@ -815,9 +816,6 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
   const globalNavSections = await Deno.readTextFile(
     new URL("../sidebar/GlobalNavSections.svelte", import.meta.url),
   );
-  const workspaceCatalogPage = await Deno.readTextFile(
-    new URL("./../../../routes/+page.svelte", import.meta.url),
-  );
   const sidebarFrame = await Deno.readTextFile(
     new URL("../sidebar/SidebarFrame.svelte", import.meta.url),
   );
@@ -891,13 +889,12 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
       globalNavSections.includes("workspaces") &&
       globalNavSections.includes("workspace.display_name") &&
       globalNavSections.includes("workspaceHref(workspace.workspace_id)") &&
-      workspaceCatalogPage.includes("SidebarOverride") &&
-      workspaceCatalogPage.includes("sidebar={homeSidebar}") &&
-      workspaceCatalogPage.includes("GlobalNavSections") &&
-      workspaceCatalogPage.includes("{workspaces}") &&
+      rootLayout.includes("workspaces={data.accessibleWorkspaces}") &&
+      rootLayout.includes("workspaceError={data.workspaceCatalogError}") &&
+      rootLayoutLoad.includes("listWorkspaces(fetch)") &&
       !globalNavSections.includes("Tickets") &&
       !globalNavSections.includes("Repositories"),
-    "Root page sidebar should replace the Workspaces button with a categorized accessible Workspace list below the remaining global navigation",
+    "Top-level sidebar should replace the Workspaces button with a categorized accessible Workspace list below the remaining global navigation",
   );
   assert(
     workspaceLayout.includes("{#snippet workspaceSidebar()}") &&
@@ -935,7 +932,8 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
   );
   assert(
     rootLayoutLoad.includes("export const load") &&
-      rootLayoutLoad.includes("() => ({})") &&
+      rootLayoutLoad.includes("listWorkspaces(fetch)") &&
+      rootLayoutLoad.includes("accessibleWorkspaces") &&
       !rootLayoutLoad.includes("workspaceRoute") &&
       !rootLayoutLoad.includes("redirect("),
     "Root layout should leave account and device-login routes public by avoiding Workspace redirects entirely",
