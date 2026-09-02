@@ -462,11 +462,18 @@ pub fn fork_at(
 ) -> Result<SegmentId, StoreError> {
     let entries = store.read_all(source_session_id, source_id)?;
     let cut = if at_turn_index == 0 {
-        // Branch directly after the SegmentStart (or whatever opens the
-        // segment), before any turn completes.
+        // Branch from the seeded state before any new turn completes. A typed
+        // input checkpoint immediately following SegmentStart is part of that
+        // seed and must stay atomic with its annotated history.
         entries
             .iter()
-            .position(|e| !matches!(e, LogEntry::AnnotatedSegmentStart { .. }))
+            .position(|entry| {
+                !matches!(
+                    entry,
+                    LogEntry::AnnotatedSegmentStart { .. }
+                        | LogEntry::InputSegmentsCheckpoint { .. }
+                )
+            })
             .unwrap_or(entries.len())
     } else {
         entries
@@ -478,8 +485,9 @@ pub fn fork_at(
     let state = segment_log::collect_state(&entries[..cut]);
 
     let fork_id = crate::new_segment_id();
+    let ts = segment_log::now_millis();
     let entry = LogEntry::AnnotatedSegmentStart {
-        ts: segment_log::now_millis(),
+        ts,
         session_id: source_session_id,
         system_prompt: state.system_prompt,
         config: state.config,
@@ -490,7 +498,14 @@ pub fn fork_at(
         }),
         compacted_from: None,
     };
-    store.create_segment(source_session_id, fork_id, &[entry])?;
+    let mut fork_entries = vec![entry];
+    if !state.user_segments.is_empty() {
+        fork_entries.push(LogEntry::InputSegmentsCheckpoint {
+            ts,
+            user_segments: state.user_segments,
+        });
+    }
+    store.create_segment(source_session_id, fork_id, &fork_entries)?;
     Ok(fork_id)
 }
 

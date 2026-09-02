@@ -17,6 +17,8 @@ thiserror = { workspace = true }
 protocol = { workspace = true }
 tracing.workspace = true
 unicode-normalization = "0.1.25"
+unicode-properties = { version = "0.1.4", features = ["general-category"] }
+unicode-security = "0.1.2"
 
 [dev-dependencies]
 async-trait = { workspace = true }

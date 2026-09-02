@@ -10,6 +10,7 @@ use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use agen::{Engine, History};
 use async_trait::async_trait;
 use common::MockLlmClient;
+use protocol::{Segment, SessionSnapshotEntryData, UploadedFileAvailability, UploadedFileRef};
 use session_store::{FsStore, LogEntry, SegmentStartState, Store, collect_state};
 
 // =============================================================================
@@ -455,7 +456,11 @@ async fn session_fork_at_truncates_within_session() {
     let fork_segid = session_store::fork_at(&store, sid, segid, worker.turn_count()).unwrap();
 
     let fork_entries = store.read_all(sid, fork_segid).unwrap();
-    assert_eq!(fork_entries.len(), 1); // Just the new SegmentStart
+    assert_eq!(fork_entries.len(), 2);
+    assert!(matches!(
+        &fork_entries[1],
+        LogEntry::InputSegmentsCheckpoint { .. }
+    ));
 
     let fork_state = collect_state(&fork_entries);
     assert_eq!(fork_state.session_id, Some(sid), "fork_at inherits Session");
@@ -467,6 +472,7 @@ async fn session_fork_at_truncates_within_session() {
         .position(|e| matches!(e, LogEntry::TurnEnd { turn_count, .. } if *turn_count == worker.turn_count()))
         .expect("source segment has the matching TurnEnd");
     let source_state_at_fork = collect_state(&all_entries[..=turn_end_pos]);
+    assert_eq!(fork_state.user_segments, source_state_at_fork.user_segments);
     assert_eq!(fork_state.history.len(), source_state_at_fork.history.len());
     assert_eq!(
         fork_state.annotated_history, source_state_at_fork.annotated_history,
@@ -490,6 +496,58 @@ async fn session_fork_at_truncates_within_session() {
     let segs = store.list_segments(sid).unwrap();
     assert!(segs.contains(&segid));
     assert!(segs.contains(&fork_segid));
+}
+
+#[test]
+fn rewound_fork_preserves_uploaded_file_segments_in_snapshot() {
+    let (_dir, store) = make_store();
+    let config = RequestConfig::default();
+    let (sid, segid) = session_store::create_segment(
+        &store,
+        SegmentStartState {
+            system_prompt: Some("System prompt"),
+            config: &config,
+            history: Vec::new(),
+        },
+    )
+    .unwrap();
+    let uploaded = UploadedFileRef {
+        artifact_id: "uploaded-file-1".into(),
+        file_name: "notes.txt".into(),
+        media_type: "text/plain".into(),
+        created_at_ms: 123,
+        availability: UploadedFileAvailability::Available,
+        byte_len: 5,
+        sha256: "a".repeat(64),
+        source_entry_id: Some("entry-1".into()),
+    };
+    let segments = vec![Segment::UploadedFile {
+        file: uploaded.clone(),
+    }];
+    session_store::save_user_input(
+        &store,
+        sid,
+        segid,
+        segments.clone(),
+        annotated(&[Item::user_message(Segment::flatten_to_text(&segments))]),
+    )
+    .unwrap();
+    session_store::save_turn_end(&store, sid, segid, 1).unwrap();
+
+    let fork_segid = session_store::fork_at(&store, sid, segid, 1).unwrap();
+    let fork_entries = store.read_all(sid, fork_segid).unwrap();
+    let snapshot = session_store::public_snapshot::project_session_snapshot(sid, &fork_entries);
+
+    assert!(fork_entries.iter().any(|entry| matches!(
+        entry,
+        LogEntry::InputSegmentsCheckpoint { user_segments, .. }
+            if user_segments == &vec![segments.clone()]
+    )));
+    assert!(snapshot.entries.iter().any(|entry| matches!(
+        &entry.data,
+        SessionSnapshotEntryData::UserInput { segments: restored }
+            if restored == &segments
+    )));
 }
 
 #[tokio::test]
@@ -654,12 +712,19 @@ async fn nested_past_fork_leaves_ancestors_immutable() {
     let fork1_entries = store.read_all(sid, fork1).unwrap();
     assert_eq!(
         fork1_entries.len(),
-        1,
-        "fork1 is just its SegmentStart seed"
+        2,
+        "fork1 stores its SegmentStart and typed input checkpoint"
     );
 
-    // fork2's lineage points at fork1, not the root.
-    match &store.read_all(sid, fork2).unwrap()[0] {
+    // fork2's lineage points at fork1, not the root, and the typed seed remains
+    // intact across the nested turn-zero fork.
+    let fork2_entries = store.read_all(sid, fork2).unwrap();
+    assert_eq!(fork2_entries.len(), 2);
+    assert_eq!(
+        collect_state(&fork2_entries).user_segments,
+        collect_state(&fork1_entries).user_segments
+    );
+    match &fork2_entries[0] {
         LogEntry::AnnotatedSegmentStart {
             forked_from: Some(origin),
             ..

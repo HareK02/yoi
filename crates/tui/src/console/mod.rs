@@ -123,11 +123,45 @@ fn copy_selection_to_terminal(app: &mut App) -> bool {
 
 type AttachmentUploadResult = Result<UploadedFileRef, String>;
 
+fn mark_attachments_after_transport_acceptance(
+    pending: &mut Vec<UploadedFileRef>,
+    awaiting_acceptance: &mut Vec<UploadedFileRef>,
+) {
+    awaiting_acceptance.append(pending);
+}
+
+fn reconcile_attachment_submission(
+    pending: &mut Vec<UploadedFileRef>,
+    awaiting_acceptance: &mut Vec<UploadedFileRef>,
+    event: &Event,
+) -> bool {
+    match event {
+        Event::UserMessage { segments, .. } => {
+            let had_awaiting = !awaiting_acceptance.is_empty();
+            let accepted_ids = segments
+                .iter()
+                .filter_map(|segment| match segment {
+                    Segment::UploadedFile { file } => Some(file.artifact_id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            awaiting_acceptance.retain(|file| !accepted_ids.contains(&file.artifact_id.as_str()));
+            had_awaiting && awaiting_acceptance.is_empty()
+        }
+        Event::Error { .. } if !awaiting_acceptance.is_empty() => {
+            pending.append(awaiting_acceptance);
+            false
+        }
+        _ => false,
+    }
+}
+
 struct ConsoleConnection<T> {
     client: Client<T>,
     standalone_host: Option<StandaloneHost>,
     backend_target: Option<BackendRuntimeTarget>,
     pending_attachments: Vec<UploadedFileRef>,
+    awaiting_attachment_acceptance: Vec<UploadedFileRef>,
     upload_tasks: Vec<tokio::task::JoinHandle<()>>,
     upload_ids: HashMap<PathBuf, String>,
 }
@@ -198,6 +232,7 @@ impl<T: Socket> ConsoleConnection<T> {
             standalone_host: Some(host),
             backend_target: None,
             pending_attachments: Vec::new(),
+            awaiting_attachment_acceptance: Vec::new(),
             upload_tasks: Vec::new(),
             upload_ids: HashMap::new(),
         }
@@ -209,6 +244,7 @@ impl<T: Socket> ConsoleConnection<T> {
             standalone_host: None,
             backend_target: Some(target),
             pending_attachments: Vec::new(),
+            awaiting_attachment_acceptance: Vec::new(),
             upload_tasks: Vec::new(),
             upload_ids: HashMap::new(),
         }
@@ -236,8 +272,7 @@ impl<T: Socket> ConsoleConnection<T> {
         }
         self.client.send(&prepared).await?;
         if carries_attachments {
-            self.pending_attachments.clear();
-            self.upload_ids.clear();
+            self.mark_attachments_awaiting_acceptance();
         }
         Ok(())
     }
@@ -268,6 +303,23 @@ impl<T: Socket> ConsoleConnection<T> {
         Ok(())
     }
 
+    fn observe_worker_event(&mut self, event: &Event) {
+        if reconcile_attachment_submission(
+            &mut self.pending_attachments,
+            &mut self.awaiting_attachment_acceptance,
+            event,
+        ) {
+            self.upload_ids.clear();
+        }
+    }
+
+    fn mark_attachments_awaiting_acceptance(&mut self) {
+        mark_attachments_after_transport_acceptance(
+            &mut self.pending_attachments,
+            &mut self.awaiting_attachment_acceptance,
+        );
+    }
+
     async fn clear_pending_attachments(&mut self) {
         for task in self.upload_tasks.drain(..) {
             task.abort();
@@ -287,6 +339,8 @@ impl<T: Socket> ConsoleConnection<T> {
     }
 
     async fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.pending_attachments
+            .append(&mut self.awaiting_attachment_acceptance);
         self.clear_pending_attachments().await;
         if let Some(host) = self.standalone_host.take() {
             host.shutdown().await?;
@@ -737,6 +791,7 @@ async fn drain_worker_events<T: Socket>(
         match client.try_next_event()? {
             Some(ev) => {
                 handled = true;
+                client.observe_worker_event(&ev);
                 if let Some(method) = app.handle_worker_event(ev) {
                     client.send(&method).await?;
                 }
@@ -811,6 +866,7 @@ async fn run_loop<T: Socket>(
             },
             LoopInput::Worker(event) => match event? {
                 Some(ev) => {
+                    client.observe_worker_event(&ev);
                     if let Some(method) = app.handle_worker_event(ev) {
                         client.send(&method).await?;
                     }
@@ -1349,7 +1405,10 @@ fn handle_pause_or_quit(app: &mut App) -> Option<Method> {
 mod tests {
     use super::*;
     use crate::text_selection::{HistoryViewport, SelectionRow};
-    use protocol::{Event, RewindTarget, RewindTargetId, Segment};
+    use async_trait::async_trait;
+    use protocol::{
+        Event, RewindTarget, RewindTargetId, Segment, UploadedFileAvailability, UploadedFileRef,
+    };
 
     #[test]
     fn standalone_console_starts_with_in_process_connection_ready() {
@@ -1380,6 +1439,88 @@ mod tests {
             Some("image/webp")
         );
         assert_eq!(attachment_media_type(Path::new("program.exe")), None);
+    }
+
+    struct FailOnceSocket {
+        fail_next_send: bool,
+    }
+
+    #[async_trait]
+    impl Socket for FailOnceSocket {
+        type Error = io::Error;
+
+        async fn send(&mut self, _message: String) -> Result<(), Self::Error> {
+            if std::mem::take(&mut self.fail_next_send) {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "disconnected",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn next(&mut self) -> Result<Option<String>, Self::Error> {
+            Ok(None)
+        }
+
+        fn try_next(&mut self) -> Result<Option<String>, Self::Error> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_submission_waits_for_authoritative_acceptance_and_can_retry() {
+        let file = UploadedFileRef {
+            artifact_id: "artifact-1".into(),
+            file_name: "notes.txt".into(),
+            media_type: "text/plain".into(),
+            created_at_ms: 1,
+            availability: UploadedFileAvailability::Available,
+            byte_len: 5,
+            sha256: "a".repeat(64),
+            source_entry_id: None,
+        };
+        let mut connection = ConsoleConnection {
+            client: Client::new(FailOnceSocket {
+                fail_next_send: true,
+            }),
+            standalone_host: None,
+            backend_target: None,
+            pending_attachments: vec![file.clone()],
+            awaiting_attachment_acceptance: Vec::new(),
+            upload_tasks: Vec::new(),
+            upload_ids: HashMap::new(),
+        };
+
+        assert!(
+            connection
+                .send(&Method::Run {
+                    input: vec![Segment::text("inspect")],
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(connection.pending_attachments, vec![file.clone()]);
+        assert!(connection.awaiting_attachment_acceptance.is_empty());
+
+        connection
+            .send(&Method::Run {
+                input: vec![Segment::text("inspect")],
+            })
+            .await
+            .unwrap();
+        assert!(connection.pending_attachments.is_empty());
+        assert_eq!(
+            connection.awaiting_attachment_acceptance,
+            vec![file.clone()]
+        );
+
+        connection.observe_worker_event(&Event::UserMessage {
+            segments: vec![Segment::text("inspect"), Segment::UploadedFile { file }],
+        });
+        assert!(connection.pending_attachments.is_empty());
+        assert!(connection.awaiting_attachment_acceptance.is_empty());
     }
 
     #[test]

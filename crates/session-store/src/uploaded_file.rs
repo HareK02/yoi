@@ -10,6 +10,8 @@ use protocol::{UploadedFileAvailability, UploadedFileRef};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
+use unicode_properties::general_category::{GeneralCategory, UnicodeGeneralCategory};
+use unicode_security::{confusable_detection::skeleton, mixed_script::MixedScript};
 use uuid::Uuid;
 
 use crate::StoreError;
@@ -62,18 +64,26 @@ struct StoredUploadedFile {
 }
 
 pub(crate) fn validate_file_name(file_name: &str) -> Result<()> {
+    let normalized: String = file_name.nfkc().collect();
+    let stem = file_name
+        .rsplit_once('.')
+        .map_or(file_name, |(stem, _)| stem);
+    let confusable_skeleton: String = skeleton(stem).collect();
+    let ascii_confusable = stem.chars().any(|ch| !ch.is_ascii())
+        && confusable_skeleton.is_ascii()
+        && !confusable_skeleton.eq_ignore_ascii_case(stem);
+
     if file_name.is_empty()
         || file_name.chars().count() > MAX_FILE_NAME_CHARS
         || file_name == "."
         || file_name == ".."
+        || normalized != file_name
+        || !stem.is_single_script()
+        || ascii_confusable
         || file_name.chars().any(|ch| {
             ch.is_control()
-                || matches!(
-                    ch,
-                    '/' | '\\' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}'
-                )
-                || ('\u{202a}'..='\u{202e}').contains(&ch)
-                || ('\u{2066}'..='\u{2069}').contains(&ch)
+                || ch.general_category() == GeneralCategory::Format
+                || matches!(ch, '/' | '\\')
         })
     {
         return Err(StoreError::InvalidUploadedFileName);

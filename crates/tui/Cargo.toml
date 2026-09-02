@@ -30,4 +30,5 @@ pulldown-cmark = { version = "0.13.3", default-features = false }
 agen.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile = { workspace = true }

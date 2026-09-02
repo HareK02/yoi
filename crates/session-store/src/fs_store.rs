@@ -919,6 +919,36 @@ mod tests {
     }
 
     #[test]
+    fn uploaded_file_names_reject_format_mixed_script_and_confusable_forms() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FsStore::new(tmp.path()).unwrap();
+        let session_id = new_session_id();
+        let limits = UploadedFileLimits::default();
+
+        for file_name in [
+            "safe\u{00ad}name.txt",
+            "safe\u{061c}name.txt",
+            "safe\u{180e}name.txt",
+            "safe\u{e0001}name.txt",
+            "p\u{0430}ypal.txt",
+            "\u{0440}\u{0430}\u{0443}\u{0440}\u{0430}\u{04cf}.txt",
+            "\u{ff26}\u{ff49}\u{ff4c}\u{ff45}.txt",
+            "re\u{0301}sume\u{0301}.txt",
+        ] {
+            assert!(matches!(
+                store.write_uploaded_file(session_id, file_name, "text/plain", b"safe", limits),
+                Err(StoreError::InvalidUploadedFileName)
+            ));
+        }
+
+        for file_name in ["notes.txt", "résumé.txt", "日本語.txt", "📎.txt"] {
+            store
+                .write_uploaded_file(session_id, file_name, "text/plain", b"safe", limits)
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn paste_artifact_limits_and_corruption_fail_closed() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = FsStore::new(tmp.path()).unwrap();
