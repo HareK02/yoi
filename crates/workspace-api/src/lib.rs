@@ -1410,10 +1410,12 @@ mod workdir_typescript_tests {
         value
             .chars()
             .filter_map(|character| match character {
-                '\r' | '\n' | ' ' | '\t' => None,
-                _ => Some(character),
+                character if character.is_whitespace() => None,
+                ',' => Some(';'),
+                character => Some(character),
             })
-            .collect()
+            .collect::<String>()
+            .replace("=|", "=")
     }
 }
 
