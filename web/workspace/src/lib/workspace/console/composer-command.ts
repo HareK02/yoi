@@ -88,8 +88,10 @@ export function buildComposerSegmentsRequest(
   sourceSegments: readonly Segment[],
   options: ComposerSegmentsRequestOptions = {},
 ): ComposerCommandResult {
-  const hasPaste = sourceSegments.some((segment) => segment.kind === "paste");
-  if (!hasPaste) {
+  const hasRichSegment = sourceSegments.some((segment) =>
+    segment.kind === "paste" || segment.kind === "uploaded_file"
+  );
+  if (!hasRichSegment) {
     const content = sourceSegments.map(segmentContent).join("");
     if (!options.preserveExactText || content.trimStart().startsWith(":")) {
       return buildComposerRequest(content);
@@ -121,7 +123,7 @@ export function buildComposerSegmentsRequest(
     return {
       ok: false,
       message:
-        "Commands cannot include a paste chip. Remove the chip or send it as a message.",
+        "Commands cannot include paste or attachment chips. Remove the chip or send it as a message.",
     };
   }
 
@@ -154,6 +156,8 @@ function segmentContent(segment: Segment): string {
       return segment.selector;
     case "paste_artifact":
       return "";
+    case "uploaded_file":
+      return `[Attached file: ${segment.file.file_name}]`;
     default:
       return "";
   }

@@ -1,5 +1,6 @@
 import {
   buildComposerRequest,
+  buildComposerSegmentsRequest,
   parseSigilSegments,
 } from "./composer-command.ts";
 
@@ -23,6 +24,26 @@ Deno.test("parseSigilSegments leaves hash sigils as plain text", () => {
     kind: "text",
     content: "ask #memory",
   }]);
+});
+
+Deno.test("uploaded-file-only input remains a typed run request", () => {
+  const file = {
+    artifact_id: "01900000-0000-7000-8000-000000000001",
+    file_name: "notes.md",
+    media_type: "text/markdown",
+    created_at_ms: 1,
+    availability: "available" as const,
+    byte_len: 12,
+    sha256: "a".repeat(64),
+  };
+  assertEquals(buildComposerSegmentsRequest([{ kind: "uploaded_file", file }]), {
+    ok: true,
+    request: {
+      kind: "user",
+      content: "[Attached file: notes.md]",
+      segments: [{ kind: "uploaded_file", file }],
+    },
+  });
 });
 
 Deno.test("notify command exposes the operation instead of a System-role input", () => {

@@ -928,6 +928,14 @@ impl App {
         Some(self.method_for_run(queued.segments))
     }
 
+    pub fn push_notice(&mut self, message: impl Into<String>) {
+        self.blocks.push(Block::Alert {
+            level: AlertLevel::Info,
+            source: AlertSource::Worker,
+            message: message.into(),
+        });
+    }
+
     pub fn push_error(&mut self, message: impl Into<String>) {
         self.blocks.push(Block::Alert {
             level: AlertLevel::Error,

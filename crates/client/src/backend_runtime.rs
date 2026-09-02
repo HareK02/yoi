@@ -1,6 +1,7 @@
 use crate::transport::websocket::{Socket as WebSocket, SocketError as WebSocketError};
 use crate::{BackendApiClient, BackendApiClientError, Client};
 use reqwest::Method as HttpMethod;
+use serde::Deserialize;
 use std::fmt;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -51,6 +52,61 @@ impl BackendRuntimeTarget {
     pub fn display_label(&self) -> String {
         format!("{}:{}", self.runtime_id, self.worker_id)
     }
+
+    pub async fn upload_file(
+        &self,
+        file_name: &str,
+        media_type: &str,
+        content: Vec<u8>,
+    ) -> Result<protocol::UploadedFileRef, BackendRuntimeClientError> {
+        let api = BackendApiClient::from_stored_token(&self.base_url)?;
+        let path = format!(
+            "/api/w/{}/runtimes/{}/workers/{}/attachments?file_name={}&media_type={}",
+            path_segment_encode(&self.workspace_id),
+            path_segment_encode(&self.runtime_id),
+            path_segment_encode(&self.worker_id),
+            path_segment_encode(file_name),
+            path_segment_encode(media_type),
+        );
+        let response = api
+            .request(HttpMethod::POST, &path)?
+            .body(content)
+            .send()
+            .await
+            .map_err(BackendRuntimeClientError::Http)?;
+        api.check_status(response.status())?;
+        response
+            .json::<UploadedFileResponse>()
+            .await
+            .map(|response| response.file)
+            .map_err(BackendRuntimeClientError::Http)
+    }
+
+    pub async fn delete_uploaded_file(
+        &self,
+        artifact_id: &str,
+    ) -> Result<(), BackendRuntimeClientError> {
+        let api = BackendApiClient::from_stored_token(&self.base_url)?;
+        let path = format!(
+            "/api/w/{}/runtimes/{}/workers/{}/attachments/{}",
+            path_segment_encode(&self.workspace_id),
+            path_segment_encode(&self.runtime_id),
+            path_segment_encode(&self.worker_id),
+            path_segment_encode(artifact_id),
+        );
+        let response = api
+            .request(HttpMethod::DELETE, &path)?
+            .send()
+            .await
+            .map_err(BackendRuntimeClientError::Http)?;
+        api.check_status(response.status())?;
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct UploadedFileResponse {
+    file: protocol::UploadedFileRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

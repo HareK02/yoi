@@ -32,6 +32,12 @@
         type ConsoleViewScroll,
     } from "$lib/workspace/console/model";
     import type { Event as ProtocolEvent, Method as ProtocolMethod, RewindTarget, Segment } from "$lib/generated/protocol";
+    import {
+        MAX_FILES_PER_SUBMISSION,
+        uploadAttachment,
+        validateAttachmentFile,
+        type ComposerAttachment,
+    } from "$lib/workspace/console/composer-attachments";
     import { pushWorkspaceAlert } from "$lib/workspace/alerts/store";
     import { workspaceApiPath } from "$lib/workspace/api/http";
     import { workspaceMultiplexer, type WorkspaceMultiplexerSubscription } from "$lib/workspace/multiplexer";
@@ -129,6 +135,10 @@
     };
 
     let draft = $state<ComposerDraftSnapshot>(EMPTY_DRAFT);
+    let attachments = $state<ComposerAttachment[]>([]);
+    let nextAttachmentId = 1;
+    let fileInput: HTMLInputElement | null = null;
+    let isDraggingFiles = $state(false);
     let completionEntries = $state<ComposerCompletionEntry[]>([]);
     let completionToken = $state<ComposerCompletionToken | null>(null);
     let completionBusy = $state(false);
@@ -582,9 +592,24 @@
         composerDrafts.set(activeComposerTargetKey, cachedComposerDraft(snapshot));
     }
 
+    function discardAllAttachments(): void {
+        const discarded = attachments;
+        attachments = [];
+        for (const attachment of discarded) {
+            attachment.request?.abort();
+            if (attachment.reference) {
+                void fetch(
+                    `${attachment.uploadPath}/${encodeURIComponent(attachment.reference.artifact_id)}`,
+                    { method: "DELETE" },
+                ).catch(() => undefined);
+            }
+        }
+    }
+
     function switchComposerTarget(target: ConsoleTarget) {
         const nextKey = `${target.workspaceId}:${target.runtimeId}:${target.workerId}`;
         if (nextKey === activeComposerTargetKey) return;
+        if (activeComposerTargetKey) discardAllAttachments();
         if (composerInputElement) {
             composerDrafts.set(
                 activeComposerTargetKey,
@@ -613,8 +638,118 @@
         void submitDraft(composerInputElement?.snapshot() ?? draft);
     }
 
+    function attachmentPath(): string {
+        return `/api/w/${encodeURIComponent(workspaceId)}/runtimes/${encodeURIComponent(runtimeId)}/workers/${encodeURIComponent(workerId)}/attachments`;
+    }
+
+    function updateAttachment(id: number, update: Partial<ComposerAttachment>): void {
+        attachments = attachments.map((attachment) =>
+            attachment.id === id ? { ...attachment, ...update } : attachment,
+        );
+    }
+
+    function startAttachmentUpload(attachment: ComposerAttachment): void {
+        const error = validateAttachmentFile(attachment.file);
+        if (error) {
+            updateAttachment(attachment.id, { state: "failed", error, request: null });
+            return;
+        }
+        updateAttachment(attachment.id, {
+            state: "uploading",
+            progress: 0,
+            reference: null,
+            error: null,
+            request: null,
+        });
+        const request = uploadAttachment(attachment.uploadPath, attachment.file, {
+            progress: (progress) => updateAttachment(attachment.id, { progress }),
+            complete: (reference) =>
+                updateAttachment(attachment.id, {
+                    state: "uploaded",
+                    progress: 1,
+                    reference,
+                    error: null,
+                    request: null,
+                }),
+            failed: (message) =>
+                updateAttachment(attachment.id, {
+                    state: "failed",
+                    error: message,
+                    request: null,
+                }),
+        });
+        updateAttachment(attachment.id, { request });
+    }
+
+    function addAttachmentFiles(files: Iterable<File>): void {
+        const available = Math.max(0, MAX_FILES_PER_SUBMISSION - attachments.length);
+        for (const file of Array.from(files).slice(0, available)) {
+            const attachment: ComposerAttachment = {
+                id: nextAttachmentId++,
+                file,
+                uploadPath: attachmentPath(),
+                state: "uploading",
+                progress: 0,
+                reference: null,
+                error: null,
+                request: null,
+            };
+            attachments = [...attachments, attachment];
+            startAttachmentUpload(attachment);
+        }
+    }
+
+    async function removeAttachment(attachment: ComposerAttachment): Promise<void> {
+        attachment.request?.abort();
+        attachments = attachments.filter((candidate) => candidate.id !== attachment.id);
+        if (attachment.reference) {
+            await fetch(`${attachment.uploadPath}/${encodeURIComponent(attachment.reference.artifact_id)}`, {
+                method: "DELETE",
+            }).catch(() => undefined);
+        }
+    }
+
+    function retryAttachment(attachment: ComposerAttachment): void {
+        startAttachmentUpload(attachment);
+    }
+
+    function handleFileInput(event: Event): void {
+        const input = event.currentTarget as HTMLInputElement;
+        if (input.files) addAttachmentFiles(input.files);
+        input.value = "";
+    }
+
+    function handleFileDragOver(event: DragEvent): void {
+        if (!event.dataTransfer?.types.includes("Files")) return;
+        event.preventDefault();
+        isDraggingFiles = true;
+    }
+
+    function handleFileDrop(event: DragEvent): void {
+        if (!event.dataTransfer?.types.includes("Files")) return;
+        event.preventDefault();
+        isDraggingFiles = false;
+        if (event.dataTransfer?.files) addAttachmentFiles(event.dataTransfer.files);
+    }
+
     async function submitDraft(value: ComposerDraftSnapshot) {
-        const command = buildComposerSegmentsRequest(value.segments, {
+        const incompleteAttachment = attachments.find((attachment) =>
+            attachment.state !== "uploaded" || !attachment.reference
+        );
+        if (incompleteAttachment) {
+            composerNotice = null;
+            sendError = incompleteAttachment.state === "uploading"
+                ? "Wait for file uploads to finish before sending."
+                : incompleteAttachment.error ?? "Retry or remove the failed attachment.";
+            return;
+        }
+        const attachmentSegments: Segment[] = attachments.map((attachment) => ({
+            kind: "uploaded_file",
+            file: attachment.reference!,
+        }));
+        const command = buildComposerSegmentsRequest(
+            [...value.segments, ...attachmentSegments],
+            {
             preserveExactText: value.textPastes.length > 0,
         });
         if (!command.ok) {
@@ -637,6 +772,7 @@
             const method = composerRequestToProtocolMethod(command.request);
             sendProtocolMethod(method);
             composerInputElement?.clear();
+            attachments = [];
             if (method.method === "run" || method.method === "notify") {
                 liveWorkerState = "running";
             }
@@ -1338,6 +1474,10 @@
         if (!targetWorker) void loadWorker(target, token);
     });
 
+    $effect(() => {
+        return () => discardAllAttachments();
+    });
+
     $effect(() => connectProtocolTransport(worker, reloadToken, consoleTarget));
 </script>
 
@@ -1599,7 +1739,23 @@
     />
 
     <form class="console-composer" onsubmit={sendMessage}>
-        <div class="composer-input-shell">
+        <div
+            class="composer-input-shell"
+            role="group"
+            aria-label="Message composer and file drop area"
+            class:dragging-files={isDraggingFiles}
+            ondragover={handleFileDragOver}
+            ondragleave={() => (isDraggingFiles = false)}
+            ondrop={handleFileDrop}
+        >
+            <input
+                class="attachment-file-input"
+                bind:this={fileInput}
+                type="file"
+                multiple
+                accept="text/*,application/json,application/pdf,image/png,image/jpeg,image/gif,image/webp"
+                onchange={handleFileInput}
+            />
             <ComposerInput
                 bind:this={composerInputElement}
                 ariaLabel="Console input"
@@ -1609,8 +1765,37 @@
                 onkeydown={handleComposerKeydown}
                 onsubmit={handleComposerSubmit}
             />
+            {#if attachments.length > 0}
+                <div class="composer-attachments" aria-live="polite">
+                    {#each attachments as attachment (attachment.id)}
+                        <div class:failed={attachment.state === "failed"} class="composer-attachment">
+                            <span class="attachment-name" title={attachment.file.name}>{attachment.file.name}</span>
+                            {#if attachment.state === "uploading"}
+                                <progress max="1" value={attachment.progress} aria-label={`Uploading ${attachment.file.name}`}></progress>
+                                <span>{Math.round(attachment.progress * 100)}%</span>
+                            {:else if attachment.state === "failed"}
+                                <span class="error">{attachment.error}</span>
+                                <button type="button" onclick={() => retryAttachment(attachment)}>Retry</button>
+                            {:else}
+                                <span>Ready</span>
+                            {/if}
+                            <button
+                                type="button"
+                                aria-label={`Remove ${attachment.file.name}`}
+                                onclick={() => void removeAttachment(attachment)}
+                            >×</button>
+                        </div>
+                    {/each}
+                </div>
+            {/if}
             <div class="composer-input-footer">
                 <div class="composer-footer-slot">
+                    <button
+                        class="composer-attach-button"
+                        type="button"
+                        disabled={!composerEditable || attachments.length >= MAX_FILES_PER_SUBMISSION}
+                        onclick={() => fileInput?.click()}
+                    >Attach file</button>
                     {#if completionBusy || completionError || completionEntries.length > 0}
                         <div class="composer-completions" aria-live="polite">
                             {#if completionBusy}
@@ -1931,6 +2116,66 @@
     .composer-input-shell:focus-within {
         border-color: color-mix(in srgb, var(--tui-cyan) 60%, var(--line));
         box-shadow: 0 0 0 1px color-mix(in srgb, var(--tui-cyan) 18%, transparent);
+    }
+
+    .composer-input-shell.dragging-files {
+        border-color: var(--accent);
+        background: color-mix(in srgb, var(--accent) 8%, var(--bg-raised));
+    }
+
+    .attachment-file-input {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+    }
+
+    .composer-attachments {
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--space-2);
+        padding: 0 var(--space-3) 3rem;
+    }
+
+    .composer-attachment {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-2);
+        max-width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 0.2rem 0.5rem;
+        font: 500 0.75rem/1.2 var(--font-mono);
+    }
+
+    .composer-attachment.failed {
+        border-color: var(--danger);
+    }
+
+    .composer-attachment progress {
+        width: 4rem;
+    }
+
+    .attachment-name {
+        max-width: 16rem;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .composer-attachment button,
+    .composer-attach-button {
+        border: 0;
+        background: transparent;
+        color: var(--text-muted);
+        cursor: pointer;
+        pointer-events: auto;
+        font: inherit;
+    }
+
+    .composer-attach-button {
+        padding: 0.35rem 0;
     }
 
     .composer-input-footer {

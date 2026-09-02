@@ -161,6 +161,26 @@ Deno.test("large paste segments project compact artifact metadata", () => {
   assert(!text.includes(body), "artifact body is not projected");
 });
 
+Deno.test("uploaded files project bounded metadata without client paths or bytes", () => {
+  const text = segmentsToText([{
+    kind: "uploaded_file",
+    file: {
+      artifact_id: "019ca7c8-57b6-7f05-8edf-524147aba7b3",
+      file_name: "report.pdf",
+      media_type: "application/pdf",
+      created_at_ms: 1_700_000_000_000,
+      availability: "available",
+      byte_len: 4096,
+      sha256: "b".repeat(64),
+      source_entry_id: "entry-2",
+    },
+  }]);
+  assert(text.includes("report.pdf"), "display name is visible");
+  assert(text.includes("application/pdf"), "media type is visible");
+  assert(text.includes("4096 bytes"), "bounded size is visible");
+  assert(!text.includes("/home/user"), "client path is not projected");
+});
+
 Deno.test("console routing projects live errors but not completion replies", () => {
   const errorEvent = {
     event: "error",

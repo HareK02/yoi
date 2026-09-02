@@ -1308,6 +1308,16 @@ fn chip_span_for(seg: &Segment, fallback: Style) -> (Style, String) {
                 artifact.created_at_ms
             ),
         ),
+        Segment::UploadedFile { file } => (
+            Style::default().fg(Color::Cyan),
+            format!(
+                "[Attached {} | {} bytes, {}, {}]",
+                file.file_name,
+                file.byte_len,
+                file.media_type,
+                file.availability.as_str()
+            ),
+        ),
         Segment::FileRef { path } => (Style::default().fg(Color::Cyan), format!("@{path}")),
         Segment::Flow { selector } => (
             Style::default().fg(Color::Yellow),
@@ -1334,6 +1344,13 @@ fn segment_display_text(seg: &Segment) -> String {
             artifact.media_type.as_str(),
             artifact.availability.as_str(),
             artifact.created_at_ms
+        ),
+        Segment::UploadedFile { file } => format!(
+            "[Attached {} | {} bytes, {}, {}]",
+            file.file_name,
+            file.byte_len,
+            file.media_type,
+            file.availability.as_str()
         ),
         Segment::FileRef { path } => format!("@{path}"),
         Segment::Flow { selector } => format!("[Flow: {selector}]"),

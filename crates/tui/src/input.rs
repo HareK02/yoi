@@ -266,6 +266,13 @@ impl InputBuffer {
                 protocol::Segment::PasteArtifact { artifact } => {
                     self.atoms.push(Atom::PasteArtifact(artifact.clone()));
                 }
+                protocol::Segment::UploadedFile { file } => {
+                    self.atoms.extend(
+                        format!("[Attached file: {}]", file.file_name)
+                            .chars()
+                            .map(Atom::Char),
+                    );
+                }
                 protocol::Segment::FileRef { path } => {
                     self.atoms
                         .push(Atom::FileRef(FileRefAtom { path: path.clone() }));

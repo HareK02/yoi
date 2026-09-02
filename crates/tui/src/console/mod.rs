@@ -15,9 +15,9 @@ use crossterm::event::{
 };
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{Command, execute};
-use protocol::{Event, Method, WorkerStatus};
+use protocol::{Event, Method, Segment, UploadedFileRef, WorkerStatus};
 #[cfg(feature = "e2e-test")]
-use protocol::{Greeting, RewindSummary, RewindTarget, RewindTargetId, Segment};
+use protocol::{Greeting, RewindSummary, RewindTarget, RewindTargetId};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use standalone::{StandaloneHost, StandaloneLaunchConfig};
@@ -123,20 +123,45 @@ fn copy_selection_to_terminal(app: &mut App) -> bool {
 struct ConsoleConnection<T> {
     client: Client<T>,
     standalone_host: Option<StandaloneHost>,
+    backend_target: Option<BackendRuntimeTarget>,
+    pending_attachments: Vec<UploadedFileRef>,
+}
+
+fn attachment_media_type(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "txt" | "log" | "rs" | "toml" | "yaml" | "yml" | "dcdl" | "csv" => Some("text/plain"),
+        "md" => Some("text/markdown"),
+        "json" => Some("application/json"),
+        "pdf" => Some("application/pdf"),
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
 }
 
 impl<T: Socket> ConsoleConnection<T> {
-    fn new(client: Client<T>) -> Self {
-        Self {
-            client,
-            standalone_host: None,
-        }
-    }
-
     fn with_standalone_host(client: Client<T>, host: StandaloneHost) -> Self {
         Self {
             client,
             standalone_host: Some(host),
+            backend_target: None,
+            pending_attachments: Vec::new(),
+        }
+    }
+
+    fn with_backend_target(client: Client<T>, target: BackendRuntimeTarget) -> Self {
+        Self {
+            client,
+            standalone_host: None,
+            backend_target: Some(target),
+            pending_attachments: Vec::new(),
         }
     }
 
@@ -149,10 +174,81 @@ impl<T: Socket> ConsoleConnection<T> {
     }
 
     async fn send(&mut self, method: &Method) -> Result<(), Box<dyn std::error::Error>> {
-        Ok(self.client.send(method).await?)
+        let mut prepared = method.clone();
+        let carries_attachments =
+            matches!(prepared, Method::Run { .. }) && !self.pending_attachments.is_empty();
+        if let Method::Run { input } = &mut prepared {
+            input.extend(
+                self.pending_attachments
+                    .iter()
+                    .cloned()
+                    .map(|file| Segment::UploadedFile { file }),
+            );
+        }
+        self.client.send(&prepared).await?;
+        if carries_attachments {
+            self.pending_attachments.clear();
+        }
+        Ok(())
+    }
+
+    async fn upload_path(
+        &mut self,
+        path: &Path,
+    ) -> Result<UploadedFileRef, Box<dyn std::error::Error>> {
+        let target = self.backend_target.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "client-local file upload is available only for Backend Workers",
+            )
+        })?;
+        let metadata = tokio::fs::metadata(path).await?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "attachment path is not a file",
+            )
+            .into());
+        }
+        if metadata.len() > 10 * 1024 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "attachment exceeds the 10 MiB limit",
+            )
+            .into());
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "attachment file name is not valid UTF-8",
+                )
+            })?;
+        let media_type = attachment_media_type(path).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "attachment file type is not supported",
+            )
+        })?;
+        let bytes = tokio::fs::read(path).await?;
+        let reference = target.upload_file(file_name, media_type, bytes).await?;
+        self.pending_attachments.push(reference.clone());
+        Ok(reference)
+    }
+
+    async fn clear_pending_attachments(&mut self) {
+        let references = std::mem::take(&mut self.pending_attachments);
+        if let Some(target) = &self.backend_target {
+            for reference in references {
+                let _ = target.delete_uploaded_file(&reference.artifact_id).await;
+            }
+        }
     }
 
     async fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.clear_pending_attachments().await;
         if let Some(host) = self.standalone_host.take() {
             host.shutdown().await?;
         }
@@ -248,12 +344,13 @@ pub(crate) async fn run_backend_runtime(
     target: BackendRuntimeTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let worker_label = target.display_label();
+    let attachment_target = target.clone();
     let client = connect_backend_runtime(target).await?;
     let mut terminal = enter_fullscreen()?;
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut app = App::new_with_persistent_input_history(worker_label, &workspace_root);
     app.connected = true;
-    let mut connection = ConsoleConnection::new(client);
+    let mut connection = ConsoleConnection::with_backend_target(client, attachment_target);
     let result = run_loop(&mut terminal, &mut app, &mut connection).await;
     let _ = leave_fullscreen(&mut terminal);
     result
@@ -664,6 +761,27 @@ async fn run_loop<T: Socket>(
     Ok(())
 }
 
+fn attachment_command_path(method: &Method) -> Option<PathBuf> {
+    let Method::Run { input } = method else {
+        return None;
+    };
+    let [Segment::Text { content }] = input.as_slice() else {
+        return None;
+    };
+    let path = content.strip_prefix("/attach ")?.trim();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+fn is_clear_attachments_command(method: &Method) -> bool {
+    let Method::Run { input } = method else {
+        return false;
+    };
+    matches!(
+        input.as_slice(),
+        [Segment::Text { content }] if content.trim() == "/clear-attachments"
+    )
+}
+
 async fn handle_terminal_event<T: Socket>(
     app: &mut App,
     client: &mut ConsoleConnection<T>,
@@ -672,7 +790,22 @@ async fn handle_terminal_event<T: Socket>(
     match event {
         TermEvent::Key(key) => {
             if let Some(method) = handle_key(app, key) {
-                client.send(&method).await?;
+                if let Some(path) = attachment_command_path(&method) {
+                    match client.upload_path(&path).await {
+                        Ok(reference) => app.push_notice(format!(
+                            "Attached {} ({} bytes); it will be sent with the next message.",
+                            reference.file_name, reference.byte_len
+                        )),
+                        Err(error) => {
+                            app.push_error(format!("Attachment upload failed: {error}"));
+                        }
+                    }
+                } else if is_clear_attachments_command(&method) {
+                    client.clear_pending_attachments().await;
+                    app.push_notice("Removed pending attachments.");
+                } else {
+                    client.send(&method).await?;
+                }
             }
         }
         TermEvent::Mouse(mouse) => {
@@ -1142,6 +1275,29 @@ mod tests {
         let app = standalone_console_app("standalone".to_string(), temp.path());
 
         assert!(app.connected);
+    }
+
+    #[test]
+    fn client_local_attachment_commands_are_typed_and_do_not_send_the_path() {
+        let attach = Method::Run {
+            input: vec![Segment::text("/attach /tmp/report.md")],
+        };
+        assert_eq!(
+            attachment_command_path(&attach),
+            Some(PathBuf::from("/tmp/report.md"))
+        );
+        assert!(!is_clear_attachments_command(&attach));
+
+        let clear = Method::Run {
+            input: vec![Segment::text("/clear-attachments")],
+        };
+        assert!(is_clear_attachments_command(&clear));
+        assert_eq!(attachment_command_path(&clear), None);
+        assert_eq!(
+            attachment_media_type(Path::new("report.webp")),
+            Some("image/webp")
+        );
+        assert_eq!(attachment_media_type(Path::new("program.exe")), None);
     }
 
     #[test]
