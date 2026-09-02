@@ -65,21 +65,23 @@ struct StoredUploadedFile {
 
 pub(crate) fn validate_file_name(file_name: &str) -> Result<()> {
     let normalized: String = file_name.nfkc().collect();
-    let stem = file_name
-        .rsplit_once('.')
-        .map_or(file_name, |(stem, _)| stem);
-    let confusable_skeleton: String = skeleton(stem).collect();
-    let ascii_confusable = stem.chars().any(|ch| !ch.is_ascii())
-        && confusable_skeleton.is_ascii()
-        && !confusable_skeleton.eq_ignore_ascii_case(stem);
+    let has_unsafe_component = file_name
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .any(|part| {
+            let confusable_skeleton: String = skeleton(part).collect();
+            let ascii_confusable = part.chars().any(|ch| !ch.is_ascii())
+                && confusable_skeleton.is_ascii()
+                && !confusable_skeleton.eq_ignore_ascii_case(part);
+            !part.is_single_script() || ascii_confusable
+        });
 
     if file_name.is_empty()
         || file_name.chars().count() > MAX_FILE_NAME_CHARS
         || file_name == "."
         || file_name == ".."
         || normalized != file_name
-        || !stem.is_single_script()
-        || ascii_confusable
+        || has_unsafe_component
         || file_name.chars().any(|ch| {
             ch.is_control()
                 || ch.general_category() == GeneralCategory::Format

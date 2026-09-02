@@ -145,8 +145,15 @@ fn reconcile_attachment_submission(
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            awaiting_acceptance.retain(|file| !accepted_ids.contains(&file.artifact_id.as_str()));
-            had_awaiting && awaiting_acceptance.is_empty()
+            let accepts_exact_submission = had_awaiting
+                && accepted_ids.len() == awaiting_acceptance.len()
+                && awaiting_acceptance
+                    .iter()
+                    .all(|file| accepted_ids.contains(&file.artifact_id.as_str()));
+            if accepts_exact_submission {
+                awaiting_acceptance.clear();
+            }
+            accepts_exact_submission
         }
         Event::Error { .. } if !awaiting_acceptance.is_empty() => {
             pending.append(awaiting_acceptance);
@@ -1521,6 +1528,52 @@ mod tests {
         });
         assert!(connection.pending_attachments.is_empty());
         assert!(connection.awaiting_attachment_acceptance.is_empty());
+    }
+
+    #[test]
+    fn partial_attachment_echo_does_not_acknowledge_an_atomic_submission() {
+        let first = UploadedFileRef {
+            artifact_id: "artifact-1".into(),
+            file_name: "one.txt".into(),
+            media_type: "text/plain".into(),
+            created_at_ms: 1,
+            availability: UploadedFileAvailability::Available,
+            byte_len: 1,
+            sha256: "a".repeat(64),
+            source_entry_id: None,
+        };
+        let second = UploadedFileRef {
+            artifact_id: "artifact-2".into(),
+            file_name: "two.txt".into(),
+            ..first.clone()
+        };
+        let mut pending = Vec::new();
+        let mut awaiting = vec![first.clone(), second.clone()];
+
+        assert!(!reconcile_attachment_submission(
+            &mut pending,
+            &mut awaiting,
+            &Event::UserMessage {
+                segments: vec![Segment::UploadedFile { file: first }],
+            },
+        ));
+        assert_eq!(
+            awaiting,
+            vec![
+                UploadedFileRef {
+                    artifact_id: "artifact-1".into(),
+                    file_name: "one.txt".into(),
+                    media_type: "text/plain".into(),
+                    created_at_ms: 1,
+                    availability: UploadedFileAvailability::Available,
+                    byte_len: 1,
+                    sha256: "a".repeat(64),
+                    source_entry_id: None,
+                },
+                second,
+            ]
+        );
+        assert!(pending.is_empty());
     }
 
     #[test]

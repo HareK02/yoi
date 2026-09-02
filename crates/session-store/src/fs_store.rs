@@ -987,6 +987,7 @@ mod tests {
             "safe\u{180e}name.txt",
             "safe\u{e0001}name.txt",
             "p\u{0430}ypal.txt",
+            "report.\u{03c1}df",
             "\u{0440}\u{0430}\u{0443}\u{0440}\u{0430}\u{04cf}.txt",
             "\u{ff26}\u{ff49}\u{ff4c}\u{ff45}.txt",
             "re\u{0301}sume\u{0301}.txt",
