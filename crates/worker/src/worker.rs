@@ -7919,6 +7919,7 @@ mod build_summary_prompt_tests {
             fork_entries.as_slice(),
             [
                 LogEntry::AnnotatedSegmentStart { .. },
+                LogEntry::InputSegmentsCheckpoint { .. },
                 LogEntry::ActiveRunCheckpoint {
                     active_turn_count: 3,
                     total_turn_count: 7,
