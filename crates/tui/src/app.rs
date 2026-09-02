@@ -778,6 +778,20 @@ impl App {
         Some(self.method_for_run(segments))
     }
 
+    pub fn restore_unsent_run(&mut self, method: &Method) {
+        let Method::Run { input } = method else {
+            return;
+        };
+        self.pending_submit_rollback = None;
+        if self.input.is_empty() {
+            self.input.replace_with_segments(input);
+            self.completion = None;
+        } else {
+            self.queued_inputs
+                .push_front(QueuedInput::new(input.clone()));
+        }
+    }
+
     fn method_for_run(&mut self, segments: Vec<Segment>) -> Method {
         // TurnHeader / UserMessage blocks are pushed only after the Worker
         // emits `Event::UserMessage` from a committed `LogEntry::AnnotatedUserInput`.

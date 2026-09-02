@@ -137,7 +137,6 @@ fn reconcile_attachment_submission(
 ) -> bool {
     match event {
         Event::UserMessage { segments, .. } => {
-            let had_awaiting = !awaiting_acceptance.is_empty();
             let accepted_ids = segments
                 .iter()
                 .filter_map(|segment| match segment {
@@ -145,11 +144,11 @@ fn reconcile_attachment_submission(
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            let accepts_exact_submission = had_awaiting
-                && accepted_ids.len() == awaiting_acceptance.len()
-                && awaiting_acceptance
-                    .iter()
-                    .all(|file| accepted_ids.contains(&file.artifact_id.as_str()));
+            let awaited_ids = awaiting_acceptance
+                .iter()
+                .map(|file| file.artifact_id.as_str())
+                .collect::<Vec<_>>();
+            let accepts_exact_submission = !awaited_ids.is_empty() && accepted_ids == awaited_ids;
             if accepts_exact_submission {
                 awaiting_acceptance.clear();
             }
@@ -818,7 +817,7 @@ async fn drain_worker_events<T: Socket>(
                     app.clear_actionbar_notice();
                 }
                 if let Some(method) = app.handle_worker_event(ev) {
-                    client.send(&method).await?;
+                    send_console_method(app, client, &method).await?;
                 }
             }
             None => break,
@@ -898,7 +897,7 @@ async fn run_loop<T: Socket>(
                         app.clear_actionbar_notice();
                     }
                     if let Some(method) = app.handle_worker_event(ev) {
-                        client.send(&method).await?;
+                        send_console_method(app, client, &method).await?;
                     }
                 }
                 None => {
@@ -943,6 +942,7 @@ async fn send_console_method<T: Socket>(
     method: &Method,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if matches!(method, Method::Run { .. }) && client.has_active_uploads() {
+        app.restore_unsent_run(method);
         app.flash_actionbar_notice(
             "Attachment upload is still in progress; wait or use /clear-attachments.",
             ActionbarNoticeLevel::Info,
@@ -956,6 +956,7 @@ async fn send_console_method<T: Socket>(
         matches!(method, Method::Run { .. }) && !client.pending_attachments.is_empty();
     if let Err(error) = client.send(method).await {
         if sends_attachments {
+            app.restore_unsent_run(method);
             app.push_error(format!(
                 "Attachment submission failed: {error}. Pending attachments were retained; retry Send."
             ));
@@ -1475,7 +1476,8 @@ mod tests {
     use crate::text_selection::{HistoryViewport, SelectionRow};
     use async_trait::async_trait;
     use protocol::{
-        Event, RewindTarget, RewindTargetId, Segment, UploadedFileAvailability, UploadedFileRef,
+        Event, RewindTarget, RewindTargetId, RunResult, Segment, UploadedFileAvailability,
+        UploadedFileRef, WorkerStatus,
     };
 
     #[test]
@@ -1563,27 +1565,32 @@ mod tests {
         };
 
         let mut app = App::new("worker".into());
-        let method = Method::Run {
-            input: vec![Segment::text("inspect")],
-        };
+        app.input.insert_str("inspect");
 
         connection.active_uploads = 1;
-        send_console_method(&mut app, &mut connection, &method)
+        let blocked = app.submit_input().unwrap();
+        assert!(app.input.is_empty());
+        send_console_method(&mut app, &mut connection, &blocked)
             .await
             .unwrap();
+        assert_eq!(app.input.plain_text(), "inspect");
         assert_eq!(connection.pending_attachments, vec![file.clone()]);
         assert!(connection.awaiting_attachment_acceptance.is_empty());
 
         connection.active_uploads = 0;
-        send_console_method(&mut app, &mut connection, &method)
+        let failed = app.submit_input().unwrap();
+        send_console_method(&mut app, &mut connection, &failed)
             .await
             .unwrap();
+        assert_eq!(app.input.plain_text(), "inspect");
         assert_eq!(connection.pending_attachments, vec![file.clone()]);
         assert!(connection.awaiting_attachment_acceptance.is_empty());
 
-        send_console_method(&mut app, &mut connection, &method)
+        let retry = app.submit_input().unwrap();
+        send_console_method(&mut app, &mut connection, &retry)
             .await
             .unwrap();
+        assert!(app.input.is_empty());
         assert!(connection.pending_attachments.is_empty());
         assert_eq!(
             connection.awaiting_attachment_acceptance,
@@ -1594,6 +1601,49 @@ mod tests {
             segments: vec![Segment::text("inspect"), Segment::UploadedFile { file }],
         });
         assert!(connection.pending_attachments.is_empty());
+        assert!(connection.awaiting_attachment_acceptance.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_attachment_send_failure_restores_draft_without_exiting_console() {
+        let file = UploadedFileRef {
+            artifact_id: "artifact-queued".into(),
+            file_name: "queued.txt".into(),
+            media_type: "text/plain".into(),
+            created_at_ms: 1,
+            availability: UploadedFileAvailability::Available,
+            byte_len: 1,
+            sha256: "a".repeat(64),
+            source_entry_id: None,
+        };
+        let mut connection = ConsoleConnection {
+            client: Client::new(FailOnceSocket {
+                fail_next_send: true,
+            }),
+            standalone_host: None,
+            backend_target: None,
+            pending_attachments: vec![file.clone()],
+            awaiting_attachment_acceptance: Vec::new(),
+            upload_tasks: Vec::new(),
+            active_uploads: 0,
+            upload_ids: HashMap::new(),
+        };
+        let mut app = App::new("worker".into());
+        app.set_worker_status(WorkerStatus::Running);
+        app.input.insert_str("queued inspect");
+        assert!(app.submit_input().is_none());
+
+        let method = app
+            .handle_worker_event(Event::RunEnd {
+                result: RunResult::Finished,
+            })
+            .expect("queued run must be released");
+        send_console_method(&mut app, &mut connection, &method)
+            .await
+            .unwrap();
+
+        assert_eq!(app.input.plain_text(), "queued inspect");
+        assert_eq!(connection.pending_attachments, vec![file]);
         assert!(connection.awaiting_attachment_acceptance.is_empty());
     }
 
@@ -1616,31 +1666,37 @@ mod tests {
         };
         let mut pending = Vec::new();
         let mut awaiting = vec![first.clone(), second.clone()];
+        let expected = awaiting.clone();
 
-        assert!(!reconcile_attachment_submission(
-            &mut pending,
-            &mut awaiting,
-            &Event::UserMessage {
-                segments: vec![Segment::UploadedFile { file: first }],
-            },
-        ));
-        assert_eq!(
-            awaiting,
+        for segments in [
+            vec![Segment::UploadedFile {
+                file: first.clone(),
+            }],
             vec![
-                UploadedFileRef {
-                    artifact_id: "artifact-1".into(),
-                    file_name: "one.txt".into(),
-                    media_type: "text/plain".into(),
-                    created_at_ms: 1,
-                    availability: UploadedFileAvailability::Available,
-                    byte_len: 1,
-                    sha256: "a".repeat(64),
-                    source_entry_id: None,
+                Segment::UploadedFile {
+                    file: second.clone(),
                 },
-                second,
-            ]
-        );
-        assert!(pending.is_empty());
+                Segment::UploadedFile {
+                    file: first.clone(),
+                },
+            ],
+            vec![
+                Segment::UploadedFile {
+                    file: first.clone(),
+                },
+                Segment::UploadedFile {
+                    file: first.clone(),
+                },
+            ],
+        ] {
+            assert!(!reconcile_attachment_submission(
+                &mut pending,
+                &mut awaiting,
+                &Event::UserMessage { segments },
+            ));
+            assert_eq!(awaiting, expected);
+            assert!(pending.is_empty());
+        }
     }
 
     #[test]
