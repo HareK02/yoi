@@ -636,6 +636,7 @@
         try {
             const method = composerRequestToProtocolMethod(command.request);
             sendProtocolMethod(method);
+            composerInputElement?.recordHistory(value);
             composerInputElement?.clear();
             if (method.method === "run" || method.method === "notify") {
                 liveWorkerState = "running";
@@ -1602,6 +1603,7 @@
         <div class="composer-input-shell">
             <ComposerInput
                 bind:this={composerInputElement}
+                historyScope={workspaceId}
                 ariaLabel="Console input"
                 ariaKeyShortcuts="Meta+Enter Control+Enter"
                 disabled={!composerEditable}
