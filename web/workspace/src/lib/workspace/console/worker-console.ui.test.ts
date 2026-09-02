@@ -812,6 +812,12 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
   const globalSidebar = await Deno.readTextFile(
     new URL("../sidebar/GlobalSidebar.svelte", import.meta.url),
   );
+  const globalNavSections = await Deno.readTextFile(
+    new URL("../sidebar/GlobalNavSections.svelte", import.meta.url),
+  );
+  const workspaceCatalogPage = await Deno.readTextFile(
+    new URL("./../../../routes/+page.svelte", import.meta.url),
+  );
   const sidebarFrame = await Deno.readTextFile(
     new URL("../sidebar/SidebarFrame.svelte", import.meta.url),
   );
@@ -874,13 +880,24 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     "Root layout chrome should keep GlobalSidebar as the root slot owner while account navigation stays in the header",
   );
   assert(
-    globalSidebar.includes('aria-label="Global pages"') &&
-      !globalSidebar.includes('<p class="sidebar-section-label">') &&
-      globalSidebar.includes("/account") &&
-      globalSidebar.includes("/login/device") &&
-      !globalSidebar.includes("Tickets") &&
-      !globalSidebar.includes("Repositories"),
-    "Root default sidebar should contain only global navigation, not workspace-scoped sections",
+    globalSidebar.includes("GlobalNavSections") &&
+      globalNavSections.includes('aria-label="Global pages"') &&
+      !globalNavSections.includes('<p class="sidebar-section-label">') &&
+      globalNavSections.includes('"/account"') &&
+      globalNavSections.includes('"/login/device"') &&
+      !globalNavSections.includes('label: "Workspaces"') &&
+      globalNavSections.includes("sidebar-nav-section--category") &&
+      globalNavSections.includes("global-workspaces-heading") &&
+      globalNavSections.includes("workspaces") &&
+      globalNavSections.includes("workspace.display_name") &&
+      globalNavSections.includes("workspaceHref(workspace.workspace_id)") &&
+      workspaceCatalogPage.includes("SidebarOverride") &&
+      workspaceCatalogPage.includes("sidebar={homeSidebar}") &&
+      workspaceCatalogPage.includes("GlobalNavSections") &&
+      workspaceCatalogPage.includes("{workspaces}") &&
+      !globalNavSections.includes("Tickets") &&
+      !globalNavSections.includes("Repositories"),
+    "Root page sidebar should replace the Workspaces button with a categorized accessible Workspace list below the remaining global navigation",
   );
   assert(
     workspaceLayout.includes("{#snippet workspaceSidebar()}") &&
