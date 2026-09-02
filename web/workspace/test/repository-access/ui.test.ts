@@ -56,7 +56,7 @@ test("Repository Access renders the shared access projection fields", () => {
       "accessProjection.config_revision",
       "accessProjection.projection_digest",
       "accessProjection.bindings",
-      "binding.repository_id",
+      "binding.repository_key",
       "binding.credential_id",
       "binding.host_trust_id",
       "binding.access",

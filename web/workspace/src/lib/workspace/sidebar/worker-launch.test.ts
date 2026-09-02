@@ -44,12 +44,12 @@ const options: WorkerLaunchOptionsResponse = {
     { id: "builtin:coder", label: "Coder", description: "code" },
   ],
   repositories: [
-    { id: "repo", display_name: "Repo", default_selector: "HEAD" },
+    { repository_key: "repo", default_selector: "HEAD" },
   ],
   working_directories: [
     {
       working_directory_id: "wd-1-repo",
-      repository_id: "repo",
+      repository_key: "repo",
       creation_selector: "HEAD",
       creation_ref: "0123456789abcdef",
       current_selector: null,
@@ -61,7 +61,7 @@ const options: WorkerLaunchOptionsResponse = {
       cleanup_target: {
         kind: "git_worktree",
         working_directory_id: "wd-1-repo",
-        repository_id: "repo",
+        repository_key: "repo",
       },
     },
   ],
@@ -75,7 +75,7 @@ Deno.test("defaultWorkerLaunchForm uses the Backend-published Workspace default 
     profile: "",
     initial_text: "hello",
     working_directory_id: "",
-    working_directory_repository_id: "",
+    working_directory_repository_key: "",
     working_directory_selector: "",
     relative_cwd: "",
   });
@@ -85,7 +85,7 @@ Deno.test("defaultWorkerLaunchForm uses the Backend-published Workspace default 
   assertEquals(form.profile, "builtin:coder");
   assertEquals(form.initial_text, "hello");
   assertEquals(form.working_directory_id, "wd-1-repo");
-  assertEquals(form.working_directory_repository_id, "repo");
+  assertEquals(form.working_directory_repository_key, "repo");
   assertEquals(form.working_directory_selector, "HEAD");
 });
 
@@ -103,7 +103,7 @@ Deno.test("defaultWorkerLaunchForm preserves an available Ticket role profile", 
     profile: "builtin:reviewer",
     initial_text: "Review the ticket.",
     working_directory_id: "",
-    working_directory_repository_id: "repo",
+    working_directory_repository_key: "repo",
     working_directory_selector: "HEAD",
     relative_cwd: "",
   });
@@ -133,7 +133,7 @@ Deno.test("defaultWorkerLaunchForm skips occupied working directories", () => {
       profile: "",
       initial_text: "hello",
       working_directory_id: "",
-      working_directory_repository_id: "",
+      working_directory_repository_key: "",
       working_directory_selector: "",
       relative_cwd: "",
     },
@@ -149,8 +149,7 @@ Deno.test("defaultWorkerLaunchForm preserves a Ticket repository target", () => 
       repositories: [
         ...options.repositories,
         {
-          id: "ticket-repo",
-          display_name: "Ticket repo",
+          repository_key: "ticket-repo",
           default_selector: "main",
         },
       ],
@@ -159,7 +158,7 @@ Deno.test("defaultWorkerLaunchForm preserves a Ticket repository target", () => 
         {
           ...options.working_directories[0],
           working_directory_id: "ticket-workdir",
-          repository_id: "ticket-repo",
+          repository_key: "ticket-repo",
           creation_selector: "work/ticket",
         },
       ],
@@ -170,14 +169,14 @@ Deno.test("defaultWorkerLaunchForm preserves a Ticket repository target", () => 
       profile: "builtin:coder",
       initial_text: "Work on a ticket.",
       working_directory_id: "",
-      working_directory_repository_id: "ticket-repo",
+      working_directory_repository_key: "ticket-repo",
       working_directory_selector: "work/ticket",
       relative_cwd: "",
     },
   );
 
   assertEquals(form.working_directory_id, "ticket-workdir");
-  assertEquals(form.working_directory_repository_id, "ticket-repo");
+  assertEquals(form.working_directory_repository_key, "ticket-repo");
   assertEquals(form.working_directory_selector, "work/ticket");
 });
 
@@ -188,7 +187,7 @@ Deno.test("buildCreateWorkspaceWorkerRequest sends working_directory id and rela
     profile: "builtin:coder",
     initial_text: "go",
     working_directory_id: "wd-1-repo",
-    working_directory_repository_id: "repo",
+    working_directory_repository_key: "repo",
     working_directory_selector: "main",
     relative_cwd: "crates/yoi",
   });
@@ -212,7 +211,7 @@ Deno.test("buildCreateWorkspaceWorkerRequest sends no initial segments for an em
     profile: "builtin:companion",
     initial_text: "   ",
     working_directory_id: "",
-    working_directory_repository_id: "",
+    working_directory_repository_key: "",
     working_directory_selector: "",
     relative_cwd: "",
   });
@@ -227,7 +226,7 @@ Deno.test("buildCreateWorkspaceWorkerRequest omits working_directory for embedde
     profile: "builtin:companion",
     initial_text: "chat",
     working_directory_id: "",
-    working_directory_repository_id: "",
+    working_directory_repository_key: "",
     working_directory_selector: "",
     relative_cwd: "",
   });

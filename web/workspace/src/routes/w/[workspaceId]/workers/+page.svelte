@@ -146,9 +146,9 @@
   function workerDirectory(worker: Worker): string {
     const directory = worker.working_directory;
     if (!directory) return '—';
-    const provider = data.repositories?.items.find((repository) => repository.id === directory.repository_id)
+    const provider = data.repositories?.items.find((repository) => repository.repository_key === directory.repository_key)
       ?.provider;
-    return `${directory.repository_id} · ${formatCurrentWorkdirRevision(directory, provider)}`;
+    return `${directory.repository_key} · ${formatCurrentWorkdirRevision(directory, provider)}`;
   }
 </script>
 

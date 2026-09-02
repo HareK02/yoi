@@ -6,7 +6,7 @@
 </script>
 
 <svelte:head>
-  <title>{data.repository?.item.display_name ?? data.repositoryId} · Repository</title>
+  <title>{data.repository?.item.repository_key ?? data.repositoryKey} · Repository</title>
 </svelte:head>
 
 <section class="card repository-detail-card">
@@ -14,7 +14,7 @@
   {#if data.repository}
     <div class="repository-detail-heading">
       <div>
-        <h3>{data.repository.item.display_name}</h3>
+        <h3>{data.repository.item.repository_key}</h3>
       </div>
       <span class="status-pill" class:warn={data.repository.item.observed_status !== 'ready'}>{data.repository.item.observed_status}</span>
     </div>

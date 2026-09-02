@@ -65,7 +65,7 @@ export type DeleteRepositorySshHostTrustRequest = {
 export type RepositoryAccessMode = "read_only" | "read_write";
 
 export type RepositorySshAccessBinding = {
-  repository_id: string;
+  repository_key: string;
   credential_id: string;
   host_trust_id: string;
   access: RepositoryAccessMode;

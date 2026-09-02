@@ -14,8 +14,7 @@ export type WorkspaceCatalogListResponse = Array<WorkspaceSummary>;
 
 export type WorkspaceRepositoryRecord = {
   workspace_id: string;
-  repository_id: string;
-  name: string;
+  repository_key: string;
   kind: string;
   provider: string | null;
   source: RepositorySource;
@@ -175,8 +174,7 @@ export type GitRepositorySummary = {
 };
 
 export type RepositorySummary = {
-  id: string;
-  display_name: string;
+  repository_key: string;
   kind: string;
   provider: string;
   source: RepositorySource;
@@ -216,7 +214,7 @@ export type RepositoryDetailResponse = {
 
 export type RepositoryLogResponse = {
   workspace_id: string;
-  repository_id: string;
+  repository_key: string;
   default_selector?: string | null;
   limit: number;
   items: Array<GitCommitSummary>;

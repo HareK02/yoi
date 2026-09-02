@@ -78,7 +78,7 @@ pub struct TicketDetail {
     pub item_revision: String,
     pub queued_by: Option<String>,
     pub queued_at: Option<String>,
-    pub repository_id: Option<String>,
+    pub repository_key: Option<String>,
     pub ref_selector: Option<String>,
     pub risk_flags: Vec<String>,
     pub body: String,
@@ -301,7 +301,7 @@ pub struct TicketActionEligibility {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketMergeRequestSummary {
     pub merge_request_id: String,
-    pub repository_id: String,
+    pub repository_key: String,
     pub state: String,
     pub review_status: String,
     pub selector_from: Option<String>,

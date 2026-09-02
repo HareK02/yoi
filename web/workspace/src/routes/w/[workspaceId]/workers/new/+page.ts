@@ -11,7 +11,7 @@ export function load(
         ticketTitle: url.searchParams.get("ticketTitle") ?? ticketId,
         ticketRole,
         initialInput: url.searchParams.get("initialInput") ?? "",
-        repositoryId: url.searchParams.get("repositoryId") ?? "",
+        repositoryKey: url.searchParams.get("repositoryKey") ?? "",
         refSelector: url.searchParams.get("refSelector") ?? "HEAD",
       }
       : null,

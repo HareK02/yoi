@@ -58,8 +58,7 @@ Deno.test("workspace catalog enriches each visible workspace without dropping si
       return Promise.resolve(Response.json({
         workspace_id: "w-a",
         items: [{
-          id: "main",
-          display_name: "Main",
+          repository_key: "main",
           kind: "git",
           provider: "git",
           source: { kind: "local_path", uri: "/srv/alpha" },
@@ -78,7 +77,7 @@ Deno.test("workspace catalog enriches each visible workspace without dropping si
 
   const items = await loadWorkspaceCatalog(fetcher as typeof fetch);
   assertEquals(items.length, 2);
-  assertEquals(items[0].repositories[0].id, "main");
+  assertEquals(items[0].repositories[0].repository_key, "main");
   assertEquals(items[1].repositories, []);
   assertEquals(typeof items[1].repository_error, "string");
 });
@@ -89,8 +88,8 @@ Deno.test("workspace creation preserves caller-owned operation key across retry"
     operation_key: "web-create-1",
     display_name: "Alpha",
     repository: {
+      repository_key: "main",
       uri: "/srv/alpha",
-      display_name: "Main",
       default_ref: "develop",
     },
   };

@@ -112,12 +112,12 @@ export function parseRepositoryAccessProjection(
   bindings.forEach((binding, index) => {
     const bindingPath = `${path}.bindings[${index}]`;
     const bindingRecord = readRecord(binding, bindingPath, [
-      "repository_id",
+      "repository_key",
       "credential_id",
       "host_trust_id",
       "access",
     ]);
-    readString(bindingRecord, "repository_id", bindingPath);
+    readString(bindingRecord, "repository_key", bindingPath);
     readString(bindingRecord, "credential_id", bindingPath);
     readString(bindingRecord, "host_trust_id", bindingPath);
     const access = readString(bindingRecord, "access", bindingPath);

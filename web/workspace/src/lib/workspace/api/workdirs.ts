@@ -11,7 +11,7 @@ import type {
 
 const SUMMARY_KEYS = new Set([
   "working_directory_id",
-  "repository_id",
+  "repository_key",
   "creation_selector",
   "creation_ref",
   "creation_tree",
@@ -28,7 +28,7 @@ const SUMMARY_KEYS = new Set([
 ]);
 const CREATE_REQUEST_KEYS = new Set([
   "runtime_id",
-  "repository_id",
+  "repository_key",
   "selector",
   "operation_id",
 ]);
@@ -36,7 +36,7 @@ const DIAGNOSTIC_KEYS = new Set(["code", "severity", "message"]);
 const CLEANUP_TARGET_KEYS = new Set([
   "kind",
   "working_directory_id",
-  "repository_id",
+  "repository_key",
 ]);
 const OCCUPANCY_KEYS = new Set([
   "runtime_id",
@@ -81,7 +81,7 @@ export function validateWorkingDirectoryCreateRequest(
     "Workdir create request",
   );
   const request: WorkingDirectoryCreateRequest = {
-    repository_id: stringField(record, "repository_id"),
+    repository_key: stringField(record, "repository_key"),
   };
   assignOptionalString(request, record, "runtime_id");
   assignOptionalString(request, record, "selector");
@@ -110,7 +110,7 @@ function parseSummary(value: unknown): WorkingDirectorySummary {
   const record = exactRecord(value, SUMMARY_KEYS, "Workdir summary");
   const summary: WorkingDirectorySummary = {
     working_directory_id: stringField(record, "working_directory_id"),
-    repository_id: stringField(record, "repository_id"),
+    repository_key: stringField(record, "repository_key"),
     materializer_kind: enumField(record, "materializer_kind", [
       "runtime_git_cache",
       "local_git_worktree",
@@ -166,7 +166,7 @@ function parseCleanupTarget(value: unknown): WorkingDirectoryCleanupTarget {
   return {
     kind: stringField(record, "kind"),
     working_directory_id: stringField(record, "working_directory_id"),
-    repository_id: stringField(record, "repository_id"),
+    repository_key: stringField(record, "repository_key"),
   };
 }
 

@@ -1976,6 +1976,22 @@ impl WorkspaceApi {
             .ok_or_else(|| ApiError::from(Error::UnknownRepository(repository_id.to_string())))
     }
 
+    fn require_configured_workspace_repository_by_key(
+        &self,
+        repository_key: &str,
+    ) -> ApiResult<ConfiguredRepository> {
+        workspace_api::validate_repository_key(repository_key).map_err(|error| {
+            ApiError::from(Error::InvalidInput(format!(
+                "invalid Repository key: {error}"
+            )))
+        })?;
+        let repository = self
+            .store
+            .get_repository_by_key(&self.config.workspace_id, repository_key)?
+            .ok_or_else(|| ApiError::from(Error::UnknownRepository(repository_key.to_string())))?;
+        self.require_configured_workspace_repository(&repository.repository_id)
+    }
+
     fn validate_worker_spawn_repository_scope(
         &self,
         request: &WorkerSpawnRequest,
@@ -2013,14 +2029,16 @@ impl WorkspaceApi {
             // Workdir-less Ticket Workers cannot execute repository implementation.
             // Preserve that control-plane launch while still validating any persisted
             // target (including its Workspace ownership) when one exists.
-            if selected_repository_id.is_none() && ticket.repository_id.is_none() {
+            if selected_repository_id.is_none() && ticket.repository_key.is_none() {
                 return Ok(());
             }
-            let repository_id = ticket.repository_id.as_deref().ok_or_else(|| {
+            let repository_key = ticket.repository_key.as_deref().ok_or_else(|| {
                 ApiError::from(Error::Config(
                     "Ticket implementation target must be validated and persisted before spawning a Ticket Worker".to_owned(),
                 ))
             })?;
+            let repository = self.require_configured_workspace_repository_by_key(repository_key)?;
+            let repository_id = repository.id.as_str();
             let ref_selector = ticket.ref_selector.as_deref().ok_or_else(|| {
                 ApiError::from(Error::Config(
                     "Ticket implementation target selector must be validated and persisted before spawning a Ticket Worker".to_owned(),
@@ -2036,7 +2054,7 @@ impl WorkspaceApi {
                 })?;
             if selected_repository_id.as_deref() != Some(repository_id) {
                 return Err(ApiError::from(Error::Config(format!(
-                    "Ticket `{ticket_id}` targets repository `{repository_id}`, but the Worker launch resolves `{}`",
+                    "Ticket `{ticket_id}` targets repository `{repository_key}`, but the Worker launch resolves `{}`",
                     selected_repository_id.as_deref().unwrap_or("none")
                 ))));
             }
@@ -2459,14 +2477,14 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
             "/api/w/{workspace_id}/repositories",
             get(scoped_list_repositories).post(scoped_create_repository),
         )
-        .route("/api/repositories/{repository_id}", get(repository_detail))
+        .route("/api/repositories/{repository_key}", get(repository_detail))
         .route(
-            "/api/w/{workspace_id}/repositories/{repository_id}",
+            "/api/w/{workspace_id}/repositories/{repository_key}",
             get(scoped_repository_detail),
         )
-        .route("/api/repositories/{repository_id}/log", get(repository_log))
+        .route("/api/repositories/{repository_key}/log", get(repository_log))
         .route(
-            "/api/w/{workspace_id}/repositories/{repository_id}/log",
+            "/api/w/{workspace_id}/repositories/{repository_key}/log",
             get(scoped_repository_log),
         )
         .route("/api/hosts", get(list_hosts))
@@ -2929,7 +2947,7 @@ pub struct CleanupWorkdirCandidate {
     pub action: CleanupTargetKind,
     pub workdir_id: String,
     pub runtime_id: String,
-    pub repository_id: String,
+    pub repository_key: String,
     pub reason: String,
     pub blocking_reason: Option<String>,
     pub linked_worker_ids: Vec<String>,
@@ -3024,8 +3042,7 @@ pub struct WorkerLaunchProfileCandidate {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkingDirectoryRepositoryOption {
-    pub id: String,
-    pub display_name: String,
+    pub repository_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_selector: Option<String>,
 }
@@ -3174,7 +3191,7 @@ struct ScopedSkillPath {
 #[derive(Debug, Deserialize)]
 struct ScopedRepositoryPath {
     workspace_id: String,
-    repository_id: String,
+    repository_key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4558,17 +4575,24 @@ async fn scoped_edit_ticket_item(
     Json(request): Json<BrowserEditTicketRequest>,
 ) -> ApiResult<Json<TicketDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    if let Some(TicketTargetEdit::Set { repository_id, .. }) = request.target.as_ref() {
-        if api
+    let mut target = request.target;
+    if let Some(TicketTargetEdit::Set { repository_id, .. }) = target.as_mut() {
+        workspace_api::validate_repository_key(repository_id).map_err(|_| {
+            settings_bad_request(
+                "repository_key_invalid",
+                "Repository key must contain 1-64 lowercase ASCII letters, digits, or hyphens without a leading or trailing hyphen",
+            )
+        })?;
+        *repository_id = api
             .store
-            .get_repository(&api.config.workspace_id, repository_id)?
-            .is_none()
-        {
-            return Err(settings_bad_request(
-                "unknown_ticket_repository",
-                "repository_id must identify a repository registered in this Workspace",
-            ));
-        }
+            .get_repository_by_key(&api.config.workspace_id, repository_id)?
+            .map(|repository| repository.repository_id)
+            .ok_or_else(|| {
+                settings_bad_request(
+                    "unknown_ticket_repository",
+                    "repository_key must identify a Repository registered in this Workspace",
+                )
+            })?;
     }
     browser_ticket_backend(&api)?
         .edit_item(
@@ -4590,7 +4614,7 @@ async fn scoped_edit_ticket_item(
                         ));
                     }
                 },
-                target: request.target,
+                target,
                 author: request.author,
             },
         )
@@ -4736,6 +4760,36 @@ fn reject_unguarded_ticket_completion(operation: &TicketBackendOperation) -> Res
     Ok(())
 }
 
+fn resolve_ticket_operation_repository_keys(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    operation: &mut TicketBackendOperation,
+) -> ApiResult<()> {
+    let submitted_key = match operation {
+        TicketBackendOperation::Create { input } => input.repository_id.as_mut(),
+        TicketBackendOperation::EditItem { edit, .. } => match edit.target.as_mut() {
+            Some(ticket::TicketTargetEdit::Set { repository_id, .. }) => Some(repository_id),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(repository_key) = submitted_key else {
+        return Ok(());
+    };
+    workspace_api::validate_repository_key(repository_key).map_err(|error| {
+        ApiError::from(Error::InvalidInput(format!(
+            "invalid Repository key: {error}"
+        )))
+    })?;
+    let repository_id = api
+        .store
+        .get_repository_by_key(workspace_id, repository_key)?
+        .map(|repository| repository.repository_id)
+        .ok_or_else(|| ApiError::from(Error::UnknownRepository(repository_key.clone())))?;
+    *repository_key = repository_id;
+    Ok(())
+}
+
 async fn execute_ticket_rest_operation(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -4743,6 +4797,7 @@ async fn execute_ticket_rest_operation(
     mut operation: TicketBackendOperation,
 ) -> ApiResult<TicketBackendOperationResult> {
     validate_workspace_scope(api, workspace_id)?;
+    resolve_ticket_operation_repository_keys(api, workspace_id, &mut operation)?;
     let mut backend = SqliteTicketBackend::open_verified(
         api.config.database_path.clone(),
         api.config.workspace_id.clone(),
@@ -4844,7 +4899,7 @@ async fn execute_ticket_rest_operation(
         backend = backend.with_event_attributes(event_attributes);
     }
 
-    let result = execute_ticket_backend_operation(&backend, operation).map_err(Error::from)?;
+    let mut result = execute_ticket_backend_operation(&backend, operation).map_err(Error::from)?;
     if is_mutation {
         if let TicketBackendOperationResult::QueueOutcome(outcome) = &result {
             for ticket_id in &outcome.queued_tickets {
@@ -4869,6 +4924,16 @@ async fn execute_ticket_rest_operation(
                 source,
             );
         }
+    }
+    if let TicketBackendOperationResult::Ticket(ticket) = &mut result
+        && let Some(repository_id) = ticket.meta.repository_id.as_deref()
+    {
+        let repository_key = api
+            .store
+            .get_repository(workspace_id, repository_id)?
+            .map(|repository| repository.repository_key)
+            .ok_or_else(|| Error::UnknownRepository(repository_id.to_string()))?;
+        ticket.meta.repository_id = Some(repository_key);
     }
     Ok(result)
 }
@@ -5211,7 +5276,7 @@ async fn scoped_queue_ticket_record(
 
 #[derive(Debug, serde::Deserialize)]
 struct OpenMergeRequestRequest {
-    repository_id: String,
+    repository_key: String,
     selector_from: String,
     selector_to: String,
     #[serde(default)]
@@ -5433,10 +5498,34 @@ fn resolve_workspace_worker_ticket_assignment(
     Ok(())
 }
 
+fn public_merge_request(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    mr: merge_request::MergeRequest,
+) -> ApiResult<PublicMergeRequest> {
+    let repository_key = api
+        .store
+        .get_repository(workspace_id, &mr.repository_id)?
+        .map(|repository| repository.repository_key)
+        .ok_or_else(|| ApiError::from(Error::UnknownRepository(mr.repository_id.clone())))?;
+    Ok(PublicMergeRequest {
+        workspace_id: mr.workspace_id,
+        merge_request_id: mr.merge_request_id,
+        repository_key,
+        state: mr.state,
+        selector_from: mr.selector_from,
+        selector_to: mr.selector_to,
+        ticket_ids: mr.ticket_ids,
+        created_at: mr.created_at,
+        updated_at: mr.updated_at,
+        thread: mr.thread,
+    })
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct MergeRequestListHttpQuery {
     state: Option<String>,
-    repository_id: Option<String>,
+    repository_key: Option<String>,
     ticket_ref: Option<String>,
     selector_from: Option<String>,
     selector_to: Option<String>,
@@ -5461,10 +5550,24 @@ struct MergeRequestLinkedTicketResponse {
 #[derive(Debug, serde::Serialize)]
 struct MergeRequestDetailResponse {
     #[serde(flatten)]
-    merge_request: merge_request::MergeRequest,
+    merge_request: PublicMergeRequest,
     source: MergeRequestRefResponse,
     target: MergeRequestRefResponse,
     linked_tickets: Vec<MergeRequestLinkedTicketResponse>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct PublicMergeRequest {
+    workspace_id: String,
+    merge_request_id: String,
+    repository_key: String,
+    state: merge_request::MergeRequestState,
+    selector_from: Option<String>,
+    selector_to: String,
+    ticket_ids: Vec<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    thread: Vec<merge_request::MergeRequestThreadEvent>,
 }
 
 async fn scoped_list_merge_requests(
@@ -5492,12 +5595,22 @@ async fn scoped_list_merge_requests(
             )),
         })
         .transpose()?;
+    let repository_id = query
+        .repository_key
+        .as_deref()
+        .map(|repository_key| {
+            api.store
+                .get_repository_by_key(&workspace_id, repository_key)?
+                .map(|repository| repository.repository_id)
+                .ok_or_else(|| Error::UnknownRepository(repository_key.to_string()))
+        })
+        .transpose()?;
     let store = merge_request_store(&api, &workspace_id)?;
     let page = store.list(
         &workspace_id,
         &merge_request::MergeRequestListQuery {
             state,
-            repository_id: query.repository_id,
+            repository_id,
             ticket_id,
             selector_from: query.selector_from,
             selector_to: query.selector_to,
@@ -5509,22 +5622,31 @@ async fn scoped_list_merge_requests(
     let items = page
         .items
         .into_iter()
-        .map(|merge_request| {
+        .map(|merge_request| -> ApiResult<MergeRequestListItem> {
             let current_subject_ref = merge_request.selector_from.as_deref().and_then(|selector| {
                 reader
                     .observe_merge_target(&merge_request.repository_id, Some(selector))
                     .ok()
                     .map(|observation| observation.commit)
             });
+            let repository_key = api
+                .store
+                .get_repository(&workspace_id, &merge_request.repository_id)?
+                .map(|repository| repository.repository_key)
+                .ok_or_else(|| {
+                    ApiError::from(Error::UnknownRepository(
+                        merge_request.repository_id.clone(),
+                    ))
+                })?;
             let ticket_ids = merge_request.ticket_ids.clone();
             let thread_event_count = merge_request.thread.len();
-            MergeRequestListItem {
-                summary: merge_request_summary(merge_request, current_subject_ref),
+            Ok(MergeRequestListItem {
+                summary: merge_request_summary(merge_request, repository_key, current_subject_ref),
                 ticket_ids,
                 thread_event_count,
-            }
+            })
         })
-        .collect();
+        .collect::<ApiResult<Vec<_>>>()?;
     Ok(Json(MergeRequestListResponse {
         items,
         next_cursor: page.next_cursor,
@@ -5593,8 +5715,9 @@ async fn scoped_show_merge_request(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let merge_request = public_merge_request(&api, &workspace_id, mr)?;
     Ok(Json(MergeRequestDetailResponse {
-        merge_request: mr,
+        merge_request,
         source,
         target,
         linked_tickets,
@@ -5633,7 +5756,7 @@ async fn scoped_open_merge_request(
     headers: HeaderMap,
     AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
     Json(input): Json<OpenMergeRequestRequest>,
-) -> ApiResult<Json<merge_request::MergeRequest>> {
+) -> ApiResult<Json<PublicMergeRequest>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
     let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     require_workspace_access(&workspace_id, &api)?;
@@ -5655,7 +5778,9 @@ async fn scoped_open_merge_request(
     let ticket = browser_ticket_backend(&api)?
         .show(TicketIdOrSlug::Id(ticket_id.clone().into()))
         .map_err(Error::from)?;
-    if ticket.meta.repository_id.as_deref() != Some(input.repository_id.as_str())
+    let repository = api.require_configured_workspace_repository_by_key(&input.repository_key)?;
+    let repository_id = repository.id;
+    if ticket.meta.repository_id.as_deref() != Some(repository_id.as_str())
         || ticket.meta.ref_selector.as_deref() != Some(input.selector_to.as_str())
     {
         return Err(Error::InvalidInput(
@@ -5665,31 +5790,34 @@ async fn scoped_open_merge_request(
     }
     let reader = api.repository_reader();
     reader
-        .observe_merge_target(&input.repository_id, Some(&input.selector_from))
+        .observe_merge_target(&repository_id, Some(&input.selector_from))
         .map_err(repository_merge_evidence_error)?;
     reader
-        .observe_merge_target(&input.repository_id, Some(&input.selector_to))
+        .observe_merge_target(&repository_id, Some(&input.selector_to))
         .map_err(repository_merge_evidence_error)?;
-    Ok(Json(
-        merge_request_store(&api, &workspace_id)?.open_merge_request(
-            merge_request::OpenMergeRequest {
-                merge_request_id: Uuid::now_v7().to_string(),
-                ticket_id,
-                repository_id: input.repository_id.clone(),
-                selector_from: input.selector_from,
-                selector_to: input.selector_to,
-                summary: input.summary,
-                auth: merge_request::MergeRequestAuth {
-                    workspace_id,
-                    repository_id: input.repository_id,
-                    runtime_id: source.runtime_id,
-                    worker_id: source.worker_id,
-                    assignment_id: assignment.assignment_id,
-                },
-                now: Utc::now(),
+    let merge_request = merge_request_store(&api, &workspace_id)?.open_merge_request(
+        merge_request::OpenMergeRequest {
+            merge_request_id: Uuid::now_v7().to_string(),
+            ticket_id,
+            repository_id: repository_id.clone(),
+            selector_from: input.selector_from,
+            selector_to: input.selector_to,
+            summary: input.summary,
+            auth: merge_request::MergeRequestAuth {
+                workspace_id: workspace_id.clone(),
+                repository_id,
+                runtime_id: source.runtime_id,
+                worker_id: source.worker_id,
+                assignment_id: assignment.assignment_id,
             },
-        )?,
-    ))
+            now: Utc::now(),
+        },
+    )?;
+    Ok(Json(public_merge_request(
+        &api,
+        &workspace_id,
+        merge_request,
+    )?))
 }
 
 async fn scoped_merge_request_thread(
@@ -5714,7 +5842,7 @@ async fn scoped_repair_merge_request_selector(
     headers: HeaderMap,
     AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
     Json(input): Json<RepairMergeRequestSelectorRequest>,
-) -> ApiResult<Json<merge_request::MergeRequest>> {
+) -> ApiResult<Json<PublicMergeRequest>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
     let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     require_workspace_access(&workspace_id, &api)?;
@@ -5730,20 +5858,19 @@ async fn scoped_repair_merge_request_selector(
         .observe_merge_target(&mr.repository_id, Some(&input.selector_from))
         .map_err(repository_merge_evidence_error)?
         .commit;
-    Ok(Json(store.repair_selector_from(
-        merge_request::RepairSelectorFrom {
-            workspace_id,
-            ticket_id,
-            selector_from: input.selector_from,
-            resolved_subject_ref,
-            repaired_by: merge_request::WorkerIdentity {
-                runtime_id: "browser".into(),
-                worker_id: "authenticated-user".into(),
-            },
-            reason: input.reason,
-            now: Utc::now(),
+    let repaired = store.repair_selector_from(merge_request::RepairSelectorFrom {
+        workspace_id: workspace_id.clone(),
+        ticket_id,
+        selector_from: input.selector_from,
+        resolved_subject_ref,
+        repaired_by: merge_request::WorkerIdentity {
+            runtime_id: "browser".into(),
+            worker_id: "authenticated-user".into(),
         },
-    )?))
+        reason: input.reason,
+        now: Utc::now(),
+    })?;
+    Ok(Json(public_merge_request(&api, &workspace_id, repaired)?))
 }
 
 async fn scoped_register_reviewer_child_session(
@@ -7982,7 +8109,7 @@ async fn scoped_repository_detail(
     AxumPath(path): AxumPath<ScopedRepositoryPath>,
 ) -> ApiResult<Json<RepositoryDetailResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    repository_detail(State(api), AxumPath(path.repository_id)).await
+    repository_detail(State(api), AxumPath(path.repository_key)).await
 }
 
 async fn scoped_repository_log(
@@ -7991,7 +8118,7 @@ async fn scoped_repository_log(
     Query(query): Query<LogQuery>,
 ) -> ApiResult<Json<RepositoryLogResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    repository_log(State(api), AxumPath(path.repository_id), Query(query)).await
+    repository_log(State(api), AxumPath(path.repository_key), Query(query)).await
 }
 
 async fn scoped_list_hosts(
@@ -9197,7 +9324,7 @@ async fn create_workspace_working_directory(
         .as_ref()
         .map(|selector| selector.as_ref().to_string());
     let request_fingerprint = crate::workdir_create_operations::request_fingerprint(
-        &request.repository_id,
+        &request.repository_key,
         selector.as_deref(),
         requested_runtime_id.as_deref(),
         &working_directory_request.repository.source_fingerprint,
@@ -9249,7 +9376,7 @@ async fn create_workspace_working_directory(
                 workspace_id: workspace_id.to_string(),
                 operation_id: operation_id.clone(),
                 request_fingerprint: request_fingerprint.clone(),
-                repository_id: request.repository_id.clone(),
+                repository_id: working_directory_request.repository.id.clone(),
                 selector,
                 requested_runtime_id,
                 resolved_runtime_id,
@@ -9277,7 +9404,7 @@ async fn create_workspace_working_directory(
                 host_trust_revision: None,
                 repository_access_mode: None,
                 cache_generation: 0,
-                working_directory_id: next_backend_workdir_id(&request.repository_id),
+                working_directory_id: next_backend_workdir_id(&request.repository_key),
                 state: "pending".to_string(),
                 failure: None,
                 created_at: now.clone(),
@@ -9486,8 +9613,7 @@ async fn create_workspace_working_directory(
         None,
         &now_registry_timestamp(),
     )?;
-    let mut summary = working_directory.summary;
-    apply_workdir_occupancy_projection(api, &mut summary)?;
+    let summary = projected_workdir_summary_from_record(api, &record)?;
     Ok((
         StatusCode::CREATED,
         Json(BrowserWorkingDirectoryCreateResponse {
@@ -9511,8 +9637,7 @@ fn working_directory_detail_for_runtime(
     if let Some(working_directory) = result.working_directory {
         let record = workdir_record_from_summary(&api, runtime_id, &working_directory.summary);
         api.store.upsert_workdir_registry(&record)?;
-        let mut summary = working_directory.summary;
-        apply_workdir_occupancy_projection(&api, &mut summary)?;
+        let summary = projected_workdir_summary_from_record(&api, &record)?;
         return Ok(Json(BrowserWorkingDirectoryDetailResponse {
             workspace_id: api.config.workspace_id.clone(),
             runtime_id: runtime_id.to_string(),
@@ -10088,12 +10213,17 @@ fn build_runtime_cleanup_plan(
         } else {
             None
         };
+        let repository_key = api
+            .store
+            .get_repository(&api.config.workspace_id, &record.repository_id)?
+            .map(|repository| repository.repository_key)
+            .ok_or_else(|| Error::UnknownRepository(record.repository_id.clone()))?;
         workdir_candidates.push(CleanupWorkdirCandidate {
             target_id: format!("workdir:{}", record.workdir_id),
             action,
             workdir_id: record.workdir_id.clone(),
             runtime_id: record.runtime_id.clone(),
-            repository_id: record.repository_id.clone(),
+            repository_key,
             reason: if blocking_reason.is_some() {
                 "Workdir cleanup is blocked until linked Worker state is safe".to_string()
             } else if file_status.is_record_only() {
@@ -11632,7 +11762,10 @@ async fn repository_detail(
             "invalid Repository key: {error}"
         )))
     })?;
-    let item = repository_lookup(api.live_repository_reader()?.summary(&repository_key))?;
+    let item = repository_lookup(
+        api.live_repository_reader()?
+            .summary_by_key(&repository_key),
+    )?;
     Ok(Json(RepositoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
         item,
@@ -11879,19 +12012,12 @@ fn configured_working_directory_request(
     api: &WorkspaceApi,
     request: &WorkerSpawnWorkingDirectoryRequest,
 ) -> Result<WorkingDirectoryRequest> {
-    if api
-        .store
-        .get_repository(&api.config.workspace_id, &request.repository_id)?
-        .is_none()
-    {
-        return Err(Error::UnknownRepository(request.repository_id.clone()));
-    }
     let repository = api
         .config
         .repositories
         .iter()
-        .find(|repository| repository.id == request.repository_id)
-        .ok_or_else(|| Error::UnknownRepository(request.repository_id.clone()))?;
+        .find(|repository| repository.repository_key == request.repository_key)
+        .ok_or_else(|| Error::UnknownRepository(request.repository_key.clone()))?;
     Ok(working_directory_request_from_repository(
         repository,
         request.selector.as_deref(),
@@ -13596,7 +13722,20 @@ fn project_workspace_worker(
                 summary.worker.worker_id
             ))
         })?;
-    Ok(workspace_worker_summary(summary, resource_key))
+    let working_directory = summary
+        .working_directory
+        .as_ref()
+        .map(|working_directory| {
+            let record =
+                workdir_record_from_summary(api, &summary.worker.runtime_id, working_directory);
+            projected_workdir_summary_from_record(api, &record)
+        })
+        .transpose()?;
+    Ok(workspace_worker_summary(
+        summary,
+        resource_key,
+        working_directory,
+    ))
 }
 
 fn project_observed_workspace_workers(
@@ -14372,8 +14511,7 @@ fn working_directory_repository_options(
         .repositories
         .iter()
         .map(|repository| WorkingDirectoryRepositoryOption {
-            id: repository.id.clone(),
-            display_name: repository.repository_key.clone(),
+            repository_key: repository.repository_key.clone(),
             default_selector: repository.default_selector.clone(),
         })
         .collect()
@@ -14555,7 +14693,7 @@ fn merge_worker_registry_projection(
             .iter()
             .find(|workdir| workdir.workdir_id == link.workdir_id)
             .map(|workdir| {
-                let mut workdir_summary = workdir_summary_from_record(workdir);
+                let mut workdir_summary = runtime_workdir_summary_from_record(workdir);
                 workdir_summary.occupied_by = Some(WorkingDirectoryOccupancy {
                     runtime_id: record.worker.runtime_id.clone(),
                     worker_id: record.worker.worker_id.clone(),
@@ -14779,7 +14917,7 @@ fn sync_linked_workdir_after_worker_stop(
 fn workdir_record_from_summary(
     api: &WorkspaceApi,
     runtime_id: &str,
-    summary: &WorkingDirectorySummary,
+    summary: &worker_runtime::catalog::WorkingDirectorySummary,
 ) -> WorkdirRegistryRecord {
     let timestamp = now_registry_timestamp();
     WorkdirRegistryRecord {
@@ -14847,7 +14985,43 @@ fn preserve_workdir_identity_for_corrupted_summary(
     }
 }
 
-fn workdir_summary_from_record(record: &WorkdirRegistryRecord) -> WorkingDirectorySummary {
+fn runtime_workdir_summary_from_record(
+    record: &WorkdirRegistryRecord,
+) -> worker_runtime::catalog::WorkingDirectorySummary {
+    let status = match record.materialization_status.as_str() {
+        "present" => WorkingDirectoryStatusKind::Active,
+        "pending" => WorkingDirectoryStatusKind::CleanupPending,
+        "corrupted" => WorkingDirectoryStatusKind::Corrupted,
+        "not_found" | "missing" => WorkingDirectoryStatusKind::NotFound,
+        _ => WorkingDirectoryStatusKind::Unknown,
+    };
+    worker_runtime::catalog::WorkingDirectorySummary {
+        working_directory_id: record.workdir_id.clone(),
+        repository_id: record.repository_id.clone(),
+        creation_selector: record.creation_selector.clone(),
+        creation_ref: record.creation_ref.clone(),
+        creation_tree: record.creation_tree.clone(),
+        current_selector: record.current_selector.clone(),
+        current_ref: record.current_ref.clone(),
+        current_tree: record.current_tree.clone(),
+        observed_at_epoch_seconds: record.observed_at_epoch_seconds,
+        materializer_kind: MaterializerKind::RuntimeGitCache,
+        cleanup_target: Some(worker_runtime::catalog::WorkingDirectoryCleanupTarget {
+            kind: "runtime_git_cache_worktree".to_string(),
+            working_directory_id: record.workdir_id.clone(),
+            repository_id: record.repository_id.clone(),
+        }),
+        status,
+        cleanliness: Some(record.cleanliness.clone()),
+        primary_worker_id: None,
+        occupied_by: None,
+    }
+}
+
+fn workdir_summary_from_record(
+    record: &WorkdirRegistryRecord,
+    repository_key: &str,
+) -> WorkingDirectorySummary {
     let status = match record.materialization_status.as_str() {
         "present" => WorkingDirectoryStatusKind::Active,
         "pending" => WorkingDirectoryStatusKind::CleanupPending,
@@ -14858,7 +15032,7 @@ fn workdir_summary_from_record(record: &WorkdirRegistryRecord) -> WorkingDirecto
     };
     WorkingDirectorySummary {
         working_directory_id: record.workdir_id.clone(),
-        repository_id: record.repository_id.clone(),
+        repository_key: repository_key.to_string(),
         creation_selector: record.creation_selector.clone(),
         creation_ref: record.creation_ref.clone(),
         creation_tree: record.creation_tree.clone(),
@@ -14870,7 +15044,7 @@ fn workdir_summary_from_record(record: &WorkdirRegistryRecord) -> WorkingDirecto
         cleanup_target: Some(WorkingDirectoryCleanupTarget {
             kind: "runtime_git_cache_worktree".to_string(),
             working_directory_id: record.workdir_id.clone(),
-            repository_id: record.repository_id.clone(),
+            repository_key: repository_key.to_string(),
         }),
         status,
         cleanliness: Some(record.cleanliness.clone()),
@@ -14915,7 +15089,11 @@ fn projected_workdir_summary_from_record(
     api: &WorkspaceApi,
     record: &WorkdirRegistryRecord,
 ) -> Result<WorkingDirectorySummary> {
-    let mut summary = workdir_summary_from_record(record);
+    let repository = api
+        .store
+        .get_repository(&record.workspace_id, &record.repository_id)?
+        .ok_or_else(|| Error::UnknownRepository(record.repository_id.clone()))?;
+    let mut summary = workdir_summary_from_record(record, &repository.repository_key);
     apply_workdir_occupancy_projection(api, &mut summary)?;
     Ok(summary)
 }
@@ -15144,11 +15322,18 @@ fn authorize_repository_materialization(
     projection: &RepositoryAccessProjection,
     request: &mut WorkingDirectoryRequest,
 ) -> ApiResult<()> {
+    let repository_key = api
+        .config
+        .repositories
+        .iter()
+        .find(|repository| repository.id == request.repository.id)
+        .map(|repository| repository.repository_key.as_str())
+        .ok_or_else(|| Error::UnknownRepository(request.repository.id.clone()))?;
     let ssh = if request.repository.source.kind == workspace_api::RepositorySourceKind::Ssh {
         let binding = projection
             .bindings
             .iter()
-            .find(|binding| binding.repository_id == request.repository.id)
+            .find(|binding| binding.repository_key == repository_key)
             .ok_or_else(|| {
                 settings_bad_request(
                     "working_directory_remote_repository_access_required",
@@ -15255,7 +15440,7 @@ fn working_directory_request_for_browser(
     api: &WorkspaceApi,
     request: BrowserWorkingDirectoryCreateRequest,
 ) -> ApiResult<WorkingDirectoryRequest> {
-    let repository = api.require_configured_workspace_repository(&request.repository_id)?;
+    let repository = api.require_configured_workspace_repository_by_key(&request.repository_key)?;
     let selector = request
         .selector
         .or_else(|| repository.default_selector.clone())
@@ -17628,7 +17813,7 @@ mod tests {
             updated_at: "2".to_string(),
         };
 
-        let projected = workdir_summary_from_record(&workdir);
+        let projected = workdir_summary_from_record(&workdir, "main");
 
         assert_eq!(projected.status, WorkingDirectoryStatusKind::Active);
         let serialized = serde_json::to_string(&projected).unwrap();
@@ -18427,6 +18612,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(created.status(), StatusCode::CREATED);
+        let created_body: Value =
+            serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(created_body["repository_key"], "documentation");
+        assert!(created_body.get("repository_id").is_none());
         let replayed = app
             .clone()
             .oneshot(create_repository(repository_request.clone()))
@@ -18437,9 +18627,8 @@ mod tests {
         let conflict = app
             .clone()
             .oneshot(create_repository(serde_json::json!({
-                "repository_id": "documentation",
-                "display_name": "Different registration",
-                "source": temp.path().join("documentation").display().to_string(),
+                "repository_key": "documentation",
+                "source": temp.path().join("different-documentation").display().to_string(),
                 "default_ref": "main"
             })))
             .await
@@ -18459,8 +18648,7 @@ mod tests {
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "repository_id": "foreign-owner",
-                            "display_name": "Foreign owner",
+                            "repository_key": "foreign-owner",
                             "source": temp.path().join("foreign-owner").display().to_string()
                         })
                         .to_string(),
@@ -18854,7 +19042,7 @@ mod tests {
             "display_name": "Created Workspace",
             "repository": {
                 "uri": repository,
-                "display_name": "Repository",
+                "repository_key": "repository",
                 "default_ref": "HEAD"
             }
         });
@@ -19086,8 +19274,9 @@ mod tests {
         let api = test_api(dir.path()).await;
         let backend = browser_ticket_backend(&api).unwrap();
 
+        let repository_id = test_repository_id(&api);
         let mut input = ticket::NewTicket::new("Validated target");
-        input.repository_id = Some(TEST_REPOSITORY_ID.to_owned());
+        input.repository_id = Some(repository_id.clone());
         input.ref_selector = Some("develop".to_owned());
         let ticket_ref = backend.create(input).unwrap();
         let request = ticket::TicketMarkReady {
@@ -19102,7 +19291,7 @@ mod tests {
         assert_eq!(ready.meta.workflow_state, TicketWorkflowState::Ready);
         assert_eq!(
             ready.meta.repository_id.as_deref(),
-            Some(TEST_REPOSITORY_ID)
+            Some(repository_id.as_str())
         );
         assert_eq!(ready.meta.ref_selector.as_deref(), Some("develop"));
         assert_eq!(
@@ -19271,7 +19460,7 @@ mod tests {
         execution.take_inputs();
 
         let mut input = ticket::NewTicket::new("Bounded notification");
-        input.repository_id = Some(TEST_REPOSITORY_ID.to_owned());
+        input.repository_id = Some(test_repository_id(&api));
         input.ref_selector = Some("develop".to_owned());
         let ticket = browser_ticket_backend(&api).unwrap().create(input).unwrap();
         assign_test_orchestrator(&api, &ticket.id);
@@ -20021,7 +20210,7 @@ mod tests {
         let backend = browser_ticket_backend(&api).unwrap();
         let mut input = ticket::NewTicket::new("Queue role gate");
         input.workflow_state = Some(TicketWorkflowState::Ready);
-        input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        input.repository_id = Some(test_repository_id(&api));
         input.ref_selector = Some("develop".to_string());
         let ticket = backend.create(input).unwrap();
         let path = (TEST_WORKSPACE_ID.to_string(), ticket.id.clone());
@@ -20084,12 +20273,12 @@ mod tests {
         let backend = browser_ticket_backend(&api).unwrap();
         let mut first_input = ticket::NewTicket::new("First cycle Ticket");
         first_input.workflow_state = Some(TicketWorkflowState::Ready);
-        first_input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        first_input.repository_id = Some(test_repository_id(&api));
         first_input.ref_selector = Some("develop".to_string());
         let first = backend.create(first_input).unwrap();
         let mut second_input = ticket::NewTicket::new("Second cycle Ticket");
         second_input.workflow_state = Some(TicketWorkflowState::Ready);
-        second_input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        second_input.repository_id = Some(test_repository_id(&api));
         second_input.ref_selector = Some("develop".to_string());
         let second = backend.create(second_input).unwrap();
         for (ticket_id, target) in [
@@ -20137,12 +20326,12 @@ mod tests {
         let backend = browser_ticket_backend(&api).unwrap();
         let mut dependency_input = ticket::NewTicket::new("Invalid target dependency");
         dependency_input.workflow_state = Some(TicketWorkflowState::Ready);
-        dependency_input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        dependency_input.repository_id = Some(test_repository_id(&api));
         dependency_input.ref_selector = Some("missing-ref".to_string());
         let dependency = backend.create(dependency_input).unwrap();
         let mut root_input = ticket::NewTicket::new("Queue root");
         root_input.workflow_state = Some(TicketWorkflowState::Ready);
-        root_input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        root_input.repository_id = Some(test_repository_id(&api));
         root_input.ref_selector = Some("develop".to_string());
         let root = backend.create(root_input).unwrap();
         backend
@@ -20191,12 +20380,12 @@ mod tests {
         let backend = browser_ticket_backend(&api).unwrap();
         let mut dependency_input = ticket::NewTicket::new("Ready dependency");
         dependency_input.workflow_state = Some(TicketWorkflowState::Ready);
-        dependency_input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        dependency_input.repository_id = Some(test_repository_id(&api));
         dependency_input.ref_selector = Some("develop".to_string());
         let dependency = backend.create(dependency_input).unwrap();
         let mut root_input = ticket::NewTicket::new("Queue root");
         root_input.workflow_state = Some(TicketWorkflowState::Ready);
-        root_input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        root_input.repository_id = Some(test_repository_id(&api));
         root_input.ref_selector = Some("develop".to_string());
         let root = backend.create(root_input).unwrap();
         backend
@@ -20550,7 +20739,7 @@ mod tests {
         let backend = browser_ticket_backend(&api).unwrap();
         let mut input = ticket::NewTicket::new("Recover queued work");
         input.workflow_state = Some(TicketWorkflowState::Queued);
-        input.repository_id = Some(TEST_REPOSITORY_ID.to_owned());
+        input.repository_id = Some(test_repository_id(&api));
         input.ref_selector = Some("HEAD".to_owned());
         let ticket_ref = backend.create(input).unwrap();
         assign_test_orchestrator(&api, &ticket_ref.id);
@@ -21138,7 +21327,7 @@ mod tests {
         };
         let mut related_input = ticket::NewTicket::new("Related Browser Ticket");
         related_input.workflow_state = Some(TicketWorkflowState::Ready);
-        related_input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        related_input.repository_id = Some(test_repository_id(&api));
         related_input.ref_selector = Some("develop".to_string());
         let related_ticket_id = browser_ticket_backend(&api)
             .unwrap()
@@ -21168,7 +21357,7 @@ mod tests {
                 new_string: None,
                 replace_all: false,
                 target: Some(TicketTargetEdit::Set {
-                    repository_id: "main".to_string(),
+                    repository_id: "test-repository".to_string(),
                     ref_selector: Some("develop".to_string()),
                 }),
                 author: Some("browser-user".to_string()),
@@ -21178,7 +21367,7 @@ mod tests {
         .unwrap();
         assert_eq!(edited.title, "Browser Ticket API edited");
         assert_eq!(edited.body, "Updated from the Browser API.");
-        assert_eq!(edited.repository_id.as_deref(), Some("main"));
+        assert_eq!(edited.repository_key.as_deref(), Some("test-repository"));
         assert_eq!(edited.ref_selector.as_deref(), Some("develop"));
         assert!(edited.assignments.is_empty());
         assert!(edited.assignment_diagnostics.is_empty());
@@ -21435,6 +21624,14 @@ mod tests {
 
     async fn test_api(workspace_root: impl Into<PathBuf>) -> WorkspaceApi {
         test_api_with_recording_backend(workspace_root).await.0
+    }
+
+    fn test_repository_id(api: &WorkspaceApi) -> String {
+        api.store
+            .get_repository_by_key(TEST_WORKSPACE_ID, "test-repository")
+            .unwrap()
+            .expect("test Repository exists")
+            .repository_id
     }
 
     fn set_test_default_runtime(api: &WorkspaceApi, runtime_id: &str) {
@@ -22520,7 +22717,7 @@ mod tests {
 
     fn workdir_removal_result(
         state: WorkerOperationState,
-        summary: Option<WorkingDirectorySummary>,
+        summary: Option<worker_runtime::catalog::WorkingDirectorySummary>,
         diagnostics: Vec<RuntimeDiagnostic>,
     ) -> crate::hosts::RuntimeWorkingDirectoryResult {
         crate::hosts::RuntimeWorkingDirectoryResult {
@@ -22534,14 +22731,17 @@ mod tests {
     fn reserve_removal_fixture(
         api: &WorkspaceApi,
         working_directory_id: &str,
-    ) -> (WorkdirRemovalOperation, WorkingDirectorySummary) {
+    ) -> (
+        WorkdirRemovalOperation,
+        worker_runtime::catalog::WorkingDirectorySummary,
+    ) {
         seed_cleanup_workdir(api, working_directory_id, "present", "clean");
         let record = api
             .store
             .get_workdir_registry(&api.config.workspace_id, working_directory_id)
             .unwrap()
             .unwrap();
-        let summary = workdir_summary_from_record(&record);
+        let summary = runtime_workdir_summary_from_record(&record);
         let intent = workdir_removal_intent(
             &record,
             "account:owner",
@@ -23955,11 +24155,12 @@ mod tests {
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
         let operation_id = "provider-rejection-classification";
+        let repository_id = test_repository_id(&api);
         let repository = api
-            .require_configured_workspace_repository(TEST_REPOSITORY_ID)
+            .require_configured_workspace_repository(&repository_id)
             .unwrap();
         let request_fingerprint = crate::workdir_create_operations::request_fingerprint(
-            TEST_REPOSITORY_ID,
+            &repository_id,
             Some("HEAD"),
             Some(EMBEDDED_WORKER_RUNTIME_ID),
             &repository.source_fingerprint,
@@ -24057,7 +24258,7 @@ mod tests {
             "POST",
             &workspace_path,
             Some(serde_json::json!({
-                "repository_id": TEST_REPOSITORY_ID,
+                "repository_key": "test-repository",
                 "selector": "HEAD",
             })),
             StatusCode::BAD_REQUEST,
@@ -24087,7 +24288,7 @@ mod tests {
             &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
             Some(serde_json::json!({
                 "runtime_id": "missing-runtime",
-                "repository_id": TEST_REPOSITORY_ID,
+                "repository_key": "test-repository",
                 "selector": "HEAD",
                 "operation_id": operation_id,
             })),
@@ -24130,7 +24331,7 @@ mod tests {
             &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
             Some(serde_json::json!({
                 "runtime_id": "missing-runtime",
-                "repository_id": TEST_REPOSITORY_ID,
+                "repository_key": "test-repository",
                 "selector": "HEAD",
                 "operation_id": "stale-workdir-create",
                 "path": "/tmp/legacy-workdir",
@@ -24166,7 +24367,7 @@ mod tests {
             &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
             Some(serde_json::json!({
                 "runtime_id": EMBEDDED_WORKER_RUNTIME_ID,
-                "repository_id": "foreign-or-missing-repository",
+                "repository_key": "foreign-or-missing-repository",
                 "selector": "HEAD",
                 "operation_id": "missing-workdir-repository",
             })),
@@ -24203,7 +24404,7 @@ mod tests {
             "POST",
             &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
             Some(serde_json::json!({
-                "repository_id": TEST_REPOSITORY_ID,
+                "repository_key": "test-repository",
                 "selector": "HEAD",
                 "operation_id": operation_id,
             })),
@@ -24222,7 +24423,7 @@ mod tests {
             "POST",
             &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
             Some(serde_json::json!({
-                "repository_id": TEST_REPOSITORY_ID,
+                "repository_key": "test-repository",
                 "selector": "HEAD",
                 "operation_id": operation_id,
             })),
@@ -24864,7 +25065,7 @@ mod tests {
                     "value": "builtin:coder"
                 },
                 "working_directory_request": {
-                    "repository_id": TEST_REPOSITORY_ID,
+                    "repository_key": "test-repository",
                     "local_path": dir.path().display().to_string()
                 }
             })),
@@ -24903,7 +25104,7 @@ mod tests {
                     "value": "builtin:coder"
                 },
                 "working_directory_request": {
-                    "repository_id": TEST_REPOSITORY_ID,
+                    "repository_key": "test-repository",
                     "selector": "HEAD"
                 }
             })),
@@ -25277,9 +25478,9 @@ mod tests {
             serde_json::from_value(repositories.clone()).unwrap();
         assert_eq!(
             typed_repositories.items[0].repository_key,
-            TEST_REPOSITORY_ID
+            "test-repository"
         );
-        assert_eq!(repositories["items"][0]["id"], TEST_REPOSITORY_ID);
+        assert!(repositories["items"][0].get("id").is_none());
         assert_eq!(repositories["items"][0]["kind"], "git");
         assert_eq!(
             repositories["items"][0]["record_authority"],
@@ -25291,21 +25492,31 @@ mod tests {
                 .contains("repository_git_unavailable")
         );
 
-        let repository_detail = get_json(app.clone(), "/api/repositories/main").await;
+        let repository_detail = get_json(app.clone(), "/api/repositories/test-repository").await;
         let _: workspace_api::RepositoryDetailResponse =
             serde_json::from_value(repository_detail.clone()).unwrap();
-        assert_eq!(repository_detail["item"]["id"], TEST_REPOSITORY_ID);
+        assert_eq!(
+            repository_detail["item"]["repository_key"],
+            "test-repository"
+        );
+        assert!(repository_detail["item"].get("id").is_none());
         let scoped_repository_detail = get_json(
             app.clone(),
-            &format!("/api/w/{TEST_WORKSPACE_ID}/repositories/main"),
+            &format!("/api/w/{TEST_WORKSPACE_ID}/repositories/test-repository"),
         )
         .await;
-        assert_eq!(scoped_repository_detail["item"]["id"], TEST_REPOSITORY_ID);
+        assert_eq!(
+            scoped_repository_detail["item"]["repository_key"],
+            "test-repository"
+        );
+        assert!(scoped_repository_detail["item"].get("id").is_none());
 
-        let repository_log = get_json(app.clone(), "/api/repositories/main/log?limit=3").await;
+        let repository_log =
+            get_json(app.clone(), "/api/repositories/test-repository/log?limit=3").await;
         let _: workspace_api::RepositoryLogResponse =
             serde_json::from_value(repository_log.clone()).unwrap();
-        assert_eq!(repository_log["repository_id"], TEST_REPOSITORY_ID);
+        assert_eq!(repository_log["repository_key"], "test-repository");
+        assert!(repository_log.get("repository_id").is_none());
         assert_eq!(repository_log["default_selector"], "HEAD");
         assert_eq!(repository_log["limit"], 3);
 
@@ -25313,7 +25524,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/repositories/main/tickets")
+                    .uri("/api/repositories/test-repository/tickets")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -25774,7 +25985,7 @@ mod tests {
         let unknown = request_json(
             app.clone(),
             "GET",
-            "/api/repositories/main/log",
+            "/api/repositories/test-repository/log",
             None,
             StatusCode::NOT_FOUND,
         )
@@ -26671,7 +26882,7 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             items: vec![WorkingDirectorySummary {
                 working_directory_id: "wd-1".to_string(),
-                repository_id: "main".to_string(),
+                repository_key: "main".to_string(),
                 creation_selector: None,
                 creation_ref: None,
                 creation_tree: None,

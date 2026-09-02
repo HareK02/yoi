@@ -9,7 +9,7 @@ import { compareWorkersForSidebar } from './workers';
 import type { Worker } from './types';
 
 export type SidebarWorker = Worker & {
-  repository_id: string | null;
+  repository_key: string | null;
   working_directory_id: string | null;
   has_running_internal_workers: boolean;
 };
@@ -97,7 +97,7 @@ function projectWorker(worker: SubscriptionWorker): SidebarWorker {
       can_stop: worker.state !== 'stopped' && worker.state !== 'cancelled',
       can_spawn_followup: false,
     },
-    repository_id: worker.repository_id ?? null,
+    repository_key: worker.repository_key ?? null,
     working_directory_id: worker.working_directory_id ?? null,
     has_running_internal_workers: worker.has_running_internal_workers,
     working_directory: null,

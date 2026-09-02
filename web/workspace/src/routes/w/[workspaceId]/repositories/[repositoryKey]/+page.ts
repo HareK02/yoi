@@ -7,20 +7,20 @@ import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {
   const workspaceId = params.workspaceId;
-  const repositoryId = params.repositoryId;
+  const repositoryKey = params.repositoryKey;
   const [repositoryResult, logResult] = await Promise.all([
     loadJson<unknown>(
       fetch,
       workspaceApiPath(
         workspaceId,
-        `/repositories/${encodeURIComponent(repositoryId)}`,
+        `/repositories/${encodeURIComponent(repositoryKey)}`,
       ),
     ),
     loadJson<unknown>(
       fetch,
       workspaceApiPath(
         workspaceId,
-        `/repositories/${encodeURIComponent(repositoryId)}/log`,
+        `/repositories/${encodeURIComponent(repositoryKey)}/log`,
       ),
     ),
   ]);
@@ -50,7 +50,7 @@ export const load: PageLoad = async ({ fetch, params }) => {
   }
 
   return {
-    repositoryId,
+    repositoryKey,
     repository,
     repositoryError,
     repositoryLog: log,

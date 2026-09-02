@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 pub use workspace_api::{
+    RuntimeWorkingDirectoryCleanupTarget, RuntimeWorkingDirectorySummary,
     WorkingDirectoryCleanupTarget, WorkingDirectoryMaterializerKind as MaterializerKind,
     WorkingDirectoryOccupancy, WorkingDirectoryStatusKind, WorkingDirectorySummary,
 };

@@ -234,9 +234,9 @@
     <h3>Active access projection</h3>
     <p>Config revision {accessProjection.config_revision} · <code>{accessProjection.projection_digest}</code></p>
     {#if accessProjection.bindings.length === 0}<p>No repository access bindings are active.</p>{/if}
-    {#each accessProjection.bindings as binding (binding.repository_id)}
+    {#each accessProjection.bindings as binding (binding.repository_key)}
       <div class="card">
-        <strong>{binding.repository_id}</strong>
+        <strong>{binding.repository_key}</strong>
         <p>{binding.access} · credential <code>{binding.credential_id}</code> · host trust <code>{binding.host_trust_id}</code></p>
       </div>
     {/each}

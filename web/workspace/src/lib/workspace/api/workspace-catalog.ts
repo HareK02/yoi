@@ -18,8 +18,8 @@ export type CreateWorkspaceRequest = {
   operation_key: string;
   display_name: string;
   repository: {
+    repository_key: string;
     uri: string;
-    display_name: string | null;
     default_ref: string | null;
   };
 };

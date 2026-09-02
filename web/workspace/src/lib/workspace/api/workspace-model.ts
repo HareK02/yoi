@@ -170,8 +170,7 @@ function repositorySummary(value: unknown, path: string): RepositorySummary {
   exactKeys(
     item,
     [
-      "id",
-      "display_name",
+      "repository_key",
       "kind",
       "provider",
       "source",
@@ -200,8 +199,7 @@ function repositorySummary(value: unknown, path: string): RepositorySummary {
         repositoryDiagnostic(entry, `${path}.diagnostics[${index}]`)
       );
   return {
-    id: string(item.id, `${path}.id`),
-    display_name: string(item.display_name, `${path}.display_name`),
+    repository_key: string(item.repository_key, `${path}.repository_key`),
     kind: string(item.kind, `${path}.kind`),
     provider: string(item.provider, `${path}.provider`),
     source: repositorySource(item.source, `${path}.source`),
@@ -263,8 +261,7 @@ function workspaceRepositoryRecord(
     item,
     [
       "workspace_id",
-      "repository_id",
-      "name",
+      "repository_key",
       "kind",
       "provider",
       "source",
@@ -287,8 +284,7 @@ function workspaceRepositoryRecord(
   }
   return {
     workspace_id: string(item.workspace_id, `${path}.workspace_id`),
-    repository_id: string(item.repository_id, `${path}.repository_id`),
-    name: string(item.name, `${path}.name`),
+    repository_key: string(item.repository_key, `${path}.repository_key`),
     kind: string(item.kind, `${path}.kind`),
     provider: nullableString(item.provider, `${path}.provider`),
     source: repositorySource(item.source, `${path}.source`),
@@ -573,7 +569,7 @@ export function parseRepositoryLogResponse(
     response,
     [
       "workspace_id",
-      "repository_id",
+      "repository_key",
       "default_selector",
       "limit",
       "items",
@@ -586,9 +582,9 @@ export function parseRepositoryLogResponse(
       response.workspace_id,
       "repository log response.workspace_id",
     ),
-    repository_id: string(
-      response.repository_id,
-      "repository log response.repository_id",
+    repository_key: string(
+      response.repository_key,
+      "repository log response.repository_key",
     ),
     default_selector: optionalNullableString(
       response.default_selector,

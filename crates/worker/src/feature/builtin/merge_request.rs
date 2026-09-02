@@ -56,7 +56,7 @@ struct TicketInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct OpenMergeRequestInput {
     ticket: String,
-    repository_id: String,
+    repository_key: String,
     selector_from: String,
     selector_to: String,
     #[serde(default)]
@@ -178,7 +178,7 @@ impl Tool for MergeRequestTool {
                     WorkspaceRequestMethod::Post,
                     format!("/api/w/{ws}/tickets/{}/merge-request", v.ticket),
                     Some(
-                        json!({"repository_id":v.repository_id,"selector_from":v.selector_from,"selector_to":v.selector_to,"summary":v.summary}),
+                        json!({"repository_key":v.repository_key,"selector_from":v.selector_from,"selector_to":v.selector_to,"summary":v.summary}),
                     ),
                 )
             }

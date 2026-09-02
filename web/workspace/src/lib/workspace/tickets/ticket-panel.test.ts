@@ -88,7 +88,7 @@ Deno.test("ticket worker launch uses the common Worker route and bounded Ticket 
   const ticket = {
     id: "00001KYRRDVH9",
     title: "Ticket panel API",
-    repository_id: "main repo",
+    repository_key: "main repo",
     ref_selector: "work/ticket",
   } as TicketDetail;
 
@@ -102,7 +102,7 @@ Deno.test("ticket worker launch uses the common Worker route and bounded Ticket 
   assertEquals(url.pathname, "/w/workspace%20one/workers/new");
   assertEquals(url.searchParams.get("ticketId"), ticket.id);
   assertEquals(url.searchParams.get("ticketRole"), "reviewer");
-  assertEquals(url.searchParams.get("repositoryId"), "main repo");
+  assertEquals(url.searchParams.get("repositoryKey"), "main repo");
   assertEquals(url.searchParams.get("refSelector"), "work/ticket");
   assertEquals(
     url.searchParams.get("initialInput"),

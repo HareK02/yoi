@@ -192,7 +192,12 @@ resource_key?: string | null,
 /**
  * Producer-owned monotonic revision for this Worker subject.
  */
-subject_revision: number, state: SubscriptionWorkerState, has_running_internal_workers: boolean, workspace_id?: string | null, display_name?: string | null, profile?: string | null, repository_id?: string | null, working_directory_id?: SubscriptionWorkdirId | null, };
+subject_revision: number, state: SubscriptionWorkerState, has_running_internal_workers: boolean, workspace_id?: string | null, display_name?: string | null, profile?: string | null, repository_id?: string | null,
+/**
+ * Workspace-facing Repository key. Runtime producers leave this unset and
+ * Workspace Server projections replace `repository_id` with this field.
+ */
+repository_key?: string | null, working_directory_id?: SubscriptionWorkdirId | null, };
 
 export type SubscriptionWorkdir = { working_directory_id: SubscriptionWorkdirId, repository_id: string, state: string, primary_worker_id?: SubscriptionWorkerId | null, };
 

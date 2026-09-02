@@ -19,7 +19,7 @@ export type MergeRequestThreadEvent = {
 export type MergeRequestRecord = {
   merge_request_id: string;
   workspace_id: string;
-  repository_id: string;
+  repository_key: string;
   selector_from: string | null;
   selector_to: string;
   ticket_ids: string[];

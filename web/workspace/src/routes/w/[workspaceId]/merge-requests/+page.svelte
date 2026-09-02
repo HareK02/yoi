@@ -40,7 +40,7 @@
               </strong>
             </div>
             <p class="ticket-summary">
-              Repository {mergeRequest.repository_id} · {item.ticket_ids.length} linked Ticket{item.ticket_ids.length === 1 ? "" : "s"} · review {mergeRequest.review_status}
+              Repository {mergeRequest.repository_key} · {item.ticket_ids.length} linked Ticket{item.ticket_ids.length === 1 ? "" : "s"} · review {mergeRequest.review_status}
             </p>
           </div>
           <div class="ticket-meta">

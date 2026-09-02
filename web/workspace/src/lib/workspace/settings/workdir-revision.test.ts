@@ -17,7 +17,7 @@ function workdir(
 ): WorkingDirectorySummary {
   return {
     working_directory_id: "workdir-1",
-    repository_id: "repository-1",
+    repository_key: "repository-1",
     current_selector,
     current_ref,
     materializer_kind: "local_git_worktree",
@@ -25,7 +25,7 @@ function workdir(
     cleanup_target: {
       kind: "local_git_worktree",
       working_directory_id: "workdir-1",
-      repository_id: "repository-1",
+      repository_key: "repository-1",
     },
   };
 }

@@ -1298,6 +1298,16 @@ impl SqliteWorkspaceStore {
             repairs.push("create missing worker_diagnostics_archives table".to_string());
         }
 
+        if current_schema_version < 50 && table_exists(&source, "repositories")? {
+            let repository_count: i64 =
+                source.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+            if repository_count > 0 {
+                repairs.push(format!(
+                    "replace {repository_count} legacy public Repository id(s) with UUIDv7 internal ids, retain each prior id as repository_key, and retire free-form Repository names"
+                ));
+            }
+        }
+
         let mut candidate = Connection::open_in_memory()?;
         {
             let backup = Backup::new(&source, &mut candidate)?;
@@ -12568,6 +12578,18 @@ INSERT INTO worker_registry (
                  '1', '1', 'local_path', '/repo-a', 1, 'sha256:a', 'unverified'),
                 ('workspace-b', 'main', 'Legacy B', 'git', 'git', '/repo-b', 'develop',
                  '1', '1', 'local_path', '/repo-b', 1, 'sha256:b', 'unverified');
+            INSERT INTO typed_tickets (
+                workspace_id, ticket_id, slug, title, status, kind, priority, body,
+                workflow_state, workflow_state_explicit, repository_id
+            ) VALUES
+                ('workspace-a', 'ticket-a', 'ticket-a', 'Ticket A', 'open', 'task', 'normal', '', 'planning', 1, 'main'),
+                ('workspace-b', 'ticket-b', 'ticket-b', 'Ticket B', 'open', 'task', 'normal', '', 'planning', 1, 'main');
+            INSERT INTO merge_requests (
+                workspace_id, merge_request_id, repository_id, state,
+                selector_from, selector_to, created_at, updated_at
+            ) VALUES
+                ('workspace-a', 'mr-a', 'main', 'open', 'work/a', 'develop', '1', '1'),
+                ('workspace-b', 'mr-b', 'main', 'open', 'work/b', 'develop', '1', '1');
             INSERT INTO artifacts (
                 workspace_id, artifact_id, kind, uri, created_at,
                 created_by_kind, created_by_key, created_by_display, repository_id
@@ -12628,8 +12650,24 @@ INSERT INTO worker_registry (
                     |row| row.get(0),
                 )
                 .unwrap();
+            let ticket_repository_id: String = conn
+                .query_row(
+                    "SELECT repository_id FROM typed_tickets WHERE workspace_id = ?1",
+                    params![workspace_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let merge_request_repository_id: String = conn
+                .query_row(
+                    "SELECT repository_id FROM merge_requests WHERE workspace_id = ?1",
+                    params![workspace_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
             assert_eq!(&artifact_repository_id, repository_id);
             assert_eq!(&workdir_repository_id, repository_id);
+            assert_eq!(&ticket_repository_id, repository_id);
+            assert_eq!(&merge_request_repository_id, repository_id);
         }
         assert!(
             table_columns(&conn, "repositories")

@@ -28,9 +28,9 @@
   };
 
   function workdirOptionLabel(directory: WorkingDirectorySummary): string {
-    const provider = data.repositories?.items.find((repository) => repository.id === directory.repository_id)
+    const provider = data.repositories?.items.find((repository) => repository.repository_key === directory.repository_key)
       ?.provider;
-    return `${directory.repository_id} · ${formatCurrentWorkdirRevision(directory, provider)}`;
+    return `${directory.repository_key} · ${formatCurrentWorkdirRevision(directory, provider)}`;
   }
 
   let { data }: PageProps = $props();
@@ -59,7 +59,7 @@
   );
   let initialText = $state(ticketContext?.initialInput ?? '');
   let workingDirectoryId = $state('');
-  let workingDirectoryRepositoryId = $state(ticketContext?.repositoryId ?? '');
+  let workingDirectoryRepositoryKey = $state(ticketContext?.repositoryKey ?? '');
   let workingDirectorySelector = $state(ticketContext?.refSelector ?? 'HEAD');
   let relativeCwd = $state('');
   let creatingWorkingDirectory = $state(false);
@@ -123,7 +123,7 @@
         profile,
         initial_text: initialText,
         working_directory_id: workingDirectoryId,
-        working_directory_repository_id: workingDirectoryRepositoryId,
+        working_directory_repository_key: workingDirectoryRepositoryKey,
         working_directory_selector: workingDirectorySelector,
         relative_cwd: relativeCwd,
       });
@@ -131,8 +131,8 @@
       displayName = form.display_name;
       profile = form.profile;
       workingDirectoryId = form.working_directory_id ||
-        (ticketContext?.repositoryId ? NEW_WORKING_DIRECTORY_VALUE : '');
-      workingDirectoryRepositoryId = form.working_directory_repository_id;
+        (ticketContext?.repositoryKey ? NEW_WORKING_DIRECTORY_VALUE : '');
+      workingDirectoryRepositoryKey = form.working_directory_repository_key;
       workingDirectorySelector = form.working_directory_selector;
       relativeCwd = form.relative_cwd;
     } catch (err) {
@@ -156,7 +156,7 @@
       submitError = { message: 'embedded Runtime does not create workdirs', diagnostics: [] };
       return;
     }
-    if (!workingDirectoryRepositoryId) {
+    if (!workingDirectoryRepositoryKey) {
       submitError = { message: 'select a repository before creating a workdir', diagnostics: [] };
       return;
     }
@@ -165,7 +165,7 @@
     try {
       const request = validateWorkingDirectoryCreateRequest({
         runtime_id: runtimeId,
-        repository_id: workingDirectoryRepositoryId,
+        repository_key: workingDirectoryRepositoryKey,
         ...(workingDirectorySelector ? { selector: workingDirectorySelector } : {}),
       });
       const response = await fetch(
@@ -220,7 +220,7 @@
           profile,
           initial_text: initialText,
           working_directory_id: workingDirectoryId,
-          working_directory_repository_id: workingDirectoryRepositoryId,
+          working_directory_repository_key: workingDirectoryRepositoryKey,
           working_directory_selector: workingDirectorySelector,
           relative_cwd: relativeCwd,
         })),
@@ -339,10 +339,10 @@
             <div class="new-working-directory-fields">
               <label>
                 <span>Repository</span>
-                <select bind:value={workingDirectoryRepositoryId}>
+                <select bind:value={workingDirectoryRepositoryKey}>
                   {#if options?.repositories.length}
                     {#each options.repositories as repository}
-                      <option value={repository.id}>{repository.display_name}</option>
+                      <option value={repository.repository_key}>{repository.repository_key}</option>
                     {/each}
                   {:else}
                     <option value="" disabled>No configured repositories</option>
@@ -354,7 +354,7 @@
                 <input bind:value={workingDirectorySelector} autocomplete="off" placeholder="HEAD" />
               </label>
             </div>
-            <button type="button" disabled={creatingWorkingDirectory || !runtimeId || !workingDirectoryRepositoryId} onclick={() => void createWorkingDirectory()}>
+            <button type="button" disabled={creatingWorkingDirectory || !runtimeId || !workingDirectoryRepositoryKey} onclick={() => void createWorkingDirectory()}>
               {creatingWorkingDirectory ? 'Creating…' : 'Create workdir'}
             </button>
           </div>

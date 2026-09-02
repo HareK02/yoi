@@ -10,7 +10,7 @@ import {
 
 const summary = {
   working_directory_id: "workdir-1",
-  repository_id: "main",
+  repository_key: "main",
   materializer_kind: "runtime_git_cache",
   status: "active",
   occupied_by: {
@@ -60,7 +60,7 @@ Deno.test("Workdir REST validation rejects stale response JSON", () => {
 Deno.test("Workdir REST validation enforces create operation fields", () => {
   const request = validateWorkingDirectoryCreateRequest({
     runtime_id: "arcadia",
-    repository_id: "main",
+    repository_key: "main",
     selector: "develop",
     operation_id: "operation-1",
   });
@@ -71,7 +71,7 @@ Deno.test("Workdir REST validation enforces create operation fields", () => {
   for (
     const invalid of [
       { runtime_id: "arcadia", operation_id: "operation-1" },
-      { repository_id: "main", operation_key: "operation-1" },
+      { repository_key: "main", operation_key: "operation-1" },
     ]
   ) {
     let rejected = false;

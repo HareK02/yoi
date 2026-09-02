@@ -25,8 +25,7 @@ test("Repository settings use the scoped list and typed create collection", () =
     "workspaceApiPath(params.workspaceId, \"/repositories\")",
     "workspaceApiPath(data.workspaceId, '/repositories')",
     "method: 'POST'",
-    "repository_id: repositoryId",
-    "display_name: displayName",
+    "repository_key: repositoryKey",
     "default_ref: defaultRef || null",
     "await invalidateAll()",
   ]) {

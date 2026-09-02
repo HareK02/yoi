@@ -313,6 +313,7 @@ impl From<RuntimeSummary> for workspace_api::RuntimeSummary {
 pub(crate) fn workspace_worker_summary(
     summary: WorkerSummary,
     resource_key: String,
+    working_directory: Option<workspace_api::WorkingDirectorySummary>,
 ) -> workspace_api::WorkerSummary {
     workspace_api::WorkerSummary {
         runtime_id: summary.worker.runtime_id,
@@ -341,7 +342,7 @@ pub(crate) fn workspace_worker_summary(
             can_stop: summary.capabilities.can_stop,
             can_spawn_followup: summary.capabilities.can_spawn_followup,
         },
-        working_directory: summary.working_directory,
+        working_directory,
         diagnostics: summary.diagnostics.into_iter().map(Into::into).collect(),
     }
 }
@@ -402,10 +403,10 @@ pub struct RuntimeWorkingDirectoryResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerSpawnWorkingDirectoryRequest {
-    /// Safe configured Repository id. The host resolves this id to repository
-    /// authority from server-side config; browser callers cannot provide raw
-    /// source paths or runtime-internal storage paths.
-    pub repository_id: String,
+    /// Safe configured Repository key. The host resolves this key to internal
+    /// Repository authority; browser callers cannot provide Backend UUIDs, raw
+    /// source paths, or Runtime-internal storage paths.
+    pub repository_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<String>,
 }

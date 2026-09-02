@@ -370,7 +370,7 @@ fn working_directory_text(worker: &BackendWorkerSummary) -> String {
     let cleanliness = wd.cleanliness.as_deref().unwrap_or("unknown");
     format!(
         "wd:{}:{} {} {}",
-        wd.repository_id, wd.working_directory_id, wd.status, cleanliness
+        wd.repository_key, wd.working_directory_id, wd.status, cleanliness
     )
 }
 

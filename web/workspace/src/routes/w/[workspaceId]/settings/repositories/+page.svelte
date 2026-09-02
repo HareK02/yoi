@@ -16,8 +16,7 @@
     return kind === 'ssh' || kind === 'http' || kind === 'https';
   }
   let showAddRepository = $state(false);
-  let repositoryId = $state('');
-  let displayName = $state('');
+  let repositoryKey = $state('');
   let source = $state('');
   let defaultRef = $state('');
   let pending = $state(false);
@@ -39,15 +38,13 @@
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          repository_id: repositoryId,
-          display_name: displayName,
+          repository_key: repositoryKey,
           source,
           default_ref: defaultRef || null,
         }),
       });
       if (!response.ok) throw new Error(await responseError(response));
-      repositoryId = '';
-      displayName = '';
+      repositoryKey = '';
       source = '';
       defaultRef = '';
       showAddRepository = false;
@@ -82,12 +79,9 @@
       <h2>Add Repository</h2>
       <div class="settings-form-grid">
         <label>
-          Repository ID
-          <input bind:value={repositoryId} required pattern="[A-Za-z0-9_.-]+" maxlength="128" autocomplete="off" />
-        </label>
-        <label>
-          Display name
-          <input bind:value={displayName} required maxlength="256" autocomplete="off" />
+          Repository key
+          <input bind:value={repositoryKey} required pattern="[a-z0-9]|[a-z0-9][a-z0-9-]*[a-z0-9]" maxlength="64" autocomplete="off" />
+          <small>1–64 lowercase letters, digits, or hyphens; no leading or trailing hyphen.</small>
         </label>
         <label class="settings-form-field-wide">
           Source
@@ -133,13 +127,12 @@
           </tr>
         </thead>
         <tbody>
-          {#each data.repositories.items as repository (repository.id)}
+          {#each data.repositories.items as repository (repository.repository_key)}
             <tr>
               <td>
-                <a class="inline-link" href={workspaceRoute(data.workspaceId, `/repositories/${encodeURIComponent(repository.id)}`)}>
-                  <strong>{repository.display_name}</strong>
+                <a class="inline-link" href={workspaceRoute(data.workspaceId, `/repositories/${encodeURIComponent(repository.repository_key)}`)}>
+                  <strong><code>{repository.repository_key}</code></strong>
                 </a>
-                <small><code>{repository.id}</code></small>
               </td>
               <td>
                 <span>{sourceLabel(repository.source.kind)}</span>

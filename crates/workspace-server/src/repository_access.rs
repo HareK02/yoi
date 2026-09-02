@@ -146,16 +146,17 @@ fn project_repository_access_evaluation(
             Error::InvalidInput(format!("invalid Repository access config: {error}"))
         })?;
     let mut bindings = Vec::with_capacity(config.repository_access.len());
-    for (repository_id, access) in config.repository_access {
-        validate_identifier("repository_id", &repository_id)?;
+    for (repository_key, access) in config.repository_access {
+        workspace_api::validate_repository_key(&repository_key)
+            .map_err(|error| Error::InvalidInput(format!("invalid Repository key: {error}")))?;
         validate_identifier("credential_id", &access.ssh.credential)?;
         validate_identifier("host_trust_id", &access.ssh.host_trust)?;
         let repository = store
-            .get_repository(workspace_id, &repository_id)?
-            .ok_or_else(|| Error::InvalidInput(format!("unknown Repository `{repository_id}`")))?;
+            .get_repository_by_key(workspace_id, &repository_key)?
+            .ok_or_else(|| Error::InvalidInput(format!("unknown Repository `{repository_key}`")))?;
         if repository.source.kind != workspace_api::RepositorySourceKind::Ssh {
             return Err(Error::InvalidInput(format!(
-                "Repository `{repository_id}` is not an ssh:// Repository"
+                "Repository `{repository_key}` is not an ssh:// Repository"
             )));
         }
         let credential = secrets
@@ -182,34 +183,34 @@ fn project_repository_access_evaluation(
             })?;
         let uri = url::Url::parse(&repository.source.uri).map_err(|_| {
             Error::InvalidInput(format!(
-                "Repository `{repository_id}` has an invalid SSH URI"
+                "Repository `{repository_key}` has an invalid SSH URI"
             ))
         })?;
         if uri.scheme() != "ssh" || uri.username().is_empty() || uri.password().is_some() {
             return Err(Error::InvalidInput(format!(
-                "Repository `{repository_id}` must use ssh://user@host[:port]/path without credentials"
+                "Repository `{repository_key}` must use ssh://user@host[:port]/path without credentials"
             )));
         }
         let hostname = uri.host_str().ok_or_else(|| {
             Error::InvalidInput(format!(
-                "Repository `{repository_id}` SSH URI has no hostname"
+                "Repository `{repository_key}` SSH URI has no hostname"
             ))
         })?;
         let port = uri.port().unwrap_or(22);
         if hostname != host_trust.hostname || port != host_trust.port {
             return Err(Error::InvalidInput(format!(
-                "Repository `{repository_id}` SSH host does not match host trust `{}`",
+                "Repository `{repository_key}` SSH host does not match host trust `{}`",
                 access.ssh.host_trust
             )));
         }
         bindings.push(RepositorySshAccessBinding {
-            repository_id,
+            repository_key,
             credential_id: access.ssh.credential,
             host_trust_id: access.ssh.host_trust,
             access: access.ssh.access,
         });
     }
-    bindings.sort_by(|left, right| left.repository_id.cmp(&right.repository_id));
+    bindings.sort_by(|left, right| left.repository_key.cmp(&right.repository_key));
     Ok(RepositoryAccessProjection {
         workspace_id: workspace_id.to_string(),
         config_revision,
@@ -1441,7 +1442,7 @@ fn credential_references(
         .bindings
         .iter()
         .filter(|binding| binding.credential_id == credential_id)
-        .map(|binding| binding.repository_id.clone())
+        .map(|binding| binding.repository_key.clone())
         .collect()
 }
 
@@ -1453,7 +1454,7 @@ fn host_trust_references(
         .bindings
         .iter()
         .filter(|binding| binding.host_trust_id == host_trust_id)
-        .map(|binding| binding.repository_id.clone())
+        .map(|binding| binding.repository_key.clone())
         .collect()
 }
 
@@ -1912,7 +1913,7 @@ mod tests {
         let projection =
             project_repository_access_state(&*store, &service, "workspace-a", &state).unwrap();
         assert_eq!(projection.bindings.len(), 1);
-        assert_eq!(projection.bindings[0].repository_id, "remote");
+        assert_eq!(projection.bindings[0].repository_key, "remote");
         assert_eq!(
             projection.bindings[0].access,
             RepositoryAccessMode::ReadOnly
@@ -1999,7 +2000,7 @@ mod tests {
             config_revision: 3,
             projection_digest: "sha256:test".to_string(),
             bindings: vec![RepositorySshAccessBinding {
-                repository_id: "main".to_string(),
+                repository_key: "main".to_string(),
                 credential_id: "deploy".to_string(),
                 host_trust_id: "host".to_string(),
                 access: RepositoryAccessMode::ReadOnly,

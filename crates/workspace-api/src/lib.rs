@@ -533,7 +533,7 @@ impl std::fmt::Display for WorkingDirectoryStatusKind {
 pub struct WorkingDirectoryCleanupTarget {
     pub kind: String,
     pub working_directory_id: String,
-    pub repository_id: String,
+    pub repository_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -575,6 +575,51 @@ pub struct WorkingDirectoryOccupancy {
     pub linked_at: String,
 }
 
+/// Runtime-internal Workdir cleanup authority. This transport intentionally
+/// retains the Backend-generated Repository id and is never a Workspace public
+/// projection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeWorkingDirectoryCleanupTarget {
+    pub kind: String,
+    pub working_directory_id: String,
+    pub repository_id: String,
+}
+
+/// Runtime-internal Workdir inventory transport. Workspace REST and model-facing
+/// surfaces must project this through [`WorkingDirectorySummary`] so the UUID is
+/// replaced with `repository_key`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeWorkingDirectorySummary {
+    pub working_directory_id: String,
+    pub repository_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_selector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_tree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_selector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_tree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_epoch_seconds: Option<u64>,
+    pub materializer_kind: WorkingDirectoryMaterializerKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_target: Option<RuntimeWorkingDirectoryCleanupTarget>,
+    pub status: WorkingDirectoryStatusKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanliness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_worker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occupied_by: Option<WorkingDirectoryOccupancy>,
+}
+
 /// Public, provider-neutral Workdir inventory projection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -582,7 +627,7 @@ pub struct WorkingDirectoryOccupancy {
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectorySummary {
     pub working_directory_id: String,
-    pub repository_id: String,
+    pub repository_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_selector: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -629,7 +674,7 @@ impl WorkingDirectorySummary {
 pub struct WorkingDirectoryCreateRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_id: Option<String>,
-    pub repository_id: String,
+    pub repository_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1228,7 +1273,7 @@ pub enum RepositoryAccessMode {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositorySshAccessBinding {
-    pub repository_id: String,
+    pub repository_key: String,
     pub credential_id: String,
     pub host_trust_id: String,
     pub access: RepositoryAccessMode,
@@ -1438,8 +1483,7 @@ mod tests {
         let repositories = serde_json::json!({
             "workspace_id": "workspace-test",
             "items": [{
-                "id": "main",
-                "display_name": "main",
+                "repository_key": "main",
                 "kind": "git",
                 "provider": "git",
                 "source": {"kind": "local_path", "uri": "/srv/project"},
@@ -1460,7 +1504,7 @@ mod tests {
         let stale = serde_json::json!({
             "workspace_id": "workspace-test",
             "items": [{
-                "repository_id": "main",
+                "repository_key": "main",
                 "display_name": "main",
                 "kind": "git",
                 "provider": "git",
@@ -1497,7 +1541,7 @@ mod tests {
         assert!(output.contains(
             "export type WorkspaceProfileSourceProvenance = \"project_profile_source_tree\""
         ));
-        assert!(!output.contains("repository_id: string, display_name"));
+        assert!(!output.contains("repository_key: string, display_name"));
     }
 
     #[test]
@@ -1754,7 +1798,7 @@ mod tests {
 
     #[test]
     fn workdir_create_request_preserves_optional_operation_fields() {
-        let payload = serde_json::json!({"repository_id": "main"});
+        let payload = serde_json::json!({"repository_key": "main"});
         let request = serde_json::from_value::<WorkingDirectoryCreateRequest>(payload)
             .expect("optional create fields may be absent");
 
@@ -1763,13 +1807,13 @@ mod tests {
         assert_eq!(request.operation_id, None);
 
         let serialized = serde_json::to_value(request).expect("serialize create request");
-        assert_eq!(serialized, serde_json::json!({"repository_id": "main"}));
+        assert_eq!(serialized, serde_json::json!({"repository_key": "main"}));
     }
 
     #[test]
     fn workdir_create_request_rejects_stale_or_incomplete_json() {
         let stale = serde_json::json!({
-            "repository_id": "main",
+            "repository_key": "main",
             "selector": "develop",
             "path": "/tmp/workdir"
         });
@@ -1786,7 +1830,7 @@ mod tests {
     fn workdir_summary_omits_absent_optional_fields_on_the_wire() {
         let value = serde_json::to_value(WorkingDirectorySummary {
             working_directory_id: "workdir-1".into(),
-            repository_id: "main".into(),
+            repository_key: "main".into(),
             creation_selector: None,
             creation_ref: None,
             creation_tree: None,
@@ -1830,7 +1874,7 @@ mod tests {
             "workspace_id": "workspace-test",
             "items": [{
                 "working_directory_id": "workdir-1",
-                "repository_id": "main",
+                "repository_key": "main",
                 "materializer_kind": "runtime_git_cache",
                 "status": "active",
                 "occupied_by": {

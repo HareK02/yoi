@@ -918,13 +918,33 @@ impl SqliteWorkspaceAuthority {
                     self.merge_revision_source
                         .resolve_subject_ref(&request.repository_id, selector)
                 });
-                Some(merge_request_summary(request, current_subject_ref))
+                let repository_key = self
+                    .store
+                    .get_repository(&self.workspace_id, &request.repository_id)?
+                    .map(|repository| repository.repository_key)
+                    .ok_or_else(|| Error::UnknownRepository(request.repository_id.clone()))?;
+                Some(merge_request_summary(
+                    request,
+                    repository_key,
+                    current_subject_ref,
+                ))
             }
             Err(MergeRequestError::NotFound) => None,
             Err(error) => return Err(Error::Store(error.to_string())),
         };
+        let repository_key = ticket
+            .meta
+            .repository_id
+            .as_deref()
+            .map(|repository_id| {
+                self.store
+                    .get_repository(&self.workspace_id, repository_id)?
+                    .map(|repository| repository.repository_key)
+                    .ok_or_else(|| Error::UnknownRepository(repository_id.to_string()))
+            })
+            .transpose()?;
         let evidence = ticket_evidence_summary(
-            ticket.meta.repository_id.as_deref(),
+            repository_key.as_deref(),
             &ticket.events,
             merge_request.as_ref(),
         );
@@ -980,7 +1000,7 @@ impl SqliteWorkspaceAuthority {
             item_revision,
             queued_by: ticket.meta.queued_by,
             queued_at: ticket.meta.queued_at,
-            repository_id: ticket.meta.repository_id,
+            repository_key,
             ref_selector: ticket.meta.ref_selector,
             risk_flags: ticket.meta.risk_flags,
             body,
@@ -1742,6 +1762,7 @@ fn ticket_evidence_event(sequence: usize, event: &TicketEvent) -> TicketEvidence
 
 pub(crate) fn merge_request_summary(
     request: MergeRequest,
+    repository_key: String,
     current_subject_ref: Option<String>,
 ) -> TicketMergeRequestSummary {
     let latest_review_request = request.thread.iter().rev().find_map(|event| match event {
@@ -1790,7 +1811,7 @@ pub(crate) fn merge_request_summary(
 
     TicketMergeRequestSummary {
         merge_request_id: request.merge_request_id.clone(),
-        repository_id: request.repository_id.clone(),
+        repository_key,
         state,
         review_status,
         selector_from: request.selector_from.clone(),
@@ -1835,7 +1856,7 @@ fn ticket_evidence_summary(
     let linked_merge_request = merge_request.filter(|request| {
         request.state == "open"
             && ticket_repository_id
-                .is_some_and(|repository_id| repository_id == request.repository_id)
+                .is_some_and(|repository_id| repository_id == request.repository_key)
     });
     let has_merge_request = linked_merge_request.is_some();
     let has_current_subject_ref = linked_merge_request.is_some_and(|request| {
@@ -1886,7 +1907,7 @@ fn ticket_evidence_summary(
         Some(request) if request.state != "open" => missing.push("open_merge_request".to_string()),
         Some(request)
             if ticket_repository_id
-                .is_none_or(|repository_id| repository_id != request.repository_id) =>
+                .is_none_or(|repository_id| repository_id != request.repository_key) =>
         {
             missing.push("merge_request_repository".to_string())
         }
@@ -2823,6 +2844,7 @@ mod tests {
     fn merge_request_summary_uses_the_provider_resolved_current_subject() {
         let approved = merge_request_summary(
             reviewed_merge_request(ReviewDecision::Approve, false),
+            "main".to_string(),
             Some("commit-1".to_string()),
         );
         assert_eq!(approved.review_status, "approved");
@@ -2834,6 +2856,7 @@ mod tests {
 
         let moved = merge_request_summary(
             reviewed_merge_request(ReviewDecision::Approve, false),
+            "main".to_string(),
             Some("commit-2".to_string()),
         );
         assert_eq!(moved.review_status, "pending");
@@ -2846,6 +2869,7 @@ mod tests {
     fn ticket_readiness_requires_current_unrevoked_approval_without_a_report() {
         let approved = merge_request_summary(
             reviewed_merge_request(ReviewDecision::Approve, false),
+            "main".to_string(),
             Some("commit-1".to_string()),
         );
         let evidence = ticket_evidence_summary(Some("main"), &[], Some(&approved));
@@ -2866,6 +2890,7 @@ mod tests {
 
         let revoked = merge_request_summary(
             reviewed_merge_request(ReviewDecision::Approve, true),
+            "main".to_string(),
             Some("commit-1".to_string()),
         );
         let evidence = ticket_evidence_summary(Some("main"), &[], Some(&revoked));
@@ -2874,6 +2899,7 @@ mod tests {
 
         let changes = merge_request_summary(
             reviewed_merge_request(ReviewDecision::RequestChanges, false),
+            "main".to_string(),
             Some("commit-1".to_string()),
         );
         let evidence = ticket_evidence_summary(Some("main"), &[], Some(&changes));
@@ -2883,8 +2909,11 @@ mod tests {
 
     #[test]
     fn ticket_readiness_fails_closed_for_missing_or_closed_current_merge_request() {
-        let unresolved =
-            merge_request_summary(reviewed_merge_request(ReviewDecision::Approve, false), None);
+        let unresolved = merge_request_summary(
+            reviewed_merge_request(ReviewDecision::Approve, false),
+            "main".to_string(),
+            None,
+        );
         let evidence = ticket_evidence_summary(Some("main"), &[], Some(&unresolved));
         assert!(!evidence.has_current_subject_ref);
         assert!(!evidence.has_commit);
@@ -2892,7 +2921,11 @@ mod tests {
 
         let mut closed_request = reviewed_merge_request(ReviewDecision::Approve, false);
         closed_request.state = MergeRequestState::Closed;
-        let closed = merge_request_summary(closed_request, Some("commit-1".to_string()));
+        let closed = merge_request_summary(
+            closed_request,
+            "main".to_string(),
+            Some("commit-1".to_string()),
+        );
         let evidence = ticket_evidence_summary(Some("main"), &[], Some(&closed));
         assert!(!evidence.has_merge_request);
         assert!(!evidence.complete_for_integration);
@@ -2903,6 +2936,7 @@ mod tests {
     fn ticket_readiness_requires_request_and_approval_after_substantive_rescope() {
         let approved = merge_request_summary(
             reviewed_merge_request(ReviewDecision::Approve, false),
+            "main".to_string(),
             Some("commit-1".to_string()),
         );
         let fresh = ticket_evidence_summary(
@@ -2946,6 +2980,7 @@ mod tests {
     fn ticket_query_filters_map_to_current_merge_request_evidence() {
         let approved_summary = merge_request_summary(
             reviewed_merge_request(ReviewDecision::Approve, false),
+            "main".to_string(),
             Some("commit-1".to_string()),
         );
         let approved = ticket_evidence_summary(Some("main"), &[], Some(&approved_summary));
@@ -2962,6 +2997,7 @@ mod tests {
 
         let pending_summary = merge_request_summary(
             reviewed_merge_request(ReviewDecision::Approve, false),
+            "main".to_string(),
             Some("commit-2".to_string()),
         );
         let pending = ticket_evidence_summary(Some("main"), &[], Some(&pending_summary));

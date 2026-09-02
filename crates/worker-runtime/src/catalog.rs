@@ -92,9 +92,9 @@ pub struct WorkingDirectoryRepository {
 }
 
 pub use workdir::workspace::{
-    MaterializerKind, WorkingDirectoryCleanupTarget, WorkingDirectoryCurrentObservation,
+    MaterializerKind, RuntimeWorkingDirectoryCleanupTarget as WorkingDirectoryCleanupTarget,
+    RuntimeWorkingDirectorySummary as WorkingDirectorySummary, WorkingDirectoryCurrentObservation,
     WorkingDirectoryOccupancy, WorkingDirectoryProvenance, WorkingDirectoryStatusKind,
-    WorkingDirectorySummary,
 };
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

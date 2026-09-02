@@ -408,6 +408,9 @@ async fn run_workspace_workers(
                         continue;
                     };
                     worker.resource_key = Some(resource_key);
+                    if !project_repository_key(&api, &mut worker) {
+                        continue;
+                    }
                     let worker_ref = RuntimeWorkerRef::new(&runtime_id, worker.worker_id.as_str());
                     let revision = next_revision(&mut revisions, &worker_ref);
                     worker.subject_revision = revision;
@@ -507,9 +510,26 @@ fn install_snapshot(
             continue;
         };
         worker.resource_key = Some(resource_key);
+        if !project_repository_key(api, &mut worker) {
+            continue;
+        }
         projected.insert(worker.worker_id.to_string(), worker);
     }
     workers.insert(runtime_id.to_string(), projected);
+}
+
+fn project_repository_key(api: &WorkspaceApi, worker: &mut SubscriptionWorker) -> bool {
+    let Some(repository_id) = worker.repository_id.take() else {
+        return true;
+    };
+    let Ok(Some(repository)) = api
+        .store
+        .get_repository(&api.config.workspace_id, &repository_id)
+    else {
+        return false;
+    };
+    worker.repository_key = Some(repository.repository_key);
+    true
 }
 
 async fn send_event(

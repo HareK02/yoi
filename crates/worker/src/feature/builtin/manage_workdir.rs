@@ -423,12 +423,13 @@ impl WorkspaceHttpWorkdirBackend {
             .as_deref()
             .map(|value| validate_identity(value, CREATE_TOOL, "runtime_id"))
             .transpose()?;
-        let repository_id = validate_identity(&input.repository_id, CREATE_TOOL, "repository_id")?;
+        let repository_key =
+            validate_identity(&input.repository_key, CREATE_TOOL, "repository_key")?;
         let selector = validate_optional_selector(input.selector)?;
         let workspace_id = encode_path_segment(self.workspace_id()?);
         let request = WorkdirCreateRequest {
             runtime_id: runtime_id.map(str::to_string),
-            repository_id: repository_id.to_string(),
+            repository_key: repository_key.to_string(),
             selector,
             operation_id: Some(operation_id),
         };
@@ -682,10 +683,10 @@ fn create_schema() -> serde_json::Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["repository_id"],
+        "required": ["repository_key"],
         "properties": {
             "runtime_id": {"type": ["string", "null"], "minLength": 1},
-            "repository_id": {"type": "string", "minLength": 1},
+            "repository_key": {"type": "string", "minLength": 1},
             "selector": {"type": ["string", "null"], "minLength": 1}
         }
     })
@@ -727,7 +728,7 @@ struct WorkdirListInput {}
 struct WorkdirCreateInput {
     #[serde(default)]
     runtime_id: Option<String>,
-    repository_id: String,
+    repository_key: String,
     #[serde(default)]
     selector: Option<String>,
 }
@@ -840,14 +841,14 @@ mod tests {
     fn workdir_json(id: &str) -> serde_json::Value {
         json!({
             "working_directory_id": id,
-            "repository_id": "main",
+            "repository_key": "main",
             "creation_selector": "refs/heads/main",
             "creation_ref": "0123456789abcdef",
             "materializer_kind": "local_git_worktree",
             "cleanup_target": {
                 "kind": "git_worktree",
                 "working_directory_id": id,
-                "repository_id": "main"
+                "repository_key": "main"
             },
             "status": "active",
             "cleanliness": "clean",
@@ -973,7 +974,7 @@ mod tests {
     #[test]
     fn schemas_expose_identities_without_paths_or_session_handles() {
         let create = create_schema();
-        assert_eq!(create["required"], json!(["repository_id"]));
+        assert_eq!(create["required"], json!(["repository_key"]));
         assert_eq!(
             create["properties"]["runtime_id"]["type"],
             json!(["string", "null"])
@@ -1048,7 +1049,7 @@ mod tests {
             .create(
                 WorkdirCreateInput {
                     runtime_id: Some("runtime/one".to_string()),
-                    repository_id: "main".to_string(),
+                    repository_key: "main".to_string(),
                     selector: Some("refs/heads/topic".to_string()),
                 },
                 "call-create-1".to_string(),
@@ -1089,7 +1090,7 @@ mod tests {
         assert_eq!(requests[1].method, WorkspaceRequestMethod::Post);
         let body: serde_json::Value =
             serde_json::from_str(requests[1].body.as_deref().unwrap()).unwrap();
-        assert_eq!(body["repository_id"], "main");
+        assert_eq!(body["repository_key"], "main");
         assert_eq!(body["runtime_id"], "runtime/one");
         assert_eq!(body["operation_id"], "call-create-1");
         assert_eq!(body["selector"], "refs/heads/topic");
@@ -1380,7 +1381,7 @@ mod tests {
             .create(
                 WorkdirCreateInput {
                     runtime_id: None,
-                    repository_id: "main".to_string(),
+                    repository_key: "main".to_string(),
                     selector: None,
                 },
                 "call-default".to_string(),
@@ -1405,7 +1406,7 @@ mod tests {
             .create(
                 WorkdirCreateInput {
                     runtime_id: Some(" ".to_string()),
-                    repository_id: "main".to_string(),
+                    repository_key: "main".to_string(),
                     selector: None,
                 },
                 "call-invalid".to_string(),

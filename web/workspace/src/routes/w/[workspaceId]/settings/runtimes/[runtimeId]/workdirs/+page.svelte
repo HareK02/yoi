@@ -25,7 +25,7 @@
   });
 
   function repositoryProvider(workdir: WorkingDirectorySummary): string | null {
-    return data.repositories?.items.find((repository) => repository.id === workdir.repository_id)
+    return data.repositories?.items.find((repository) => repository.repository_key === workdir.repository_key)
       ?.provider ?? null;
   }
 
@@ -139,7 +139,7 @@
             {@const cleanup = cleanupCandidate(workdir)}
             <tr>
               <td><code>{workdir.working_directory_id}</code></td>
-              <td>{workdir.repository_id}</td>
+              <td>{workdir.repository_key}</td>
               <td><code>{currentRevision(workdir)}</code></td>
               <td>{workdir.status}</td>
               <td>{workdir.cleanliness ?? 'unknown'}</td>

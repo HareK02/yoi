@@ -568,6 +568,10 @@ pub struct SubscriptionWorker {
     pub profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_id: Option<String>,
+    /// Workspace-facing Repository key. Runtime producers leave this unset and
+    /// Workspace Server projections replace `repository_id` with this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory_id: Option<SubscriptionWorkdirId>,
 }
@@ -811,6 +815,7 @@ mod tests {
             display_name: Some(format!("Worker {value}")),
             profile: Some("builtin:coder".to_string()),
             repository_id: None,
+            repository_key: None,
             working_directory_id: None,
         }
     }

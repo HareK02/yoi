@@ -97,7 +97,14 @@ impl RepositoryRegistryReader {
         }
     }
 
-    pub fn summary(
+    pub fn summary(&self, id: &str) -> Result<RepositorySummary, RepositoryLookupError> {
+        let repository = self
+            .find(id)
+            .ok_or_else(|| RepositoryLookupError::UnknownRepository { id: id.to_string() })?;
+        Ok(self.summary_for_config(repository))
+    }
+
+    pub fn summary_by_key(
         &self,
         repository_key: &str,
     ) -> Result<RepositorySummary, RepositoryLookupError> {

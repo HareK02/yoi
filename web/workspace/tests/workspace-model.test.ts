@@ -22,8 +22,7 @@ function assertThrows(operation: () => unknown, expected: string): void {
 const repositoryList = {
   workspace_id: "w-a",
   items: [{
-    id: "main",
-    display_name: "Main",
+    repository_key: "main",
     kind: "git",
     provider: "git",
     source: { kind: "local_path", uri: "/srv/alpha" },
@@ -38,8 +37,8 @@ const repositoryList = {
 
 Deno.test("generated repository wrapper validates current Backend JSON", () => {
   const parsed = parseRepositoryListResponse(repositoryList);
-  if (parsed.items[0]?.id !== "main") {
-    throw new Error("repository id was not preserved");
+  if (parsed.items[0]?.repository_key !== "main") {
+    throw new Error("repository key was not preserved");
   }
   if (parsed.items[0]?.source.kind !== "local_path") {
     throw new Error("repository source kind was not preserved");
@@ -49,11 +48,11 @@ Deno.test("generated repository wrapper validates current Backend JSON", () => {
 Deno.test("stale repository aliases fail closed at the JSON boundary", () => {
   const stale = structuredClone(repositoryList) as Record<string, unknown>;
   const items = stale.items as Array<Record<string, unknown>>;
-  items[0].repository_id = items[0].id;
-  delete items[0].id;
+  items[0].id = items[0].repository_key;
+  delete items[0].repository_key;
   assertThrows(
     () => parseRepositoryListResponse(stale),
-    ".repository_id is not part",
+    ".id is not part",
   );
 });
 
@@ -129,7 +128,7 @@ Deno.test("Repository settings consume the validated shared wire shape", async (
   for (
     const token of [
       "parseRepositoryListResponse",
-      "repository.id",
+      "repository.repository_key",
       "repository.observed_status",
       "sourceLabel(repository.source.kind)",
       "supportsRepositoryAccess(repository.source.kind)",
@@ -141,8 +140,8 @@ Deno.test("Repository settings consume the validated shared wire shape", async (
   }
   for (
     const staleToken of [
-      "repository.repository_id",
-      "repository.observed.status",
+      "repository.id",
+      "repository.display_name",
       "repository.source.kind === 'remote_git'",
     ]
   ) {

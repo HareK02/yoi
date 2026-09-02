@@ -128,7 +128,7 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
       workersNav.includes("worker.display_name || worker.label") &&
       workersNav.includes("worker-status-dot") &&
       workersNav.includes("worker-status-spinner") &&
-      workersNav.includes("worker.repository_id ?? '—'") &&
+      workersNav.includes("worker.repository_key ?? '—'") &&
       workersNav.includes("worker.working_directory_id ?? '—'") &&
       !workersNav.includes('aria-disabled="true"'),
     "Workers sidebar should link to the Worker list page and show state indicators with repository/workdir metadata",
@@ -207,13 +207,13 @@ Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", as
   );
   const repositoryLoad = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/repositories/[repositoryId]/+page.ts",
+      "./../../../routes/w/[workspaceId]/repositories/[repositoryKey]/+page.ts",
       import.meta.url,
     ),
   );
   const repositoryPage = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/repositories/[repositoryId]/+page.svelte",
+      "./../../../routes/w/[workspaceId]/repositories/[repositoryKey]/+page.svelte",
       import.meta.url,
     ),
   );

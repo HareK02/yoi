@@ -66,7 +66,7 @@ Deno.test("Repository Access parsers accept generated response contracts", () =>
       config_revision: 4,
       projection_digest: "sha256:projection",
       bindings: [{
-        repository_id: "main",
+        repository_key: "main",
         credential_id: "deploy-key",
         host_trust_id: "gitea",
         access: "read_only",
@@ -77,7 +77,7 @@ Deno.test("Repository Access parsers accept generated response contracts", () =>
       config_revision: 4,
       projection_digest: "sha256:projection",
       bindings: [{
-        repository_id: "main",
+        repository_key: "main",
         credential_id: "deploy-key",
         host_trust_id: "gitea",
         access: "read_only",
@@ -114,7 +114,7 @@ Deno.test("Repository Access parsers reject missing and wrong-typed fields", () 
         config_revision: 4,
         projection_digest: "sha256:projection",
         bindings: [{
-          repository_id: "main",
+          repository_key: "main",
           credential_id: "deploy-key",
           host_trust_id: "gitea",
           access: "admin",

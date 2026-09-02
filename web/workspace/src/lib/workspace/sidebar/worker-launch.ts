@@ -11,7 +11,7 @@ export type WorkerLaunchFormState = {
   profile: string;
   initial_text: string;
   working_directory_id: string;
-  working_directory_repository_id: string;
+  working_directory_repository_key: string;
   working_directory_selector: string;
   relative_cwd: string;
 };
@@ -54,20 +54,20 @@ export function defaultWorkerLaunchForm(
   const preferredWorkingDirectory = workdirlessRuntime
     ? undefined
     : availableWorkingDirectories.find((directory) =>
-      Boolean(current.working_directory_repository_id) &&
-      directory.repository_id === current.working_directory_repository_id &&
+      Boolean(current.working_directory_repository_key) &&
+      directory.repository_key === current.working_directory_repository_key &&
       (!current.working_directory_selector ||
         (directory.current_selector ?? directory.creation_selector) ===
           current.working_directory_selector)
     ) ?? availableWorkingDirectories.find((directory) =>
-      Boolean(current.working_directory_repository_id) &&
-      directory.repository_id === current.working_directory_repository_id
-    ) ?? (current.working_directory_repository_id
+      Boolean(current.working_directory_repository_key) &&
+      directory.repository_key === current.working_directory_repository_key
+    ) ?? (current.working_directory_repository_key
       ? undefined
       : availableWorkingDirectories[0]);
   const preferredRepository =
     options?.repositories.find((repository) =>
-      repository.id === current.working_directory_repository_id
+      repository.repository_key === current.working_directory_repository_key
     ) ??
       options?.repositories[0];
 
@@ -86,8 +86,8 @@ export function defaultWorkerLaunchForm(
         )
         ? current.working_directory_id
         : preferredWorkingDirectory?.working_directory_id || "",
-    working_directory_repository_id: current.working_directory_repository_id ||
-      preferredRepository?.id || "",
+    working_directory_repository_key: current.working_directory_repository_key ||
+      preferredRepository?.repository_key || "",
     working_directory_selector: current.working_directory_selector ||
       preferredRepository?.default_selector || "HEAD",
     relative_cwd: current.relative_cwd,

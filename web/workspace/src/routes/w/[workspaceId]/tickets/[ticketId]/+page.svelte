@@ -48,7 +48,7 @@
   let editing = $state(false);
   let editTitle = $state(loadedTicket.title);
   let editBody = $state(loadedTicket.body);
-  let repositoryId = $state(loadedTicket.repository_id ?? "");
+  let repositoryKey = $state(loadedTicket.repository_key ?? "");
   let refSelector = $state(loadedTicket.ref_selector ?? "");
   let nextState = $state(loadedTicket.state);
   let transitionReason = $state("");
@@ -68,7 +68,7 @@
     ticket.assignments.find((assignment) => assignment.role === "coder") ?? null,
   );
   const selectedRepository = $derived(
-    (loadedRepositories?.items ?? []).find((repository: RepositorySummary) => repository.id === repositoryId) ?? null,
+    (loadedRepositories?.items ?? []).find((repository: RepositorySummary) => repository.repository_key === repositoryKey) ?? null,
   );
   const effectiveRefSelector = $derived(refSelector.trim() || selectedRepository?.default_ref || "");
   const targetCandidateValid = $derived(
@@ -78,10 +78,10 @@
       effectiveRefSelector.length > 0,
   );
   const persistedTargetValid = $derived(
-    ticket.repository_id !== null &&
+    ticket.repository_key !== null &&
       ticket.ref_selector !== null &&
       (loadedRepositories?.items ?? []).some((repository: RepositorySummary) =>
-        repository.id === ticket.repository_id && (repository.diagnostics ?? []).length === 0
+        repository.repository_key === ticket.repository_key && (repository.diagnostics ?? []).length === 0
       ),
   );
   const implementationStartEligible = $derived(
@@ -99,7 +99,7 @@
     ticket = updatedTicket;
     editTitle = updatedTicket.title;
     editBody = updatedTicket.body;
-    repositoryId = updatedTicket.repository_id ?? "";
+    repositoryKey = updatedTicket.repository_key ?? "";
     refSelector = updatedTicket.ref_selector ?? "";
     nextState = updatedTicket.state;
   }
@@ -266,10 +266,10 @@
   async function saveTarget(event: SubmitEvent) {
     event.preventDefault();
     await mutate("target", "", {
-      target: repositoryId
+      target: repositoryKey
         ? {
           action: "set",
-          repository_id: repositoryId,
+          repository_key: repositoryKey,
           ref_selector: refSelector.trim() || null,
         }
         : { action: "clear" },
@@ -279,13 +279,13 @@
   async function markReady() {
     if (!targetCandidateValid || busy) return;
     if (
-      ticket.repository_id !== repositoryId ||
+      ticket.repository_key !== repositoryKey ||
       (ticket.ref_selector ?? "") !== refSelector.trim()
     ) {
       const saved = await mutate("target", "", {
         target: {
           action: "set",
-          repository_id: repositoryId,
+          repository_key: repositoryKey,
           ref_selector: refSelector.trim() || null,
         },
       }, "PATCH");
@@ -540,10 +540,10 @@
         <header><h2>Repository target</h2></header>
         <form class="ticket-control-form" onsubmit={saveTarget}>
           <label>Repository
-            <select bind:value={repositoryId} disabled={ticket.state !== "planning"}>
+            <select bind:value={repositoryKey} disabled={ticket.state !== "planning"}>
               <option value="">Not assigned</option>
               {#each loadedRepositories?.items ?? [] as repository}
-                <option value={repository.id}>{repository.display_name}</option>
+                <option value={repository.repository_key}>{repository.repository_key}</option>
               {/each}
             </select>
           </label>

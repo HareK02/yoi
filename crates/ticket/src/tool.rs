@@ -402,8 +402,8 @@ struct TicketCreateParams {
     queued_at: Option<String>,
     /// Optional target Workspace repository id.
     #[serde(default)]
-    repository_id: Option<String>,
-    /// Optional target Git ref selector. Requires `repository_id`.
+    repository_key: Option<String>,
+    /// Optional target Git ref selector. Requires `repository_key`.
     #[serde(default)]
     ref_selector: Option<String>,
 }
@@ -944,7 +944,7 @@ impl Tool for TicketCreateTool {
         input.workflow_state = params.state.map(TicketWorkflowStateParam::into_state);
         input.queued_by = None;
         input.queued_at = params.queued_at;
-        input.repository_id = params.repository_id;
+        input.repository_id = params.repository_key;
         input.ref_selector = params.ref_selector;
 
         let created = self
@@ -1173,7 +1173,7 @@ impl Tool for TicketMarkReadyTool {
             json!({
                 "ticket": ticket.meta.id,
                 "state": ticket.meta.workflow_state.as_str(),
-                "repository_id": ticket.meta.repository_id,
+                "repository_key": ticket.meta.repository_id,
                 "ref_selector": ticket.meta.ref_selector,
                 "ok": true
             }),
@@ -1206,7 +1206,7 @@ impl Tool for TicketIntakeReadyTool {
             json!({
                 "ticket": ticket.meta.id,
                 "state": ticket.meta.workflow_state.as_str(),
-                "repository_id": ticket.meta.repository_id,
+                "repository_key": ticket.meta.repository_id,
                 "ref_selector": ticket.meta.ref_selector,
                 "ok": true
             }),
@@ -1940,11 +1940,11 @@ mod tests {
         fn resolve_target(
             &self,
             _workspace_id: &str,
-            repository_id: Option<&str>,
+            repository_key: Option<&str>,
             ref_selector: Option<&str>,
         ) -> crate::Result<crate::ResolvedTicketTarget> {
             Ok(crate::ResolvedTicketTarget {
-                repository_id: repository_id.unwrap_or("main").to_owned(),
+                repository_id: repository_key.unwrap_or("main").to_owned(),
                 ref_selector: ref_selector.unwrap_or("develop").to_owned(),
             })
         }

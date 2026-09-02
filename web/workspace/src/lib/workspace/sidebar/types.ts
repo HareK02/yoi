@@ -118,8 +118,7 @@ export type WorkerLaunchProfileCandidate = {
 };
 
 export type WorkingDirectoryRepositoryOption = {
-  id: string;
-  display_name: string;
+  repository_key: string;
   default_selector?: string | null;
 };
 
@@ -149,7 +148,7 @@ export type CleanupWorkdirCandidate = {
   action: CleanupTargetKind;
   workdir_id: string;
   runtime_id: string;
-  repository_id: string;
+  repository_key: string;
   reason: string;
   blocking_reason?: string | null;
   linked_worker_ids: string[];

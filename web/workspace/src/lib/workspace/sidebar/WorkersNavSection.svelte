@@ -88,7 +88,7 @@
             </span>
             <span class="worker-nav-label">{worker.display_name || worker.label}</span>
             <small class="worker-nav-meta">
-              {worker.repository_id ?? '—'}・{worker.working_directory_id ?? '—'}
+              {worker.repository_key ?? '—'}・{worker.working_directory_id ?? '—'}
             </small>
           </a>
         </li>

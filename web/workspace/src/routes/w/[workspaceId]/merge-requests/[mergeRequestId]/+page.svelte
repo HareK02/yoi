@@ -48,7 +48,7 @@
         <section class="ticket-detail-section">
           <div class="ticket-section-heading"><h2>Selectors</h2></div>
           <dl class="ticket-facts">
-            <div><dt>Repository</dt><dd>{mergeRequest.repository_id}</dd></div>
+            <div><dt>Repository</dt><dd>{mergeRequest.repository_key}</dd></div>
             <div><dt>State</dt><dd>{mergeRequest.state}</dd></div>
             <div><dt>Source selector</dt><dd><code>{mergeRequest.selector_from ?? "requires repair"}</code></dd></div>
             <div><dt>Source revision</dt><dd>{mergeRequest.source.status}{mergeRequest.source.ref ? ` · ${mergeRequest.source.ref}` : ""}</dd></div>

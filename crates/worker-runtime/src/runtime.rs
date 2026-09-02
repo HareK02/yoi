@@ -2402,6 +2402,7 @@ impl RuntimeState {
             display_name: worker.request.display_name.clone(),
             profile,
             repository_id,
+            repository_key: None,
             working_directory_id,
         })
     }

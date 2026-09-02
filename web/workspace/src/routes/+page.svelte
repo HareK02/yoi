@@ -17,8 +17,8 @@
   let creating = $state(false);
   let creationError = $state<string | null>(null);
   let displayName = $state("");
+  let repositoryKey = $state("");
   let repositoryUri = $state("");
-  let repositoryName = $state("Main");
   let defaultRef = $state("");
   let lastSubmission = $state<{
     signature: string;
@@ -48,7 +48,7 @@
     const normalized = {
       displayName: displayName.trim(),
       repositoryUri: repositoryUri.trim(),
-      repositoryName: repositoryName.trim(),
+      repositoryKey: repositoryKey.trim(),
       defaultRef: defaultRef.trim(),
     };
     const signature = JSON.stringify(normalized);
@@ -58,8 +58,8 @@
         operation_key: createOperationKey(),
         display_name: normalized.displayName,
         repository: {
+          repository_key: normalized.repositoryKey,
           uri: normalized.repositoryUri,
-          display_name: normalized.repositoryName || null,
           default_ref: normalized.defaultRef || null,
         },
       };
@@ -132,7 +132,7 @@
             <code>{workspace.workspace_id}</code>
             {#if workspace.repositories[0]}
               <span class="workspace-repository-summary">
-                {workspace.repositories[0].display_name}
+                {workspace.repositories[0].repository_key}
                 <small>
                   {workspace.repositories[0].default_selector ?? "repository default"} ·
                   {workspace.repositories[0].kind}
@@ -169,8 +169,8 @@
       </label>
       <div class="workspace-create-row">
         <label>
-          Repository display name
-          <input bind:value={repositoryName} autocomplete="off" />
+          Repository key
+          <input bind:value={repositoryKey} required pattern="[a-z0-9]|[a-z0-9][a-z0-9-]*[a-z0-9]" maxlength="64" autocomplete="off" />
         </label>
         <label>
           Default ref

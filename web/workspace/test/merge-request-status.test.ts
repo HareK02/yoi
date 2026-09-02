@@ -25,7 +25,7 @@ function detail(thread: MergeRequestThreadEvent[]): MergeRequestDetail {
   return {
     merge_request_id: "MR-1",
     workspace_id: "W",
-    repository_id: "main",
+    repository_key: "main",
     ticket_ids: ["T-1"],
     selector_from: "work/ticket",
     selector_to: "develop",

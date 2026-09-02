@@ -120,7 +120,7 @@ export function ticketWorkerLaunchHref(
   workspaceId: string,
   ticket: Pick<
     TicketDetail,
-    "id" | "title" | "repository_id" | "ref_selector"
+    "id" | "title" | "repository_key" | "ref_selector"
   >,
   role: TicketWorkerRole,
 ): string {
@@ -130,8 +130,8 @@ export function ticketWorkerLaunchHref(
     ticketRole: role,
     initialInput: ticketWorkerMessage(ticket.id, role),
   });
-  if (ticket.repository_id) {
-    params.set("repositoryId", ticket.repository_id);
+  if (ticket.repository_key) {
+    params.set("repositoryKey", ticket.repository_key);
   }
   if (ticket.ref_selector) {
     params.set("refSelector", ticket.ref_selector);

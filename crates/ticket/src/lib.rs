@@ -489,6 +489,7 @@ pub struct NewTicket {
     pub workflow_state: Option<TicketWorkflowState>,
     pub queued_by: Option<String>,
     pub queued_at: Option<String>,
+    #[serde(rename = "repository_key")]
     pub repository_id: Option<String>,
     pub ref_selector: Option<String>,
 }
@@ -519,6 +520,7 @@ impl NewTicket {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum TicketTargetEdit {
     Set {
+        #[serde(rename = "repository_key")]
         repository_id: String,
         ref_selector: Option<String>,
     },
@@ -1610,6 +1612,7 @@ pub struct TicketMeta {
     pub workflow_state_explicit: bool,
     pub queued_by: Option<String>,
     pub queued_at: Option<String>,
+    #[serde(rename = "repository_key")]
     pub repository_id: Option<String>,
     pub ref_selector: Option<String>,
     pub raw: BTreeMap<String, String>,
