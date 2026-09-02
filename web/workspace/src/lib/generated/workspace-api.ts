@@ -81,6 +81,64 @@ export type WorkspaceResponse = {
   extension_points: WorkspaceExtensionPoints;
 };
 
+export type WorkspaceMetadataSettingsResponse = {
+  workspace_id: string;
+  display_name: string;
+  created_at: string;
+  revision: string;
+  source: string;
+  diagnostics: Array<Diagnostic>;
+};
+
+export type UpdateWorkspaceMetadataRequest = {
+  display_name: string;
+  revision: string;
+};
+
+export type WorkspaceMetadataMutationResponse = {
+  workspace: WorkspaceMetadataSettingsResponse;
+  diagnostics: Array<Diagnostic>;
+};
+
+export type ProfileSettingsResponse = {
+  workspace_id: string;
+  registry_revision: string;
+  config_revision?: number | null;
+  tree_digest?: string | null;
+  projection_digest?: string | null;
+  default_profile?: string | null;
+  profiles: Array<WorkspaceProfileSummary>;
+  sources: Array<WorkspaceProfileSourceSummary>;
+  diagnostics: Array<Diagnostic>;
+};
+
+export type WorkspaceProfileSummary = {
+  profile_id: string;
+  selector: string;
+  label: string;
+  source_kind: string;
+  profile_source_id?: string | null;
+  description?: string | null;
+  editable: boolean;
+  is_default: boolean;
+  diagnostics: Array<Diagnostic>;
+};
+
+export type WorkspaceProfileSourceSummary = {
+  profile_source_id: string;
+  display_path: string;
+  kind: string;
+  content_type: string;
+  content_digest: string;
+  provenance: WorkspaceProfileSourceProvenance;
+  editable: boolean;
+  revision: string;
+  size_bytes: number;
+  diagnostics: Array<Diagnostic>;
+};
+
+export type WorkspaceProfileSourceProvenance = "project_profile_source_tree";
+
 export type RepositorySourceKind =
   | "local_path"
   | "file"

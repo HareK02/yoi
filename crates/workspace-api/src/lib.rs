@@ -222,6 +222,100 @@ pub struct WorkspaceResponse {
     pub extension_points: WorkspaceExtensionPoints,
 }
 
+/// Workspace identity metadata exposed by the current settings resource.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceMetadataSettingsResponse {
+    pub workspace_id: String,
+    pub display_name: String,
+    pub created_at: String,
+    pub revision: String,
+    pub source: String,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Compare-and-swap update for Workspace identity display metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct UpdateWorkspaceMetadataRequest {
+    pub display_name: String,
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceMetadataMutationResponse {
+    pub workspace: WorkspaceMetadataSettingsResponse,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Read-only Profile catalog projected from one active Workspace config revision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
+#[serde(deny_unknown_fields)]
+pub struct ProfileSettingsResponse {
+    pub workspace_id: String,
+    pub registry_revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional, type = "number | null"))]
+    pub config_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<String>,
+    pub profiles: Vec<WorkspaceProfileSummary>,
+    pub sources: Vec<WorkspaceProfileSourceSummary>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceProfileSummary {
+    pub profile_id: String,
+    pub selector: String,
+    pub label: String,
+    pub source_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_source_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub editable: bool,
+    pub is_default: bool,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceProfileSourceSummary {
+    pub profile_source_id: String,
+    pub display_path: String,
+    pub kind: String,
+    pub content_type: String,
+    pub content_digest: String,
+    pub provenance: WorkspaceProfileSourceProvenance,
+    pub editable: bool,
+    pub revision: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub size_bytes: u64,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceProfileSourceProvenance {
+    ProjectProfileSourceTree,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
@@ -1124,6 +1218,13 @@ pub fn catalog_typescript() -> String {
         WorkspaceExtensionPointState::decl(&config),
         WorkspaceExtensionPoints::decl(&config),
         WorkspaceResponse::decl(&config),
+        WorkspaceMetadataSettingsResponse::decl(&config),
+        UpdateWorkspaceMetadataRequest::decl(&config),
+        WorkspaceMetadataMutationResponse::decl(&config),
+        ProfileSettingsResponse::decl(&config),
+        WorkspaceProfileSummary::decl(&config),
+        WorkspaceProfileSourceSummary::decl(&config),
+        WorkspaceProfileSourceProvenance::decl(&config),
         RepositorySourceKind::decl(&config),
         RepositorySource::decl(&config),
         RepositoryObservedStatus::decl(&config),
@@ -1322,6 +1423,14 @@ mod tests {
         assert!(output.contains("export type RepositoryListResponse ="));
         assert!(output.contains("items: Array<RepositorySummary>"));
         assert!(output.contains("observed_at?: string | null"));
+        assert!(output.contains("export type WorkspaceMetadataSettingsResponse ="));
+        assert!(output.contains("export type WorkspaceMetadataMutationResponse ="));
+        assert!(output.contains("export type ProfileSettingsResponse ="));
+        assert!(output.contains("config_revision?: number | null"));
+        assert!(output.contains("provenance: WorkspaceProfileSourceProvenance"));
+        assert!(output.contains(
+            "export type WorkspaceProfileSourceProvenance = \"project_profile_source_tree\""
+        ));
         assert!(!output.contains("repository_id: string, display_name"));
     }
 
@@ -1352,6 +1461,83 @@ mod tests {
         let encoded = serde_json::to_vec(&value).expect("fixture should serialize");
         let decoded: T = serde_json::from_slice(&encoded).expect("fixture should deserialize");
         assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn workspace_metadata_and_profile_projection_fixtures_round_trip() {
+        let diagnostic = Diagnostic {
+            code: "profile_projection_warning".to_string(),
+            severity: DiagnosticSeverity::Warning,
+            message: "projected from the active config revision".to_string(),
+        };
+        let metadata = WorkspaceMetadataSettingsResponse {
+            workspace_id: "workspace-test".to_string(),
+            display_name: "Test".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            revision: "sha256:metadata".to_string(),
+            source: "workspace-config".to_string(),
+            diagnostics: vec![diagnostic.clone()],
+        };
+        round_trip(metadata.clone());
+        round_trip(UpdateWorkspaceMetadataRequest {
+            display_name: "Renamed".to_string(),
+            revision: metadata.revision.clone(),
+        });
+        round_trip(WorkspaceMetadataMutationResponse {
+            workspace: metadata,
+            diagnostics: vec![],
+        });
+
+        round_trip(ProfileSettingsResponse {
+            workspace_id: "workspace-test".to_string(),
+            registry_revision: "config-source:7:sha256:tree:sha256:projection".to_string(),
+            config_revision: Some(7),
+            tree_digest: Some("sha256:tree".to_string()),
+            projection_digest: Some("sha256:projection".to_string()),
+            default_profile: Some("workspace:coder".to_string()),
+            profiles: vec![WorkspaceProfileSummary {
+                profile_id: "workspace:coder".to_string(),
+                selector: "workspace:coder".to_string(),
+                label: "Coder".to_string(),
+                source_kind: "project".to_string(),
+                profile_source_id: Some("profile-source-1".to_string()),
+                description: None,
+                editable: true,
+                is_default: true,
+                diagnostics: vec![diagnostic.clone()],
+            }],
+            sources: vec![WorkspaceProfileSourceSummary {
+                profile_source_id: "profile-source-1".to_string(),
+                display_path: "profiles/coder.dcdl".to_string(),
+                kind: "profile".to_string(),
+                content_type: "text/x-decodal".to_string(),
+                content_digest: "sha256:source".to_string(),
+                provenance: WorkspaceProfileSourceProvenance::ProjectProfileSourceTree,
+                editable: false,
+                revision: "config-source:7".to_string(),
+                size_bytes: 128,
+                diagnostics: vec![],
+            }],
+            diagnostics: vec![diagnostic],
+        });
+
+        let absent_optional_fields = serde_json::json!({
+            "workspace_id": "workspace-test",
+            "registry_revision": "builtin",
+            "profiles": [],
+            "sources": [],
+            "diagnostics": []
+        });
+        let decoded: ProfileSettingsResponse =
+            serde_json::from_value(absent_optional_fields.clone()).unwrap();
+        assert_eq!(decoded.config_revision, None);
+        assert_eq!(decoded.tree_digest, None);
+        assert_eq!(decoded.projection_digest, None);
+        assert_eq!(decoded.default_profile, None);
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            absent_optional_fields
+        );
     }
 
     fn companion_worker() -> WorkspaceWorkerDiscoveryItem {

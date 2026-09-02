@@ -61,20 +61,22 @@ use workspace_api::{
     CreateWorkspaceRepositoryRequest, CreateWorkspaceRepositoryResponse,
     DeleteRepositorySshCredentialRequest, DeleteRepositorySshHostTrustRequest,
     ObjectiveCreateRequest, ObjectiveEditRequest, ObjectiveLinkTicketRequest,
-    ObjectiveStateRequest, PutRepositorySshHostTrustRequest, RepositoryAccessProjection,
-    RepositoryDetailResponse, RepositoryListResponse, RepositoryLogResponse,
-    RepositorySshCredential, RepositorySshHostTrust, RotateRepositorySshCredentialRequest,
-    RuntimeConnectionTestResponse, RuntimeManagementSummary, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
-    TICKET_RELATIONS_QUERY_PATH,
+    ObjectiveStateRequest, ProfileSettingsResponse, PutRepositorySshHostTrustRequest,
+    RepositoryAccessProjection, RepositoryDetailResponse, RepositoryListResponse,
+    RepositoryLogResponse, RepositorySshCredential, RepositorySshHostTrust,
+    RotateRepositorySshCredentialRequest, RuntimeConnectionTestResponse, RuntimeManagementSummary,
+    TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
+    UpdateWorkspaceMetadataRequest,
     WorkingDirectoryCreateRequest as BrowserWorkingDirectoryCreateRequest,
     WorkingDirectoryCreateResponse as BrowserWorkingDirectoryCreateResponse,
     WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
     WorkingDirectoryListResponse as BrowserWorkingDirectoryListResponse,
     WorkingDirectoryRemovalDisposition, WorkingDirectoryRemovalRequest,
     WorkingDirectoryRemovalResponse, WorkspaceCatalogListResponse, WorkspaceCreateResponse,
-    WorkspaceExtensionPointState, WorkspaceExtensionPoints, WorkspacePermissionSummary,
-    WorkspaceRepositoryRecord, WorkspaceResponse, WorkspaceRuntimeResource, WorkspaceSummary,
-    WorkspaceWorkerDiscoveryItem, WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
+    WorkspaceExtensionPointState, WorkspaceExtensionPoints, WorkspaceMetadataMutationResponse,
+    WorkspaceMetadataSettingsResponse, WorkspacePermissionSummary, WorkspaceRepositoryRecord,
+    WorkspaceResponse, WorkspaceRuntimeResource, WorkspaceSummary, WorkspaceWorkerDiscoveryItem,
+    WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
 };
 
 use crate::auth::{
@@ -114,7 +116,6 @@ use crate::observation::{
     BackendObservationProxy, ObservationProxyError, RuntimeObservationClient,
     RuntimeObservationSource, RuntimeObservationSourceConfig,
 };
-use crate::profile_settings::UpdateWorkspaceMetadataRequest;
 use crate::records::{
     MergeRequestListItem, MergeRequestListResponse, ObjectiveDetail, ObjectiveQueryRequest,
     ObjectiveQueryResponse, ObjectiveShowRequest, ProjectRecordList, TicketDetail,
@@ -3360,7 +3361,7 @@ async fn scoped_get_workspace(
 async fn scoped_get_workspace_settings(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
-) -> ApiResult<Json<crate::profile_settings::WorkspaceMetadataSettingsResponse>> {
+) -> ApiResult<Json<WorkspaceMetadataSettingsResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     Ok(Json(crate::profile_settings::workspace_metadata_settings(
         &api.config.workspace_root,
@@ -3374,20 +3375,18 @@ async fn scoped_update_workspace_settings(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     Json(request): Json<UpdateWorkspaceMetadataRequest>,
-) -> ApiResult<Json<crate::profile_settings::WorkspaceMetadataMutationResponse>> {
+) -> ApiResult<Json<WorkspaceMetadataMutationResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let workspace =
         crate::profile_settings::update_workspace_metadata(&api.config.workspace_root, request)?;
-    Ok(Json(
-        crate::profile_settings::WorkspaceMetadataMutationResponse {
-            workspace,
-            diagnostics: vec![RuntimeDiagnostic {
-                code: "workspace_metadata_updated".to_string(),
-                severity: DiagnosticSeverity::Info,
-                message: "Workspace display metadata was updated.".to_string(),
-            }],
-        },
-    ))
+    Ok(Json(WorkspaceMetadataMutationResponse {
+        workspace,
+        diagnostics: vec![workspace_api::Diagnostic {
+            code: "workspace_metadata_updated".to_string(),
+            severity: workspace_api::DiagnosticSeverity::Info,
+            message: "Workspace display metadata was updated.".to_string(),
+        }],
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -3763,7 +3762,7 @@ async fn scoped_commit_workspace_config_tree(
 async fn scoped_get_profile_settings(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
-) -> ApiResult<Json<crate::profile_settings::ProfileSettingsResponse>> {
+) -> ApiResult<Json<ProfileSettingsResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let state = api
         .config_store
@@ -14353,7 +14352,7 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> ApiResult<WorkerLaunchO
             !profile
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+                .any(|diagnostic| diagnostic.severity == workspace_api::DiagnosticSeverity::Error)
         })
         .map(|profile| WorkerLaunchProfileCandidate {
             id: profile.profile_id,
@@ -26640,6 +26639,13 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
     #[tokio::test]
     async fn profile_settings_are_read_only_virtual_config_projection() {
         let dir = tempfile::tempdir().unwrap();
+        let legacy_profile_dir = dir.path().join(".yoi/profiles");
+        std::fs::create_dir_all(&legacy_profile_dir).unwrap();
+        std::fs::write(
+            legacy_profile_dir.join("legacy.dcdl"),
+            "LegacyFilesystemProfile = { label = 'must not be projected' }\n",
+        )
+        .unwrap();
         let app = test_app(dir.path()).await;
         let path = format!("/api/w/{TEST_WORKSPACE_ID}/settings/profiles");
         let settings = get_json(app.clone(), &path).await;
@@ -26654,6 +26660,8 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
                 .iter()
                 .all(|profile| profile["editable"] == false)
         );
+        assert!(!settings.to_string().contains("LegacyFilesystemProfile"));
+        assert!(!settings.to_string().contains("legacy.dcdl"));
         let mutation = app
             .oneshot(
                 Request::builder()
