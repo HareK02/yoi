@@ -930,7 +930,7 @@ impl App {
 
     pub fn push_notice(&mut self, message: impl Into<String>) {
         self.blocks.push(Block::Alert {
-            level: AlertLevel::Info,
+            level: AlertLevel::Warn,
             source: AlertSource::Worker,
             message: message.into(),
         });
