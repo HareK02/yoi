@@ -512,7 +512,7 @@ mod tests {
             "capabilities": {"can_stop": true, "can_spawn_followup": false},
             "working_directory": {
                 "working_directory_id": "wd-1",
-                "repository_id": "main",
+                "repository_key": "main",
                 "materializer_kind": "local_git_worktree",
                 "status": "active",
                 "occupied_by": {
@@ -525,11 +525,9 @@ mod tests {
         });
 
         let worker: BackendWorkerSummary = serde_json::from_value(payload.clone()).unwrap();
-        let occupied_by = worker
-            .working_directory
-            .unwrap()
-            .occupied_by
-            .expect("occupied Workdir");
+        let workdir = worker.working_directory.unwrap();
+        assert_eq!(workdir.repository_key, "main");
+        let occupied_by = workdir.occupied_by.expect("occupied Workdir");
         assert_eq!(occupied_by.runtime_id, "arcadia");
         assert_eq!(occupied_by.worker_id, "worker-opaque-64");
 
