@@ -792,17 +792,27 @@ async fn handle_terminal_event<T: Socket>(
             if let Some(method) = handle_key(app, key) {
                 if let Some(path) = attachment_command_path(&method) {
                     match client.upload_path(&path).await {
-                        Ok(reference) => app.push_notice(format!(
-                            "Attached {} ({} bytes); it will be sent with the next message.",
-                            reference.file_name, reference.byte_len
-                        )),
+                        Ok(reference) => app.flash_actionbar_notice(
+                            format!(
+                                "Attached {} ({} bytes); it will be sent with the next message.",
+                                reference.file_name, reference.byte_len
+                            ),
+                            ActionbarNoticeLevel::Info,
+                            ActionbarNoticeSource::Tui,
+                            Duration::from_secs(6),
+                        ),
                         Err(error) => {
                             app.push_error(format!("Attachment upload failed: {error}"));
                         }
                     }
                 } else if is_clear_attachments_command(&method) {
                     client.clear_pending_attachments().await;
-                    app.push_notice("Removed pending attachments.");
+                    app.flash_actionbar_notice(
+                        "Removed pending attachments.",
+                        ActionbarNoticeLevel::Info,
+                        ActionbarNoticeSource::Tui,
+                        Duration::from_secs(4),
+                    );
                 } else {
                     client.send(&method).await?;
                 }

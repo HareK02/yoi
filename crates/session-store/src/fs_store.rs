@@ -20,8 +20,8 @@ use crate::paste_artifact::{read_from_dir, write_to_dir};
 use crate::segment_log::LogEntry;
 use crate::store::{Store, StoreError};
 use crate::uploaded_file::{
-    bind_uploaded_file, delete_uploaded_file, read_uploaded_file, read_uploaded_file_by_id,
-    write_uploaded_file,
+    bind_uploaded_file, delete_uncommitted_uploaded_files, delete_uploaded_file,
+    read_uploaded_file, read_uploaded_file_by_id, write_uploaded_file,
 };
 use crate::{PasteArtifactLimits, SegmentId, SessionId, UploadedFileLimits};
 use protocol::{PasteArtifactRef, UploadedFileRef};
@@ -459,6 +459,14 @@ impl Store for FsStore {
         delete_uploaded_file(&self.paste_artifact_dir(session_id), artifact_id)
     }
 
+    fn delete_uncommitted_uploaded_files(&self, session_id: SessionId) -> Result<u64, StoreError> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("session store append lock was poisoned"))?;
+        delete_uncommitted_uploaded_files(&self.paste_artifact_dir(session_id))
+    }
+
     fn append_trace(
         &self,
         session_id: SessionId,
@@ -678,6 +686,47 @@ mod tests {
             store.write_uploaded_file(session_id, "notes.txt", "not a type", b"x", limits),
             Err(StoreError::InvalidUploadedFileMediaType)
         ));
+        assert!(matches!(
+            store.write_uploaded_file(
+                session_id,
+                "safe\u{202e}txt.exe",
+                "text/plain",
+                b"x",
+                limits
+            ),
+            Err(StoreError::InvalidUploadedFileName)
+        ));
+        assert!(matches!(
+            store.write_uploaded_file(session_id, "image.png", "image/png", b"not a png", limits),
+            Err(StoreError::ArtifactIntegrityMismatch)
+        ));
+        let pending = store
+            .write_uploaded_file(session_id, "Readme.txt", "text/plain", b"x", limits)
+            .unwrap();
+        let replay = store
+            .write_uploaded_file(session_id, "Readme.txt", "text/plain", b"x", limits)
+            .unwrap();
+        assert_eq!(replay.artifact_id, pending.artifact_id);
+        assert!(matches!(
+            store.write_uploaded_file(session_id, "README.txt", "text/plain", b"changed", limits),
+            Err(StoreError::InvalidUploadedFileName)
+        ));
+        assert!(matches!(
+            store.write_uploaded_file(session_id, "ＲＥＡＤＭＥ.txt", "text/plain", b"y", limits),
+            Err(StoreError::InvalidUploadedFileName)
+        ));
+        let bound = store
+            .bind_uploaded_file(session_id, &pending, "entry-upload")
+            .unwrap();
+        let other = store
+            .write_uploaded_file(session_id, "other.txt", "text/plain", b"z", limits)
+            .unwrap();
+        assert_eq!(
+            store.delete_uncommitted_uploaded_files(session_id).unwrap(),
+            1
+        );
+        assert!(store.read_uploaded_file(session_id, &other).is_err());
+        assert_eq!(store.read_uploaded_file(session_id, &bound).unwrap(), b"x");
         store
             .write_paste_artifact(
                 session_id,

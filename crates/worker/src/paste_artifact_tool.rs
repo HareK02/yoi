@@ -340,7 +340,7 @@ mod tests {
                 owner,
                 "image.png",
                 "image/png",
-                &[0xff, 0xd8, 0x00],
+                b"\x89PNG\r\n\x1a\nbody",
                 session_store::UploadedFileLimits::default(),
             )
             .unwrap();

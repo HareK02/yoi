@@ -63,6 +63,14 @@ pub enum LogEntry {
         compacted_from: Option<SegmentOrigin>,
     },
 
+    /// Typed user-segment projection accompanying a compacted or forked
+    /// SegmentStart history snapshot. This keeps attachment identity and
+    /// metadata aligned with retained user entries without embedding bodies.
+    InputSegmentsCheckpoint {
+        ts: u64,
+        user_segments: Vec<Vec<Segment>>,
+    },
+
     /// IDLE → active marker. Records the start of a new self-driving
     /// cycle (Invoke range). The range extends implicitly until the
     /// next `Invoke` entry; this entry carries the trigger only — the
@@ -272,6 +280,9 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
                     .cloned()
                     .map(|entry| Item::from(entry.item))
                     .collect();
+            }
+            LogEntry::InputSegmentsCheckpoint { user_segments, .. } => {
+                state.user_segments = user_segments.clone();
             }
             LogEntry::Invoke { .. } => {
                 // A terminal run record below clears or refines this. If the

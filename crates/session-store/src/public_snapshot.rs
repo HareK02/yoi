@@ -41,6 +41,24 @@ pub fn project_session_snapshot(session_id: SessionId, log: &[LogEntry]) -> Sess
                 entries.clear();
                 extend_history(&mut entries, history, None, *ts);
             }
+            LogEntry::InputSegmentsCheckpoint { user_segments, .. } => {
+                let mut segments = user_segments.iter();
+                for entry in &mut entries {
+                    let is_user = matches!(
+                        &entry.data,
+                        SessionSnapshotEntryData::UserInput { .. }
+                            | SessionSnapshotEntryData::Message {
+                                role: SessionMessageRole::User,
+                                ..
+                            }
+                    );
+                    if is_user && let Some(checkpoint) = segments.next() {
+                        entry.data = SessionSnapshotEntryData::UserInput {
+                            segments: checkpoint.clone(),
+                        };
+                    }
+                }
+            }
             LogEntry::AnnotatedUserInput {
                 ts,
                 segments,
@@ -355,6 +373,63 @@ mod tests {
         assert!(!json.contains("secret prompt"));
         assert!(!json.contains("secret reasoning"));
         assert!(json.contains("visible"));
+    }
+
+    #[test]
+    fn compacted_checkpoint_restores_uploaded_file_segments() {
+        let session_id = crate::new_session_id();
+        let user_entry_id = LoggedSessionHistoryEntryId::new();
+        let file = protocol::UploadedFileRef {
+            artifact_id: "019ca7c8-57b6-7f05-8edf-524147aba7b3".into(),
+            file_name: "notes.md".into(),
+            media_type: "text/markdown".into(),
+            created_at_ms: 7,
+            availability: protocol::UploadedFileAvailability::Available,
+            byte_len: 12,
+            sha256: "a".repeat(64),
+            source_entry_id: Some(user_entry_id.0.clone()),
+        };
+        let segment = Segment::UploadedFile { file };
+        let log = vec![
+            LogEntry::AnnotatedSegmentStart {
+                ts: 10,
+                session_id,
+                system_prompt: None,
+                config: RequestConfig::default(),
+                history: vec![LoggedHistoryEntry {
+                    item: LoggedItem::Message {
+                        role: LoggedRole::User,
+                        content: vec![LoggedContentPart::Text {
+                            text: "[Attached file: notes.md]".into(),
+                        }],
+                    },
+                    metadata: LoggedSessionHistoryMetadata {
+                        entry_id: user_entry_id,
+                        origin: LoggedSessionHistoryOrigin::HumanInput {
+                            account_id: "account-1".into(),
+                        },
+                        derivation: None,
+                    },
+                }],
+                forked_from: None,
+                compacted_from: Some(crate::SegmentOrigin {
+                    segment_id: crate::new_segment_id(),
+                    at_turn_index: 1,
+                }),
+            },
+            LogEntry::InputSegmentsCheckpoint {
+                ts: 10,
+                user_segments: vec![vec![segment.clone()]],
+            },
+        ];
+
+        let snapshot = project_current_session_snapshot(&log);
+        assert_eq!(
+            snapshot.entries[0].data,
+            SessionSnapshotEntryData::UserInput {
+                segments: vec![segment]
+            }
+        );
     }
 
     #[test]

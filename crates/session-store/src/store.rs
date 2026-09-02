@@ -221,6 +221,10 @@ pub trait Store: Send + Sync {
         Err(StoreError::PasteArtifactUnsupported)
     }
 
+    fn delete_uncommitted_uploaded_files(&self, _session_id: SessionId) -> Result<u64, StoreError> {
+        Ok(0)
+    }
+
     /// Append a trace entry to the debug event trace file.
     fn append_trace(
         &self,

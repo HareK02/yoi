@@ -2145,6 +2145,25 @@ where
                 ),
             );
         }
+        let cleanup_handle = match self.workers.lock() {
+            Ok(workers) => workers
+                .get(handle.worker_ref())
+                .map(|execution| execution.handle.clone()),
+            Err(_) => {
+                return WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Stop,
+                    "worker adapter registry lock is poisoned",
+                );
+            }
+        };
+        if let Some(worker) = cleanup_handle
+            && let Err(error) = worker.delete_uncommitted_uploaded_files()
+        {
+            return WorkerExecutionResult::errored(
+                WorkerExecutionOperation::Stop,
+                format!("uploaded_file_cleanup_failed: {error}"),
+            );
+        }
         let execution = match self.workers.lock() {
             Ok(mut workers) => workers.remove(handle.worker_ref()),
             Err(_) => {

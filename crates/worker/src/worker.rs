@@ -3331,7 +3331,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             }),
             compacted_from: None,
         };
-        let mut initial_entries = vec![entry.clone()];
+        let mut initial_entries = vec![
+            entry.clone(),
+            LogEntry::InputSegmentsCheckpoint {
+                ts: segment_log::now_millis(),
+                user_segments: self.user_segments.clone(),
+            },
+        ];
         if let Some(checkpoint) =
             active_run_checkpoint_entry(w.active_run_turn_count(), w.turn_count())
         {
@@ -4295,6 +4301,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             })
             .collect::<Vec<_>>();
 
+        let retained_user_segments = self
+            .user_segments
+            .iter()
+            .skip(self.user_segments.len().saturating_sub(retained_user_msgs))
+            .cloned()
+            .collect::<Vec<_>>();
+
         // Build the SegmentStart entry for the new compacted segment.
         // Inherits the source Segment's session_id so the compacted
         // lineage stays grouped under the same Session. Atomically
@@ -4320,7 +4333,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 at_turn_index: source_turn_count,
             }),
         };
-        let mut initial_entries = vec![entry.clone()];
+        let mut initial_entries = vec![
+            entry.clone(),
+            LogEntry::InputSegmentsCheckpoint {
+                ts: segment_log::now_millis(),
+                user_segments: retained_user_segments.clone(),
+            },
+        ];
         if let Some(checkpoint) =
             active_run_checkpoint_entry(w.active_run_turn_count(), source_turn_count)
         {
@@ -4372,10 +4391,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // segments; only the user_messages surviving in retained_items
         // keep them. They are always the trailing K entries of
         // `self.user_segments` because submissions are appended in order.
-        let drop_n = self.user_segments.len().saturating_sub(retained_user_msgs);
-        if drop_n > 0 {
-            self.user_segments.drain(..drop_n);
-        }
+        self.user_segments = retained_user_segments;
 
         self.session.replace_history(compacted_history_entries);
         // Compaction-introduced system messages are part of the new

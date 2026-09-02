@@ -9,6 +9,7 @@ use fs4::fs_std::FileExt;
 use protocol::{UploadedFileAvailability, UploadedFileRef};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use crate::StoreError;
@@ -18,6 +19,7 @@ type Result<T> = std::result::Result<T, StoreError>;
 pub const DEFAULT_MAX_UPLOADED_FILE_BYTES: u64 = 10 * 1024 * 1024;
 pub const DEFAULT_MAX_SESSION_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 pub const DEFAULT_MAX_FILES_PER_SUBMISSION: usize = 8;
+pub const DEFAULT_MAX_SESSION_UPLOADED_FILES: u64 = 256;
 const MAX_FILE_NAME_CHARS: usize = 255;
 const MAX_MEDIA_TYPE_BYTES: usize = 127;
 
@@ -53,9 +55,15 @@ pub(crate) fn validate_file_name(file_name: &str) -> Result<()> {
         || file_name.chars().count() > MAX_FILE_NAME_CHARS
         || file_name == "."
         || file_name == ".."
-        || file_name
-            .chars()
-            .any(|ch| ch.is_control() || matches!(ch, '/' | '\\'))
+        || file_name.chars().any(|ch| {
+            ch.is_control()
+                || matches!(
+                    ch,
+                    '/' | '\\' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}'
+                )
+                || ('\u{202a}'..='\u{202e}').contains(&ch)
+                || ('\u{2066}'..='\u{2069}').contains(&ch)
+        })
     {
         return Err(StoreError::InvalidUploadedFileName);
     }
@@ -92,6 +100,35 @@ pub(crate) fn validate_media_type(media_type: &str) -> Result<()> {
         );
     if !valid || !allowed {
         return Err(StoreError::InvalidUploadedFileMediaType);
+    }
+    Ok(())
+}
+
+fn normalized_file_name(file_name: &str) -> String {
+    file_name.nfkc().flat_map(char::to_lowercase).collect()
+}
+
+fn validate_content(media_type: &str, content: &[u8]) -> Result<()> {
+    if content.is_empty() {
+        return Err(StoreError::InvalidUploadedFileMediaType);
+    }
+    let matches_declared_type = if media_type.starts_with("text/") {
+        std::str::from_utf8(content).is_ok()
+    } else {
+        match media_type {
+            "application/json" => serde_json::from_slice::<serde_json::Value>(content).is_ok(),
+            "application/pdf" => content.starts_with(b"%PDF-"),
+            "image/png" => content.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "image/jpeg" => content.starts_with(&[0xff, 0xd8, 0xff]),
+            "image/gif" => content.starts_with(b"GIF87a") || content.starts_with(b"GIF89a"),
+            "image/webp" => {
+                content.len() >= 12 && content.starts_with(b"RIFF") && &content[8..12] == b"WEBP"
+            }
+            _ => false,
+        }
+    };
+    if !matches_declared_type {
+        return Err(StoreError::ArtifactIntegrityMismatch);
     }
     Ok(())
 }
@@ -133,7 +170,7 @@ pub(crate) fn stored_uploaded_file_usage(dir: &Path) -> Result<(u64, u64)> {
         {
             continue;
         }
-        let stored: StoredUploadedFile = serde_json::from_slice(&fs::read(path)?)?;
+        let stored: StoredUploadedFile = serde_json::from_slice(&fs::read(&path)?)?;
         bytes = bytes
             .checked_add(stored.byte_len)
             .ok_or(StoreError::ArtifactQuotaExceeded)?;
@@ -153,7 +190,9 @@ pub(crate) fn write_uploaded_file(
 ) -> Result<UploadedFileRef> {
     validate_file_name(file_name)?;
     validate_media_type(media_type)?;
+    validate_content(media_type, content)?;
     let byte_len = u64::try_from(content.len()).map_err(|_| StoreError::ArtifactTooLarge)?;
+    let sha256 = digest(content);
     if byte_len > limits.max_file_bytes {
         return Err(StoreError::ArtifactTooLarge);
     }
@@ -166,7 +205,48 @@ pub(crate) fn write_uploaded_file(
         .open(dir.join(".aggregate.lock"))?;
     FileExt::lock_exclusive(&aggregate_lock)?;
     let (paste_bytes, _) = crate::paste_artifact::stored_paste_usage(dir)?;
-    let (file_bytes, _) = stored_uploaded_file_usage(dir)?;
+    let (file_bytes, file_count) = stored_uploaded_file_usage(dir)?;
+    if file_count >= DEFAULT_MAX_SESSION_UPLOADED_FILES {
+        return Err(StoreError::ArtifactQuotaExceeded);
+    }
+    let normalized_name = normalized_file_name(file_name);
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".file.json"))
+        {
+            continue;
+        }
+        let stored: StoredUploadedFile = serde_json::from_slice(&fs::read(&path)?)?;
+        if stored.source_entry_id.is_none()
+            && normalized_file_name(&stored.file_name) == normalized_name
+        {
+            if stored.media_type == media_type
+                && stored.byte_len == byte_len
+                && stored.sha256 == sha256
+            {
+                let artifact_id = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_suffix(".file.json"))
+                    .ok_or(StoreError::InvalidArtifactId)?
+                    .to_string();
+                return Ok(UploadedFileRef {
+                    artifact_id,
+                    file_name: stored.file_name,
+                    media_type: stored.media_type,
+                    created_at_ms: stored.created_at_ms,
+                    availability: UploadedFileAvailability::Available,
+                    byte_len: stored.byte_len,
+                    sha256: stored.sha256,
+                    source_entry_id: None,
+                });
+            }
+            return Err(StoreError::InvalidUploadedFileName);
+        }
+    }
     if paste_bytes
         .checked_add(file_bytes)
         .and_then(|total| total.checked_add(byte_len))
@@ -177,7 +257,6 @@ pub(crate) fn write_uploaded_file(
 
     let artifact_id = Uuid::now_v7().to_string();
     let created_at_ms = now_ms()?;
-    let sha256 = digest(content);
     let stored = StoredUploadedFile {
         file_name: file_name.to_owned(),
         media_type: media_type.to_owned(),
@@ -272,6 +351,36 @@ pub(crate) fn bind_uploaded_file(
     let mut bound = reference.clone();
     bound.source_entry_id = Some(source_entry_id.to_owned());
     Ok(bound)
+}
+
+pub(crate) fn delete_uncommitted_uploaded_files(dir: &Path) -> Result<u64> {
+    fs::create_dir_all(dir)?;
+    let aggregate_lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(dir.join(".aggregate.lock"))?;
+    FileExt::lock_exclusive(&aggregate_lock)?;
+    let mut removed = 0_u64;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".file.json"))
+        {
+            continue;
+        }
+        let stored: StoredUploadedFile = serde_json::from_slice(&fs::read(&path)?)?;
+        if stored.source_entry_id.is_none() {
+            fs::remove_file(path)?;
+            removed = removed
+                .checked_add(1)
+                .ok_or(StoreError::ArtifactQuotaExceeded)?;
+        }
+    }
+    Ok(removed)
 }
 
 pub(crate) fn delete_uploaded_file(dir: &Path, artifact_id: &str) -> Result<bool> {

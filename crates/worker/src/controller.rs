@@ -88,6 +88,11 @@ impl WorkerHandle {
             .delete_uploaded_file(self.session_id, artifact_id)
     }
 
+    pub fn delete_uncommitted_uploaded_files(&self) -> Result<u64, session_store::StoreError> {
+        self.artifact_store
+            .delete_uncommitted_uploaded_files(self.session_id)
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.working_event_tx.subscribe()
     }
