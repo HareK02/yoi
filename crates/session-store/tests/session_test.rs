@@ -237,6 +237,7 @@ async fn session_run_logs_entries() {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
             history: annotated(&worker.history()),
+            user_segments: Vec::new(),
         },
     )
     .unwrap();
@@ -285,6 +286,7 @@ async fn session_restore_round_trip() {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
             history: annotated(&worker.history()),
+            user_segments: Vec::new(),
         },
     )
     .unwrap();
@@ -324,6 +326,7 @@ async fn session_run_with_tool_call() {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
             history: annotated(&worker.history()),
+            user_segments: Vec::new(),
         },
     )
     .unwrap();
@@ -359,6 +362,7 @@ async fn session_resume_after_pause() {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
             history: annotated(&worker.history()),
+            user_segments: Vec::new(),
         },
     )
     .unwrap();
@@ -398,6 +402,7 @@ async fn session_fork_creates_new_session() {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
             history: annotated(&worker.history()),
+            user_segments: Vec::new(),
         },
     )
     .unwrap();
@@ -405,6 +410,9 @@ async fn session_fork_creates_new_session() {
     let (worker, _) = run_and_persist(worker, &store, sid, segid, "Hello").await;
 
     let original_history_len = worker.history().len();
+    let source_user_segments = session_store::restore(&store, sid, segid)
+        .unwrap()
+        .user_segments;
     let (fork_sid, fork_segid) = session_store::fork(
         &store,
         sid,
@@ -412,22 +420,28 @@ async fn session_fork_creates_new_session() {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
             history: annotated(&worker.history()),
+            user_segments: source_user_segments.clone(),
         },
     )
     .unwrap();
     assert_ne!(fork_sid, sid, "`fork` mints a fresh Session");
 
-    // Fork should have a SegmentStart with the current history
+    // Fork should have an annotated seed and typed input checkpoint.
     let fork_entries = store.read_all(fork_sid, fork_segid).unwrap();
-    assert_eq!(fork_entries.len(), 1);
+    assert_eq!(fork_entries.len(), 2);
     assert!(matches!(
         &fork_entries[0],
         LogEntry::AnnotatedSegmentStart { .. }
+    ));
+    assert!(matches!(
+        &fork_entries[1],
+        LogEntry::InputSegmentsCheckpoint { .. }
     ));
 
     let fork_state = collect_state(&fork_entries);
     assert_eq!(fork_state.session_id, Some(fork_sid));
     assert_eq!(fork_state.history.len(), original_history_len);
+    assert_eq!(fork_state.user_segments, source_user_segments);
     assert_eq!(fork_state.system_prompt.as_deref(), Some("System prompt"));
 }
 
@@ -443,6 +457,7 @@ async fn session_fork_at_truncates_within_session() {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
             history: annotated(&worker.history()),
+            user_segments: Vec::new(),
         },
     )
     .unwrap();
@@ -508,6 +523,7 @@ fn rewound_fork_preserves_uploaded_file_segments_in_snapshot() {
             system_prompt: Some("System prompt"),
             config: &config,
             history: Vec::new(),
+            user_segments: Vec::new(),
         },
     )
     .unwrap();
@@ -548,6 +564,31 @@ fn rewound_fork_preserves_uploaded_file_segments_in_snapshot() {
         SessionSnapshotEntryData::UserInput { segments: restored }
             if restored == &segments
     )));
+
+    let fork_state = collect_state(&fork_entries);
+    let (copied_session_id, copied_segment_id) = session_store::fork(
+        &store,
+        sid,
+        SegmentStartState {
+            system_prompt: fork_state.system_prompt.as_deref(),
+            config: &fork_state.config,
+            history: fork_state.annotated_history.clone(),
+            user_segments: fork_state.user_segments.clone(),
+        },
+    )
+    .unwrap();
+    let copied_entries = store
+        .read_all(copied_session_id, copied_segment_id)
+        .unwrap();
+    let copied_snapshot = session_store::public_snapshot::project_session_snapshot(
+        copied_session_id,
+        &copied_entries,
+    );
+    assert!(copied_snapshot.entries.iter().any(|entry| matches!(
+        &entry.data,
+        SessionSnapshotEntryData::UserInput { segments: restored }
+            if restored == &segments
+    )));
 }
 
 #[tokio::test]
@@ -562,6 +603,7 @@ async fn session_config_changed_logged() {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
             history: annotated(&worker.history()),
+            user_segments: Vec::new(),
         },
     )
     .unwrap();
@@ -595,6 +637,7 @@ async fn session_auto_forks_on_conflict() {
             system_prompt: worker_a.get_system_prompt(),
             config: worker_a.request_config(),
             history: annotated(&worker_a.history()),
+            user_segments: Vec::new(),
         },
     )
     .unwrap();
@@ -623,6 +666,7 @@ async fn session_auto_forks_on_conflict() {
             system_prompt: worker_a.get_system_prompt(),
             config: worker_a.request_config(),
             history: annotated(&worker_a.history()),
+            user_segments: Vec::new(),
         },
     )
     .unwrap();
@@ -682,6 +726,7 @@ async fn nested_past_fork_leaves_ancestors_immutable() {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
             history: annotated(&worker.history()),
+            user_segments: Vec::new(),
         },
     )
     .unwrap();

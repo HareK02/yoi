@@ -17,6 +17,33 @@ pub struct SegmentStartState<'a> {
     pub system_prompt: Option<&'a str>,
     pub config: &'a RequestConfig,
     pub history: Vec<LoggedHistoryEntry>,
+    pub user_segments: Vec<Vec<Segment>>,
+}
+
+fn seed_entries(
+    ts: u64,
+    session_id: SessionId,
+    state: SegmentStartState<'_>,
+    forked_from: Option<SegmentOrigin>,
+    compacted_from: Option<SegmentOrigin>,
+) -> Vec<LogEntry> {
+    let entry = LogEntry::AnnotatedSegmentStart {
+        ts,
+        session_id,
+        system_prompt: state.system_prompt.map(String::from),
+        config: state.config.clone(),
+        history: state.history,
+        forked_from,
+        compacted_from,
+    };
+    let mut entries = vec![entry];
+    if !state.user_segments.is_empty() {
+        entries.push(LogEntry::InputSegmentsCheckpoint {
+            ts,
+            user_segments: state.user_segments,
+        });
+    }
+    entries
 }
 
 /// Create a new session + initial segment, writing the initial
@@ -42,16 +69,8 @@ pub fn create_segment_with_ids(
     segment_id: SegmentId,
     state: SegmentStartState<'_>,
 ) -> Result<(), StoreError> {
-    let entry = LogEntry::AnnotatedSegmentStart {
-        ts: segment_log::now_millis(),
-        session_id,
-        system_prompt: state.system_prompt.map(String::from),
-        config: state.config.clone(),
-        history: state.history.to_vec(),
-        forked_from: None,
-        compacted_from: None,
-    };
-    store.append(session_id, segment_id, &entry)
+    let entries = seed_entries(segment_log::now_millis(), session_id, state, None, None);
+    store.create_segment(session_id, segment_id, &entries)
 }
 
 /// Create a compacted segment from an existing one. Inherits the source's
@@ -68,19 +87,17 @@ pub fn create_compacted_segment(
     source_turn_count: usize,
 ) -> Result<SegmentId, StoreError> {
     let segment_id = crate::new_segment_id();
-    let entry = LogEntry::AnnotatedSegmentStart {
-        ts: segment_log::now_millis(),
-        session_id: source_session_id,
-        system_prompt: state.system_prompt.map(String::from),
-        config: state.config.clone(),
-        history: state.history.to_vec(),
-        forked_from: None,
-        compacted_from: Some(SegmentOrigin {
+    let entries = seed_entries(
+        segment_log::now_millis(),
+        source_session_id,
+        state,
+        None,
+        Some(SegmentOrigin {
             segment_id: source_segment_id,
             at_turn_index: source_turn_count,
         }),
-    };
-    store.append(source_session_id, segment_id, &entry)?;
+    );
+    store.create_segment(source_session_id, segment_id, &entries)?;
     Ok(segment_id)
 }
 
@@ -152,21 +169,19 @@ pub fn ensure_head_or_fork(
     }
     let source_segment_id = *segment_id;
     let fork_id = crate::new_segment_id();
-    let entry = LogEntry::AnnotatedSegmentStart {
-        ts: segment_log::now_millis(),
+    let entries = seed_entries(
+        segment_log::now_millis(),
         session_id,
-        system_prompt: state.system_prompt.map(String::from),
-        config: state.config.clone(),
-        history: state.history.to_vec(),
-        forked_from: Some(SegmentOrigin {
+        state,
+        Some(SegmentOrigin {
             segment_id: source_segment_id,
             at_turn_index,
         }),
-        compacted_from: None,
-    };
-    store.create_segment(session_id, fork_id, &[entry])?;
+        None,
+    );
+    store.create_segment(session_id, fork_id, &entries)?;
     *segment_id = fork_id;
-    *entries_written = 1;
+    *entries_written = entries.len();
     Ok(())
 }
 
@@ -425,16 +440,8 @@ pub fn fork(
 ) -> Result<(SessionId, SegmentId), StoreError> {
     let session_id = crate::new_session_id();
     let fork_id = crate::new_segment_id();
-    let entry = LogEntry::AnnotatedSegmentStart {
-        ts: segment_log::now_millis(),
-        session_id,
-        system_prompt: state.system_prompt.map(String::from),
-        config: state.config.clone(),
-        history: state.history.to_vec(),
-        forked_from: None,
-        compacted_from: None,
-    };
-    store.create_segment(session_id, fork_id, &[entry])?;
+    let entries = seed_entries(segment_log::now_millis(), session_id, state, None, None);
+    store.create_segment(session_id, fork_id, &entries)?;
     store.copy_committed_uploaded_files(source_session_id, session_id)?;
     Ok((session_id, fork_id))
 }

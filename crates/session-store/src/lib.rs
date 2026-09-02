@@ -27,6 +27,7 @@
 //!     system_prompt: None,
 //!     config: &config,
 //!     history: Vec::new(),
+//!     user_segments: Vec::new(),
 //! })?;
 //! ```
 

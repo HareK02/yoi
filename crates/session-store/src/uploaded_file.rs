@@ -228,9 +228,6 @@ pub(crate) fn write_uploaded_file(
     FileExt::lock_exclusive(&aggregate_lock)?;
     let (paste_bytes, _) = crate::paste_artifact::stored_paste_usage(dir)?;
     let (file_bytes, file_count) = stored_uploaded_file_usage(dir)?;
-    if file_count >= DEFAULT_MAX_SESSION_UPLOADED_FILES {
-        return Err(StoreError::ArtifactQuotaExceeded);
-    }
     let normalized_name = normalized_file_name(file_name);
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
@@ -242,10 +239,12 @@ pub(crate) fn write_uploaded_file(
             continue;
         }
         let stored: StoredUploadedFile = serde_json::from_slice(&fs::read(&path)?)?;
-        if stored.source_entry_id.is_none()
-            && normalized_file_name(&stored.file_name) == normalized_name
-        {
-            if stored.media_type == media_type
+        let same_context = context.is_some() && stored.upload_context.as_ref() == context;
+        let same_uncommitted_name = stored.source_entry_id.is_none()
+            && normalized_file_name(&stored.file_name) == normalized_name;
+        if same_context || same_uncommitted_name {
+            if stored.file_name == file_name
+                && stored.media_type == media_type
                 && stored.byte_len == byte_len
                 && stored.sha256 == sha256
                 && stored.upload_context.as_ref() == context
@@ -269,6 +268,9 @@ pub(crate) fn write_uploaded_file(
             }
             return Err(StoreError::InvalidUploadedFileName);
         }
+    }
+    if file_count >= DEFAULT_MAX_SESSION_UPLOADED_FILES {
+        return Err(StoreError::ArtifactQuotaExceeded);
     }
     if paste_bytes
         .checked_add(file_bytes)

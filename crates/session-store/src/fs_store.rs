@@ -764,6 +764,62 @@ mod tests {
                 .unwrap()
                 .contains("account-1")
         );
+
+        let replay = store
+            .write_uploaded_file_with_context(
+                session_id,
+                "notes.txt",
+                "text/plain",
+                b"hello",
+                &context,
+                UploadedFileLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(replay.artifact_id, reference.artifact_id);
+        assert!(matches!(
+            store.write_uploaded_file_with_context(
+                session_id,
+                "renamed.txt",
+                "text/plain",
+                b"hello",
+                &context,
+                UploadedFileLimits::default(),
+            ),
+            Err(StoreError::InvalidUploadedFileName)
+        ));
+    }
+
+    #[test]
+    fn uploaded_file_exact_replay_succeeds_at_session_count_limit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FsStore::new(tmp.path()).unwrap();
+        let session_id = new_session_id();
+        let limits = UploadedFileLimits {
+            max_file_bytes: 1,
+            max_session_bytes: crate::DEFAULT_MAX_SESSION_UPLOADED_FILES,
+        };
+        let mut first = None;
+        for index in 0..crate::DEFAULT_MAX_SESSION_UPLOADED_FILES {
+            let reference = store
+                .write_uploaded_file(
+                    session_id,
+                    &format!("file-{index}.txt"),
+                    "text/plain",
+                    b"x",
+                    limits,
+                )
+                .unwrap();
+            first.get_or_insert(reference);
+        }
+
+        let replay = store
+            .write_uploaded_file(session_id, "file-0.txt", "text/plain", b"x", limits)
+            .unwrap();
+        assert_eq!(replay.artifact_id, first.unwrap().artifact_id);
+        assert!(matches!(
+            store.write_uploaded_file(session_id, "overflow.txt", "text/plain", b"x", limits),
+            Err(StoreError::ArtifactQuotaExceeded)
+        ));
     }
 
     #[test]
