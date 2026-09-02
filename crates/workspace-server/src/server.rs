@@ -18176,6 +18176,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_repository_import_rejects_changed_source_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_server_config(dir.path());
+        let store = test_control_store(&config);
+        seed_test_registered_workspace(&store, &config)
+            .await
+            .unwrap();
+
+        import_configured_repositories(&store, &config).unwrap();
+        let persisted = store
+            .get_repository_by_key(TEST_WORKSPACE_ID, "test-repository")
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.source, config.repositories[0].source);
+
+        let changed_source = workspace_api::RepositorySource {
+            kind: workspace_api::RepositorySourceKind::LocalPath,
+            uri: dir.path().join("different-source").display().to_string(),
+        };
+        config.repositories[0].source_fingerprint =
+            crate::repository_source::repository_source_fingerprint(&changed_source);
+        config.repositories[0].source = changed_source;
+
+        let error = import_configured_repositories(&store, &config).unwrap_err();
+        assert!(
+            matches!(error, crate::Error::WorkspaceConfigConflict(_)),
+            "unexpected error: {error}"
+        );
+        let after_rejected_import = store
+            .get_repository_by_key(TEST_WORKSPACE_ID, "test-repository")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_rejected_import.repository_id, persisted.repository_id);
+        assert_eq!(after_rejected_import.source, persisted.source);
+        assert_eq!(
+            after_rejected_import.source_fingerprint,
+            persisted.source_fingerprint
+        );
+    }
+
+    #[tokio::test]
     async fn server_router_serves_workspace_chooser_before_first_workspace_exists() {
         let dir = tempfile::tempdir().unwrap();
         let static_dir = dir.path().join("static");

@@ -2197,38 +2197,67 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
 
     fn upsert_repository(&self, record: &RepositoryRecord) -> Result<()> {
         validate_repository_record_identity(record)?;
-        self.with_conn(|conn| {
-            conn.execute(
-                r#"INSERT INTO repositories (
-                    workspace_id, repository_id, repository_key, kind, provider, uri,
-                    source_kind, source_uri, default_ref, source_revision,
-                    source_fingerprint, observed_status, observed_at, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-                ON CONFLICT(workspace_id, repository_key) DO UPDATE SET
-                    kind = excluded.kind,
-                    provider = excluded.provider,
-                    default_ref = excluded.default_ref,
-                    observed_status = excluded.observed_status,
-                    observed_at = excluded.observed_at,
-                    updated_at = excluded.updated_at"#,
-                params![
-                    record.workspace_id,
-                    record.repository_id,
-                    record.repository_key,
-                    record.kind,
-                    record.provider,
-                    record.source.uri,
-                    record.source.kind.as_str(),
-                    record.source.uri,
-                    record.default_ref,
-                    record.source_revision,
-                    record.source_fingerprint,
-                    record.observed_status.as_str(),
-                    record.observed_at,
-                    record.created_at,
-                    record.updated_at,
-                ],
-            )?;
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let existing = tx
+                .query_row(
+                    r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
+                              source_kind, source_uri, default_ref, source_revision,
+                              source_fingerprint, observed_status, observed_at, created_at, updated_at
+                       FROM repositories
+                       WHERE workspace_id = ?1 AND repository_key = ?2"#,
+                    params![record.workspace_id, record.repository_key],
+                    read_repository_record,
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                if !repository_registration_intent_matches(&existing, record) {
+                    return Err(Error::WorkspaceConfigConflict(format!(
+                        "Repository key `{}` already exists with different registration intent",
+                        record.repository_key
+                    )));
+                }
+                tx.execute(
+                    r#"UPDATE repositories
+                       SET observed_status = ?3,
+                           observed_at = ?4,
+                           updated_at = ?5
+                       WHERE workspace_id = ?1 AND repository_id = ?2"#,
+                    params![
+                        record.workspace_id,
+                        existing.repository_id,
+                        record.observed_status.as_str(),
+                        record.observed_at,
+                        record.updated_at,
+                    ],
+                )?;
+            } else {
+                tx.execute(
+                    r#"INSERT INTO repositories (
+                        workspace_id, repository_id, repository_key, kind, provider, uri,
+                        source_kind, source_uri, default_ref, source_revision,
+                        source_fingerprint, observed_status, observed_at, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
+                    params![
+                        record.workspace_id,
+                        record.repository_id,
+                        record.repository_key,
+                        record.kind,
+                        record.provider,
+                        record.source.uri,
+                        record.source.kind.as_str(),
+                        record.source.uri,
+                        record.default_ref,
+                        record.source_revision,
+                        record.source_fingerprint,
+                        record.observed_status.as_str(),
+                        record.observed_at,
+                        record.created_at,
+                        record.updated_at,
+                    ],
+                )?;
+            }
+            tx.commit()?;
             Ok(())
         })
     }
@@ -5356,6 +5385,20 @@ fn read_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceR
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
     })
+}
+
+fn repository_registration_intent_matches(
+    existing: &RepositoryRecord,
+    requested: &RepositoryRecord,
+) -> bool {
+    existing.workspace_id == requested.workspace_id
+        && existing.repository_key == requested.repository_key
+        && existing.kind == requested.kind
+        && existing.provider == requested.provider
+        && existing.source == requested.source
+        && existing.default_ref == requested.default_ref
+        && existing.source_revision == requested.source_revision
+        && existing.source_fingerprint == requested.source_fingerprint
 }
 
 fn validate_repository_record_identity(record: &RepositoryRecord) -> Result<()> {
