@@ -537,7 +537,7 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
                 created_at: workspace.created_at.clone(),
                 display_name: workspace.display_name.clone(),
             },
-            infer_workspace_root_from_repositories(store.as_ref(), workspace)?,
+            workspace_root_from_server_data(workspace)?,
         )
     } else {
         (
@@ -619,34 +619,7 @@ fn append_trusted_runtime_sources(
     Ok(())
 }
 
-fn infer_workspace_root_from_repositories(
-    store: &SqliteWorkspaceStore,
-    workspace: &WorkspaceRecord,
-) -> Result<PathBuf, CliError> {
-    let repositories = store
-        .list_repositories(&workspace.workspace_id)
-        .map_err(|error| {
-            CliError(format!(
-                "failed to list repositories from server DB: {error}"
-            ))
-        })?;
-    let Some(repository) = repositories
-        .iter()
-        .find(|repository| repository.repository_id == "main")
-        .or_else(|| repositories.first())
-    else {
-        return Err(CliError(format!(
-            "workspace `{}` has no repository records; cannot derive a workspace root",
-            workspace.workspace_id
-        )));
-    };
-
-    if repository.source.kind == workspace_api::RepositorySourceKind::Invalid {
-        return Err(CliError(format!(
-            "repository `{}` has an invalid migrated source and cannot be used by serve",
-            repository.repository_id
-        )));
-    }
+fn workspace_root_from_server_data(workspace: &WorkspaceRecord) -> Result<PathBuf, CliError> {
     Ok(ServerConfig::default_workspace_backend_data_root(
         &workspace.workspace_id,
     ))
