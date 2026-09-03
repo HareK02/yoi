@@ -155,10 +155,9 @@ Deno.test("sidebar Delete reports cleanup-plan blocking reasons", async () => {
   );
 });
 
-Deno.test("sidebar Delete is enabled only for terminal Worker states", () => {
+Deno.test("sidebar Delete is enabled only for stopped Workers", () => {
   assert(!canDeleteSidebarWorker(worker));
   assert(canDeleteSidebarWorker({ ...worker, state: "stopped" }));
-  assert(canDeleteSidebarWorker({ ...worker, state: "cancelled" }));
 });
 
 Deno.test("Worker navigation exposes an accessible hover action menu", async () => {

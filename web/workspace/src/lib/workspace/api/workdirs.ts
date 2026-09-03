@@ -55,7 +55,7 @@ export function parseWorkingDirectoryListResponse(
   );
   return {
     workspace_id: stringField(record, "workspace_id"),
-    items: arrayField(record, "items").map(parseSummary),
+    items: arrayField(record, "items").map(parseWorkingDirectorySummary),
     diagnostics: arrayField(record, "diagnostics").map(parseDiagnostic),
   };
 }
@@ -101,12 +101,14 @@ function parseDetailLike(
   return {
     workspace_id: stringField(record, "workspace_id"),
     runtime_id: stringField(record, "runtime_id"),
-    item: parseSummary(record.item),
+    item: parseWorkingDirectorySummary(record.item),
     diagnostics: arrayField(record, "diagnostics").map(parseDiagnostic),
   };
 }
 
-function parseSummary(value: unknown): WorkingDirectorySummary {
+export function parseWorkingDirectorySummary(
+  value: unknown,
+): WorkingDirectorySummary {
   const record = exactRecord(value, SUMMARY_KEYS, "Workdir summary");
   const summary: WorkingDirectorySummary = {
     working_directory_id: stringField(record, "working_directory_id"),

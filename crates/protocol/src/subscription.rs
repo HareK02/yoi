@@ -557,7 +557,6 @@ pub enum SubscriptionWorkerState {
     Running,
     Paused,
     Stopped,
-    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1107,6 +1106,25 @@ mod tests {
                     }
                 }
             })
+        );
+    }
+
+    #[test]
+    fn worker_subscription_state_has_exactly_four_lifecycle_values() {
+        for (state, wire) in [
+            (SubscriptionWorkerState::Idle, "idle"),
+            (SubscriptionWorkerState::Running, "running"),
+            (SubscriptionWorkerState::Paused, "paused"),
+            (SubscriptionWorkerState::Stopped, "stopped"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(state).unwrap(),
+                serde_json::json!(wire)
+            );
+        }
+        assert!(
+            serde_json::from_value::<SubscriptionWorkerState>(serde_json::json!("cancelled"))
+                .is_err()
         );
     }
 

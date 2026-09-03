@@ -195,7 +195,7 @@ async fn run_and_persist(
             )
             .unwrap();
         }
-        agen::EngineRunExit::Interrupted(agen::StopReason::LimitReached) => {
+        agen::EngineRunExit::Interrupted(agen::RunInterruptionReason::LimitReached) => {
             session_store::save_run_completed(
                 store,
                 session_id,
