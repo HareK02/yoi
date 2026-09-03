@@ -3,7 +3,7 @@ mod common;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use agen::interceptor::{Interceptor, TurnEndAction};
+use agen::interceptor::{Interceptor, InterceptorResult, TurnEndAction};
 use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use agen::llm_client::types::{Item, RequestConfig};
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
@@ -100,8 +100,8 @@ struct PausePolicy;
 
 #[async_trait]
 impl Interceptor for PausePolicy {
-    async fn on_turn_end(&self, _history: &[Item]) -> TurnEndAction {
-        TurnEndAction::Pause
+    async fn on_turn_end(&self, _history: &[Item]) -> InterceptorResult<TurnEndAction> {
+        Ok(TurnEndAction::Pause)
     }
 }
 

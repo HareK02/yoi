@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agen::interceptor::{Interceptor, PostToolAction, PreToolAction, ToolCallInfo, ToolResultInfo};
+use agen::interceptor::{
+    Interceptor, InterceptorResult, PostToolAction, PreToolAction, ToolCallInfo, ToolResultInfo,
+};
 use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use agen::tool::{
     Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput, ToolResult,
@@ -905,24 +907,27 @@ async fn test_tool_execution_context_for_skipped_and_synthetic_paths() {
 
     #[async_trait]
     impl Interceptor for ContextPolicy {
-        async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> PreToolAction {
+        async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> InterceptorResult<PreToolAction> {
             self.pre_contexts.lock().unwrap().push(info.context.clone());
-            match info.call.name.as_str() {
+            Ok(match info.call.name.as_str() {
                 "skip_tool" => PreToolAction::Skip,
                 "synthetic_tool" => PreToolAction::SyntheticResult(ToolResult::from_output(
                     &info.call.id,
                     ToolOutput::from("synthetic result".to_string()),
                 )),
                 _ => PreToolAction::Continue,
-            }
+            })
         }
 
-        async fn post_tool_call(&self, info: &mut ToolResultInfo) -> PostToolAction {
+        async fn post_tool_call(
+            &self,
+            info: &mut ToolResultInfo,
+        ) -> InterceptorResult<PostToolAction> {
             self.post_contexts
                 .lock()
                 .unwrap()
                 .push(info.context.clone());
-            PostToolAction::Continue
+            Ok(PostToolAction::Continue)
         }
     }
 
@@ -994,12 +999,12 @@ async fn test_before_tool_call_skip() {
 
     #[async_trait]
     impl Interceptor for BlockingPolicy {
-        async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> PreToolAction {
-            if info.call.name == "blocked_tool" {
+        async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> InterceptorResult<PreToolAction> {
+            Ok(if info.call.name == "blocked_tool" {
                 PreToolAction::Skip
             } else {
                 PreToolAction::Continue
-            }
+            })
         }
     }
 
@@ -1081,10 +1086,13 @@ async fn test_post_tool_call_modification() {
 
     #[async_trait]
     impl Interceptor for ModifyingPolicy {
-        async fn post_tool_call(&self, info: &mut ToolResultInfo) -> PostToolAction {
+        async fn post_tool_call(
+            &self,
+            info: &mut ToolResultInfo,
+        ) -> InterceptorResult<PostToolAction> {
             info.result.summary = format!("[Modified] {}", info.result.summary);
             *self.modified_content.lock().unwrap() = Some(info.result.summary.clone());
-            PostToolAction::Continue
+            Ok(PostToolAction::Continue)
         }
     }
 
@@ -1143,11 +1151,11 @@ async fn test_before_tool_call_synthetic_result_committed() {
 
     #[async_trait]
     impl Interceptor for SyntheticPolicy {
-        async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> PreToolAction {
-            PreToolAction::SyntheticResult(ToolResult::error(
+        async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> InterceptorResult<PreToolAction> {
+            Ok(PreToolAction::SyntheticResult(ToolResult::error(
                 info.call.id.clone(),
                 "permission denied",
-            ))
+            )))
         }
     }
 
@@ -1184,8 +1192,11 @@ async fn post_tool_abort_commits_confirmed_result_before_stopping_run() {
     struct AbortAfterResult;
     #[async_trait]
     impl Interceptor for AbortAfterResult {
-        async fn post_tool_call(&self, _info: &mut ToolResultInfo) -> PostToolAction {
-            PostToolAction::Abort("policy stopped the run".to_string())
+        async fn post_tool_call(
+            &self,
+            _info: &mut ToolResultInfo,
+        ) -> InterceptorResult<PostToolAction> {
+            Ok(PostToolAction::Abort("policy stopped the run".to_string()))
         }
     }
     engine.set_interceptor(AbortAfterResult);

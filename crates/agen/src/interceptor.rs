@@ -12,6 +12,101 @@ use crate::Item;
 use crate::tool::{Tool, ToolCall, ToolExecutionContext, ToolMeta, ToolResult};
 
 // =============================================================================
+// Failure Types
+// =============================================================================
+
+/// A typed failure returned by an [`Interceptor`] implementation.
+///
+/// The Engine attaches the exact [`InterceptorPoint`] at which the failure was
+/// observed before exposing it through the run termination boundary.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct InterceptorError {
+    message: String,
+}
+
+impl InterceptorError {
+    /// Create an interceptor failure with a caller-defined message.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    /// Return the failure message supplied by the interceptor.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl From<String> for InterceptorError {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<&str> for InterceptorError {
+    fn from(message: &str) -> Self {
+        Self::new(message)
+    }
+}
+
+/// The Engine lifecycle point at which an interceptor failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterceptorPoint {
+    PromptSubmit,
+    PendingHistoryAppends,
+    PreLlmRequest,
+    PreToolCall,
+    PostToolCall,
+    TurnEnd,
+    Abort,
+}
+
+impl std::fmt::Display for InterceptorPoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::PromptSubmit => "prompt_submit",
+            Self::PendingHistoryAppends => "pending_history_appends",
+            Self::PreLlmRequest => "pre_llm_request",
+            Self::PreToolCall => "pre_tool_call",
+            Self::PostToolCall => "post_tool_call",
+            Self::TurnEnd => "turn_end",
+            Self::Abort => "abort",
+        };
+        formatter.write_str(name)
+    }
+}
+
+/// An interceptor failure bound to the exact Engine lifecycle point that ran it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{point} interceptor failed: {error}")]
+pub struct InterceptorFailure {
+    point: InterceptorPoint,
+    #[source]
+    error: InterceptorError,
+}
+
+impl InterceptorFailure {
+    pub(crate) fn new(point: InterceptorPoint, error: InterceptorError) -> Self {
+        Self { point, error }
+    }
+
+    /// The lifecycle point that returned the failure.
+    pub fn point(&self) -> InterceptorPoint {
+        self.point
+    }
+
+    /// The typed error returned by the interceptor.
+    pub fn error(&self) -> &InterceptorError {
+        &self.error
+    }
+}
+
+/// Result returned by asynchronous interceptor lifecycle methods.
+pub type InterceptorResult<T> = Result<T, InterceptorError>;
+
+// =============================================================================
 // Action Enums
 // =============================================================================
 
@@ -130,14 +225,19 @@ pub struct ToolResultInfo {
 
 /// Intercepts the Engine execution loop at key decision points.
 ///
-/// All methods have default implementations that let the Engine
-/// proceed without intervention. Callers provide richer implementations for
-/// approval flows, permission checks, etc.
+/// Every lifecycle method is asynchronous and returns [`InterceptorResult`],
+/// keeping implementation failure separate from the method's control-flow
+/// action. The Engine reports a failure as a typed run interruption annotated
+/// with the exact [`InterceptorPoint`] that failed.
+///
+/// All methods have default implementations that let the Engine proceed
+/// without intervention. Callers provide richer implementations for approval
+/// flows, permission checks, and other trusted host adaptation.
 #[async_trait]
 pub trait Interceptor: Send + Sync {
-    /// Called after receiving user input, before adding to history.
-    async fn on_prompt_submit(&self, _item: &mut Item) -> PromptAction {
-        PromptAction::Continue
+    /// Called after receiving user input, before adding it to Engine history.
+    async fn on_prompt_submit(&self, _item: &mut Item) -> InterceptorResult<PromptAction> {
+        Ok(PromptAction::Continue)
     }
 
     /// Items that should be **committed to `engine.history`** just
@@ -158,7 +258,7 @@ pub trait Interceptor: Send + Sync {
     /// reproducible per-request transformations (pruning, content
     /// trimming, cache anchors) that depend only on the existing
     /// history.
-    async fn pending_history_appends(&self) -> Result<Vec<Item>, String> {
+    async fn pending_history_appends(&self) -> InterceptorResult<Vec<Item>> {
         Ok(Vec::new())
     }
 
@@ -170,27 +270,38 @@ pub trait Interceptor: Send + Sync {
     /// If an interceptor derives a human/model-visible nudge from the current
     /// request context, return [`PreRequestAction::ContinueWith`] so the Engine
     /// commits it to history before the request is sent.
-    async fn pre_llm_request(&self, _context: &mut Vec<Item>) -> PreRequestAction {
-        PreRequestAction::Continue
+    async fn pre_llm_request(
+        &self,
+        _context: &mut Vec<Item>,
+    ) -> InterceptorResult<PreRequestAction> {
+        Ok(PreRequestAction::Continue)
     }
 
     /// Called before each tool is executed.
-    async fn pre_tool_call(&self, _info: &mut ToolCallInfo) -> PreToolAction {
-        PreToolAction::Continue
+    async fn pre_tool_call(&self, _info: &mut ToolCallInfo) -> InterceptorResult<PreToolAction> {
+        Ok(PreToolAction::Continue)
     }
 
-    /// Called after each tool completes.
-    async fn post_tool_call(&self, _info: &mut ToolResultInfo) -> PostToolAction {
-        PostToolAction::Continue
+    /// Called after each tool reaches one terminal result.
+    async fn post_tool_call(
+        &self,
+        _info: &mut ToolResultInfo,
+    ) -> InterceptorResult<PostToolAction> {
+        Ok(PostToolAction::Continue)
     }
 
-    /// Called when a turn ends with no tool calls.
-    async fn on_turn_end(&self, _history: &[Item]) -> TurnEndAction {
-        TurnEndAction::Finish
+    /// Called at the assistant boundary when a completed response has no tool calls.
+    ///
+    /// This is not the logical run termination observer. A host that needs that
+    /// boundary must inspect the returned [`crate::EngineRunExit`].
+    async fn on_turn_end(&self, _history: &[Item]) -> InterceptorResult<TurnEndAction> {
+        Ok(TurnEndAction::Finish)
     }
 
-    /// Called when execution is interrupted (abort or cancel).
-    async fn on_abort(&self, _reason: &str) {}
+    /// Called once when execution is interrupted (abort, cancellation, or failure).
+    async fn on_abort(&self, _reason: &str) -> InterceptorResult<()> {
+        Ok(())
+    }
 }
 
 /// Default interceptor: no intervention. Engine proceeds through the loop

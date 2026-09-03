@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use agen::Item;
 use agen::interceptor::{
-    Interceptor, PreRequestAction, PreToolAction, ToolCallInfo, TurnEndAction,
+    Interceptor, InterceptorError, InterceptorPoint, InterceptorResult, PostToolAction,
+    PreRequestAction, PreToolAction, PromptAction, ToolCallInfo, ToolResultInfo, TurnEndAction,
 };
 use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
@@ -613,12 +614,15 @@ struct YieldOnce {
 
 #[async_trait]
 impl Interceptor for YieldOnce {
-    async fn pre_llm_request(&self, _context: &mut Vec<Item>) -> PreRequestAction {
-        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+    async fn pre_llm_request(
+        &self,
+        _context: &mut Vec<Item>,
+    ) -> InterceptorResult<PreRequestAction> {
+        Ok(if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             PreRequestAction::Yield
         } else {
             PreRequestAction::Continue
-        }
+        })
     }
 }
 
@@ -628,12 +632,12 @@ struct PauseToolOnce {
 
 #[async_trait]
 impl Interceptor for PauseToolOnce {
-    async fn pre_tool_call(&self, _info: &mut ToolCallInfo) -> PreToolAction {
-        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+    async fn pre_tool_call(&self, _info: &mut ToolCallInfo) -> InterceptorResult<PreToolAction> {
+        Ok(if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             PreToolAction::Pause
         } else {
             PreToolAction::Continue
-        }
+        })
     }
 }
 
@@ -643,12 +647,192 @@ struct ContinueTurnOnce {
 
 #[async_trait]
 impl Interceptor for ContinueTurnOnce {
-    async fn on_turn_end(&self, _history: &[Item]) -> TurnEndAction {
-        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+    async fn on_turn_end(&self, _history: &[Item]) -> InterceptorResult<TurnEndAction> {
+        Ok(if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             TurnEndAction::ContinueWithMessages(vec![Item::system_message("continue")])
         } else {
             TurnEndAction::Finish
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FailingLifecycleInterceptor {
+    failure: InterceptorPoint,
+    calls: Arc<Mutex<Vec<InterceptorPoint>>>,
+}
+
+impl FailingLifecycleInterceptor {
+    fn new(failure: InterceptorPoint) -> Self {
+        Self {
+            failure,
+            calls: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn record<T>(&self, point: InterceptorPoint, action: T) -> InterceptorResult<T> {
+        self.calls.lock().unwrap().push(point);
+        if self.failure == point {
+            Err(InterceptorError::new(format!("{point} rejected")))
+        } else {
+            Ok(action)
+        }
+    }
+
+    fn calls(&self) -> Vec<InterceptorPoint> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl Interceptor for FailingLifecycleInterceptor {
+    async fn on_prompt_submit(&self, _item: &mut Item) -> InterceptorResult<PromptAction> {
+        tokio::task::yield_now().await;
+        self.record(InterceptorPoint::PromptSubmit, PromptAction::Continue)
+    }
+
+    async fn pending_history_appends(&self) -> InterceptorResult<Vec<Item>> {
+        tokio::task::yield_now().await;
+        self.record(InterceptorPoint::PendingHistoryAppends, Vec::new())
+    }
+
+    async fn pre_llm_request(
+        &self,
+        _context: &mut Vec<Item>,
+    ) -> InterceptorResult<PreRequestAction> {
+        tokio::task::yield_now().await;
+        if self.failure == InterceptorPoint::Abort {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(InterceptorPoint::PreLlmRequest);
+            Ok(PreRequestAction::Cancel(
+                "trigger abort callback".to_string(),
+            ))
+        } else {
+            self.record(InterceptorPoint::PreLlmRequest, PreRequestAction::Continue)
+        }
+    }
+
+    async fn pre_tool_call(&self, _info: &mut ToolCallInfo) -> InterceptorResult<PreToolAction> {
+        tokio::task::yield_now().await;
+        self.record(InterceptorPoint::PreToolCall, PreToolAction::Continue)
+    }
+
+    async fn post_tool_call(
+        &self,
+        _info: &mut ToolResultInfo,
+    ) -> InterceptorResult<PostToolAction> {
+        tokio::task::yield_now().await;
+        self.record(InterceptorPoint::PostToolCall, PostToolAction::Continue)
+    }
+
+    async fn on_turn_end(&self, _history: &[Item]) -> InterceptorResult<TurnEndAction> {
+        tokio::task::yield_now().await;
+        self.record(InterceptorPoint::TurnEnd, TurnEndAction::Finish)
+    }
+
+    async fn on_abort(&self, _reason: &str) -> InterceptorResult<()> {
+        tokio::task::yield_now().await;
+        self.record(InterceptorPoint::Abort, ())
+    }
+}
+
+fn expected_interceptor_calls(failure: InterceptorPoint) -> Vec<InterceptorPoint> {
+    use InterceptorPoint as Point;
+
+    match failure {
+        Point::PromptSubmit => vec![Point::PromptSubmit, Point::Abort],
+        Point::PendingHistoryAppends => {
+            vec![
+                Point::PromptSubmit,
+                Point::PendingHistoryAppends,
+                Point::Abort,
+            ]
+        }
+        Point::PreLlmRequest => vec![
+            Point::PromptSubmit,
+            Point::PendingHistoryAppends,
+            Point::PreLlmRequest,
+            Point::Abort,
+        ],
+        Point::PreToolCall => vec![
+            Point::PromptSubmit,
+            Point::PendingHistoryAppends,
+            Point::PreLlmRequest,
+            Point::PreToolCall,
+            Point::Abort,
+        ],
+        Point::PostToolCall => vec![
+            Point::PromptSubmit,
+            Point::PendingHistoryAppends,
+            Point::PreLlmRequest,
+            Point::PreToolCall,
+            Point::PostToolCall,
+            Point::Abort,
+        ],
+        Point::TurnEnd => vec![
+            Point::PromptSubmit,
+            Point::PendingHistoryAppends,
+            Point::PreLlmRequest,
+            Point::TurnEnd,
+            Point::Abort,
+        ],
+        Point::Abort => vec![
+            Point::PromptSubmit,
+            Point::PendingHistoryAppends,
+            Point::PreLlmRequest,
+            Point::Abort,
+        ],
+    }
+}
+
+#[tokio::test]
+async fn interceptor_failures_are_typed_and_each_lifecycle_point_runs_once() {
+    use InterceptorPoint as Point;
+
+    for failure_point in [
+        Point::PromptSubmit,
+        Point::PendingHistoryAppends,
+        Point::PreLlmRequest,
+        Point::PreToolCall,
+        Point::PostToolCall,
+        Point::TurnEnd,
+        Point::Abort,
+    ] {
+        let interceptor = FailingLifecycleInterceptor::new(failure_point);
+        let needs_tool = matches!(failure_point, Point::PreToolCall | Point::PostToolCall);
+        let events = if needs_tool {
+            vec![
+                Event::tool_use_start(0, "call-1", "count_tool"),
+                Event::tool_input_delta(0, "{}"),
+                Event::tool_use_stop(0),
+                Event::Status(StatusEvent {
+                    status: ResponseStatus::Completed,
+                }),
+            ]
+        } else {
+            completed_text_events()
+        };
+        let mut engine = Engine::new(MockLlmClient::new(events));
+        engine.register_tool(CountingTool::new("count_tool").definition());
+        engine.set_interceptor(interceptor.clone());
+        let mut history = History::new();
+        let mut engine = engine.lock(&history);
+
+        let exit = engine.run(&mut history, "test").await;
+        let EngineRunExit::Interrupted(RunInterruptionReason::Interceptor(failure)) = exit else {
+            panic!("expected typed interceptor interruption at {failure_point}, got {exit:?}");
+        };
+        assert_eq!(failure.point(), failure_point);
+        assert_eq!(
+            failure.error().message(),
+            format!("{failure_point} rejected")
+        );
+        assert_eq!(
+            interceptor.calls(),
+            expected_interceptor_calls(failure_point)
+        );
     }
 }
 

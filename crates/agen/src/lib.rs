@@ -26,7 +26,9 @@ pub use engine::{
 };
 pub use handler::ToolUseBlockStart;
 pub use history::{History, HistoryEntry};
-pub use interceptor::Interceptor;
+pub use interceptor::{
+    Interceptor, InterceptorError, InterceptorFailure, InterceptorPoint, InterceptorResult,
+};
 pub use message::{ContentPart, Item, Message, Role};
 pub use tool::{
     ToolCall, ToolExecutionContext, ToolExecutionHandle, ToolExecutionPolicy,

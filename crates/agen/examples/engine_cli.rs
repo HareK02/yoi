@@ -40,7 +40,7 @@ use tracing_subscriber::EnvFilter;
 
 use agen::{
     Engine, EngineRunExit, RunInterruptionReason,
-    interceptor::{Interceptor, PostToolAction, ToolResultInfo},
+    interceptor::{Interceptor, InterceptorResult, PostToolAction, ToolResultInfo},
     llm_client::{
         LlmClient,
         capability::{CacheStrategy, ModelCapability, StructuredOutput, ToolCallingSupport},
@@ -280,7 +280,7 @@ impl ToolResultPrinterPolicy {
 
 #[async_trait]
 impl Interceptor for ToolResultPrinterPolicy {
-    async fn post_tool_call(&self, info: &mut ToolResultInfo) -> PostToolAction {
+    async fn post_tool_call(&self, info: &mut ToolResultInfo) -> InterceptorResult<PostToolAction> {
         let name = self
             .call_names
             .lock()
@@ -294,7 +294,7 @@ impl Interceptor for ToolResultPrinterPolicy {
             println!("   Result ({}): ✅ {}", name, info.result.summary);
         }
 
-        PostToolAction::Continue
+        Ok(PostToolAction::Continue)
     }
 }
 

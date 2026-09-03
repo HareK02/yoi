@@ -15,8 +15,8 @@ use crate::{
     },
     handler::{ErrorKind, StatusKind, ToolUseBlockStart, UsageKind},
     interceptor::{
-        DefaultInterceptor, Interceptor, PostToolAction, PreRequestAction, PreToolAction,
-        PromptAction, ToolCallInfo, ToolResultInfo, TurnEndAction,
+        DefaultInterceptor, Interceptor, InterceptorFailure, InterceptorPoint, PostToolAction,
+        PreRequestAction, PreToolAction, PromptAction, ToolCallInfo, ToolResultInfo, TurnEndAction,
     },
     llm_client::{
         ClientError, ConfigWarning, LlmClient, Request, RequestConfig, ResponseStream,
@@ -58,6 +58,9 @@ pub enum EngineError {
     /// A durable-history observer rejected an item before it entered history.
     #[error("History append failed: {0}")]
     HistoryAppend(String),
+    /// A trusted host interceptor callback failed.
+    #[error(transparent)]
+    Interceptor(#[from] InterceptorFailure),
     /// Tool terminalization lost its execution-attempt compare-and-set fence.
     #[error("Tool execution attempt fence failed: {0}")]
     ToolAttemptFence(String),
@@ -153,6 +156,8 @@ pub enum EngineRunExit {
 /// A typed reason why an engine run could not finish normally.
 #[derive(Debug)]
 pub enum RunInterruptionReason {
+    /// A trusted host interceptor callback failed at a typed lifecycle point.
+    Interceptor(InterceptorFailure),
     LimitReached,
     ContextWindowExceeded,
     Cancelled,
@@ -173,6 +178,9 @@ impl From<Result<EngineResult, EngineError>> for EngineRunExit {
             }
             Err(EngineError::Cancelled) => Self::Interrupted(RunInterruptionReason::Cancelled),
             Err(EngineError::PauseRequested) => Self::Paused,
+            Err(EngineError::Interceptor(failure)) => {
+                Self::Interrupted(RunInterruptionReason::Interceptor(failure))
+            }
             Err(error) => Self::Interrupted(RunInterruptionReason::Unexpected(error)),
         }
     }
@@ -1092,7 +1100,9 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
                     EngineError::Cancelled => "Cancelled".to_string(),
                     _ => err.to_string(),
                 };
-                self.interceptor.on_abort(&reason).await;
+                if let Err(error) = self.interceptor.on_abort(&reason).await {
+                    return Err(InterceptorFailure::new(InterceptorPoint::Abort, error).into());
+                }
                 Err(err)
             }
         }
@@ -1175,7 +1185,17 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
                     context,
                 };
 
-                match self.interceptor.pre_tool_call(&mut info).await {
+                let pre_tool_action =
+                    self.interceptor
+                        .pre_tool_call(&mut info)
+                        .await
+                        .map_err(|error| {
+                            EngineError::from(InterceptorFailure::new(
+                                InterceptorPoint::PreToolCall,
+                                error,
+                            ))
+                        })?;
+                match pre_tool_action {
                     PreToolAction::Continue => {}
                     PreToolAction::Skip => {
                         continue;
@@ -1476,7 +1496,17 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
                 context: context.clone(),
             };
 
-            match self.interceptor.post_tool_call(&mut info).await {
+            let post_tool_action =
+                self.interceptor
+                    .post_tool_call(&mut info)
+                    .await
+                    .map_err(|error| {
+                        EngineError::from(InterceptorFailure::new(
+                            InterceptorPoint::PostToolCall,
+                            error,
+                        ))
+                    })?;
+            match post_tool_action {
                 PostToolAction::Continue => {}
                 PostToolAction::Abort(reason) => {
                     abort_reason = Some(reason);
@@ -1612,7 +1642,12 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
                 .interceptor
                 .pending_history_appends()
                 .await
-                .map_err(EngineError::HistoryAppend)?;
+                .map_err(|error| {
+                    EngineError::from(InterceptorFailure::new(
+                        InterceptorPoint::PendingHistoryAppends,
+                        error,
+                    ))
+                })?;
             if !pending.is_empty() {
                 self.append_history_items(history, pending, annotate)?;
             }
@@ -1679,7 +1714,17 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
             }
 
             // Interceptor: pre_llm_request
-            match self.interceptor.pre_llm_request(&mut request_context).await {
+            let pre_request_action = self
+                .interceptor
+                .pre_llm_request(&mut request_context)
+                .await
+                .map_err(|error| {
+                    EngineError::from(InterceptorFailure::new(
+                        InterceptorPoint::PreLlmRequest,
+                        error,
+                    ))
+                })?;
+            match pre_request_action {
                 PreRequestAction::Cancel(reason) => {
                     info!(reason = %reason, "Aborted by interceptor");
                     for cb in &self.turn_end_cbs {
@@ -1795,7 +1840,14 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
 
             if tool_calls.is_empty() {
                 let turn_end_context = history.items_cloned();
-                match self.interceptor.on_turn_end(&turn_end_context).await {
+                let turn_end_action = self
+                    .interceptor
+                    .on_turn_end(&turn_end_context)
+                    .await
+                    .map_err(|error| {
+                        EngineError::from(InterceptorFailure::new(InterceptorPoint::TurnEnd, error))
+                    })?;
+                match turn_end_action {
                     TurnEndAction::Finish => {
                         return Ok(EngineResult::Finished);
                     }
@@ -2502,7 +2554,14 @@ impl<C: LlmClient, A> Engine<C, Locked, A> {
         // Supplying new user input abandons any paused/yielded logical run.
         self.active_run_turn_count = None;
         let mut user_item = Item::user_message(user_input);
-        let extras = match self.interceptor.on_prompt_submit(&mut user_item).await {
+        let prompt_action = match self.interceptor.on_prompt_submit(&mut user_item).await {
+            Ok(action) => action,
+            Err(error) => {
+                let error = InterceptorFailure::new(InterceptorPoint::PromptSubmit, error).into();
+                return self.finalize_interruption(Err(error)).await;
+            }
+        };
+        let extras = match prompt_action {
             PromptAction::Cancel(reason) => {
                 return self
                     .finalize_interruption(Err(EngineError::Aborted(reason)))

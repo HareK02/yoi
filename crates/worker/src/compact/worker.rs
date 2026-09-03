@@ -22,7 +22,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agen::Item;
-use agen::interceptor::{Interceptor, PreRequestAction, PreToolAction, ToolCallInfo};
+use agen::interceptor::{
+    Interceptor, InterceptorResult, PreRequestAction, PreToolAction, ToolCallInfo,
+};
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -398,14 +400,17 @@ impl CompactWorkerInterceptor {
 
 #[async_trait]
 impl Interceptor for CompactWorkerInterceptor {
-    async fn pre_llm_request(&self, context: &mut Vec<Item>) -> PreRequestAction {
+    async fn pre_llm_request(
+        &self,
+        context: &mut Vec<Item>,
+    ) -> InterceptorResult<PreRequestAction> {
         let records = self.usage_tracker.records();
         let estimate = agen::token_counter::total_tokens(context, &records);
         if estimate.tokens > self.max_input_tokens {
-            return PreRequestAction::Cancel(format!(
+            return Ok(PreRequestAction::Cancel(format!(
                 "compact worker input occupancy exceeded {} tokens",
                 self.max_input_tokens
-            ));
+            )));
         }
 
         let remaining = self.max_input_tokens.saturating_sub(estimate.tokens);
@@ -413,25 +418,25 @@ impl Interceptor for CompactWorkerInterceptor {
             .store(remaining, Ordering::Release);
         if let Some(item) = self.maybe_emit_warning(remaining) {
             self.usage_tracker.note_request(context.len() + 1);
-            return PreRequestAction::ContinueWith(vec![item]);
+            return Ok(PreRequestAction::ContinueWith(vec![item]));
         }
 
         self.usage_tracker.note_request(context.len());
-        PreRequestAction::Continue
+        Ok(PreRequestAction::Continue)
     }
 
-    async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> PreToolAction {
+    async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> InterceptorResult<PreToolAction> {
         if self.final_reserve_tokens == 0 || info.call.name == "write_summary" {
-            return PreToolAction::Continue;
+            return Ok(PreToolAction::Continue);
         }
         let remaining = self.last_remaining_tokens.load(Ordering::Acquire);
         if remaining > self.final_reserve_tokens {
-            return PreToolAction::Continue;
+            return Ok(PreToolAction::Continue);
         }
-        PreToolAction::SyntheticResult(ToolResult::error(
+        Ok(PreToolAction::SyntheticResult(ToolResult::error(
             info.call.id.clone(),
             "compact worker final reserve reached; do not perform more exploratory tool reads. Call `write_summary` now.",
-        ))
+        )))
     }
 }
 
@@ -467,13 +472,13 @@ mod tests {
         let mut context = vec![Item::user_message("hello")];
 
         assert!(matches!(
-            interceptor.pre_llm_request(&mut context).await,
+            interceptor.pre_llm_request(&mut context).await.unwrap(),
             PreRequestAction::Continue
         ));
         tracker.record_usage(&make_usage(100));
 
         assert!(matches!(
-            interceptor.pre_llm_request(&mut context).await,
+            interceptor.pre_llm_request(&mut context).await.unwrap(),
             PreRequestAction::Continue
         ));
         tracker.record_usage(&make_usage(100));
@@ -481,7 +486,7 @@ mod tests {
         // Two 100-token requests would exceed a cumulative 150-token cap, but
         // current occupancy is still the latest 100-token measurement.
         assert!(matches!(
-            interceptor.pre_llm_request(&mut context).await,
+            interceptor.pre_llm_request(&mut context).await.unwrap(),
             PreRequestAction::Continue
         ));
     }
@@ -503,13 +508,13 @@ mod tests {
         let mut context = vec![Item::user_message("hello")];
 
         assert!(matches!(
-            interceptor.pre_llm_request(&mut context).await,
+            interceptor.pre_llm_request(&mut context).await.unwrap(),
             PreRequestAction::Continue
         ));
         tracker.record_usage(&make_usage(100));
 
         assert!(matches!(
-            interceptor.pre_llm_request(&mut context).await,
+            interceptor.pre_llm_request(&mut context).await.unwrap(),
             PreRequestAction::ContinueWith(items)
                 if items.len() == 1 && items[0].as_text().unwrap_or_default().contains("write_summary")
         ));
@@ -523,13 +528,13 @@ mod tests {
         let mut context = vec![Item::user_message("hello")];
 
         assert!(matches!(
-            interceptor.pre_llm_request(&mut context).await,
+            interceptor.pre_llm_request(&mut context).await.unwrap(),
             PreRequestAction::Continue
         ));
         tracker.record_usage(&make_usage(100));
 
         assert!(matches!(
-            interceptor.pre_llm_request(&mut context).await,
+            interceptor.pre_llm_request(&mut context).await.unwrap(),
             PreRequestAction::Cancel(message) if message.contains("occupancy")
         ));
     }
