@@ -1,6 +1,7 @@
 use crate::catalog::{
-    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail, WorkerLifecycleAck,
-    WorkerStatus, WorkerSummary, WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest,
+    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, RepositoryRefObservation,
+    RepositoryRefObservationRequest, WorkerDetail, WorkerLifecycleAck, WorkerStatus, WorkerSummary,
+    WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest,
     WorkingDirectoryStatus as CatalogWorkingDirectoryStatus, WorkspaceApiRef,
 };
 use crate::config_bundle::{
@@ -390,6 +391,31 @@ impl Runtime {
             self.resolve_repository_access_resource(ssh).await?;
         }
         self.create_working_directory(request)
+    }
+
+    pub async fn observe_repository_ref_from_resource(
+        &self,
+        mut request: RepositoryRefObservationRequest,
+    ) -> Result<RepositoryRefObservation, RuntimeError> {
+        if let Some(ssh) = request
+            .materialization
+            .as_mut()
+            .and_then(|materialization| materialization.ssh.as_mut())
+        {
+            self.resolve_repository_access_resource(ssh).await?;
+        }
+        let backend = {
+            let state = self.lock()?;
+            state.ensure_running()?;
+            state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::ExecutionBackendUnavailable {
+                    message: "Repository ref observation requires an execution backend".to_string(),
+                }
+            })?
+        };
+        backend
+            .observe_repository_ref(&request)
+            .map_err(RuntimeError::from)
     }
 
     pub fn authorize_working_directory_repository_access(

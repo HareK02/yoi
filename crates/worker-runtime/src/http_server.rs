@@ -11,9 +11,9 @@ use crate::auth::{
     verify_capability_token,
 };
 use crate::catalog::{
-    ConfigBundleRef, CreateWorkerRequest, WorkerDetail, WorkerLifecycleAck, WorkerSummary,
-    WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest, WorkingDirectoryStatus,
-    WorkspaceApiRef,
+    ConfigBundleRef, CreateWorkerRequest, RepositoryRefObservationRequest, WorkerDetail,
+    WorkerLifecycleAck, WorkerSummary, WorkingDirectoryRepositoryAccessRequest,
+    WorkingDirectoryRequest, WorkingDirectoryStatus, WorkspaceApiRef,
 };
 use crate::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary};
 use crate::error::RuntimeError;
@@ -208,6 +208,7 @@ fn runtime_http_router_with_optional_auth(
             "/v1/working-directories/repository-access",
             post(authorize_working_directory_repository_access),
         )
+        .route("/v1/repository-refs/observe", post(observe_repository_ref))
         .route(
             "/v1/working-directories/{working_directory_id}/sessions",
             post(open_workdir_session),
@@ -581,6 +582,31 @@ async fn authorize_working_directory_repository_access(
     Ok(Json(RuntimeHttpRepositoryAccessResponse {
         authorized: true,
     }))
+}
+
+async fn observe_repository_ref(
+    State(state): State<RuntimeHttpState>,
+    Extension(auth): Extension<RuntimeAuthContext>,
+    body: Result<Json<RepositoryRefObservationRequest>, JsonRejection>,
+) -> RestResult<crate::catalog::RepositoryRefObservation> {
+    let Json(request) = body.map_err(RuntimeHttpRestError::json_rejection)?;
+    if request
+        .materialization
+        .as_ref()
+        .is_some_and(|materialization| materialization.workspace_id != auth.workspace_id)
+    {
+        return Err(RuntimeHttpRestError::new(
+            StatusCode::FORBIDDEN,
+            "repository_ref_observation_workspace_mismatch",
+            "Repository ref observation authority does not match the authenticated Workspace",
+        ));
+    }
+    let observation = state
+        .runtime
+        .observe_repository_ref_from_resource(request)
+        .await
+        .map_err(RuntimeHttpRestError::runtime)?;
+    Ok(Json(observation))
 }
 
 async fn list_working_directories(
@@ -1750,7 +1776,10 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     if path == "/v1/workers" && *method == Method::POST {
         return Some("workers:create");
     }
-    if path == "/v1/working-directories/repository-access" && *method == Method::POST {
+    if (path == "/v1/working-directories/repository-access"
+        || path == "/v1/repository-refs/observe")
+        && *method == Method::POST
+    {
         return Some("workdirs:operate");
     }
     if path.starts_with("/v1/workdir-sessions")
@@ -2422,6 +2451,10 @@ mod tests {
     fn workdir_routes_require_dedicated_operation_permission() {
         assert_eq!(
             required_runtime_permission(&Method::POST, "/v1/working-directories/repository-access",),
+            Some("workdirs:operate")
+        );
+        assert_eq!(
+            required_runtime_permission(&Method::POST, "/v1/repository-refs/observe"),
             Some("workdirs:operate")
         );
         assert_eq!(
