@@ -274,6 +274,12 @@ pub struct RegisterReviewerChildSession {
     pub reviewer_profile: String,
     pub now: DateTime<Utc>,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewSubmissionAuthorization {
+    pub workspace_id: String,
+    pub subject_ref: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SubmitMergeRequestReview {
     pub ticket_id: String,
@@ -535,6 +541,34 @@ impl MergeRequestStore {
         t.commit()?;
         Ok(RequestedMergeRequestReview { request_event: e })
     }
+    pub fn authorize_review_submission(
+        &self,
+        ticket_id: &str,
+        capability_token: &str,
+    ) -> Result<ReviewSubmissionAuthorization, MergeRequestError> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT g.workspace_id,g.subject_ref
+                   FROM merge_request_review_grants g
+                   JOIN merge_request_ticket_relations rel
+                     ON rel.workspace_id=g.workspace_id AND rel.merge_request_id=g.merge_request_id
+                   JOIN merge_requests mr
+                     ON mr.workspace_id=g.workspace_id AND mr.merge_request_id=g.merge_request_id
+                  WHERE g.capability_token=?1 AND rel.ticket_id=?2
+                    AND g.status='issued' AND mr.state='open'",
+                params![capability_token, ticket_id],
+                |row| {
+                    Ok(ReviewSubmissionAuthorization {
+                        workspace_id: row.get(0)?,
+                        subject_ref: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| MergeRequestError::Unauthorized("review grant invalid".into()))
+    }
+
     pub fn submit_review(
         &self,
         i: SubmitMergeRequestReview,

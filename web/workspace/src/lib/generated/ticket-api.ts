@@ -25,7 +25,9 @@ export type TicketActionEligibility = { can_assign_orchestrator: boolean, can_un
 
 export type TicketMergeRequestSummary = { merge_request_id: string, repository_key: string, state: string, review_status: string, selector_from: string | null, selector_to: string, updated_at: string, current_subject_ref: string | null, review_subject_ref: string | null, review_requested_at: string | null, review_submitted_at: string | null, review_excerpt: string | null, };
 
-export type MergeRequestListItem = { summary: TicketMergeRequestSummary, ticket_ids: Array<string>, thread_event_count: number, };
+export type MergeRequestRefDiagnostic = { code: string, message: string, };
+
+export type MergeRequestListItem = { summary: TicketMergeRequestSummary, ticket_ids: Array<string>, thread_event_count: number, ref_diagnostics?: Array<MergeRequestRefDiagnostic>, };
 
 export type MergeRequestListResponse = { items: Array<MergeRequestListItem>, next_cursor: string | null, };
 
