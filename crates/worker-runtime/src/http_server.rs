@@ -1970,6 +1970,33 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         {
             StatusCode::NOT_FOUND
         }
+        RuntimeError::WorkingDirectory(diagnostic)
+            if matches!(
+                diagnostic.code.as_str(),
+                "repository_ref_provider_unavailable"
+                    | "repository_ref_provider_timeout"
+                    | "repository_access_provider_unavailable"
+            ) =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        RuntimeError::WorkingDirectory(diagnostic)
+            if matches!(
+                diagnostic.code.as_str(),
+                "repository_ref_provider_auth_failed"
+                    | "repository_access_credential_expired"
+                    | "repository_access_credential_unavailable"
+                    | "repository_access_credential_unauthorized"
+                    | "repository_access_credential_invalid"
+            ) =>
+        {
+            StatusCode::FORBIDDEN
+        }
+        RuntimeError::WorkingDirectory(diagnostic)
+            if diagnostic.code == "repository_ref_not_found" =>
+        {
+            StatusCode::NOT_FOUND
+        }
         RuntimeError::RuntimeStopped
         | RuntimeError::WorkerExecutionUnavailable { .. }
         | RuntimeError::ExecutionBackendUnavailable { .. }
@@ -1980,8 +2007,8 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         | RuntimeError::InvalidInitialInputKind { .. }
         | RuntimeError::ConfigBundleDigestMismatch { .. }
         | RuntimeError::InvalidProfileSelector { .. }
-        | RuntimeError::UnsupportedConfigDeclaration { .. }
-        | RuntimeError::WorkingDirectory(_) => StatusCode::BAD_REQUEST,
+        | RuntimeError::UnsupportedConfigDeclaration { .. } => StatusCode::BAD_REQUEST,
+        RuntimeError::WorkingDirectory(_) => StatusCode::BAD_REQUEST,
         RuntimeError::StoreIo { .. }
         | RuntimeError::StoreMissing { .. }
         | RuntimeError::StoreCorrupt { .. }
@@ -2967,17 +2994,25 @@ mod tests {
 
     #[test]
     fn workdir_runtime_errors_preserve_diagnostic_code() {
-        let error =
-            RuntimeError::WorkingDirectory(crate::working_directory::WorkingDirectoryDiagnostic {
-                code: "working_directory_not_found".to_string(),
-                message: "working directory missing-workdir was not found".to_string(),
-            });
-
-        assert_eq!(status_for_runtime_error(&error), StatusCode::NOT_FOUND);
-        assert_eq!(
-            code_for_runtime_error(&error),
-            "working_directory_not_found"
-        );
+        let cases = [
+            ("working_directory_not_found", StatusCode::NOT_FOUND),
+            (
+                "repository_ref_provider_timeout",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            ("repository_ref_provider_auth_failed", StatusCode::FORBIDDEN),
+            ("repository_ref_not_found", StatusCode::NOT_FOUND),
+        ];
+        for (code, expected_status) in cases {
+            let error = RuntimeError::WorkingDirectory(
+                crate::working_directory::WorkingDirectoryDiagnostic {
+                    code: code.to_string(),
+                    message: "bounded diagnostic".to_string(),
+                },
+            );
+            assert_eq!(status_for_runtime_error(&error), expected_status);
+            assert_eq!(code_for_runtime_error(&error), code);
+        }
     }
 }
 

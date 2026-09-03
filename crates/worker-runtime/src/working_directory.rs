@@ -954,13 +954,7 @@ impl WorkingDirectoryMaterializer for RuntimeGitCacheMaterializer {
         request: &RepositoryRefObservationRequest,
     ) -> Result<RepositoryRefObservation, WorkingDirectoryDiagnostic> {
         let selector = request.selector.trim();
-        validate_selector(selector)?;
-        if !selector.starts_with("refs/heads/") {
-            return Err(WorkingDirectoryDiagnostic::new(
-                "repository_ref_selector_invalid",
-                "Repository ref observation requires an exact branch selector",
-            ));
-        }
+        validate_exact_branch_selector(selector)?;
 
         let working_request = WorkingDirectoryRequest {
             repository: request.repository.clone(),
@@ -2100,6 +2094,40 @@ fn repository_git_command(
     command
 }
 
+fn validate_exact_branch_selector(selector: &str) -> Result<(), WorkingDirectoryDiagnostic> {
+    validate_selector(selector).map_err(|_| {
+        WorkingDirectoryDiagnostic::new(
+            "repository_ref_selector_invalid",
+            "Repository ref observation requires a valid exact branch selector",
+        )
+    })?;
+    if !selector.starts_with("refs/heads/") {
+        return Err(WorkingDirectoryDiagnostic::new(
+            "repository_ref_selector_invalid",
+            "Repository ref observation requires an exact branch selector",
+        ));
+    }
+    let status = Command::new("git")
+        .args(["check-ref-format", selector])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "repository_ref_provider_unavailable",
+                "Git ref validation could not be started",
+            )
+        })?;
+    if !status.success() {
+        return Err(WorkingDirectoryDiagnostic::new(
+            "repository_ref_selector_invalid",
+            "Repository ref observation requires a valid exact branch selector",
+        ));
+    }
+    Ok(())
+}
+
 fn read_bounded_command_output(mut reader: impl Read) -> Vec<u8> {
     const MAX_CAPTURE_BYTES: usize = 8192;
     let mut captured = Vec::new();
@@ -2729,12 +2757,20 @@ mod tests {
         assert_eq!(missing.code, "repository_ref_not_found");
         let non_branch = materializer
             .observe_repository_ref(&RepositoryRefObservationRequest {
-                repository,
+                repository: repository.clone(),
                 selector: "HEAD".to_string(),
                 materialization: None,
             })
             .unwrap_err();
         assert_eq!(non_branch.code, "repository_ref_selector_invalid");
+        let wildcard = materializer
+            .observe_repository_ref(&RepositoryRefObservationRequest {
+                repository,
+                selector: "refs/heads/release/*".to_string(),
+                materialization: None,
+            })
+            .unwrap_err();
+        assert_eq!(wildcard.code, "repository_ref_selector_invalid");
     }
 
     #[test]

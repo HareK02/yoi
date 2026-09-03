@@ -5593,19 +5593,26 @@ fn require_assigned_workdir_source(
             ))
         })?
         .summary;
+    validate_assigned_workdir_source(&workdir, repository_id, selector, revision_ref)
+        .map_err(Error::MergeRequest)?;
+    Ok(())
+}
+
+fn validate_assigned_workdir_source(
+    workdir: &worker_runtime::catalog::WorkingDirectorySummary,
+    repository_id: &str,
+    selector: &str,
+    revision_ref: &str,
+) -> std::result::Result<(), merge_request::MergeRequestError> {
     if workdir.repository_id != repository_id {
-        return Err(Error::MergeRequest(merge_request::MergeRequestError::Conflict(
+        return Err(merge_request::MergeRequestError::Conflict(
             "merge_request_source_workdir_repository_mismatch: current Coder Workdir belongs to a different Repository".into(),
-        ))
-        .into());
+        ));
     }
     if workdir.cleanliness.as_deref() != Some("clean") {
-        return Err(
-            Error::MergeRequest(merge_request::MergeRequestError::Conflict(
-                "merge_request_source_workdir_dirty: current Coder Workdir must be clean".into(),
-            ))
-            .into(),
-        );
+        return Err(merge_request::MergeRequestError::Conflict(
+            "merge_request_source_workdir_dirty: current Coder Workdir must be clean".into(),
+        ));
     }
     let workdir_selector_matches = workdir
         .current_selector
@@ -5619,10 +5626,9 @@ fn require_assigned_workdir_source(
                 .is_ok_and(|selector| selector == workdir_selector)
         });
     if !workdir_selector_matches || workdir.current_ref.as_deref() != Some(revision_ref) {
-        return Err(Error::MergeRequest(merge_request::MergeRequestError::Conflict(
+        return Err(merge_request::MergeRequestError::Conflict(
             "merge_request_source_workdir_head_mismatch: current Coder Workdir selector and HEAD must match the provider-published source ref".into(),
-        ))
-        .into());
+        ));
     }
     Ok(())
 }
@@ -5825,17 +5831,41 @@ async fn scoped_list_merge_requests(
             limit: query.limit.unwrap_or(50),
         },
     )?;
-    let reader = api.repository_reader();
     let items = page
         .items
         .into_iter()
         .map(|merge_request| -> ApiResult<MergeRequestListItem> {
-            let current_subject_ref = merge_request.selector_from.as_deref().and_then(|selector| {
-                reader
-                    .observe_merge_target(&merge_request.repository_id, Some(selector))
-                    .ok()
-                    .map(|observation| observation.commit)
-            });
+            let current_subject_ref =
+                if merge_request.state == merge_request::MergeRequestState::Open {
+                    match (
+                        merge_request.selector_from.as_deref(),
+                        merge_request.ticket_ids.first(),
+                    ) {
+                        (Some(selector), Some(ticket_id)) => {
+                            let assignment = api
+                                .store
+                                .get_current_ticket_coder_assignment(&workspace_id, ticket_id)?
+                                .ok_or_else(|| {
+                                    Error::TicketAssignmentConflict(
+                                        "Open Merge Request has no current assigned Coder".into(),
+                                    )
+                                })?;
+                            Some(
+                                observe_published_merge_ref(
+                                    &api,
+                                    &workspace_id,
+                                    &assignment.worker.runtime_id,
+                                    &merge_request.repository_id,
+                                    selector,
+                                )?
+                                .revision_ref,
+                            )
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
             let repository_key = api
                 .store
                 .get_repository(&workspace_id, &merge_request.repository_id)?
@@ -5860,6 +5890,18 @@ async fn scoped_list_merge_requests(
     }))
 }
 
+fn merge_ref_response(observation: RepositoryRefObservation) -> MergeRequestRefResponse {
+    let observed_at =
+        chrono::DateTime::<Utc>::from_timestamp(observation.observed_at_epoch_seconds as i64, 0)
+            .unwrap_or_else(Utc::now)
+            .to_rfc3339();
+    MergeRequestRefResponse {
+        status: "known".into(),
+        revision_ref: Some(observation.revision_ref),
+        observed_at,
+    }
+}
+
 async fn scoped_show_merge_request(
     State(api): State<WorkspaceApi>,
     AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
@@ -5875,39 +5917,38 @@ async fn scoped_show_merge_request(
         query.after,
         query.limit.unwrap_or(100),
     )?;
-    let reader = api.repository_reader();
-    let observed_at = Utc::now().to_rfc3339();
+    let ticket_id = mr.ticket_ids.first().ok_or_else(|| {
+        Error::MergeRequest(merge_request::MergeRequestError::Conflict(
+            "Merge Request has no linked Ticket".into(),
+        ))
+    })?;
+    let assignment = api
+        .store
+        .get_current_ticket_coder_assignment(&workspace_id, ticket_id)?
+        .ok_or_else(|| {
+            Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
+        })?;
     let source = match mr.selector_from.as_deref() {
-        Some(selector) => match reader.observe_merge_target(&mr.repository_id, Some(selector)) {
-            Ok(value) => MergeRequestRefResponse {
-                status: "known".into(),
-                revision_ref: Some(value.commit),
-                observed_at: observed_at.clone(),
-            },
-            Err(_) => MergeRequestRefResponse {
-                status: "unknown".into(),
-                revision_ref: None,
-                observed_at: observed_at.clone(),
-            },
-        },
+        Some(selector) => merge_ref_response(observe_published_merge_ref(
+            &api,
+            &workspace_id,
+            &assignment.worker.runtime_id,
+            &mr.repository_id,
+            selector,
+        )?),
         None => MergeRequestRefResponse {
             status: "requires_repair".into(),
             revision_ref: None,
-            observed_at: observed_at.clone(),
+            observed_at: Utc::now().to_rfc3339(),
         },
     };
-    let target = match reader.observe_merge_target(&mr.repository_id, Some(&mr.selector_to)) {
-        Ok(value) => MergeRequestRefResponse {
-            status: "known".into(),
-            revision_ref: Some(value.commit),
-            observed_at,
-        },
-        Err(_) => MergeRequestRefResponse {
-            status: "unknown".into(),
-            revision_ref: None,
-            observed_at,
-        },
-    };
+    let target = merge_ref_response(observe_published_merge_ref(
+        &api,
+        &workspace_id,
+        &assignment.worker.runtime_id,
+        &mr.repository_id,
+        &mr.selector_to,
+    )?);
     let linked_tickets = mr
         .ticket_ids
         .iter()
@@ -6209,6 +6250,16 @@ async fn scoped_submit_merge_request_review(
     let workspace_id = parse_workspace_id(&workspace_id)?;
     let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     let store = merge_request_store(&api, &workspace_id)?;
+    let review_authorization =
+        store.authorize_review_submission(&ticket_id, &input.capability_token)?;
+    if review_authorization.workspace_id != workspace_id {
+        return Err(
+            Error::MergeRequest(merge_request::MergeRequestError::Unauthorized(
+                "review grant invalid".into(),
+            ))
+            .into(),
+        );
+    }
     let mr = store.get(&workspace_id, &ticket_id)?;
     let selector = mr
         .selector_from
@@ -16543,9 +16594,11 @@ mod tests {
     }
 
     #[test]
-    fn merge_request_mutations_observe_refs_through_runtime_provider_authority() {
+    fn merge_request_http_paths_observe_refs_through_runtime_provider_authority() {
         let source = include_str!("server.rs");
         for handler in [
+            "scoped_list_merge_requests",
+            "scoped_show_merge_request",
             "scoped_open_merge_request",
             "scoped_repair_merge_request_selector",
             "scoped_register_merge_request_review_capability",
@@ -16555,7 +16608,73 @@ mod tests {
             let handler = handler_source(source, handler);
             assert!(handler.contains("observe_published_merge_ref("));
             assert!(!handler.contains("repository_reader()"));
+            assert!(!handler.contains("status: \"unknown\""));
         }
+        let submit = handler_source(source, "scoped_submit_merge_request_review");
+        assert!(
+            submit
+                .find("authorize_review_submission(")
+                .is_some_and(|authorization| {
+                    submit
+                        .find("observe_published_merge_ref(")
+                        .is_some_and(|observation| authorization < observation)
+                }),
+            "review capability must be validated before provider access",
+        );
+    }
+
+    #[test]
+    fn assigned_workdir_must_be_clean_and_match_published_source() {
+        let mut workdir = worker_runtime::catalog::WorkingDirectorySummary {
+            working_directory_id: "workdir-1".to_string(),
+            repository_id: "repository-1".to_string(),
+            creation_selector: Some("work/T-549".to_string()),
+            creation_ref: Some("abc123".to_string()),
+            creation_tree: None,
+            current_selector: Some("work/T-549".to_string()),
+            current_ref: Some("abc123".to_string()),
+            current_tree: None,
+            observed_at_epoch_seconds: Some(1_767_225_600),
+            materializer_kind: workspace_api::WorkingDirectoryMaterializerKind::RuntimeGitCache,
+            cleanup_target: None,
+            status: worker_runtime::catalog::WorkingDirectoryStatusKind::Active,
+            cleanliness: Some("clean".to_string()),
+            primary_worker_id: Some("worker-1".to_string()),
+            occupied_by: None,
+        };
+        assert!(
+            validate_assigned_workdir_source(
+                &workdir,
+                "repository-1",
+                "refs/heads/work/T-549",
+                "abc123",
+            )
+            .is_ok()
+        );
+
+        workdir.cleanliness = Some("dirty".to_string());
+        assert!(matches!(
+            validate_assigned_workdir_source(
+                &workdir,
+                "repository-1",
+                "work/T-549",
+                "abc123"
+            ),
+            Err(merge_request::MergeRequestError::Conflict(message))
+                if message.starts_with("merge_request_source_workdir_dirty:")
+        ));
+        workdir.cleanliness = Some("clean".to_string());
+        workdir.current_ref = Some("different".to_string());
+        assert!(matches!(
+            validate_assigned_workdir_source(
+                &workdir,
+                "repository-1",
+                "work/T-549",
+                "abc123"
+            ),
+            Err(merge_request::MergeRequestError::Conflict(message))
+                if message.starts_with("merge_request_source_workdir_head_mismatch:")
+        ));
     }
 
     fn completed_upload_file(sha256: &str) -> protocol::UploadedFileRef {

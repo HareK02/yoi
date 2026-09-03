@@ -3002,20 +3002,35 @@ fn worker_status_from_run_state(run_state: WorkerExecutionRunState) -> WorkerSta
 }
 
 fn repository_resource_error(error: BackendResourceError) -> RuntimeError {
-    let category = match error {
-        BackendResourceError::Expired => "expired",
-        BackendResourceError::Unauthorized { .. } => "unauthorized",
-        BackendResourceError::UnsupportedKind => "unsupported_kind",
-        BackendResourceError::MissingResource => "missing_resource",
-        BackendResourceError::Oversized { .. } => "oversized",
-        BackendResourceError::DigestMismatch { .. } => "digest_mismatch",
-        BackendResourceError::ContentTypeMismatch { .. } => "content_type_mismatch",
-        BackendResourceError::InvalidResponse { .. } => "invalid_response",
-        BackendResourceError::Transport { .. } => "transport",
+    let (code, message) = match error {
+        BackendResourceError::Expired => (
+            "repository_access_credential_expired",
+            "Repository access credential lease expired",
+        ),
+        BackendResourceError::Unauthorized { .. } => (
+            "repository_access_credential_unauthorized",
+            "Repository access credential lease was rejected",
+        ),
+        BackendResourceError::MissingResource => (
+            "repository_access_credential_unavailable",
+            "Repository access credential lease is unavailable or already consumed",
+        ),
+        BackendResourceError::Transport { .. } => (
+            "repository_access_provider_unavailable",
+            "Repository access credential provider is unavailable",
+        ),
+        BackendResourceError::UnsupportedKind
+        | BackendResourceError::Oversized { .. }
+        | BackendResourceError::DigestMismatch { .. }
+        | BackendResourceError::ContentTypeMismatch { .. }
+        | BackendResourceError::InvalidResponse { .. } => (
+            "repository_access_credential_invalid",
+            "Repository access credential response is invalid",
+        ),
     };
-    RuntimeError::InvalidRequest(format!(
-        "Backend Repository SSH access resource fetch failed: {category}"
-    ))
+    RuntimeError::WorkingDirectory(
+        crate::working_directory::WorkingDirectoryDiagnostic::rejected(code, message),
+    )
 }
 
 fn durable_create_worker_request(request: &CreateWorkerRequest) -> CreateWorkerRequest {
@@ -3216,6 +3231,33 @@ mod tests {
     #[cfg(feature = "fs-store")]
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn repository_resource_failures_keep_typed_credential_diagnostics() {
+        let cases = [
+            (
+                BackendResourceError::Expired,
+                "repository_access_credential_expired",
+            ),
+            (
+                BackendResourceError::MissingResource,
+                "repository_access_credential_unavailable",
+            ),
+            (
+                BackendResourceError::Unauthorized {
+                    message: "denied".to_string(),
+                },
+                "repository_access_credential_unauthorized",
+            ),
+        ];
+        for (error, expected_code) in cases {
+            let RuntimeError::WorkingDirectory(diagnostic) = repository_resource_error(error)
+            else {
+                panic!("Repository resource failure lost its typed diagnostic")
+            };
+            assert_eq!(diagnostic.code, expected_code);
+        }
+    }
 
     fn internal_worker_ref(
         session_id: &str,
