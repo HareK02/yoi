@@ -7123,6 +7123,10 @@ fn migrate_repository_identity_to_keys(conn: &Connection) -> Result<()> {
         stmt.query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
+    let mut repository_reference_tables = REPOSITORY_REFERENCE_TABLES
+        .iter()
+        .map(|table| (*table).to_string())
+        .collect::<Vec<_>>();
     for table in &tables {
         let quoted = table.replace('"', "\"\"");
         let pragma = format!("PRAGMA table_info(\"{quoted}\")");
@@ -7132,23 +7136,45 @@ fn migrate_repository_identity_to_keys(conn: &Connection) -> Result<()> {
             .collect::<std::result::Result<Vec<_>, _>>()?
             .iter()
             .any(|column| column == "repository_id");
-        if has_repository_id
-            && table != "repositories"
-            && table != "legacy_repositories"
-            && !REPOSITORY_REFERENCE_TABLES.contains(&table.as_str())
+        if !has_repository_id
+            || table == "repositories"
+            || table == "legacy_repositories"
+            || REPOSITORY_REFERENCE_TABLES.contains(&table.as_str())
         {
+            continue;
+        }
+
+        let pragma = format!("PRAGMA foreign_key_list(\"{quoted}\")");
+        let mut stmt = conn.prepare(&pragma)?;
+        let references_repository_authority = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .iter()
+            .any(|(parent, from, to)| {
+                parent == "repositories" && from == "repository_id" && to == "repository_id"
+            });
+        if references_repository_authority {
+            repository_reference_tables.push(table.clone());
+        } else {
             return Err(Error::Store(format!(
                 "repository identity migration does not recognize repository_id authority in table {table}"
             )));
         }
     }
-    for table in REPOSITORY_REFERENCE_TABLES {
+    for table in &repository_reference_tables {
         if !tables.iter().any(|candidate| candidate == table) {
             continue;
         }
+        let quoted = table.replace('"', "\"\"");
         let sql = format!(
             r#"SELECT COUNT(*)
-               FROM "{table}" AS child
+               FROM "{quoted}" AS child
                LEFT JOIN repositories AS repository
                  ON repository.workspace_id = child.workspace_id
                 AND repository.repository_id = child.repository_id
@@ -7183,12 +7209,13 @@ fn migrate_repository_identity_to_keys(conn: &Connection) -> Result<()> {
         )?;
     }
 
-    for table in REPOSITORY_REFERENCE_TABLES {
+    for table in &repository_reference_tables {
         if !tables.iter().any(|candidate| candidate == table) {
             continue;
         }
+        let quoted = table.replace('"', "\"\"");
         let sql = format!(
-            r#"UPDATE "{table}" AS child
+            r#"UPDATE "{quoted}" AS child
                SET repository_id = (
                    SELECT mapping.new_repository_id
                    FROM repository_identity_v50 AS mapping
@@ -12597,6 +12624,17 @@ INSERT INTO worker_registry (
                  '1', '1', 'local_path', '/repo-a', 1, 'sha256:a', 'unverified'),
                 ('workspace-b', 'main', 'Legacy B', 'git', 'git', '/repo-b', 'develop',
                  '1', '1', 'local_path', '/repo-b', 1, 'sha256:b', 'unverified');
+            CREATE TABLE legacy_v5_merge_requests (
+                workspace_id TEXT NOT NULL,
+                merge_request_id TEXT NOT NULL,
+                repository_id TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, merge_request_id),
+                FOREIGN KEY (workspace_id, repository_id)
+                    REFERENCES repositories(workspace_id, repository_id)
+            );
+            INSERT INTO legacy_v5_merge_requests (
+                workspace_id, merge_request_id, repository_id
+            ) VALUES ('workspace-a', 'legacy-mr-a', 'main');
             INSERT INTO typed_tickets (
                 workspace_id, ticket_id, slug, title, status, kind, priority, body,
                 workflow_state, workflow_state_explicit, repository_id
@@ -12651,6 +12689,14 @@ INSERT INTO worker_registry (
         assert_eq!(repositories[0].2, "main");
         assert_eq!(repositories[1].2, "main");
         assert_ne!(repositories[0].1, repositories[1].1);
+        let legacy_repository_id: String = conn
+            .query_row(
+                "SELECT repository_id FROM legacy_v5_merge_requests WHERE workspace_id = 'workspace-a' AND merge_request_id = 'legacy-mr-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_repository_id, repositories[0].1);
         for (_, repository_id, _) in &repositories {
             assert_eq!(Uuid::parse_str(repository_id).unwrap().get_version_num(), 7);
         }

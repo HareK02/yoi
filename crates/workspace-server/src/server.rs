@@ -26650,13 +26650,14 @@ mod tests {
             "embedded_worker_runtime"
         );
 
+        let repository_id = test_repository_id(&api);
         let workdir_id = "external-workdir";
         api.store
             .upsert_workdir_registry(&WorkdirRegistryRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 workdir_id: workdir_id.to_string(),
                 runtime_id: "external-workdir-runtime".to_string(),
-                repository_id: "main".to_string(),
+                repository_id,
                 creation_selector: None,
                 creation_ref: None,
                 creation_tree: None,
