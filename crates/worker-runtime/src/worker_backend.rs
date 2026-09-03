@@ -20,6 +20,7 @@ use crate::auth::{
 };
 use crate::catalog::{
     CreateWorkerRequest, ProfileSourceArchiveHttpRef, ProfileSourceArchiveSource,
+    RepositoryRefObservation, RepositoryRefObservationRequest,
     WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest, WorkingDirectoryStatus,
 };
 use crate::execution::{
@@ -1643,6 +1644,19 @@ where
             )
         })?;
         materializer.authorize_repository_access(request)
+    }
+
+    fn observe_repository_ref(
+        &self,
+        request: &RepositoryRefObservationRequest,
+    ) -> Result<RepositoryRefObservation, WorkingDirectoryDiagnostic> {
+        let materializer = self.working_directory_materializer.as_ref().ok_or_else(|| {
+            WorkingDirectoryDiagnostic::rejected(
+                "repository_ref_provider_unavailable",
+                "Repository ref observation requested, but no materializer is configured for this Runtime backend",
+            )
+        })?;
+        materializer.observe_repository_ref(request)
     }
 
     fn list_working_directories(&self) -> Vec<WorkingDirectoryStatus> {

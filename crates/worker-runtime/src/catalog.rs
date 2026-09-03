@@ -179,6 +179,30 @@ pub struct WorkingDirectoryRequest {
     pub materialization: Option<RepositoryMaterializationContext>,
 }
 
+/// Backend-authorized request to freshly resolve one Repository provider ref.
+///
+/// Runtime executes this against the registered source itself rather than a Workdir
+/// or Runtime cache. Secret material is fetched through `materialization` and never
+/// appears in the result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryRefObservationRequest {
+    pub repository: WorkingDirectoryRepository,
+    pub selector: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization: Option<RepositoryMaterializationContext>,
+}
+
+/// Provider-neutral proof of one freshly observed Repository ref.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryRefObservation {
+    pub repository_id: String,
+    pub source_revision: u64,
+    pub source_fingerprint: String,
+    pub selector: String,
+    pub revision_ref: String,
+    pub observed_at_epoch_seconds: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingDirectoryClaim {
     pub working_directory_id: String,

@@ -6,10 +6,13 @@
     parseWorkingDirectoryCreateResponse,
     validateWorkingDirectoryCreateRequest,
   } from '$lib/workspace/api/workdirs';
+  import {
+    parseBrowserCreateWorkerResponse,
+    parseWorkerLaunchOptionsResponse,
+  } from '$lib/workspace/api/workers';
   import { formatCurrentWorkdirRevision } from '$lib/workspace/settings/workdir-revision';
   import { buildCreateWorkspaceWorkerRequest, defaultWorkerLaunchForm } from '$lib/workspace/sidebar/worker-launch';
   import type {
-    BrowserCreateWorkerResponse,
     Diagnostic,
     WorkerLaunchOptionsResponse,
     WorkingDirectorySummary,
@@ -115,7 +118,7 @@
       if (!response.ok) {
         throw new Error(`worker launch options failed (${response.status})`);
       }
-      const payload = (await response.json()) as WorkerLaunchOptionsResponse;
+      const payload = parseWorkerLaunchOptionsResponse(await response.json());
       options = payload;
       const form = defaultWorkerLaunchForm(payload, {
         runtime_id: runtimeId,
@@ -229,7 +232,7 @@
         submitError = await responseDisplayError(response, 'worker create failed');
         return;
       }
-      const payload = (await response.json()) as BrowserCreateWorkerResponse;
+      const payload = parseBrowserCreateWorkerResponse(await response.json());
       await goto(payload.console_href);
     } catch (err) {
       submitError = exceptionDisplayError(err, 'worker create failed');

@@ -23,10 +23,10 @@ use worker_runtime::RuntimeWorkspaceScope;
 use worker_runtime::auth::{CapabilityTokenSigner, capability_claims};
 use worker_runtime::catalog::{
     ConfigBundleRef, CreateWorkerRequest, ProfileSelector, ProfileSourceArchiveHttpRef,
-    ProfileSourceArchiveSource, WorkerDetail as EmbeddedWorkerDetail,
-    WorkerStatus as EmbeddedWorkerStatus, WorkingDirectoryClaim,
-    WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest, WorkingDirectoryStatus,
-    WorkingDirectorySummary, WorkspaceApiRef,
+    ProfileSourceArchiveSource, RepositoryRefObservation, RepositoryRefObservationRequest,
+    WorkerDetail as EmbeddedWorkerDetail, WorkerStatus as EmbeddedWorkerStatus,
+    WorkingDirectoryClaim, WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest,
+    WorkingDirectoryStatus, WorkingDirectorySummary, WorkspaceApiRef,
 };
 use worker_runtime::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary};
 #[cfg(test)]
@@ -830,6 +830,17 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         ))
     }
 
+    fn observe_repository_ref(
+        &self,
+        _request: RepositoryRefObservationRequest,
+    ) -> std::result::Result<RepositoryRefObservation, Error> {
+        Err(Error::RuntimeOperationFailed {
+            runtime_id: self.runtime_id().to_string(),
+            code: "repository_ref_provider_unavailable".to_string(),
+            message: "Runtime does not support Repository ref observation".to_string(),
+        })
+    }
+
     fn list_working_directories(&self) -> RuntimeList<WorkingDirectoryStatus> {
         RuntimeList::new(Vec::new(), Vec::new())
     }
@@ -1446,6 +1457,31 @@ impl RuntimeRegistry {
                 runtime_id: runtime_id.to_string(),
                 code: "working_directory_repository_access_failed".to_string(),
                 message: error.to_string(),
+            })
+    }
+
+    pub fn observe_repository_ref(
+        &self,
+        runtime_id: &str,
+        request: RepositoryRefObservationRequest,
+    ) -> Result<RepositoryRefObservation, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        runtime
+            .observe_repository_ref(request)
+            .map_err(|error| match error {
+                Error::RuntimeOperationFailed { code, message, .. } => {
+                    RuntimeRegistryError::RuntimeOperationFailed {
+                        runtime_id: runtime_id.to_string(),
+                        code,
+                        message,
+                    }
+                }
+                other => RuntimeRegistryError::RuntimeOperationFailed {
+                    runtime_id: runtime_id.to_string(),
+                    code: "repository_ref_provider_unavailable".to_string(),
+                    message: other.to_string(),
+                },
             })
     }
 
@@ -2141,6 +2177,28 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             working_directory: None,
             diagnostics: vec![embedded_workdir_unsupported_diagnostic()],
         }
+    }
+
+    fn observe_repository_ref(
+        &self,
+        request: RepositoryRefObservationRequest,
+    ) -> std::result::Result<RepositoryRefObservation, Error> {
+        self.runtime
+            .observe_repository_ref(request)
+            .map_err(|error| match error {
+                worker_runtime::error::RuntimeError::WorkingDirectory(diagnostic) => {
+                    Error::RuntimeOperationFailed {
+                        runtime_id: self.runtime_id.clone(),
+                        code: diagnostic.code,
+                        message: diagnostic.message,
+                    }
+                }
+                error => Error::RuntimeOperationFailed {
+                    runtime_id: self.runtime_id.clone(),
+                    code: "repository_ref_provider_unavailable".to_string(),
+                    message: error.to_string(),
+                },
+            })
     }
 
     fn list_working_directories(&self) -> RuntimeList<WorkingDirectoryStatus> {
@@ -3353,6 +3411,18 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         )
         .map(|_| ())
         .map_err(|diagnostic| Error::RegistryInconsistency(diagnostic.message))
+    }
+
+    fn observe_repository_ref(
+        &self,
+        request: RepositoryRefObservationRequest,
+    ) -> std::result::Result<RepositoryRefObservation, Error> {
+        self.post_json::<_, RepositoryRefObservation>("/v1/repository-refs/observe", &request)
+            .map_err(|diagnostic| Error::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+            })
     }
 
     fn list_working_directories(&self) -> RuntimeList<WorkingDirectoryStatus> {
@@ -4787,6 +4857,85 @@ mod tests {
                 "spawn failed before input could be dispatched",
             )
         }
+    }
+
+    struct ObservingExecutionBackend {
+        response: RepositoryRefObservation,
+        observed: Arc<Mutex<Vec<RepositoryRefObservationRequest>>>,
+    }
+
+    impl worker_runtime::execution::WorkerExecutionBackend for ObservingExecutionBackend {
+        fn backend_id(&self) -> &str {
+            "repository-observation-test-backend"
+        }
+
+        fn spawn_worker(
+            &self,
+            _request: worker_runtime::execution::WorkerExecutionSpawnRequest,
+        ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
+            unreachable!("Repository observation test does not spawn Workers")
+        }
+
+        fn dispatch_input(
+            &self,
+            _handle: &worker_runtime::execution::WorkerExecutionHandle,
+            _input: EmbeddedWorkerInput,
+        ) -> worker_runtime::execution::WorkerExecutionResult {
+            unreachable!("Repository observation test does not dispatch Worker input")
+        }
+
+        fn observe_repository_ref(
+            &self,
+            request: &RepositoryRefObservationRequest,
+        ) -> Result<
+            RepositoryRefObservation,
+            worker_runtime::working_directory::WorkingDirectoryDiagnostic,
+        > {
+            self.observed.lock().unwrap().push(request.clone());
+            Ok(self.response.clone())
+        }
+    }
+
+    #[test]
+    fn embedded_runtime_forwards_repository_ref_observation_to_execution_backend() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let expected = RepositoryRefObservation {
+            repository_id: "repository-1".to_string(),
+            source_revision: 7,
+            source_fingerprint: "sha256:source".to_string(),
+            selector: "refs/heads/published".to_string(),
+            revision_ref: "0123456789012345678901234567890123456789".to_string(),
+            observed_at_epoch_seconds: 42,
+        };
+        let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
+            "workspace-test",
+            Arc::new(ObservingExecutionBackend {
+                response: expected.clone(),
+                observed: observed.clone(),
+            }),
+        )
+        .unwrap();
+        let request = RepositoryRefObservationRequest {
+            repository: worker_runtime::catalog::WorkingDirectoryRepository {
+                id: "repository-1".to_string(),
+                provider: "git".to_string(),
+                source: workspace_api::RepositorySource {
+                    kind: workspace_api::RepositorySourceKind::LocalPath,
+                    uri: "/provider/repository.git".to_string(),
+                },
+                source_revision: 7,
+                source_fingerprint: "sha256:source".to_string(),
+                selector: None,
+            },
+            selector: "refs/heads/published".to_string(),
+            materialization: None,
+        };
+
+        assert_eq!(
+            runtime.observe_repository_ref(request.clone()).unwrap(),
+            expected
+        );
+        assert_eq!(observed.lock().unwrap().as_slice(), &[request]);
     }
 
     #[derive(Default)]

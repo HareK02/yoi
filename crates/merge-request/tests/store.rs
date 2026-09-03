@@ -92,6 +92,23 @@ fn approve(s: &MergeRequestStore, subject: &str, token: &str) -> ReviewEvent {
     .unwrap()
 }
 #[test]
+fn review_submission_authorization_rejects_invalid_grants_before_side_effects() {
+    let (_d, store) = fixture();
+    open(&store);
+    request(&store, "published-source", "valid-token");
+
+    let invalid = store
+        .authorize_review_submission("T", "invalid-token")
+        .unwrap_err();
+    assert!(matches!(invalid, MergeRequestError::Unauthorized(_)));
+    let authorized = store
+        .authorize_review_submission("T", "valid-token")
+        .unwrap();
+    assert_eq!(authorized.workspace_id, "W");
+    assert_eq!(authorized.subject_ref, "published-source");
+}
+
+#[test]
 fn selectors_thread_and_completion_have_no_revision_or_commit_api() {
     let (d, s) = fixture();
     open(&s);
