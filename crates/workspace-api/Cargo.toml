@@ -13,6 +13,7 @@ typescript = ["dep:ts-rs", "protocol/typescript"]
 protocol.workspace = true
 serde = { workspace = true, features = ["derive"] }
 ts-rs = { version = "12.0.1", optional = true }
+webauthn-rs-proto = "0.5.5"
 
 [[example]]
 name = "generate_typescript"
@@ -35,6 +36,10 @@ required-features = ["typescript"]
 
 [[example]]
 name = "generate_memory_api_types"
+required-features = ["typescript"]
+
+[[example]]
+name = "generate_auth_api_types"
 required-features = ["typescript"]
 
 [[example]]

@@ -5,6 +5,312 @@
 //! callers must explicitly construct these Workspace-authoritative resources.
 
 use serde::{Deserialize, Serialize};
+use webauthn_rs_proto::{
+    CreationChallengeResponse, PublicKeyCredential, RegisterPublicKeyCredential,
+    RequestChallengeResponse,
+};
+
+/// Public browser-authentication configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct AuthPublicConfig {
+    pub rp_id: String,
+    pub origin: String,
+    pub public_base_url: String,
+    pub cookie_name: String,
+}
+
+/// Authentication method that established the current request actor.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ActorAuthMethod {
+    BrowserSession,
+    ApiToken,
+}
+
+/// Public user identity returned by authentication operations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatedUser {
+    pub user_id: String,
+    pub account_id: String,
+    pub handle: String,
+    pub display_name: String,
+}
+
+/// Authenticated actor returned by `GET /api/auth/whoami`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RequestActor {
+    pub user_id: String,
+    pub account_id: String,
+    pub handle: String,
+    pub display_name: String,
+    pub auth_method: ActorAuthMethod,
+}
+
+impl RequestActor {
+    pub fn user(&self) -> AuthenticatedUser {
+        AuthenticatedUser {
+            user_id: self.user_id.clone(),
+            account_id: self.account_id.clone(),
+            handle: self.handle.clone(),
+            display_name: self.display_name.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WhoamiResponse {
+    pub actor: Option<RequestActor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct AuthBootstrapUserRequest {
+    pub handle: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct AuthUserResponse {
+    pub user: AuthenticatedUser,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyRegistrationOptionsRequest {
+    pub handle: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub browser_origin: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyRegistrationOptionsResponse {
+    pub challenge_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
+    pub public_key: CreationChallengeResponse,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyRegistrationCompleteRequest {
+    pub challenge_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
+    pub credential: RegisterPublicKeyCredential,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyLoginOptionsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub browser_origin: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyLoginOptionsResponse {
+    pub challenge_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
+    pub public_key: RequestChallengeResponse,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyLoginCompleteRequest {
+    pub challenge_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
+    pub credential: PublicKeyCredential,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct DeviceLoginStartRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub client_name: Option<String>,
+}
+
+const DEVICE_LOGIN_EXPIRES_IN_MAX_SECONDS: u64 = 24 * 60 * 60;
+const DEVICE_LOGIN_POLL_INTERVAL_MAX_SECONDS: u64 = 60;
+
+#[derive(Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct DeviceLoginStartResponse {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub verification_uri_complete: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub expires_in: u64,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub interval: u64,
+}
+
+impl<'de> Deserialize<'de> for DeviceLoginStartResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            device_code: String,
+            user_code: String,
+            verification_uri: String,
+            verification_uri_complete: String,
+            expires_in: u64,
+            interval: u64,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.expires_in == 0 || wire.expires_in > DEVICE_LOGIN_EXPIRES_IN_MAX_SECONDS {
+            return Err(serde::de::Error::custom(format!(
+                "expires_in must be between 1 and {DEVICE_LOGIN_EXPIRES_IN_MAX_SECONDS}"
+            )));
+        }
+        if wire.interval == 0 || wire.interval > DEVICE_LOGIN_POLL_INTERVAL_MAX_SECONDS {
+            return Err(serde::de::Error::custom(format!(
+                "interval must be between 1 and {DEVICE_LOGIN_POLL_INTERVAL_MAX_SECONDS}"
+            )));
+        }
+        Ok(Self {
+            device_code: wire.device_code,
+            user_code: wire.user_code,
+            verification_uri: wire.verification_uri,
+            verification_uri_complete: wire.verification_uri_complete,
+            expires_in: wire.expires_in,
+            interval: wire.interval,
+        })
+    }
+}
+
+impl std::fmt::Debug for DeviceLoginStartResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceLoginStartResponse")
+            .field("device_code", &"[redacted]")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("verification_uri_complete", &self.verification_uri_complete)
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct DeviceLoginApproveRequest {
+    pub user_code: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceLoginApprovalStatus {
+    Approved,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct DeviceLoginApproveResponse {
+    pub status: DeviceLoginApprovalStatus,
+    pub user: AuthenticatedUser,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct DeviceLoginPollRequest {
+    pub device_code: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub enum DeviceAccessTokenType {
+    Bearer,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceLoginPollStatus {
+    Pending,
+    Approved,
+    Expired,
+    Consumed,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct DeviceLoginPollResponse {
+    pub status: DeviceLoginPollStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub access_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub token_type: Option<DeviceAccessTokenType>,
+}
+
+impl std::fmt::Debug for DeviceLoginPollResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceLoginPollResponse")
+            .field("status", &self.status)
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("token_type", &self.token_type)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum LogoutStatus {
+    LoggedOut,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct LogoutResponse {
+    pub status: LogoutStatus,
+}
 
 pub const REPOSITORY_KEY_MIN_LEN: usize = 1;
 pub const REPOSITORY_KEY_MAX_LEN: usize = 64;
@@ -1699,6 +2005,47 @@ pub fn repository_access_api_typescript() -> String {
 }
 
 #[cfg(feature = "typescript")]
+pub fn auth_api_typescript() -> String {
+    use ts_rs::TS;
+
+    let config = ts_rs::Config::default();
+    let declarations = [
+        AuthPublicConfig::decl(&config),
+        ActorAuthMethod::decl(&config),
+        AuthenticatedUser::decl(&config),
+        RequestActor::decl(&config),
+        WhoamiResponse::decl(&config),
+        AuthBootstrapUserRequest::decl(&config),
+        AuthUserResponse::decl(&config),
+        PasskeyRegistrationOptionsRequest::decl(&config),
+        PasskeyRegistrationOptionsResponse::decl(&config),
+        PasskeyRegistrationCompleteRequest::decl(&config),
+        PasskeyLoginOptionsRequest::decl(&config),
+        PasskeyLoginOptionsResponse::decl(&config),
+        PasskeyLoginCompleteRequest::decl(&config),
+        DeviceLoginStartRequest::decl(&config),
+        DeviceLoginStartResponse::decl(&config),
+        DeviceLoginApproveRequest::decl(&config),
+        DeviceLoginApprovalStatus::decl(&config),
+        DeviceLoginApproveResponse::decl(&config),
+        DeviceLoginPollRequest::decl(&config),
+        DeviceAccessTokenType::decl(&config),
+        DeviceLoginPollStatus::decl(&config),
+        DeviceLoginPollResponse::decl(&config),
+        LogoutStatus::decl(&config),
+        LogoutResponse::decl(&config),
+    ];
+    format!(
+        "// Generated from workspace-api. Do not edit by hand.\n// Regenerate: cargo run -q -p workspace-api --features typescript --example generate_auth_api_types > web/workspace/src/lib/generated/auth-api.ts\n\n{}\n",
+        declarations
+            .into_iter()
+            .map(|declaration| format!("export {declaration}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    )
+}
+
+#[cfg(feature = "typescript")]
 pub fn workdir_api_typescript() -> String {
     use ts_rs::TS;
 
@@ -2290,6 +2637,130 @@ mod tests {
     }
 
     #[test]
+    fn auth_server_fixtures_round_trip_through_shared_dtos() {
+        let whoami = serde_json::json!({
+            "actor": {
+                "user_id": "user-1",
+                "account_id": "account-1",
+                "handle": "hare",
+                "display_name": "Hare",
+                "auth_method": "browser_session"
+            }
+        });
+        let decoded = serde_json::from_value::<WhoamiResponse>(whoami.clone())
+            .expect("server whoami fixture should match shared DTO");
+        assert_eq!(serde_json::to_value(decoded).unwrap(), whoami);
+
+        let registration_options = serde_json::json!({
+            "challenge_id": "challenge-1",
+            "public_key": {
+                "publicKey": {
+                    "challenge": "AQID",
+                    "rp": {"id": "localhost", "name": "Yoi"},
+                    "user": {"id": "BAUG", "name": "hare", "displayName": "Hare"},
+                    "pubKeyCredParams": [{"type": "public-key", "alg": -7}]
+                }
+            }
+        });
+        let decoded = serde_json::from_value::<PasskeyRegistrationOptionsResponse>(
+            registration_options.clone(),
+        )
+        .expect("server registration options fixture should match shared DTO");
+        assert_eq!(serde_json::to_value(decoded).unwrap(), registration_options);
+
+        let device_start = serde_json::json!({
+            "device_code": "device-secret",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://yoi.example/login/device",
+            "verification_uri_complete": "https://yoi.example/login/device?user_code=ABCD-EFGH",
+            "expires_in": 600,
+            "interval": 2
+        });
+        let decoded = serde_json::from_value::<DeviceLoginStartResponse>(device_start.clone())
+            .expect("server device-login fixture should match shared DTO");
+        assert_eq!(serde_json::to_value(decoded).unwrap(), device_start);
+    }
+
+    #[test]
+    fn auth_dtos_reject_unknown_status_and_fields() {
+        let unknown_status = serde_json::json!({"status": "future_status"});
+        assert!(
+            serde_json::from_value::<DeviceLoginPollResponse>(unknown_status).is_err(),
+            "unknown device-login statuses must fail closed"
+        );
+
+        let unsafe_expiry = serde_json::json!({
+            "device_code": "device-secret",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://yoi.example/login/device",
+            "verification_uri_complete": "https://yoi.example/login/device?user_code=ABCD-EFGH",
+            "expires_in": 0,
+            "interval": 2
+        });
+        assert!(serde_json::from_value::<DeviceLoginStartResponse>(unsafe_expiry).is_err());
+
+        let malformed_credential = serde_json::json!({
+            "challenge_id": "challenge-1",
+            "credential": {
+                "id": "AQID",
+                "rawId": "AQID",
+                "type": "public-key",
+                "response": {"clientDataJSON": 42}
+            }
+        });
+        assert!(
+            serde_json::from_value::<PasskeyLoginCompleteRequest>(malformed_credential).is_err(),
+            "malformed passkey credential payloads must fail closed"
+        );
+
+        let unexpected_field = serde_json::json!({
+            "actor": null,
+            "access_token": "must-not-be-accepted"
+        });
+        assert!(serde_json::from_value::<WhoamiResponse>(unexpected_field).is_err());
+    }
+
+    #[test]
+    fn device_login_debug_output_redacts_secret_material() {
+        let start = DeviceLoginStartResponse {
+            device_code: "device-secret".to_string(),
+            user_code: "ABCD-EFGH".to_string(),
+            verification_uri: "https://yoi.example/login/device".to_string(),
+            verification_uri_complete: "https://yoi.example/login/device?user_code=ABCD-EFGH"
+                .to_string(),
+            expires_in: 600,
+            interval: 2,
+        };
+        let start_debug = format!("{start:?}");
+        assert!(!start_debug.contains("device-secret"));
+        assert!(start_debug.contains("[redacted]"));
+
+        let poll = DeviceLoginPollResponse {
+            status: DeviceLoginPollStatus::Approved,
+            access_token: Some("access-secret".to_string()),
+            token_type: Some(DeviceAccessTokenType::Bearer),
+        };
+        let poll_debug = format!("{poll:?}");
+        assert!(!poll_debug.contains("access-secret"));
+        assert!(poll_debug.contains("[redacted]"));
+    }
+
+    #[cfg(feature = "typescript")]
+    #[test]
+    fn generated_auth_api_contract_is_current() {
+        let expected = auth_api_typescript();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/workspace/src/lib/generated/auth-api.ts");
+        let actual = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        assert_eq!(
+            normalize_typescript(&actual),
+            normalize_typescript(&expected),
+            "regenerate auth API TypeScript types with `cargo run -q -p workspace-api --features typescript --example generate_auth_api_types > web/workspace/src/lib/generated/auth-api.ts` and format the generated file",
+        );
+    }
+
+    #[test]
     fn companion_transcript_fixture_round_trips() {
         round_trip(CompanionTranscriptProjection {
             state: CompanionLifecycleState::Idle,
@@ -2383,6 +2854,7 @@ mod tests {
             })
             .collect::<String>()
             .replace(";}", "}")
+            .replace("=|", "=")
     }
 
     #[test]

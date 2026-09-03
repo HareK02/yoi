@@ -1,8 +1,13 @@
 import {
+  authenticationCredentialToJson,
   base64UrlToBuffer,
   bufferToBase64Url,
+  parseDeviceLoginPollResponse,
+  parseDeviceLoginStartResponse,
+  parseWhoamiResponse,
   prepareLoginOptions,
   prepareRegistrationOptions,
+  registrationCredentialToJson,
 } from "./model.ts";
 
 declare const Deno: {
@@ -15,6 +20,21 @@ function assertEquals<T>(actual: T, expected: T): void {
       `expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
     );
   }
+}
+
+function assertThrows(fn: () => unknown, message: string): void {
+  try {
+    fn();
+  } catch (error) {
+    if (
+      !(error instanceof Error) ||
+      !error.message.startsWith("Invalid auth payload:")
+    ) {
+      throw new Error(`${message}: unexpected error`);
+    }
+    return;
+  }
+  throw new Error(`${message}: expected an error`);
 }
 
 function bytes(buffer: BufferSource): number[] {
@@ -39,18 +59,20 @@ Deno.test("prepareRegistrationOptions decodes binary public key fields", () => {
   const options = prepareRegistrationOptions({
     challenge_id: "challenge-1",
     public_key: {
-      challenge: "AQID" as unknown as BufferSource,
-      rp: { id: "localhost", name: "Yoi" },
-      user: {
-        id: "BAUG" as unknown as BufferSource,
-        name: "local",
-        displayName: "Local User",
+      publicKey: {
+        challenge: "AQID" as unknown as BufferSource,
+        rp: { id: "localhost", name: "Yoi" },
+        user: {
+          id: "BAUG" as unknown as BufferSource,
+          name: "local",
+          displayName: "Local User",
+        },
+        pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+        excludeCredentials: [{
+          type: "public-key",
+          id: "BwgJ" as unknown as BufferSource,
+        }],
       },
-      pubKeyCredParams: [{ type: "public-key", alg: -7 }],
-      excludeCredentials: [{
-        type: "public-key",
-        id: "BwgJ" as unknown as BufferSource,
-      }],
     },
   });
 
@@ -67,11 +89,13 @@ Deno.test("prepareLoginOptions decodes challenge and allowed credential ids", ()
   const options = prepareLoginOptions({
     challenge_id: "challenge-1",
     public_key: {
-      challenge: "AQID" as unknown as BufferSource,
-      allowCredentials: [{
-        type: "public-key",
-        id: "BwgJ" as unknown as BufferSource,
-      }],
+      publicKey: {
+        challenge: "AQID" as unknown as BufferSource,
+        allowCredentials: [{
+          type: "public-key",
+          id: "BwgJ" as unknown as BufferSource,
+        }],
+      },
     },
   });
 
@@ -81,4 +105,86 @@ Deno.test("prepareLoginOptions decodes challenge and allowed credential ids", ()
     8,
     9,
   ]);
+});
+
+Deno.test("whoami rejects unknown auth methods and extra fields", () => {
+  assertEquals(parseWhoamiResponse({ actor: null }), { actor: null });
+  assertThrows(
+    () =>
+      parseWhoamiResponse({
+        actor: {
+          user_id: "user-1",
+          account_id: "account-1",
+          handle: "hare",
+          display_name: "Hare",
+          auth_method: "future_method",
+        },
+      }),
+    "unknown auth method",
+  );
+  assertThrows(
+    () => parseWhoamiResponse({ actor: null, token: "secret" }),
+    "unexpected whoami field",
+  );
+});
+
+Deno.test("device login rejects unsafe expiry and unknown status", () => {
+  const start = {
+    device_code: "device-1",
+    user_code: "ABCD-EFGH",
+    verification_uri: "https://yoi.example/login/device",
+    verification_uri_complete:
+      "https://yoi.example/login/device?user_code=ABCD-EFGH",
+    expires_in: 600,
+    interval: 2,
+  };
+  assertEquals(parseDeviceLoginStartResponse(start), start);
+  assertThrows(
+    () =>
+      parseDeviceLoginStartResponse({
+        ...start,
+        expires_in: Number.MAX_SAFE_INTEGER + 1,
+      }),
+    "unsafe expiry",
+  );
+  assertThrows(
+    () => parseDeviceLoginPollResponse({ status: "future_status" }),
+    "unknown device-login status",
+  );
+  assertThrows(
+    () => parseDeviceLoginPollResponse({ status: "approved" }),
+    "approved response without token",
+  );
+});
+
+Deno.test("passkey credential conversion fails closed on malformed payloads", () => {
+  const bytes = new Uint8Array([1, 2, 3]).buffer;
+  const registration = {
+    id: "AQID",
+    rawId: bytes,
+    type: "public-key",
+    authenticatorAttachment: "platform",
+    getClientExtensionResults: () => ({ credProps: { rk: true } }),
+    response: {
+      clientDataJSON: bytes,
+      attestationObject: bytes,
+      getTransports: () => ["internal"],
+    },
+  };
+  const converted = registrationCredentialToJson(registration) as Record<
+    string,
+    unknown
+  >;
+  assertEquals(converted.id, "AQID");
+  assertEquals(converted.clientExtensionResults, { credProps: { rk: true } });
+
+  assertThrows(
+    () => registrationCredentialToJson({ ...registration, rawId: "AQID" }),
+    "registration rawId string",
+  );
+  assertThrows(
+    () =>
+      authenticationCredentialToJson({ ...registration, type: "future-key" }),
+    "unknown credential type",
+  );
 });

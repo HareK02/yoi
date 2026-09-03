@@ -1,7 +1,10 @@
 use crate::BackendOrigin;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::fmt;
 use std::time::Duration;
+
+use workspace_api::{DeviceLoginPollRequest, DeviceLoginPollStatus, DeviceLoginStartRequest};
+pub use workspace_api::{DeviceLoginPollResponse, DeviceLoginStartResponse};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendAuthTarget {
@@ -26,23 +29,6 @@ impl BackendAuthTarget {
                 .unwrap_or_else(|| path.to_string())
         )
     }
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct DeviceLoginStartResponse {
-    pub device_code: String,
-    pub user_code: String,
-    pub verification_uri: String,
-    pub verification_uri_complete: String,
-    pub expires_in: u64,
-    pub interval: u64,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct DeviceLoginPollResponse {
-    pub status: String,
-    pub access_token: Option<String>,
-    pub token_type: Option<String>,
 }
 
 #[derive(Debug)]
@@ -74,16 +60,6 @@ impl From<reqwest::Error> for BackendAuthClientError {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct DeviceLoginStartRequest<'a> {
-    client_name: Option<&'a str>,
-}
-
-#[derive(Debug, Serialize)]
-struct DeviceLoginPollRequest<'a> {
-    device_code: &'a str,
-}
-
 pub async fn start_device_login(
     target: &BackendAuthTarget,
     client_name: Option<&str>,
@@ -91,7 +67,9 @@ pub async fn start_device_login(
     let client = reqwest::Client::new();
     let response = client
         .post(target.api_url("/api/auth/device-login/start"))
-        .json(&DeviceLoginStartRequest { client_name })
+        .json(&DeviceLoginStartRequest {
+            client_name: client_name.map(ToOwned::to_owned),
+        })
         .send()
         .await?;
     parse_json_response(response).await
@@ -104,7 +82,9 @@ pub async fn poll_device_login(
     let client = reqwest::Client::new();
     let response = client
         .post(target.api_url("/api/auth/device-login/poll"))
-        .json(&DeviceLoginPollRequest { device_code })
+        .json(&DeviceLoginPollRequest {
+            device_code: device_code.to_string(),
+        })
         .send()
         .await?;
     parse_json_response(response).await
@@ -119,25 +99,25 @@ pub async fn wait_for_device_login(
     let started = std::time::Instant::now();
     loop {
         let response = poll_device_login(target, device_code).await?;
-        match response.status.as_str() {
-            "approved" => {
+        match response.status {
+            DeviceLoginPollStatus::Approved => {
                 return response
                     .access_token
                     .ok_or(BackendAuthClientError::MissingAccessToken);
             }
-            "expired" => {
+            DeviceLoginPollStatus::Expired => {
                 return Err(BackendAuthClientError::BackendStatus {
                     status: 410,
                     body: "device login expired".to_string(),
                 });
             }
-            "consumed" => {
+            DeviceLoginPollStatus::Consumed => {
                 return Err(BackendAuthClientError::BackendStatus {
                     status: 409,
                     body: "device login was already consumed".to_string(),
                 });
             }
-            _ => {}
+            DeviceLoginPollStatus::Pending => {}
         }
         if started.elapsed() >= expires_in {
             return Err(BackendAuthClientError::BackendStatus {

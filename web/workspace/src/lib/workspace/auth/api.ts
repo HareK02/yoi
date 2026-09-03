@@ -1,118 +1,143 @@
+import type {
+  DeviceLoginApproveRequest,
+  PasskeyLoginCompleteRequest,
+  PasskeyLoginOptionsRequest,
+  PasskeyRegistrationCompleteRequest,
+  PasskeyRegistrationOptionsRequest,
+} from "$lib/generated/auth-api.ts";
 import {
   authenticationCredentialToJson,
+  type AuthUser,
   type DeviceApprovalResponse,
-  isPublicKeyCredential,
-  type PasskeyLoginOptionsResponse,
-  type PasskeyRegistrationOptionsResponse,
-  type PasskeyUserResponse,
+  parseAuthUserResponse,
+  parseDeviceApprovalResponse,
+  parseLogoutResponse,
+  parseWhoamiResponse,
   prepareLoginOptions,
   prepareRegistrationOptions,
   registrationCredentialToJson,
   type WhoamiResponse,
-} from "./model";
+} from "$lib/workspace/auth/model";
 
-async function jsonOrThrow<T>(response: Response): Promise<T> {
-  const text = await response.text();
+async function requestJson(path: string, init?: RequestInit): Promise<unknown> {
+  const response = await fetch(path, {
+    credentials: "same-origin",
+    ...init,
+    headers: {
+      "content-type": "application/json",
+      ...(init?.headers ?? {}),
+    },
+  });
+  const body = await response.json() as unknown;
   if (!response.ok) {
-    throw new Error(
-      `${response.status} ${response.statusText}${text ? `: ${text}` : ""}`,
-    );
+    const errorBody = typeof body === "object" && body !== null
+      ? body as Record<string, unknown>
+      : null;
+    const message = typeof errorBody?.message === "string"
+      ? errorBody.message
+      : `Request failed (${response.status})`;
+    throw new Error(message);
   }
-  return text ? JSON.parse(text) as T : (null as T);
+  return body;
 }
 
-function browserOrigin(): string | null {
-  return globalThis.location?.origin ?? null;
+export async function loadWhoami(): Promise<WhoamiResponse> {
+  return parseWhoamiResponse(await requestJson("/api/auth/whoami"));
 }
 
-export async function loadWhoami(
-  fetcher: typeof fetch = fetch,
-): Promise<WhoamiResponse> {
-  return await fetcher("/api/auth/whoami", { credentials: "same-origin" }).then(
-    jsonOrThrow<WhoamiResponse>,
+export async function logout(): Promise<void> {
+  parseLogoutResponse(
+    await requestJson("/api/auth/logout", {
+      method: "POST",
+      body: "{}",
+    }),
   );
 }
 
 export async function registerPasskey(
   handle: string,
-  displayName: string,
-  fetcher: typeof fetch = fetch,
-): Promise<PasskeyUserResponse> {
-  const options = await fetcher("/api/auth/passkeys/registration/options", {
+  displayName?: string,
+): Promise<AuthUser> {
+  const optionsRequest: PasskeyRegistrationOptionsRequest = {
+    handle,
+    display_name: displayName ?? null,
+    browser_origin: window.location.origin,
+  };
+  const options = await requestJson("/api/auth/passkeys/registration/options", {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    credentials: "same-origin",
-    body: JSON.stringify({
-      handle,
-      display_name: displayName,
-      browser_origin: browserOrigin(),
-    }),
-  }).then(jsonOrThrow<PasskeyRegistrationOptionsResponse>);
-
+    body: JSON.stringify(optionsRequest),
+  });
+  const optionsRecord = typeof options === "object" && options !== null
+    ? options as Record<string, unknown>
+    : null;
+  const challengeId = optionsRecord?.challenge_id;
+  if (typeof challengeId !== "string" || challengeId.length === 0) {
+    throw new Error(
+      "Invalid auth payload: registration_options.challenge_id is required.",
+    );
+  }
   const credential = await navigator.credentials.create({
     publicKey: prepareRegistrationOptions(options),
   });
-  if (!isPublicKeyCredential(credential)) {
-    throw new Error(
-      "Passkey registration did not return a public-key credential.",
-    );
-  }
+  if (!credential) throw new Error("Passkey registration was cancelled");
 
-  return await fetcher("/api/auth/passkeys/registration/complete", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    credentials: "same-origin",
-    body: JSON.stringify({
-      challenge_id: options.challenge_id,
-      credential: registrationCredentialToJson(credential),
+  const completeRequest: PasskeyRegistrationCompleteRequest = {
+    challenge_id: challengeId,
+    credential: registrationCredentialToJson(credential),
+  };
+  const result = parseAuthUserResponse(
+    await requestJson("/api/auth/passkeys/registration/complete", {
+      method: "POST",
+      body: JSON.stringify(completeRequest),
     }),
-  }).then(jsonOrThrow<PasskeyUserResponse>);
+  );
+  return result.user;
 }
 
-export async function loginWithPasskey(
-  handle: string,
-  fetcher: typeof fetch = fetch,
-): Promise<PasskeyUserResponse> {
-  const options = await fetcher("/api/auth/passkeys/login/options", {
+export async function loginWithPasskey(handle?: string): Promise<AuthUser> {
+  const optionsRequest: PasskeyLoginOptionsRequest = {
+    handle: handle ?? null,
+    browser_origin: window.location.origin,
+  };
+  const options = await requestJson("/api/auth/passkeys/login/options", {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    credentials: "same-origin",
-    body: JSON.stringify({ handle, browser_origin: browserOrigin() }),
-  }).then(jsonOrThrow<PasskeyLoginOptionsResponse>);
-
+    body: JSON.stringify(optionsRequest),
+  });
+  const optionsRecord = typeof options === "object" && options !== null
+    ? options as Record<string, unknown>
+    : null;
+  const challengeId = optionsRecord?.challenge_id;
+  if (typeof challengeId !== "string" || challengeId.length === 0) {
+    throw new Error(
+      "Invalid auth payload: login_options.challenge_id is required.",
+    );
+  }
   const credential = await navigator.credentials.get({
     publicKey: prepareLoginOptions(options),
   });
-  if (!isPublicKeyCredential(credential)) {
-    throw new Error("Passkey login did not return a public-key credential.");
-  }
+  if (!credential) throw new Error("Passkey login was cancelled");
 
-  return await fetcher("/api/auth/passkeys/login/complete", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    credentials: "same-origin",
-    body: JSON.stringify({
-      challenge_id: options.challenge_id,
-      credential: authenticationCredentialToJson(credential),
+  const completeRequest: PasskeyLoginCompleteRequest = {
+    challenge_id: challengeId,
+    credential: authenticationCredentialToJson(credential),
+  };
+  const result = parseAuthUserResponse(
+    await requestJson("/api/auth/passkeys/login/complete", {
+      method: "POST",
+      body: JSON.stringify(completeRequest),
     }),
-  }).then(jsonOrThrow<PasskeyUserResponse>);
-}
-
-export async function logout(fetcher: typeof fetch = fetch): Promise<void> {
-  await fetcher("/api/auth/logout", {
-    method: "POST",
-    credentials: "same-origin",
-  }).then(jsonOrThrow<unknown>);
+  );
+  return result.user;
 }
 
 export async function approveDeviceLogin(
   userCode: string,
-  fetcher: typeof fetch = fetch,
 ): Promise<DeviceApprovalResponse> {
-  return await fetcher("/api/auth/device-login/approve", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    credentials: "same-origin",
-    body: JSON.stringify({ user_code: userCode }),
-  }).then(jsonOrThrow<DeviceApprovalResponse>);
+  const request: DeviceLoginApproveRequest = { user_code: userCode };
+  return parseDeviceApprovalResponse(
+    await requestJson("/api/auth/device-login/approve", {
+      method: "POST",
+      body: JSON.stringify(request),
+    }),
+  );
 }
