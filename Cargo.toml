@@ -68,6 +68,12 @@ default-members = [
 edition = "2024"
 license = "MIT"
 
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [workspace.dependencies]
 # Internal crates
 client = { path = "crates/client" }
