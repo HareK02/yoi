@@ -14,7 +14,7 @@ use agen::interceptor::{
 };
 use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
-use agen::{Engine, EngineError, EngineRunExit, History, StopReason};
+use agen::{Engine, EngineError, EngineRunExit, History, RunInterruptionReason};
 use async_trait::async_trait;
 use common::MockLlmClient;
 
@@ -205,7 +205,7 @@ async fn history_append_failure_stops_before_tool_execution() {
     let exit = engine.run(&mut history, "use the tool").await;
 
     assert!(
-        matches!(exit, EngineRunExit::Interrupted(StopReason::Unexpected(EngineError::HistoryAppend(ref message))) if message == "simulated ENOSPC")
+        matches!(exit, EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(EngineError::HistoryAppend(ref message))) if message == "simulated ENOSPC")
     );
     assert_eq!(tool.call_count(), 0);
     assert_eq!(history.len(), 1);
@@ -730,7 +730,7 @@ async fn paused_tool_resume_does_not_reset_the_consumed_turn_budget() {
 
     assert!(matches!(
         engine.resume(&mut history).await,
-        EngineRunExit::Interrupted(StopReason::LimitReached)
+        EngineRunExit::Interrupted(RunInterruptionReason::LimitReached)
     ));
     assert_eq!(engine.turn_count(), 1);
     assert_eq!(engine.active_run_turn_count(), None);
@@ -785,7 +785,7 @@ async fn interceptor_continuation_consumes_the_logical_run_budget() {
 
     assert!(matches!(
         engine.run(&mut history, "start").await,
-        EngineRunExit::Interrupted(StopReason::LimitReached)
+        EngineRunExit::Interrupted(RunInterruptionReason::LimitReached)
     ));
     assert_eq!(engine.turn_count(), 1);
     assert_eq!(engine.llm_call_count(), 1);
@@ -803,7 +803,7 @@ async fn restored_active_run_budget_is_enforced_before_another_llm_call() {
 
     assert!(matches!(
         engine.resume(&mut history).await,
-        EngineRunExit::Interrupted(StopReason::LimitReached)
+        EngineRunExit::Interrupted(RunInterruptionReason::LimitReached)
     ));
     assert_eq!(engine.turn_count(), 7);
     assert_eq!(engine.llm_call_count(), 0);

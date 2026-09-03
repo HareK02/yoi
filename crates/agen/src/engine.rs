@@ -147,12 +147,12 @@ pub enum EngineRunExit {
     Finished,
     Paused,
     Yielded,
-    Interrupted(StopReason),
+    Interrupted(RunInterruptionReason),
 }
 
 /// A typed reason why an engine run could not finish normally.
 #[derive(Debug)]
-pub enum StopReason {
+pub enum RunInterruptionReason {
     LimitReached,
     ContextWindowExceeded,
     Cancelled,
@@ -165,13 +165,15 @@ impl From<Result<EngineResult, EngineError>> for EngineRunExit {
             Ok(EngineResult::Finished) => Self::Finished,
             Ok(EngineResult::Paused) => Self::Paused,
             Ok(EngineResult::Yielded) => Self::Yielded,
-            Ok(EngineResult::LimitReached) => Self::Interrupted(StopReason::LimitReached),
-            Err(EngineError::Client(ClientError::ContextWindowExceeded)) => {
-                Self::Interrupted(StopReason::ContextWindowExceeded)
+            Ok(EngineResult::LimitReached) => {
+                Self::Interrupted(RunInterruptionReason::LimitReached)
             }
-            Err(EngineError::Cancelled) => Self::Interrupted(StopReason::Cancelled),
+            Err(EngineError::Client(ClientError::ContextWindowExceeded)) => {
+                Self::Interrupted(RunInterruptionReason::ContextWindowExceeded)
+            }
+            Err(EngineError::Cancelled) => Self::Interrupted(RunInterruptionReason::Cancelled),
             Err(EngineError::PauseRequested) => Self::Paused,
-            Err(error) => Self::Interrupted(StopReason::Unexpected(error)),
+            Err(error) => Self::Interrupted(RunInterruptionReason::Unexpected(error)),
         }
     }
 }

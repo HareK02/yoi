@@ -1028,14 +1028,14 @@ mod tests {
     }
 
     #[test]
-    fn migration_dry_run_accepts_real_v1_document_without_workers_field() {
+    fn migration_dry_run_accepts_previous_schema_document_without_workers_field() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime");
         std::fs::create_dir_all(root.join("workers")).unwrap();
         std::fs::write(
             root.join("runtime.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 3,
                 "display_name": "local",
                 "backend": "fs_store",
                 "status": "running",
@@ -1067,14 +1067,14 @@ mod tests {
     }
 
     #[test]
-    fn migration_dry_run_rejects_v1_document_that_cannot_decode_as_v3() {
+    fn migration_dry_run_rejects_previous_schema_document_that_cannot_decode_as_v4() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime");
         std::fs::create_dir_all(root.join("workers")).unwrap();
         std::fs::write(
             root.join("runtime.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 3,
                 "display_name": "local",
                 "backend": "fs_store",
                 "status": 3,

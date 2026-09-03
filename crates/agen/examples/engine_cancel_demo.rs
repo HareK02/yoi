@@ -4,7 +4,7 @@
 
 use agen::llm_client::scheme::{Scheme, anthropic::AnthropicScheme};
 use agen::llm_client::transport::{HttpTransport, ResolvedAuth};
-use agen::{Engine, EngineRunExit, StopReason};
+use agen::{Engine, EngineRunExit, RunInterruptionReason};
 use std::time::Duration;
 
 #[tokio::main]
@@ -51,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         EngineRunExit::Finished => println!("✅ Task completed normally"),
         EngineRunExit::Paused => println!("⏸️  Task paused"),
         EngineRunExit::Yielded => println!("↩️  Task yielded"),
-        EngineRunExit::Interrupted(StopReason::LimitReached) => {
+        EngineRunExit::Interrupted(RunInterruptionReason::LimitReached) => {
             println!("🔒 Turn limit reached")
         }
         EngineRunExit::Interrupted(reason) => println!("❌ Task interrupted: {reason:?}"),

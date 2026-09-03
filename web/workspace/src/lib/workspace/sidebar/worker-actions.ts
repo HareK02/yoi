@@ -46,7 +46,7 @@ function diagnosticMessage(
 }
 
 export function canDeleteSidebarWorker(worker: Worker): boolean {
-  return worker.state === "stopped" || worker.state === "cancelled";
+  return worker.state === "stopped";
 }
 
 export async function stopSidebarWorker(
