@@ -23,10 +23,10 @@ use worker_runtime::RuntimeWorkspaceScope;
 use worker_runtime::auth::{CapabilityTokenSigner, capability_claims};
 use worker_runtime::catalog::{
     ConfigBundleRef, CreateWorkerRequest, ProfileSelector, ProfileSourceArchiveHttpRef,
-    ProfileSourceArchiveSource, WorkerDetail as EmbeddedWorkerDetail,
-    WorkerStatus as EmbeddedWorkerStatus, WorkingDirectoryClaim,
-    WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest, WorkingDirectoryStatus,
-    WorkingDirectorySummary, WorkspaceApiRef,
+    ProfileSourceArchiveSource, RepositoryRefObservation, RepositoryRefObservationRequest,
+    WorkerDetail as EmbeddedWorkerDetail, WorkerStatus as EmbeddedWorkerStatus,
+    WorkingDirectoryClaim, WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest,
+    WorkingDirectoryStatus, WorkingDirectorySummary, WorkspaceApiRef,
 };
 use worker_runtime::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary};
 #[cfg(test)]
@@ -830,6 +830,17 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         ))
     }
 
+    fn observe_repository_ref(
+        &self,
+        _request: RepositoryRefObservationRequest,
+    ) -> std::result::Result<RepositoryRefObservation, Error> {
+        Err(Error::RuntimeOperationFailed {
+            runtime_id: self.runtime_id().to_string(),
+            code: "repository_ref_provider_unavailable".to_string(),
+            message: "Runtime does not support Repository ref observation".to_string(),
+        })
+    }
+
     fn list_working_directories(&self) -> RuntimeList<WorkingDirectoryStatus> {
         RuntimeList::new(Vec::new(), Vec::new())
     }
@@ -1446,6 +1457,31 @@ impl RuntimeRegistry {
                 runtime_id: runtime_id.to_string(),
                 code: "working_directory_repository_access_failed".to_string(),
                 message: error.to_string(),
+            })
+    }
+
+    pub fn observe_repository_ref(
+        &self,
+        runtime_id: &str,
+        request: RepositoryRefObservationRequest,
+    ) -> Result<RepositoryRefObservation, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        runtime
+            .observe_repository_ref(request)
+            .map_err(|error| match error {
+                Error::RuntimeOperationFailed { code, message, .. } => {
+                    RuntimeRegistryError::RuntimeOperationFailed {
+                        runtime_id: runtime_id.to_string(),
+                        code,
+                        message,
+                    }
+                }
+                other => RuntimeRegistryError::RuntimeOperationFailed {
+                    runtime_id: runtime_id.to_string(),
+                    code: "repository_ref_provider_unavailable".to_string(),
+                    message: other.to_string(),
+                },
             })
     }
 
@@ -3353,6 +3389,18 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         )
         .map(|_| ())
         .map_err(|diagnostic| Error::RegistryInconsistency(diagnostic.message))
+    }
+
+    fn observe_repository_ref(
+        &self,
+        request: RepositoryRefObservationRequest,
+    ) -> std::result::Result<RepositoryRefObservation, Error> {
+        self.post_json::<_, RepositoryRefObservation>("/v1/repository-refs/observe", &request)
+            .map_err(|diagnostic| Error::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+            })
     }
 
     fn list_working_directories(&self) -> RuntimeList<WorkingDirectoryStatus> {
