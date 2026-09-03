@@ -1,3 +1,0 @@
-[build]
-build-dir = "{cargo-cache-home}/build/yoi"
-incremental = false
