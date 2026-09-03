@@ -280,7 +280,10 @@ impl ToolResultPrinterPolicy {
 
 #[async_trait]
 impl Interceptor for ToolResultPrinterPolicy {
-    async fn post_tool_call(&self, info: &ToolResultInfo) -> InterceptorResult<PostToolAction> {
+    async fn post_tool_call(
+        &self,
+        info: &ToolResultInfo<'_, ()>,
+    ) -> InterceptorResult<PostToolAction> {
         let name = self
             .call_names
             .lock()

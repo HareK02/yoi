@@ -27,8 +27,11 @@ pub use engine::{
 pub use handler::ToolUseBlockStart;
 pub use history::{History, HistoryEntry};
 pub use interceptor::{
-    AssistantTurnEndContext, Interceptor, InterceptorError, InterceptorFailure, InterceptorPoint,
-    InterceptorResult, PreLlmRequestContext, PromptSubmitContext, RunExitContext,
+    AssistantTurnEndContext, Interceptor, InterceptorCallId, InterceptorCounter,
+    InterceptorCounters, InterceptorError, InterceptorErrorCategory, InterceptorFailure,
+    InterceptorInvocation, InterceptorPhase, InterceptorResult, InterceptorRunId,
+    InterceptorTurnId, MAX_INTERCEPTOR_DIAGNOSTIC_BYTES, PendingHistoryAppendsContext,
+    PreLlmRequestContext, PromptSubmitContext, RunExitContext,
 };
 pub use message::{ContentPart, Item, Message, Role};
 pub use tool::{

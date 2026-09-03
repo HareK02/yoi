@@ -10,51 +10,73 @@ use async_trait::async_trait;
 
 use crate::Item;
 use crate::engine::EngineRunExit;
+use crate::history::HistoryEntry;
 use crate::tool::{Tool, ToolCall, ToolExecutionContext, ToolMeta, ToolResult};
 
 // =============================================================================
-// Failure Types
+// Typed lifecycle metadata and failures
 // =============================================================================
 
-/// A typed failure returned by an [`Interceptor`] implementation.
-///
-/// The Engine attaches the exact [`InterceptorPoint`] at which the failure was
-/// observed before exposing it through the run termination boundary.
+/// Maximum UTF-8 byte length retained for interceptor diagnostics.
+pub const MAX_INTERCEPTOR_DIAGNOSTIC_BYTES: usize = 1024;
+
+/// Stable category for the source of an interceptor failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterceptorErrorCategory {
+    Policy,
+    Dependency,
+    ContractViolation,
+    Internal,
+}
+
+impl std::fmt::Display for InterceptorErrorCategory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Policy => "policy",
+            Self::Dependency => "dependency",
+            Self::ContractViolation => "contract_violation",
+            Self::Internal => "internal",
+        })
+    }
+}
+
+/// A typed, bounded failure returned by an [`Interceptor`] implementation.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{message}")]
+#[error("{category}: {diagnostic}")]
 pub struct InterceptorError {
-    message: String,
+    category: InterceptorErrorCategory,
+    diagnostic: String,
 }
 
 impl InterceptorError {
-    /// Create an interceptor failure with a caller-defined message.
-    pub fn new(message: impl Into<String>) -> Self {
+    pub fn new(category: InterceptorErrorCategory, diagnostic: impl Into<String>) -> Self {
+        let mut diagnostic = diagnostic.into();
+        if diagnostic.len() > MAX_INTERCEPTOR_DIAGNOSTIC_BYTES {
+            let mut end = MAX_INTERCEPTOR_DIAGNOSTIC_BYTES;
+            while !diagnostic.is_char_boundary(end) {
+                end -= 1;
+            }
+            diagnostic.truncate(end);
+        }
         Self {
-            message: message.into(),
+            category,
+            diagnostic,
         }
     }
 
-    /// Return the failure message supplied by the interceptor.
-    pub fn message(&self) -> &str {
-        &self.message
+    pub fn category(&self) -> InterceptorErrorCategory {
+        self.category
+    }
+
+    pub fn diagnostic(&self) -> &str {
+        &self.diagnostic
     }
 }
 
-impl From<String> for InterceptorError {
-    fn from(message: String) -> Self {
-        Self::new(message)
-    }
-}
-
-impl From<&str> for InterceptorError {
-    fn from(message: &str) -> Self {
-        Self::new(message)
-    }
-}
-
-/// The Engine lifecycle point at which an interceptor failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InterceptorPoint {
+/// The lifecycle phase at which an interceptor callback executes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InterceptorPhase {
+    #[default]
     PromptSubmit,
     PendingHistoryAppends,
     PreLlmRequest,
@@ -64,9 +86,9 @@ pub enum InterceptorPoint {
     RunExit,
 }
 
-impl std::fmt::Display for InterceptorPoint {
+impl std::fmt::Display for InterceptorPhase {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
+        formatter.write_str(match self {
             Self::PromptSubmit => "prompt_submit",
             Self::PendingHistoryAppends => "pending_history_appends",
             Self::PreLlmRequest => "pre_llm_request",
@@ -74,66 +96,113 @@ impl std::fmt::Display for InterceptorPoint {
             Self::PostToolCall => "post_tool_call",
             Self::AssistantTurnEnd => "assistant_turn_end",
             Self::RunExit => "run_exit",
-        };
-        formatter.write_str(name)
+        })
     }
 }
 
-/// An interceptor failure bound to the exact Engine lifecycle point that ran it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct InterceptorRunId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InterceptorTurnId(pub u64);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum InterceptorCallId {
+    Llm(u64),
+    Tool(String),
+}
+
+/// Saturating public counter used by interceptor contexts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct InterceptorCounter(u32);
+
+impl InterceptorCounter {
+    pub fn from_usize(value: usize) -> Self {
+        Self(u32::try_from(value).unwrap_or(u32::MAX))
+    }
+
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InterceptorCounters {
+    pub invocation: InterceptorCounter,
+    pub engine_turn: InterceptorCounter,
+    pub run_turn: InterceptorCounter,
+    pub llm_call: InterceptorCounter,
+    pub tool_batch: InterceptorCounter,
+    pub tool_call: InterceptorCounter,
+}
+
+/// Identity, phase, and bounded counters common to every lifecycle callback.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InterceptorInvocation {
+    pub run_id: InterceptorRunId,
+    pub turn_id: Option<InterceptorTurnId>,
+    pub call_id: Option<InterceptorCallId>,
+    pub phase: InterceptorPhase,
+    pub counters: InterceptorCounters,
+}
+
+/// An interceptor failure bound to the exact Engine lifecycle phase that ran it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{point} interceptor failed: {error}")]
+#[error("{phase} interceptor failed: {error}")]
 pub struct InterceptorFailure {
-    point: InterceptorPoint,
+    phase: InterceptorPhase,
     #[source]
     error: InterceptorError,
 }
 
 impl InterceptorFailure {
-    pub(crate) fn new(point: InterceptorPoint, error: InterceptorError) -> Self {
-        Self { point, error }
+    pub(crate) fn new(phase: InterceptorPhase, error: InterceptorError) -> Self {
+        Self { phase, error }
     }
 
-    /// The lifecycle point that returned the failure.
-    pub fn point(&self) -> InterceptorPoint {
-        self.point
+    pub fn phase(&self) -> InterceptorPhase {
+        self.phase
     }
 
-    /// The typed error returned by the interceptor.
     pub fn error(&self) -> &InterceptorError {
         &self.error
     }
 }
 
-/// Result returned by asynchronous interceptor lifecycle methods.
 pub type InterceptorResult<T> = Result<T, InterceptorError>;
 
 // =============================================================================
 // Lifecycle Contexts
 // =============================================================================
 
-/// Mutable prompt input presented before it is committed to Engine history.
-pub struct PromptSubmitContext<'a> {
+pub struct PromptSubmitContext<'a, A = ()> {
+    pub invocation: InterceptorInvocation,
     pub item: &'a mut Item,
+    pub history: &'a [HistoryEntry<A>],
 }
 
-/// Mutable provider-visible item projection presented before an LLM request.
-pub struct PreLlmRequestContext<'a> {
+pub struct PendingHistoryAppendsContext<'a, A = ()> {
+    pub invocation: InterceptorInvocation,
+    pub history: &'a [HistoryEntry<A>],
+}
+
+pub struct PreLlmRequestContext<'a, A = ()> {
+    pub invocation: InterceptorInvocation,
     pub items: &'a mut Vec<Item>,
+    pub history: &'a [HistoryEntry<A>],
 }
 
-/// A terminalized and committed assistant response at the next-phase boundary.
-pub struct AssistantTurnEndContext<'a> {
-    /// The exact assistant items committed for this response.
-    pub assistant_items: &'a [Item],
-    /// The committed Engine history after the assistant items were appended.
-    pub history: &'a [Item],
-    /// Terminal tool calls collected from the response, if any.
+pub struct AssistantTurnEndContext<'a, A = ()> {
+    pub invocation: InterceptorInvocation,
+    pub assistant_entries: &'a [HistoryEntry<A>],
+    pub history: &'a [HistoryEntry<A>],
     pub tool_calls: &'a [ToolCall],
 }
 
-/// The one terminal outcome produced by a public Engine run or resume call.
-pub struct RunExitContext<'a> {
+pub struct RunExitContext<'a, A = ()> {
+    pub invocation: InterceptorInvocation,
     pub exit: &'a EngineRunExit,
+    pub history: &'a [HistoryEntry<A>],
 }
 
 // =============================================================================
@@ -224,8 +293,9 @@ pub enum TurnEndAction {
 // =============================================================================
 
 /// Context for pre-tool-call decisions.
-pub struct ToolCallInfo {
-    /// Tool call information (modifiable).
+pub struct ToolCallInfo<'a, A = ()> {
+    pub invocation: InterceptorInvocation,
+    pub history: &'a [HistoryEntry<A>],
     pub call: ToolCall,
     /// Tool meta information.
     pub meta: ToolMeta,
@@ -236,8 +306,9 @@ pub struct ToolCallInfo {
 }
 
 /// Context for post-tool-call decisions.
-pub struct ToolResultInfo {
-    /// Original tool call.
+pub struct ToolResultInfo<'a, A = ()> {
+    pub invocation: InterceptorInvocation,
+    pub history: &'a [HistoryEntry<A>],
     pub call: ToolCall,
     /// Committed terminal tool execution result.
     pub result: ToolResult,
@@ -258,17 +329,17 @@ pub struct ToolResultInfo {
 /// Every lifecycle method is asynchronous and returns [`InterceptorResult`],
 /// keeping implementation failure separate from the method's control-flow
 /// action. The Engine reports a failure as a typed run interruption annotated
-/// with the exact [`InterceptorPoint`] that failed.
+/// with the exact [`InterceptorPhase`] that failed.
 ///
 /// All methods have default implementations that let the Engine proceed
 /// without intervention. Callers provide richer implementations for approval
 /// flows, permission checks, and other trusted host adaptation.
 #[async_trait]
-pub trait Interceptor: Send + Sync {
+pub trait Interceptor<A: Send + Sync = ()>: Send + Sync {
     /// Called after receiving user input, before adding it to Engine history.
     async fn on_prompt_submit(
         &self,
-        _context: PromptSubmitContext<'_>,
+        _context: PromptSubmitContext<'_, A>,
     ) -> InterceptorResult<PromptAction> {
         Ok(PromptAction::Continue)
     }
@@ -291,7 +362,10 @@ pub trait Interceptor: Send + Sync {
     /// reproducible per-request transformations (pruning, content
     /// trimming, cache anchors) that depend only on the existing
     /// history.
-    async fn pending_history_appends(&self) -> InterceptorResult<Vec<Item>> {
+    async fn pending_history_appends(
+        &self,
+        _context: PendingHistoryAppendsContext<'_, A>,
+    ) -> InterceptorResult<Vec<Item>> {
         Ok(Vec::new())
     }
 
@@ -305,18 +379,24 @@ pub trait Interceptor: Send + Sync {
     /// commits it to history before the request is sent.
     async fn pre_llm_request(
         &self,
-        _context: PreLlmRequestContext<'_>,
+        _context: PreLlmRequestContext<'_, A>,
     ) -> InterceptorResult<PreRequestAction> {
         Ok(PreRequestAction::Continue)
     }
 
     /// Called before each tool is executed.
-    async fn pre_tool_call(&self, _info: &mut ToolCallInfo) -> InterceptorResult<PreToolAction> {
+    async fn pre_tool_call(
+        &self,
+        _info: &mut ToolCallInfo<'_, A>,
+    ) -> InterceptorResult<PreToolAction> {
         Ok(PreToolAction::Continue)
     }
 
     /// Called after each tool reaches one terminal result and that result is committed.
-    async fn post_tool_call(&self, _info: &ToolResultInfo) -> InterceptorResult<PostToolAction> {
+    async fn post_tool_call(
+        &self,
+        _info: &ToolResultInfo<'_, A>,
+    ) -> InterceptorResult<PostToolAction> {
         Ok(PostToolAction::Continue)
     }
 
@@ -324,13 +404,13 @@ pub trait Interceptor: Send + Sync {
     /// the Engine decides whether to execute tools, continue, or finish.
     async fn on_assistant_turn_end(
         &self,
-        _context: AssistantTurnEndContext<'_>,
+        _context: AssistantTurnEndContext<'_, A>,
     ) -> InterceptorResult<TurnEndAction> {
         Ok(TurnEndAction::Finish)
     }
 
     /// Called once for the terminal outcome of each public run or resume call.
-    async fn on_run_exit(&self, _context: RunExitContext<'_>) -> InterceptorResult<()> {
+    async fn on_run_exit(&self, _context: RunExitContext<'_, A>) -> InterceptorResult<()> {
         Ok(())
     }
 }
@@ -340,4 +420,4 @@ pub trait Interceptor: Send + Sync {
 pub(crate) struct DefaultInterceptor;
 
 #[async_trait]
-impl Interceptor for DefaultInterceptor {}
+impl<A: Send + Sync> Interceptor<A> for DefaultInterceptor {}

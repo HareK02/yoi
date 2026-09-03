@@ -5996,7 +5996,7 @@ where
 /// Note: `system_prompt` is intentionally not applied here. It is a
 /// minijinja template that is parsed by `Worker::from_manifest` and
 /// rendered once at first turn in `ensure_system_prompt_materialized`.
-pub fn apply_worker_manifest<C: LlmClient + 'static, A>(
+pub fn apply_worker_manifest<C: LlmClient + 'static, A: Send + Sync>(
     worker: &mut Engine<C, Mutable, A>,
     wm: &manifest::EngineManifest,
 ) {

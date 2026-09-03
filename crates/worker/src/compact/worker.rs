@@ -400,10 +400,10 @@ impl CompactWorkerInterceptor {
 }
 
 #[async_trait]
-impl Interceptor for CompactWorkerInterceptor {
+impl<A: Send + Sync> Interceptor<A> for CompactWorkerInterceptor {
     async fn pre_llm_request(
         &self,
-        context: PreLlmRequestContext<'_>,
+        context: PreLlmRequestContext<'_, A>,
     ) -> InterceptorResult<PreRequestAction> {
         let context = context.items;
         let records = self.usage_tracker.records();
@@ -427,7 +427,10 @@ impl Interceptor for CompactWorkerInterceptor {
         Ok(PreRequestAction::Continue)
     }
 
-    async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> InterceptorResult<PreToolAction> {
+    async fn pre_tool_call(
+        &self,
+        info: &mut ToolCallInfo<'_, A>,
+    ) -> InterceptorResult<PreToolAction> {
         if self.final_reserve_tokens == 0 || info.call.name == "write_summary" {
             return Ok(PreToolAction::Continue);
         }
@@ -475,8 +478,10 @@ mod tests {
 
         assert!(matches!(
             interceptor
-                .pre_llm_request(PreLlmRequestContext {
+                .pre_llm_request(PreLlmRequestContext::<()> {
+                    invocation: Default::default(),
                     items: &mut context,
+                    history: &[],
                 })
                 .await
                 .unwrap(),
@@ -486,8 +491,10 @@ mod tests {
 
         assert!(matches!(
             interceptor
-                .pre_llm_request(PreLlmRequestContext {
+                .pre_llm_request(PreLlmRequestContext::<()> {
+                    invocation: Default::default(),
                     items: &mut context,
+                    history: &[],
                 })
                 .await
                 .unwrap(),
@@ -499,8 +506,10 @@ mod tests {
         // current occupancy is still the latest 100-token measurement.
         assert!(matches!(
             interceptor
-                .pre_llm_request(PreLlmRequestContext {
+                .pre_llm_request(PreLlmRequestContext::<()> {
+                    invocation: Default::default(),
                     items: &mut context,
+                    history: &[],
                 })
                 .await
                 .unwrap(),
@@ -526,8 +535,10 @@ mod tests {
 
         assert!(matches!(
             interceptor
-                .pre_llm_request(PreLlmRequestContext {
+                .pre_llm_request(PreLlmRequestContext::<()> {
+                    invocation: Default::default(),
                     items: &mut context,
+                    history: &[],
                 })
                 .await
                 .unwrap(),
@@ -537,8 +548,10 @@ mod tests {
 
         assert!(matches!(
             interceptor
-                .pre_llm_request(PreLlmRequestContext {
+                .pre_llm_request(PreLlmRequestContext::<()> {
+                    invocation: Default::default(),
                     items: &mut context,
+                    history: &[],
                 })
                 .await
                 .unwrap(),
@@ -556,8 +569,10 @@ mod tests {
 
         assert!(matches!(
             interceptor
-                .pre_llm_request(PreLlmRequestContext {
+                .pre_llm_request(PreLlmRequestContext::<()> {
+                    invocation: Default::default(),
                     items: &mut context,
+                    history: &[],
                 })
                 .await
                 .unwrap(),
@@ -567,8 +582,10 @@ mod tests {
 
         assert!(matches!(
             interceptor
-                .pre_llm_request(PreLlmRequestContext {
+                .pre_llm_request(PreLlmRequestContext::<()> {
+                    invocation: Default::default(),
                     items: &mut context,
+                    history: &[],
                 })
                 .await
                 .unwrap(),

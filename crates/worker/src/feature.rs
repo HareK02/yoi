@@ -1795,7 +1795,7 @@ impl FeatureRegistryBuilder {
     }
 
     /// Install modules into the existing Engine tool path and hook builder.
-    pub(crate) fn install_into_engine<C: LlmClient, A>(
+    pub(crate) fn install_into_engine<C: LlmClient, A: Send + Sync>(
         self,
         worker: &mut Engine<C, Mutable, A>,
         hook_builder: &mut HookRegistryBuilder,

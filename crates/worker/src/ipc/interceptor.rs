@@ -15,7 +15,8 @@ use std::sync::{Arc, Mutex};
 use agen::Item;
 use agen::UsageRecord;
 use agen::interceptor::{
-    AssistantTurnEndContext, Interceptor, InterceptorResult, PostToolAction, PreLlmRequestContext,
+    AssistantTurnEndContext, Interceptor, InterceptorError, InterceptorErrorCategory,
+    InterceptorResult, PendingHistoryAppendsContext, PostToolAction, PreLlmRequestContext,
     PreRequestAction, PreToolAction, PromptAction, PromptSubmitContext, ToolCallInfo,
     ToolResultInfo, TurnEndAction,
 };
@@ -232,10 +233,10 @@ impl WorkerInterceptor {
 }
 
 #[async_trait]
-impl Interceptor for WorkerInterceptor {
+impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
     async fn on_prompt_submit(
         &self,
-        context: PromptSubmitContext<'_>,
+        context: PromptSubmitContext<'_, SessionHistoryMetadata>,
     ) -> InterceptorResult<PromptAction> {
         let item = context.item;
         let turn_index = self.next_turn_index.fetch_add(1, Ordering::Relaxed);
@@ -274,7 +275,10 @@ impl Interceptor for WorkerInterceptor {
         })
     }
 
-    async fn pending_history_appends(&self) -> InterceptorResult<Vec<Item>> {
+    async fn pending_history_appends(
+        &self,
+        _context: PendingHistoryAppendsContext<'_, SessionHistoryMetadata>,
+    ) -> InterceptorResult<Vec<Item>> {
         let drained = self.pending_notifies.drain();
         if drained.is_empty() {
             return Ok(Vec::new());
@@ -300,7 +304,10 @@ impl Interceptor for WorkerInterceptor {
                 Ok(system_item) => system_item,
                 Err(error) => {
                     self.pending_notifies.requeue_front(drained);
-                    return Err(format!("failed to render notify_wrapper: {error}").into());
+                    return Err(InterceptorError::new(
+                        InterceptorErrorCategory::Dependency,
+                        format!("failed to render notify_wrapper: {error}"),
+                    ));
                 }
             };
             items.push(system_item.to_history_item());
@@ -308,14 +315,17 @@ impl Interceptor for WorkerInterceptor {
         }
         if let Err(error) = self.commit_system_items(&system_items) {
             self.pending_notifies.requeue_front(drained);
-            return Err(format!("session persistence failed: {error}").into());
+            return Err(InterceptorError::new(
+                InterceptorErrorCategory::Dependency,
+                format!("session persistence failed: {error}"),
+            ));
         }
         Ok(items)
     }
 
     async fn pre_llm_request(
         &self,
-        context: PreLlmRequestContext<'_>,
+        context: PreLlmRequestContext<'_, SessionHistoryMetadata>,
     ) -> InterceptorResult<PreRequestAction> {
         let context = context.items;
         let initial_tokens = self.estimated_tokens(context);
@@ -385,7 +395,10 @@ impl Interceptor for WorkerInterceptor {
         })
     }
 
-    async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> InterceptorResult<PreToolAction> {
+    async fn pre_tool_call(
+        &self,
+        info: &mut ToolCallInfo<'_, SessionHistoryMetadata>,
+    ) -> InterceptorResult<PreToolAction> {
         let summary = ToolCallSummary {
             call_id: info.call.id.clone(),
             tool_name: info.call.name.clone(),
@@ -401,7 +414,10 @@ impl Interceptor for WorkerInterceptor {
         Ok(PreToolAction::Continue)
     }
 
-    async fn post_tool_call(&self, info: &ToolResultInfo) -> InterceptorResult<PostToolAction> {
+    async fn post_tool_call(
+        &self,
+        info: &ToolResultInfo<'_, SessionHistoryMetadata>,
+    ) -> InterceptorResult<PostToolAction> {
         let summary = ToolResultSummary {
             call_id: info.result.tool_use_id.clone(),
             tool_name: info.call.name.clone(),
@@ -424,14 +440,14 @@ impl Interceptor for WorkerInterceptor {
 
     async fn on_assistant_turn_end(
         &self,
-        context: AssistantTurnEndContext<'_>,
+        context: AssistantTurnEndContext<'_, SessionHistoryMetadata>,
     ) -> InterceptorResult<TurnEndAction> {
         let history = context.history;
         let final_text_preview = history
             .iter()
             .rev()
-            .find(|i| i.is_assistant_message())
-            .and_then(extract_message_text)
+            .find(|entry| entry.item.is_assistant_message())
+            .and_then(|entry| extract_message_text(&entry.item))
             .map(|t| preview(&t, FINAL_TEXT_PREVIEW_LIMIT))
             .unwrap_or_default();
         let info = TurnEndInfo {
@@ -515,6 +531,7 @@ mod tests {
         Hook, HookPostToolAction, HookPreRequestAction, HookPreToolAction, HookRegistryBuilder,
         HookTurnEndAction, OnTurnEnd, PostToolCall, PreLlmRequest, PreToolCall,
     };
+    use crate::session_history::{WorkerHistoryProvenance, history_entry};
 
     fn test_prompts() -> Arc<ArcSwap<PromptCatalog>> {
         Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap()))
@@ -574,7 +591,10 @@ mod tests {
         }
     }
 
-    fn task_tool_call_info(name: &str, input: serde_json::Value) -> ToolCallInfo {
+    fn task_tool_call_info(
+        name: &str,
+        input: serde_json::Value,
+    ) -> ToolCallInfo<'static, SessionHistoryMetadata> {
         let def = crate::feature::builtin::task::task_tools(
             crate::feature::builtin::task::TaskStore::new(),
         )
@@ -586,6 +606,8 @@ mod tests {
         .expect("task tool definition");
         let (meta, tool) = def();
         ToolCallInfo {
+            invocation: Default::default(),
+            history: &[],
             call: agen::tool::ToolCall {
                 id: "call-id".into(),
                 name: name.into(),
@@ -630,7 +652,11 @@ mod tests {
         );
         let mut ctx = ctx_items;
         let action = interceptor
-            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .pre_llm_request(PreLlmRequestContext {
+                invocation: Default::default(),
+                items: &mut ctx,
+                history: &[],
+            })
             .await
             .unwrap();
 
@@ -665,7 +691,11 @@ mod tests {
         );
         let mut ctx = ctx_items;
         let action = interceptor
-            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .pre_llm_request(PreLlmRequestContext {
+                invocation: Default::default(),
+                items: &mut ctx,
+                history: &[],
+            })
             .await
             .unwrap();
 
@@ -705,7 +735,11 @@ mod tests {
         .with_usage_tracker(usage_tracker);
         let mut ctx = ctx_items;
         let action = interceptor
-            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .pre_llm_request(PreLlmRequestContext {
+                invocation: Default::default(),
+                items: &mut ctx,
+                history: &[],
+            })
             .await
             .unwrap();
 
@@ -732,7 +766,11 @@ mod tests {
         );
         let mut ctx = ctx_items;
         let action = interceptor
-            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .pre_llm_request(PreLlmRequestContext {
+                invocation: Default::default(),
+                items: &mut ctx,
+                history: &[],
+            })
             .await
             .unwrap();
 
@@ -776,7 +814,11 @@ mod tests {
         );
         let mut ctx = ctx_items;
         let action = interceptor
-            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .pre_llm_request(PreLlmRequestContext {
+                invocation: Default::default(),
+                items: &mut ctx,
+                history: &[],
+            })
             .await
             .unwrap();
 
@@ -806,7 +848,11 @@ mod tests {
         );
         let mut ctx = ctx_items;
         let action = interceptor
-            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .pre_llm_request(PreLlmRequestContext {
+                invocation: Default::default(),
+                items: &mut ctx,
+                history: &[],
+            })
             .await
             .unwrap();
 
@@ -830,7 +876,11 @@ mod tests {
         );
         let mut ctx: Vec<Item> = Vec::new();
         let action = interceptor
-            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .pre_llm_request(PreLlmRequestContext {
+                invocation: Default::default(),
+                items: &mut ctx,
+                history: &[],
+            })
             .await
             .unwrap();
 
@@ -862,7 +912,11 @@ mod tests {
 
         let mut ctx: Vec<Item> = Vec::new();
         let action = interceptor
-            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .pre_llm_request(PreLlmRequestContext {
+                invocation: Default::default(),
+                items: &mut ctx,
+                history: &[],
+            })
             .await
             .unwrap();
 
@@ -912,7 +966,11 @@ mod tests {
 
         let mut ctx: Vec<Item> = Vec::new();
         let action = interceptor
-            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .pre_llm_request(PreLlmRequestContext {
+                invocation: Default::default(),
+                items: &mut ctx,
+                history: &[],
+            })
             .await
             .unwrap();
 
@@ -1017,7 +1075,9 @@ mod tests {
             None,
         );
         let info = task_tool_call_info("TaskList", serde_json::json!({}));
-        let mut result_info = ToolResultInfo {
+        let result_info = ToolResultInfo {
+            invocation: Default::default(),
+            history: &[],
             call: info.call,
             result: agen::tool::ToolResult::from_output(
                 "call-id",
@@ -1033,7 +1093,7 @@ mod tests {
             context: info.context,
         };
 
-        let action = interceptor.post_tool_call(&mut result_info).await.unwrap();
+        let action = interceptor.post_tool_call(&result_info).await.unwrap();
 
         assert_eq!(action, PostToolAction::Abort("post tool abort".to_string()));
         assert_eq!(count.load(Ordering::Relaxed), 1);
@@ -1067,11 +1127,20 @@ mod tests {
             test_prompts(),
             None,
         );
-        let history = vec![Item::user_message("hi"), Item::assistant_message("done")];
-
+        let history = vec![
+            history_entry(
+                Item::user_message("hi"),
+                WorkerHistoryProvenance::LegacyUnknown,
+            ),
+            history_entry(
+                Item::assistant_message("done"),
+                WorkerHistoryProvenance::LegacyUnknown,
+            ),
+        ];
         let action = interceptor
             .on_assistant_turn_end(AssistantTurnEndContext {
-                assistant_items: &[],
+                invocation: Default::default(),
+                assistant_entries: &history[1..],
                 history: &history,
                 tool_calls: &[],
             })
@@ -1114,7 +1183,11 @@ mod tests {
         for _ in 0..23 {
             let mut ctx = ctx_items.clone();
             let action = interceptor
-                .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+                .pre_llm_request(PreLlmRequestContext {
+                    invocation: Default::default(),
+                    items: &mut ctx,
+                    history: &[],
+                })
                 .await
                 .unwrap();
             assert!(matches!(action, PreRequestAction::Continue));
@@ -1129,7 +1202,11 @@ mod tests {
 
         let mut ctx = ctx_items.clone();
         let action = interceptor
-            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .pre_llm_request(PreLlmRequestContext {
+                invocation: Default::default(),
+                items: &mut ctx,
+                history: &[],
+            })
             .await
             .unwrap();
         let appended_len = match action {
@@ -1204,7 +1281,13 @@ mod tests {
         ));
 
         buffer.push_notify("updated".to_string(), false);
-        let appends = interceptor.pending_history_appends().await.unwrap();
+        let appends = interceptor
+            .pending_history_appends(PendingHistoryAppendsContext {
+                invocation: Default::default(),
+                history: &[],
+            })
+            .await
+            .unwrap();
         assert_eq!(appends.len(), 1);
         assert!(format!("{:?}", appends[0]).contains("CURRENT-PROJECTION updated"));
         let committed = committed.lock().unwrap();
@@ -1254,9 +1337,19 @@ mod tests {
         ));
         buffer.push_notify("must persist".to_string(), false);
 
-        let error = interceptor.pending_history_appends().await.unwrap_err();
+        let error = interceptor
+            .pending_history_appends(PendingHistoryAppendsContext {
+                invocation: Default::default(),
+                history: &[],
+            })
+            .await
+            .unwrap_err();
 
-        assert!(error.message().contains("failed to render notify_wrapper"));
+        assert!(
+            error
+                .diagnostic()
+                .contains("failed to render notify_wrapper")
+        );
         let requeued = buffer.drain();
         assert_eq!(requeued.len(), 1);
     }
@@ -1278,7 +1371,13 @@ mod tests {
             None,
         );
 
-        let items = interceptor.pending_history_appends().await.unwrap();
+        let items = interceptor
+            .pending_history_appends(PendingHistoryAppendsContext {
+                invocation: Default::default(),
+                history: &[],
+            })
+            .await
+            .unwrap();
         assert_eq!(items.len(), 2);
         let first = items[0].as_text().unwrap_or_default();
         let second = items[1].as_text().unwrap_or_default();
@@ -1292,7 +1391,13 @@ mod tests {
         );
 
         // Empty buffer → empty Vec (no synthesised items).
-        let again = interceptor.pending_history_appends().await.unwrap();
+        let again = interceptor
+            .pending_history_appends(PendingHistoryAppendsContext {
+                invocation: Default::default(),
+                history: &[],
+            })
+            .await
+            .unwrap();
         assert!(again.is_empty());
     }
 
@@ -1316,7 +1421,11 @@ mod tests {
         );
         let mut ctx: Vec<Item> = vec![Item::user_message("hi")];
         let action = interceptor
-            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .pre_llm_request(PreLlmRequestContext {
+                invocation: Default::default(),
+                items: &mut ctx,
+                history: &[],
+            })
             .await
             .unwrap();
 
@@ -1349,7 +1458,11 @@ mod tests {
         );
         let mut ctx: Vec<Item> = Vec::new();
         let action = interceptor
-            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .pre_llm_request(PreLlmRequestContext {
+                invocation: Default::default(),
+                items: &mut ctx,
+                history: &[],
+            })
             .await
             .unwrap();
 

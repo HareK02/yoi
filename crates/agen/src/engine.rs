@@ -15,10 +15,12 @@ use crate::{
     },
     handler::{ErrorKind, StatusKind, ToolUseBlockStart, UsageKind},
     interceptor::{
-        AssistantTurnEndContext, DefaultInterceptor, Interceptor, InterceptorFailure,
-        InterceptorPoint, PostToolAction, PreLlmRequestContext, PreRequestAction, PreToolAction,
-        PromptAction, PromptSubmitContext, RunExitContext, ToolCallInfo, ToolResultInfo,
-        TurnEndAction,
+        AssistantTurnEndContext, DefaultInterceptor, Interceptor, InterceptorCallId,
+        InterceptorCounter, InterceptorCounters, InterceptorError, InterceptorErrorCategory,
+        InterceptorFailure, InterceptorInvocation, InterceptorPhase, InterceptorRunId,
+        InterceptorTurnId, PendingHistoryAppendsContext, PostToolAction, PreLlmRequestContext,
+        PreRequestAction, PreToolAction, PromptAction, PromptSubmitContext, RunExitContext,
+        ToolCallInfo, ToolResultInfo, TurnEndAction,
     },
     llm_client::{
         ClientError, ConfigWarning, LlmClient, Request, RequestConfig, ResponseStream,
@@ -186,7 +188,7 @@ impl From<Result<EngineResult, EngineError>> for EngineRunExit {
 /// Result of [`Engine::run`] or [`Engine::resume`].
 ///
 /// Contains the `Locked` Engine (ready for subsequent runs) and the outcome.
-pub struct EngineRunOutput<C: LlmClient, A = ()> {
+pub struct EngineRunOutput<C: LlmClient, A: Send + Sync = ()> {
     /// The Engine, now in Locked state.
     pub engine: Engine<C, Locked, A>,
     /// Outcome of the turn.
@@ -310,7 +312,7 @@ enum StreamCompletion {
     Interrupted { reason: String },
 }
 
-pub struct Engine<C: LlmClient, S: EngineState = Mutable, A = ()> {
+pub struct Engine<C: LlmClient, S: EngineState = Mutable, A: Send + Sync = ()> {
     /// LLM client
     client: C,
     /// Retry policy for opening an LLM response stream.
@@ -327,7 +329,7 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable, A = ()> {
     /// Tool server handle
     tool_server: ToolServerHandle,
     /// Interceptor for control-flow decisions
-    interceptor: Box<dyn Interceptor>,
+    interceptor: Box<dyn Interceptor<A>>,
     /// System prompt
     system_prompt: Option<String>,
     /// History length at lock time (only meaningful in Locked state)
@@ -346,6 +348,11 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable, A = ()> {
     /// `max_turns` is enforced against this run-scoped count rather than the
     /// cumulative `turn_count` above.
     active_run_turn_count: Option<usize>,
+    /// Identity retained across pause/yield and resume.
+    active_run_id: Option<InterceptorRunId>,
+    next_run_id: u64,
+    interceptor_invocation_count: usize,
+    last_run_exit_observer_failure: Option<InterceptorFailure>,
     /// LlmCall count (per-Engine running counter, monotonic). Unlike
     /// `turn_count` this never collapses retries.
     llm_call_count: usize,
@@ -426,18 +433,57 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable, A = ()> {
     _state: PhantomData<(S, A)>,
 }
 
-impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
+impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
     fn start_logical_run(&mut self) {
         self.active_run_turn_count = Some(0);
+        self.active_run_id = Some(InterceptorRunId(self.next_run_id));
+        self.next_run_id = self.next_run_id.wrapping_add(1).max(1);
+        self.interceptor_invocation_count = 0;
+        self.last_run_exit_observer_failure = None;
     }
 
     fn ensure_logical_run(&mut self) {
         self.active_run_turn_count.get_or_insert(0);
+        if self.active_run_id.is_none() {
+            self.active_run_id = Some(InterceptorRunId(self.next_run_id));
+            self.next_run_id = self.next_run_id.wrapping_add(1).max(1);
+            self.interceptor_invocation_count = 0;
+        }
+    }
+
+    fn interceptor_invocation(
+        &mut self,
+        phase: InterceptorPhase,
+        turn_id: Option<usize>,
+        call_id: Option<InterceptorCallId>,
+        tool_call: usize,
+    ) -> InterceptorInvocation {
+        let invocation = self.interceptor_invocation_count;
+        self.interceptor_invocation_count = self.interceptor_invocation_count.saturating_add(1);
+        InterceptorInvocation {
+            run_id: self
+                .active_run_id
+                .expect("logical run identity must exist before interception"),
+            turn_id: turn_id.map(|value| InterceptorTurnId(value as u64)),
+            call_id,
+            phase,
+            counters: InterceptorCounters {
+                invocation: InterceptorCounter::from_usize(invocation),
+                engine_turn: InterceptorCounter::from_usize(self.turn_count),
+                run_turn: InterceptorCounter::from_usize(
+                    self.active_run_turn_count.unwrap_or_default(),
+                ),
+                llm_call: InterceptorCounter::from_usize(self.llm_call_count),
+                tool_batch: InterceptorCounter::from_usize(self.tool_execution_batch_count),
+                tool_call: InterceptorCounter::from_usize(tool_call),
+            },
+        }
     }
 
     fn finish_logical_run(&mut self, exit: &EngineRunExit) {
         if !matches!(exit, EngineRunExit::Paused | EngineRunExit::Yielded) {
             self.active_run_turn_count = None;
+            self.active_run_id = None;
         }
     }
 
@@ -743,7 +789,7 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
     /// The interceptor governs approval, skip, pause, and abort decisions
     /// at key points in the execution loop. If not set, the default
     /// interceptor is used (all Continue / Finish).
-    pub fn set_interceptor(&mut self, interceptor: impl Interceptor + 'static) {
+    pub fn set_interceptor(&mut self, interceptor: impl Interceptor<A> + 'static) {
         self.interceptor = Box::new(interceptor);
     }
 
@@ -844,6 +890,10 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
     ///
     /// `Some` is retained only while Pause or Yield permits a later
     /// [`resume`](Self::resume). Terminal outcomes return this to `None`.
+    pub fn last_run_exit_observer_failure(&self) -> Option<&InterceptorFailure> {
+        self.last_run_exit_observer_failure.as_ref()
+    }
+
     pub fn active_run_turn_count(&self) -> Option<usize> {
         self.active_run_turn_count
     }
@@ -855,6 +905,13 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
     /// [`resume`](Self::resume) starts a fresh budget.
     pub fn set_active_run_turn_count(&mut self, turn_count: Option<usize>) {
         self.active_run_turn_count = turn_count;
+        if turn_count.is_none() {
+            self.active_run_id = None;
+        } else if self.active_run_id.is_none() {
+            self.active_run_id = Some(InterceptorRunId(self.next_run_id));
+            self.next_run_id = self.next_run_id.wrapping_add(1).max(1);
+            self.interceptor_invocation_count = 0;
+        }
     }
 
     /// Get the current LlmCall count (per-Engine running counter, never
@@ -1082,19 +1139,24 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
 
     async fn finalize_run_exit(
         &mut self,
+        history: &History<A>,
         result: Result<EngineResult, EngineError>,
     ) -> EngineRunExit {
         let exit = EngineRunExit::from(result);
-        let exit = match self
+        let invocation = self.interceptor_invocation(InterceptorPhase::RunExit, None, None, 0);
+        self.last_run_exit_observer_failure = None;
+        if let Err(error) = self
             .interceptor
-            .on_run_exit(RunExitContext { exit: &exit })
+            .on_run_exit(RunExitContext {
+                invocation,
+                exit: &exit,
+                history: history.entries(),
+            })
             .await
         {
-            Ok(()) => exit,
-            Err(error) => EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(
-                InterceptorFailure::new(InterceptorPoint::RunExit, error).into(),
-            )),
-        };
+            self.last_run_exit_observer_failure =
+                Some(InterceptorFailure::new(InterceptorPhase::RunExit, error));
+        }
         self.finish_logical_run(&exit);
         exit
     }
@@ -1167,9 +1229,18 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
         // Phase 1: Apply pre_tool_call interceptor (determine skip/abort/synthetic result)
         let mut approved_calls = Vec::new();
         for (call_index, mut tool_call) in tool_calls.into_iter().enumerate() {
+            let expected_tool_use_id = tool_call.id.clone();
             let context = ToolExecutionContext::new(&tool_call.id, &batch_id, call_index);
             if let Some((meta, tool)) = self.tool_server.get_tool(&tool_call.name) {
+                let invocation = self.interceptor_invocation(
+                    InterceptorPhase::PreToolCall,
+                    Some(self.turn_count.saturating_sub(1)),
+                    Some(InterceptorCallId::Tool(expected_tool_use_id.clone())),
+                    call_index,
+                );
                 let mut info = ToolCallInfo {
+                    invocation,
+                    history: history.entries(),
                     call: tool_call.clone(),
                     meta,
                     tool,
@@ -1182,16 +1253,36 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
                         .await
                         .map_err(|error| {
                             EngineError::from(InterceptorFailure::new(
-                                InterceptorPoint::PreToolCall,
+                                InterceptorPhase::PreToolCall,
                                 error,
                             ))
                         })?;
+                if info.call.id != expected_tool_use_id {
+                    return Err(InterceptorFailure::new(
+                        InterceptorPhase::PreToolCall,
+                        InterceptorError::new(
+                            InterceptorErrorCategory::ContractViolation,
+                            "pre-tool interceptor changed immutable tool call identity",
+                        ),
+                    )
+                    .into());
+                }
                 match pre_tool_action {
                     PreToolAction::Continue => {}
                     PreToolAction::Skip => {
                         continue;
                     }
                     PreToolAction::SyntheticResult(result) => {
+                        if result.tool_use_id != expected_tool_use_id {
+                            return Err(InterceptorFailure::new(
+                                InterceptorPhase::PreToolCall,
+                                InterceptorError::new(
+                                    InterceptorErrorCategory::ContractViolation,
+                                    "synthetic tool result changed immutable tool call identity",
+                                ),
+                            )
+                            .into());
+                        }
                         let tool_call = info.call;
                         let mut context = info.context;
                         context.call_id = tool_call.id.clone();
@@ -1538,7 +1629,15 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
         self.emit_tool_result(&tool_result);
 
         if let Some((tool_call, meta, tool, context)) = call_info {
+            let invocation = self.interceptor_invocation(
+                InterceptorPhase::PostToolCall,
+                Some(self.turn_count.saturating_sub(1)),
+                Some(InterceptorCallId::Tool(tool_call.id.clone())),
+                context.call_index,
+            );
             let info = ToolResultInfo {
+                invocation,
+                history: history.entries(),
                 call: tool_call.clone(),
                 result: tool_result,
                 meta: meta.clone(),
@@ -1551,7 +1650,7 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
                     .await
                     .map_err(|error| {
                         EngineError::from(InterceptorFailure::new(
-                            InterceptorPoint::PostToolCall,
+                            InterceptorPhase::PostToolCall,
                             error,
                         ))
                     })?;
@@ -1622,13 +1721,22 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
             // These are committed *before* the per-request clone so they
             // participate in the LLM request below and get persisted by
             // the caller that owns durable history.
+            let pending_invocation = self.interceptor_invocation(
+                InterceptorPhase::PendingHistoryAppends,
+                Some(current_turn),
+                None,
+                0,
+            );
             let pending = self
                 .interceptor
-                .pending_history_appends()
+                .pending_history_appends(PendingHistoryAppendsContext {
+                    invocation: pending_invocation,
+                    history: history.entries(),
+                })
                 .await
                 .map_err(|error| {
                     EngineError::from(InterceptorFailure::new(
-                        InterceptorPoint::PendingHistoryAppends,
+                        InterceptorPhase::PendingHistoryAppends,
                         error,
                     ))
                 })?;
@@ -1698,15 +1806,23 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
             }
 
             // Interceptor: pre_llm_request
+            let request_invocation = self.interceptor_invocation(
+                InterceptorPhase::PreLlmRequest,
+                Some(current_turn),
+                Some(InterceptorCallId::Llm(self.llm_call_count as u64)),
+                0,
+            );
             let pre_request_action = self
                 .interceptor
                 .pre_llm_request(PreLlmRequestContext {
+                    invocation: request_invocation,
                     items: &mut request_context,
+                    history: history.entries(),
                 })
                 .await
                 .map_err(|error| {
                     EngineError::from(InterceptorFailure::new(
-                        InterceptorPoint::PreLlmRequest,
+                        InterceptorPhase::PreLlmRequest,
                         error,
                     ))
                 })?;
@@ -1822,21 +1938,29 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
             let tool_calls = self.tool_call_collector.take_collected();
             let assistant_items =
                 self.build_assistant_items(&reasoning_items, &text_blocks, &tool_calls);
-            let committed_assistant_items = assistant_items.clone();
+            let assistant_start = history.len();
             self.append_history_items(history, assistant_items, annotate)?;
 
-            let assistant_turn_history = history.items_cloned();
+            let assistant_invocation = self.interceptor_invocation(
+                InterceptorPhase::AssistantTurnEnd,
+                Some(current_turn),
+                Some(InterceptorCallId::Llm(
+                    self.llm_call_count.saturating_sub(1) as u64,
+                )),
+                0,
+            );
             let assistant_turn_action = self
                 .interceptor
                 .on_assistant_turn_end(AssistantTurnEndContext {
-                    assistant_items: &committed_assistant_items,
-                    history: &assistant_turn_history,
+                    invocation: assistant_invocation,
+                    assistant_entries: &history.entries()[assistant_start..],
+                    history: history.entries(),
                     tool_calls: &tool_calls,
                 })
                 .await
                 .map_err(|error| {
                     EngineError::from(InterceptorFailure::new(
-                        InterceptorPoint::AssistantTurnEnd,
+                        InterceptorPhase::AssistantTurnEnd,
                         error,
                     ))
                 })?;
@@ -2145,7 +2269,7 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
     }
 }
 
-impl<C: LlmClient, A> Engine<C, Mutable, A> {
+impl<C: LlmClient, A: Send + Sync> Engine<C, Mutable, A> {
     /// Create a new annotated Engine (in Mutable state).
     pub fn new_annotated(client: C) -> Self {
         let text_block_collector = TextBlockCollector::new();
@@ -2173,6 +2297,10 @@ impl<C: LlmClient, A> Engine<C, Mutable, A> {
             locked_prefix_len: 0,
             turn_count: 0,
             active_run_turn_count: None,
+            active_run_id: None,
+            next_run_id: 1,
+            interceptor_invocation_count: 0,
+            last_run_exit_observer_failure: None,
             llm_call_count: 0,
             tool_execution_batch_count: 0,
             max_turns: None,
@@ -2448,6 +2576,10 @@ impl<C: LlmClient, A> Engine<C, Mutable, A> {
             locked_prefix_len,
             turn_count: self.turn_count,
             active_run_turn_count: self.active_run_turn_count,
+            active_run_id: self.active_run_id,
+            next_run_id: self.next_run_id,
+            interceptor_invocation_count: self.interceptor_invocation_count,
+            last_run_exit_observer_failure: self.last_run_exit_observer_failure,
             llm_call_count: self.llm_call_count,
             tool_execution_batch_count: self.tool_execution_batch_count,
             max_turns: self.max_turns,
@@ -2524,7 +2656,7 @@ impl<C: LlmClient> Engine<C, Mutable, ()> {
     }
 }
 
-impl<C: LlmClient, A> Engine<C, Locked, A> {
+impl<C: LlmClient, A: Send + Sync> Engine<C, Locked, A> {
     /// Execute a turn
     ///
     /// Adds a new user message to history and sends a request to the LLM.
@@ -2538,7 +2670,7 @@ impl<C: LlmClient, A> Engine<C, Locked, A> {
         let result = self
             .run_result_with_annotation(history, user_input.into(), annotate)
             .await;
-        self.finalize_run_exit(result).await
+        self.finalize_run_exit(history, result).await
     }
 
     async fn run_result_with_annotation(
@@ -2549,16 +2681,21 @@ impl<C: LlmClient, A> Engine<C, Locked, A> {
     ) -> Result<EngineResult, EngineError> {
         // Supplying new user input abandons any paused/yielded logical run.
         self.active_run_turn_count = None;
+        self.active_run_id = None;
+        self.start_logical_run();
         let mut user_item = Item::user_message(user_input);
+        let invocation = self.interceptor_invocation(InterceptorPhase::PromptSubmit, None, None, 0);
         let prompt_action = self
             .interceptor
             .on_prompt_submit(PromptSubmitContext {
+                invocation,
                 item: &mut user_item,
+                history: history.entries(),
             })
             .await
             .map_err(|error| {
                 EngineError::from(InterceptorFailure::new(
-                    InterceptorPoint::PromptSubmit,
+                    InterceptorPhase::PromptSubmit,
                     error,
                 ))
             })?;
@@ -2571,7 +2708,6 @@ impl<C: LlmClient, A> Engine<C, Locked, A> {
         if !extras.is_empty() {
             self.append_history_items(history, extras, annotate)?;
         }
-        self.start_logical_run();
         match self.run_turn_loop(history, annotate).await {
             Err(EngineError::PauseRequested) => Ok(EngineResult::Paused),
             other => other,
@@ -2585,7 +2721,7 @@ impl<C: LlmClient, A> Engine<C, Locked, A> {
         annotate: &mut impl FnMut(&Item) -> Result<A, String>,
     ) -> EngineRunExit {
         let result = self.resume_result_with_annotation(history, annotate).await;
-        self.finalize_run_exit(result).await
+        self.finalize_run_exit(history, result).await
     }
 
     async fn resume_result_with_annotation(
@@ -2623,6 +2759,10 @@ impl<C: LlmClient, A> Engine<C, Locked, A> {
             locked_prefix_len: 0,
             turn_count: self.turn_count,
             active_run_turn_count: self.active_run_turn_count,
+            active_run_id: self.active_run_id,
+            next_run_id: self.next_run_id,
+            interceptor_invocation_count: self.interceptor_invocation_count,
+            last_run_exit_observer_failure: self.last_run_exit_observer_failure,
             llm_call_count: self.llm_call_count,
             tool_execution_batch_count: self.tool_execution_batch_count,
             max_turns: self.max_turns,

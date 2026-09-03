@@ -7,14 +7,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agen::interceptor::{
-    Interceptor, InterceptorResult, PostToolAction, PreToolAction, ToolCallInfo, ToolResultInfo,
+    Interceptor, InterceptorErrorCategory, InterceptorPhase, InterceptorResult, PostToolAction,
+    PreToolAction, ToolCallInfo, ToolResultInfo,
 };
 use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use agen::tool::{
     Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput, ToolResult,
     ToolResultDisposition,
 };
-use agen::{Engine, History, Item, ToolExecutionPolicy};
+use agen::{
+    Engine, EngineError, EngineRunExit, History, Item, RunInterruptionReason, ToolExecutionPolicy,
+};
 use async_trait::async_trait;
 
 mod common;
@@ -907,7 +910,10 @@ async fn test_tool_execution_context_for_skipped_and_synthetic_paths() {
 
     #[async_trait]
     impl Interceptor for ContextPolicy {
-        async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> InterceptorResult<PreToolAction> {
+        async fn pre_tool_call(
+            &self,
+            info: &mut ToolCallInfo<'_, ()>,
+        ) -> InterceptorResult<PreToolAction> {
             self.pre_contexts.lock().unwrap().push(info.context.clone());
             Ok(match info.call.name.as_str() {
                 "skip_tool" => PreToolAction::Skip,
@@ -919,7 +925,10 @@ async fn test_tool_execution_context_for_skipped_and_synthetic_paths() {
             })
         }
 
-        async fn post_tool_call(&self, info: &ToolResultInfo) -> InterceptorResult<PostToolAction> {
+        async fn post_tool_call(
+            &self,
+            info: &ToolResultInfo<'_, ()>,
+        ) -> InterceptorResult<PostToolAction> {
             self.post_contexts
                 .lock()
                 .unwrap()
@@ -996,7 +1005,10 @@ async fn test_before_tool_call_skip() {
 
     #[async_trait]
     impl Interceptor for BlockingPolicy {
-        async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> InterceptorResult<PreToolAction> {
+        async fn pre_tool_call(
+            &self,
+            info: &mut ToolCallInfo<'_, ()>,
+        ) -> InterceptorResult<PreToolAction> {
             Ok(if info.call.name == "blocked_tool" {
                 PreToolAction::Skip
             } else {
@@ -1083,7 +1095,19 @@ async fn test_post_tool_call_observes_committed_result() {
 
     #[async_trait]
     impl Interceptor for ObservingPolicy {
-        async fn post_tool_call(&self, info: &ToolResultInfo) -> InterceptorResult<PostToolAction> {
+        async fn post_tool_call(
+            &self,
+            info: &ToolResultInfo<'_, ()>,
+        ) -> InterceptorResult<PostToolAction> {
+            assert_eq!(info.invocation.phase, InterceptorPhase::PostToolCall);
+            assert_eq!(
+                info.invocation.call_id,
+                Some(agen::InterceptorCallId::Tool(info.call.id.clone()))
+            );
+            assert!(matches!(
+                info.history.last().map(|entry| &entry.item),
+                Some(Item::ToolResult { call_id, .. }) if call_id == &info.call.id
+            ));
             *self.observed_content.lock().unwrap() = Some(info.result.summary.clone());
             Ok(PostToolAction::Continue)
         }
@@ -1144,7 +1168,10 @@ async fn test_before_tool_call_synthetic_result_committed() {
 
     #[async_trait]
     impl Interceptor for SyntheticPolicy {
-        async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> InterceptorResult<PreToolAction> {
+        async fn pre_tool_call(
+            &self,
+            info: &mut ToolCallInfo<'_, ()>,
+        ) -> InterceptorResult<PreToolAction> {
             Ok(PreToolAction::SyntheticResult(ToolResult::error(
                 info.call.id.clone(),
                 "permission denied",
@@ -1166,6 +1193,80 @@ async fn test_before_tool_call_synthetic_result_committed() {
             ..
         } if call_id == "call_1" && summary == "permission denied"
     )));
+}
+
+#[derive(Clone, Copy)]
+enum InvalidIdentityMode {
+    ContinuedCall,
+    SyntheticResult,
+}
+
+struct InvalidIdentityPolicy(InvalidIdentityMode);
+
+#[async_trait]
+impl Interceptor for InvalidIdentityPolicy {
+    async fn pre_tool_call(
+        &self,
+        info: &mut ToolCallInfo<'_, ()>,
+    ) -> InterceptorResult<PreToolAction> {
+        assert_eq!(info.invocation.phase, InterceptorPhase::PreToolCall);
+        assert_eq!(
+            info.invocation.call_id,
+            Some(agen::InterceptorCallId::Tool("call_1".to_string()))
+        );
+        assert!(matches!(
+            info.history.last().map(|entry| &entry.item),
+            Some(Item::ToolCall { call_id, .. }) if call_id == "call_1"
+        ));
+        Ok(match self.0 {
+            InvalidIdentityMode::ContinuedCall => {
+                info.call.id = "different-call".to_string();
+                PreToolAction::Continue
+            }
+            InvalidIdentityMode::SyntheticResult => PreToolAction::SyntheticResult(
+                ToolResult::error("different-call", "invalid synthetic result"),
+            ),
+        })
+    }
+}
+
+#[tokio::test]
+async fn interceptor_cannot_change_tool_call_identity() {
+    for mode in [
+        InvalidIdentityMode::ContinuedCall,
+        InvalidIdentityMode::SyntheticResult,
+    ] {
+        let client = MockLlmClient::new(vec![
+            Event::tool_use_start(0, "call_1", "echo"),
+            Event::tool_input_delta(0, r#"{}"#),
+            Event::tool_use_stop(0),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ]);
+        let mut engine = Engine::new(client);
+        engine.register_tool(SlowTool::new("echo", 1).definition());
+        engine.set_interceptor(InvalidIdentityPolicy(mode));
+        let mut history = History::new();
+
+        let result = engine.run(&mut history, "identity").await;
+        let EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(
+            EngineError::Interceptor(failure),
+        )) = result.result
+        else {
+            panic!("invalid tool identity must interrupt with a typed failure");
+        };
+        assert_eq!(failure.phase(), InterceptorPhase::PreToolCall);
+        assert_eq!(
+            failure.error().category(),
+            InterceptorErrorCategory::ContractViolation
+        );
+        assert!(
+            !history
+                .items()
+                .any(|item| matches!(item, Item::ToolResult { .. }))
+        );
+    }
 }
 
 #[tokio::test]
@@ -1190,7 +1291,7 @@ async fn post_tool_abort_commits_confirmed_result_before_stopping_run() {
     impl Interceptor for AbortAfterResult {
         async fn post_tool_call(
             &self,
-            _info: &ToolResultInfo,
+            _info: &ToolResultInfo<'_, ()>,
         ) -> InterceptorResult<PostToolAction> {
             self.lifecycle.lock().unwrap().push("post_tool_call");
             Ok(PostToolAction::Abort("policy stopped the run".to_string()))
