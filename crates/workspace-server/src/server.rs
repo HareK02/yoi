@@ -13167,22 +13167,13 @@ fn compensate_failed_worker_spawn(
     let cancellation = api
         .runtime
         .cancel_worker(&worker.worker, lifecycle_request.clone());
-    let cancellation_accepted = cancellation
+    let stop = api.runtime.stop_worker(&worker.worker, lifecycle_request);
+    let stop_accepted = stop
         .as_ref()
         .is_ok_and(|result| result.state == WorkerOperationState::Accepted);
-    let stop = (!cancellation_accepted)
-        .then(|| api.runtime.stop_worker(&worker.worker, lifecycle_request));
-    let stop_accepted = stop.as_ref().is_some_and(|result| {
-        result
-            .as_ref()
-            .is_ok_and(|result| result.state == WorkerOperationState::Accepted)
-    });
-    let termination_detail = (!cancellation_accepted && !stop_accepted).then(|| {
+    let termination_detail = (!stop_accepted).then(|| {
         let cancellation = lifecycle_failure_detail("cancel", &cancellation);
-        let stop = stop
-            .as_ref()
-            .map(|result| lifecycle_failure_detail("stop", result))
-            .unwrap_or_else(|| "stop was not attempted".to_string());
+        let stop = lifecycle_failure_detail("stop", &stop);
         format!("{cancellation}; {stop}")
     });
 
@@ -20256,7 +20247,7 @@ mod tests {
                 .iter()
                 .any(|assignment| assignment.role == "coder")
         );
-        assert_eq!(api.runtime.worker(&worker).unwrap().state, "cancelled");
+        assert_eq!(api.runtime.worker(&worker).unwrap().state, "idle");
 
         let Json(replayed) = scoped_cancel_ticket_implementation(State(api), path(), request())
             .await
@@ -26620,13 +26611,14 @@ mod tests {
             "embedded_worker_runtime"
         );
 
+        let repository_id = test_repository_id(&api);
         let workdir_id = "external-workdir";
         api.store
             .upsert_workdir_registry(&WorkdirRegistryRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 workdir_id: workdir_id.to_string(),
                 runtime_id: "external-workdir-runtime".to_string(),
-                repository_id: "main".to_string(),
+                repository_id,
                 creation_selector: None,
                 creation_ref: None,
                 creation_tree: None,

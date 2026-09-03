@@ -10,8 +10,8 @@ use agen::llm_client::client::LlmClient;
 use agen::llm_client::types::Role;
 use agen::state::Mutable;
 use agen::{
-    Engine, EngineError, EngineResult, EngineRunExit, History, HistoryEntry, Item, StopReason,
-    ToolExecutionPolicy, ToolOutputLimits, UsageRecord,
+    Engine, EngineError, EngineResult, EngineRunExit, History, HistoryEntry, Item,
+    RunInterruptionReason, ToolExecutionPolicy, ToolOutputLimits, UsageRecord,
 };
 use arc_swap::ArcSwap;
 use session_store::{
@@ -2605,7 +2605,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     ) -> bool {
         if !matches!(
             result,
-            EngineRunExit::Paused | EngineRunExit::Interrupted(StopReason::Cancelled)
+            EngineRunExit::Paused | EngineRunExit::Interrupted(RunInterruptionReason::Cancelled)
         ) {
             return false;
         }
@@ -3403,15 +3403,15 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 self.last_run_interrupted = true;
                 Ok(WorkerRunResult::Paused)
             }
-            EngineRunExit::Interrupted(StopReason::LimitReached) => {
+            EngineRunExit::Interrupted(RunInterruptionReason::LimitReached) => {
                 self.last_run_interrupted = false;
                 Ok(WorkerRunResult::LimitReached)
             }
             EngineRunExit::Interrupted(reason) => {
                 self.last_run_interrupted = true;
                 Ok(WorkerRunResult::Interrupted {
-                    code: stop_reason_error_code(&reason),
-                    message: stop_reason_message(&reason),
+                    code: run_interruption_reason_error_code(&reason),
+                    message: run_interruption_reason_message(&reason),
                 })
             }
             EngineRunExit::Yielded => unreachable!("yielded handled above"),
@@ -3731,9 +3731,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             result,
             EngineRunExit::Paused
                 | EngineRunExit::Yielded
-                | EngineRunExit::Interrupted(StopReason::Cancelled)
-                | EngineRunExit::Interrupted(StopReason::ContextWindowExceeded)
-                | EngineRunExit::Interrupted(StopReason::Unexpected(_))
+                | EngineRunExit::Interrupted(RunInterruptionReason::Cancelled)
+                | EngineRunExit::Interrupted(RunInterruptionReason::ContextWindowExceeded)
+                | EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(_))
         );
         let active_run_turn_count = self.engine.as_ref().unwrap().active_run_turn_count();
         match result {
@@ -3751,7 +3751,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     active_run_turn_count,
                 })?;
             }
-            EngineRunExit::Interrupted(StopReason::LimitReached) => {
+            EngineRunExit::Interrupted(RunInterruptionReason::LimitReached) => {
                 self.commit_entry(LogEntry::RunCompleted {
                     ts: segment_log::now_millis(),
                     interrupted: false,
@@ -3763,7 +3763,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 self.commit_entry(LogEntry::RunErrored {
                     ts: segment_log::now_millis(),
                     interrupted,
-                    message: stop_reason_message(reason),
+                    message: run_interruption_reason_message(reason),
                 })?;
             }
         }
@@ -6122,15 +6122,14 @@ fn restore_manifest_from_worker_metadata_snapshot(
     }
 }
 
-fn stop_reason_error_code(reason: &StopReason) -> ErrorCode {
+fn run_interruption_reason_error_code(reason: &RunInterruptionReason) -> ErrorCode {
     match reason {
-        StopReason::ContextWindowExceeded | StopReason::Unexpected(EngineError::Client(_)) => {
-            ErrorCode::ProviderError
-        }
-        StopReason::Unexpected(EngineError::Tool(_)) => ErrorCode::ToolError,
-        StopReason::LimitReached
-        | StopReason::Cancelled
-        | StopReason::Unexpected(
+        RunInterruptionReason::ContextWindowExceeded
+        | RunInterruptionReason::Unexpected(EngineError::Client(_)) => ErrorCode::ProviderError,
+        RunInterruptionReason::Unexpected(EngineError::Tool(_)) => ErrorCode::ToolError,
+        RunInterruptionReason::LimitReached
+        | RunInterruptionReason::Cancelled
+        | RunInterruptionReason::Unexpected(
             EngineError::Aborted(_)
             | EngineError::Cancelled
             | EngineError::PauseRequested
@@ -6141,12 +6140,12 @@ fn stop_reason_error_code(reason: &StopReason) -> ErrorCode {
     }
 }
 
-fn stop_reason_message(reason: &StopReason) -> String {
+fn run_interruption_reason_message(reason: &RunInterruptionReason) -> String {
     match reason {
-        StopReason::LimitReached => "engine turn limit reached".to_string(),
-        StopReason::ContextWindowExceeded => "model context window reached".to_string(),
-        StopReason::Cancelled => "engine run cancelled".to_string(),
-        StopReason::Unexpected(error) => format!("unexpected engine failure: {error}"),
+        RunInterruptionReason::LimitReached => "engine turn limit reached".to_string(),
+        RunInterruptionReason::ContextWindowExceeded => "model context window reached".to_string(),
+        RunInterruptionReason::Cancelled => "engine run cancelled".to_string(),
+        RunInterruptionReason::Unexpected(error) => format!("unexpected engine failure: {error}"),
     }
 }
 
@@ -8695,7 +8694,7 @@ mod build_summary_prompt_tests {
         ]);
         let _ = worker
             .handle_worker_result(
-                EngineRunExit::Interrupted(StopReason::Cancelled),
+                EngineRunExit::Interrupted(RunInterruptionReason::Cancelled),
                 worker.history().len(),
             )
             .await

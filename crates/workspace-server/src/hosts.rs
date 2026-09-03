@@ -3772,7 +3772,6 @@ fn embedded_worker_status_label(status: EmbeddedWorkerStatus) -> &'static str {
         EmbeddedWorkerStatus::Running => "running",
         EmbeddedWorkerStatus::Paused => "paused",
         EmbeddedWorkerStatus::Stopped => "stopped",
-        EmbeddedWorkerStatus::Cancelled => "cancelled",
     }
 }
 
@@ -5678,7 +5677,7 @@ mod tests {
                 json!({
                     "workers": [
                         worker_json_with_status("remote:primary", &worker_ids[0], "stopped"),
-                        worker_json_with_status("remote:primary", &worker_ids[1], "cancelled"),
+                        worker_json_with_status("remote:primary", &worker_ids[1], "running"),
                         worker_json_with_status("remote:primary", &worker_ids[2], "paused"),
                         worker_json_with_status("remote:primary", &worker_ids[3], "idle")
                     ]
@@ -5717,11 +5716,11 @@ mod tests {
         let workers = registry.list_workers(10);
         assert_eq!(workers.items.len(), 4);
         assert!(!workers.items[0].capabilities.can_stop);
-        assert!(!workers.items[1].capabilities.can_stop);
+        assert!(workers.items[1].capabilities.can_stop);
         assert!(workers.items[2].capabilities.can_stop);
         assert!(workers.items[3].capabilities.can_stop);
         assert_eq!(workers.items[0].state, "stopped");
-        assert_eq!(workers.items[1].state, "cancelled");
+        assert_eq!(workers.items[1].state, "running");
         assert_eq!(workers.items[2].state, "paused");
         assert_eq!(workers.items[3].state, "idle");
 

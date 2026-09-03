@@ -94,7 +94,7 @@ function projectWorker(worker: SubscriptionWorker): SidebarWorker {
       display_hint: 'Workspace-authorized Runtime Worker',
     },
     capabilities: {
-      can_stop: worker.state !== 'stopped' && worker.state !== 'cancelled',
+      can_stop: worker.state !== 'stopped',
       can_spawn_followup: false,
     },
     repository_key: worker.repository_key ?? null,

@@ -43,7 +43,6 @@ pub struct RuntimeSummary {
     pub worker_count: usize,
     pub active_worker_count: usize,
     pub stopped_worker_count: usize,
-    pub cancelled_worker_count: usize,
     pub diagnostic_count: usize,
     #[serde(default = "unknown_platform_component")]
     pub os: String,

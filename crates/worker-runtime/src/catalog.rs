@@ -250,6 +250,10 @@ pub struct CreateWorkerRequest {
 }
 
 /// Worker lifecycle status for the in-memory embedded runtime.
+///
+/// Run termination details are carried separately by the Worker protocol. In
+/// particular, cancellation returns a Worker to `Idle`; it is not a lifecycle
+/// state of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerStatus {
@@ -257,13 +261,19 @@ pub enum WorkerStatus {
     Running,
     Paused,
     Stopped,
-    Cancelled,
 }
 
 impl WorkerStatus {
     pub fn is_active(self) -> bool {
         matches!(self, Self::Idle | Self::Running | Self::Paused)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkerRestoreIntent {
+    Automatic,
+    Explicit,
 }
 
 /// Lightweight catalog row.
