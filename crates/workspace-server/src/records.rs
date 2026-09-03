@@ -316,10 +316,19 @@ pub struct TicketMergeRequestSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct MergeRequestRefDiagnostic {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct MergeRequestListItem {
     pub summary: TicketMergeRequestSummary,
     pub ticket_ids: Vec<String>,
     pub thread_event_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ref_diagnostics: Vec<MergeRequestRefDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

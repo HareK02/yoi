@@ -2741,6 +2741,89 @@ mod tests {
     }
 
     #[test]
+    fn repository_ref_observation_ignores_unpublished_and_stale_workdir_or_cache_refs() {
+        let seed = create_clean_repo();
+        let layout = tempfile::tempdir().unwrap();
+        let provider = layout.path().join("provider.git");
+        git(
+            layout.path(),
+            &[
+                "clone",
+                "--bare",
+                seed.path().to_str().unwrap(),
+                provider.to_str().unwrap(),
+            ],
+        );
+        let cache = layout.path().join("cache");
+        git(
+            layout.path(),
+            &["clone", provider.to_str().unwrap(), cache.to_str().unwrap()],
+        );
+        let workdir = layout.path().join("workdir");
+        git(
+            layout.path(),
+            &[
+                "clone",
+                provider.to_str().unwrap(),
+                workdir.to_str().unwrap(),
+            ],
+        );
+        git(&workdir, &["config", "user.name", "Yoi Test"]);
+        git(&workdir, &["config", "user.email", "yoi@example.com"]);
+        git(&workdir, &["switch", "-c", "published-source"]);
+        fs::write(workdir.join("source.txt"), "first\n").unwrap();
+        git(&workdir, &["add", "source.txt"]);
+        git(&workdir, &["commit", "-m", "source first"]);
+
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
+        let repository = request(&provider).repository;
+        let observation_request = RepositoryRefObservationRequest {
+            repository,
+            selector: "refs/heads/published-source".to_string(),
+            materialization: None,
+        };
+        assert_eq!(
+            materializer
+                .observe_repository_ref(&observation_request)
+                .unwrap_err()
+                .code,
+            "repository_ref_not_found"
+        );
+
+        git(
+            &workdir,
+            &["push", "origin", "HEAD:refs/heads/published-source"],
+        );
+        let first = materializer
+            .observe_repository_ref(&observation_request)
+            .unwrap();
+        fs::write(workdir.join("source.txt"), "second\n").unwrap();
+        git(&workdir, &["add", "source.txt"]);
+        git(&workdir, &["commit", "-m", "source second"]);
+        let unpublished_second = git_stdout(&workdir, ["rev-parse", "HEAD"]).unwrap();
+        let still_first = materializer
+            .observe_repository_ref(&observation_request)
+            .unwrap();
+        assert_eq!(still_first.revision_ref, first.revision_ref);
+        assert_ne!(still_first.revision_ref, unpublished_second);
+
+        git(
+            &workdir,
+            &["push", "origin", "HEAD:refs/heads/published-source"],
+        );
+        let second = materializer
+            .observe_repository_ref(&observation_request)
+            .unwrap();
+        assert_eq!(second.revision_ref, unpublished_second);
+        assert_ne!(second.revision_ref, first.revision_ref);
+        assert_ne!(
+            git_stdout(&cache, ["rev-parse", "HEAD"]).unwrap(),
+            second.revision_ref
+        );
+    }
+
+    #[test]
     fn repository_ref_observation_rejects_missing_and_non_branch_selectors() {
         let repo = create_clean_repo();
         let runtime_root = tempfile::tempdir().unwrap();

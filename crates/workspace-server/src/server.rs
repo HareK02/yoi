@@ -118,9 +118,9 @@ use crate::observation::{
     RuntimeObservationSource, RuntimeObservationSourceConfig,
 };
 use crate::records::{
-    MergeRequestListItem, MergeRequestListResponse, ObjectiveDetail, ObjectiveQueryRequest,
-    ObjectiveQueryResponse, ObjectiveShowRequest, ProjectRecordList, TicketDetail,
-    TicketQueryRequest, TicketQueryResponse, TicketShowRequest,
+    MergeRequestListItem, MergeRequestListResponse, MergeRequestRefDiagnostic, ObjectiveDetail,
+    ObjectiveQueryRequest, ObjectiveQueryResponse, ObjectiveShowRequest, ProjectRecordList,
+    TicketDetail, TicketQueryRequest, TicketQueryResponse, TicketShowRequest,
 };
 use crate::repositories::{
     ConfiguredRepository, RepositoryListProjection, RepositoryLogRead, RepositoryLookupError,
@@ -5562,6 +5562,64 @@ fn observe_published_merge_ref(
         .map_err(repository_ref_observation_error)
 }
 
+fn source_ref_error_code(code: &str) -> String {
+    match code {
+        "repository_ref_not_found" => "source_ref_not_found".to_string(),
+        "repository_ref_provider_timeout" => "source_ref_provider_timeout".to_string(),
+        "repository_ref_provider_auth_failed" => "source_ref_provider_auth_failed".to_string(),
+        "repository_ref_response_invalid" => "source_ref_response_invalid".to_string(),
+        "repository_ref_selector_invalid" => "source_ref_selector_invalid".to_string(),
+        "repository_access_credential_expired" => "source_ref_credential_expired".to_string(),
+        "repository_access_credential_unavailable" => {
+            "source_ref_credential_unavailable".to_string()
+        }
+        "repository_access_credential_unauthorized" => {
+            "source_ref_credential_unauthorized".to_string()
+        }
+        "repository_access_credential_invalid" => "source_ref_credential_invalid".to_string(),
+        "repository_access_provider_unavailable" | "repository_ref_provider_unavailable" => {
+            "source_ref_provider_unavailable".to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+fn source_ref_readiness_blocker(code: &str) -> &'static str {
+    if code == "source_ref_not_found" {
+        "source_ref_not_found"
+    } else {
+        "source_ref_unavailable"
+    }
+}
+
+fn remap_source_ref_error(error: ApiError) -> ApiError {
+    let ApiError { error, diagnostics } = error;
+    match error {
+        Error::RuntimeOperationFailed {
+            runtime_id,
+            code,
+            message,
+        } => Error::RuntimeOperationFailed {
+            runtime_id,
+            code: source_ref_error_code(&code),
+            message,
+        }
+        .into(),
+        error => ApiError { error, diagnostics },
+    }
+}
+
+fn observe_published_source_ref(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    runtime_id: &str,
+    repository_id: &str,
+    selector: &str,
+) -> ApiResult<RepositoryRefObservation> {
+    observe_published_merge_ref(api, workspace_id, runtime_id, repository_id, selector)
+        .map_err(remap_source_ref_error)
+}
+
 fn require_assigned_workdir_source(
     api: &WorkspaceApi,
     assignment: &crate::store::TicketCoderAssignmentRecord,
@@ -5593,8 +5651,13 @@ fn require_assigned_workdir_source(
             ))
         })?
         .summary;
-    validate_assigned_workdir_source(&workdir, repository_id, selector, revision_ref)
-        .map_err(Error::MergeRequest)?;
+    validate_assigned_workdir_source(&workdir, repository_id, selector, revision_ref).map_err(
+        |diagnostic| Error::RuntimeOperationFailed {
+            runtime_id: assignment.worker.runtime_id.clone(),
+            code: diagnostic.code,
+            message: diagnostic.message,
+        },
+    )?;
     Ok(())
 }
 
@@ -5603,16 +5666,22 @@ fn validate_assigned_workdir_source(
     repository_id: &str,
     selector: &str,
     revision_ref: &str,
-) -> std::result::Result<(), merge_request::MergeRequestError> {
+) -> std::result::Result<(), worker_runtime::working_directory::WorkingDirectoryDiagnostic> {
     if workdir.repository_id != repository_id {
-        return Err(merge_request::MergeRequestError::Conflict(
-            "merge_request_source_workdir_repository_mismatch: current Coder Workdir belongs to a different Repository".into(),
-        ));
+        return Err(
+            worker_runtime::working_directory::WorkingDirectoryDiagnostic {
+                code: "source_workdir_repository_mismatch".to_string(),
+                message: "Current Coder Workdir belongs to a different Repository".to_string(),
+            },
+        );
     }
     if workdir.cleanliness.as_deref() != Some("clean") {
-        return Err(merge_request::MergeRequestError::Conflict(
-            "merge_request_source_workdir_dirty: current Coder Workdir must be clean".into(),
-        ));
+        return Err(
+            worker_runtime::working_directory::WorkingDirectoryDiagnostic {
+                code: "source_workdir_dirty".to_string(),
+                message: "Current Coder Workdir must be clean".to_string(),
+            },
+        );
     }
     let workdir_selector_matches = workdir
         .current_selector
@@ -5626,9 +5695,12 @@ fn validate_assigned_workdir_source(
                 .is_ok_and(|selector| selector == workdir_selector)
         });
     if !workdir_selector_matches || workdir.current_ref.as_deref() != Some(revision_ref) {
-        return Err(merge_request::MergeRequestError::Conflict(
-            "merge_request_source_workdir_head_mismatch: current Coder Workdir selector and HEAD must match the provider-published source ref".into(),
-        ));
+        return Err(
+            worker_runtime::working_directory::WorkingDirectoryDiagnostic {
+                code: "source_ref_revision_mismatch".to_string(),
+                message: "Current Coder Workdir selector and HEAD do not match the provider-published source ref".to_string(),
+            },
+        );
     }
     Ok(())
 }
@@ -5752,6 +5824,8 @@ struct MergeRequestRefResponse {
     #[serde(rename = "ref")]
     revision_ref: Option<String>,
     observed_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<MergeRequestRefDiagnostic>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -5835,36 +5909,39 @@ async fn scoped_list_merge_requests(
         .items
         .into_iter()
         .map(|merge_request| -> ApiResult<MergeRequestListItem> {
-            let current_subject_ref =
+            let (current_subject_ref, ref_diagnostics) =
                 if merge_request.state == merge_request::MergeRequestState::Open {
                     match (
                         merge_request.selector_from.as_deref(),
                         merge_request.ticket_ids.first(),
                     ) {
-                        (Some(selector), Some(ticket_id)) => {
-                            let assignment = api
-                                .store
-                                .get_current_ticket_coder_assignment(&workspace_id, ticket_id)?
-                                .ok_or_else(|| {
-                                    Error::TicketAssignmentConflict(
-                                        "Open Merge Request has no current assigned Coder".into(),
-                                    )
-                                })?;
-                            Some(
-                                observe_published_merge_ref(
-                                    &api,
-                                    &workspace_id,
-                                    &assignment.worker.runtime_id,
-                                    &merge_request.repository_id,
-                                    selector,
-                                )?
-                                .revision_ref,
-                            )
-                        }
-                        _ => None,
+                        (Some(selector), Some(ticket_id)) => match api
+                            .store
+                            .get_current_ticket_coder_assignment(&workspace_id, ticket_id)?
+                        {
+                            Some(assignment) => match observe_published_source_ref(
+                                &api,
+                                &workspace_id,
+                                &assignment.worker.runtime_id,
+                                &merge_request.repository_id,
+                                selector,
+                            ) {
+                                Ok(observation) => (Some(observation.revision_ref), Vec::new()),
+                                Err(error) => (None, vec![merge_ref_diagnostic(error)]),
+                            },
+                            None => (
+                                None,
+                                vec![MergeRequestRefDiagnostic {
+                                    code: "source_ref_runtime_unavailable".to_string(),
+                                    message: "No current Coder Runtime is available to observe the source ref"
+                                        .to_string(),
+                                }],
+                            ),
+                        },
+                        _ => (None, Vec::new()),
                     }
                 } else {
-                    None
+                    (None, Vec::new())
                 };
             let repository_key = api
                 .store
@@ -5881,6 +5958,7 @@ async fn scoped_list_merge_requests(
                 summary: merge_request_summary(merge_request, repository_key, current_subject_ref),
                 ticket_ids,
                 thread_event_count,
+                ref_diagnostics,
             })
         })
         .collect::<ApiResult<Vec<_>>>()?;
@@ -5888,6 +5966,42 @@ async fn scoped_list_merge_requests(
         items,
         next_cursor: page.next_cursor,
     }))
+}
+
+fn merge_ref_diagnostic(error: ApiError) -> MergeRequestRefDiagnostic {
+    let ApiError { error, diagnostics } = error;
+    diagnostics
+        .into_iter()
+        .next()
+        .map(|diagnostic| MergeRequestRefDiagnostic {
+            code: diagnostic.code,
+            message: diagnostic.message,
+        })
+        .unwrap_or_else(|| MergeRequestRefDiagnostic {
+            code: "merge_ref_observation_unavailable".to_string(),
+            message: sanitize_backend_error(&error.to_string()),
+        })
+}
+
+fn unknown_merge_ref(code: &str, message: &str) -> MergeRequestRefResponse {
+    MergeRequestRefResponse {
+        status: "unknown".to_string(),
+        revision_ref: None,
+        observed_at: Utc::now().to_rfc3339(),
+        diagnostic: Some(MergeRequestRefDiagnostic {
+            code: code.to_string(),
+            message: message.to_string(),
+        }),
+    }
+}
+
+fn unknown_merge_ref_response(error: ApiError) -> MergeRequestRefResponse {
+    MergeRequestRefResponse {
+        status: "unknown".to_string(),
+        revision_ref: None,
+        observed_at: Utc::now().to_rfc3339(),
+        diagnostic: Some(merge_ref_diagnostic(error)),
+    }
 }
 
 fn merge_ref_response(observation: RepositoryRefObservation) -> MergeRequestRefResponse {
@@ -5899,6 +6013,7 @@ fn merge_ref_response(observation: RepositoryRefObservation) -> MergeRequestRefR
         status: "known".into(),
         revision_ref: Some(observation.revision_ref),
         observed_at,
+        diagnostic: None,
     }
 }
 
@@ -5924,31 +6039,47 @@ async fn scoped_show_merge_request(
     })?;
     let assignment = api
         .store
-        .get_current_ticket_coder_assignment(&workspace_id, ticket_id)?
-        .ok_or_else(|| {
-            Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
-        })?;
-    let source = match mr.selector_from.as_deref() {
-        Some(selector) => merge_ref_response(observe_published_merge_ref(
+        .get_current_ticket_coder_assignment(&workspace_id, ticket_id)?;
+    let source = match (mr.selector_from.as_deref(), assignment.as_ref()) {
+        (Some(selector), Some(assignment)) => {
+            match observe_published_source_ref(
+                &api,
+                &workspace_id,
+                &assignment.worker.runtime_id,
+                &mr.repository_id,
+                selector,
+            ) {
+                Ok(observation) => merge_ref_response(observation),
+                Err(error) => unknown_merge_ref_response(error),
+            }
+        }
+        (Some(_), None) => unknown_merge_ref(
+            "source_ref_runtime_unavailable",
+            "No current Coder Runtime is available to observe the source ref",
+        ),
+        (None, _) => MergeRequestRefResponse {
+            status: "requires_repair".into(),
+            revision_ref: None,
+            observed_at: Utc::now().to_rfc3339(),
+            diagnostic: None,
+        },
+    };
+    let target = match assignment.as_ref() {
+        Some(assignment) => match observe_published_merge_ref(
             &api,
             &workspace_id,
             &assignment.worker.runtime_id,
             &mr.repository_id,
-            selector,
-        )?),
-        None => MergeRequestRefResponse {
-            status: "requires_repair".into(),
-            revision_ref: None,
-            observed_at: Utc::now().to_rfc3339(),
+            &mr.selector_to,
+        ) {
+            Ok(observation) => merge_ref_response(observation),
+            Err(error) => unknown_merge_ref_response(error),
         },
+        None => unknown_merge_ref(
+            "target_ref_runtime_unavailable",
+            "No current Coder Runtime is available to observe the target ref",
+        ),
     };
-    let target = merge_ref_response(observe_published_merge_ref(
-        &api,
-        &workspace_id,
-        &assignment.worker.runtime_id,
-        &mr.repository_id,
-        &mr.selector_to,
-    )?);
     let linked_tickets = mr
         .ticket_ids
         .iter()
@@ -5982,25 +6113,26 @@ async fn scoped_merge_request_readiness(
     let mr = store.get(&workspace_id, &ticket_id)?;
     let assignment = api
         .store
-        .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
-        .ok_or_else(|| {
-            Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
-        })?;
-    let current_subject_ref = mr
-        .selector_from
-        .as_deref()
-        .map(|selector| {
-            observe_published_merge_ref(
-                &api,
-                &workspace_id,
-                &assignment.worker.runtime_id,
-                &mr.repository_id,
-                selector,
-            )
-            .map(|observation| observation.revision_ref)
-        })
-        .transpose()?;
-    Ok(Json(store.readiness(merge_request::ReadinessCheck {
+        .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?;
+    let (current_subject_ref, source_blocker) = match (mr.selector_from.as_deref(), assignment) {
+        (Some(selector), Some(assignment)) => match observe_published_source_ref(
+            &api,
+            &workspace_id,
+            &assignment.worker.runtime_id,
+            &mr.repository_id,
+            selector,
+        ) {
+            Ok(observation) => (Some(observation.revision_ref), None),
+            Err(error) => {
+                let diagnostic = merge_ref_diagnostic(error);
+                let blocker = source_ref_readiness_blocker(&diagnostic.code);
+                (None, Some(blocker.to_string()))
+            }
+        },
+        (Some(_), None) => (None, Some("source_ref_unavailable".to_string())),
+        (None, _) => (None, None),
+    };
+    let mut report = store.readiness(merge_request::ReadinessCheck {
         ticket_id,
         current_subject_ref,
         auth: merge_request::MergeRequestAuth {
@@ -6010,7 +6142,17 @@ async fn scoped_merge_request_readiness(
             worker_id: String::new(),
             assignment_id: String::new(),
         },
-    })?))
+    })?;
+    if let Some(blocker) = source_blocker {
+        report
+            .blockers
+            .retain(|current| current != "selector_unresolved");
+        if !report.blockers.contains(&blocker) {
+            report.blockers.push(blocker);
+        }
+        report.ready = false;
+    }
+    Ok(Json(report))
 }
 
 async fn scoped_open_merge_request(
@@ -6050,7 +6192,7 @@ async fn scoped_open_merge_request(
         )
         .into());
     }
-    let source_observation = observe_published_merge_ref(
+    let source_observation = observe_published_source_ref(
         &api,
         &workspace_id,
         &assignment.worker.runtime_id,
@@ -6135,7 +6277,7 @@ async fn scoped_repair_merge_request_selector(
         .ok_or_else(|| {
             Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
         })?;
-    let resolved_subject_ref = observe_published_merge_ref(
+    let resolved_subject_ref = observe_published_source_ref(
         &api,
         &workspace_id,
         &assignment.worker.runtime_id,
@@ -6210,7 +6352,7 @@ async fn scoped_register_merge_request_review_capability(
         .selector_from
         .as_deref()
         .ok_or_else(|| Error::InvalidInput("selector_from requires repair".into()))?;
-    let source_observation = observe_published_merge_ref(
+    let source_observation = observe_published_source_ref(
         &api,
         &workspace_id,
         &assignment.worker.runtime_id,
@@ -6271,7 +6413,7 @@ async fn scoped_submit_merge_request_review(
         .ok_or_else(|| {
             Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
         })?;
-    let current_subject_ref = observe_published_merge_ref(
+    let current_subject_ref = observe_published_source_ref(
         &api,
         &workspace_id,
         &assignment.worker.runtime_id,
@@ -6382,7 +6524,7 @@ async fn scoped_complete_merge_request(
         .selector_from
         .as_deref()
         .ok_or_else(|| Error::InvalidInput("selector_from requires repair".into()))?;
-    let current_source_ref = observe_published_merge_ref(
+    let current_source_ref = observe_published_source_ref(
         &api,
         &workspace_id,
         &assignment.worker.runtime_id,
@@ -16606,9 +16748,11 @@ mod tests {
             "scoped_complete_merge_request",
         ] {
             let handler = handler_source(source, handler);
-            assert!(handler.contains("observe_published_merge_ref("));
+            assert!(
+                handler.contains("observe_published_source_ref(")
+                    || handler.contains("observe_published_merge_ref(")
+            );
             assert!(!handler.contains("repository_reader()"));
-            assert!(!handler.contains("status: \"unknown\""));
         }
         let submit = handler_source(source, "scoped_submit_merge_request_review");
         assert!(
@@ -16616,11 +16760,35 @@ mod tests {
                 .find("authorize_review_submission(")
                 .is_some_and(|authorization| {
                     submit
-                        .find("observe_published_merge_ref(")
+                        .find("observe_published_source_ref(")
                         .is_some_and(|observation| authorization < observation)
                 }),
             "review capability must be validated before provider access",
         );
+    }
+
+    #[test]
+    fn readiness_distinguishes_missing_source_from_unavailable_provider() {
+        assert_eq!(
+            source_ref_readiness_blocker("source_ref_not_found"),
+            "source_ref_not_found"
+        );
+        assert_eq!(
+            source_ref_error_code("repository_ref_not_found"),
+            "source_ref_not_found"
+        );
+        assert_eq!(
+            source_ref_error_code("repository_ref_provider_timeout"),
+            "source_ref_provider_timeout"
+        );
+        for code in [
+            "source_ref_provider_unavailable",
+            "source_ref_provider_timeout",
+            "source_ref_provider_auth_failed",
+            "source_ref_credential_expired",
+        ] {
+            assert_eq!(source_ref_readiness_blocker(code), "source_ref_unavailable");
+        }
     }
 
     #[test]
@@ -16660,8 +16828,7 @@ mod tests {
                 "work/T-549",
                 "abc123"
             ),
-            Err(merge_request::MergeRequestError::Conflict(message))
-                if message.starts_with("merge_request_source_workdir_dirty:")
+            Err(diagnostic) if diagnostic.code == "source_workdir_dirty"
         ));
         workdir.cleanliness = Some("clean".to_string());
         workdir.current_ref = Some("different".to_string());
@@ -16672,8 +16839,7 @@ mod tests {
                 "work/T-549",
                 "abc123"
             ),
-            Err(merge_request::MergeRequestError::Conflict(message))
-                if message.starts_with("merge_request_source_workdir_head_mismatch:")
+            Err(diagnostic) if diagnostic.code == "source_ref_revision_mismatch"
         ));
     }
 
