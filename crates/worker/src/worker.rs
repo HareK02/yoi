@@ -50,8 +50,7 @@ use crate::feature::{
     FeatureRegistryInstallReport, dedupe_instruction_contributions,
 };
 use crate::hook::{
-    Hook, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest,
-    PreToolCall,
+    Hook, HookRegistryBuilder, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest, PreToolCall,
 };
 use crate::in_flight::InFlightEvents;
 use crate::internal_worker::{
@@ -2328,12 +2327,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.hook_builder.add_on_turn_end(hook);
     }
 
-    /// Register a hook that runs when execution is aborted.
-    pub fn add_on_abort_hook(&mut self, hook: impl Hook<OnAbort> + 'static) {
-        self.assert_hooks_open();
-        self.hook_builder.add_on_abort(hook);
-    }
-
     /// Install the hook-based interceptor on the Engine if not already done.
     ///
     /// When either compaction threshold (`threshold` or
@@ -3733,7 +3726,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 | EngineRunExit::Yielded
                 | EngineRunExit::Interrupted(RunInterruptionReason::Cancelled)
                 | EngineRunExit::Interrupted(RunInterruptionReason::ContextWindowExceeded)
-                | EngineRunExit::Interrupted(RunInterruptionReason::Interceptor(_))
                 | EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(_))
         );
         let active_run_turn_count = self.engine.as_ref().unwrap().active_run_turn_count();
@@ -6130,7 +6122,6 @@ fn run_interruption_reason_error_code(reason: &RunInterruptionReason) -> ErrorCo
         RunInterruptionReason::Unexpected(EngineError::Tool(_)) => ErrorCode::ToolError,
         RunInterruptionReason::LimitReached
         | RunInterruptionReason::Cancelled
-        | RunInterruptionReason::Interceptor(_)
         | RunInterruptionReason::Unexpected(
             EngineError::Aborted(_)
             | EngineError::Cancelled
@@ -6148,7 +6139,6 @@ fn run_interruption_reason_message(reason: &RunInterruptionReason) -> String {
         RunInterruptionReason::LimitReached => "engine turn limit reached".to_string(),
         RunInterruptionReason::ContextWindowExceeded => "model context window reached".to_string(),
         RunInterruptionReason::Cancelled => "engine run cancelled".to_string(),
-        RunInterruptionReason::Interceptor(failure) => failure.to_string(),
         RunInterruptionReason::Unexpected(error) => format!("unexpected engine failure: {error}"),
     }
 }

@@ -15,8 +15,9 @@ use std::sync::{Arc, Mutex};
 use agen::Item;
 use agen::UsageRecord;
 use agen::interceptor::{
-    Interceptor, InterceptorResult, PostToolAction, PreRequestAction, PreToolAction, PromptAction,
-    ToolCallInfo, ToolResultInfo, TurnEndAction,
+    AssistantTurnEndContext, Interceptor, InterceptorResult, PostToolAction, PreLlmRequestContext,
+    PreRequestAction, PreToolAction, PromptAction, PromptSubmitContext, ToolCallInfo,
+    ToolResultInfo, TurnEndAction,
 };
 use agen::tool::ToolOutput;
 use arc_swap::ArcSwap;
@@ -28,9 +29,9 @@ use crate::compact::usage_tracker::UsageTracker;
 use session_store::SystemItem;
 
 use crate::hook::{
-    AbortInfo, HookPostToolAction, HookPreRequestAction, HookPreToolAction, HookPromptAction,
-    HookRegistry, HookTurnEndAction, PreRequestContext, PreRequestInfo, PromptSubmitInfo,
-    SystemItemAppendHandle, ToolCallSummary, ToolResultSummary, TurnEndInfo,
+    HookPostToolAction, HookPreRequestAction, HookPreToolAction, HookPromptAction, HookRegistry,
+    HookTurnEndAction, PreRequestContext, PreRequestInfo, PromptSubmitInfo, SystemItemAppendHandle,
+    ToolCallSummary, ToolResultSummary, TurnEndInfo,
 };
 use crate::ipc::notify_buffer::{NotifyBuffer, build_system_item_with_provenance};
 use crate::prompt::catalog::PromptCatalog;
@@ -232,7 +233,11 @@ impl WorkerInterceptor {
 
 #[async_trait]
 impl Interceptor for WorkerInterceptor {
-    async fn on_prompt_submit(&self, item: &mut Item) -> InterceptorResult<PromptAction> {
+    async fn on_prompt_submit(
+        &self,
+        context: PromptSubmitContext<'_>,
+    ) -> InterceptorResult<PromptAction> {
+        let item = context.item;
         let turn_index = self.next_turn_index.fetch_add(1, Ordering::Relaxed);
         self.tool_calls_this_turn.store(0, Ordering::Relaxed);
 
@@ -310,8 +315,9 @@ impl Interceptor for WorkerInterceptor {
 
     async fn pre_llm_request(
         &self,
-        context: &mut Vec<Item>,
+        context: PreLlmRequestContext<'_>,
     ) -> InterceptorResult<PreRequestAction> {
+        let context = context.items;
         let initial_tokens = self.estimated_tokens(context);
         if self.request_threshold_exceeded(initial_tokens, context) {
             return Ok(PreRequestAction::Yield);
@@ -395,7 +401,7 @@ impl Interceptor for WorkerInterceptor {
         Ok(PreToolAction::Continue)
     }
 
-    async fn post_tool_call(&self, info: &mut ToolResultInfo) -> InterceptorResult<PostToolAction> {
+    async fn post_tool_call(&self, info: &ToolResultInfo) -> InterceptorResult<PostToolAction> {
         let summary = ToolResultSummary {
             call_id: info.result.tool_use_id.clone(),
             tool_name: info.call.name.clone(),
@@ -416,7 +422,11 @@ impl Interceptor for WorkerInterceptor {
         Ok(PostToolAction::Continue)
     }
 
-    async fn on_turn_end(&self, history: &[Item]) -> InterceptorResult<TurnEndAction> {
+    async fn on_assistant_turn_end(
+        &self,
+        context: AssistantTurnEndContext<'_>,
+    ) -> InterceptorResult<TurnEndAction> {
+        let history = context.history;
         let final_text_preview = history
             .iter()
             .rev()
@@ -436,16 +446,6 @@ impl Interceptor for WorkerInterceptor {
             }
         }
         Ok(TurnEndAction::Finish)
-    }
-
-    async fn on_abort(&self, reason: &str) -> InterceptorResult<()> {
-        let info = AbortInfo {
-            reason: reason.to_string(),
-        };
-        for hook in &self.registry.on_abort {
-            hook.call(&info).await;
-        }
-        Ok(())
     }
 }
 
@@ -629,7 +629,10 @@ mod tests {
             None,
         );
         let mut ctx = ctx_items;
-        let action = interceptor.pre_llm_request(&mut ctx).await.unwrap();
+        let action = interceptor
+            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .await
+            .unwrap();
 
         assert!(matches!(action, PreRequestAction::Yield));
         // Hook must not run when an internal mechanism short-circuits first.
@@ -661,7 +664,10 @@ mod tests {
             })),
         );
         let mut ctx = ctx_items;
-        let action = interceptor.pre_llm_request(&mut ctx).await.unwrap();
+        let action = interceptor
+            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .await
+            .unwrap();
 
         match action {
             PreRequestAction::YieldWith(items) => assert_eq!(items.len(), 1),
@@ -698,7 +704,10 @@ mod tests {
         )
         .with_usage_tracker(usage_tracker);
         let mut ctx = ctx_items;
-        let action = interceptor.pre_llm_request(&mut ctx).await.unwrap();
+        let action = interceptor
+            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .await
+            .unwrap();
 
         assert!(matches!(action, PreRequestAction::Yield));
     }
@@ -722,7 +731,10 @@ mod tests {
             None,
         );
         let mut ctx = ctx_items;
-        let action = interceptor.pre_llm_request(&mut ctx).await.unwrap();
+        let action = interceptor
+            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .await
+            .unwrap();
 
         assert!(matches!(action, PreRequestAction::Continue));
         assert_eq!(count.load(Ordering::Relaxed), 1);
@@ -763,7 +775,10 @@ mod tests {
             None,
         );
         let mut ctx = ctx_items;
-        let action = interceptor.pre_llm_request(&mut ctx).await.unwrap();
+        let action = interceptor
+            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .await
+            .unwrap();
 
         assert!(matches!(action, PreRequestAction::Continue));
         assert_eq!(count.load(Ordering::Relaxed), 1);
@@ -790,7 +805,10 @@ mod tests {
             None,
         );
         let mut ctx = ctx_items;
-        let action = interceptor.pre_llm_request(&mut ctx).await.unwrap();
+        let action = interceptor
+            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .await
+            .unwrap();
 
         assert!(matches!(action, PreRequestAction::Continue));
         assert_eq!(count.load(Ordering::Relaxed), 1);
@@ -811,7 +829,10 @@ mod tests {
             None,
         );
         let mut ctx: Vec<Item> = Vec::new();
-        let action = interceptor.pre_llm_request(&mut ctx).await.unwrap();
+        let action = interceptor
+            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .await
+            .unwrap();
 
         assert!(matches!(action, PreRequestAction::Continue));
         assert_eq!(count.load(Ordering::Relaxed), 1);
@@ -840,7 +861,10 @@ mod tests {
         );
 
         let mut ctx: Vec<Item> = Vec::new();
-        let action = interceptor.pre_llm_request(&mut ctx).await.unwrap();
+        let action = interceptor
+            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .await
+            .unwrap();
 
         assert!(saw_handle.load(Ordering::Relaxed));
         let PreRequestAction::ContinueWith(items) = action else {
@@ -887,7 +911,10 @@ mod tests {
         );
 
         let mut ctx: Vec<Item> = Vec::new();
-        let action = interceptor.pre_llm_request(&mut ctx).await.unwrap();
+        let action = interceptor
+            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .await
+            .unwrap();
 
         assert!(!saw_handle.load(Ordering::Relaxed));
         assert!(matches!(action, PreRequestAction::Continue));
@@ -1042,7 +1069,14 @@ mod tests {
         );
         let history = vec![Item::user_message("hi"), Item::assistant_message("done")];
 
-        let action = interceptor.on_turn_end(&history).await.unwrap();
+        let action = interceptor
+            .on_assistant_turn_end(AssistantTurnEndContext {
+                assistant_items: &[],
+                history: &history,
+                tool_calls: &[],
+            })
+            .await
+            .unwrap();
 
         assert!(matches!(action, TurnEndAction::Pause));
         assert_eq!(count.load(Ordering::Relaxed), 1);
@@ -1079,7 +1113,10 @@ mod tests {
         let ctx_items = vec![Item::user_message("hi")];
         for _ in 0..23 {
             let mut ctx = ctx_items.clone();
-            let action = interceptor.pre_llm_request(&mut ctx).await.unwrap();
+            let action = interceptor
+                .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+                .await
+                .unwrap();
             assert!(matches!(action, PreRequestAction::Continue));
             usage_tracker.record_usage(&agen::event::UsageEvent {
                 input_tokens: Some(10),
@@ -1091,7 +1128,10 @@ mod tests {
         }
 
         let mut ctx = ctx_items.clone();
-        let action = interceptor.pre_llm_request(&mut ctx).await.unwrap();
+        let action = interceptor
+            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .await
+            .unwrap();
         let appended_len = match action {
             PreRequestAction::ContinueWith(items) => items.len(),
             other => panic!("expected reminder append, got {other:?}"),
@@ -1275,7 +1315,10 @@ mod tests {
             None,
         );
         let mut ctx: Vec<Item> = vec![Item::user_message("hi")];
-        let action = interceptor.pre_llm_request(&mut ctx).await.unwrap();
+        let action = interceptor
+            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .await
+            .unwrap();
 
         assert!(matches!(action, PreRequestAction::Continue));
         assert_eq!(ctx.len(), 1, "pre_llm_request must not append notifies");
@@ -1305,7 +1348,10 @@ mod tests {
             None,
         );
         let mut ctx: Vec<Item> = Vec::new();
-        let action = interceptor.pre_llm_request(&mut ctx).await.unwrap();
+        let action = interceptor
+            .pre_llm_request(PreLlmRequestContext { items: &mut ctx })
+            .await
+            .unwrap();
 
         assert!(matches!(action, PreRequestAction::Cancel(_)));
         assert!(first_called.load(Ordering::Relaxed));

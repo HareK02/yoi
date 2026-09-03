@@ -27,7 +27,8 @@ pub use engine::{
 pub use handler::ToolUseBlockStart;
 pub use history::{History, HistoryEntry};
 pub use interceptor::{
-    Interceptor, InterceptorError, InterceptorFailure, InterceptorPoint, InterceptorResult,
+    AssistantTurnEndContext, Interceptor, InterceptorError, InterceptorFailure, InterceptorPoint,
+    InterceptorResult, PreLlmRequestContext, PromptSubmitContext, RunExitContext,
 };
 pub use message::{ContentPart, Item, Message, Role};
 pub use tool::{

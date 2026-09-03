@@ -15,8 +15,10 @@ use crate::{
     },
     handler::{ErrorKind, StatusKind, ToolUseBlockStart, UsageKind},
     interceptor::{
-        DefaultInterceptor, Interceptor, InterceptorFailure, InterceptorPoint, PostToolAction,
-        PreRequestAction, PreToolAction, PromptAction, ToolCallInfo, ToolResultInfo, TurnEndAction,
+        AssistantTurnEndContext, DefaultInterceptor, Interceptor, InterceptorFailure,
+        InterceptorPoint, PostToolAction, PreLlmRequestContext, PreRequestAction, PreToolAction,
+        PromptAction, PromptSubmitContext, RunExitContext, ToolCallInfo, ToolResultInfo,
+        TurnEndAction,
     },
     llm_client::{
         ClientError, ConfigWarning, LlmClient, Request, RequestConfig, ResponseStream,
@@ -156,8 +158,6 @@ pub enum EngineRunExit {
 /// A typed reason why an engine run could not finish normally.
 #[derive(Debug)]
 pub enum RunInterruptionReason {
-    /// A trusted host interceptor callback failed at a typed lifecycle point.
-    Interceptor(InterceptorFailure),
     LimitReached,
     ContextWindowExceeded,
     Cancelled,
@@ -178,9 +178,6 @@ impl From<Result<EngineResult, EngineError>> for EngineRunExit {
             }
             Err(EngineError::Cancelled) => Self::Interrupted(RunInterruptionReason::Cancelled),
             Err(EngineError::PauseRequested) => Self::Paused,
-            Err(EngineError::Interceptor(failure)) => {
-                Self::Interrupted(RunInterruptionReason::Interceptor(failure))
-            }
             Err(error) => Self::Interrupted(RunInterruptionReason::Unexpected(error)),
         }
     }
@@ -438,11 +435,8 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
         self.active_run_turn_count.get_or_insert(0);
     }
 
-    fn finish_logical_run(&mut self, result: &Result<EngineResult, EngineError>) {
-        if !matches!(
-            result,
-            Ok(EngineResult::Paused | EngineResult::Yielded) | Err(EngineError::PauseRequested)
-        ) {
+    fn finish_logical_run(&mut self, exit: &EngineRunExit) {
+        if !matches!(exit, EngineRunExit::Paused | EngineRunExit::Yielded) {
             self.active_run_turn_count = None;
         }
     }
@@ -1086,26 +1080,23 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
         request
     }
 
-    /// Hooks: on_prompt_submit
-    ///
-    async fn finalize_interruption<T>(
+    async fn finalize_run_exit(
         &mut self,
-        result: Result<T, EngineError>,
-    ) -> Result<T, EngineError> {
-        match result {
-            Ok(value) => Ok(value),
-            Err(err) => {
-                let reason = match &err {
-                    EngineError::Aborted(reason) => reason.clone(),
-                    EngineError::Cancelled => "Cancelled".to_string(),
-                    _ => err.to_string(),
-                };
-                if let Err(error) = self.interceptor.on_abort(&reason).await {
-                    return Err(InterceptorFailure::new(InterceptorPoint::Abort, error).into());
-                }
-                Err(err)
-            }
-        }
+        result: Result<EngineResult, EngineError>,
+    ) -> EngineRunExit {
+        let exit = EngineRunExit::from(result);
+        let exit = match self
+            .interceptor
+            .on_run_exit(RunExitContext { exit: &exit })
+            .await
+        {
+            Ok(()) => exit,
+            Err(error) => EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(
+                InterceptorFailure::new(InterceptorPoint::RunExit, error).into(),
+            )),
+        };
+        self.finish_logical_run(&exit);
+        exit
     }
 
     /// Check for pending tool calls (for resuming from Pause)
@@ -1486,41 +1477,13 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
         }
 
         let call_info = call_info_map.get(&tool_result.tool_use_id);
-        let mut abort_reason = None;
-        if let Some((tool_call, meta, tool, context)) = call_info {
-            let mut info = ToolResultInfo {
-                call: tool_call.clone(),
-                result: tool_result,
-                meta: meta.clone(),
-                tool: tool.clone(),
-                context: context.clone(),
-            };
-
-            let post_tool_action =
-                self.interceptor
-                    .post_tool_call(&mut info)
-                    .await
-                    .map_err(|error| {
-                        EngineError::from(InterceptorFailure::new(
-                            InterceptorPoint::PostToolCall,
-                            error,
-                        ))
-                    })?;
-            match post_tool_action {
-                PostToolAction::Continue => {}
-                PostToolAction::Abort(reason) => {
-                    abort_reason = Some(reason);
-                }
-            }
-            tool_result = info.result;
-        }
         if tool_result.is_error && tool_result.disposition.is_success() {
             tool_result.disposition = ToolResultDisposition::Error;
         }
         tool_result.is_error = !tool_result.disposition.is_success();
 
-        // Cap content only after post_tool_call so interceptors still observe
-        // the full payload and any content they inject is bounded too.
+        // Bound the terminal payload before committing it so the post-tool
+        // interceptor observes exactly the model-visible durable result.
         if let (Some(limits), Some((tool_call, _, _, _)), Some(content)) = (
             self.tool_output_limits.as_ref(),
             call_info,
@@ -1573,9 +1536,30 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
             "Tool execution terminalized"
         );
         self.emit_tool_result(&tool_result);
-        if let Some(reason) = abort_reason {
-            return Err(EngineError::Aborted(reason));
+
+        if let Some((tool_call, meta, tool, context)) = call_info {
+            let info = ToolResultInfo {
+                call: tool_call.clone(),
+                result: tool_result,
+                meta: meta.clone(),
+                tool: tool.clone(),
+                context: context.clone(),
+            };
+            let post_tool_action =
+                self.interceptor
+                    .post_tool_call(&info)
+                    .await
+                    .map_err(|error| {
+                        EngineError::from(InterceptorFailure::new(
+                            InterceptorPoint::PostToolCall,
+                            error,
+                        ))
+                    })?;
+            if let PostToolAction::Abort(reason) = post_tool_action {
+                return Err(EngineError::Aborted(reason));
+            }
         }
+
         Ok(true)
     }
 
@@ -1716,7 +1700,9 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
             // Interceptor: pre_llm_request
             let pre_request_action = self
                 .interceptor
-                .pre_llm_request(&mut request_context)
+                .pre_llm_request(PreLlmRequestContext {
+                    items: &mut request_context,
+                })
                 .await
                 .map_err(|error| {
                     EngineError::from(InterceptorFailure::new(
@@ -1836,28 +1822,37 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
             let tool_calls = self.tool_call_collector.take_collected();
             let assistant_items =
                 self.build_assistant_items(&reasoning_items, &text_blocks, &tool_calls);
+            let committed_assistant_items = assistant_items.clone();
             self.append_history_items(history, assistant_items, annotate)?;
 
-            if tool_calls.is_empty() {
-                let turn_end_context = history.items_cloned();
-                let turn_end_action = self
-                    .interceptor
-                    .on_turn_end(&turn_end_context)
-                    .await
-                    .map_err(|error| {
-                        EngineError::from(InterceptorFailure::new(InterceptorPoint::TurnEnd, error))
-                    })?;
-                match turn_end_action {
-                    TurnEndAction::Finish => {
-                        return Ok(EngineResult::Finished);
-                    }
-                    TurnEndAction::ContinueWithMessages(additional) => {
-                        self.append_history_items(history, additional, annotate)?;
+            let assistant_turn_history = history.items_cloned();
+            let assistant_turn_action = self
+                .interceptor
+                .on_assistant_turn_end(AssistantTurnEndContext {
+                    assistant_items: &committed_assistant_items,
+                    history: &assistant_turn_history,
+                    tool_calls: &tool_calls,
+                })
+                .await
+                .map_err(|error| {
+                    EngineError::from(InterceptorFailure::new(
+                        InterceptorPoint::AssistantTurnEnd,
+                        error,
+                    ))
+                })?;
+            match assistant_turn_action {
+                TurnEndAction::Finish if tool_calls.is_empty() => {
+                    return Ok(EngineResult::Finished);
+                }
+                TurnEndAction::Finish => {}
+                TurnEndAction::ContinueWithMessages(additional) => {
+                    self.append_history_items(history, additional, annotate)?;
+                    if tool_calls.is_empty() {
                         continue;
                     }
-                    TurnEndAction::Pause => {
-                        return Ok(EngineResult::Paused);
-                    }
+                }
+                TurnEndAction::Pause => {
+                    return Ok(EngineResult::Paused);
                 }
             }
 
@@ -2540,9 +2535,10 @@ impl<C: LlmClient, A> Engine<C, Locked, A> {
         user_input: impl Into<String>,
         annotate: &mut impl FnMut(&Item) -> Result<A, String>,
     ) -> EngineRunExit {
-        self.run_result_with_annotation(history, user_input.into(), annotate)
-            .await
-            .into()
+        let result = self
+            .run_result_with_annotation(history, user_input.into(), annotate)
+            .await;
+        self.finalize_run_exit(result).await
     }
 
     async fn run_result_with_annotation(
@@ -2554,19 +2550,20 @@ impl<C: LlmClient, A> Engine<C, Locked, A> {
         // Supplying new user input abandons any paused/yielded logical run.
         self.active_run_turn_count = None;
         let mut user_item = Item::user_message(user_input);
-        let prompt_action = match self.interceptor.on_prompt_submit(&mut user_item).await {
-            Ok(action) => action,
-            Err(error) => {
-                let error = InterceptorFailure::new(InterceptorPoint::PromptSubmit, error).into();
-                return self.finalize_interruption(Err(error)).await;
-            }
-        };
+        let prompt_action = self
+            .interceptor
+            .on_prompt_submit(PromptSubmitContext {
+                item: &mut user_item,
+            })
+            .await
+            .map_err(|error| {
+                EngineError::from(InterceptorFailure::new(
+                    InterceptorPoint::PromptSubmit,
+                    error,
+                ))
+            })?;
         let extras = match prompt_action {
-            PromptAction::Cancel(reason) => {
-                return self
-                    .finalize_interruption(Err(EngineError::Aborted(reason)))
-                    .await;
-            }
+            PromptAction::Cancel(reason) => return Err(EngineError::Aborted(reason)),
             PromptAction::Continue => Vec::new(),
             PromptAction::ContinueWith(items) => items,
         };
@@ -2575,13 +2572,10 @@ impl<C: LlmClient, A> Engine<C, Locked, A> {
             self.append_history_items(history, extras, annotate)?;
         }
         self.start_logical_run();
-        let result = match self.run_turn_loop(history, annotate).await {
+        match self.run_turn_loop(history, annotate).await {
             Err(EngineError::PauseRequested) => Ok(EngineResult::Paused),
             other => other,
-        };
-        let result = self.finalize_interruption(result).await;
-        self.finish_logical_run(&result);
-        result
+        }
     }
 
     /// Resume execution (from Paused state).
@@ -2590,9 +2584,8 @@ impl<C: LlmClient, A> Engine<C, Locked, A> {
         history: &mut History<A>,
         annotate: &mut impl FnMut(&Item) -> Result<A, String>,
     ) -> EngineRunExit {
-        self.resume_result_with_annotation(history, annotate)
-            .await
-            .into()
+        let result = self.resume_result_with_annotation(history, annotate).await;
+        self.finalize_run_exit(result).await
     }
 
     async fn resume_result_with_annotation(
@@ -2601,13 +2594,10 @@ impl<C: LlmClient, A> Engine<C, Locked, A> {
         annotate: &mut impl FnMut(&Item) -> Result<A, String>,
     ) -> Result<EngineResult, EngineError> {
         self.ensure_logical_run();
-        let result = match self.run_turn_loop(history, annotate).await {
+        match self.run_turn_loop(history, annotate).await {
             Err(EngineError::PauseRequested) => Ok(EngineResult::Paused),
             other => other,
-        };
-        let result = self.finalize_interruption(result).await;
-        self.finish_logical_run(&result);
-        result
+        }
     }
 
     /// Get the prefix length at lock time

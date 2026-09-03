@@ -23,7 +23,8 @@ use std::sync::{Arc, Mutex};
 
 use agen::Item;
 use agen::interceptor::{
-    Interceptor, InterceptorResult, PreRequestAction, PreToolAction, ToolCallInfo,
+    Interceptor, InterceptorResult, PreLlmRequestContext, PreRequestAction, PreToolAction,
+    ToolCallInfo,
 };
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput, ToolResult};
 use async_trait::async_trait;
@@ -402,8 +403,9 @@ impl CompactWorkerInterceptor {
 impl Interceptor for CompactWorkerInterceptor {
     async fn pre_llm_request(
         &self,
-        context: &mut Vec<Item>,
+        context: PreLlmRequestContext<'_>,
     ) -> InterceptorResult<PreRequestAction> {
+        let context = context.items;
         let records = self.usage_tracker.records();
         let estimate = agen::token_counter::total_tokens(context, &records);
         if estimate.tokens > self.max_input_tokens {
@@ -472,13 +474,23 @@ mod tests {
         let mut context = vec![Item::user_message("hello")];
 
         assert!(matches!(
-            interceptor.pre_llm_request(&mut context).await.unwrap(),
+            interceptor
+                .pre_llm_request(PreLlmRequestContext {
+                    items: &mut context,
+                })
+                .await
+                .unwrap(),
             PreRequestAction::Continue
         ));
         tracker.record_usage(&make_usage(100));
 
         assert!(matches!(
-            interceptor.pre_llm_request(&mut context).await.unwrap(),
+            interceptor
+                .pre_llm_request(PreLlmRequestContext {
+                    items: &mut context,
+                })
+                .await
+                .unwrap(),
             PreRequestAction::Continue
         ));
         tracker.record_usage(&make_usage(100));
@@ -486,7 +498,12 @@ mod tests {
         // Two 100-token requests would exceed a cumulative 150-token cap, but
         // current occupancy is still the latest 100-token measurement.
         assert!(matches!(
-            interceptor.pre_llm_request(&mut context).await.unwrap(),
+            interceptor
+                .pre_llm_request(PreLlmRequestContext {
+                    items: &mut context,
+                })
+                .await
+                .unwrap(),
             PreRequestAction::Continue
         ));
     }
@@ -508,13 +525,23 @@ mod tests {
         let mut context = vec![Item::user_message("hello")];
 
         assert!(matches!(
-            interceptor.pre_llm_request(&mut context).await.unwrap(),
+            interceptor
+                .pre_llm_request(PreLlmRequestContext {
+                    items: &mut context,
+                })
+                .await
+                .unwrap(),
             PreRequestAction::Continue
         ));
         tracker.record_usage(&make_usage(100));
 
         assert!(matches!(
-            interceptor.pre_llm_request(&mut context).await.unwrap(),
+            interceptor
+                .pre_llm_request(PreLlmRequestContext {
+                    items: &mut context,
+                })
+                .await
+                .unwrap(),
             PreRequestAction::ContinueWith(items)
                 if items.len() == 1 && items[0].as_text().unwrap_or_default().contains("write_summary")
         ));
@@ -528,13 +555,23 @@ mod tests {
         let mut context = vec![Item::user_message("hello")];
 
         assert!(matches!(
-            interceptor.pre_llm_request(&mut context).await.unwrap(),
+            interceptor
+                .pre_llm_request(PreLlmRequestContext {
+                    items: &mut context,
+                })
+                .await
+                .unwrap(),
             PreRequestAction::Continue
         ));
         tracker.record_usage(&make_usage(100));
 
         assert!(matches!(
-            interceptor.pre_llm_request(&mut context).await.unwrap(),
+            interceptor
+                .pre_llm_request(PreLlmRequestContext {
+                    items: &mut context,
+                })
+                .await
+                .unwrap(),
             PreRequestAction::Cancel(message) if message.contains("occupancy")
         ));
     }

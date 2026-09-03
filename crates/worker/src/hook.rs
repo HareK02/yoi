@@ -285,12 +285,6 @@ pub struct TurnEndInfo {
     pub final_text_preview: String,
 }
 
-/// Information passed to `OnAbort` hooks.
-pub struct AbortInfo {
-    /// Reason supplied by the aborter.
-    pub reason: String,
-}
-
 // =============================================================================
 // Hook Event Kinds
 // =============================================================================
@@ -315,10 +309,8 @@ pub struct PreLlmRequest;
 pub struct PreToolCall;
 /// After each tool completes; observational except it may abort the run.
 pub struct PostToolCall;
-/// When a turn ends with no tool calls; observational except it may pause.
+/// After every terminal assistant response is committed; observational except it may pause.
 pub struct OnTurnEnd;
-/// When execution is interrupted; observational only.
-pub struct OnAbort;
 
 impl HookEventKind for OnPromptSubmit {
     type Input = PromptSubmitInfo;
@@ -343,11 +335,6 @@ impl HookEventKind for PostToolCall {
 impl HookEventKind for OnTurnEnd {
     type Input = TurnEndInfo;
     type Output = HookTurnEndAction;
-}
-
-impl HookEventKind for OnAbort {
-    type Input = AbortInfo;
-    type Output = ();
 }
 
 // =============================================================================
@@ -380,7 +367,6 @@ pub struct HookRegistryBuilder {
     pre_tool_call: Vec<Box<dyn Hook<PreToolCall>>>,
     post_tool_call: Vec<Box<dyn Hook<PostToolCall>>>,
     on_turn_end: Vec<Box<dyn Hook<OnTurnEnd>>>,
-    on_abort: Vec<Box<dyn Hook<OnAbort>>>,
 }
 
 impl HookRegistryBuilder {
@@ -408,10 +394,6 @@ impl HookRegistryBuilder {
         self.on_turn_end.push(Box::new(hook));
     }
 
-    pub fn add_on_abort(&mut self, hook: impl Hook<OnAbort> + 'static) {
-        self.on_abort.push(Box::new(hook));
-    }
-
     /// Freeze the builder into an immutable registry.
     pub fn build(self) -> HookRegistry {
         HookRegistry {
@@ -420,7 +402,6 @@ impl HookRegistryBuilder {
             pre_tool_call: self.pre_tool_call,
             post_tool_call: self.post_tool_call,
             on_turn_end: self.on_turn_end,
-            on_abort: self.on_abort,
         }
     }
 }
@@ -432,7 +413,6 @@ pub struct HookRegistry {
     pub(crate) pre_tool_call: Vec<Box<dyn Hook<PreToolCall>>>,
     pub(crate) post_tool_call: Vec<Box<dyn Hook<PostToolCall>>>,
     pub(crate) on_turn_end: Vec<Box<dyn Hook<OnTurnEnd>>>,
-    pub(crate) on_abort: Vec<Box<dyn Hook<OnAbort>>>,
 }
 
 #[cfg(test)]

@@ -919,10 +919,7 @@ async fn test_tool_execution_context_for_skipped_and_synthetic_paths() {
             })
         }
 
-        async fn post_tool_call(
-            &self,
-            info: &mut ToolResultInfo,
-        ) -> InterceptorResult<PostToolAction> {
+        async fn post_tool_call(&self, info: &ToolResultInfo) -> InterceptorResult<PostToolAction> {
             self.post_contexts
                 .lock()
                 .unwrap()
@@ -1026,9 +1023,9 @@ async fn test_before_tool_call_skip() {
     );
 }
 
-/// Hook: post_tool_call - verify that results can be modified
+/// Hook: post_tool_call - verify that the committed terminal result is observed.
 #[tokio::test]
-async fn test_post_tool_call_modification() {
+async fn test_post_tool_call_observes_committed_result() {
     // Prepare responses for multiple requests
     let client = MockLlmClient::with_responses(vec![
         // First request: tool call
@@ -1079,43 +1076,39 @@ async fn test_post_tool_call_modification() {
 
     engine.register_tool(simple_tool_definition());
 
-    // Policy to modify results
-    struct ModifyingPolicy {
-        modified_content: Arc<std::sync::Mutex<Option<String>>>,
+    // Policy to observe the committed terminal result.
+    struct ObservingPolicy {
+        observed_content: Arc<std::sync::Mutex<Option<String>>>,
     }
 
     #[async_trait]
-    impl Interceptor for ModifyingPolicy {
-        async fn post_tool_call(
-            &self,
-            info: &mut ToolResultInfo,
-        ) -> InterceptorResult<PostToolAction> {
-            info.result.summary = format!("[Modified] {}", info.result.summary);
-            *self.modified_content.lock().unwrap() = Some(info.result.summary.clone());
+    impl Interceptor for ObservingPolicy {
+        async fn post_tool_call(&self, info: &ToolResultInfo) -> InterceptorResult<PostToolAction> {
+            *self.observed_content.lock().unwrap() = Some(info.result.summary.clone());
             Ok(PostToolAction::Continue)
         }
     }
 
-    let modified_content = Arc::new(std::sync::Mutex::new(None));
-    engine.set_interceptor(ModifyingPolicy {
-        modified_content: modified_content.clone(),
+    let observed_content = Arc::new(std::sync::Mutex::new(None));
+    engine.set_interceptor(ObservingPolicy {
+        observed_content: observed_content.clone(),
     });
 
     // Mutable::run consumes self, returns (Locked, EngineResult)
-    let result = engine.run(&mut history, "Test modification").await;
+    let result = engine.run(&mut history, "Test observation").await;
 
     assert!(
         matches!(result.result, agen::EngineRunExit::Finished),
         "Engine should complete"
     );
 
-    // Verify hook was called and content was modified
-    let content = modified_content.lock().unwrap().clone();
-    assert!(content.is_some(), "Hook should have been called");
-    assert!(
-        content.unwrap().contains("[Modified]"),
-        "Result should be modified"
-    );
+    // Verify the interceptor observed the exact committed result.
+    let observed = observed_content.lock().unwrap().clone();
+    assert_eq!(observed.as_deref(), Some("Original Result"));
+    assert!(history.items().any(|item| matches!(
+        item,
+        Item::ToolResult { summary, .. } if summary == "Original Result"
+    )));
 }
 
 /// Hook: pre_tool_call synthetic result - skipped tool gets an error result in history.
@@ -1189,19 +1182,24 @@ async fn post_tool_abort_commits_confirmed_result_before_stopping_run() {
     let tool = SlowTool::new("confirmed", 1);
     engine.register_tool(tool.definition());
 
-    struct AbortAfterResult;
+    let observed = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    struct AbortAfterResult {
+        lifecycle: Arc<Mutex<Vec<&'static str>>>,
+    }
     #[async_trait]
     impl Interceptor for AbortAfterResult {
         async fn post_tool_call(
             &self,
-            _info: &mut ToolResultInfo,
+            _info: &ToolResultInfo,
         ) -> InterceptorResult<PostToolAction> {
+            self.lifecycle.lock().unwrap().push("post_tool_call");
             Ok(PostToolAction::Abort("policy stopped the run".to_string()))
         }
     }
-    engine.set_interceptor(AbortAfterResult);
+    engine.set_interceptor(AbortAfterResult {
+        lifecycle: observed.clone(),
+    });
 
-    let observed = Arc::new(Mutex::new(Vec::<&'static str>::new()));
     let published = observed.clone();
     engine.on_tool_result(move |_| published.lock().unwrap().push("published"));
     let committed = observed.clone();
@@ -1221,7 +1219,7 @@ async fn post_tool_abort_commits_confirmed_result_before_stopping_run() {
     assert_eq!(tool.call_count(), 1);
     assert_eq!(
         observed.lock().unwrap().as_slice(),
-        ["committed", "published", "run-returned"]
+        ["committed", "published", "post_tool_call", "run-returned"]
     );
     assert!(matches!(
         output.result,

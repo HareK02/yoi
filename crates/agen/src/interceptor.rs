@@ -9,6 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::Item;
+use crate::engine::EngineRunExit;
 use crate::tool::{Tool, ToolCall, ToolExecutionContext, ToolMeta, ToolResult};
 
 // =============================================================================
@@ -59,8 +60,8 @@ pub enum InterceptorPoint {
     PreLlmRequest,
     PreToolCall,
     PostToolCall,
-    TurnEnd,
-    Abort,
+    AssistantTurnEnd,
+    RunExit,
 }
 
 impl std::fmt::Display for InterceptorPoint {
@@ -71,8 +72,8 @@ impl std::fmt::Display for InterceptorPoint {
             Self::PreLlmRequest => "pre_llm_request",
             Self::PreToolCall => "pre_tool_call",
             Self::PostToolCall => "post_tool_call",
-            Self::TurnEnd => "turn_end",
-            Self::Abort => "abort",
+            Self::AssistantTurnEnd => "assistant_turn_end",
+            Self::RunExit => "run_exit",
         };
         formatter.write_str(name)
     }
@@ -105,6 +106,35 @@ impl InterceptorFailure {
 
 /// Result returned by asynchronous interceptor lifecycle methods.
 pub type InterceptorResult<T> = Result<T, InterceptorError>;
+
+// =============================================================================
+// Lifecycle Contexts
+// =============================================================================
+
+/// Mutable prompt input presented before it is committed to Engine history.
+pub struct PromptSubmitContext<'a> {
+    pub item: &'a mut Item,
+}
+
+/// Mutable provider-visible item projection presented before an LLM request.
+pub struct PreLlmRequestContext<'a> {
+    pub items: &'a mut Vec<Item>,
+}
+
+/// A terminalized and committed assistant response at the next-phase boundary.
+pub struct AssistantTurnEndContext<'a> {
+    /// The exact assistant items committed for this response.
+    pub assistant_items: &'a [Item],
+    /// The committed Engine history after the assistant items were appended.
+    pub history: &'a [Item],
+    /// Terminal tool calls collected from the response, if any.
+    pub tool_calls: &'a [ToolCall],
+}
+
+/// The one terminal outcome produced by a public Engine run or resume call.
+pub struct RunExitContext<'a> {
+    pub exit: &'a EngineRunExit,
+}
 
 // =============================================================================
 // Action Enums
@@ -181,9 +211,9 @@ pub enum PostToolAction {
 /// Action at the end of a turn (when LLM produces no tool calls).
 #[derive(Debug, Clone)]
 pub enum TurnEndAction {
-    /// Turn is finished, return to caller.
+    /// Accept the Engine's natural next phase: execute tools, or finish when none exist.
     Finish,
-    /// Continue with additional messages injected into history.
+    /// Commit additional messages, then continue through the natural next phase.
     ContinueWithMessages(Vec<Item>),
     /// Pause execution (can be resumed later).
     Pause,
@@ -209,7 +239,7 @@ pub struct ToolCallInfo {
 pub struct ToolResultInfo {
     /// Original tool call.
     pub call: ToolCall,
-    /// Tool execution result (modifiable).
+    /// Committed terminal tool execution result.
     pub result: ToolResult,
     /// Tool meta information.
     pub meta: ToolMeta,
@@ -236,7 +266,10 @@ pub struct ToolResultInfo {
 #[async_trait]
 pub trait Interceptor: Send + Sync {
     /// Called after receiving user input, before adding it to Engine history.
-    async fn on_prompt_submit(&self, _item: &mut Item) -> InterceptorResult<PromptAction> {
+    async fn on_prompt_submit(
+        &self,
+        _context: PromptSubmitContext<'_>,
+    ) -> InterceptorResult<PromptAction> {
         Ok(PromptAction::Continue)
     }
 
@@ -272,7 +305,7 @@ pub trait Interceptor: Send + Sync {
     /// commits it to history before the request is sent.
     async fn pre_llm_request(
         &self,
-        _context: &mut Vec<Item>,
+        _context: PreLlmRequestContext<'_>,
     ) -> InterceptorResult<PreRequestAction> {
         Ok(PreRequestAction::Continue)
     }
@@ -282,24 +315,22 @@ pub trait Interceptor: Send + Sync {
         Ok(PreToolAction::Continue)
     }
 
-    /// Called after each tool reaches one terminal result.
-    async fn post_tool_call(
-        &self,
-        _info: &mut ToolResultInfo,
-    ) -> InterceptorResult<PostToolAction> {
+    /// Called after each tool reaches one terminal result and that result is committed.
+    async fn post_tool_call(&self, _info: &ToolResultInfo) -> InterceptorResult<PostToolAction> {
         Ok(PostToolAction::Continue)
     }
 
-    /// Called at the assistant boundary when a completed response has no tool calls.
-    ///
-    /// This is not the logical run termination observer. A host that needs that
-    /// boundary must inspect the returned [`crate::EngineRunExit`].
-    async fn on_turn_end(&self, _history: &[Item]) -> InterceptorResult<TurnEndAction> {
+    /// Called after every terminal assistant response is committed and before
+    /// the Engine decides whether to execute tools, continue, or finish.
+    async fn on_assistant_turn_end(
+        &self,
+        _context: AssistantTurnEndContext<'_>,
+    ) -> InterceptorResult<TurnEndAction> {
         Ok(TurnEndAction::Finish)
     }
 
-    /// Called once when execution is interrupted (abort, cancellation, or failure).
-    async fn on_abort(&self, _reason: &str) -> InterceptorResult<()> {
+    /// Called once for the terminal outcome of each public run or resume call.
+    async fn on_run_exit(&self, _context: RunExitContext<'_>) -> InterceptorResult<()> {
         Ok(())
     }
 }

@@ -3,7 +3,7 @@ mod common;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use agen::interceptor::{Interceptor, InterceptorResult, TurnEndAction};
+use agen::interceptor::{AssistantTurnEndContext, Interceptor, InterceptorResult, TurnEndAction};
 use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use agen::llm_client::types::{Item, RequestConfig};
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
@@ -100,7 +100,10 @@ struct PausePolicy;
 
 #[async_trait]
 impl Interceptor for PausePolicy {
-    async fn on_turn_end(&self, _history: &[Item]) -> InterceptorResult<TurnEndAction> {
+    async fn on_assistant_turn_end(
+        &self,
+        _context: AssistantTurnEndContext<'_>,
+    ) -> InterceptorResult<TurnEndAction> {
         Ok(TurnEndAction::Pause)
     }
 }
@@ -350,7 +353,8 @@ async fn session_run_with_tool_call() {
 async fn session_resume_after_pause() {
     let (_dir, store) = make_store();
 
-    // First run: tool call with pause policy → Paused
+    // First terminal assistant response requests a tool; the assistant-turn
+    // interceptor pauses before the Engine enters the tool phase.
     let client = MockLlmClient::with_responses(tool_call_events());
     let mut worker = TestWorker::new(Engine::new(client));
     worker.register_tool(weather_tool_definition());
@@ -386,7 +390,7 @@ async fn session_resume_after_pause() {
     // Restore state and verify
     let state = session_store::restore(&store, sid, segid).unwrap();
     assert!(state.last_run_interrupted);
-    assert_eq!(state.active_run_turn_count, Some(2));
+    assert_eq!(state.active_run_turn_count, Some(1));
 }
 
 #[tokio::test]
