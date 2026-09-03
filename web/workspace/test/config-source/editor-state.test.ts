@@ -1,3 +1,6 @@
+import denoConfig from "../../deno.json" with { type: "json" };
+import { CODEMIRROR_VITE_DEDUPE } from "../../src/lib/workspace/config-source/vite-dedupe.ts";
+
 declare const Deno: {
   test(name: string, fn: () => Promise<void> | void): void;
   readTextFile(path: URL): Promise<string>;
@@ -6,6 +9,30 @@ declare const Deno: {
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
+
+Deno.test("Vite deduplicates CodeMirror stateful packages", () => {
+  for (
+    const packageName of [
+      "@codemirror/autocomplete",
+      "@codemirror/language",
+      "@codemirror/state",
+      "@codemirror/view",
+      "@lezer/common",
+    ]
+  ) {
+    assert(
+      CODEMIRROR_VITE_DEDUPE.includes(packageName),
+      `Vite must deduplicate ${packageName}`,
+    );
+  }
+
+  for (const packageName of CODEMIRROR_VITE_DEDUPE) {
+    assert(
+      packageName in (denoConfig.imports ?? {}),
+      `${packageName} must be a direct dependency so Vite can deduplicate it`,
+    );
+  }
+});
 
 Deno.test("config editor snapshots Svelte proxies before cloning baselines", async () => {
   const source = await Deno.readTextFile(
@@ -71,6 +98,17 @@ Deno.test("Decodal editor follows readonly prop changes after mount", async () =
       !source.includes("--text-primary") &&
       !source.includes("--border-subtle"),
     "CodeMirror theme must use workspace tokens that actually exist",
+  );
+  assert(
+    source.includes("keymap.of(completionKeymapWithoutEnter)") &&
+      source.includes("binding.key !== 'Enter'") &&
+      source.includes("activateOnTyping: false") &&
+      source.includes("shouldStartCompletionAfterTyping(insertedText)") &&
+      source.includes("startCompletion(editor)") &&
+      !source.includes("EditorView.domEventHandlers") &&
+      !source.includes("update.selectionSet") &&
+      source.includes("completionStatus(editor.state) === null"),
+    "completion should start only after non-whitespace typing, without using focus, cursor movement, Space, or Enter",
   );
   assert(
     source.includes("fixedSchemaWrapperCompartment.reconfigure") &&

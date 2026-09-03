@@ -571,20 +571,10 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
     let mut socket_override = None;
     let mut runtime_id = None;
     let mut worker_id = None;
-    let mut standalone_resume = false;
-    let mut standalone_all = false;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         match arg.as_str() {
-            "--resume" => {
-                standalone_resume = true;
-                i += 1;
-            }
-            "--all" => {
-                standalone_all = true;
-                i += 1;
-            }
             "--worker" => {
                 let value = args
                     .get(i + 1)
@@ -766,29 +756,6 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
         &workspace_root,
     )?;
 
-    if standalone_all && !standalone_resume {
-        return Err(ParseError("--all requires --resume".to_string()));
-    }
-    if standalone_resume {
-        if target.kind() != TargetKind::Standalone {
-            return Err(ParseError(
-                "--resume is a Standalone option and requires --local".to_string(),
-            ));
-        }
-        if worker_name.is_some()
-            || profile.is_some()
-            || session.is_some()
-            || socket_override.is_some()
-            || runtime_id.is_some()
-            || worker_id.is_some()
-        {
-            return Err(ParseError(
-                "--local --resume cannot be combined with Worker, profile, session, socket, or Runtime selectors"
-                    .to_string(),
-            ));
-        }
-    }
-
     if target.kind() == TargetKind::Standalone {
         if runtime_id.is_some() || worker_id.is_some() {
             return Err(ParseError(
@@ -798,7 +765,7 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
         }
         if session.is_some() {
             return Err(ParseError(
-                "--local does not accept legacy --session; use --local --resume for Standalone Worker restore"
+                "--local does not accept legacy --session; use `yoi --local resume` for Standalone Worker restore"
                     .to_string(),
             ));
         }
@@ -834,16 +801,12 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
 
     if target.kind() == TargetKind::Standalone && (session.is_some() || socket_override.is_some()) {
         return Err(ParseError(
-            "Standalone does not accept legacy Worker session or socket selectors; use --resume for the standalone Worker store"
+            "Standalone does not accept legacy Worker session or socket selectors; use `yoi --local resume` for the standalone Worker store"
                 .to_string(),
         ));
     }
 
-    let mode = if standalone_resume {
-        LaunchMode::StandaloneResume {
-            include_all: standalone_all,
-        }
-    } else if target.kind() == TargetKind::Standalone {
+    let mode = if target.kind() == TargetKind::Standalone {
         LaunchMode::Spawn {
             worker_name,
             profile,
@@ -951,7 +914,7 @@ fn parse_workers_args<R: CliConnectionResolver + ?Sized>(
     )?;
     if target.kind() != TargetKind::Backend {
         return Err(ParseError(
-            "yoi workers requires a Backend connection target; use yoi --local --resume for Standalone Workers"
+            "yoi workers requires a Backend connection target; use yoi --local resume for Standalone Workers"
                 .to_string(),
         ));
     }
@@ -1741,7 +1704,6 @@ const TOP_LEVEL_HELP: &str = r#"yoi
 
 Usage:
   yoi [TARGET]
-  yoi --local --resume [--all]
   yoi [TARGET] workers [-r|--stopped] [--runtime-id <ID>]
   yoi [TARGET] resume [--all] [--runtime-id <ID>]
   yoi --backend <URL> [--workspace-id <ID>] panel
@@ -1750,8 +1712,6 @@ Usage:
 
 Target selection:
       --local              Use the client-owned one-process Standalone host
-      --resume             With --local, restore from the Standalone Worker store
-      --all                With Standalone restore, include Workers from every cwd identity
       --backend <URL>      Use a Workspace Backend explicitly
       --workspace-id <ID>  Scope Backend routes to a Workspace id
 
@@ -1801,7 +1761,7 @@ Usage:
 
 Authority:
   Lists Workers from the selected Backend Workspace. Standalone Workers are restored with
-  `yoi --local --resume` and are not part of the Workspace Worker catalog.
+  `yoi --local resume` and are not part of the Workspace Worker catalog.
 
 Options:
       --backend <URL>      Use this Workspace Backend
@@ -2212,35 +2172,14 @@ backend = "shared"
     }
 
     #[test]
-    fn parser_local_resume_uses_standalone_picker_scope() {
-        let mode = parse_args_from(["--local", "--resume"]).unwrap();
-        let Mode::Tui { target, mode, .. } = mode else {
-            panic!("expected TUI mode")
-        };
-        assert_eq!(target.kind(), TargetKind::Standalone);
-        assert!(matches!(
-            mode,
-            LaunchMode::StandaloneResume { include_all: false }
-        ));
-        let intent = target.standalone_worker_list(false).unwrap();
-        assert!(intent.state_dir.ends_with("client/standalone/workers"));
-        assert!(!intent.include_all);
-
-        let mode = parse_args_from(["--local", "--resume", "--all"]).unwrap();
-        let Mode::Tui { mode, .. } = mode else {
-            panic!("expected TUI mode")
-        };
-        assert!(matches!(
-            mode,
-            LaunchMode::StandaloneResume { include_all: true }
-        ));
-
-        assert_eq!(
-            parse_args_from(["--local", "--all"])
-                .unwrap_err()
-                .to_string(),
-            "--all requires --resume"
-        );
+    fn parser_rejects_removed_top_level_resume_flags() {
+        for (args, expected) in [
+            (vec!["--resume"], "unknown argument: --resume"),
+            (vec!["--local", "--resume"], "unknown argument: --resume"),
+            (vec!["--all"], "unknown argument: --all"),
+        ] {
+            assert_eq!(parse_args_from(args).unwrap_err().to_string(), expected);
+        }
     }
 
     #[test]
@@ -2264,7 +2203,7 @@ backend = "shared"
         let err = parse_args_slice_with_connection_resolver(&session_args, &resolver).unwrap_err();
         assert_eq!(
             err.0,
-            "--local does not accept legacy --session; use --local --resume for Standalone Worker restore"
+            "--local does not accept legacy --session; use `yoi --local resume` for Standalone Worker restore"
         );
 
         let socket_args = [
@@ -2897,7 +2836,7 @@ backend = "shared"
             other => panic!("expected WorkersHelp mode, got {other:?}"),
         }
         assert!(WORKERS_HELP.contains("selected Backend Workspace"));
-        assert!(WORKERS_HELP.contains("--local --resume"));
+        assert!(WORKERS_HELP.contains("--local resume"));
         assert!(!WORKERS_HELP.contains("[--local|--backend"));
         assert!(!WORKERS_HELP.contains("local Worker records"));
     }

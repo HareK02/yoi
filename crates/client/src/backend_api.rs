@@ -192,6 +192,32 @@ impl BackendApiClient {
         format!("Bearer {}", self.access_token.0)
     }
 
+    pub async fn require_success(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<reqwest::Response, BackendApiClientError> {
+        let status = response.status();
+        match status {
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                self.check_status(status)?;
+            }
+            status if !status.is_success() => {
+                let detail = response
+                    .bytes()
+                    .await
+                    .ok()
+                    .and_then(|body| backend_error_detail(&body));
+                return Err(BackendApiClientError::BackendResponse {
+                    origin: self.origin.clone(),
+                    status: status.as_u16(),
+                    detail,
+                });
+            }
+            _ => {}
+        }
+        Ok(response)
+    }
+
     pub fn check_status(&self, status: StatusCode) -> Result<(), BackendApiClientError> {
         match status {
             StatusCode::UNAUTHORIZED => Err(BackendApiClientError::Unauthorized {
@@ -235,6 +261,18 @@ fn redirect_policy(origin: BackendOrigin) -> redirect::Policy {
     })
 }
 
+#[derive(Deserialize)]
+struct BackendErrorBody {
+    message: String,
+}
+
+fn backend_error_detail(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<BackendErrorBody>(body)
+        .ok()
+        .map(|body| body.message)
+        .filter(|message| !message.trim().is_empty())
+}
+
 #[derive(Debug)]
 pub enum BackendApiClientError {
     InvalidBackendOrigin(String),
@@ -265,6 +303,11 @@ pub enum BackendApiClientError {
     BackendStatus {
         origin: BackendOrigin,
         status: u16,
+    },
+    BackendResponse {
+        origin: BackendOrigin,
+        status: u16,
+        detail: Option<String>,
     },
     Io {
         path: PathBuf,
@@ -311,6 +354,17 @@ impl fmt::Display for BackendApiClientError {
             ),
             Self::BackendStatus { origin, status } => {
                 write!(f, "Backend {origin} returned HTTP {status}")
+            }
+            Self::BackendResponse {
+                origin,
+                status,
+                detail,
+            } => {
+                write!(f, "Backend {origin} returned HTTP {status}")?;
+                if let Some(detail) = detail {
+                    write!(f, ": {detail}")?;
+                }
+                Ok(())
             }
             Self::Io { path, source } => {
                 write!(f, "failed to access {}: {source}", path.display())
@@ -581,6 +635,23 @@ mod tests {
                 .unwrap()
                 .as_str(),
             "https://example.com:8443"
+        );
+    }
+
+    #[test]
+    fn backend_error_detail_preserves_public_server_message() {
+        let detail = backend_error_detail(
+            br#"{"error":"Bad Request","message":"working_directory_runtime_mismatch: Working directory is owned by a different Runtime","diagnostics":[{"code":"working_directory_runtime_mismatch"}]}"#,
+        );
+        let error = BackendApiClientError::BackendResponse {
+            origin: BackendOrigin::parse("http://127.0.0.1:8787").unwrap(),
+            status: 400,
+            detail,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Backend http://127.0.0.1:8787 returned HTTP 400: working_directory_runtime_mismatch: Working directory is owned by a different Runtime"
         );
     }
 

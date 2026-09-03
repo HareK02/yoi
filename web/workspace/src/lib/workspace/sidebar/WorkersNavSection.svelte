@@ -1,6 +1,12 @@
 <script lang="ts">
   import Spinner from '$lib/workspace/console/Spinner.svelte';
   import { workerConsoleHref } from '$lib/workspace/console/model';
+  import { pushWorkspaceAlert } from '$lib/workspace/alerts/store';
+  import {
+    canDeleteSidebarWorker,
+    deleteSidebarWorker,
+    stopSidebarWorker,
+  } from './worker-actions';
   import {
     workspaceWorkersStore,
     type SidebarWorker,
@@ -8,6 +14,7 @@
   import { canShowWorkerInSidebar, sidebarWorkerActivity } from './workers';
 
   const COLLAPSED_WORKER_COUNT = 6;
+  type WorkerActionKind = 'stop' | 'delete';
 
   type Props = {
     currentPath?: string;
@@ -19,6 +26,10 @@
   let error = $state<string | null>(null);
   let workers = $state<SidebarWorker[]>([]);
   let expanded = $state(false);
+  let openWorkerKey = $state<string | null>(null);
+  let menuElement = $state<HTMLElement | null>(null);
+  let menuTrigger = $state<HTMLButtonElement | null>(null);
+  let busyAction = $state<{ workerKey: string; kind: WorkerActionKind } | null>(null);
   let visibleWorkers = $derived(
     expanded ? workers : workers.slice(0, COLLAPSED_WORKER_COUNT),
   );
@@ -26,8 +37,95 @@
     Math.max(0, workers.length - COLLAPSED_WORKER_COUNT),
   );
 
+  function workerKey(worker: SidebarWorker): string {
+    return `${worker.runtime_id}:${worker.worker_id}`;
+  }
+
+  function isBusy(worker: SidebarWorker, kind: WorkerActionKind): boolean {
+    return busyAction?.workerKey === workerKey(worker) && busyAction.kind === kind;
+  }
+
+  function closeWorkerMenu(restoreFocus = false) {
+    const trigger = menuTrigger;
+    openWorkerKey = null;
+    menuElement = null;
+    menuTrigger = null;
+    if (restoreFocus) queueMicrotask(() => trigger?.focus());
+  }
+
+  function toggleWorkerMenu(worker: SidebarWorker, trigger: HTMLButtonElement) {
+    const key = workerKey(worker);
+    if (openWorkerKey === key) {
+      closeWorkerMenu();
+      return;
+    }
+    openWorkerKey = key;
+    menuTrigger = trigger;
+    queueMicrotask(() => {
+      menuElement?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
+    });
+  }
+
+  function handleWindowClick(event: MouseEvent) {
+    if (!openWorkerKey) return;
+    const target = event.target;
+    const owner = target instanceof Element ? target.closest('[data-worker-actions]') : null;
+    if (owner?.getAttribute('data-worker-actions') !== openWorkerKey) closeWorkerMenu();
+  }
+
+  function handleWindowKeydown(event: KeyboardEvent) {
+    if (event.key !== 'Escape' || !openWorkerKey) return;
+    event.preventDefault();
+    closeWorkerMenu(true);
+  }
+
+  async function stopWorker(worker: SidebarWorker) {
+    if (busyAction || !worker.capabilities.can_stop) return;
+    closeWorkerMenu();
+    busyAction = { workerKey: workerKey(worker), kind: 'stop' };
+    try {
+      await stopSidebarWorker(workspaceId, worker);
+      workers = workers.map((item) =>
+        workerKey(item) === workerKey(worker)
+          ? { ...item, state: 'stopped', capabilities: { ...item.capabilities, can_stop: false } }
+          : item
+      );
+      pushWorkspaceAlert('info', `${worker.display_name || worker.label} stopped`, {
+        title: 'Worker stopped',
+      });
+    } catch (cause) {
+      pushWorkspaceAlert('error', cause instanceof Error ? cause.message : 'Worker stop failed', {
+        title: 'Worker stop failed',
+      });
+    } finally {
+      busyAction = null;
+    }
+  }
+
+  async function deleteWorker(worker: SidebarWorker) {
+    if (busyAction || !canDeleteSidebarWorker(worker)) return;
+    closeWorkerMenu();
+    busyAction = { workerKey: workerKey(worker), kind: 'delete' };
+    try {
+      await deleteSidebarWorker(workspaceId, worker);
+      workers = workers.filter((item) => workerKey(item) !== workerKey(worker));
+      pushWorkspaceAlert('info', `${worker.display_name || worker.label} deleted`, {
+        title: 'Worker deleted',
+      });
+    } catch (cause) {
+      pushWorkspaceAlert('error', cause instanceof Error ? cause.message : 'Worker deletion failed', {
+        title: 'Worker deletion failed',
+      });
+    } finally {
+      busyAction = null;
+    }
+  }
+
   $effect(() => {
     expanded = false;
+    openWorkerKey = null;
+    menuElement = null;
+    menuTrigger = null;
     const subscription = workspaceWorkersStore(workspaceId);
     return subscription.subscribe((state) => {
       loading = state.loading;
@@ -36,6 +134,8 @@
     });
   });
 </script>
+
+<svelte:window onclick={handleWindowClick} onkeydown={handleWindowKeydown} />
 
 <section class="sidebar-nav-section" aria-labelledby="workers-heading">
   <div class="section-heading-row">
@@ -70,7 +170,9 @@
       {#each visibleWorkers as worker (`${worker.runtime_id}:${worker.worker_id}`)}
         {@const href = workerConsoleHref(worker, workspaceId)}
         {@const activity = sidebarWorkerActivity(worker)}
-        <li>
+        {@const key = workerKey(worker)}
+        {@const label = worker.display_name || worker.label}
+        <li class="worker-nav-item" data-worker-actions={key}>
           <a
             href={href}
             class="worker-nav-link"
@@ -86,11 +188,47 @@
                 <span class="worker-status-dot" aria-label="Idle"></span>
               {/if}
             </span>
-            <span class="worker-nav-label">{worker.display_name || worker.label}</span>
+            <span class="worker-nav-label">{label}</span>
             <small class="worker-nav-meta">
               {worker.repository_key ?? '—'}・{worker.working_directory_id ?? '—'}
             </small>
           </a>
+          <button
+            class="worker-actions-trigger"
+            class:open={openWorkerKey === key}
+            type="button"
+            aria-label={`Actions for ${label}`}
+            aria-haspopup="menu"
+            aria-expanded={openWorkerKey === key}
+            onclick={(event) => toggleWorkerMenu(worker, event.currentTarget)}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="5" cy="12" r="1.5"></circle>
+              <circle cx="12" cy="12" r="1.5"></circle>
+              <circle cx="19" cy="12" r="1.5"></circle>
+            </svg>
+          </button>
+          {#if openWorkerKey === key}
+            <div class="worker-actions-menu" role="menu" aria-label={`Actions for ${label}`} bind:this={menuElement}>
+              <button
+                type="button"
+                role="menuitem"
+                disabled={busyAction !== null || !worker.capabilities.can_stop}
+                onclick={() => stopWorker(worker)}
+              >
+                {isBusy(worker, 'stop') ? 'Stopping…' : 'Stop'}
+              </button>
+              <button
+                class="danger"
+                type="button"
+                role="menuitem"
+                disabled={busyAction !== null || !canDeleteSidebarWorker(worker)}
+                onclick={() => deleteWorker(worker)}
+              >
+                {isBusy(worker, 'delete') ? 'Deleting…' : 'Delete'}
+              </button>
+            </div>
+          {/if}
         </li>
       {/each}
     </ul>

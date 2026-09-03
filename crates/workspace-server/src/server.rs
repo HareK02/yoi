@@ -1990,16 +1990,18 @@ impl WorkspaceApi {
             .list_worker_workdir_links(&self.config.workspace_id, worker)?
             .into_iter()
             .find(|link| link.unlinked_at.is_none())
-            && let Some(access) = repository_access_request_for_workdir(
+        {
+            let workdir_runtime_id = registered_workdir_runtime_id(self, &link.workdir_id)?;
+            if let Some(access) = repository_access_request_for_workdir(
                 self,
-                &worker.runtime_id,
+                &workdir_runtime_id,
                 &link.workdir_id,
                 &format!("worker-restore:{}", WorkerId::now_v7()),
-            )?
-        {
-            self.runtime
-                .authorize_working_directory_repository_access(&worker.runtime_id, access)
-                .map_err(RuntimeRegistryError::into_error)?;
+            )? {
+                self.runtime
+                    .authorize_working_directory_repository_access(&workdir_runtime_id, access)
+                    .map_err(RuntimeRegistryError::into_error)?;
+            }
         }
         let binding = self
             .runtime
@@ -22720,6 +22722,119 @@ mod tests {
         assert!(!route_body.contains("source"));
         assert!(!route_body.contains("proof"));
 
+        let outer_path = format!("/api/w/{TEST_WORKSPACE_ID}/workers/remove");
+        let outer_request_body = r#"{"target_runtime_id":"runtime-target","target_worker_id":"target-worker","reason":"retire target Worker"}"#;
+        let outer_mutation_token = signer
+            .issue_worker_remove(
+                "server-main",
+                &api.config.workspace_id,
+                "7",
+                "runtime-target",
+                "target-worker",
+                60,
+            )
+            .unwrap();
+        let outer_request_token =
+            worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&identity)
+                .issue(
+                    "server-main",
+                    &api.config.workspace_id,
+                    Some("7"),
+                    worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION,
+                    "POST",
+                    &outer_path,
+                    outer_request_body.as_bytes(),
+                    i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap_or(i64::MAX),
+                    30,
+                )
+                .unwrap();
+        let outer_response = build_router(api.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&outer_path)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(
+                        worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+                        outer_request_token,
+                    )
+                    .header(
+                        worker_runtime::auth::WORKER_MUTATION_SOURCE_PROOF_HEADER,
+                        outer_mutation_token,
+                    )
+                    .body(Body::from(outer_request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outer_response.status(), StatusCode::NOT_FOUND);
+        let outer_response_body = axum::body::to_bytes(outer_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(outer_response_body.to_vec())
+                .unwrap()
+                .contains("unknown_worker")
+        );
+
+        let missing_outer_mutation_token = signer
+            .issue_worker_remove(
+                "server-main",
+                &api.config.workspace_id,
+                "7",
+                "runtime-target",
+                "target-worker",
+                60,
+            )
+            .unwrap();
+        let missing_outer_response = build_router(api.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&outer_path)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(
+                        worker_runtime::auth::WORKER_MUTATION_SOURCE_PROOF_HEADER,
+                        missing_outer_mutation_token,
+                    )
+                    .body(Body::from(outer_request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_outer_response.status(), StatusCode::UNAUTHORIZED);
+
+        let missing_mutation_request_token =
+            worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&identity)
+                .issue(
+                    "server-main",
+                    &api.config.workspace_id,
+                    Some("7"),
+                    worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION,
+                    "POST",
+                    &outer_path,
+                    outer_request_body.as_bytes(),
+                    i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap_or(i64::MAX),
+                    30,
+                )
+                .unwrap();
+        let missing_mutation_response = build_router(api.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&outer_path)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(
+                        worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+                        missing_mutation_request_token,
+                    )
+                    .body(Body::from(outer_request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_mutation_response.status(), StatusCode::UNAUTHORIZED);
+
         let mut revoked = trust;
         revoked.revoked_at = Some("2026-08-11T00:01:00Z".to_string());
         let authority = SqliteWorkspaceStore::open(api.config.database_path.clone()).unwrap();
@@ -26480,7 +26595,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let app = build_inner_router(api);
+        let app = build_inner_router(api.clone());
 
         let runtimes = get_json(app.clone(), "/api/runtimes").await;
         let embedded_summary = runtimes["items"]
@@ -26534,6 +26649,37 @@ mod tests {
             spawned["worker"]["implementation"]["kind"],
             "embedded_worker_runtime"
         );
+
+        let workdir_id = "external-workdir";
+        api.store
+            .upsert_workdir_registry(&WorkdirRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                workdir_id: workdir_id.to_string(),
+                runtime_id: "external-workdir-runtime".to_string(),
+                repository_id: "main".to_string(),
+                creation_selector: None,
+                creation_ref: None,
+                creation_tree: None,
+                current_selector: None,
+                current_ref: None,
+                current_tree: None,
+                observed_at_epoch_seconds: None,
+                materialization_status: "present".to_string(),
+                cleanliness: "clean".to_string(),
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .unwrap();
+        api.store
+            .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                worker: RuntimeWorkerRef::new("embedded-worker-runtime", &worker_id),
+                workdir_id: workdir_id.to_string(),
+                role: "attachment".to_string(),
+                linked_at: "2".to_string(),
+                unlinked_at: None,
+            })
+            .unwrap();
 
         let worker = get_json(
             app.clone(),

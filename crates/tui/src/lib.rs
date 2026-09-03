@@ -10,6 +10,7 @@ mod composer_keys;
 mod console;
 #[cfg(feature = "e2e-test")]
 mod e2e_observer;
+mod inline_terminal;
 mod input;
 pub mod keys;
 mod markdown;

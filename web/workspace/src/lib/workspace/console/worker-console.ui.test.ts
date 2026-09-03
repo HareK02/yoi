@@ -358,9 +358,10 @@ Deno.test("root layout keeps Workspace selection explicit", async () => {
 
   assert(
     layoutLoad.includes("export const load") &&
-      layoutLoad.includes("() => ({})") &&
+      layoutLoad.includes("listWorkspaces(fetch)") &&
+      layoutLoad.includes("accessibleWorkspaces") &&
       !layoutLoad.includes("scopedCompatibilityRoute") &&
-      !layoutLoad.includes("/api/workspace") &&
+      !layoutLoad.includes('"/api/workspace"') &&
       !layoutLoad.includes("workspaceRoute") &&
       !layoutLoad.includes("redirect("),
     "root layout should not infer, bootstrap, or redirect through a singleton Workspace",
@@ -812,6 +813,9 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
   const globalSidebar = await Deno.readTextFile(
     new URL("../sidebar/GlobalSidebar.svelte", import.meta.url),
   );
+  const globalNavSections = await Deno.readTextFile(
+    new URL("../sidebar/GlobalNavSections.svelte", import.meta.url),
+  );
   const sidebarFrame = await Deno.readTextFile(
     new URL("../sidebar/SidebarFrame.svelte", import.meta.url),
   );
@@ -874,13 +878,23 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     "Root layout chrome should keep GlobalSidebar as the root slot owner while account navigation stays in the header",
   );
   assert(
-    globalSidebar.includes('aria-label="Global pages"') &&
-      !globalSidebar.includes('<p class="sidebar-section-label">') &&
-      globalSidebar.includes("/account") &&
-      globalSidebar.includes("/login/device") &&
-      !globalSidebar.includes("Tickets") &&
-      !globalSidebar.includes("Repositories"),
-    "Root default sidebar should contain only global navigation, not workspace-scoped sections",
+    globalSidebar.includes("GlobalNavSections") &&
+      globalNavSections.includes('aria-label="Global pages"') &&
+      !globalNavSections.includes('<p class="sidebar-section-label">') &&
+      globalNavSections.includes('"/account"') &&
+      globalNavSections.includes('"/login/device"') &&
+      !globalNavSections.includes('label: "Workspaces"') &&
+      globalNavSections.includes("sidebar-nav-section--category") &&
+      globalNavSections.includes("global-workspaces-heading") &&
+      globalNavSections.includes("workspaces") &&
+      globalNavSections.includes("workspace.display_name") &&
+      globalNavSections.includes("workspaceHref(workspace.workspace_id)") &&
+      rootLayout.includes("workspaces={data.accessibleWorkspaces}") &&
+      rootLayout.includes("workspaceError={data.workspaceCatalogError}") &&
+      rootLayoutLoad.includes("listWorkspaces(fetch)") &&
+      !globalNavSections.includes("Tickets") &&
+      !globalNavSections.includes("Repositories"),
+    "Top-level sidebar should replace the Workspaces button with a categorized accessible Workspace list below the remaining global navigation",
   );
   assert(
     workspaceLayout.includes("{#snippet workspaceSidebar()}") &&
@@ -918,7 +932,8 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
   );
   assert(
     rootLayoutLoad.includes("export const load") &&
-      rootLayoutLoad.includes("() => ({})") &&
+      rootLayoutLoad.includes("listWorkspaces(fetch)") &&
+      rootLayoutLoad.includes("accessibleWorkspaces") &&
       !rootLayoutLoad.includes("workspaceRoute") &&
       !rootLayoutLoad.includes("redirect("),
     "Root layout should leave account and device-login routes public by avoiding Workspace redirects entirely",

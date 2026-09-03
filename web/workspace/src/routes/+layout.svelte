@@ -10,7 +10,7 @@
   import '../app.css';
   import type { LayoutProps } from './$types';
 
-  let { children }: LayoutProps = $props();
+  let { children, data }: LayoutProps = $props();
   let sidebar = $state<SidebarSnippet | null>(null);
   const sidebarOverrides = createOverrideStack<SidebarSnippet>((activeSidebar) => {
     sidebar = activeSidebar;
@@ -27,7 +27,12 @@
 
 <div class="app-shell">
   <SidebarFrame>
-    <GlobalSidebar currentPath={page.url.pathname} content={sidebar} />
+    <GlobalSidebar
+      currentPath={page.url.pathname}
+      content={sidebar}
+      workspaces={data.accessibleWorkspaces}
+      workspaceError={data.workspaceCatalogError}
+    />
   </SidebarFrame>
   <header class="app-shell__topbar">
     <div class="app-shell__topbar-location">

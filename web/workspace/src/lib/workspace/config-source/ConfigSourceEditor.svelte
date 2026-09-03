@@ -328,10 +328,12 @@
     </header>
     <DecodalSourceEditor
       value={source}
-      readonly={!selectedPath || busy}
+      readonly={!selectedPath || busy || !analysisReady}
       fixedSchemaWrapper={mainSelected}
       onChange={(value) => source = value}
-      onComplete={(value, offset, explicit) => toolchain?.complete(selectedPath, value, offset, explicit) ?? Promise.resolve(null)}
+      onComplete={(value, offset, explicit) => analysisReady && toolchain
+        ? toolchain.complete(selectedPath, value, offset, explicit)
+        : Promise.resolve(null)}
     />
     <p class="config-source-status" aria-live="polite">{status}</p>
     {#if conflict}

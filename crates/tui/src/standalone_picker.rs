@@ -3,14 +3,13 @@ use std::time::Duration;
 
 use client::{StandaloneWorkerListIntent, StandaloneWorkerResumeIntent, Target};
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style};
 use ratatui::widgets::Paragraph;
-use ratatui::{TerminalOptions, Viewport};
 use standalone::{StandaloneListScope, StandaloneWorkerRecord, StandaloneWorkerStore};
 use thiserror::Error;
+
+use crate::inline_terminal::with_inline_terminal;
 
 const LIMIT: usize = 100;
 
@@ -57,41 +56,36 @@ fn run_picker(
     records: Vec<StandaloneWorkerRecord>,
 ) -> Result<Option<StandaloneWorkerRecord>, StandalonePickerError> {
     let height = u16::try_from(records.len().saturating_add(3).min(20)).unwrap_or(20);
-    let mut terminal = Terminal::with_options(
-        CrosstermBackend::new(io::stdout()),
-        TerminalOptions {
-            viewport: Viewport::Inline(height),
-        },
-    )
-    .map_err(StandalonePickerError::Io)?;
-    let mut selected = 0usize;
-    loop {
-        terminal
-            .draw(|frame| draw(frame, &records, selected))
-            .map_err(StandalonePickerError::Io)?;
-        if !event::poll(Duration::from_millis(100)).map_err(StandalonePickerError::Io)? {
-            continue;
-        }
-        let TermEvent::Key(key) = event::read().map_err(StandalonePickerError::Io)? else {
-            continue;
-        };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') if !ctrl => {
-                selected = selected.saturating_sub(1);
+    with_inline_terminal(height, |terminal| {
+        let mut selected = 0usize;
+        loop {
+            terminal
+                .draw(|frame| draw(frame, &records, selected))
+                .map_err(StandalonePickerError::Io)?;
+            if !event::poll(Duration::from_millis(100)).map_err(StandalonePickerError::Io)? {
+                continue;
             }
-            KeyCode::Down | KeyCode::Char('j') if !ctrl => {
-                selected = (selected + 1).min(records.len() - 1);
+            let TermEvent::Key(key) = event::read().map_err(StandalonePickerError::Io)? else {
+                continue;
+            };
+            if key.kind == KeyEventKind::Release {
+                continue;
             }
-            KeyCode::Enter => return Ok(Some(records[selected].clone())),
-            KeyCode::Esc => return Ok(None),
-            KeyCode::Char('c') if ctrl => return Ok(None),
-            _ => {}
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') if !ctrl => {
+                    selected = selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') if !ctrl => {
+                    selected = (selected + 1).min(records.len() - 1);
+                }
+                KeyCode::Enter => return Ok(Some(records[selected].clone())),
+                KeyCode::Esc => return Ok(None),
+                KeyCode::Char('c') if ctrl => return Ok(None),
+                _ => {}
+            }
         }
-    }
+    })
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, records: &[StandaloneWorkerRecord], selected: usize) {
@@ -145,11 +139,11 @@ pub(crate) enum StandalonePickerError {
     #[error("standalone Worker state is unavailable: {0}")]
     StateStore(#[source] standalone::StandaloneStoreError),
     #[error(
-        "no standalone Workers found for this cwd; use `yoi --local --resume --all` to include all cwd identities"
+        "no standalone Workers found for this cwd; use `yoi --local resume --all` to include all cwd identities"
     )]
     NoWorkers { include_all: bool },
     #[error("standalone Worker picker I/O failed: {0}")]
-    Io(#[source] io::Error),
+    Io(#[from] io::Error),
 }
 
 #[cfg(test)]

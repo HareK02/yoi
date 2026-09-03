@@ -37,12 +37,21 @@
     type ComposerPaste,
     type ComposerTextPaste,
   } from "$lib/workspace/console/composer-draft.ts";
+  import {
+    ComposerHistory,
+    loadComposerHistory,
+    saveComposerHistory,
+    shouldBrowseComposerHistory,
+    type ComposerHistoryDirection,
+    type ComposerHistoryEntry,
+  } from "$lib/workspace/console/composer-history.ts";
   import { shouldSubmitChatKey } from "$lib/workspace/console/chat-submit.ts";
 
   interface Props {
     disabled?: boolean;
     ariaLabel?: string;
     ariaKeyShortcuts?: string;
+    historyScope: string;
     onchange?: (snapshot: ComposerDraftSnapshot) => void;
     onkeydown?: (event: KeyboardEvent) => void;
     onsubmit?: () => void;
@@ -52,6 +61,7 @@
     disabled = false,
     ariaLabel = "Message",
     ariaKeyShortcuts = "Meta+Enter Control+Enter",
+    historyScope,
     onchange,
     onkeydown,
     onsubmit,
@@ -59,6 +69,8 @@
 
   let mountElement: HTMLDivElement;
   let view: EditorView | null = null;
+  let composerHistory = new ComposerHistory();
+  let restoringHistory = false;
   let nextPasteId = 1;
   let nextPasteKey = 1;
   const editable = new Compartment();
@@ -179,6 +191,40 @@
     onchange?.(currentSnapshot());
   }
 
+  function historyEntry(state: EditorState): ComposerHistoryEntry {
+    const snapshot = currentSnapshot(state);
+    return {
+      segments: snapshot.segments,
+      preserveExactText: snapshot.textPastes.length > 0,
+    };
+  }
+
+  function browseHistory(currentView: EditorView, direction: ComposerHistoryDirection): boolean {
+    const selection = currentView.state.selection.main;
+    const cursorLine = currentView.state.doc.lineAt(selection.head).number;
+    if (!shouldBrowseComposerHistory({
+      direction,
+      cursorLine,
+      lineCount: currentView.state.doc.lines,
+      selectionEmpty: selection.empty,
+      readOnly: currentView.state.readOnly,
+      composing: currentView.composing,
+    })) return false;
+
+    const entry = direction === "older"
+      ? composerHistory.previous(historyEntry(currentView.state))
+      : composerHistory.next();
+    if (!entry) return false;
+
+    restoringHistory = true;
+    try {
+      restoreSegments(entry.segments, entry.preserveExactText);
+    } finally {
+      restoringHistory = false;
+    }
+    return true;
+  }
+
   function insertPasteChip(content: string, measurement: ComposerPasteMeasurement): void {
     if (!view) return;
     const selection = view.state.selection.main;
@@ -273,6 +319,10 @@
     return true;
   }
 
+  $effect(() => {
+    composerHistory = loadComposerHistory(localStorage, historyScope);
+  });
+
   onMount(() => {
     view = new EditorView({
       parent: mountElement,
@@ -291,6 +341,14 @@
             {
               key: "Mod-y",
               run: (currentView) => currentView.state.readOnly,
+            },
+            {
+              key: "ArrowUp",
+              run: (currentView) => browseHistory(currentView, "older"),
+            },
+            {
+              key: "ArrowDown",
+              run: (currentView) => browseHistory(currentView, "newer"),
             },
             {
               key: "Backspace",
@@ -319,6 +377,7 @@
             spellcheck: "true",
           }),
           EditorView.updateListener.of((update) => {
+            if (update.docChanged && !restoringHistory) composerHistory.cancelNavigation();
             if (update.docChanged || update.transactions.some((tx) => tx.effects.length > 0)) {
               emitChange();
             }
@@ -394,6 +453,16 @@
 
   export function snapshot(): ComposerDraftSnapshot {
     return currentSnapshot();
+  }
+
+  export function recordHistory(value: ComposerDraftSnapshot): void {
+    const entry: ComposerHistoryEntry = {
+      segments: value.segments,
+      preserveExactText: value.textPastes.length > 0,
+    };
+    if (composerHistory.record(entry)) {
+      saveComposerHistory(localStorage, historyScope, composerHistory);
+    }
   }
 
   export function focus(): void {

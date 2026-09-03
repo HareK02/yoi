@@ -1,5 +1,18 @@
-import type { LayoutLoad } from './$types';
+import { listWorkspaces } from "$lib/workspace/api/workspace-catalog";
+import type { LayoutLoad } from "./$types";
 
-// Workspace selection is explicit at `/`; the root layout must never infer a
-// singleton Workspace or redirect based on an unscoped compatibility endpoint.
-export const load: LayoutLoad = () => ({});
+export const load: LayoutLoad = async ({ fetch }) => {
+  try {
+    return {
+      accessibleWorkspaces: await listWorkspaces(fetch),
+      workspaceCatalogError: null,
+    };
+  } catch (error) {
+    return {
+      accessibleWorkspaces: [],
+      workspaceCatalogError: error instanceof Error
+        ? error.message
+        : "Unable to load Workspaces",
+    };
+  }
+};

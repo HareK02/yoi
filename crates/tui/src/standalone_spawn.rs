@@ -1,16 +1,16 @@
-use std::io::{self, Stdout};
+use std::io;
 use std::path::Path;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use manifest::ProfileDiscovery;
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use thiserror::Error;
+
+use crate::inline_terminal::{InlineTerminal, with_inline_terminal};
 
 const VIEWPORT_HEIGHT: u16 = 6;
 const FALLBACK_WORKER_NAME: &str = "worker";
@@ -182,15 +182,16 @@ pub(crate) fn select(
         return Err(StandaloneSpawnError::NoProfiles);
     }
 
-    let terminal = open_inline_terminal()?;
-    run_picker(
-        terminal,
-        SpawnForm::new(worker_name, default_worker_name, choices),
-    )
+    with_inline_terminal(VIEWPORT_HEIGHT, |terminal| {
+        run_picker(
+            terminal,
+            SpawnForm::new(worker_name, default_worker_name, choices),
+        )
+    })
 }
 
 fn run_picker(
-    mut terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut InlineTerminal,
     mut form: SpawnForm,
 ) -> Result<Option<StandaloneSpawnSelection>, StandaloneSpawnError> {
     loop {
@@ -220,13 +221,6 @@ fn run_picker(
             }
         }
     }
-}
-
-fn open_inline_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
-    let options = ratatui::TerminalOptions {
-        viewport: ratatui::Viewport::Inline(VIEWPORT_HEIGHT),
-    };
-    Terminal::with_options(CrosstermBackend::new(io::stdout()), options)
 }
 
 fn profile_choices(registry: &manifest::ProfileRegistry) -> Vec<ProfileChoice> {

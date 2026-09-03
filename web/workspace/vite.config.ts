@@ -1,8 +1,13 @@
 import { sveltekit } from "@sveltejs/kit/vite";
 import { defineConfig } from "vite";
+import { CODEMIRROR_VITE_DEDUPE } from "./src/lib/workspace/config-source/vite-dedupe";
 
 export default defineConfig({
   plugins: [sveltekit()],
+
+  resolve: {
+    dedupe: CODEMIRROR_VITE_DEDUPE,
+  },
 
   server: {
     host: "localhost",
