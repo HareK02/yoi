@@ -90,6 +90,30 @@ pub async fn poll_device_login(
     parse_json_response(response).await
 }
 
+fn device_login_poll_result(
+    response: DeviceLoginPollResponse,
+) -> Result<Option<String>, BackendAuthClientError> {
+    match response.status {
+        DeviceLoginPollStatus::Approved => response
+            .access_token
+            .ok_or(BackendAuthClientError::MissingAccessToken)
+            .map(Some),
+        DeviceLoginPollStatus::Expired => Err(BackendAuthClientError::BackendStatus {
+            status: 410,
+            body: "device login expired".to_string(),
+        }),
+        DeviceLoginPollStatus::Denied => Err(BackendAuthClientError::BackendStatus {
+            status: 403,
+            body: "device login was denied".to_string(),
+        }),
+        DeviceLoginPollStatus::Consumed => Err(BackendAuthClientError::BackendStatus {
+            status: 409,
+            body: "device login was already consumed".to_string(),
+        }),
+        DeviceLoginPollStatus::Pending => Ok(None),
+    }
+}
+
 pub async fn wait_for_device_login(
     target: &BackendAuthTarget,
     device_code: &str,
@@ -99,25 +123,8 @@ pub async fn wait_for_device_login(
     let started = std::time::Instant::now();
     loop {
         let response = poll_device_login(target, device_code).await?;
-        match response.status {
-            DeviceLoginPollStatus::Approved => {
-                return response
-                    .access_token
-                    .ok_or(BackendAuthClientError::MissingAccessToken);
-            }
-            DeviceLoginPollStatus::Expired => {
-                return Err(BackendAuthClientError::BackendStatus {
-                    status: 410,
-                    body: "device login expired".to_string(),
-                });
-            }
-            DeviceLoginPollStatus::Consumed => {
-                return Err(BackendAuthClientError::BackendStatus {
-                    status: 409,
-                    body: "device login was already consumed".to_string(),
-                });
-            }
-            DeviceLoginPollStatus::Pending => {}
+        if let Some(access_token) = device_login_poll_result(response)? {
+            return Ok(access_token);
         }
         if started.elapsed() >= expires_in {
             return Err(BackendAuthClientError::BackendStatus {
@@ -141,4 +148,82 @@ async fn parse_json_response<T: for<'de> Deserialize<'de>>(
         });
     }
     Ok(response.json::<T>().await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use workspace_api::DeviceAccessTokenType;
+
+    fn poll_response(status: DeviceLoginPollStatus) -> DeviceLoginPollResponse {
+        DeviceLoginPollResponse {
+            status,
+            access_token: None,
+            token_type: None,
+        }
+    }
+
+    #[test]
+    fn device_login_start_response_enforces_shared_expiry_bounds() {
+        let valid = serde_json::json!({
+            "device_code": "device-secret",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://yoi.example/login/device",
+            "verification_uri_complete": "https://yoi.example/login/device?user_code=ABCD-EFGH",
+            "expires_in": 600,
+            "interval": 5
+        });
+        assert!(serde_json::from_value::<DeviceLoginStartResponse>(valid.clone()).is_ok());
+
+        let mut expired = valid;
+        expired["expires_in"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<DeviceLoginStartResponse>(expired).is_err());
+    }
+
+    #[test]
+    fn device_login_poll_response_rejects_unknown_status() {
+        assert!(
+            serde_json::from_value::<DeviceLoginPollResponse>(
+                serde_json::json!({"status": "future_status"}),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn device_login_poll_result_handles_pending_and_terminal_states() {
+        assert!(
+            device_login_poll_result(poll_response(DeviceLoginPollStatus::Pending))
+                .unwrap()
+                .is_none()
+        );
+
+        let approved = DeviceLoginPollResponse {
+            status: DeviceLoginPollStatus::Approved,
+            access_token: Some("access-secret".to_string()),
+            token_type: Some(DeviceAccessTokenType::Bearer),
+        };
+        assert_eq!(
+            device_login_poll_result(approved).unwrap(),
+            Some("access-secret".to_string())
+        );
+        assert!(matches!(
+            device_login_poll_result(poll_response(DeviceLoginPollStatus::Approved)),
+            Err(BackendAuthClientError::MissingAccessToken)
+        ));
+
+        for (status, expected_http_status) in [
+            (DeviceLoginPollStatus::Expired, 410),
+            (DeviceLoginPollStatus::Denied, 403),
+            (DeviceLoginPollStatus::Consumed, 409),
+        ] {
+            assert!(matches!(
+                device_login_poll_result(poll_response(status)),
+                Err(BackendAuthClientError::BackendStatus {
+                    status,
+                    ..
+                }) if status == expected_http_status
+            ));
+        }
+    }
 }

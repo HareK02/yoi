@@ -93,6 +93,7 @@ export type DeviceLoginPollStatus =
   | "pending"
   | "approved"
   | "expired"
+  | "denied"
   | "consumed";
 
 export type DeviceLoginPollResponse = {

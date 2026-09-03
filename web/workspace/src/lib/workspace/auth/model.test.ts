@@ -147,6 +147,9 @@ Deno.test("device login rejects unsafe expiry and unknown status", () => {
       }),
     "unsafe expiry",
   );
+  assertEquals(parseDeviceLoginPollResponse({ status: "denied" }), {
+    status: "denied",
+  });
   assertThrows(
     () => parseDeviceLoginPollResponse({ status: "future_status" }),
     "unknown device-login status",
@@ -155,6 +158,38 @@ Deno.test("device login rejects unsafe expiry and unknown status", () => {
     () => parseDeviceLoginPollResponse({ status: "approved" }),
     "approved response without token",
   );
+});
+
+Deno.test("auth validation enforces cumulative budgets without echoing unknown keys", () => {
+  const extensionArrays = Object.fromEntries(
+    Array.from({ length: 9 }, (_, index) => [
+      `field-${index}`,
+      Array.from({ length: 128 }, () => 1),
+    ]),
+  );
+  assertThrows(
+    () =>
+      prepareLoginOptions({
+        challenge_id: "challenge-1",
+        public_key: {
+          publicKey: {
+            challenge: "AQID",
+            extensions: extensionArrays,
+          },
+        },
+      }),
+    "cumulative value budget",
+  );
+
+  const attackerKey = `secret-${"x".repeat(512)}`;
+  try {
+    parseWhoamiResponse({ actor: null, [attackerKey]: true });
+    throw new Error("expected an error");
+  } catch (error) {
+    if (!(error instanceof Error) || error.message.includes(attackerKey)) {
+      throw new Error("diagnostic included an attacker-controlled key");
+    }
+  }
 });
 
 Deno.test("passkey credential conversion fails closed on malformed payloads", () => {

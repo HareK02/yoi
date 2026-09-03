@@ -31,6 +31,8 @@ const MAX_AUTH_STRING_LENGTH = 16 * 1024;
 const MAX_AUTH_ARRAY_LENGTH = 128;
 const MAX_AUTH_OBJECT_KEYS = 128;
 const MAX_AUTH_VALUE_DEPTH = 8;
+const MAX_AUTH_VALUE_NODES = 1_024;
+const MAX_AUTH_VALUE_STRING_UNITS = 64 * 1024;
 const MAX_DEVICE_LOGIN_SECONDS = 24 * 60 * 60;
 const MAX_WEBAUTHN_TIMEOUT_MS = 10 * 60 * 1000;
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+={0,2}$/;
@@ -57,7 +59,10 @@ function requireExactKeys(
     if (!(key in value)) invalid(`${path}.${key}`, "is required");
   }
   for (const key of Object.keys(value)) {
-    if (!allowed.has(key)) invalid(`${path}.${key}`, "is not allowed");
+    if (key.length === 0 || key.length > 256) {
+      invalid(path, "has an invalid field name");
+    }
+    if (!allowed.has(key)) invalid(path, "contains an unknown field");
   }
 }
 
@@ -96,11 +101,30 @@ function positiveSafeInteger(
   return value;
 }
 
-function boundedJson(value: unknown, path: string, depth = 0): void {
+interface ValidationBudget {
+  remainingNodes: number;
+  remainingStringUnits: number;
+}
+
+function boundedJson(
+  value: unknown,
+  path: string,
+  depth = 0,
+  budget: ValidationBudget = {
+    remainingNodes: MAX_AUTH_VALUE_NODES,
+    remainingStringUnits: MAX_AUTH_VALUE_STRING_UNITS,
+  },
+): void {
+  budget.remainingNodes -= 1;
+  if (budget.remainingNodes < 0) invalid(path, "has too many values");
   if (depth > MAX_AUTH_VALUE_DEPTH) invalid(path, "is too deeply nested");
   if (value === null || typeof value === "boolean") return;
   if (typeof value === "string") {
     boundedString(value, path, { allowEmpty: true });
+    budget.remainingStringUnits -= value.length;
+    if (budget.remainingStringUnits < 0) {
+      invalid(path, "has too much string data");
+    }
     return;
   }
   if (typeof value === "number") {
@@ -112,7 +136,7 @@ function boundedJson(value: unknown, path: string, depth = 0): void {
       invalid(path, "has too many items");
     }
     value.forEach((item, index) =>
-      boundedJson(item, `${path}[${index}]`, depth + 1)
+      boundedJson(item, `${path}[${index}]`, depth + 1, budget)
     );
     return;
   }
@@ -123,7 +147,11 @@ function boundedJson(value: unknown, path: string, depth = 0): void {
     if (key.length === 0 || key.length > 256) {
       invalid(path, "has an invalid field name");
     }
-    boundedJson(record[key], `${path}.${key}`, depth + 1);
+    budget.remainingStringUnits -= key.length;
+    if (budget.remainingStringUnits < 0) {
+      invalid(path, "has too much field-name data");
+    }
+    boundedJson(record[key], `${path}.field`, depth + 1, budget);
   }
 }
 
@@ -683,7 +711,9 @@ export function parseDeviceLoginPollResponse(
   ]);
   const status = response.status;
   if (
-    !["pending", "approved", "expired", "consumed"].includes(String(status))
+    !["pending", "approved", "expired", "denied", "consumed"].includes(
+      String(status),
+    )
   ) {
     invalid("device_login_poll.status", "contains an unknown value");
   }

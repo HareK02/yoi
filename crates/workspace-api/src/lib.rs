@@ -268,6 +268,7 @@ pub enum DeviceLoginPollStatus {
     Pending,
     Approved,
     Expired,
+    Denied,
     Consumed,
 }
 
@@ -2651,6 +2652,28 @@ mod tests {
             .expect("server whoami fixture should match shared DTO");
         assert_eq!(serde_json::to_value(decoded).unwrap(), whoami);
 
+        let auth_config = serde_json::json!({
+            "rp_id": "yoi.example",
+            "origin": "https://yoi.example",
+            "public_base_url": "https://yoi.example",
+            "cookie_name": "yoi_workspace_session"
+        });
+        let decoded = serde_json::from_value::<AuthPublicConfig>(auth_config.clone())
+            .expect("server auth-config fixture should match shared DTO");
+        assert_eq!(serde_json::to_value(decoded).unwrap(), auth_config);
+
+        let auth_user = serde_json::json!({
+            "user": {
+                "user_id": "user-1",
+                "account_id": "account-1",
+                "handle": "hare",
+                "display_name": "Hare"
+            }
+        });
+        let decoded = serde_json::from_value::<AuthUserResponse>(auth_user.clone())
+            .expect("server auth-user fixture should match shared DTO");
+        assert_eq!(serde_json::to_value(decoded).unwrap(), auth_user);
+
         let registration_options = serde_json::json!({
             "challenge_id": "challenge-1",
             "public_key": {
@@ -2668,6 +2691,65 @@ mod tests {
         .expect("server registration options fixture should match shared DTO");
         assert_eq!(serde_json::to_value(decoded).unwrap(), registration_options);
 
+        let registration_complete = serde_json::json!({
+            "challenge_id": "challenge-1",
+            "credential": {
+                "id": "AQID",
+                "rawId": "AQID",
+                "response": {
+                    "attestationObject": "AQID",
+                    "clientDataJSON": "AQID",
+                    "transports": ["internal"]
+                },
+                "type": "public-key",
+                "clientExtensionResults": {},
+                "authenticatorAttachment": "platform"
+            }
+        });
+        let decoded =
+            serde_json::from_value::<PasskeyRegistrationCompleteRequest>(registration_complete)
+                .expect("server registration-complete fixture should match shared DTO");
+        let encoded = serde_json::to_value(decoded).unwrap();
+        serde_json::from_value::<PasskeyRegistrationCompleteRequest>(encoded)
+            .expect("registration-complete DTO should round-trip");
+
+        let login_options = serde_json::json!({
+            "challenge_id": "challenge-2",
+            "public_key": {
+                "publicKey": {
+                    "challenge": "AQID",
+                    "rpId": "localhost",
+                    "allowCredentials": [],
+                    "userVerification": "preferred"
+                }
+            }
+        });
+        let decoded = serde_json::from_value::<PasskeyLoginOptionsResponse>(login_options.clone())
+            .expect("server login-options fixture should match shared DTO");
+        assert_eq!(serde_json::to_value(decoded).unwrap(), login_options);
+
+        let login_complete = serde_json::json!({
+            "challenge_id": "challenge-2",
+            "credential": {
+                "id": "AQID",
+                "rawId": "AQID",
+                "response": {
+                    "authenticatorData": "AQID",
+                    "clientDataJSON": "AQID",
+                    "signature": "AQID",
+                    "userHandle": null
+                },
+                "type": "public-key",
+                "clientExtensionResults": {},
+                "authenticatorAttachment": "platform"
+            }
+        });
+        let decoded = serde_json::from_value::<PasskeyLoginCompleteRequest>(login_complete)
+            .expect("server login-complete fixture should match shared DTO");
+        let encoded = serde_json::to_value(decoded).unwrap();
+        serde_json::from_value::<PasskeyLoginCompleteRequest>(encoded)
+            .expect("login-complete DTO should round-trip");
+
         let device_start = serde_json::json!({
             "device_code": "device-secret",
             "user_code": "ABCD-EFGH",
@@ -2679,6 +2761,37 @@ mod tests {
         let decoded = serde_json::from_value::<DeviceLoginStartResponse>(device_start.clone())
             .expect("server device-login fixture should match shared DTO");
         assert_eq!(serde_json::to_value(decoded).unwrap(), device_start);
+
+        let approved_user = AuthenticatedUser {
+            user_id: "user-1".to_string(),
+            account_id: "account-1".to_string(),
+            handle: "hare".to_string(),
+            display_name: "Hare".to_string(),
+        };
+        round_trip(DeviceLoginApproveResponse {
+            status: DeviceLoginApprovalStatus::Approved,
+            user: approved_user,
+        });
+        for status in [
+            DeviceLoginPollStatus::Pending,
+            DeviceLoginPollStatus::Expired,
+            DeviceLoginPollStatus::Denied,
+            DeviceLoginPollStatus::Consumed,
+        ] {
+            round_trip(DeviceLoginPollResponse {
+                status,
+                access_token: None,
+                token_type: None,
+            });
+        }
+        round_trip(DeviceLoginPollResponse {
+            status: DeviceLoginPollStatus::Approved,
+            access_token: Some("access-secret".to_string()),
+            token_type: Some(DeviceAccessTokenType::Bearer),
+        });
+        round_trip(LogoutResponse {
+            status: LogoutStatus::LoggedOut,
+        });
     }
 
     #[test]

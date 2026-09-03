@@ -19,6 +19,63 @@ import {
   type WhoamiResponse,
 } from "$lib/workspace/auth/model";
 
+const MAX_AUTH_RESPONSE_BYTES = 256 * 1024;
+
+export async function readBoundedAuthResponseJson(
+  response: Response,
+): Promise<unknown> {
+  const contentLength = response.headers.get("content-length");
+  if (contentLength !== null) {
+    const parsed = Number(contentLength);
+    if (
+      !Number.isSafeInteger(parsed) || parsed < 0 ||
+      parsed > MAX_AUTH_RESPONSE_BYTES
+    ) {
+      await response.body?.cancel();
+      throw new Error(
+        "Invalid auth response: response body exceeds the size limit.",
+      );
+    }
+  }
+  if (response.body === null) {
+    throw new Error("Invalid auth response: response body is missing.");
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_AUTH_RESPONSE_BYTES) {
+        await reader.cancel();
+        throw new Error(
+          "Invalid auth response: response body exceeds the size limit.",
+        );
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+    ) as unknown;
+  } catch {
+    throw new Error("Invalid auth response: response body is not valid JSON.");
+  }
+}
+
 async function requestJson(path: string, init?: RequestInit): Promise<unknown> {
   const response = await fetch(path, {
     credentials: "same-origin",
@@ -28,17 +85,11 @@ async function requestJson(path: string, init?: RequestInit): Promise<unknown> {
       ...(init?.headers ?? {}),
     },
   });
-  const body = await response.json() as unknown;
   if (!response.ok) {
-    const errorBody = typeof body === "object" && body !== null
-      ? body as Record<string, unknown>
-      : null;
-    const message = typeof errorBody?.message === "string"
-      ? errorBody.message
-      : `Request failed (${response.status})`;
-    throw new Error(message);
+    await response.body?.cancel();
+    throw new Error(`Auth request failed (${response.status}).`);
   }
-  return body;
+  return await readBoundedAuthResponseJson(response);
 }
 
 export async function loadWhoami(): Promise<WhoamiResponse> {
