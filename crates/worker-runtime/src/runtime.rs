@@ -1800,16 +1800,6 @@ impl Runtime {
         state.ensure_running()?;
         state.ensure_worker_ref(worker_ref)?;
 
-        {
-            let worker = state.worker(worker_ref)?;
-            if !worker.status.is_active() {
-                return Ok(WorkerLifecycleAck {
-                    worker_ref: worker_ref.clone(),
-                    status: worker.status,
-                });
-            }
-        }
-
         let worker = state.worker_mut(worker_ref)?;
         worker.status = status;
         worker.restore_intent = restore_intent_for_status(status);
