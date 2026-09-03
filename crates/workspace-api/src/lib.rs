@@ -579,6 +579,8 @@ pub struct WorkingDirectoryOccupancy {
 /// retains the Backend-generated Repository id and is never a Workspace public
 /// projection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkingDirectoryCleanupTarget {
     pub kind: String,
@@ -590,6 +592,8 @@ pub struct RuntimeWorkingDirectoryCleanupTarget {
 /// surfaces must project this through [`WorkingDirectorySummary`] so the UUID is
 /// replaced with `repository_key`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkingDirectorySummary {
     pub working_directory_id: String,
@@ -607,6 +611,7 @@ pub struct RuntimeWorkingDirectorySummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_tree: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
     pub observed_at_epoch_seconds: Option<u64>,
     pub materializer_kind: WorkingDirectoryMaterializerKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -908,6 +913,7 @@ pub struct RuntimeConnectionTestResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkerWorkspaceSummary {
     pub visibility: String,
     pub identity: String,
@@ -916,12 +922,14 @@ pub struct WorkerWorkspaceSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkerImplementationSummary {
     pub kind: String,
     pub display_hint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkerCapabilitySummary {
     pub can_stop: bool,
     pub can_spawn_followup: bool,
@@ -1095,6 +1103,7 @@ pub struct WorkspaceWorkerDiscoveryPage {
 /// do not carry one. The Workspace Server must resolve it from Workspace
 /// authority before constructing this response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkerSummary {
     pub runtime_id: String,
     pub worker_id: String,
@@ -1119,6 +1128,142 @@ pub struct WorkerSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<WorkingDirectorySummary>,
     #[serde(default)]
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Runtime-owned Worker summary embedded in Worker launch responses.
+///
+/// This preserves the existing launch wire shape. Workspace-owned Worker list
+/// and detail responses use [`WorkerSummary`] instead.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkerLaunchWorkerSummary {
+    pub runtime_id: String,
+    pub worker_id: String,
+    pub host_id: String,
+    pub display_name: String,
+    pub label: String,
+    pub profile: Option<String>,
+    pub singleton_key: Option<String>,
+    pub tags: Vec<String>,
+    pub workspace: WorkerWorkspaceSummary,
+    pub state: String,
+    pub last_seen_at: Option<String>,
+    pub pinned: bool,
+    pub retention_state: String,
+    pub implementation: WorkerImplementationSummary,
+    pub capabilities: WorkerCapabilitySummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub working_directory: Option<RuntimeWorkingDirectorySummary>,
+    #[serde(default)]
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkerLaunchOptionsResponse {
+    pub workspace_id: String,
+    pub runtimes: Vec<WorkerLaunchRuntimeOption>,
+    pub default_profile: Option<String>,
+    pub profiles: Vec<WorkerLaunchProfileCandidate>,
+    pub repositories: Vec<WorkingDirectoryRepositoryOption>,
+    pub working_directories: Vec<WorkingDirectorySummary>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkerLaunchRuntimeOption {
+    pub runtime_id: String,
+    pub display_name: String,
+    pub built_in: bool,
+    pub worker_creation_available: bool,
+    pub working_directory_required: bool,
+    pub status: String,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkerLaunchProfileCandidate {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectoryRepositoryOption {
+    pub repository_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub default_selector: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct BrowserWorkerWorkingDirectorySelection {
+    pub working_directory_id: String,
+    #[serde(default)]
+    pub relative_cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct CreateWorkspaceWorkerTicketAssignmentRequest {
+    pub ticket_id: String,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct CreateWorkspaceWorkerRequest {
+    pub runtime_id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub ticket_assignment: Option<CreateWorkspaceWorkerTicketAssignmentRequest>,
+    #[serde(default)]
+    pub initial_submit: Vec<protocol::Segment>,
+    #[serde(default)]
+    pub working_directory: Option<BrowserWorkerWorkingDirectorySelection>,
+    /// Backend idempotency key used only for authenticated Worker-owned spawn/control.
+    #[serde(default)]
+    pub control_operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct BrowserCreateWorkerResponse {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub worker_id: String,
+    pub console_href: String,
+    pub worker: WorkerLaunchWorkerSummary,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct BrowserWorkspaceOrchestratorResponse {
+    pub workspace_id: String,
+    pub online: bool,
+    pub disposition: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub worker: Option<WorkerLaunchWorkerSummary>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -1390,6 +1535,74 @@ pub fn workdir_api_typescript() -> String {
     )
 }
 
+#[cfg(feature = "typescript")]
+pub fn worker_launch_api_typescript() -> String {
+    use ts_rs::TS;
+
+    let config = ts_rs::Config::default();
+    let declarations = [
+        DiagnosticSeverity::decl(&config),
+        Diagnostic::decl(&config),
+        WorkingDirectoryMaterializerKind::decl(&config),
+        WorkingDirectoryStatusKind::decl(&config),
+        WorkingDirectoryCleanupTarget::decl(&config),
+        RuntimeWorkingDirectoryCleanupTarget::decl(&config),
+        RuntimeWorkingDirectorySummary::decl(&config),
+        WorkingDirectoryOccupancy::decl(&config),
+        WorkingDirectorySummary::decl(&config),
+        WorkerWorkspaceSummary::decl(&config),
+        WorkerImplementationSummary::decl(&config),
+        WorkerCapabilitySummary::decl(&config),
+        WorkerLaunchWorkerSummary::decl(&config),
+        WorkerLaunchRuntimeOption::decl(&config),
+        WorkerLaunchProfileCandidate::decl(&config),
+        WorkingDirectoryRepositoryOption::decl(&config),
+        WorkerLaunchOptionsResponse::decl(&config),
+        BrowserWorkerWorkingDirectorySelection::decl(&config),
+        CreateWorkspaceWorkerTicketAssignmentRequest::decl(&config),
+        CreateWorkspaceWorkerRequest::decl(&config),
+        BrowserCreateWorkerResponse::decl(&config),
+        BrowserWorkspaceOrchestratorResponse::decl(&config),
+    ];
+    format!(
+        "// Generated from workspace-api. Do not edit by hand.\n// Regenerate: cargo run -q -p workspace-api --features typescript --example generate_worker_launch_api_types > web/workspace/src/lib/generated/worker-launch-api.ts\n\nimport type {{ Segment }} from \"./protocol\";\n\n{}\n",
+        declarations
+            .into_iter()
+            .map(|declaration| format!("export {declaration}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    )
+}
+
+#[cfg(all(test, feature = "typescript"))]
+mod worker_launch_typescript_tests {
+    #[test]
+    fn generated_worker_launch_api_contract_is_current() {
+        let expected = super::worker_launch_api_typescript();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/workspace/src/lib/generated/worker-launch-api.ts");
+        let actual = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        assert_eq!(
+            normalize(&actual),
+            normalize(&expected),
+            "regenerate Worker launch API TypeScript types with `cargo run -q -p workspace-api --features typescript --example generate_worker_launch_api_types > web/workspace/src/lib/generated/worker-launch-api.ts` and format the generated file",
+        );
+    }
+
+    fn normalize(value: &str) -> String {
+        value
+            .chars()
+            .filter_map(|character| match character {
+                character if character.is_whitespace() => None,
+                ',' => Some(';'),
+                character => Some(character),
+            })
+            .collect::<String>()
+            .replace("=|", "=")
+    }
+}
+
 #[cfg(all(test, feature = "typescript"))]
 mod workdir_typescript_tests {
     #[test]
@@ -1422,6 +1635,113 @@ mod workdir_typescript_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn worker_launch_summary() -> WorkerLaunchWorkerSummary {
+        WorkerLaunchWorkerSummary {
+            runtime_id: "runtime-a".to_string(),
+            worker_id: "worker-a".to_string(),
+            host_id: "host-a".to_string(),
+            display_name: "Worker A".to_string(),
+            label: "worker-a".to_string(),
+            profile: None,
+            singleton_key: None,
+            tags: Vec::new(),
+            workspace: WorkerWorkspaceSummary {
+                visibility: "workspace".to_string(),
+                identity: "workspace-a".to_string(),
+                workspace_id: Some("workspace-a".to_string()),
+            },
+            state: "idle".to_string(),
+            last_seen_at: None,
+            pinned: false,
+            retention_state: "active".to_string(),
+            implementation: WorkerImplementationSummary {
+                kind: "runtime".to_string(),
+                display_hint: "Runtime Worker".to_string(),
+            },
+            capabilities: WorkerCapabilitySummary {
+                can_stop: true,
+                can_spawn_followup: false,
+            },
+            working_directory: None,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn worker_launch_optional_omission_and_request_shape_are_stable() {
+        assert_eq!(
+            serde_json::to_value(WorkingDirectoryRepositoryOption {
+                repository_key: "main".to_string(),
+                default_selector: None,
+            })
+            .unwrap(),
+            serde_json::json!({ "repository_key": "main" })
+        );
+
+        let orchestrator = serde_json::to_value(BrowserWorkspaceOrchestratorResponse {
+            workspace_id: "workspace-a".to_string(),
+            online: false,
+            disposition: "unavailable".to_string(),
+            worker: None,
+            diagnostics: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            orchestrator,
+            serde_json::json!({
+                "workspace_id": "workspace-a",
+                "online": false,
+                "disposition": "unavailable",
+                "diagnostics": [],
+            })
+        );
+
+        let worker = serde_json::to_value(worker_launch_summary()).unwrap();
+        assert!(
+            !worker
+                .as_object()
+                .unwrap()
+                .contains_key("working_directory")
+        );
+        assert_eq!(worker["profile"], serde_json::Value::Null);
+        assert_eq!(worker["singleton_key"], serde_json::Value::Null);
+        assert_eq!(worker["last_seen_at"], serde_json::Value::Null);
+
+        let request = serde_json::to_value(CreateWorkspaceWorkerRequest {
+            runtime_id: "runtime-a".to_string(),
+            display_name: "Worker A".to_string(),
+            profile: None,
+            ticket_assignment: None,
+            initial_submit: Vec::new(),
+            working_directory: None,
+            control_operation_id: None,
+        })
+        .unwrap();
+        assert_eq!(
+            request,
+            serde_json::json!({
+                "runtime_id": "runtime-a",
+                "display_name": "Worker A",
+                "profile": null,
+                "ticket_assignment": null,
+                "initial_submit": [],
+                "working_directory": null,
+                "control_operation_id": null,
+            })
+        );
+    }
+
+    #[test]
+    fn worker_launch_request_rejects_unknown_fields() {
+        let error = serde_json::from_value::<CreateWorkspaceWorkerRequest>(serde_json::json!({
+            "runtime_id": "runtime-a",
+            "display_name": "Worker A",
+            "unexpected": true,
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
+    }
 
     #[test]
     fn repository_key_validation_is_canonical_and_bounded() {

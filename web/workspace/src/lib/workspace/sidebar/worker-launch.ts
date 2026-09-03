@@ -1,9 +1,7 @@
-import type { Segment } from "$lib/generated/protocol";
+import type { CreateWorkspaceWorkerRequest } from "$lib/generated/worker-launch-api";
+import { parseCreateWorkspaceWorkerRequest } from "$lib/workspace/api/workers";
 
-import type {
-  BrowserWorkerWorkingDirectorySelection,
-  WorkerLaunchOptionsResponse,
-} from "./types";
+import type { WorkerLaunchOptionsResponse } from "./types";
 
 export type WorkerLaunchFormState = {
   runtime_id: string;
@@ -14,14 +12,6 @@ export type WorkerLaunchFormState = {
   working_directory_repository_key: string;
   working_directory_selector: string;
   relative_cwd: string;
-};
-
-export type CreateWorkspaceWorkerRequest = {
-  runtime_id: string;
-  display_name: string;
-  profile: string;
-  initial_submit: Segment[];
-  working_directory?: BrowserWorkerWorkingDirectorySelection;
 };
 
 export function defaultWorkerLaunchForm(
@@ -86,7 +76,8 @@ export function defaultWorkerLaunchForm(
         )
         ? current.working_directory_id
         : preferredWorkingDirectory?.working_directory_id || "",
-    working_directory_repository_key: current.working_directory_repository_key ||
+    working_directory_repository_key:
+      current.working_directory_repository_key ||
       preferredRepository?.repository_key || "",
     working_directory_selector: current.working_directory_selector ||
       preferredRepository?.default_selector || "HEAD",
@@ -97,22 +88,21 @@ export function defaultWorkerLaunchForm(
 export function buildCreateWorkspaceWorkerRequest(
   form: WorkerLaunchFormState,
 ): CreateWorkspaceWorkerRequest {
-  const request: CreateWorkspaceWorkerRequest = {
-    runtime_id: form.runtime_id,
-    display_name: form.display_name,
-    profile: form.profile,
-    initial_submit: form.initial_text.trim()
+  const initialMessage = form.initial_text.trim();
+  return parseCreateWorkspaceWorkerRequest({
+    runtime_id: form.runtime_id.trim(),
+    display_name: form.display_name.trim(),
+    profile: form.profile.trim() || null,
+    ticket_assignment: null,
+    initial_submit: initialMessage
       ? [{ kind: "text", content: form.initial_text }]
       : [],
-  };
-  if (form.working_directory_id) {
-    request.working_directory = {
-      working_directory_id: form.working_directory_id,
-    };
-    const relativeCwd = form.relative_cwd.trim();
-    if (relativeCwd) {
-      request.working_directory.relative_cwd = relativeCwd;
-    }
-  }
-  return request;
+    working_directory: form.working_directory_id
+      ? {
+        working_directory_id: form.working_directory_id,
+        relative_cwd: form.relative_cwd.trim() || null,
+      }
+      : null,
+    control_operation_id: null,
+  });
 }

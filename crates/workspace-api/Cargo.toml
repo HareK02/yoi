@@ -7,9 +7,10 @@ publish = false
 
 [features]
 default = []
-typescript = ["dep:ts-rs"]
+typescript = ["dep:ts-rs", "protocol/typescript"]
 
 [dependencies]
+protocol.workspace = true
 serde = { workspace = true, features = ["derive"] }
 ts-rs = { version = "12.0.1", optional = true }
 
@@ -22,6 +23,10 @@ serde_json.workspace = true
 
 [[example]]
 name = "generate_workdir_api_types"
+required-features = ["typescript"]
+
+[[example]]
+name = "generate_worker_launch_api_types"
 required-features = ["typescript"]
 
 [[example]]

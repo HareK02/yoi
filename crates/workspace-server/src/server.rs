@@ -58,25 +58,28 @@ use worker::feature::builtin::{WorkerObservationSubject, WorkerObservationSubjec
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 use workspace_api::{
-    CreateRemoteRuntimeRequest, CreateRepositorySshCredentialRequest,
-    CreateWorkspaceRepositoryRequest, CreateWorkspaceRepositoryResponse,
-    DeleteRepositorySshCredentialRequest, DeleteRepositorySshHostTrustRequest,
-    ObjectiveCreateRequest, ObjectiveEditRequest, ObjectiveLinkTicketRequest,
-    ObjectiveStateRequest, ProfileSettingsResponse, PutRepositorySshHostTrustRequest,
-    RepositoryAccessProjection, RepositoryDetailResponse, RepositoryListResponse,
-    RepositoryLogResponse, RepositorySshCredential, RepositorySshHostTrust,
+    BrowserCreateWorkerResponse, BrowserWorkspaceOrchestratorResponse, CreateRemoteRuntimeRequest,
+    CreateRepositorySshCredentialRequest, CreateWorkspaceRepositoryRequest,
+    CreateWorkspaceRepositoryResponse, CreateWorkspaceWorkerRequest,
+    CreateWorkspaceWorkerTicketAssignmentRequest, DeleteRepositorySshCredentialRequest,
+    DeleteRepositorySshHostTrustRequest, ObjectiveCreateRequest, ObjectiveEditRequest,
+    ObjectiveLinkTicketRequest, ObjectiveStateRequest, ProfileSettingsResponse,
+    PutRepositorySshHostTrustRequest, RepositoryAccessProjection, RepositoryDetailResponse,
+    RepositoryListResponse, RepositoryLogResponse, RepositorySshCredential, RepositorySshHostTrust,
     RotateRepositorySshCredentialRequest, RuntimeConnectionTestResponse, RuntimeManagementSummary,
     TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
-    UpdateWorkspaceMetadataRequest,
+    UpdateWorkspaceMetadataRequest, WorkerLaunchOptionsResponse, WorkerLaunchProfileCandidate,
+    WorkerLaunchRuntimeOption, WorkerLaunchWorkerSummary,
     WorkingDirectoryCreateRequest as BrowserWorkingDirectoryCreateRequest,
     WorkingDirectoryCreateResponse as BrowserWorkingDirectoryCreateResponse,
     WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
     WorkingDirectoryListResponse as BrowserWorkingDirectoryListResponse,
     WorkingDirectoryRemovalDisposition, WorkingDirectoryRemovalRequest,
-    WorkingDirectoryRemovalResponse, WorkspaceCatalogListResponse, WorkspaceCreateResponse,
-    WorkspaceExtensionPointState, WorkspaceExtensionPoints, WorkspaceMetadataMutationResponse,
-    WorkspaceMetadataSettingsResponse, WorkspacePermissionSummary, WorkspaceRepositoryRecord,
-    WorkspaceResponse, WorkspaceRuntimeResource, WorkspaceSummary, WorkspaceWorkerDiscoveryItem,
+    WorkingDirectoryRemovalResponse, WorkingDirectoryRepositoryOption,
+    WorkspaceCatalogListResponse, WorkspaceCreateResponse, WorkspaceExtensionPointState,
+    WorkspaceExtensionPoints, WorkspaceMetadataMutationResponse, WorkspaceMetadataSettingsResponse,
+    WorkspacePermissionSummary, WorkspaceRepositoryRecord, WorkspaceResponse,
+    WorkspaceRuntimeResource, WorkspaceSummary, WorkspaceWorkerDiscoveryItem,
     WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
 };
 
@@ -3095,98 +3098,6 @@ pub struct WorkerRetentionResponse {
     pub worker_ref: RuntimeWorkerRef,
     pub pinned: bool,
     pub retention_state: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WorkerLaunchOptionsResponse {
-    pub workspace_id: String,
-    pub runtimes: Vec<WorkerLaunchRuntimeOption>,
-    pub default_profile: Option<String>,
-    pub profiles: Vec<WorkerLaunchProfileCandidate>,
-    pub repositories: Vec<WorkingDirectoryRepositoryOption>,
-    pub working_directories: Vec<WorkingDirectorySummary>,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WorkerLaunchRuntimeOption {
-    pub runtime_id: String,
-    pub display_name: String,
-    pub built_in: bool,
-    pub worker_creation_available: bool,
-    pub working_directory_required: bool,
-    pub status: String,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerLaunchProfileCandidate {
-    pub id: String,
-    pub label: String,
-    pub description: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkingDirectoryRepositoryOption {
-    pub repository_key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_selector: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BrowserWorkerWorkingDirectorySelection {
-    pub working_directory_id: String,
-    #[serde(default)]
-    pub relative_cwd: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BrowserWorkspaceOrchestratorResponse {
-    pub workspace_id: String,
-    pub online: bool,
-    pub disposition: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker: Option<WorkerSummary>,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CreateWorkspaceWorkerTicketAssignmentRequest {
-    pub ticket_id: String,
-    pub operation_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CreateWorkspaceWorkerRequest {
-    pub runtime_id: String,
-    pub display_name: String,
-    #[serde(default)]
-    pub profile: Option<String>,
-    #[serde(default)]
-    pub ticket_assignment: Option<CreateWorkspaceWorkerTicketAssignmentRequest>,
-    #[serde(default)]
-    pub initial_submit: Vec<Segment>,
-    #[serde(default)]
-    pub working_directory: Option<BrowserWorkerWorkingDirectorySelection>,
-    /// Backend idempotency key used only for authenticated Worker-owned spawn/control.
-    #[serde(default)]
-    pub control_operation_id: Option<String>,
-    /// Trusted resolution populated only by the authenticated worker-control handler.
-    #[serde(skip, default)]
-    pub resolved_control_operation: Option<WorkerControlOperation>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BrowserCreateWorkerResponse {
-    pub workspace_id: String,
-    #[serde(flatten)]
-    pub worker_ref: RuntimeWorkerRef,
-    pub console_href: String,
-    pub worker: WorkerSummary,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7758,9 +7669,9 @@ fn start_memory_staging_consolidation(
             resolved_config_bundle,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
-            resolved_control_operation: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_control_operation: None,
         },
     )?;
     if result.state != WorkerOperationState::Accepted {
@@ -8711,18 +8622,20 @@ async fn spawn_known_worker(
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     );
-    request.resolved_control_operation = Some(WorkerControlOperation {
+    let resolved_control_operation = Some(WorkerControlOperation {
         operation_id: scoped_worker_control_operation_id(&controller, &operation_id),
         input_fingerprint,
     });
-    let response = create_workspace_worker(State(api.clone()), headers, Json(request)).await?;
+    let response =
+        create_workspace_worker_inner(api.clone(), headers, request, resolved_control_operation)
+            .await?;
     if let Err(error) = api
         .store
         .create_worker_control_grant(&WorkerControlGrantRecord {
             workspace_id: path.workspace_id.clone(),
             grant_id: new_id("wcg"),
             controller,
-            subject: response.0.worker_ref.clone(),
+            subject: RuntimeWorkerRef::new(&response.0.runtime_id, &response.0.worker_id),
             relation: relation.to_string(),
             origin: "worker_spawn".to_string(),
             permissions: vec![
@@ -9055,9 +8968,9 @@ async fn scoped_start_workspace_orchestrator(
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: true,
             resolved_worker_observation_grants: Vec::new(),
-            resolved_control_operation: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_control_operation: None,
         },
     )?;
     if result.state != WorkerOperationState::Accepted || result.worker.is_none() {
@@ -9085,6 +8998,42 @@ async fn scoped_start_workspace_orchestrator(
     Ok(Json(workspace_orchestrator_response(&api, "created")))
 }
 
+fn worker_launch_worker_summary(worker: WorkerSummary) -> WorkerLaunchWorkerSummary {
+    WorkerLaunchWorkerSummary {
+        runtime_id: worker.worker.runtime_id,
+        worker_id: worker.worker.worker_id,
+        host_id: worker.host_id,
+        display_name: worker.display_name,
+        label: worker.label,
+        profile: worker.profile,
+        singleton_key: worker.singleton_key,
+        tags: worker.tags,
+        workspace: workspace_api::WorkerWorkspaceSummary {
+            visibility: worker.workspace.visibility,
+            identity: worker.workspace.identity,
+            workspace_id: worker.workspace.workspace_id,
+        },
+        state: worker.state,
+        last_seen_at: worker.last_seen_at,
+        pinned: worker.pinned,
+        retention_state: worker.retention_state,
+        implementation: workspace_api::WorkerImplementationSummary {
+            kind: worker.implementation.kind,
+            display_hint: worker.implementation.display_hint,
+        },
+        capabilities: workspace_api::WorkerCapabilitySummary {
+            can_stop: worker.capabilities.can_stop,
+            can_spawn_followup: worker.capabilities.can_spawn_followup,
+        },
+        working_directory: worker.working_directory,
+        diagnostics: worker
+            .diagnostics
+            .into_iter()
+            .map(workspace_api::Diagnostic::from)
+            .collect(),
+    }
+}
+
 fn workspace_orchestrator_response(
     api: &WorkspaceApi,
     disposition: &str,
@@ -9095,13 +9044,20 @@ fn workspace_orchestrator_response(
         .is_some_and(workspace_orchestrator_is_online);
     let diagnostics = worker
         .as_ref()
-        .map(|worker| worker.diagnostics.clone())
+        .map(|worker| {
+            worker
+                .diagnostics
+                .iter()
+                .cloned()
+                .map(workspace_api::Diagnostic::from)
+                .collect()
+        })
         .unwrap_or_default();
     BrowserWorkspaceOrchestratorResponse {
         workspace_id: api.config.workspace_id.clone(),
         online,
         disposition: disposition.to_string(),
-        worker,
+        worker: worker.map(worker_launch_worker_summary),
         diagnostics,
     }
 }
@@ -12459,6 +12415,15 @@ async fn create_workspace_worker(
     headers: HeaderMap,
     Json(request): Json<CreateWorkspaceWorkerRequest>,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
+    create_workspace_worker_inner(api, headers, request, None).await
+}
+
+async fn create_workspace_worker_inner(
+    api: WorkspaceApi,
+    headers: HeaderMap,
+    request: CreateWorkspaceWorkerRequest,
+    resolved_control_operation: Option<WorkerControlOperation>,
+) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
     let CreateWorkspaceWorkerRequest {
         runtime_id,
         display_name,
@@ -12467,7 +12432,6 @@ async fn create_workspace_worker(
         initial_submit,
         working_directory,
         control_operation_id: _,
-        resolved_control_operation,
     } = request;
     let config_state = api
         .config_store
@@ -12765,10 +12729,14 @@ fn browser_worker_response_from_summary(
     );
     Ok(BrowserCreateWorkerResponse {
         workspace_id,
-        worker_ref: RuntimeWorkerRef::new(&runtime_id, &worker_id),
+        runtime_id,
+        worker_id,
         console_href,
-        worker,
-        diagnostics,
+        worker: worker_launch_worker_summary(worker),
+        diagnostics: diagnostics
+            .into_iter()
+            .map(workspace_api::Diagnostic::from)
+            .collect(),
     })
 }
 
@@ -14810,7 +14778,11 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> ApiResult<WorkerLaunchO
                 worker_creation_available: runtime.worker_creation_available,
                 working_directory_required: !built_in,
                 status: runtime.status,
-                diagnostics: runtime.diagnostics,
+                diagnostics: runtime
+                    .diagnostics
+                    .into_iter()
+                    .map(workspace_api::Diagnostic::from)
+                    .collect(),
             }
         })
         .collect();
@@ -17210,9 +17182,9 @@ mod tests {
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
-            resolved_control_operation: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_control_operation: None,
         };
         assert!(
             api.validate_worker_spawn_repository_scope(&workdir_flow_launch)
@@ -17456,9 +17428,9 @@ mod tests {
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
-            resolved_control_operation: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_control_operation: None,
         };
 
         assert!(
@@ -17505,7 +17477,6 @@ mod tests {
                 }],
                 working_directory: None,
                 control_operation_id: None,
-                resolved_control_operation: None,
             }),
         )
         .await
@@ -17521,7 +17492,8 @@ mod tests {
             .get_current_ticket_coder_assignment(&api.config.workspace_id, &ticket.id)
             .unwrap()
             .unwrap();
-        assert_eq!(current.worker, response.worker_ref);
+        let response_ref = RuntimeWorkerRef::new(&response.runtime_id, &response.worker_id);
+        assert_eq!(current.worker, response_ref);
         let operation = api
             .store
             .get_ticket_assignment_operation(
@@ -17531,7 +17503,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(operation.assignment_id, Some(current.assignment_id));
-        assert_eq!(operation.worker, Some(response.worker_ref));
+        assert_eq!(operation.worker, Some(response_ref));
     }
 
     #[tokio::test]
@@ -17561,7 +17533,6 @@ mod tests {
                 }],
                 working_directory: None,
                 control_operation_id: None,
-                resolved_control_operation: None,
             }),
         )
         .await;
@@ -17595,7 +17566,6 @@ mod tests {
                 initial_submit: Vec::new(),
                 working_directory: None,
                 control_operation_id: None,
-                resolved_control_operation: None,
             }),
         )
         .await
@@ -17603,11 +17573,11 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-yoi-runtime-id",
-            axum::http::HeaderValue::from_str(&created.worker_ref.runtime_id).unwrap(),
+            axum::http::HeaderValue::from_str(&created.runtime_id).unwrap(),
         );
         headers.insert(
             "x-yoi-worker-id",
-            axum::http::HeaderValue::from_str(&created.worker_ref.worker_id).unwrap(),
+            axum::http::HeaderValue::from_str(&created.worker_id).unwrap(),
         );
         let error =
             authenticate_worker_mutation_source(&api, "other-workspace", &headers).unwrap_err();
@@ -17631,14 +17601,14 @@ mod tests {
                 initial_submit: Vec::new(),
                 working_directory: None,
                 control_operation_id: None,
-                resolved_control_operation: None,
             }),
         )
         .await
         .unwrap();
 
+        let generic_ref = RuntimeWorkerRef::new(&generic.runtime_id, &generic.worker_id);
         assert!(matches!(
-            require_online_workspace_orchestrator_source(&api, &generic.worker_ref),
+            require_online_workspace_orchestrator_source(&api, &generic_ref),
             Err(Error::TicketAssignmentConflict(_))
         ));
 
@@ -17650,10 +17620,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let orchestrator = started.worker.unwrap().worker;
+        let orchestrator = started.worker.unwrap();
+        let orchestrator = RuntimeWorkerRef::new(&orchestrator.runtime_id, &orchestrator.worker_id);
         require_online_workspace_orchestrator_source(&api, &orchestrator).unwrap();
         assert!(matches!(
-            require_online_workspace_orchestrator_source(&api, &generic.worker_ref),
+            require_online_workspace_orchestrator_source(&api, &generic_ref),
             Err(Error::TicketAssignmentConflict(_))
         ));
 
@@ -17722,8 +17693,8 @@ mod tests {
         assert!(started.online);
         let worker = started
             .worker
-            .expect("production Workspace Orchestrator Worker")
-            .worker;
+            .expect("production Workspace Orchestrator Worker");
+        let worker = RuntimeWorkerRef::new(&worker.runtime_id, &worker.worker_id);
 
         let stopped = api
             .runtime
@@ -17823,12 +17794,12 @@ mod tests {
                 initial_submit: Vec::new(),
                 working_directory: None,
                 control_operation_id: None,
-                resolved_control_operation: None,
             }),
         )
         .await
         .unwrap();
-        let controller = controller_worker.worker_ref;
+        let controller =
+            RuntimeWorkerRef::new(&controller_worker.runtime_id, &controller_worker.worker_id);
         assert_ne!(
             scoped_worker_control_operation_id(&controller, "same-operation"),
             scoped_worker_control_operation_id(
@@ -17854,7 +17825,6 @@ mod tests {
             initial_submit: Vec::new(),
             working_directory: None,
             control_operation_id: Some("control-spawn-retry".to_string()),
-            resolved_control_operation: None,
         };
 
         let Json(first) = spawn_known_worker(
@@ -17878,7 +17848,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(retried.worker_ref, first.worker_ref);
+        assert_eq!(retried.runtime_id, first.runtime_id);
+        assert_eq!(retried.worker_id, first.worker_id);
         let mut conflicting_request = request();
         conflicting_request.display_name = "Different controlled child".to_string();
         let conflict = spawn_known_worker(
@@ -17908,7 +17879,10 @@ mod tests {
             .list_active_worker_control_grants(&workspace_id, &controller, 10)
             .unwrap();
         assert_eq!(grants.len(), 1);
-        assert_eq!(grants[0].subject, first.worker_ref);
+        assert_eq!(
+            grants[0].subject,
+            RuntimeWorkerRef::new(&first.runtime_id, &first.worker_id)
+        );
         assert_eq!(grants[0].operation_id, "control-spawn-retry");
     }
 
@@ -17930,7 +17904,6 @@ mod tests {
                 initial_submit: Vec::new(),
                 working_directory: None,
                 control_operation_id: None,
-                resolved_control_operation: None,
             }),
         )
         .await
@@ -17948,7 +17921,6 @@ mod tests {
                 initial_submit: Vec::new(),
                 working_directory: None,
                 control_operation_id: None,
-                resolved_control_operation: None,
             }),
         )
         .await
@@ -17969,14 +17941,16 @@ mod tests {
             dedicated.singleton_key.as_deref(),
             Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY)
         );
-        assert_ne!(dedicated.worker.worker_id, generic.worker_ref.worker_id);
+        let dedicated_ref = RuntimeWorkerRef::new(&dedicated.runtime_id, &dedicated.worker_id);
+        let generic_ref = RuntimeWorkerRef::new(&generic.runtime_id, &generic.worker_id);
+        assert_ne!(dedicated.worker_id, generic.worker_id);
 
         api.store
             .create_worker_control_grant(&WorkerControlGrantRecord {
                 workspace_id: workspace_id.clone(),
                 grant_id: "orchestrator-controls-generic".to_string(),
-                controller: dedicated.worker.clone(),
-                subject: generic.worker_ref.clone(),
+                controller: dedicated_ref.clone(),
+                subject: generic_ref.clone(),
                 relation: "spawned".to_string(),
                 origin: "test".to_string(),
                 permissions: vec!["observe".to_string()],
@@ -17989,11 +17963,11 @@ mod tests {
         let mut observation_headers = HeaderMap::new();
         observation_headers.insert(
             "x-yoi-runtime-id",
-            axum::http::HeaderValue::from_str(&dedicated.worker.runtime_id).unwrap(),
+            axum::http::HeaderValue::from_str(&dedicated.runtime_id).unwrap(),
         );
         observation_headers.insert(
             "x-yoi-worker-id",
-            axum::http::HeaderValue::from_str(&dedicated.worker.worker_id).unwrap(),
+            axum::http::HeaderValue::from_str(&dedicated.worker_id).unwrap(),
         );
         let Json(known) = list_known_workers(
             State(api.clone()),
@@ -18005,7 +17979,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(known.items.len(), 1);
-        assert_eq!(known.items[0].subject, generic.worker_ref);
+        assert_eq!(known.items[0].subject, generic_ref);
         assert_eq!(known.items[0].permissions, ["observe"]);
 
         let Json(sessions) = scoped_list_worker_observation_sessions(
@@ -18024,8 +17998,8 @@ mod tests {
                 .iter()
                 .any(|session| {
                     session["subject"]["kind"] == "runtime_worker"
-                        && session["subject"]["runtime_id"] == generic.worker_ref.runtime_id
-                        && session["subject"]["worker_id"] == generic.worker_ref.worker_id
+                        && session["subject"]["runtime_id"] == generic.runtime_id
+                        && session["subject"]["worker_id"] == generic.worker_id
                 })
         );
         let Json(capture) = scoped_capture_worker_observation_session(
@@ -18035,8 +18009,8 @@ mod tests {
             }),
             observation_headers.clone(),
             Json(WorkerObservationSubjectRef::RuntimeWorker {
-                runtime_id: generic.worker_ref.runtime_id.clone(),
-                worker_id: generic.worker_ref.worker_id.clone(),
+                runtime_id: generic.runtime_id.clone(),
+                worker_id: generic.worker_id.clone(),
             }),
         )
         .await
@@ -18059,8 +18033,8 @@ mod tests {
             }),
             observation_headers.clone(),
             Json(WorkerObservationSubjectRef::RuntimeWorker {
-                runtime_id: generic.worker_ref.runtime_id.clone(),
-                worker_id: generic.worker_ref.worker_id.clone(),
+                runtime_id: generic.runtime_id.clone(),
+                worker_id: generic.worker_id.clone(),
             }),
         )
         .await
@@ -18073,11 +18047,11 @@ mod tests {
         let mut unauthorized_headers = HeaderMap::new();
         unauthorized_headers.insert(
             "x-yoi-runtime-id",
-            axum::http::HeaderValue::from_str(&generic.worker_ref.runtime_id).unwrap(),
+            axum::http::HeaderValue::from_str(&generic.runtime_id).unwrap(),
         );
         unauthorized_headers.insert(
             "x-yoi-worker-id",
-            axum::http::HeaderValue::from_str(&generic.worker_ref.worker_id).unwrap(),
+            axum::http::HeaderValue::from_str(&generic.worker_id).unwrap(),
         );
         let Json(unauthorized) = scoped_list_worker_observation_sessions(
             State(api.clone()),
@@ -18099,10 +18073,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(existing.disposition, "existing");
-        assert_eq!(
-            existing.worker.unwrap().worker.worker_id,
-            dedicated.worker.worker_id
-        );
+        assert_eq!(existing.worker.unwrap().worker_id, dedicated.worker_id);
 
         let Json(status) = scoped_workspace_orchestrator_status(
             State(api),
@@ -18110,10 +18081,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            status.worker.unwrap().worker.worker_id,
-            dedicated.worker.worker_id
-        );
+        assert_eq!(status.worker.unwrap().worker_id, dedicated.worker_id);
     }
 
     #[tokio::test]
@@ -19917,7 +19885,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let orchestrator = started.worker.unwrap().worker;
+        let orchestrator = started.worker.unwrap();
+        let orchestrator = RuntimeWorkerRef::new(&orchestrator.runtime_id, &orchestrator.worker_id);
         execution.take_inputs();
 
         let mut input = ticket::NewTicket::new("Bounded notification");
@@ -21028,8 +20997,8 @@ mod tests {
         .unwrap()
         .0
         .worker
-        .expect("Workspace Orchestrator should be available")
-        .worker;
+        .expect("Workspace Orchestrator should be available");
+        let orchestrator = RuntimeWorkerRef::new(&orchestrator.runtime_id, &orchestrator.worker_id);
         let _ = execution.take_inputs();
         let backend = browser_ticket_backend(&api).unwrap();
         let mut input = ticket::NewTicket::new("Queued notification");
@@ -21225,7 +21194,7 @@ mod tests {
             Some(ticket_ref.id.as_str())
         );
         *api.orchestrator_attention_fingerprint.lock().unwrap() = None;
-        let worker_id = started.worker.as_ref().unwrap().worker.worker_id.clone();
+        let worker_id = started.worker.as_ref().unwrap().worker_id.clone();
         maybe_dispatch_orchestrator_turn_end(
             &api,
             &worker_id,
@@ -21356,9 +21325,9 @@ mod tests {
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
-            resolved_control_operation: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_control_operation: None,
         };
         let Json(first) = scoped_create_runtime_worker(
             State(api.clone()),
@@ -21521,7 +21490,6 @@ mod tests {
                 ticket_id: second_ticket.id.clone(),
                 operation_id: "pending-spawn-operation".to_string(),
             }),
-            resolved_control_operation: None,
             ..request
         };
         pending_request.resolved_workspace_api =
@@ -21639,9 +21607,9 @@ mod tests {
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
-            resolved_control_operation: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_control_operation: None,
         };
         let Json(created) = scoped_create_runtime_worker(
             State(api.clone()),
@@ -22349,7 +22317,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let source = orchestrator.worker.unwrap().worker;
+        let source = orchestrator.worker.unwrap();
+        let source = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
         let verified_source = || crate::worker_source::VerifiedWorkerMutationSource {
             runtime_id: source.runtime_id.clone(),
             worker_id: source.worker_id.clone(),
@@ -22425,7 +22394,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let source = orchestrator.worker.unwrap().worker;
+        let source = orchestrator.worker.unwrap();
+        let source = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
 
         let spawned = api
             .spawn_workspace_worker(
@@ -26947,9 +26917,9 @@ mod tests {
             resolved_config_bundle: Some(runtime_test_bundle()),
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
-            resolved_control_operation: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_control_operation: None,
         };
         let spawned = api
             .spawn_workspace_worker(EMBEDDED_WORKER_RUNTIME_ID, spawn_request)

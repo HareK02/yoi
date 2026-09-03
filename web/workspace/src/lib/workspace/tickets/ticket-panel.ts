@@ -1,3 +1,4 @@
+import type { BrowserWorkspaceOrchestratorResponse } from "$lib/generated/worker-launch-api";
 import type { TicketDetail, TicketSummary } from "$lib/generated/ticket-api";
 
 export const TICKET_STATES = [
@@ -12,22 +13,7 @@ export const TICKET_STATES = [
 export type TicketState = (typeof TICKET_STATES)[number];
 export type TicketWorkerRole = "coder" | "reviewer";
 
-export type WorkspaceOrchestratorStatus = {
-  workspace_id: string;
-  online: boolean;
-  disposition: string;
-  worker?: {
-    runtime_id: string;
-    worker_id: string;
-    state: string;
-    display_name: string;
-  } | null;
-  diagnostics: Array<{
-    code: string;
-    severity: string;
-    message: string;
-  }>;
-};
+export type WorkspaceOrchestratorStatus = BrowserWorkspaceOrchestratorResponse;
 
 const LANE_DEFINITIONS = [
   {

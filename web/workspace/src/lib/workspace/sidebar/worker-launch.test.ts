@@ -196,11 +196,13 @@ Deno.test("buildCreateWorkspaceWorkerRequest sends working_directory id and rela
     runtime_id: "embedded",
     display_name: "Worker",
     profile: "builtin:coder",
+    ticket_assignment: null,
     initial_submit: [{ kind: "text", content: "go" }],
     working_directory: {
       working_directory_id: "wd-1-repo",
       relative_cwd: "crates/yoi",
     },
+    control_operation_id: null,
   });
 });
 
@@ -219,7 +221,7 @@ Deno.test("buildCreateWorkspaceWorkerRequest sends no initial segments for an em
   assertEquals(request.initial_submit, []);
 });
 
-Deno.test("buildCreateWorkspaceWorkerRequest omits working_directory for embedded no-workdir launches", () => {
+Deno.test("buildCreateWorkspaceWorkerRequest emits null for embedded no-workdir launches", () => {
   const request = buildCreateWorkspaceWorkerRequest({
     runtime_id: "embedded",
     display_name: "Worker",
@@ -235,6 +237,9 @@ Deno.test("buildCreateWorkspaceWorkerRequest omits working_directory for embedde
     runtime_id: "embedded",
     display_name: "Worker",
     profile: "builtin:companion",
+    ticket_assignment: null,
     initial_submit: [{ kind: "text", content: "chat" }],
+    working_directory: null,
+    control_operation_id: null,
   });
 });

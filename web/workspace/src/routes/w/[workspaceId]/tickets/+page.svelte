@@ -2,6 +2,7 @@
   import { untrack } from "svelte";
   import type { ApiResult } from "$lib/workspace/api/http";
   import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
+  import { parseBrowserWorkspaceOrchestratorResponse } from "$lib/workspace/api/workers";
   import type {
     QueryPage,
     TicketListResponse,
@@ -99,6 +100,7 @@
       fetch,
       workspaceApiPath(data.workspaceId, "/orchestrator"),
       { method: "POST" },
+      parseBrowserWorkspaceOrchestratorResponse,
     );
     orchestratorStarting = false;
   }
