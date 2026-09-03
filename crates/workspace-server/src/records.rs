@@ -479,6 +479,7 @@ pub fn ticket_api_typescript() -> String {
         TicketAssignmentPrincipalSummary::decl(&config),
         TicketActionEligibility::decl(&config),
         TicketMergeRequestSummary::decl(&config),
+        MergeRequestRefDiagnostic::decl(&config),
         MergeRequestListItem::decl(&config),
         MergeRequestListResponse::decl(&config),
         TicketEvidenceSummary::decl(&config),
