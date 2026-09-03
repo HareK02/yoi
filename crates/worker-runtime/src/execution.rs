@@ -1,4 +1,5 @@
 use crate::catalog::{
+    RepositoryRefObservation, RepositoryRefObservationRequest,
     WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest, WorkingDirectoryStatus,
 };
 use crate::config_bundle::ConfigBundle;
@@ -333,6 +334,16 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         ))
     }
 
+    fn observe_repository_ref(
+        &self,
+        _request: &RepositoryRefObservationRequest,
+    ) -> Result<RepositoryRefObservation, WorkingDirectoryDiagnostic> {
+        Err(WorkingDirectoryDiagnostic::rejected(
+            "repository_ref_provider_unavailable",
+            "Worker execution backend does not support Repository ref observation",
+        ))
+    }
+
     fn list_working_directories(&self) -> Vec<WorkingDirectoryStatus> {
         Vec::new()
     }
@@ -499,6 +510,13 @@ impl WorkerExecutionBackendRef {
     ) -> Result<(), WorkingDirectoryDiagnostic> {
         self.backend
             .authorize_working_directory_repository_access(request)
+    }
+
+    pub(crate) fn observe_repository_ref(
+        &self,
+        request: &RepositoryRefObservationRequest,
+    ) -> Result<RepositoryRefObservation, WorkingDirectoryDiagnostic> {
+        self.backend.observe_repository_ref(request)
     }
 
     pub(crate) fn list_working_directories(&self) -> Vec<WorkingDirectoryStatus> {

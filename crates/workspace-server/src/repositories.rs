@@ -392,7 +392,7 @@ impl RepositoryRegistryReader {
     }
 }
 
-fn normalize_target_branch_selector(
+pub(crate) fn normalize_target_branch_selector(
     id: &str,
     selector: &str,
 ) -> Result<String, RepositoryLookupError> {

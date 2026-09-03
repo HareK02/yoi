@@ -58,25 +58,28 @@ use worker::feature::builtin::{WorkerObservationSubject, WorkerObservationSubjec
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 use workspace_api::{
-    CreateRemoteRuntimeRequest, CreateRepositorySshCredentialRequest,
-    CreateWorkspaceRepositoryRequest, CreateWorkspaceRepositoryResponse,
-    DeleteRepositorySshCredentialRequest, DeleteRepositorySshHostTrustRequest,
-    ObjectiveCreateRequest, ObjectiveEditRequest, ObjectiveLinkTicketRequest,
-    ObjectiveStateRequest, ProfileSettingsResponse, PutRepositorySshHostTrustRequest,
-    RepositoryAccessProjection, RepositoryDetailResponse, RepositoryListResponse,
-    RepositoryLogResponse, RepositorySshCredential, RepositorySshHostTrust,
+    BrowserCreateWorkerResponse, BrowserWorkspaceOrchestratorResponse, CreateRemoteRuntimeRequest,
+    CreateRepositorySshCredentialRequest, CreateWorkspaceRepositoryRequest,
+    CreateWorkspaceRepositoryResponse, CreateWorkspaceWorkerRequest,
+    CreateWorkspaceWorkerTicketAssignmentRequest, DeleteRepositorySshCredentialRequest,
+    DeleteRepositorySshHostTrustRequest, ObjectiveCreateRequest, ObjectiveEditRequest,
+    ObjectiveLinkTicketRequest, ObjectiveStateRequest, ProfileSettingsResponse,
+    PutRepositorySshHostTrustRequest, RepositoryAccessProjection, RepositoryDetailResponse,
+    RepositoryListResponse, RepositoryLogResponse, RepositorySshCredential, RepositorySshHostTrust,
     RotateRepositorySshCredentialRequest, RuntimeConnectionTestResponse, RuntimeManagementSummary,
     TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
-    UpdateWorkspaceMetadataRequest,
+    UpdateWorkspaceMetadataRequest, WorkerLaunchOptionsResponse, WorkerLaunchProfileCandidate,
+    WorkerLaunchRuntimeOption, WorkerLaunchWorkerSummary,
     WorkingDirectoryCreateRequest as BrowserWorkingDirectoryCreateRequest,
     WorkingDirectoryCreateResponse as BrowserWorkingDirectoryCreateResponse,
     WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
     WorkingDirectoryListResponse as BrowserWorkingDirectoryListResponse,
     WorkingDirectoryRemovalDisposition, WorkingDirectoryRemovalRequest,
-    WorkingDirectoryRemovalResponse, WorkspaceCatalogListResponse, WorkspaceCreateResponse,
-    WorkspaceExtensionPointState, WorkspaceExtensionPoints, WorkspaceMetadataMutationResponse,
-    WorkspaceMetadataSettingsResponse, WorkspacePermissionSummary, WorkspaceRepositoryRecord,
-    WorkspaceResponse, WorkspaceRuntimeResource, WorkspaceSummary, WorkspaceWorkerDiscoveryItem,
+    WorkingDirectoryRemovalResponse, WorkingDirectoryRepositoryOption,
+    WorkspaceCatalogListResponse, WorkspaceCreateResponse, WorkspaceExtensionPointState,
+    WorkspaceExtensionPoints, WorkspaceMetadataMutationResponse, WorkspaceMetadataSettingsResponse,
+    WorkspacePermissionSummary, WorkspaceRepositoryRecord, WorkspaceResponse,
+    WorkspaceRuntimeResource, WorkspaceSummary, WorkspaceWorkerDiscoveryItem,
     WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
 };
 
@@ -118,9 +121,9 @@ use crate::observation::{
     RuntimeObservationSource, RuntimeObservationSourceConfig,
 };
 use crate::records::{
-    MergeRequestListItem, MergeRequestListResponse, ObjectiveDetail, ObjectiveQueryRequest,
-    ObjectiveQueryResponse, ObjectiveShowRequest, ProjectRecordList, TicketDetail,
-    TicketQueryRequest, TicketQueryResponse, TicketShowRequest,
+    MergeRequestListItem, MergeRequestListResponse, MergeRequestRefDiagnostic, ObjectiveDetail,
+    ObjectiveQueryRequest, ObjectiveQueryResponse, ObjectiveShowRequest, ProjectRecordList,
+    TicketDetail, TicketQueryRequest, TicketQueryResponse, TicketShowRequest,
 };
 use crate::repositories::{
     ConfiguredRepository, RepositoryListProjection, RepositoryLogRead, RepositoryLookupError,
@@ -150,10 +153,10 @@ use crate::workdir_removal::{
 use crate::workspace_catalog::{WorkspaceCatalogService, WorkspaceCreateRequest};
 use crate::{Error, Result};
 use worker_runtime::catalog::{
-    ConfigBundleRef, ProfileSelector, RepositoryMaterializationContext,
-    RepositorySelector as RuntimeRepositorySelector, RepositorySshMaterializationAccess,
-    SensitiveString, WorkingDirectoryClaim, WorkingDirectoryRepository, WorkingDirectoryRequest,
-    WorkspaceApiRef,
+    ConfigBundleRef, ProfileSelector, RepositoryMaterializationContext, RepositoryRefObservation,
+    RepositoryRefObservationRequest, RepositorySelector as RuntimeRepositorySelector,
+    RepositorySshMaterializationAccess, SensitiveString, WorkingDirectoryClaim,
+    WorkingDirectoryRepository, WorkingDirectoryRequest, WorkspaceApiRef,
 };
 use worker_runtime::config_bundle::ConfigBundle;
 use worker_runtime::http_server::{
@@ -3097,98 +3100,6 @@ pub struct WorkerRetentionResponse {
     pub retention_state: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WorkerLaunchOptionsResponse {
-    pub workspace_id: String,
-    pub runtimes: Vec<WorkerLaunchRuntimeOption>,
-    pub default_profile: Option<String>,
-    pub profiles: Vec<WorkerLaunchProfileCandidate>,
-    pub repositories: Vec<WorkingDirectoryRepositoryOption>,
-    pub working_directories: Vec<WorkingDirectorySummary>,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WorkerLaunchRuntimeOption {
-    pub runtime_id: String,
-    pub display_name: String,
-    pub built_in: bool,
-    pub worker_creation_available: bool,
-    pub working_directory_required: bool,
-    pub status: String,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerLaunchProfileCandidate {
-    pub id: String,
-    pub label: String,
-    pub description: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkingDirectoryRepositoryOption {
-    pub repository_key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_selector: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BrowserWorkerWorkingDirectorySelection {
-    pub working_directory_id: String,
-    #[serde(default)]
-    pub relative_cwd: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BrowserWorkspaceOrchestratorResponse {
-    pub workspace_id: String,
-    pub online: bool,
-    pub disposition: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker: Option<WorkerSummary>,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CreateWorkspaceWorkerTicketAssignmentRequest {
-    pub ticket_id: String,
-    pub operation_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CreateWorkspaceWorkerRequest {
-    pub runtime_id: String,
-    pub display_name: String,
-    #[serde(default)]
-    pub profile: Option<String>,
-    #[serde(default)]
-    pub ticket_assignment: Option<CreateWorkspaceWorkerTicketAssignmentRequest>,
-    #[serde(default)]
-    pub initial_submit: Vec<Segment>,
-    #[serde(default)]
-    pub working_directory: Option<BrowserWorkerWorkingDirectorySelection>,
-    /// Backend idempotency key used only for authenticated Worker-owned spawn/control.
-    #[serde(default)]
-    pub control_operation_id: Option<String>,
-    /// Trusted resolution populated only by the authenticated worker-control handler.
-    #[serde(skip, default)]
-    pub resolved_control_operation: Option<WorkerControlOperation>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BrowserCreateWorkerResponse {
-    pub workspace_id: String,
-    #[serde(flatten)]
-    pub worker_ref: RuntimeWorkerRef,
-    pub console_href: String,
-    pub worker: WorkerSummary,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
 #[derive(Debug, Deserialize)]
 struct LogQuery {
     limit: Option<usize>,
@@ -5506,6 +5417,205 @@ fn merge_request_store(
     .map_err(Into::into)
 }
 
+fn repository_ref_observation_error(error: crate::hosts::RuntimeRegistryError) -> ApiError {
+    match error {
+        crate::hosts::RuntimeRegistryError::RuntimeOperationFailed {
+            runtime_id,
+            code,
+            message,
+        } => Error::RuntimeOperationFailed {
+            runtime_id,
+            code,
+            message,
+        }
+        .into(),
+        other => other.into_error().into(),
+    }
+}
+
+fn observe_published_merge_ref(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    runtime_id: &str,
+    repository_id: &str,
+    selector: &str,
+) -> ApiResult<RepositoryRefObservation> {
+    let canonical_selector =
+        crate::repositories::normalize_target_branch_selector(repository_id, selector)
+            .map_err(repository_merge_evidence_error)?;
+    let operation_id = format!("repository-ref-observation-{}", Uuid::now_v7());
+    let repository = api
+        .config
+        .repositories
+        .iter()
+        .find(|repository| repository.id == repository_id)
+        .ok_or_else(|| Error::UnknownRepository(repository_id.to_string()))?;
+    let mut materialization_request =
+        working_directory_request_from_repository(repository, Some(&canonical_selector));
+    materialization_request.backend_workdir_id = Some(operation_id.clone());
+    let projection = active_repository_access_projection(api, workspace_id)?;
+    authorize_repository_materialization(
+        api,
+        runtime_id,
+        &operation_id,
+        &projection,
+        &mut materialization_request,
+    )?;
+    api.runtime
+        .observe_repository_ref(
+            runtime_id,
+            RepositoryRefObservationRequest {
+                repository: materialization_request.repository,
+                selector: canonical_selector,
+                materialization: materialization_request.materialization,
+            },
+        )
+        .map_err(repository_ref_observation_error)
+}
+
+fn source_ref_error_code(code: &str) -> String {
+    match code {
+        "repository_ref_not_found" => "source_ref_not_found".to_string(),
+        "repository_ref_provider_timeout" => "source_ref_provider_timeout".to_string(),
+        "repository_ref_provider_auth_failed" => "source_ref_provider_auth_failed".to_string(),
+        "repository_ref_response_invalid" => "source_ref_response_invalid".to_string(),
+        "repository_ref_selector_invalid" => "source_ref_selector_invalid".to_string(),
+        "repository_access_credential_expired" => "source_ref_credential_expired".to_string(),
+        "repository_access_credential_unavailable" => {
+            "source_ref_credential_unavailable".to_string()
+        }
+        "repository_access_credential_unauthorized" => {
+            "source_ref_credential_unauthorized".to_string()
+        }
+        "repository_access_credential_invalid" => "source_ref_credential_invalid".to_string(),
+        "repository_access_provider_unavailable" | "repository_ref_provider_unavailable" => {
+            "source_ref_provider_unavailable".to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+fn source_ref_readiness_blocker(code: &str) -> &'static str {
+    if code == "source_ref_not_found" {
+        "source_ref_not_found"
+    } else {
+        "source_ref_unavailable"
+    }
+}
+
+fn remap_source_ref_error(error: ApiError) -> ApiError {
+    let ApiError { error, diagnostics } = error;
+    match error {
+        Error::RuntimeOperationFailed {
+            runtime_id,
+            code,
+            message,
+        } => Error::RuntimeOperationFailed {
+            runtime_id,
+            code: source_ref_error_code(&code),
+            message,
+        }
+        .into(),
+        error => ApiError { error, diagnostics },
+    }
+}
+
+fn observe_published_source_ref(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    runtime_id: &str,
+    repository_id: &str,
+    selector: &str,
+) -> ApiResult<RepositoryRefObservation> {
+    observe_published_merge_ref(api, workspace_id, runtime_id, repository_id, selector)
+        .map_err(remap_source_ref_error)
+}
+
+fn require_assigned_workdir_source(
+    api: &WorkspaceApi,
+    assignment: &crate::store::TicketCoderAssignmentRecord,
+    repository_id: &str,
+    selector: &str,
+    revision_ref: &str,
+) -> ApiResult<()> {
+    let worker = api
+        .runtime
+        .worker(&assignment.worker)
+        .map_err(|error| error.into_error())?;
+    let attached_workdir = worker.working_directory.ok_or_else(|| {
+        Error::MergeRequest(merge_request::MergeRequestError::Conflict(
+            "merge_request_source_workdir_missing: current Coder has no attached Workdir".into(),
+        ))
+    })?;
+    let workdir = api
+        .runtime
+        .working_directory(
+            &assignment.worker.runtime_id,
+            &attached_workdir.working_directory_id,
+        )
+        .map_err(|error| error.into_error())?
+        .working_directory
+        .ok_or_else(|| {
+            Error::MergeRequest(merge_request::MergeRequestError::Conflict(
+                "merge_request_source_workdir_unavailable: current Coder Workdir could not be observed"
+                    .into(),
+            ))
+        })?
+        .summary;
+    validate_assigned_workdir_source(&workdir, repository_id, selector, revision_ref).map_err(
+        |diagnostic| Error::RuntimeOperationFailed {
+            runtime_id: assignment.worker.runtime_id.clone(),
+            code: diagnostic.code,
+            message: diagnostic.message,
+        },
+    )?;
+    Ok(())
+}
+
+fn validate_assigned_workdir_source(
+    workdir: &worker_runtime::catalog::WorkingDirectorySummary,
+    repository_id: &str,
+    selector: &str,
+    revision_ref: &str,
+) -> std::result::Result<(), worker_runtime::working_directory::WorkingDirectoryDiagnostic> {
+    if workdir.repository_id != repository_id {
+        return Err(
+            worker_runtime::working_directory::WorkingDirectoryDiagnostic {
+                code: "source_workdir_repository_mismatch".to_string(),
+                message: "Current Coder Workdir belongs to a different Repository".to_string(),
+            },
+        );
+    }
+    if workdir.cleanliness.as_deref() != Some("clean") {
+        return Err(
+            worker_runtime::working_directory::WorkingDirectoryDiagnostic {
+                code: "source_workdir_dirty".to_string(),
+                message: "Current Coder Workdir must be clean".to_string(),
+            },
+        );
+    }
+    let workdir_selector_matches = workdir
+        .current_selector
+        .as_deref()
+        .and_then(|workdir_selector| {
+            crate::repositories::normalize_target_branch_selector(repository_id, workdir_selector)
+                .ok()
+        })
+        .is_some_and(|workdir_selector| {
+            crate::repositories::normalize_target_branch_selector(repository_id, selector)
+                .is_ok_and(|selector| selector == workdir_selector)
+        });
+    if !workdir_selector_matches || workdir.current_ref.as_deref() != Some(revision_ref) {
+        return Err(
+            worker_runtime::working_directory::WorkingDirectoryDiagnostic {
+                code: "source_ref_revision_mismatch".to_string(),
+                message: "Current Coder Workdir selector and HEAD do not match the provider-published source ref".to_string(),
+            },
+        );
+    }
+    Ok(())
+}
+
 fn repository_merge_evidence_error(error: RepositoryLookupError) -> ApiError {
     Error::InvalidInput(format!(
         "repository merge evidence validation failed: {error:?}"
@@ -5625,6 +5735,8 @@ struct MergeRequestRefResponse {
     #[serde(rename = "ref")]
     revision_ref: Option<String>,
     observed_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<MergeRequestRefDiagnostic>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -5704,17 +5816,44 @@ async fn scoped_list_merge_requests(
             limit: query.limit.unwrap_or(50),
         },
     )?;
-    let reader = api.repository_reader();
     let items = page
         .items
         .into_iter()
         .map(|merge_request| -> ApiResult<MergeRequestListItem> {
-            let current_subject_ref = merge_request.selector_from.as_deref().and_then(|selector| {
-                reader
-                    .observe_merge_target(&merge_request.repository_id, Some(selector))
-                    .ok()
-                    .map(|observation| observation.commit)
-            });
+            let (current_subject_ref, ref_diagnostics) =
+                if merge_request.state == merge_request::MergeRequestState::Open {
+                    match (
+                        merge_request.selector_from.as_deref(),
+                        merge_request.ticket_ids.first(),
+                    ) {
+                        (Some(selector), Some(ticket_id)) => match api
+                            .store
+                            .get_current_ticket_coder_assignment(&workspace_id, ticket_id)?
+                        {
+                            Some(assignment) => match observe_published_source_ref(
+                                &api,
+                                &workspace_id,
+                                &assignment.worker.runtime_id,
+                                &merge_request.repository_id,
+                                selector,
+                            ) {
+                                Ok(observation) => (Some(observation.revision_ref), Vec::new()),
+                                Err(error) => (None, vec![merge_ref_diagnostic(error)]),
+                            },
+                            None => (
+                                None,
+                                vec![MergeRequestRefDiagnostic {
+                                    code: "source_ref_runtime_unavailable".to_string(),
+                                    message: "No current Coder Runtime is available to observe the source ref"
+                                        .to_string(),
+                                }],
+                            ),
+                        },
+                        _ => (None, Vec::new()),
+                    }
+                } else {
+                    (None, Vec::new())
+                };
             let repository_key = api
                 .store
                 .get_repository(&workspace_id, &merge_request.repository_id)?
@@ -5730,6 +5869,7 @@ async fn scoped_list_merge_requests(
                 summary: merge_request_summary(merge_request, repository_key, current_subject_ref),
                 ticket_ids,
                 thread_event_count,
+                ref_diagnostics,
             })
         })
         .collect::<ApiResult<Vec<_>>>()?;
@@ -5737,6 +5877,55 @@ async fn scoped_list_merge_requests(
         items,
         next_cursor: page.next_cursor,
     }))
+}
+
+fn merge_ref_diagnostic(error: ApiError) -> MergeRequestRefDiagnostic {
+    let ApiError { error, diagnostics } = error;
+    diagnostics
+        .into_iter()
+        .next()
+        .map(|diagnostic| MergeRequestRefDiagnostic {
+            code: diagnostic.code,
+            message: diagnostic.message,
+        })
+        .unwrap_or_else(|| MergeRequestRefDiagnostic {
+            code: "merge_ref_observation_unavailable".to_string(),
+            message: sanitize_backend_error(&error.to_string()),
+        })
+}
+
+fn unknown_merge_ref(code: &str, message: &str) -> MergeRequestRefResponse {
+    MergeRequestRefResponse {
+        status: "unknown".to_string(),
+        revision_ref: None,
+        observed_at: Utc::now().to_rfc3339(),
+        diagnostic: Some(MergeRequestRefDiagnostic {
+            code: code.to_string(),
+            message: message.to_string(),
+        }),
+    }
+}
+
+fn unknown_merge_ref_response(error: ApiError) -> MergeRequestRefResponse {
+    MergeRequestRefResponse {
+        status: "unknown".to_string(),
+        revision_ref: None,
+        observed_at: Utc::now().to_rfc3339(),
+        diagnostic: Some(merge_ref_diagnostic(error)),
+    }
+}
+
+fn merge_ref_response(observation: RepositoryRefObservation) -> MergeRequestRefResponse {
+    let observed_at =
+        chrono::DateTime::<Utc>::from_timestamp(observation.observed_at_epoch_seconds as i64, 0)
+            .unwrap_or_else(Utc::now)
+            .to_rfc3339();
+    MergeRequestRefResponse {
+        status: "known".into(),
+        revision_ref: Some(observation.revision_ref),
+        observed_at,
+        diagnostic: None,
+    }
 }
 
 async fn scoped_show_merge_request(
@@ -5754,38 +5943,53 @@ async fn scoped_show_merge_request(
         query.after,
         query.limit.unwrap_or(100),
     )?;
-    let reader = api.repository_reader();
-    let observed_at = Utc::now().to_rfc3339();
-    let source = match mr.selector_from.as_deref() {
-        Some(selector) => match reader.observe_merge_target(&mr.repository_id, Some(selector)) {
-            Ok(value) => MergeRequestRefResponse {
-                status: "known".into(),
-                revision_ref: Some(value.commit),
-                observed_at: observed_at.clone(),
-            },
-            Err(_) => MergeRequestRefResponse {
-                status: "unknown".into(),
-                revision_ref: None,
-                observed_at: observed_at.clone(),
-            },
-        },
-        None => MergeRequestRefResponse {
+    let ticket_id = mr.ticket_ids.first().ok_or_else(|| {
+        Error::MergeRequest(merge_request::MergeRequestError::Conflict(
+            "Merge Request has no linked Ticket".into(),
+        ))
+    })?;
+    let assignment = api
+        .store
+        .get_current_ticket_coder_assignment(&workspace_id, ticket_id)?;
+    let source = match (mr.selector_from.as_deref(), assignment.as_ref()) {
+        (Some(selector), Some(assignment)) => {
+            match observe_published_source_ref(
+                &api,
+                &workspace_id,
+                &assignment.worker.runtime_id,
+                &mr.repository_id,
+                selector,
+            ) {
+                Ok(observation) => merge_ref_response(observation),
+                Err(error) => unknown_merge_ref_response(error),
+            }
+        }
+        (Some(_), None) => unknown_merge_ref(
+            "source_ref_runtime_unavailable",
+            "No current Coder Runtime is available to observe the source ref",
+        ),
+        (None, _) => MergeRequestRefResponse {
             status: "requires_repair".into(),
             revision_ref: None,
-            observed_at: observed_at.clone(),
+            observed_at: Utc::now().to_rfc3339(),
+            diagnostic: None,
         },
     };
-    let target = match reader.observe_merge_target(&mr.repository_id, Some(&mr.selector_to)) {
-        Ok(value) => MergeRequestRefResponse {
-            status: "known".into(),
-            revision_ref: Some(value.commit),
-            observed_at,
+    let target = match assignment.as_ref() {
+        Some(assignment) => match observe_published_merge_ref(
+            &api,
+            &workspace_id,
+            &assignment.worker.runtime_id,
+            &mr.repository_id,
+            &mr.selector_to,
+        ) {
+            Ok(observation) => merge_ref_response(observation),
+            Err(error) => unknown_merge_ref_response(error),
         },
-        Err(_) => MergeRequestRefResponse {
-            status: "unknown".into(),
-            revision_ref: None,
-            observed_at,
-        },
+        None => unknown_merge_ref(
+            "target_ref_runtime_unavailable",
+            "No current Coder Runtime is available to observe the target ref",
+        ),
     };
     let linked_tickets = mr
         .ticket_ids
@@ -5818,13 +6022,28 @@ async fn scoped_merge_request_readiness(
     let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     let store = merge_request_store(&api, &workspace_id)?;
     let mr = store.get(&workspace_id, &ticket_id)?;
-    let current_subject_ref = mr.selector_from.as_deref().and_then(|selector| {
-        api.repository_reader()
-            .observe_merge_target(&mr.repository_id, Some(selector))
-            .ok()
-            .map(|v| v.commit)
-    });
-    Ok(Json(store.readiness(merge_request::ReadinessCheck {
+    let assignment = api
+        .store
+        .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?;
+    let (current_subject_ref, source_blocker) = match (mr.selector_from.as_deref(), assignment) {
+        (Some(selector), Some(assignment)) => match observe_published_source_ref(
+            &api,
+            &workspace_id,
+            &assignment.worker.runtime_id,
+            &mr.repository_id,
+            selector,
+        ) {
+            Ok(observation) => (Some(observation.revision_ref), None),
+            Err(error) => {
+                let diagnostic = merge_ref_diagnostic(error);
+                let blocker = source_ref_readiness_blocker(&diagnostic.code);
+                (None, Some(blocker.to_string()))
+            }
+        },
+        (Some(_), None) => (None, Some("source_ref_unavailable".to_string())),
+        (None, _) => (None, None),
+    };
+    let mut report = store.readiness(merge_request::ReadinessCheck {
         ticket_id,
         current_subject_ref,
         auth: merge_request::MergeRequestAuth {
@@ -5834,7 +6053,17 @@ async fn scoped_merge_request_readiness(
             worker_id: String::new(),
             assignment_id: String::new(),
         },
-    })?))
+    })?;
+    if let Some(blocker) = source_blocker {
+        report
+            .blockers
+            .retain(|current| current != "selector_unresolved");
+        if !report.blockers.contains(&blocker) {
+            report.blockers.push(blocker);
+        }
+        report.ready = false;
+    }
+    Ok(Json(report))
 }
 
 async fn scoped_open_merge_request(
@@ -5874,13 +6103,27 @@ async fn scoped_open_merge_request(
         )
         .into());
     }
-    let reader = api.repository_reader();
-    reader
-        .observe_merge_target(&repository_id, Some(&input.selector_from))
-        .map_err(repository_merge_evidence_error)?;
-    reader
-        .observe_merge_target(&repository_id, Some(&input.selector_to))
-        .map_err(repository_merge_evidence_error)?;
+    let source_observation = observe_published_source_ref(
+        &api,
+        &workspace_id,
+        &assignment.worker.runtime_id,
+        &repository_id,
+        &input.selector_from,
+    )?;
+    require_assigned_workdir_source(
+        &api,
+        &assignment,
+        &repository_id,
+        &input.selector_from,
+        &source_observation.revision_ref,
+    )?;
+    observe_published_merge_ref(
+        &api,
+        &workspace_id,
+        &assignment.worker.runtime_id,
+        &repository_id,
+        &input.selector_to,
+    )?;
     let merge_request = merge_request_store(&api, &workspace_id)?.open_merge_request(
         merge_request::OpenMergeRequest {
             merge_request_id: Uuid::now_v7().to_string(),
@@ -5939,11 +6182,20 @@ async fn scoped_repair_merge_request_selector(
     }
     let store = merge_request_store(&api, &workspace_id)?;
     let mr = store.get(&workspace_id, &ticket_id)?;
-    let resolved_subject_ref = api
-        .repository_reader()
-        .observe_merge_target(&mr.repository_id, Some(&input.selector_from))
-        .map_err(repository_merge_evidence_error)?
-        .commit;
+    let assignment = api
+        .store
+        .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
+        .ok_or_else(|| {
+            Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
+        })?;
+    let resolved_subject_ref = observe_published_source_ref(
+        &api,
+        &workspace_id,
+        &assignment.worker.runtime_id,
+        &mr.repository_id,
+        &input.selector_from,
+    )?
+    .revision_ref;
     let repaired = store.repair_selector_from(merge_request::RepairSelectorFrom {
         workspace_id: workspace_id.clone(),
         ticket_id,
@@ -6011,11 +6263,21 @@ async fn scoped_register_merge_request_review_capability(
         .selector_from
         .as_deref()
         .ok_or_else(|| Error::InvalidInput("selector_from requires repair".into()))?;
-    let subject_ref = api
-        .repository_reader()
-        .observe_merge_target(&mr.repository_id, Some(selector))
-        .map_err(repository_merge_evidence_error)?
-        .commit;
+    let source_observation = observe_published_source_ref(
+        &api,
+        &workspace_id,
+        &assignment.worker.runtime_id,
+        &mr.repository_id,
+        selector,
+    )?;
+    require_assigned_workdir_source(
+        &api,
+        &assignment,
+        &mr.repository_id,
+        selector,
+        &source_observation.revision_ref,
+    )?;
+    let subject_ref = source_observation.revision_ref;
     store.request_review(merge_request::RequestMergeRequestReview {
         ticket_id,
         subject_ref,
@@ -6041,16 +6303,35 @@ async fn scoped_submit_merge_request_review(
     let workspace_id = parse_workspace_id(&workspace_id)?;
     let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     let store = merge_request_store(&api, &workspace_id)?;
+    let review_authorization =
+        store.authorize_review_submission(&ticket_id, &input.capability_token)?;
+    if review_authorization.workspace_id != workspace_id {
+        return Err(
+            Error::MergeRequest(merge_request::MergeRequestError::Unauthorized(
+                "review grant invalid".into(),
+            ))
+            .into(),
+        );
+    }
     let mr = store.get(&workspace_id, &ticket_id)?;
     let selector = mr
         .selector_from
         .as_deref()
         .ok_or_else(|| Error::InvalidInput("selector_from requires repair".into()))?;
-    let current_subject_ref = api
-        .repository_reader()
-        .observe_merge_target(&mr.repository_id, Some(selector))
-        .map_err(repository_merge_evidence_error)?
-        .commit;
+    let assignment = api
+        .store
+        .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
+        .ok_or_else(|| {
+            Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
+        })?;
+    let current_subject_ref = observe_published_source_ref(
+        &api,
+        &workspace_id,
+        &assignment.worker.runtime_id,
+        &mr.repository_id,
+        selector,
+    )?
+    .revision_ref;
     Ok(Json(store.submit_review(
         merge_request::SubmitMergeRequestReview {
             ticket_id,
@@ -6123,7 +6404,6 @@ async fn scoped_complete_merge_request(
     require_online_workspace_orchestrator_source(&api, &source)?;
     let store = merge_request_store(&api, &workspace_id)?;
     let mr = store.get(&workspace_id, &ticket_id)?;
-    let repositories = api.repository_reader();
     if let Some(existing) = recorded_merge_completion(&mr.thread, &input.operation_id) {
         let replay = merge_request::CompleteMergeRequest {
             ticket_id,
@@ -6155,15 +6435,23 @@ async fn scoped_complete_merge_request(
         .selector_from
         .as_deref()
         .ok_or_else(|| Error::InvalidInput("selector_from requires repair".into()))?;
-    let current_source_ref = repositories
-        .observe_merge_target(&mr.repository_id, Some(selector))
-        .map_err(repository_merge_evidence_error)?
-        .commit;
-    let observed = repositories
-        .observe_merge_target(&mr.repository_id, Some(&mr.selector_to))
-        .map_err(repository_merge_evidence_error)?;
+    let current_source_ref = observe_published_source_ref(
+        &api,
+        &workspace_id,
+        &assignment.worker.runtime_id,
+        &mr.repository_id,
+        selector,
+    )?
+    .revision_ref;
+    let observed_target = observe_published_merge_ref(
+        &api,
+        &workspace_id,
+        &assignment.worker.runtime_id,
+        &mr.repository_id,
+        &mr.selector_to,
+    )?;
     require_completed_target_observation(
-        &observed.commit,
+        &observed_target.revision_ref,
         &input.target_ref_before,
         &input.target_ref_after,
     )?;
@@ -7758,9 +8046,9 @@ fn start_memory_staging_consolidation(
             resolved_config_bundle,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
-            resolved_control_operation: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_control_operation: None,
         },
     )?;
     if result.state != WorkerOperationState::Accepted {
@@ -8711,18 +8999,20 @@ async fn spawn_known_worker(
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     );
-    request.resolved_control_operation = Some(WorkerControlOperation {
+    let resolved_control_operation = Some(WorkerControlOperation {
         operation_id: scoped_worker_control_operation_id(&controller, &operation_id),
         input_fingerprint,
     });
-    let response = create_workspace_worker(State(api.clone()), headers, Json(request)).await?;
+    let response =
+        create_workspace_worker_inner(api.clone(), headers, request, resolved_control_operation)
+            .await?;
     if let Err(error) = api
         .store
         .create_worker_control_grant(&WorkerControlGrantRecord {
             workspace_id: path.workspace_id.clone(),
             grant_id: new_id("wcg"),
             controller,
-            subject: response.0.worker_ref.clone(),
+            subject: RuntimeWorkerRef::new(&response.0.runtime_id, &response.0.worker_id),
             relation: relation.to_string(),
             origin: "worker_spawn".to_string(),
             permissions: vec![
@@ -9055,9 +9345,9 @@ async fn scoped_start_workspace_orchestrator(
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: true,
             resolved_worker_observation_grants: Vec::new(),
-            resolved_control_operation: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_control_operation: None,
         },
     )?;
     if result.state != WorkerOperationState::Accepted || result.worker.is_none() {
@@ -9085,6 +9375,42 @@ async fn scoped_start_workspace_orchestrator(
     Ok(Json(workspace_orchestrator_response(&api, "created")))
 }
 
+fn worker_launch_worker_summary(worker: WorkerSummary) -> WorkerLaunchWorkerSummary {
+    WorkerLaunchWorkerSummary {
+        runtime_id: worker.worker.runtime_id,
+        worker_id: worker.worker.worker_id,
+        host_id: worker.host_id,
+        display_name: worker.display_name,
+        label: worker.label,
+        profile: worker.profile,
+        singleton_key: worker.singleton_key,
+        tags: worker.tags,
+        workspace: workspace_api::WorkerWorkspaceSummary {
+            visibility: worker.workspace.visibility,
+            identity: worker.workspace.identity,
+            workspace_id: worker.workspace.workspace_id,
+        },
+        state: worker.state,
+        last_seen_at: worker.last_seen_at,
+        pinned: worker.pinned,
+        retention_state: worker.retention_state,
+        implementation: workspace_api::WorkerImplementationSummary {
+            kind: worker.implementation.kind,
+            display_hint: worker.implementation.display_hint,
+        },
+        capabilities: workspace_api::WorkerCapabilitySummary {
+            can_stop: worker.capabilities.can_stop,
+            can_spawn_followup: worker.capabilities.can_spawn_followup,
+        },
+        working_directory: worker.working_directory,
+        diagnostics: worker
+            .diagnostics
+            .into_iter()
+            .map(workspace_api::Diagnostic::from)
+            .collect(),
+    }
+}
+
 fn workspace_orchestrator_response(
     api: &WorkspaceApi,
     disposition: &str,
@@ -9095,13 +9421,20 @@ fn workspace_orchestrator_response(
         .is_some_and(workspace_orchestrator_is_online);
     let diagnostics = worker
         .as_ref()
-        .map(|worker| worker.diagnostics.clone())
+        .map(|worker| {
+            worker
+                .diagnostics
+                .iter()
+                .cloned()
+                .map(workspace_api::Diagnostic::from)
+                .collect()
+        })
         .unwrap_or_default();
     BrowserWorkspaceOrchestratorResponse {
         workspace_id: api.config.workspace_id.clone(),
         online,
         disposition: disposition.to_string(),
-        worker,
+        worker: worker.map(worker_launch_worker_summary),
         diagnostics,
     }
 }
@@ -12459,6 +12792,15 @@ async fn create_workspace_worker(
     headers: HeaderMap,
     Json(request): Json<CreateWorkspaceWorkerRequest>,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
+    create_workspace_worker_inner(api, headers, request, None).await
+}
+
+async fn create_workspace_worker_inner(
+    api: WorkspaceApi,
+    headers: HeaderMap,
+    request: CreateWorkspaceWorkerRequest,
+    resolved_control_operation: Option<WorkerControlOperation>,
+) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
     let CreateWorkspaceWorkerRequest {
         runtime_id,
         display_name,
@@ -12467,7 +12809,6 @@ async fn create_workspace_worker(
         initial_submit,
         working_directory,
         control_operation_id: _,
-        resolved_control_operation,
     } = request;
     let config_state = api
         .config_store
@@ -12765,10 +13106,14 @@ fn browser_worker_response_from_summary(
     );
     Ok(BrowserCreateWorkerResponse {
         workspace_id,
-        worker_ref: RuntimeWorkerRef::new(&runtime_id, &worker_id),
+        runtime_id,
+        worker_id,
         console_href,
-        worker,
-        diagnostics,
+        worker: worker_launch_worker_summary(worker),
+        diagnostics: diagnostics
+            .into_iter()
+            .map(workspace_api::Diagnostic::from)
+            .collect(),
     })
 }
 
@@ -13199,22 +13544,13 @@ fn compensate_failed_worker_spawn(
     let cancellation = api
         .runtime
         .cancel_worker(&worker.worker, lifecycle_request.clone());
-    let cancellation_accepted = cancellation
+    let stop = api.runtime.stop_worker(&worker.worker, lifecycle_request);
+    let stop_accepted = stop
         .as_ref()
         .is_ok_and(|result| result.state == WorkerOperationState::Accepted);
-    let stop = (!cancellation_accepted)
-        .then(|| api.runtime.stop_worker(&worker.worker, lifecycle_request));
-    let stop_accepted = stop.as_ref().is_some_and(|result| {
-        result
-            .as_ref()
-            .is_ok_and(|result| result.state == WorkerOperationState::Accepted)
-    });
-    let termination_detail = (!cancellation_accepted && !stop_accepted).then(|| {
+    let termination_detail = (!stop_accepted).then(|| {
         let cancellation = lifecycle_failure_detail("cancel", &cancellation);
-        let stop = stop
-            .as_ref()
-            .map(|result| lifecycle_failure_detail("stop", result))
-            .unwrap_or_else(|| "stop was not attempted".to_string());
+        let stop = lifecycle_failure_detail("stop", &stop);
         format!("{cancellation}; {stop}")
     });
 
@@ -14810,7 +15146,11 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> ApiResult<WorkerLaunchO
                 worker_creation_available: runtime.worker_creation_available,
                 working_directory_required: !built_in,
                 status: runtime.status,
-                diagnostics: runtime.diagnostics,
+                diagnostics: runtime
+                    .diagnostics
+                    .into_iter()
+                    .map(workspace_api::Diagnostic::from)
+                    .collect(),
             }
         })
         .collect();
@@ -16346,6 +16686,126 @@ mod tests {
         SqliteWorkspaceStore, TrustedRuntimeRecord, UserRecord, WorkspaceRecord,
     };
 
+    fn handler_source<'a>(source: &'a str, name: &str) -> &'a str {
+        let start = source
+            .find(&format!("async fn {name}"))
+            .unwrap_or_else(|| panic!("missing handler {name}"));
+        let tail = &source[start..];
+        let end = tail[1..]
+            .find("\nasync fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(tail.len());
+        &tail[..end]
+    }
+
+    #[test]
+    fn merge_request_http_paths_observe_refs_through_runtime_provider_authority() {
+        let source = include_str!("server.rs");
+        for handler in [
+            "scoped_list_merge_requests",
+            "scoped_show_merge_request",
+            "scoped_open_merge_request",
+            "scoped_repair_merge_request_selector",
+            "scoped_register_merge_request_review_capability",
+            "scoped_submit_merge_request_review",
+            "scoped_complete_merge_request",
+        ] {
+            let handler = handler_source(source, handler);
+            assert!(
+                handler.contains("observe_published_source_ref(")
+                    || handler.contains("observe_published_merge_ref(")
+            );
+            assert!(!handler.contains("repository_reader()"));
+        }
+        let submit = handler_source(source, "scoped_submit_merge_request_review");
+        assert!(
+            submit
+                .find("authorize_review_submission(")
+                .is_some_and(|authorization| {
+                    submit
+                        .find("observe_published_source_ref(")
+                        .is_some_and(|observation| authorization < observation)
+                }),
+            "review capability must be validated before provider access",
+        );
+    }
+
+    #[test]
+    fn readiness_distinguishes_missing_source_from_unavailable_provider() {
+        assert_eq!(
+            source_ref_readiness_blocker("source_ref_not_found"),
+            "source_ref_not_found"
+        );
+        assert_eq!(
+            source_ref_error_code("repository_ref_not_found"),
+            "source_ref_not_found"
+        );
+        assert_eq!(
+            source_ref_error_code("repository_ref_provider_timeout"),
+            "source_ref_provider_timeout"
+        );
+        for code in [
+            "source_ref_provider_unavailable",
+            "source_ref_provider_timeout",
+            "source_ref_provider_auth_failed",
+            "source_ref_credential_expired",
+        ] {
+            assert_eq!(source_ref_readiness_blocker(code), "source_ref_unavailable");
+        }
+    }
+
+    #[test]
+    fn assigned_workdir_must_be_clean_and_match_published_source() {
+        let mut workdir = worker_runtime::catalog::WorkingDirectorySummary {
+            working_directory_id: "workdir-1".to_string(),
+            repository_id: "repository-1".to_string(),
+            creation_selector: Some("work/T-549".to_string()),
+            creation_ref: Some("abc123".to_string()),
+            creation_tree: None,
+            current_selector: Some("work/T-549".to_string()),
+            current_ref: Some("abc123".to_string()),
+            current_tree: None,
+            observed_at_epoch_seconds: Some(1_767_225_600),
+            materializer_kind: workspace_api::WorkingDirectoryMaterializerKind::RuntimeGitCache,
+            cleanup_target: None,
+            status: worker_runtime::catalog::WorkingDirectoryStatusKind::Active,
+            cleanliness: Some("clean".to_string()),
+            primary_worker_id: Some("worker-1".to_string()),
+            occupied_by: None,
+        };
+        assert!(
+            validate_assigned_workdir_source(
+                &workdir,
+                "repository-1",
+                "refs/heads/work/T-549",
+                "abc123",
+            )
+            .is_ok()
+        );
+
+        workdir.cleanliness = Some("dirty".to_string());
+        assert!(matches!(
+            validate_assigned_workdir_source(
+                &workdir,
+                "repository-1",
+                "work/T-549",
+                "abc123"
+            ),
+            Err(diagnostic) if diagnostic.code == "source_workdir_dirty"
+        ));
+        workdir.cleanliness = Some("clean".to_string());
+        workdir.current_ref = Some("different".to_string());
+        assert!(matches!(
+            validate_assigned_workdir_source(
+                &workdir,
+                "repository-1",
+                "work/T-549",
+                "abc123"
+            ),
+            Err(diagnostic) if diagnostic.code == "source_ref_revision_mismatch"
+        ));
+    }
+
     fn completed_upload_file(sha256: &str) -> protocol::UploadedFileRef {
         protocol::UploadedFileRef {
             artifact_id: "019ca7c8-57b6-7f05-8edf-524147aba7b3".into(),
@@ -17210,9 +17670,9 @@ mod tests {
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
-            resolved_control_operation: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_control_operation: None,
         };
         assert!(
             api.validate_worker_spawn_repository_scope(&workdir_flow_launch)
@@ -17456,9 +17916,9 @@ mod tests {
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
-            resolved_control_operation: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_control_operation: None,
         };
 
         assert!(
@@ -17505,7 +17965,6 @@ mod tests {
                 }],
                 working_directory: None,
                 control_operation_id: None,
-                resolved_control_operation: None,
             }),
         )
         .await
@@ -17521,7 +17980,8 @@ mod tests {
             .get_current_ticket_coder_assignment(&api.config.workspace_id, &ticket.id)
             .unwrap()
             .unwrap();
-        assert_eq!(current.worker, response.worker_ref);
+        let response_ref = RuntimeWorkerRef::new(&response.runtime_id, &response.worker_id);
+        assert_eq!(current.worker, response_ref);
         let operation = api
             .store
             .get_ticket_assignment_operation(
@@ -17531,7 +17991,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(operation.assignment_id, Some(current.assignment_id));
-        assert_eq!(operation.worker, Some(response.worker_ref));
+        assert_eq!(operation.worker, Some(response_ref));
     }
 
     #[tokio::test]
@@ -17561,7 +18021,6 @@ mod tests {
                 }],
                 working_directory: None,
                 control_operation_id: None,
-                resolved_control_operation: None,
             }),
         )
         .await;
@@ -17595,7 +18054,6 @@ mod tests {
                 initial_submit: Vec::new(),
                 working_directory: None,
                 control_operation_id: None,
-                resolved_control_operation: None,
             }),
         )
         .await
@@ -17603,11 +18061,11 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-yoi-runtime-id",
-            axum::http::HeaderValue::from_str(&created.worker_ref.runtime_id).unwrap(),
+            axum::http::HeaderValue::from_str(&created.runtime_id).unwrap(),
         );
         headers.insert(
             "x-yoi-worker-id",
-            axum::http::HeaderValue::from_str(&created.worker_ref.worker_id).unwrap(),
+            axum::http::HeaderValue::from_str(&created.worker_id).unwrap(),
         );
         let error =
             authenticate_worker_mutation_source(&api, "other-workspace", &headers).unwrap_err();
@@ -17631,14 +18089,14 @@ mod tests {
                 initial_submit: Vec::new(),
                 working_directory: None,
                 control_operation_id: None,
-                resolved_control_operation: None,
             }),
         )
         .await
         .unwrap();
 
+        let generic_ref = RuntimeWorkerRef::new(&generic.runtime_id, &generic.worker_id);
         assert!(matches!(
-            require_online_workspace_orchestrator_source(&api, &generic.worker_ref),
+            require_online_workspace_orchestrator_source(&api, &generic_ref),
             Err(Error::TicketAssignmentConflict(_))
         ));
 
@@ -17650,10 +18108,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let orchestrator = started.worker.unwrap().worker;
+        let orchestrator = started.worker.unwrap();
+        let orchestrator = RuntimeWorkerRef::new(&orchestrator.runtime_id, &orchestrator.worker_id);
         require_online_workspace_orchestrator_source(&api, &orchestrator).unwrap();
         assert!(matches!(
-            require_online_workspace_orchestrator_source(&api, &generic.worker_ref),
+            require_online_workspace_orchestrator_source(&api, &generic_ref),
             Err(Error::TicketAssignmentConflict(_))
         ));
 
@@ -17722,8 +18181,8 @@ mod tests {
         assert!(started.online);
         let worker = started
             .worker
-            .expect("production Workspace Orchestrator Worker")
-            .worker;
+            .expect("production Workspace Orchestrator Worker");
+        let worker = RuntimeWorkerRef::new(&worker.runtime_id, &worker.worker_id);
 
         let stopped = api
             .runtime
@@ -17823,12 +18282,12 @@ mod tests {
                 initial_submit: Vec::new(),
                 working_directory: None,
                 control_operation_id: None,
-                resolved_control_operation: None,
             }),
         )
         .await
         .unwrap();
-        let controller = controller_worker.worker_ref;
+        let controller =
+            RuntimeWorkerRef::new(&controller_worker.runtime_id, &controller_worker.worker_id);
         assert_ne!(
             scoped_worker_control_operation_id(&controller, "same-operation"),
             scoped_worker_control_operation_id(
@@ -17854,7 +18313,6 @@ mod tests {
             initial_submit: Vec::new(),
             working_directory: None,
             control_operation_id: Some("control-spawn-retry".to_string()),
-            resolved_control_operation: None,
         };
 
         let Json(first) = spawn_known_worker(
@@ -17878,7 +18336,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(retried.worker_ref, first.worker_ref);
+        assert_eq!(retried.runtime_id, first.runtime_id);
+        assert_eq!(retried.worker_id, first.worker_id);
         let mut conflicting_request = request();
         conflicting_request.display_name = "Different controlled child".to_string();
         let conflict = spawn_known_worker(
@@ -17908,7 +18367,10 @@ mod tests {
             .list_active_worker_control_grants(&workspace_id, &controller, 10)
             .unwrap();
         assert_eq!(grants.len(), 1);
-        assert_eq!(grants[0].subject, first.worker_ref);
+        assert_eq!(
+            grants[0].subject,
+            RuntimeWorkerRef::new(&first.runtime_id, &first.worker_id)
+        );
         assert_eq!(grants[0].operation_id, "control-spawn-retry");
     }
 
@@ -17930,7 +18392,6 @@ mod tests {
                 initial_submit: Vec::new(),
                 working_directory: None,
                 control_operation_id: None,
-                resolved_control_operation: None,
             }),
         )
         .await
@@ -17948,7 +18409,6 @@ mod tests {
                 initial_submit: Vec::new(),
                 working_directory: None,
                 control_operation_id: None,
-                resolved_control_operation: None,
             }),
         )
         .await
@@ -17969,14 +18429,16 @@ mod tests {
             dedicated.singleton_key.as_deref(),
             Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY)
         );
-        assert_ne!(dedicated.worker.worker_id, generic.worker_ref.worker_id);
+        let dedicated_ref = RuntimeWorkerRef::new(&dedicated.runtime_id, &dedicated.worker_id);
+        let generic_ref = RuntimeWorkerRef::new(&generic.runtime_id, &generic.worker_id);
+        assert_ne!(dedicated.worker_id, generic.worker_id);
 
         api.store
             .create_worker_control_grant(&WorkerControlGrantRecord {
                 workspace_id: workspace_id.clone(),
                 grant_id: "orchestrator-controls-generic".to_string(),
-                controller: dedicated.worker.clone(),
-                subject: generic.worker_ref.clone(),
+                controller: dedicated_ref.clone(),
+                subject: generic_ref.clone(),
                 relation: "spawned".to_string(),
                 origin: "test".to_string(),
                 permissions: vec!["observe".to_string()],
@@ -17989,11 +18451,11 @@ mod tests {
         let mut observation_headers = HeaderMap::new();
         observation_headers.insert(
             "x-yoi-runtime-id",
-            axum::http::HeaderValue::from_str(&dedicated.worker.runtime_id).unwrap(),
+            axum::http::HeaderValue::from_str(&dedicated.runtime_id).unwrap(),
         );
         observation_headers.insert(
             "x-yoi-worker-id",
-            axum::http::HeaderValue::from_str(&dedicated.worker.worker_id).unwrap(),
+            axum::http::HeaderValue::from_str(&dedicated.worker_id).unwrap(),
         );
         let Json(known) = list_known_workers(
             State(api.clone()),
@@ -18005,7 +18467,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(known.items.len(), 1);
-        assert_eq!(known.items[0].subject, generic.worker_ref);
+        assert_eq!(known.items[0].subject, generic_ref);
         assert_eq!(known.items[0].permissions, ["observe"]);
 
         let Json(sessions) = scoped_list_worker_observation_sessions(
@@ -18024,8 +18486,8 @@ mod tests {
                 .iter()
                 .any(|session| {
                     session["subject"]["kind"] == "runtime_worker"
-                        && session["subject"]["runtime_id"] == generic.worker_ref.runtime_id
-                        && session["subject"]["worker_id"] == generic.worker_ref.worker_id
+                        && session["subject"]["runtime_id"] == generic.runtime_id
+                        && session["subject"]["worker_id"] == generic.worker_id
                 })
         );
         let Json(capture) = scoped_capture_worker_observation_session(
@@ -18035,8 +18497,8 @@ mod tests {
             }),
             observation_headers.clone(),
             Json(WorkerObservationSubjectRef::RuntimeWorker {
-                runtime_id: generic.worker_ref.runtime_id.clone(),
-                worker_id: generic.worker_ref.worker_id.clone(),
+                runtime_id: generic.runtime_id.clone(),
+                worker_id: generic.worker_id.clone(),
             }),
         )
         .await
@@ -18059,8 +18521,8 @@ mod tests {
             }),
             observation_headers.clone(),
             Json(WorkerObservationSubjectRef::RuntimeWorker {
-                runtime_id: generic.worker_ref.runtime_id.clone(),
-                worker_id: generic.worker_ref.worker_id.clone(),
+                runtime_id: generic.runtime_id.clone(),
+                worker_id: generic.worker_id.clone(),
             }),
         )
         .await
@@ -18073,11 +18535,11 @@ mod tests {
         let mut unauthorized_headers = HeaderMap::new();
         unauthorized_headers.insert(
             "x-yoi-runtime-id",
-            axum::http::HeaderValue::from_str(&generic.worker_ref.runtime_id).unwrap(),
+            axum::http::HeaderValue::from_str(&generic.runtime_id).unwrap(),
         );
         unauthorized_headers.insert(
             "x-yoi-worker-id",
-            axum::http::HeaderValue::from_str(&generic.worker_ref.worker_id).unwrap(),
+            axum::http::HeaderValue::from_str(&generic.worker_id).unwrap(),
         );
         let Json(unauthorized) = scoped_list_worker_observation_sessions(
             State(api.clone()),
@@ -18099,10 +18561,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(existing.disposition, "existing");
-        assert_eq!(
-            existing.worker.unwrap().worker.worker_id,
-            dedicated.worker.worker_id
-        );
+        assert_eq!(existing.worker.unwrap().worker_id, dedicated.worker_id);
 
         let Json(status) = scoped_workspace_orchestrator_status(
             State(api),
@@ -18110,10 +18569,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            status.worker.unwrap().worker.worker_id,
-            dedicated.worker.worker_id
-        );
+        assert_eq!(status.worker.unwrap().worker_id, dedicated.worker_id);
     }
 
     #[tokio::test]
@@ -19917,7 +20373,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let orchestrator = started.worker.unwrap().worker;
+        let orchestrator = started.worker.unwrap();
+        let orchestrator = RuntimeWorkerRef::new(&orchestrator.runtime_id, &orchestrator.worker_id);
         execution.take_inputs();
 
         let mut input = ticket::NewTicket::new("Bounded notification");
@@ -20287,7 +20744,7 @@ mod tests {
                 .iter()
                 .any(|assignment| assignment.role == "coder")
         );
-        assert_eq!(api.runtime.worker(&worker).unwrap().state, "cancelled");
+        assert_eq!(api.runtime.worker(&worker).unwrap().state, "idle");
 
         let Json(replayed) = scoped_cancel_ticket_implementation(State(api), path(), request())
             .await
@@ -21028,8 +21485,8 @@ mod tests {
         .unwrap()
         .0
         .worker
-        .expect("Workspace Orchestrator should be available")
-        .worker;
+        .expect("Workspace Orchestrator should be available");
+        let orchestrator = RuntimeWorkerRef::new(&orchestrator.runtime_id, &orchestrator.worker_id);
         let _ = execution.take_inputs();
         let backend = browser_ticket_backend(&api).unwrap();
         let mut input = ticket::NewTicket::new("Queued notification");
@@ -21225,7 +21682,7 @@ mod tests {
             Some(ticket_ref.id.as_str())
         );
         *api.orchestrator_attention_fingerprint.lock().unwrap() = None;
-        let worker_id = started.worker.as_ref().unwrap().worker.worker_id.clone();
+        let worker_id = started.worker.as_ref().unwrap().worker_id.clone();
         maybe_dispatch_orchestrator_turn_end(
             &api,
             &worker_id,
@@ -21356,9 +21813,9 @@ mod tests {
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
-            resolved_control_operation: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_control_operation: None,
         };
         let Json(first) = scoped_create_runtime_worker(
             State(api.clone()),
@@ -21521,7 +21978,6 @@ mod tests {
                 ticket_id: second_ticket.id.clone(),
                 operation_id: "pending-spawn-operation".to_string(),
             }),
-            resolved_control_operation: None,
             ..request
         };
         pending_request.resolved_workspace_api =
@@ -21639,9 +22095,9 @@ mod tests {
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
-            resolved_control_operation: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_control_operation: None,
         };
         let Json(created) = scoped_create_runtime_worker(
             State(api.clone()),
@@ -22349,7 +22805,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let source = orchestrator.worker.unwrap().worker;
+        let source = orchestrator.worker.unwrap();
+        let source = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
         let verified_source = || crate::worker_source::VerifiedWorkerMutationSource {
             runtime_id: source.runtime_id.clone(),
             worker_id: source.worker_id.clone(),
@@ -22425,7 +22882,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let source = orchestrator.worker.unwrap().worker;
+        let source = orchestrator.worker.unwrap();
+        let source = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
 
         let spawned = api
             .spawn_workspace_worker(
@@ -26948,9 +27406,9 @@ mod tests {
             resolved_config_bundle: Some(runtime_test_bundle()),
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
-            resolved_control_operation: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_control_operation: None,
         };
         let spawned = api
             .spawn_workspace_worker(EMBEDDED_WORKER_RUNTIME_ID, spawn_request)

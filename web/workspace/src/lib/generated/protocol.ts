@@ -178,7 +178,7 @@ export type SubscriptionWorkdirId = string;
 
 export type SubscriptionWorkerIds = Array<SubscriptionWorkerId>;
 
-export type SubscriptionWorkerState = "idle" | "running" | "paused" | "stopped" | "cancelled";
+export type SubscriptionWorkerState = "idle" | "running" | "paused" | "stopped";
 
 export type EventSubscriptionSelector = { "topic": "runtime_workers" } | { "topic": "worker_lifecycle", worker_ids: SubscriptionWorkerIds, } | { "topic": "worker_protocol", worker_id: SubscriptionWorkerId, runtime_id?: string | null, } | { "topic": "workspace_workers" } | { "topic": "workspace_workdirs" };
 

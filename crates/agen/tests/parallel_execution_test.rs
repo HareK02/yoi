@@ -580,7 +580,7 @@ async fn cooperative_cancellation_commits_bounded_terminal_output() {
     );
     assert!(matches!(
         output.result,
-        agen::EngineRunExit::Interrupted(agen::StopReason::Cancelled)
+        agen::EngineRunExit::Interrupted(agen::RunInterruptionReason::Cancelled)
     ));
 }
 
@@ -1214,7 +1214,7 @@ async fn post_tool_abort_commits_confirmed_result_before_stopping_run() {
     );
     assert!(matches!(
         output.result,
-        agen::EngineRunExit::Interrupted(agen::StopReason::Unexpected(
+        agen::EngineRunExit::Interrupted(agen::RunInterruptionReason::Unexpected(
             agen::EngineError::Aborted(ref reason)
         )) if reason == "policy stopped the run"
     ));

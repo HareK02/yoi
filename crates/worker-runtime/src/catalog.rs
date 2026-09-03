@@ -179,6 +179,30 @@ pub struct WorkingDirectoryRequest {
     pub materialization: Option<RepositoryMaterializationContext>,
 }
 
+/// Backend-authorized request to freshly resolve one Repository provider ref.
+///
+/// Runtime executes this against the registered source itself rather than a Workdir
+/// or Runtime cache. Secret material is fetched through `materialization` and never
+/// appears in the result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryRefObservationRequest {
+    pub repository: WorkingDirectoryRepository,
+    pub selector: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization: Option<RepositoryMaterializationContext>,
+}
+
+/// Provider-neutral proof of one freshly observed Repository ref.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryRefObservation {
+    pub repository_id: String,
+    pub source_revision: u64,
+    pub source_fingerprint: String,
+    pub selector: String,
+    pub revision_ref: String,
+    pub observed_at_epoch_seconds: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingDirectoryClaim {
     pub working_directory_id: String,
@@ -250,6 +274,10 @@ pub struct CreateWorkerRequest {
 }
 
 /// Worker lifecycle status for the in-memory embedded runtime.
+///
+/// Run termination details are carried separately by the Worker protocol. In
+/// particular, cancellation returns a Worker to `Idle`; it is not a lifecycle
+/// state of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerStatus {
@@ -257,13 +285,19 @@ pub enum WorkerStatus {
     Running,
     Paused,
     Stopped,
-    Cancelled,
 }
 
 impl WorkerStatus {
     pub fn is_active(self) -> bool {
         matches!(self, Self::Idle | Self::Running | Self::Paused)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkerRestoreIntent {
+    Automatic,
+    Explicit,
 }
 
 /// Lightweight catalog row.

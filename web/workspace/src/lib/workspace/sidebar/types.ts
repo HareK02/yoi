@@ -1,4 +1,13 @@
 import type {
+  BrowserCreateWorkerResponse as SharedBrowserCreateWorkerResponse,
+  BrowserWorkerWorkingDirectorySelection
+    as SharedBrowserWorkerWorkingDirectorySelection,
+  WorkerLaunchOptionsResponse as SharedWorkerLaunchOptionsResponse,
+  WorkerLaunchProfileCandidate as SharedWorkerLaunchProfileCandidate,
+  WorkerLaunchRuntimeOption as SharedWorkerLaunchRuntimeOption,
+  WorkingDirectoryRepositoryOption as SharedWorkingDirectoryRepositoryOption,
+} from "$lib/generated/worker-launch-api";
+import type {
   WorkingDirectoryCreateRequest,
   WorkingDirectoryCreateResponse,
   WorkingDirectoryDetailResponse,
@@ -101,26 +110,10 @@ export type Worker = {
 
 export type WorkerOperationState = "accepted" | "unsupported" | "rejected";
 
-export type WorkerLaunchRuntimeOption = {
-  runtime_id: string;
-  display_name: string;
-  built_in: boolean;
-  worker_creation_available: boolean;
-  working_directory_required: boolean;
-  status: string;
-  diagnostics: Diagnostic[];
-};
-
-export type WorkerLaunchProfileCandidate = {
-  id: string;
-  label: string;
-  description: string;
-};
-
-export type WorkingDirectoryRepositoryOption = {
-  repository_key: string;
-  default_selector?: string | null;
-};
+export type WorkerLaunchRuntimeOption = SharedWorkerLaunchRuntimeOption;
+export type WorkerLaunchProfileCandidate = SharedWorkerLaunchProfileCandidate;
+export type WorkingDirectoryRepositoryOption =
+  SharedWorkingDirectoryRepositoryOption;
 
 export type CleanupTargetKind =
   | "worker_delete"
@@ -185,29 +178,10 @@ export type RuntimeCleanupExecutionResponse = {
   diagnostics: Diagnostic[];
 };
 
-export type BrowserWorkerWorkingDirectorySelection = {
-  working_directory_id: string;
-  relative_cwd?: string | null;
-};
-
-export type WorkerLaunchOptionsResponse = {
-  workspace_id: string;
-  runtimes: WorkerLaunchRuntimeOption[];
-  default_profile?: string | null;
-  profiles: WorkerLaunchProfileCandidate[];
-  repositories: WorkingDirectoryRepositoryOption[];
-  working_directories: WorkingDirectorySummary[];
-  diagnostics: Diagnostic[];
-};
-
-export type BrowserCreateWorkerResponse = {
-  workspace_id: string;
-  runtime_id: string;
-  worker_id: string;
-  console_href: string;
-  worker: Worker;
-  diagnostics: Diagnostic[];
-};
+export type BrowserWorkerWorkingDirectorySelection =
+  SharedBrowserWorkerWorkingDirectorySelection;
+export type WorkerLaunchOptionsResponse = SharedWorkerLaunchOptionsResponse;
+export type BrowserCreateWorkerResponse = SharedBrowserCreateWorkerResponse;
 
 export type WorkerInputResult = {
   state: WorkerOperationState;

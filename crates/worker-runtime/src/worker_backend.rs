@@ -20,6 +20,7 @@ use crate::auth::{
 };
 use crate::catalog::{
     CreateWorkerRequest, ProfileSourceArchiveHttpRef, ProfileSourceArchiveSource,
+    RepositoryRefObservation, RepositoryRefObservationRequest,
     WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest, WorkingDirectoryStatus,
 };
 use crate::execution::{
@@ -1643,6 +1644,19 @@ where
             )
         })?;
         materializer.authorize_repository_access(request)
+    }
+
+    fn observe_repository_ref(
+        &self,
+        request: &RepositoryRefObservationRequest,
+    ) -> Result<RepositoryRefObservation, WorkingDirectoryDiagnostic> {
+        let materializer = self.working_directory_materializer.as_ref().ok_or_else(|| {
+            WorkingDirectoryDiagnostic::rejected(
+                "repository_ref_provider_unavailable",
+                "Repository ref observation requested, but no materializer is configured for this Runtime backend",
+            )
+        })?;
+        materializer.observe_repository_ref(request)
     }
 
     fn list_working_directories(&self) -> Vec<WorkingDirectoryStatus> {
@@ -3663,6 +3677,60 @@ mod tests {
             )
         }));
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn stopped_runtime_worker_can_restore_and_accept_input() {
+        let client = MockClient::new(simple_text_events());
+        let runtime_base = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let factory = MockFactory {
+            client,
+            runtime_base: runtime_base.path().to_path_buf(),
+            cwd: cwd.path().to_path_buf(),
+            store_dir: store.path().join("sessions"),
+            worker_metadata_dir: store.path().join("workers"),
+            observed_cwds: Arc::new(Mutex::new(Vec::new())),
+            observed_workspace_clients: Arc::new(Mutex::new(Vec::new())),
+        };
+        let backend = Arc::new(WorkerRuntimeExecutionBackend::new(factory).unwrap());
+        let runtime =
+            EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), backend.clone())
+                .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let detail = runtime
+            .create_worker(create_request("restore-after-stop"))
+            .unwrap();
+
+        runtime.stop_worker(&detail.worker_ref, None).unwrap();
+        assert_eq!(
+            runtime.worker_detail(&detail.worker_ref).unwrap().status,
+            crate::catalog::WorkerStatus::Stopped
+        );
+        assert!(
+            !backend
+                .workers
+                .lock()
+                .unwrap()
+                .contains_key(&detail.worker_ref)
+        );
+
+        runtime.restore_worker(&detail.worker_ref).unwrap();
+        assert_eq!(
+            runtime.worker_detail(&detail.worker_ref).unwrap().status,
+            crate::catalog::WorkerStatus::Idle
+        );
+        assert!(
+            backend
+                .workers
+                .lock()
+                .unwrap()
+                .contains_key(&detail.worker_ref)
+        );
+        runtime
+            .send_input(&detail.worker_ref, WorkerInput::user("continue"))
+            .unwrap();
     }
 
     #[test]

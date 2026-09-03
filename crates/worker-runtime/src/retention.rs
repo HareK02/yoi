@@ -303,7 +303,12 @@ impl FsWorkerRetentionProvider {
                 ));
                 continue;
             }
-            match self.inventory(workspace_id, runtime_id, worker_id, snapshot.run_generation) {
+            match self.inventory(
+                workspace_id,
+                runtime_id,
+                worker_id,
+                snapshot.run_generation(),
+            ) {
                 Ok(item) => workers.push(item),
                 Err(_) => diagnostics.push(runtime_aggregate_diagnostic(
                     &bounded_id,
@@ -388,10 +393,11 @@ impl WorkerRetentionProvider for FsWorkerRetentionProvider {
         if worker.workspace_id.as_deref() != Some(workspace_id) {
             return Err(RuntimeError::WorkerNotFound { worker_id });
         }
-        if worker.run_generation != run_generation {
+        let current_run_generation = worker.run_generation();
+        if current_run_generation != run_generation {
             return Err(RuntimeError::InvalidRequest(format!(
                 "Worker retention inventory expected generation {run_generation}, current generation is {}",
-                worker.run_generation
+                current_run_generation
             )));
         }
         let session_dir = worker_dir.join("session");
@@ -498,10 +504,11 @@ impl WorkerRetentionProvider for FsWorkerRetentionProvider {
                 worker_id: request.worker_id,
             });
         }
-        if snapshot.run_generation != request.expected_run_generation {
+        let run_generation = snapshot.run_generation();
+        if run_generation != request.expected_run_generation {
             return Err(RuntimeError::InvalidRequest(format!(
                 "Worker retention plan expected generation {}, current generation is {}",
-                request.expected_run_generation, snapshot.run_generation
+                request.expected_run_generation, run_generation
             )));
         }
 
@@ -568,8 +575,27 @@ impl WorkerRetentionProvider for FsWorkerRetentionProvider {
 struct WorkerGenerationSnapshot {
     #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default)]
+    execution: WorkerGenerationExecution,
+}
+
+#[derive(Deserialize)]
+struct WorkerGenerationExecution {
+    binding: Option<WorkerGenerationBinding>,
+}
+
+#[derive(Deserialize)]
+struct WorkerGenerationBinding {
     run_generation: u64,
+}
+
+impl WorkerGenerationSnapshot {
+    fn run_generation(&self) -> u64 {
+        self.execution
+            .binding
+            .as_ref()
+            .map(|binding| binding.run_generation)
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Deserialize)]
@@ -1264,7 +1290,10 @@ mod tests {
         let worker = root.join("workers").join(worker_id.to_string());
         write_json(
             &worker.join("worker.json"),
-            &serde_json::json!({"workspace_id": "workspace-a", "run_generation": generation}),
+            &serde_json::json!({
+                "workspace_id": "workspace-a",
+                "execution": {"binding": {"run_generation": generation}}
+            }),
         );
         write_json(
             &worker.join("session/session.json"),
@@ -1462,7 +1491,10 @@ mod tests {
                 .join("workers")
                 .join(other_worker.to_string())
                 .join("worker.json"),
-            &serde_json::json!({"workspace_id": "other-workspace", "run_generation": 1}),
+            &serde_json::json!({
+                "workspace_id": "other-workspace",
+                "execution": {"binding": {"run_generation": 1}}
+            }),
         );
         fs::create_dir_all(temp.path().join("workers/not-a-worker")).unwrap();
         fs::write(

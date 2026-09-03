@@ -39,7 +39,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use agen::{
-    Engine, EngineRunExit, StopReason,
+    Engine, EngineRunExit, RunInterruptionReason,
     interceptor::{Interceptor, PostToolAction, ToolResultInfo},
     llm_client::{
         LlmClient,
@@ -478,7 +478,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // One-shot mode
     if let Some(prompt) = args.prompt {
         let output = engine.run(&mut history, &prompt).await;
-        if let EngineRunExit::Interrupted(StopReason::Unexpected(error)) = output.result {
+        if let EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(error)) = output.result
+        {
             eprintln!("\n❌ Error: {error}");
         }
 
@@ -518,7 +519,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        if let EngineRunExit::Interrupted(StopReason::Unexpected(error)) =
+        if let EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(error)) =
             locked.run(&mut history, input).await
         {
             eprintln!("\n❌ Error: {error}");

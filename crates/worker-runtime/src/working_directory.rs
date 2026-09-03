@@ -1,5 +1,6 @@
 use crate::catalog::{
-    MaterializerKind, RepositorySshMaterializationAccess, WorkingDirectoryCleanupTarget,
+    MaterializerKind, RepositoryRefObservation, RepositoryRefObservationRequest,
+    RepositorySshMaterializationAccess, WorkingDirectoryCleanupTarget,
     WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest, WorkingDirectoryStatus,
     WorkingDirectoryStatusKind, WorkingDirectorySummary,
 };
@@ -195,6 +196,11 @@ pub trait WorkingDirectoryMaterializer: Send + Sync + 'static {
         &self,
         request: &WorkingDirectoryRepositoryAccessRequest,
     ) -> Result<(), WorkingDirectoryDiagnostic>;
+
+    fn observe_repository_ref(
+        &self,
+        request: &RepositoryRefObservationRequest,
+    ) -> Result<RepositoryRefObservation, WorkingDirectoryDiagnostic>;
 
     fn bind_working_directory(
         &self,
@@ -941,6 +947,72 @@ impl WorkingDirectoryMaterializer for RuntimeGitCacheMaterializer {
         binding.working_directory.evidence.host_trust_revision = Some(ssh.host_trust_revision);
         self.write_record(&binding)?;
         self.cache_repository_access(&request.working_directory_id, ssh)
+    }
+
+    fn observe_repository_ref(
+        &self,
+        request: &RepositoryRefObservationRequest,
+    ) -> Result<RepositoryRefObservation, WorkingDirectoryDiagnostic> {
+        let selector = request.selector.trim();
+        validate_exact_branch_selector(selector)?;
+
+        let working_request = WorkingDirectoryRequest {
+            repository: request.repository.clone(),
+            materializer: MaterializerKind::RuntimeGitCache,
+            backend_workdir_id: None,
+            materialization: request.materialization.clone(),
+        };
+        Self::validate_request(&working_request)?;
+        let access = RepositoryCommandAccess::prepare(&self.runtime_root, &working_request)?;
+        let mut command = repository_git_command(&working_request, access.as_ref());
+        command.args([
+            "ls-remote",
+            "--exit-code",
+            "--refs",
+            request.repository.source.uri.as_str(),
+            selector,
+        ]);
+        let output = run_repository_git_stdout(command, request.repository.source.kind)?;
+        let mut lines = output.lines();
+        let line = lines.next().ok_or_else(|| {
+            WorkingDirectoryDiagnostic::new(
+                "repository_ref_not_found",
+                "Repository provider did not return the requested ref",
+            )
+        })?;
+        if lines.next().is_some() {
+            return Err(WorkingDirectoryDiagnostic::new(
+                "repository_ref_response_invalid",
+                "Repository provider returned an ambiguous ref observation",
+            ));
+        }
+        let (revision_ref, observed_selector) = line.split_once('\t').ok_or_else(|| {
+            WorkingDirectoryDiagnostic::new(
+                "repository_ref_response_invalid",
+                "Repository provider returned an invalid ref observation",
+            )
+        })?;
+        if observed_selector != selector
+            || !matches!(revision_ref.len(), 40 | 64)
+            || !revision_ref.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(WorkingDirectoryDiagnostic::new(
+                "repository_ref_response_invalid",
+                "Repository provider returned an invalid ref observation",
+            ));
+        }
+
+        Ok(RepositoryRefObservation {
+            repository_id: request.repository.id.clone(),
+            source_revision: request.repository.source_revision,
+            source_fingerprint: request.repository.source_fingerprint.clone(),
+            selector: selector.to_string(),
+            revision_ref: revision_ref.to_ascii_lowercase(),
+            observed_at_epoch_seconds: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        })
     }
 
     fn bind_working_directory(
@@ -2022,6 +2094,146 @@ fn repository_git_command(
     command
 }
 
+fn validate_exact_branch_selector(selector: &str) -> Result<(), WorkingDirectoryDiagnostic> {
+    validate_selector(selector).map_err(|_| {
+        WorkingDirectoryDiagnostic::new(
+            "repository_ref_selector_invalid",
+            "Repository ref observation requires a valid exact branch selector",
+        )
+    })?;
+    if !selector.starts_with("refs/heads/") {
+        return Err(WorkingDirectoryDiagnostic::new(
+            "repository_ref_selector_invalid",
+            "Repository ref observation requires an exact branch selector",
+        ));
+    }
+    let status = Command::new("git")
+        .args(["check-ref-format", selector])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "repository_ref_provider_unavailable",
+                "Git ref validation could not be started",
+            )
+        })?;
+    if !status.success() {
+        return Err(WorkingDirectoryDiagnostic::new(
+            "repository_ref_selector_invalid",
+            "Repository ref observation requires a valid exact branch selector",
+        ));
+    }
+    Ok(())
+}
+
+fn read_bounded_command_output(mut reader: impl Read) -> Vec<u8> {
+    const MAX_CAPTURE_BYTES: usize = 8192;
+    let mut captured = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let remaining = MAX_CAPTURE_BYTES.saturating_sub(captured.len());
+                captured.extend_from_slice(&chunk[..read.min(remaining)]);
+            }
+        }
+    }
+    captured
+}
+
+fn run_repository_git_stdout(
+    mut command: Command,
+    source_kind: workspace_api::RepositorySourceKind,
+) -> Result<String, WorkingDirectoryDiagnostic> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|_| {
+        WorkingDirectoryDiagnostic::new(
+            "repository_ref_provider_unavailable",
+            "Repository provider operation could not be started",
+        )
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        WorkingDirectoryDiagnostic::new(
+            "repository_ref_provider_unavailable",
+            "Repository provider response could not be captured",
+        )
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        WorkingDirectoryDiagnostic::new(
+            "repository_ref_provider_unavailable",
+            "Repository provider diagnostic could not be captured",
+        )
+    })?;
+    let stdout_reader = std::thread::spawn(move || read_bounded_command_output(stdout));
+    let stderr_reader = std::thread::spawn(move || read_bounded_command_output(stderr));
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "repository_ref_provider_unavailable",
+                "Repository provider operation status could not be observed",
+            )
+        })? {
+            break status;
+        }
+        if started.elapsed() >= REPOSITORY_COMMAND_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(WorkingDirectoryDiagnostic::new(
+                "repository_ref_provider_timeout",
+                "Repository provider operation exceeded the Runtime time limit",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if status.success() {
+        return String::from_utf8(stdout).map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "repository_ref_response_invalid",
+                "Repository provider returned a non-UTF-8 ref observation",
+            )
+        });
+    }
+    if status.code() == Some(2) {
+        return Err(WorkingDirectoryDiagnostic::new(
+            "repository_ref_not_found",
+            "Repository provider did not return the requested ref",
+        ));
+    }
+    let diagnostic = String::from_utf8_lossy(&stderr).to_ascii_lowercase();
+    let auth_failed = source_kind.is_remote()
+        && [
+            "authentication failed",
+            "permission denied",
+            "could not read username",
+            "publickey",
+        ]
+        .iter()
+        .any(|marker| diagnostic.contains(marker));
+    Err(WorkingDirectoryDiagnostic::new(
+        if auth_failed {
+            "repository_ref_provider_auth_failed"
+        } else {
+            "repository_ref_provider_unavailable"
+        },
+        if auth_failed {
+            "Repository provider rejected the operation-scoped authentication"
+        } else {
+            "Repository provider operation failed"
+        },
+    ))
+}
+
 fn run_repository_git(
     mut command: Command,
     code: &'static str,
@@ -2491,6 +2703,157 @@ mod tests {
 
     fn worker_ref(sequence: u64) -> WorkerRef {
         WorkerRef::new(WorkerId::from_legacy_u64(sequence))
+    }
+
+    #[test]
+    fn repository_ref_observation_reads_the_provider_fresh() {
+        let repo = create_clean_repo();
+        git(repo.path(), &["branch", "published"]);
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
+        let repository = request(repo.path()).repository;
+        let observation_request = RepositoryRefObservationRequest {
+            repository,
+            selector: "refs/heads/published".to_string(),
+            materialization: None,
+        };
+
+        let first = materializer
+            .observe_repository_ref(&observation_request)
+            .unwrap();
+        assert_eq!(
+            first.revision_ref,
+            git_stdout(repo.path(), ["rev-parse", "published"]).unwrap()
+        );
+        fs::write(repo.path().join("second.txt"), "second\n").unwrap();
+        git(repo.path(), &["add", "second.txt"]);
+        git(repo.path(), &["commit", "-m", "second"]);
+        git(repo.path(), &["branch", "-f", "published"]);
+
+        let second = materializer
+            .observe_repository_ref(&observation_request)
+            .unwrap();
+        assert_ne!(first.revision_ref, second.revision_ref);
+        assert_eq!(
+            second.revision_ref,
+            git_stdout(repo.path(), ["rev-parse", "published"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn repository_ref_observation_ignores_unpublished_and_stale_workdir_or_cache_refs() {
+        let seed = create_clean_repo();
+        let layout = tempfile::tempdir().unwrap();
+        let provider = layout.path().join("provider.git");
+        git(
+            layout.path(),
+            &[
+                "clone",
+                "--bare",
+                seed.path().to_str().unwrap(),
+                provider.to_str().unwrap(),
+            ],
+        );
+        let cache = layout.path().join("cache");
+        git(
+            layout.path(),
+            &["clone", provider.to_str().unwrap(), cache.to_str().unwrap()],
+        );
+        let workdir = layout.path().join("workdir");
+        git(
+            layout.path(),
+            &[
+                "clone",
+                provider.to_str().unwrap(),
+                workdir.to_str().unwrap(),
+            ],
+        );
+        git(&workdir, &["config", "user.name", "Yoi Test"]);
+        git(&workdir, &["config", "user.email", "yoi@example.com"]);
+        git(&workdir, &["switch", "-c", "published-source"]);
+        fs::write(workdir.join("source.txt"), "first\n").unwrap();
+        git(&workdir, &["add", "source.txt"]);
+        git(&workdir, &["commit", "-m", "source first"]);
+
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
+        let repository = request(&provider).repository;
+        let observation_request = RepositoryRefObservationRequest {
+            repository,
+            selector: "refs/heads/published-source".to_string(),
+            materialization: None,
+        };
+        assert_eq!(
+            materializer
+                .observe_repository_ref(&observation_request)
+                .unwrap_err()
+                .code,
+            "repository_ref_not_found"
+        );
+
+        git(
+            &workdir,
+            &["push", "origin", "HEAD:refs/heads/published-source"],
+        );
+        let first = materializer
+            .observe_repository_ref(&observation_request)
+            .unwrap();
+        fs::write(workdir.join("source.txt"), "second\n").unwrap();
+        git(&workdir, &["add", "source.txt"]);
+        git(&workdir, &["commit", "-m", "source second"]);
+        let unpublished_second = git_stdout(&workdir, ["rev-parse", "HEAD"]).unwrap();
+        let still_first = materializer
+            .observe_repository_ref(&observation_request)
+            .unwrap();
+        assert_eq!(still_first.revision_ref, first.revision_ref);
+        assert_ne!(still_first.revision_ref, unpublished_second);
+
+        git(
+            &workdir,
+            &["push", "origin", "HEAD:refs/heads/published-source"],
+        );
+        let second = materializer
+            .observe_repository_ref(&observation_request)
+            .unwrap();
+        assert_eq!(second.revision_ref, unpublished_second);
+        assert_ne!(second.revision_ref, first.revision_ref);
+        assert_ne!(
+            git_stdout(&cache, ["rev-parse", "HEAD"]).unwrap(),
+            second.revision_ref
+        );
+    }
+
+    #[test]
+    fn repository_ref_observation_rejects_missing_and_non_branch_selectors() {
+        let repo = create_clean_repo();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
+        let repository = request(repo.path()).repository;
+
+        let missing = materializer
+            .observe_repository_ref(&RepositoryRefObservationRequest {
+                repository: repository.clone(),
+                selector: "refs/heads/not-published".to_string(),
+                materialization: None,
+            })
+            .unwrap_err();
+        assert_eq!(missing.code, "repository_ref_not_found");
+        let non_branch = materializer
+            .observe_repository_ref(&RepositoryRefObservationRequest {
+                repository: repository.clone(),
+                selector: "HEAD".to_string(),
+                materialization: None,
+            })
+            .unwrap_err();
+        assert_eq!(non_branch.code, "repository_ref_selector_invalid");
+        let wildcard = materializer
+            .observe_repository_ref(&RepositoryRefObservationRequest {
+                repository,
+                selector: "refs/heads/release/*".to_string(),
+                materialization: None,
+            })
+            .unwrap_err();
+        assert_eq!(wildcard.code, "repository_ref_selector_invalid");
     }
 
     #[test]

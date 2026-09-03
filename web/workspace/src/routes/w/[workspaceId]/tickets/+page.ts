@@ -1,3 +1,4 @@
+import { parseBrowserWorkspaceOrchestratorResponse } from "$lib/workspace/api/workers";
 import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
 import type { TicketListResponse } from "$lib/generated/ticket-api";
 import type { WorkspaceOrchestratorStatus } from "$lib/workspace/tickets/ticket-panel";
@@ -42,6 +43,8 @@ export const load: PageLoad = async ({ fetch, params }) => {
     loadJson<WorkspaceOrchestratorStatus>(
       fetch,
       workspaceApiPath(workspaceId, "/orchestrator"),
+      undefined,
+      parseBrowserWorkspaceOrchestratorResponse,
     ),
   ]);
 

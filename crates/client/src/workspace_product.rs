@@ -1,6 +1,6 @@
 use reqwest::Method;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use ticket::{
     MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent, NewTicketRelation,
     OrchestrationPlanKind, OrchestrationPlanRecord, Ticket, TicketBackend, TicketDependencyCheck,
@@ -9,38 +9,16 @@ use ticket::{
     TicketRelationKind, TicketRelationView, TicketStateChange, TicketStateSelector, TicketSummary,
 };
 use workspace_api::{
-    ListResponse, ObjectiveCreateRequest, ObjectiveDetail, ObjectiveEditRequest,
-    ObjectiveLinkTicketRequest, ObjectiveStateRequest, ObjectiveSummary,
+    BrowserCreateWorkerResponse, BrowserWorkspaceOrchestratorResponse,
+    CreateWorkspaceWorkerRequest, ListResponse, ObjectiveCreateRequest, ObjectiveDetail,
+    ObjectiveEditRequest, ObjectiveLinkTicketRequest, ObjectiveStateRequest, ObjectiveSummary,
     TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
+    WorkerLaunchOptionsResponse,
 };
 
 use crate::{BackendApiClient, BackendWorkspaceClientError};
 
 const DEFAULT_PRODUCT_LIST_LIMIT: usize = 1_000;
-
-#[derive(Debug, Deserialize)]
-struct BackendWorkerLaunchOptions {
-    runtimes: Vec<BackendWorkerLaunchRuntime>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BackendWorkerLaunchRuntime {
-    runtime_id: String,
-    worker_creation_available: bool,
-    working_directory_required: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct BackendCreateWorkerResponse {
-    runtime_id: String,
-    worker_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct BackendWorkspaceOrchestratorResponse {
-    disposition: String,
-    worker: Option<BackendCreateWorkerResponse>,
-}
 
 /// Workspace-scoped Backend client for Ticket and Objective product state.
 ///
@@ -267,7 +245,7 @@ impl BackendWorkspaceProductClient {
         &self,
         ticket_id: &str,
     ) -> Result<String, BackendWorkspaceClientError> {
-        let options: BackendWorkerLaunchOptions = self.get_json("/workers/launch-options")?;
+        let options: WorkerLaunchOptionsResponse = self.get_json("/workers/launch-options")?;
         let runtime = options
             .runtimes
             .iter()
@@ -278,19 +256,19 @@ impl BackendWorkspaceProductClient {
                         .to_string(),
                 )
             })?;
-        let response: BackendCreateWorkerResponse = self.send_json(
-            Method::POST,
-            "/workers",
-            Some(&serde_json::json!({
-                "runtime_id": runtime.runtime_id,
-                "display_name": format!("intake-{ticket_id}"),
-                "profile": "builtin:intake",
-                "initial_submit": [{
-                    "kind": "text",
-                    "content": format!("Please handle intake for Ticket {ticket_id}.")
-                }]
-            })),
-        )?;
+        let request = CreateWorkspaceWorkerRequest {
+            runtime_id: runtime.runtime_id.clone(),
+            display_name: format!("intake-{ticket_id}"),
+            profile: Some("builtin:intake".to_string()),
+            ticket_assignment: None,
+            initial_submit: vec![protocol::Segment::Text {
+                content: format!("Please handle intake for Ticket {ticket_id}."),
+            }],
+            working_directory: None,
+            control_operation_id: None,
+        };
+        let response: BrowserCreateWorkerResponse =
+            self.send_json(Method::POST, "/workers", Some(&request))?;
         Ok(format!(
             "Started Intake Worker {}/{} for Ticket {ticket_id}",
             response.runtime_id, response.worker_id
@@ -298,7 +276,7 @@ impl BackendWorkspaceProductClient {
     }
 
     pub fn start_workspace_orchestrator(&self) -> Result<String, BackendWorkspaceClientError> {
-        let response: BackendWorkspaceOrchestratorResponse =
+        let response: BrowserWorkspaceOrchestratorResponse =
             self.send_json::<(), _>(Method::POST, "/orchestrator", None)?;
         let worker = response.worker.ok_or_else(|| {
             BackendWorkspaceClientError::InvalidTarget(
@@ -792,11 +770,11 @@ mod tests {
         let (base_url, requests, handle) = response_sequence_server(vec![
             (
                 "200 OK",
-                r#"{"runtimes":[{"runtime_id":"embedded","worker_creation_available":true,"working_directory_required":false}]}"#,
+                r#"{"workspace_id":"workspace-a","runtimes":[{"runtime_id":"embedded","display_name":"Embedded","built_in":true,"worker_creation_available":true,"working_directory_required":false,"status":"connected","diagnostics":[]}],"default_profile":null,"profiles":[],"repositories":[],"working_directories":[],"diagnostics":[]}"#,
             ),
             (
                 "200 OK",
-                r#"{"runtime_id":"embedded","worker_id":"worker-1"}"#,
+                r#"{"workspace_id":"workspace-a","runtime_id":"embedded","worker_id":"worker-1","console_href":"/w/workspace-a/workers/worker-1","worker":{"runtime_id":"embedded","worker_id":"worker-1","host_id":"embedded","display_name":"Intake","label":"worker-1","profile":"builtin:intake","singleton_key":null,"tags":[],"workspace":{"visibility":"workspace","identity":"workspace-a","workspace_id":"workspace-a"},"state":"idle","last_seen_at":null,"pinned":false,"retention_state":"active","implementation":{"kind":"runtime","display_hint":"Runtime Worker"},"capabilities":{"can_stop":true,"can_spawn_followup":false},"diagnostics":[]},"diagnostics":[]}"#,
             ),
         ]);
         let client = BackendWorkspaceProductClient::new_with_access_token(
@@ -824,7 +802,7 @@ mod tests {
 
     #[test]
     fn workspace_orchestrator_launch_uses_scoped_backend_route() {
-        let body = r#"{"disposition":"created","worker":{"runtime_id":"embedded","worker_id":"worker-2"}}"#;
+        let body = r#"{"workspace_id":"workspace-a","online":true,"disposition":"created","worker":{"runtime_id":"embedded","worker_id":"worker-2","host_id":"embedded","display_name":"Orchestrator","label":"worker-2","profile":"builtin:orchestrator","singleton_key":"workspace-orchestrator","tags":[],"workspace":{"visibility":"workspace","identity":"workspace-a","workspace_id":"workspace-a"},"state":"idle","last_seen_at":null,"pinned":true,"retention_state":"active","implementation":{"kind":"runtime","display_hint":"Runtime Worker"},"capabilities":{"can_stop":true,"can_spawn_followup":false},"diagnostics":[]},"diagnostics":[]}"#;
         let (base_url, request, handle) = one_response_server("200 OK", body);
         let client = BackendWorkspaceProductClient::new_with_access_token(
             base_url,

@@ -1,5 +1,6 @@
 use crate::catalog::{
-    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail, WorkerLifecycleAck,
+    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, RepositoryRefObservation,
+    RepositoryRefObservationRequest, WorkerDetail, WorkerLifecycleAck, WorkerRestoreIntent,
     WorkerStatus, WorkerSummary, WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest,
     WorkingDirectoryStatus as CatalogWorkingDirectoryStatus, WorkspaceApiRef,
 };
@@ -17,7 +18,8 @@ use crate::execution::{
 };
 #[cfg(feature = "fs-store")]
 use crate::fs_store::{
-    FsRuntimeStore, FsRuntimeStoreOptions, PersistedRuntimeState, PersistedWorkerRecord,
+    FsRuntimeStore, FsRuntimeStoreOptions, PersistedRuntimeState, PersistedWorkerExecution,
+    PersistedWorkerExecutionBinding, PersistedWorkerRecord,
 };
 use crate::identity::{WorkerId, WorkerRef};
 use crate::interaction::{WorkerInput, WorkerInputKind, WorkerInteractionAck};
@@ -229,14 +231,12 @@ impl Runtime {
         let state = self.lock()?;
         let mut active_worker_count = 0;
         let mut stopped_worker_count = 0;
-        let mut cancelled_worker_count = 0;
         for worker in state.workers.values() {
             match worker.status {
                 WorkerStatus::Idle | WorkerStatus::Running | WorkerStatus::Paused => {
                     active_worker_count += 1;
                 }
                 WorkerStatus::Stopped => stopped_worker_count += 1,
-                WorkerStatus::Cancelled => cancelled_worker_count += 1,
             }
         }
 
@@ -247,7 +247,6 @@ impl Runtime {
             worker_count: state.workers.len(),
             active_worker_count,
             stopped_worker_count,
-            cancelled_worker_count,
             diagnostic_count: state.diagnostics.len(),
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
@@ -343,17 +342,6 @@ impl Runtime {
             return Ok(());
         }
         state.status = RuntimeStatus::Stopped;
-        let mut stopped = Vec::new();
-        for (worker_id, worker) in &mut state.workers {
-            if worker.status.is_active() {
-                worker.status = WorkerStatus::Stopped;
-                worker.internal_workers.clear();
-                stopped.push(*worker_id);
-            }
-        }
-        for worker_id in stopped {
-            state.publish_worker_upsert(worker_id)?;
-        }
         state.persist_runtime_snapshot()?;
         state.persist_workers()?;
         Ok(())
@@ -390,6 +378,38 @@ impl Runtime {
             self.resolve_repository_access_resource(ssh).await?;
         }
         self.create_working_directory(request)
+    }
+
+    pub async fn observe_repository_ref_from_resource(
+        &self,
+        mut request: RepositoryRefObservationRequest,
+    ) -> Result<RepositoryRefObservation, RuntimeError> {
+        if let Some(ssh) = request
+            .materialization
+            .as_mut()
+            .and_then(|materialization| materialization.ssh.as_mut())
+        {
+            self.resolve_repository_access_resource(ssh).await?;
+        }
+        self.observe_repository_ref(request)
+    }
+
+    pub fn observe_repository_ref(
+        &self,
+        request: RepositoryRefObservationRequest,
+    ) -> Result<RepositoryRefObservation, RuntimeError> {
+        let backend = {
+            let state = self.lock()?;
+            state.ensure_running()?;
+            state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::ExecutionBackendUnavailable {
+                    message: "Repository ref observation requires an execution backend".to_string(),
+                }
+            })?
+        };
+        backend
+            .observe_repository_ref(&request)
+            .map_err(RuntimeError::from)
     }
 
     pub fn authorize_working_directory_repository_access(
@@ -683,6 +703,8 @@ impl Runtime {
                 workspace_id: scope.map(|scope| scope.workspace_id.clone()),
                 request: durable_request,
                 run_generation: 1,
+                execution_bound: true,
+                restore_intent: WorkerRestoreIntent::Explicit,
                 working_directory: None,
                 execution_handle: None,
                 internal_workers: BTreeMap::new(),
@@ -1019,12 +1041,6 @@ impl Runtime {
                 if worker.execution_handle.is_some() {
                     return Ok(worker.detail());
                 }
-                if worker.status == WorkerStatus::Cancelled {
-                    return Err(RuntimeError::InvalidRequest(format!(
-                        "worker {} is cancelled",
-                        worker_ref.worker_id
-                    )));
-                }
                 (
                     worker.request.clone(),
                     worker.working_directory.clone(),
@@ -1037,7 +1053,12 @@ impl Runtime {
                     message: "runtime has no execution backend".to_string(),
                 }
             })?;
-            state.worker_mut(worker_ref)?.run_generation = run_generation;
+            {
+                let worker = state.worker_mut(worker_ref)?;
+                worker.run_generation = run_generation;
+                worker.execution_bound = true;
+                worker.restore_intent = WorkerRestoreIntent::Automatic;
+            }
             state.persist_worker(&worker_ref.worker_id)?;
             let workspace_scope = worker_request.workspace_api.as_ref().and_then(|api| {
                 state
@@ -1091,18 +1112,20 @@ impl Runtime {
     }
 
     fn ensure_worker_execution(&self, worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
-        let has_handle = {
-            let state = self.lock()?;
-            state
-                .worker(worker_ref)?
-                .execution_handle
-                .as_ref()
-                .is_some()
-        };
-        if has_handle {
+        let state = self.lock()?;
+        let worker = state.worker(worker_ref)?;
+        if worker.execution_handle.is_some() {
             return Ok(());
         }
-        self.restore_worker(worker_ref).map(|_| ())
+        let message = if worker.status == WorkerStatus::Stopped {
+            "stopped worker requires an explicit restore"
+        } else {
+            "worker has no live execution handle"
+        };
+        Err(RuntimeError::WorkerExecutionUnavailable {
+            worker_id: worker_ref.worker_id,
+            message: message.to_string(),
+        })
     }
 
     /// Accept input into a Worker through a workspace-scoped Runtime authorization context.
@@ -1455,7 +1478,9 @@ impl Runtime {
         let detail = {
             let worker = state.worker_mut(worker_ref)?;
             worker.execution_handle = Some(handle);
+            worker.execution_bound = true;
             worker.status = worker_status_from_run_state(run_state);
+            worker.restore_intent = restore_intent_for_status(worker.status);
             worker.working_directory = working_directory;
             worker.detail()
         };
@@ -1484,8 +1509,13 @@ impl Runtime {
     ) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
         if result.is_accepted() {
-            state.worker_mut(worker_ref)?.status = worker_status_from_run_state(result.run_state);
+            let status = worker_status_from_run_state(result.run_state);
+            let worker = state.worker_mut(worker_ref)?;
+            worker.status = status;
+            worker.restore_intent = restore_intent_for_status(status);
             state.publish_worker_upsert(worker_ref.worker_id)?;
+            state.persist_runtime_snapshot()?;
+            state.persist_worker(&worker_ref.worker_id)?;
         }
         Ok(())
     }
@@ -1568,15 +1598,26 @@ impl Runtime {
         self.cancel_worker(worker_ref, reason)
     }
 
-    /// Cancel a Worker. Repeated cancels are idempotent.
+    /// Cancel the current run while keeping the Worker session available.
     pub fn cancel_worker(
         &self,
         worker_ref: &WorkerRef,
         reason: Option<String>,
     ) -> Result<WorkerLifecycleAck, RuntimeError> {
+        let current = {
+            let state = self.lock()?;
+            state.ensure_running()?;
+            state.worker(worker_ref)?.status
+        };
+        if matches!(current, WorkerStatus::Idle | WorkerStatus::Stopped) {
+            return Ok(WorkerLifecycleAck {
+                worker_ref: worker_ref.clone(),
+                status: current,
+            });
+        }
         self.dispatch_lifecycle_to_backend(worker_ref, WorkerExecutionOperation::Cancel)?;
         let _ = reason;
-        self.transition_worker(worker_ref, WorkerStatus::Cancelled)
+        self.transition_worker_preserving_execution(worker_ref, WorkerStatus::Idle)
     }
 
     /// Delete a non-running Worker through a workspace-scoped Runtime authorization context.
@@ -1726,6 +1767,10 @@ impl Runtime {
         if status_changed || activity_changed {
             state.publish_worker_upsert(worker_ref.worker_id)?;
         }
+        if status_changed {
+            state.persist_runtime_snapshot()?;
+            state.persist_worker(&worker_ref.worker_id)?;
+        }
         let event = state.push_worker_observation_event(worker_ref.clone(), payload);
         Ok(event)
     }
@@ -1758,6 +1803,26 @@ impl Runtime {
         Ok(())
     }
 
+    fn transition_worker_preserving_execution(
+        &self,
+        worker_ref: &WorkerRef,
+        status: WorkerStatus,
+    ) -> Result<WorkerLifecycleAck, RuntimeError> {
+        let mut state = self.lock()?;
+        state.ensure_running()?;
+        let worker = state.worker_mut(worker_ref)?;
+        worker.status = status;
+        worker.restore_intent = restore_intent_for_status(status);
+        let status = worker.status;
+        state.publish_worker_upsert(worker_ref.worker_id)?;
+        state.persist_runtime_snapshot()?;
+        state.persist_worker(&worker_ref.worker_id)?;
+        Ok(WorkerLifecycleAck {
+            worker_ref: worker_ref.clone(),
+            status,
+        })
+    }
+
     fn transition_worker(
         &self,
         worker_ref: &WorkerRef,
@@ -1767,18 +1832,9 @@ impl Runtime {
         state.ensure_running()?;
         state.ensure_worker_ref(worker_ref)?;
 
-        {
-            let worker = state.worker(worker_ref)?;
-            if !worker.status.is_active() {
-                return Ok(WorkerLifecycleAck {
-                    worker_ref: worker_ref.clone(),
-                    status: worker.status,
-                });
-            }
-        }
-
         let worker = state.worker_mut(worker_ref)?;
         worker.status = status;
+        worker.restore_intent = restore_intent_for_status(status);
         worker.execution_handle = None;
         worker.internal_workers.clear();
         let status = worker.status;
@@ -1834,7 +1890,12 @@ impl Runtime {
             let worker_ids = state
                 .workers
                 .values()
-                .filter(|worker| worker.execution_handle.is_none())
+                .filter(|worker| {
+                    worker.execution_handle.is_none()
+                        && worker.execution_bound
+                        && worker.status.is_active()
+                        && worker.restore_intent == WorkerRestoreIntent::Automatic
+                })
                 .map(|worker| worker.worker_id)
                 .collect::<Vec<_>>();
             let mut candidates = Vec::with_capacity(worker_ids.len());
@@ -1925,7 +1986,9 @@ impl Runtime {
         {
             let worker = state.worker_mut(worker_ref)?;
             worker.execution_handle = Some(handle);
+            worker.execution_bound = true;
             worker.status = worker_status_from_run_state(run_state);
+            worker.restore_intent = restore_intent_for_status(worker.status);
             worker.working_directory = working_directory;
         }
         state.publish_worker_upsert(worker_ref.worker_id)?;
@@ -2194,15 +2257,23 @@ impl RuntimeState {
         let diagnostics = persisted.diagnostics;
         let next_diagnostic_id = persisted.next_diagnostic_id;
         for (worker_id, worker) in persisted.workers {
+            let run_generation = worker
+                .execution
+                .binding
+                .as_ref()
+                .map(|binding| binding.run_generation)
+                .unwrap_or(0);
             workers.insert(
                 worker_id,
                 WorkerRecord {
                     worker_ref: worker.worker_ref,
                     worker_id: worker.worker_id,
-                    status: WorkerStatus::Stopped,
+                    status: worker.status,
                     workspace_id: worker.workspace_id,
                     request: worker.request,
-                    run_generation: worker.run_generation,
+                    run_generation,
+                    execution_bound: worker.execution.binding.is_some(),
+                    restore_intent: worker.execution.restore_intent,
                     working_directory: worker.working_directory,
                     execution_handle: None,
                     internal_workers: BTreeMap::new(),
@@ -2675,9 +2746,11 @@ impl RuntimeState {
         let worker = self.worker_mut(worker_ref)?;
         worker.execution_handle = None;
         worker.status = WorkerStatus::Stopped;
+        worker.restore_intent = WorkerRestoreIntent::Explicit;
         worker.internal_workers.clear();
         self.publish_worker_upsert(worker_ref.worker_id)?;
         self.persist_runtime_snapshot()?;
+        self.persist_worker(&worker_ref.worker_id)?;
         Ok(())
     }
 
@@ -2893,6 +2966,7 @@ impl RuntimeState {
         if let Some(next_status) = next_status {
             let changed = worker.status != next_status;
             worker.status = next_status;
+            worker.restore_intent = restore_intent_for_status(next_status);
             changed
         } else {
             false
@@ -2914,6 +2988,8 @@ struct WorkerRecord {
     workspace_id: Option<String>,
     request: CreateWorkerRequest,
     run_generation: u64,
+    execution_bound: bool,
+    restore_intent: WorkerRestoreIntent,
     working_directory: Option<CatalogWorkingDirectoryStatus>,
     execution_handle: Option<WorkerExecutionHandle>,
     internal_workers: BTreeMap<String, InternalWorkerActivity>,
@@ -2958,10 +3034,26 @@ impl WorkerRecord {
             worker_ref: self.worker_ref.clone(),
             worker_id: self.worker_id.clone(),
             request: self.request.clone(),
-            run_generation: self.run_generation,
+            status: self.status,
+            execution: PersistedWorkerExecution {
+                binding: self
+                    .execution_bound
+                    .then_some(PersistedWorkerExecutionBinding {
+                        run_generation: self.run_generation,
+                    }),
+                restore_intent: self.restore_intent,
+            },
             workspace_id: self.workspace_id.clone(),
             working_directory: self.working_directory.clone(),
         }
+    }
+}
+
+fn restore_intent_for_status(status: WorkerStatus) -> WorkerRestoreIntent {
+    if status.is_active() {
+        WorkerRestoreIntent::Automatic
+    } else {
+        WorkerRestoreIntent::Explicit
     }
 }
 
@@ -2976,20 +3068,35 @@ fn worker_status_from_run_state(run_state: WorkerExecutionRunState) -> WorkerSta
 }
 
 fn repository_resource_error(error: BackendResourceError) -> RuntimeError {
-    let category = match error {
-        BackendResourceError::Expired => "expired",
-        BackendResourceError::Unauthorized { .. } => "unauthorized",
-        BackendResourceError::UnsupportedKind => "unsupported_kind",
-        BackendResourceError::MissingResource => "missing_resource",
-        BackendResourceError::Oversized { .. } => "oversized",
-        BackendResourceError::DigestMismatch { .. } => "digest_mismatch",
-        BackendResourceError::ContentTypeMismatch { .. } => "content_type_mismatch",
-        BackendResourceError::InvalidResponse { .. } => "invalid_response",
-        BackendResourceError::Transport { .. } => "transport",
+    let (code, message) = match error {
+        BackendResourceError::Expired => (
+            "repository_access_credential_expired",
+            "Repository access credential lease expired",
+        ),
+        BackendResourceError::Unauthorized { .. } => (
+            "repository_access_credential_unauthorized",
+            "Repository access credential lease was rejected",
+        ),
+        BackendResourceError::MissingResource => (
+            "repository_access_credential_unavailable",
+            "Repository access credential lease is unavailable or already consumed",
+        ),
+        BackendResourceError::Transport { .. } => (
+            "repository_access_provider_unavailable",
+            "Repository access credential provider is unavailable",
+        ),
+        BackendResourceError::UnsupportedKind
+        | BackendResourceError::Oversized { .. }
+        | BackendResourceError::DigestMismatch { .. }
+        | BackendResourceError::ContentTypeMismatch { .. }
+        | BackendResourceError::InvalidResponse { .. } => (
+            "repository_access_credential_invalid",
+            "Repository access credential response is invalid",
+        ),
     };
-    RuntimeError::InvalidRequest(format!(
-        "Backend Repository SSH access resource fetch failed: {category}"
-    ))
+    RuntimeError::WorkingDirectory(
+        crate::working_directory::WorkingDirectoryDiagnostic::rejected(code, message),
+    )
 }
 
 fn durable_create_worker_request(request: &CreateWorkerRequest) -> CreateWorkerRequest {
@@ -3164,7 +3271,6 @@ fn subscription_worker_state(status: WorkerStatus) -> SubscriptionWorkerState {
         WorkerStatus::Running => SubscriptionWorkerState::Running,
         WorkerStatus::Paused => SubscriptionWorkerState::Paused,
         WorkerStatus::Stopped => SubscriptionWorkerState::Stopped,
-        WorkerStatus::Cancelled => SubscriptionWorkerState::Cancelled,
     }
 }
 
@@ -3190,6 +3296,33 @@ mod tests {
     #[cfg(feature = "fs-store")]
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn repository_resource_failures_keep_typed_credential_diagnostics() {
+        let cases = [
+            (
+                BackendResourceError::Expired,
+                "repository_access_credential_expired",
+            ),
+            (
+                BackendResourceError::MissingResource,
+                "repository_access_credential_unavailable",
+            ),
+            (
+                BackendResourceError::Unauthorized {
+                    message: "denied".to_string(),
+                },
+                "repository_access_credential_unauthorized",
+            ),
+        ];
+        for (error, expected_code) in cases {
+            let RuntimeError::WorkingDirectory(diagnostic) = repository_resource_error(error)
+            else {
+                panic!("Repository resource failure lost its typed diagnostic")
+            };
+            assert_eq!(diagnostic.code, expected_code);
+        }
+    }
 
     fn internal_worker_ref(
         session_id: &str,
@@ -4842,15 +4975,22 @@ mod tests {
     }
 
     #[test]
-    fn input_restores_stopped_worker_without_persisted_connection_state() {
+    fn stopped_worker_rejects_input_until_explicitly_restored() {
         let (runtime, backend) = runtime_and_backend();
         let detail = runtime
-            .create_worker(task_request("restore on input"))
+            .create_worker(task_request("restore explicitly"))
             .unwrap();
         runtime
             .send_protocol_method(&detail.worker_ref, Method::Shutdown)
             .unwrap();
 
+        assert!(matches!(
+            runtime.send_input(&detail.worker_ref, WorkerInput::user("do not wake")),
+            Err(RuntimeError::WorkerExecutionUnavailable { .. })
+        ));
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+
+        runtime.restore_worker(&detail.worker_ref).unwrap();
         runtime
             .send_input(&detail.worker_ref, WorkerInput::user("wake up"))
             .unwrap();
@@ -4998,10 +5138,13 @@ mod tests {
     }
 
     #[test]
-    fn stop_and_cancel_workers_update_summary() {
+    fn stop_and_cancel_workers_keep_four_state_summary() {
         let runtime = runtime_with_backend();
         let stopped = runtime.create_worker(task_request("stop me")).unwrap();
         let cancelled = runtime.create_worker(task_request("cancel me")).unwrap();
+        runtime
+            .send_input(&cancelled.worker_ref, WorkerInput::user("start"))
+            .unwrap();
 
         let stop_ack = runtime
             .stop_worker(&stopped.worker_ref, Some("done".to_string()))
@@ -5011,13 +5154,13 @@ mod tests {
         let cancel_ack = runtime
             .cancel_worker(&cancelled.worker_ref, Some("abort".to_string()))
             .unwrap();
-        assert_eq!(cancel_ack.status, WorkerStatus::Cancelled);
+        assert_eq!(cancel_ack.status, WorkerStatus::Idle);
 
         let summary = runtime.summary().unwrap();
         assert_eq!(summary.worker_count, 2);
-        assert_eq!(summary.active_worker_count, 0);
+        assert_eq!(summary.active_worker_count, 1);
         assert_eq!(summary.stopped_worker_count, 1);
-        assert_eq!(summary.cancelled_worker_count, 1);
+        assert!(serde_json::from_value::<WorkerStatus>(serde_json::json!("cancelled")).is_err());
     }
 
     #[test]
@@ -5064,14 +5207,16 @@ mod tests {
         let summary = runtime.summary().unwrap();
         assert_eq!(summary.active_worker_count, 0);
         assert_eq!(summary.stopped_worker_count, 1);
-        assert_eq!(summary.cancelled_worker_count, 0);
     }
 
     #[test]
-    fn cancel_then_stop_preserves_cancelled_terminal_state() {
+    fn cancel_then_stop_transitions_idle_session_to_stopped() {
         let runtime = runtime_with_backend();
         let worker = runtime
-            .create_worker(task_request("stable cancelled"))
+            .create_worker(task_request("cancel then stop"))
+            .unwrap();
+        runtime
+            .send_input(&worker.worker_ref, WorkerInput::user("start"))
             .unwrap();
 
         let cancel_ack = runtime
@@ -5081,17 +5226,16 @@ mod tests {
             .stop_worker(&worker.worker_ref, Some("late stop".to_string()))
             .unwrap();
 
-        assert_eq!(cancel_ack.status, WorkerStatus::Cancelled);
-        assert_eq!(stop_ack.status, WorkerStatus::Cancelled);
+        assert_eq!(cancel_ack.status, WorkerStatus::Idle);
+        assert_eq!(stop_ack.status, WorkerStatus::Stopped);
         assert_eq!(
             runtime.worker_detail(&worker.worker_ref).unwrap().status,
-            WorkerStatus::Cancelled
+            WorkerStatus::Stopped
         );
 
         let summary = runtime.summary().unwrap();
         assert_eq!(summary.active_worker_count, 0);
-        assert_eq!(summary.stopped_worker_count, 0);
-        assert_eq!(summary.cancelled_worker_count, 1);
+        assert_eq!(summary.stopped_worker_count, 1);
     }
 
     #[cfg(feature = "fs-store")]
@@ -5119,239 +5263,38 @@ mod tests {
 
     #[cfg(feature = "fs-store")]
     #[test]
-    fn fs_store_migrates_legacy_numeric_worker_identity_to_workspace_uuid() {
-        let root = fs_store_root("worker-id-v1");
-        let runtime_id = "arcadia";
-        let runtime = Runtime::with_fs_store_and_execution_backend(
-            crate::fs_store::FsRuntimeStoreOptions {
-                root: root.clone(),
-                runtime_id: runtime_id.to_string(),
-                display_name: None,
-            },
-            Arc::new(TestExecutionBackend::default()),
-        )
+    fn fs_store_rejects_schema_older_than_previous_release() {
+        let root = fs_store_root("unsupported-old-schema");
+        let runtime = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
+            root: root.clone(),
+            runtime_id: "test-runtime".to_string(),
+            display_name: None,
+        })
         .unwrap();
-        runtime.store_config_bundle(test_bundle()).unwrap();
-        let worker = runtime
-            .create_worker_scoped(
-                &RuntimeWorkspaceScope::new("workspace-a", "server"),
-                scoped_task_request("legacy", "workspace-a"),
-            )
-            .unwrap();
         drop(runtime);
-
-        let current_dir = root.join("workers").join(worker.worker_id.to_string());
-        let legacy_dir = root.join("workers").join("7");
-        std::fs::rename(&current_dir, &legacy_dir).unwrap();
-        let worker_path = legacy_dir.join("worker.json");
-        let mut worker_json: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&worker_path).unwrap()).unwrap();
-        worker_json["schema_version"] = serde_json::json!(1);
-        worker_json["worker_id"] = serde_json::json!(7);
-        worker_json["worker_ref"]["worker_id"] = serde_json::json!(7);
-        let request = worker_json["request"].as_object_mut().unwrap();
-        request.remove("worker_id");
-        request.remove("create_fingerprint");
-        request.insert("idempotency_key".to_string(), serde_json::Value::Null);
-        request.insert(
-            "idempotency_fingerprint".to_string(),
-            serde_json::Value::Null,
-        );
-        std::fs::write(
-            &worker_path,
-            serde_json::to_vec_pretty(&worker_json).unwrap(),
-        )
-        .unwrap();
-        let legacy_worker_name = "worker-runtime-7";
-        let legacy_manifest = manifest::WorkerManifest::from_toml(&format!(
-            r#"
-                [worker]
-                name = "{legacy_worker_name}"
-
-                [model]
-                scheme = "anthropic"
-                model_id = "test-model"
-
-                [engine]
-
-                [[scope.allow]]
-                target = "/tmp"
-                permission = "write"
-            "#,
-        ))
-        .unwrap();
-        std::fs::write(
-            legacy_dir.join("metadata.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "worker_name": legacy_worker_name,
-                "workspace_id": "workspace-a",
-                "resolved_manifest_snapshot": legacy_manifest
-            }))
-            .unwrap(),
-        )
-        .unwrap();
 
         let runtime_path = root.join("runtime.json");
         let mut runtime_json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&runtime_path).unwrap()).unwrap();
-        runtime_json["schema_version"] = serde_json::json!(1);
-        runtime_json["workers"] = serde_json::json!({"legacy": "ignored"});
-        runtime_json["next_worker_sequence"] = serde_json::json!(8);
-        runtime_json["next_diagnostic_id"] = serde_json::json!(3);
-        runtime_json["diagnostics"] = serde_json::json!([
-            {
-                "id": 1,
-                "severity": "warning",
-                "code": "mapped_legacy_worker",
-                "message": "mapped diagnostic",
-                "worker_ref": {"worker_id": 7}
-            },
-            {
-                "id": 2,
-                "severity": "warning",
-                "code": "deleted_legacy_worker",
-                "message": "unmapped diagnostic",
-                "worker_ref": {"worker_id": 6}
-            }
-        ]);
+        runtime_json["schema_version"] = serde_json::json!(2);
         std::fs::write(
             &runtime_path,
             serde_json::to_vec_pretty(&runtime_json).unwrap(),
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            let run_dir = legacy_dir.join("runs").join("6");
-            std::fs::create_dir_all(&run_dir).unwrap();
-            let socket =
-                std::os::unix::net::UnixListener::bind(run_dir.join("worker.sock")).unwrap();
-            drop(socket);
-        }
 
-        let runtime_options = crate::fs_store::FsRuntimeStoreOptions {
+        let error = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
             root: root.clone(),
-            runtime_id: runtime_id.to_string(),
+            runtime_id: "test-runtime".to_string(),
             display_name: None,
-        };
-        let runtime_before_dry_run = std::fs::read(&runtime_path).unwrap();
-        let plan = crate::fs_store::FsRuntimeStore::migration_plan(&runtime_options).unwrap();
-        assert!(plan.migration_required);
-        assert_eq!(plan.worker_count, 1);
-        assert_eq!(plan.migrated_worker_aggregate_count, 1);
-        assert_eq!(plan.migrated_diagnostic_worker_ref_count, 1);
-        assert_eq!(plan.cleared_diagnostic_worker_ref_count, 1);
-        assert_eq!(plan.mappings[0].legacy_worker_id, 7);
-        #[cfg(unix)]
-        assert_eq!(
-            plan.excluded_ephemeral_paths,
-            vec!["workers/7/runs/6/worker.sock"]
-        );
-        assert_eq!(
-            std::fs::read(&runtime_path).unwrap(),
-            runtime_before_dry_run
-        );
-        assert!(legacy_dir.exists());
-
-        let restored = Runtime::with_fs_store(runtime_options.clone()).unwrap();
-        let expected = WorkerId::from_legacy_binding("workspace-a", runtime_id, 7);
-        let detail = restored.worker_detail(&WorkerRef::new(expected)).unwrap();
-        assert_eq!(detail.worker_id, expected);
-        assert_eq!(detail.worker_ref.worker_id, expected);
-        let expected_worker_dir = root.join("workers").join(expected.to_string());
-        assert!(expected_worker_dir.exists());
-        #[cfg(unix)]
-        assert!(!expected_worker_dir.join("runs/6/worker.sock").exists());
-        assert!(!legacy_dir.exists());
-        let migrated_runtime: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&runtime_path).unwrap()).unwrap();
-        assert_eq!(migrated_runtime["schema_version"], serde_json::json!(3));
-        assert!(migrated_runtime.get("workers").is_none());
-        assert!(migrated_runtime.get("next_worker_sequence").is_none());
-        assert_eq!(
-            migrated_runtime["diagnostics"][0]["worker_ref"]["worker_id"],
-            serde_json::json!(expected.to_string())
-        );
+        })
+        .unwrap_err();
         assert!(
-            migrated_runtime["diagnostics"][1]
-                .get("worker_ref")
-                .is_none()
-        );
-        let diagnostics = restored.diagnostics().unwrap();
-        assert_eq!(
-            diagnostics
-                .iter()
-                .find(|diagnostic| diagnostic.code == "mapped_legacy_worker")
-                .and_then(|diagnostic| diagnostic.worker_ref.as_ref()),
-            Some(&WorkerRef::new(expected))
-        );
-        assert!(
-            diagnostics
-                .iter()
-                .find(|diagnostic| diagnostic.code == "deleted_legacy_worker")
-                .is_some_and(|diagnostic| diagnostic.worker_ref.is_none())
-        );
-        let metadata_path = expected_worker_dir.join("metadata.json");
-        let mut migrated_metadata: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
-        let expected_worker_name = format!("worker-runtime-{expected}");
-        assert_eq!(
-            migrated_metadata["worker_name"],
-            serde_json::json!(expected_worker_name)
-        );
-        assert_eq!(
-            migrated_metadata["resolved_manifest_snapshot"]["worker"]["name"],
-            serde_json::json!(expected_worker_name)
+            error
+                .to_string()
+                .contains("unsupported Runtime store schema version 2; expected 3 or 4")
         );
 
-        drop(restored);
-
-        let mut schema_v2_runtime: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&runtime_path).unwrap()).unwrap();
-        schema_v2_runtime["schema_version"] = serde_json::json!(2);
-        std::fs::write(
-            &runtime_path,
-            serde_json::to_vec_pretty(&schema_v2_runtime).unwrap(),
-        )
-        .unwrap();
-        let migrated_worker_path = expected_worker_dir.join("worker.json");
-        let mut schema_v2_worker: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&migrated_worker_path).unwrap()).unwrap();
-        schema_v2_worker["schema_version"] = serde_json::json!(2);
-        std::fs::write(
-            &migrated_worker_path,
-            serde_json::to_vec_pretty(&schema_v2_worker).unwrap(),
-        )
-        .unwrap();
-        migrated_metadata["worker_name"] = serde_json::json!(legacy_worker_name);
-        migrated_metadata["resolved_manifest_snapshot"]["worker"]["name"] =
-            serde_json::json!(legacy_worker_name);
-        std::fs::write(
-            &metadata_path,
-            serde_json::to_vec_pretty(&migrated_metadata).unwrap(),
-        )
-        .unwrap();
-
-        let recovery_plan =
-            crate::fs_store::FsRuntimeStore::migration_plan(&runtime_options).unwrap();
-        assert_eq!(recovery_plan.current_schema_version, 2);
-        assert_eq!(recovery_plan.target_schema_version, 3);
-        assert!(recovery_plan.migration_required);
-        assert_eq!(recovery_plan.worker_count, 1);
-        assert_eq!(recovery_plan.migrated_worker_aggregate_count, 1);
-        assert!(recovery_plan.mappings.is_empty());
-
-        let recovered = Runtime::with_fs_store(runtime_options).unwrap();
-        let recovered_metadata: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(metadata_path).unwrap()).unwrap();
-        assert_eq!(
-            recovered_metadata["worker_name"],
-            serde_json::json!(expected_worker_name)
-        );
-        assert_eq!(
-            recovered_metadata["resolved_manifest_snapshot"]["worker"]["name"],
-            serde_json::json!(expected_worker_name)
-        );
-        drop(recovered);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -5391,8 +5334,16 @@ mod tests {
         let worker_snapshot: serde_json::Value =
             serde_json::from_slice(&std::fs::read(worker_store_dir.join("worker.json")).unwrap())
                 .unwrap();
-        assert!(worker_snapshot.get("status").is_none());
-        assert!(worker_snapshot.get("execution").is_none());
+        assert_eq!(worker_snapshot["schema_version"], serde_json::json!(4));
+        assert_eq!(worker_snapshot["status"], serde_json::json!("stopped"));
+        assert_eq!(
+            worker_snapshot["execution"]["binding"]["run_generation"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            worker_snapshot["execution"]["restore_intent"],
+            serde_json::json!("explicit")
+        );
         assert!(!root.join("events.jsonl").exists());
         std::fs::write(
             worker_store_dir.join("observations.jsonl"),
@@ -5549,8 +5500,8 @@ mod tests {
             display_name: None,
         })
         .unwrap();
-        let stopped_worker = backendless.worker_detail(&worker.worker_ref).unwrap();
-        assert_eq!(stopped_worker.status, WorkerStatus::Stopped);
+        let persisted_worker = backendless.worker_detail(&worker.worker_ref).unwrap();
+        assert_eq!(persisted_worker.status, WorkerStatus::Idle);
         drop(backendless);
 
         let restoring_backend = Arc::new(TestExecutionBackend::default());
@@ -5570,6 +5521,272 @@ mod tests {
         restored
             .send_input(&worker.worker_ref, WorkerInput::user("after restart"))
             .unwrap();
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn fs_store_automatically_restores_every_active_lifecycle_state() {
+        for status in ["idle", "running", "paused"] {
+            let root = fs_store_root(&format!("automatic-{status}"));
+            let options = crate::fs_store::FsRuntimeStoreOptions {
+                root: root.clone(),
+                runtime_id: "test-runtime".to_string(),
+                display_name: None,
+            };
+            let runtime = Runtime::with_fs_store_and_execution_backend(
+                options.clone(),
+                Arc::new(TestExecutionBackend::default()),
+            )
+            .unwrap();
+            runtime.store_config_bundle(test_bundle()).unwrap();
+            let worker = runtime
+                .create_worker(task_request(&format!("restore {status}")))
+                .unwrap();
+            drop(runtime);
+
+            let worker_path = root
+                .join("workers")
+                .join(worker.worker_id.to_string())
+                .join("worker.json");
+            let mut worker_json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&worker_path).unwrap()).unwrap();
+            worker_json["status"] = serde_json::json!(status);
+            std::fs::write(
+                &worker_path,
+                serde_json::to_vec_pretty(&worker_json).unwrap(),
+            )
+            .unwrap();
+
+            let backend = Arc::new(TestExecutionBackend::default());
+            let restored =
+                Runtime::with_fs_store_and_execution_backend(options, backend.clone()).unwrap();
+            assert_eq!(*backend.restore_count.lock().unwrap(), 1, "status={status}");
+            assert_eq!(
+                restored.worker_detail(&worker.worker_ref).unwrap().status,
+                WorkerStatus::Idle,
+                "status={status}"
+            );
+
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn fs_store_current_schema_requires_lifecycle_authority() {
+        let root = fs_store_root("current-schema-requires-lifecycle");
+        let options = crate::fs_store::FsRuntimeStoreOptions {
+            root: root.clone(),
+            runtime_id: "test-runtime".to_string(),
+            display_name: None,
+        };
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            options.clone(),
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("missing lifecycle authority"))
+            .unwrap();
+        drop(runtime);
+
+        let worker_path = root
+            .join("workers")
+            .join(worker.worker_id.to_string())
+            .join("worker.json");
+        let mut worker_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&worker_path).unwrap()).unwrap();
+        worker_json.as_object_mut().unwrap().remove("status");
+        std::fs::write(
+            &worker_path,
+            serde_json::to_vec_pretty(&worker_json).unwrap(),
+        )
+        .unwrap();
+
+        let restored = Runtime::with_fs_store_and_execution_backend(
+            options,
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        assert!(restored.list_workers().unwrap().is_empty());
+        assert!(
+            restored
+                .diagnostics()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "worker_snapshot_ignored")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn fs_store_shutdown_preserves_active_worker_restore_intent() {
+        let root = fs_store_root("shutdown-preserves-worker");
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions {
+                root: root.clone(),
+                runtime_id: "test-runtime".to_string(),
+                display_name: None,
+            },
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("preserve active worker"))
+            .unwrap();
+
+        runtime.stop_runtime().unwrap();
+
+        let snapshot: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                root.join("workers")
+                    .join(worker.worker_id.to_string())
+                    .join("worker.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot["status"], serde_json::json!("idle"));
+        assert_eq!(
+            snapshot["execution"]["restore_intent"],
+            serde_json::json!("automatic")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn fs_store_stopped_worker_requires_explicit_restore() {
+        let root = fs_store_root("stopped-explicit-restore");
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions {
+                root: root.clone(),
+                runtime_id: "test-runtime".to_string(),
+                display_name: None,
+            },
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("explicit restore only"))
+            .unwrap();
+        runtime
+            .stop_worker(&worker.worker_ref, Some("operator stop".to_string()))
+            .unwrap();
+        drop(runtime);
+
+        let backend = Arc::new(TestExecutionBackend::default());
+        let restored = Runtime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions {
+                root: root.clone(),
+                runtime_id: "test-runtime".to_string(),
+                display_name: None,
+            },
+            backend.clone(),
+        )
+        .unwrap();
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+        assert_eq!(
+            restored.worker_detail(&worker.worker_ref).unwrap().status,
+            WorkerStatus::Stopped
+        );
+        assert!(matches!(
+            restored.send_input(&worker.worker_ref, WorkerInput::user("implicit restore")),
+            Err(RuntimeError::WorkerExecutionUnavailable { .. })
+        ));
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+
+        restored.restore_worker(&worker.worker_ref).unwrap();
+        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
+        assert_eq!(
+            restored.worker_detail(&worker.worker_ref).unwrap().status,
+            WorkerStatus::Idle
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn fs_store_migrates_schema_v3_workers_to_stopped_explicit_restore() {
+        let root = fs_store_root("schema-v3-restore-intent");
+        let options = crate::fs_store::FsRuntimeStoreOptions {
+            root: root.clone(),
+            runtime_id: "test-runtime".to_string(),
+            display_name: None,
+        };
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            options.clone(),
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("schema v3 worker"))
+            .unwrap();
+        drop(runtime);
+
+        let runtime_path = root.join("runtime.json");
+        let worker_path = root
+            .join("workers")
+            .join(worker.worker_id.to_string())
+            .join("worker.json");
+        let mut runtime_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&runtime_path).unwrap()).unwrap();
+        runtime_json["schema_version"] = serde_json::json!(3);
+        std::fs::write(
+            &runtime_path,
+            serde_json::to_vec_pretty(&runtime_json).unwrap(),
+        )
+        .unwrap();
+        let mut worker_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&worker_path).unwrap()).unwrap();
+        worker_json["schema_version"] = serde_json::json!(3);
+        worker_json.as_object_mut().unwrap().remove("status");
+        worker_json.as_object_mut().unwrap().remove("execution");
+        worker_json["run_generation"] = serde_json::json!(7);
+        std::fs::write(
+            &worker_path,
+            serde_json::to_vec_pretty(&worker_json).unwrap(),
+        )
+        .unwrap();
+
+        let backend = Arc::new(TestExecutionBackend::default());
+        let migrated =
+            Runtime::with_fs_store_and_execution_backend(options, backend.clone()).unwrap();
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+        assert_eq!(
+            migrated.worker_detail(&worker.worker_ref).unwrap().status,
+            WorkerStatus::Stopped
+        );
+        let migrated_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&worker_path).unwrap()).unwrap();
+        assert_eq!(migrated_json["schema_version"], serde_json::json!(4));
+        assert_eq!(migrated_json["status"], serde_json::json!("stopped"));
+        assert_eq!(
+            migrated_json["execution"]["binding"]["run_generation"],
+            serde_json::json!(7)
+        );
+        assert_eq!(
+            migrated_json["execution"]["restore_intent"],
+            serde_json::json!("explicit")
+        );
+        assert!(matches!(
+            migrated.send_input(&worker.worker_ref, WorkerInput::notify("do not restore")),
+            Err(RuntimeError::WorkerExecutionUnavailable { .. })
+        ));
+
+        migrated.restore_worker(&worker.worker_ref).unwrap();
+        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
+        assert_eq!(backend.run_generations.lock().unwrap().as_slice(), &[8]);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -5627,7 +5844,10 @@ mod tests {
                 WorkerInput::user("after failed restore"),
             )
             .unwrap_err();
-        assert!(matches!(err, RuntimeError::WorkerExecutionRejected { .. }));
+        assert!(matches!(
+            err,
+            RuntimeError::WorkerExecutionUnavailable { .. }
+        ));
 
         let _ = std::fs::remove_dir_all(root);
     }
