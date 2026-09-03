@@ -404,6 +404,13 @@ impl Runtime {
         {
             self.resolve_repository_access_resource(ssh).await?;
         }
+        self.observe_repository_ref(request)
+    }
+
+    pub fn observe_repository_ref(
+        &self,
+        request: RepositoryRefObservationRequest,
+    ) -> Result<RepositoryRefObservation, RuntimeError> {
         let backend = {
             let state = self.lock()?;
             state.ensure_running()?;
