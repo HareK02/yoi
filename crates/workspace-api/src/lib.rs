@@ -1291,6 +1291,197 @@ pub struct WorkerRestoreResponse {
     pub result: WorkerRestoreResult,
 }
 
+/// Public Workspace Memory document projection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MemoryDocumentResponse {
+    pub body_md: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub bytes: usize,
+    pub record_source: String,
+}
+
+/// Candidate kinds exposed by the Memory staging resource.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryCandidateKind {
+    Preference,
+    WorkingAssumption,
+    Constraint,
+    Decision,
+    OpenQuestion,
+    Lesson,
+}
+
+/// Typed, bounded provenance classification for public Memory evidence anchors.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryEvidenceOriginKind {
+    HumanInput,
+    WorkerInput,
+    FlowInstruction,
+    BackendInstruction,
+    ModelOutput,
+    ToolOutput,
+    DerivedSummary,
+    LegacyUnknown,
+}
+
+/// Bounded origin metadata copied from one typed Memory evidence anchor.
+///
+/// This is provenance only. It carries no message body, prompt, reasoning,
+/// secret, tool output, or authorization authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
+#[serde(deny_unknown_fields)]
+pub struct MemoryEvidenceOrigin {
+    pub kind: MemoryEvidenceOriginKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_selector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_definition_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional, type = "number | null"))]
+    pub flow_definition_revision: Option<u64>,
+}
+
+/// Record-level source range for one Memory staging candidate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MemorySourceRef {
+    pub segment_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "[number, number]"))]
+    pub range: [u64; 2],
+}
+
+/// Bounded evidence snippet included in one Memory staging record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MemoryStagingEvidence {
+    pub id: String,
+    pub kind: String,
+    #[cfg_attr(feature = "typescript", ts(type = "[number, number] | null"))]
+    pub entry_range: Option<[u64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(
+        feature = "typescript",
+        ts(optional, type = "MemoryEvidenceOrigin | null")
+    )]
+    pub origin: Option<MemoryEvidenceOrigin>,
+    pub excerpt: Option<String>,
+    pub summary: Option<String>,
+}
+
+/// Bounded source anchor included in one Memory staging record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MemorySourceEvidenceRef {
+    pub session_id: Option<String>,
+    pub segment_id: Option<String>,
+    #[cfg_attr(feature = "typescript", ts(type = "[number, number] | null"))]
+    pub entry_range: Option<[u64; 2]>,
+    pub evidence_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(
+        feature = "typescript",
+        ts(optional, type = "MemoryEvidenceOrigin | null")
+    )]
+    pub origin: Option<MemoryEvidenceOrigin>,
+    pub evidence_kind: Option<String>,
+    pub label: Option<String>,
+    pub summary: Option<String>,
+}
+
+/// Public projection of one valid Memory staging record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MemoryStagingRecord {
+    pub schema_version: u32,
+    pub id: String,
+    pub extract_run_id: String,
+    pub source: MemorySourceRef,
+    pub kind: MemoryCandidateKind,
+    pub claim: String,
+    pub why_useful: String,
+    pub staleness: Option<String>,
+    pub evidence: Vec<MemoryStagingEvidence>,
+    pub source_refs: Vec<MemorySourceEvidenceRef>,
+}
+
+/// Public list entry for one valid Memory staging record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MemoryStagingEntry {
+    pub id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub byte_len: u64,
+    pub record: MemoryStagingRecord,
+}
+
+/// Public response returned by the Workspace Memory staging list resource.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MemoryStagingListResponse {
+    pub limit: usize,
+    pub returned_count: usize,
+    pub total_valid_count: usize,
+    pub invalid_count: usize,
+    pub truncated: bool,
+    pub order: String,
+    pub record_authority: String,
+    pub items: Vec<MemoryStagingEntry>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[cfg(feature = "typescript")]
+pub fn memory_api_typescript() -> String {
+    use ts_rs::TS;
+
+    let config = ts_rs::Config::default();
+    let declarations = [
+        DiagnosticSeverity::decl(&config),
+        Diagnostic::decl(&config),
+        MemoryDocumentResponse::decl(&config),
+        MemoryCandidateKind::decl(&config),
+        MemoryEvidenceOriginKind::decl(&config),
+        MemoryEvidenceOrigin::decl(&config),
+        MemorySourceRef::decl(&config),
+        MemoryStagingEvidence::decl(&config),
+        MemorySourceEvidenceRef::decl(&config),
+        MemoryStagingRecord::decl(&config),
+        MemoryStagingEntry::decl(&config),
+        MemoryStagingListResponse::decl(&config),
+    ];
+
+    format!(
+        "// Generated from workspace-api. Do not edit by hand.\n// Regenerate: cargo run -q -p workspace-api --features typescript --example generate_memory_api_types > web/workspace/src/lib/generated/memory-api.ts\n\n{}\n",
+        declarations
+            .into_iter()
+            .map(|declaration| format!("export {declaration}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    )
+}
+
 /// Workspace-owned Memory settings returned by the shared Server API.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -1604,6 +1795,36 @@ mod worker_launch_typescript_tests {
 }
 
 #[cfg(all(test, feature = "typescript"))]
+mod memory_typescript_tests {
+    #[test]
+    fn generated_memory_api_contract_is_current() {
+        let expected = super::memory_api_typescript();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/workspace/src/lib/generated/memory-api.ts");
+        let actual = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        assert_eq!(
+            normalize(&actual),
+            normalize(&expected),
+            "regenerate Memory API TypeScript types with `cargo run -q -p workspace-api --features typescript --example generate_memory_api_types > web/workspace/src/lib/generated/memory-api.ts` and format the generated file",
+        );
+    }
+
+    fn normalize(value: &str) -> String {
+        value
+            .chars()
+            .filter_map(|character| match character {
+                character if character.is_whitespace() => None,
+                ',' => Some(';'),
+                character => Some(character),
+            })
+            .collect::<String>()
+            .replace("=|", "=")
+            .replace(";}", "}")
+    }
+}
+
+#[cfg(all(test, feature = "typescript"))]
 mod workdir_typescript_tests {
     #[test]
     fn generated_workdir_api_contract_is_current() {
@@ -1635,6 +1856,52 @@ mod workdir_typescript_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_evidence_origins_round_trip_as_typed_provenance() {
+        let kinds = [
+            MemoryEvidenceOriginKind::HumanInput,
+            MemoryEvidenceOriginKind::WorkerInput,
+            MemoryEvidenceOriginKind::FlowInstruction,
+            MemoryEvidenceOriginKind::BackendInstruction,
+            MemoryEvidenceOriginKind::ModelOutput,
+            MemoryEvidenceOriginKind::ToolOutput,
+            MemoryEvidenceOriginKind::DerivedSummary,
+            MemoryEvidenceOriginKind::LegacyUnknown,
+        ];
+        for kind in kinds {
+            let origin = MemoryEvidenceOrigin {
+                kind,
+                account_id: Some("account-1".to_string()),
+                workspace_id: Some("workspace-1".to_string()),
+                runtime_id: Some("runtime-1".to_string()),
+                worker_id: Some("worker-1".to_string()),
+                flow_selector: Some("builtin:coder-review".to_string()),
+                flow_definition_id: Some("flow-1".to_string()),
+                flow_definition_revision: Some(7),
+            };
+            let encoded = serde_json::to_value(&origin).unwrap();
+            let decoded: MemoryEvidenceOrigin = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, origin);
+        }
+    }
+
+    #[test]
+    fn memory_evidence_origin_rejects_unknown_kind_and_fields() {
+        assert!(
+            serde_json::from_value::<MemoryEvidenceOrigin>(
+                serde_json::json!({"kind": "future_origin"})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<MemoryEvidenceOrigin>(serde_json::json!({
+                "kind": "human_input",
+                "future_field": "not current schema"
+            }))
+            .is_err()
+        );
+    }
 
     fn worker_launch_summary() -> WorkerLaunchWorkerSummary {
         WorkerLaunchWorkerSummary {

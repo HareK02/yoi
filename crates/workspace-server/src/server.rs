@@ -62,10 +62,11 @@ use workspace_api::{
     CreateRepositorySshCredentialRequest, CreateWorkspaceRepositoryRequest,
     CreateWorkspaceRepositoryResponse, CreateWorkspaceWorkerRequest,
     CreateWorkspaceWorkerTicketAssignmentRequest, DeleteRepositorySshCredentialRequest,
-    DeleteRepositorySshHostTrustRequest, ObjectiveCreateRequest, ObjectiveEditRequest,
-    ObjectiveLinkTicketRequest, ObjectiveStateRequest, ProfileSettingsResponse,
-    PutRepositorySshHostTrustRequest, RepositoryAccessProjection, RepositoryDetailResponse,
-    RepositoryListResponse, RepositoryLogResponse, RepositorySshCredential, RepositorySshHostTrust,
+    DeleteRepositorySshHostTrustRequest, MemoryDocumentResponse, MemoryStagingListResponse,
+    ObjectiveCreateRequest, ObjectiveEditRequest, ObjectiveLinkTicketRequest,
+    ObjectiveStateRequest, ProfileSettingsResponse, PutRepositorySshHostTrustRequest,
+    RepositoryAccessProjection, RepositoryDetailResponse, RepositoryListResponse,
+    RepositoryLogResponse, RepositorySshCredential, RepositorySshHostTrust,
     RotateRepositorySshCredentialRequest, RuntimeConnectionTestResponse, RuntimeManagementSummary,
     TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
     UpdateWorkspaceMetadataRequest, WorkerLaunchOptionsResponse, WorkerLaunchProfileCandidate,
@@ -113,8 +114,7 @@ use crate::hosts::{
 use crate::identity::WorkspaceIdentity;
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
 use crate::memory_staging::{
-    MemoryStagingListResponse, list_memory_staging_from_authority,
-    memory_staging_backlog_from_authority,
+    list_memory_staging_from_authority, memory_staging_backlog_from_authority,
 };
 use crate::observation::{
     BackendObservationProxy, ObservationProxyError, RuntimeObservationClient,
@@ -7538,15 +7538,6 @@ fn find_workspace_orchestrator(api: &WorkspaceApi) -> Option<WorkerSummary> {
         }
     }
     None
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct MemoryDocumentResponse {
-    body_md: String,
-    created_at: String,
-    updated_at: String,
-    bytes: usize,
-    record_source: String,
 }
 
 async fn scoped_get_memory_document(
@@ -25981,6 +25972,8 @@ mod tests {
 
         let memory_document =
             get_json(app.clone(), &format!("/api/w/{TEST_WORKSPACE_ID}/memory")).await;
+        let _: workspace_api::MemoryDocumentResponse =
+            serde_json::from_value(memory_document.clone()).unwrap();
         assert_eq!(memory_document["created_at"], "2026-01-01T00:00:00Z");
         assert_eq!(memory_document["updated_at"], "2026-01-02T00:00:00Z");
         assert_eq!(memory_document["bytes"], 63);
@@ -25997,6 +25990,8 @@ mod tests {
             &format!("/api/w/{TEST_WORKSPACE_ID}/memory/staging?limit=10"),
         )
         .await;
+        let _: workspace_api::MemoryStagingListResponse =
+            serde_json::from_value(memory_staging.clone()).unwrap();
         assert_eq!(
             memory_staging["record_authority"],
             "sqlite_workspace_authority.memory_staging"
