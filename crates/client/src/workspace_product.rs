@@ -10,10 +10,10 @@ use ticket::{
 };
 use workspace_api::{
     BrowserCreateWorkerResponse, BrowserWorkspaceOrchestratorResponse,
-    CreateWorkspaceWorkerRequest, ListResponse, ObjectiveCreateRequest, ObjectiveDetail,
-    ObjectiveEditRequest, ObjectiveLinkTicketRequest, ObjectiveStateRequest, ObjectiveSummary,
-    TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
-    WorkerLaunchOptionsResponse,
+    CreateWorkspaceWorkerRequest, ListResponse, MemoryDocumentResponse, MemoryStagingListResponse,
+    ObjectiveCreateRequest, ObjectiveDetail, ObjectiveEditRequest, ObjectiveLinkTicketRequest,
+    ObjectiveStateRequest, ObjectiveSummary, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
+    TICKET_RELATIONS_QUERY_PATH, WorkerLaunchOptionsResponse,
 };
 
 use crate::{BackendApiClient, BackendWorkspaceClientError};
@@ -239,6 +239,17 @@ impl BackendWorkspaceProductClient {
             ),
             None,
         )
+    }
+
+    pub fn memory_document(&self) -> Result<MemoryDocumentResponse, BackendWorkspaceClientError> {
+        self.get_json("/memory")
+    }
+
+    pub fn list_memory_staging(
+        &self,
+        limit: usize,
+    ) -> Result<MemoryStagingListResponse, BackendWorkspaceClientError> {
+        self.get_json(&format!("/memory/staging?limit={limit}"))
     }
 
     pub fn launch_ticket_intake(
@@ -666,6 +677,82 @@ mod tests {
             }
         });
         (format!("http://{address}"), receiver, handle)
+    }
+
+    #[test]
+    fn memory_document_uses_shared_workspace_scoped_response() {
+        let body = r##"{"body_md":"# Memory\\n","created_at":"2026-09-01T00:00:00Z","updated_at":"2026-09-02T00:00:00Z","bytes":10,"record_source":"workspace-sqlite"}"##;
+        let (base_url, request, handle) = one_response_server("200 OK", body);
+        let client = BackendWorkspaceProductClient::new_with_access_token(
+            base_url,
+            "workspace-a",
+            "test-backend-token",
+        )
+        .unwrap();
+
+        let response = client.memory_document().unwrap();
+
+        assert_eq!(response.record_source, "workspace-sqlite");
+        assert!(
+            request
+                .recv()
+                .unwrap()
+                .starts_with("GET /api/w/workspace-a/memory ")
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn memory_staging_uses_shared_dto_with_typed_origin() {
+        let body = r#"{"limit":10,"returned_count":1,"total_valid_count":1,"invalid_count":0,"truncated":false,"order":"imported_at_desc_candidate_id_asc","record_authority":"sqlite_workspace_authority.memory_staging","items":[{"id":"candidate-1","byte_len":128,"record":{"schema_version":1,"id":"candidate-1","extract_run_id":"run-1","source":{"segment_id":"segment-1","range":[1,2]},"kind":"decision","claim":"Keep typed provenance.","why_useful":"Prevents trust loss.","staleness":null,"evidence":[],"source_refs":[{"session_id":"session-1","segment_id":"segment-1","entry_range":[1,2],"evidence_id":"evidence-1","origin":{"kind":"worker_input","workspace_id":"workspace-a","runtime_id":"runtime-1","worker_id":"worker-1"},"evidence_kind":"worker_session_entry","label":null,"summary":null}]}}],"diagnostics":[]}"#;
+        let (base_url, request, handle) = one_response_server("200 OK", body);
+        let client = BackendWorkspaceProductClient::new_with_access_token(
+            base_url,
+            "workspace-a",
+            "test-backend-token",
+        )
+        .unwrap();
+
+        let response = client.list_memory_staging(10).unwrap();
+
+        assert_eq!(
+            response.items[0].record.source_refs[0]
+                .origin
+                .as_ref()
+                .unwrap()
+                .kind,
+            workspace_api::MemoryEvidenceOriginKind::WorkerInput
+        );
+        assert!(
+            request
+                .recv()
+                .unwrap()
+                .starts_with("GET /api/w/workspace-a/memory/staging?limit=10 ")
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn memory_staging_rejects_unknown_origin_kind() {
+        let body = r#"{"limit":10,"returned_count":1,"total_valid_count":1,"invalid_count":0,"truncated":false,"order":"order","record_authority":"authority","items":[{"id":"candidate-1","byte_len":1,"record":{"schema_version":1,"id":"candidate-1","extract_run_id":"run-1","source":{"segment_id":"segment-1","range":[1,2]},"kind":"decision","claim":"claim","why_useful":"useful","staleness":null,"evidence":[],"source_refs":[{"session_id":null,"segment_id":null,"entry_range":null,"evidence_id":null,"origin":{"kind":"future_origin"},"evidence_kind":null,"label":null,"summary":null}]}}],"diagnostics":[]}"#;
+        let (base_url, request, handle) = one_response_server("200 OK", body);
+        let client = BackendWorkspaceProductClient::new_with_access_token(
+            base_url,
+            "workspace-a",
+            "test-backend-token",
+        )
+        .unwrap();
+
+        let error = client.list_memory_staging(10).unwrap_err();
+
+        assert!(matches!(error, BackendWorkspaceClientError::Http(_)));
+        assert!(
+            request
+                .recv()
+                .unwrap()
+                .starts_with("GET /api/w/workspace-a/memory/staging?limit=10 ")
+        );
+        handle.join().unwrap();
     }
 
     #[test]

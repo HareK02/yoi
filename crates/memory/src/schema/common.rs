@@ -22,6 +22,7 @@ impl<'de> Deserialize<'de> for SourceRef {
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct RawSourceRef {
             #[serde(default)]
             segment_id: Option<String>,
@@ -83,6 +84,7 @@ pub enum EvidenceOriginKind {
 /// Bounded origin snapshot attached to extraction evidence. This is audit
 /// metadata only and cannot authorize Workspace operations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceOrigin {
     pub kind: EvidenceOriginKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +109,7 @@ pub struct EvidenceOrigin {
 /// ranges, and short labels/summaries. It must not carry raw message bodies or
 /// full tool result content.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SourceEvidenceRef {
     /// Stable session id when the anchor crosses or disambiguates segments.
     #[serde(default, skip_serializing_if = "Option::is_none")]

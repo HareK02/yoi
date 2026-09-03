@@ -6710,6 +6710,7 @@ dependencies = [
  "serde",
  "serde_json",
  "ts-rs",
+ "webauthn-rs-proto",
 ]
 
 [[package]]
