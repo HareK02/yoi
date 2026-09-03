@@ -135,7 +135,10 @@ Deno.test("Worker create request parser requires the complete shared request", (
     display_name: "Worker A",
     profile: "builtin:coder",
     ticket_assignment: null,
-    initial_submit: [{ kind: "text", content: "Implement T-565." }],
+    initial_submit: [
+      { kind: "text", content: "Implement T-565." },
+      { kind: "flow", selector: "builtin:coder-review" },
+    ],
     working_directory: {
       working_directory_id: "workdir-a",
       relative_cwd: null,
@@ -158,5 +161,23 @@ Deno.test("Worker create request parser requires the complete shared request", (
     () => parseCreateWorkspaceWorkerRequest(missingInitialSubmit),
     Error,
     "initial_submit",
+  );
+  assertThrows(
+    () =>
+      parseCreateWorkspaceWorkerRequest({
+        ...request,
+        initial_submit: [{ kind: "flow" }],
+      }),
+    Error,
+    "selector",
+  );
+  assertThrows(
+    () =>
+      parseCreateWorkspaceWorkerRequest({
+        ...request,
+        initial_submit: [{ kind: "newer_client_segment" }],
+      }),
+    Error,
+    "kind is invalid",
   );
 });

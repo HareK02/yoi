@@ -489,14 +489,144 @@ function ticketAssignment(
   };
 }
 
+function unsignedInteger(value: unknown, label: string): number {
+  const parsed = number(value, label);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`${label} must be a non-negative safe integer`);
+  }
+  return parsed;
+}
+
+function pasteArtifact(
+  value: unknown,
+  label: string,
+): Extract<Segment, { kind: "paste_artifact" }>["artifact"] {
+  const item = record(value, label);
+  exact(
+    item,
+    [
+      "artifact_id",
+      "created_at_ms",
+      "media_type",
+      "availability",
+      "byte_len",
+      "char_count",
+      "line_count",
+      "sha256",
+      "source_entry_id",
+    ],
+    label,
+  );
+  const mediaType = string(item.media_type, `${label}.media_type`);
+  if (mediaType !== "text_plain_utf8") {
+    throw new Error(`${label}.media_type is invalid`);
+  }
+  const availability = string(item.availability, `${label}.availability`);
+  if (
+    !["available", "unavailable", "integrity_failed"].includes(availability)
+  ) {
+    throw new Error(`${label}.availability is invalid`);
+  }
+  return {
+    artifact_id: string(item.artifact_id, `${label}.artifact_id`),
+    created_at_ms: unsignedInteger(
+      item.created_at_ms,
+      `${label}.created_at_ms`,
+    ),
+    media_type: mediaType,
+    availability: availability as Extract<Segment, { kind: "paste_artifact" }>[
+      "artifact"
+    ]["availability"],
+    byte_len: unsignedInteger(item.byte_len, `${label}.byte_len`),
+    char_count: unsignedInteger(item.char_count, `${label}.char_count`),
+    line_count: unsignedInteger(item.line_count, `${label}.line_count`),
+    sha256: string(item.sha256, `${label}.sha256`),
+    source_entry_id: string(item.source_entry_id, `${label}.source_entry_id`),
+  };
+}
+
+function uploadedFile(
+  value: unknown,
+  label: string,
+): Extract<Segment, { kind: "uploaded_file" }>["file"] {
+  const item = record(value, label);
+  exact(
+    item,
+    [
+      "artifact_id",
+      "file_name",
+      "media_type",
+      "created_at_ms",
+      "availability",
+      "byte_len",
+      "sha256",
+      "source_entry_id",
+    ],
+    label,
+  );
+  const availability = string(item.availability, `${label}.availability`);
+  if (
+    !["available", "unavailable", "integrity_failed"].includes(availability)
+  ) {
+    throw new Error(`${label}.availability is invalid`);
+  }
+  return {
+    artifact_id: string(item.artifact_id, `${label}.artifact_id`),
+    file_name: string(item.file_name, `${label}.file_name`),
+    media_type: string(item.media_type, `${label}.media_type`),
+    created_at_ms: unsignedInteger(
+      item.created_at_ms,
+      `${label}.created_at_ms`,
+    ),
+    availability: availability as Extract<Segment, { kind: "uploaded_file" }>[
+      "file"
+    ]["availability"],
+    byte_len: unsignedInteger(item.byte_len, `${label}.byte_len`),
+    sha256: string(item.sha256, `${label}.sha256`),
+    source_entry_id: optional(
+      item.source_entry_id,
+      `${label}.source_entry_id`,
+      string,
+    ),
+  };
+}
+
 function segment(value: unknown, label: string): Segment {
   const item = record(value, label);
-  const kind = string(item.kind, `${label}.kind`);
-  if (kind === "text") {
-    exact(item, ["kind", "content"], label);
-    return { kind, content: string(item.content, `${label}.content`) };
+  const kind = string(item.kind, `${label}.kind`) as Segment["kind"];
+  switch (kind) {
+    case "text":
+      exact(item, ["kind", "content"], label);
+      return { kind, content: string(item.content, `${label}.content`) };
+    case "paste":
+      exact(item, ["kind", "id", "chars", "lines", "content"], label);
+      return {
+        kind,
+        id: unsignedInteger(item.id, `${label}.id`),
+        chars: unsignedInteger(item.chars, `${label}.chars`),
+        lines: unsignedInteger(item.lines, `${label}.lines`),
+        content: string(item.content, `${label}.content`),
+      };
+    case "paste_artifact":
+      exact(item, ["kind", "artifact"], label);
+      return {
+        kind,
+        artifact: pasteArtifact(item.artifact, `${label}.artifact`),
+      };
+    case "uploaded_file":
+      exact(item, ["kind", "file"], label);
+      return { kind, file: uploadedFile(item.file, `${label}.file`) };
+    case "file_ref":
+      exact(item, ["kind", "path"], label);
+      return { kind, path: string(item.path, `${label}.path`) };
+    case "flow":
+      exact(item, ["kind", "selector"], label);
+      return { kind, selector: string(item.selector, `${label}.selector`) };
+    case "unknown":
+      throw new Error(`${label}.kind is not supported by Worker creation`);
   }
-  throw new Error(`${label}.kind is not supported by Worker creation`);
+  const exhaustive: never = kind;
+  throw new Error(`${label}.kind is invalid: ${exhaustive}`);
 }
 
 export function parseCreateWorkspaceWorkerRequest(
