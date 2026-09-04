@@ -7,7 +7,7 @@ use crate::{Result, TicketError, sqlite_err};
 
 const MIGRATION_TABLE: &str = "ticket_schema_migrations";
 const MAX_SCHEMA_DIAGNOSTICS: usize = 32;
-pub const LATEST_SQLITE_TICKET_SCHEMA_VERSION: i64 = 6;
+const LATEST_SQLITE_TICKET_SCHEMA_VERSION: i64 = 6;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -16,38 +16,11 @@ struct Migration {
     apply: fn(&Connection) -> Result<()>,
 }
 
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        name: "create_typed_ticket_tables",
-        apply: create_typed_ticket_tables,
-    },
-    Migration {
-        version: 2,
-        name: "add_ticket_repository_target",
-        apply: add_ticket_repository_target,
-    },
-    Migration {
-        version: 3,
-        name: "convert_legacy_reviews_to_comments",
-        apply: retire_legacy_ticket_review_events,
-    },
-    Migration {
-        version: 4,
-        name: "add_ticket_query_indexes",
-        apply: add_ticket_query_indexes,
-    },
-    Migration {
-        version: 5,
-        name: "add_workspace_human_keys",
-        apply: add_workspace_human_keys,
-    },
-    Migration {
-        version: 6,
-        name: "rename_workspace_resource_keys",
-        apply: rename_workspace_resource_keys,
-    },
-];
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: LATEST_SQLITE_TICKET_SCHEMA_VERSION,
+    name: "ticket schema baseline",
+    apply: create_latest_ticket_schema,
+}];
 
 #[derive(Clone, Copy)]
 struct ExpectedColumn {
@@ -258,30 +231,12 @@ const fn column(
     }
 }
 
-/// Applies the Ticket crate's SQLite migrations and verifies the resulting schema.
+/// Creates and verifies the Ticket crate's latest SQLite schema.
 ///
 /// This is a startup/standalone-open operation. Normal Ticket request handling must
 /// use [`verify_sqlite_ticket_schema`] instead, so request paths never acquire DDL
 /// authority.
 pub fn migrate_sqlite_ticket_schema(connection: &Connection) -> Result<()> {
-    migrate_sqlite_ticket_schema_through(connection, LATEST_SQLITE_TICKET_SCHEMA_VERSION)
-}
-
-/// Applies Ticket migrations only through `target_version`.
-///
-/// This exists for the Workspace Server's ordered migration bridge: older Server
-/// migrations must materialize the Ticket schema shape they were written against
-/// before the current Ticket migration is applied at the matching Server version.
-#[doc(hidden)]
-pub fn migrate_sqlite_ticket_schema_through(
-    connection: &Connection,
-    target_version: i64,
-) -> Result<()> {
-    if !(1..=LATEST_SQLITE_TICKET_SCHEMA_VERSION).contains(&target_version) {
-        return Err(TicketError::Sqlite(format!(
-            "unsupported Ticket schema migration target {target_version}"
-        )));
-    }
     connection
         .busy_timeout(Duration::from_secs(5))
         .map_err(sqlite_err)?;
@@ -302,25 +257,10 @@ pub fn migrate_sqlite_ticket_schema_through(
         verify_table(connection, MIGRATION_TABLE, MIGRATION_COLUMNS, &[], false)?;
 
         let applied = load_applied_migrations(connection)?;
-        validate_applied_migrations(&applied)?;
-
-        if let Some(version) = applied
-            .keys()
-            .copied()
-            .find(|version| *version > target_version)
-        {
-            return Err(TicketError::Sqlite(format!(
-                "Ticket schema version {version} is newer than requested migration target {target_version}"
-            )));
-        }
-
-        for migration in MIGRATIONS
-            .iter()
-            .filter(|migration| migration.version <= target_version)
-        {
-            if applied.contains_key(&migration.version) {
-                continue;
-            }
+        if applied.is_empty() {
+            let migration = MIGRATIONS
+                .first()
+                .ok_or_else(|| TicketError::Sqlite("Ticket migration catalog is empty".into()))?;
             (migration.apply)(connection)?;
             connection
                 .execute(
@@ -333,24 +273,11 @@ pub fn migrate_sqlite_ticket_schema_through(
                     ],
                 )
                 .map_err(sqlite_err)?;
+        } else {
+            validate_applied_migrations(&applied)?;
         }
 
-        if target_version == LATEST_SQLITE_TICKET_SCHEMA_VERSION {
-            verify_sqlite_ticket_schema(connection)
-        } else {
-            let applied = load_applied_migrations(connection)?;
-            let expected = MIGRATIONS
-                .iter()
-                .filter(|migration| migration.version <= target_version)
-                .map(|migration| (migration.version, migration.name.to_string()))
-                .collect::<BTreeMap<_, _>>();
-            if applied != expected {
-                return Err(TicketError::Sqlite(format!(
-                    "Ticket schema migration history does not match target version {target_version}"
-                )));
-            }
-            Ok(())
-        }
+        verify_sqlite_ticket_schema(connection)
     })();
 
     match result {
@@ -360,47 +287,6 @@ pub fn migrate_sqlite_ticket_schema_through(
             Err(error)
         }
     }
-}
-
-/// Applies the resource-key Ticket migration inside a transaction owned by the
-/// Workspace Server. The caller must provide an active transaction; this function
-/// deliberately does not begin or commit one so the Ticket and Server migration
-/// markers can be persisted atomically.
-#[doc(hidden)]
-pub fn migrate_sqlite_ticket_resource_key_schema_in_transaction(
-    connection: &Connection,
-) -> Result<()> {
-    connection
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS ticket_schema_migrations (
-                version INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                applied_at TEXT NOT NULL
-            );",
-        )
-        .map_err(sqlite_err)?;
-    let applied = load_applied_migrations(connection)?;
-    validate_applied_migrations(&applied)?;
-    if applied.contains_key(&LATEST_SQLITE_TICKET_SCHEMA_VERSION) {
-        return verify_sqlite_ticket_schema(connection);
-    }
-    let expected_previous = LATEST_SQLITE_TICKET_SCHEMA_VERSION - 1;
-    if applied.len() != expected_previous as usize || !applied.contains_key(&expected_previous) {
-        return Err(TicketError::Sqlite(format!(
-            "Ticket schema must be at version {expected_previous} before the resource-key migration"
-        )));
-    }
-    let migration = MIGRATIONS
-        .last()
-        .ok_or_else(|| TicketError::Sqlite("Ticket migration catalog is empty".to_string()))?;
-    (migration.apply)(connection)?;
-    connection
-        .execute(
-            "INSERT INTO ticket_schema_migrations (version, name, applied_at) VALUES (?1, ?2, datetime('now'))",
-            params![migration.version, migration.name],
-        )
-        .map_err(sqlite_err)?;
-    verify_sqlite_ticket_schema(connection)
 }
 
 /// Verifies the current Ticket-owned SQLite schema without executing DDL.
@@ -539,238 +425,9 @@ pub fn verify_sqlite_ticket_schema(connection: &Connection) -> Result<()> {
     }
 }
 
-fn create_typed_ticket_tables(connection: &Connection) -> Result<()> {
+fn create_latest_ticket_schema(connection: &Connection) -> Result<()> {
     connection
-        .execute_batch(
-            r#"
-CREATE TABLE IF NOT EXISTS typed_tickets (
-    workspace_id TEXT NOT NULL,
-    ticket_id TEXT NOT NULL,
-    slug TEXT NOT NULL,
-    title TEXT NOT NULL,
-    status TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    priority TEXT NOT NULL,
-    body TEXT NOT NULL,
-    created_at TEXT,
-    updated_at TEXT,
-    assignee TEXT,
-    readiness TEXT,
-    workflow_state TEXT NOT NULL,
-    workflow_state_explicit INTEGER NOT NULL,
-    queued_by TEXT,
-    queued_at TEXT,
-    resolution TEXT,
-    PRIMARY KEY (workspace_id, ticket_id)
-);
-CREATE TABLE IF NOT EXISTS typed_ticket_labels (
-    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, ordinal INTEGER NOT NULL, label TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, ordinal),
-    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS typed_ticket_risk_flags (
-    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, ordinal INTEGER NOT NULL, risk_flag TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, ordinal),
-    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS typed_ticket_raw_frontmatter (
-    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, key),
-    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS typed_ticket_events (
-    workspace_id TEXT NOT NULL,
-    ticket_id TEXT NOT NULL,
-    event_index INTEGER NOT NULL,
-    kind TEXT NOT NULL,
-    author TEXT,
-    at TEXT,
-    status TEXT,
-    from_state TEXT,
-    to_state TEXT,
-    reason TEXT,
-    state_field TEXT,
-    heading TEXT,
-    body TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, event_index),
-    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS typed_ticket_event_references (
-    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, event_index INTEGER NOT NULL, ordinal INTEGER NOT NULL, kind TEXT NOT NULL, target TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, event_index, ordinal),
-    FOREIGN KEY (workspace_id, ticket_id, event_index) REFERENCES typed_ticket_events(workspace_id, ticket_id, event_index) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS typed_ticket_event_attributes (
-    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, event_index INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, event_index, key),
-    FOREIGN KEY (workspace_id, ticket_id, event_index) REFERENCES typed_ticket_events(workspace_id, ticket_id, event_index) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS typed_ticket_relations (
-    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, kind TEXT NOT NULL, target TEXT NOT NULL, note TEXT, author TEXT NOT NULL, at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, kind, target),
-    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS typed_ticket_orchestration_plans (
-    workspace_id TEXT NOT NULL,
-    ticket_id TEXT NOT NULL,
-    record_id TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    related_ticket TEXT,
-    note TEXT,
-    accepted_summary TEXT,
-    accepted_branch TEXT,
-    accepted_worktree TEXT,
-    accepted_role_plan TEXT,
-    author TEXT NOT NULL,
-    at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, record_id),
-    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS typed_ticket_artifacts (
-    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, relative_path TEXT NOT NULL, content BLOB NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, relative_path),
-    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
-);
-"#,
-        )
-        .map_err(sqlite_err)
-}
-
-fn add_ticket_repository_target(connection: &Connection) -> Result<()> {
-    add_column_if_missing(connection, "typed_tickets", "repository_id", "TEXT")?;
-    add_column_if_missing(connection, "typed_tickets", "ref_selector", "TEXT")
-}
-
-fn retire_legacy_ticket_review_events(connection: &Connection) -> Result<()> {
-    // Historical prose remains visible for audit, but it is explicitly converted to a
-    // non-authoritative comment. Approval authority now lives only in Merge Requests.
-    connection
-        .execute_batch(
-            r#"
-        INSERT OR REPLACE INTO typed_ticket_event_attributes
-            (workspace_id, ticket_id, event_index, key, value)
-        SELECT workspace_id, ticket_id, event_index, 'legacy_event_kind', 'review'
-        FROM typed_ticket_events WHERE kind = 'review';
-        UPDATE typed_ticket_events
-        SET kind = 'comment', status = NULL, heading = 'Legacy review (non-authoritative)'
-        WHERE kind = 'review';
-        DELETE FROM typed_ticket_event_attributes
-        WHERE key IN ('result', 'review_result', 'status')
-          AND EXISTS (
-            SELECT 1 FROM typed_ticket_events event
-            WHERE event.workspace_id = typed_ticket_event_attributes.workspace_id
-              AND event.ticket_id = typed_ticket_event_attributes.ticket_id
-              AND event.event_index = typed_ticket_event_attributes.event_index
-              AND event.heading = 'Legacy review (non-authoritative)'
-          );
-        "#,
-        )
-        .map_err(sqlite_err)
-}
-
-fn add_ticket_query_indexes(connection: &Connection) -> Result<()> {
-    connection
-        .execute_batch(
-            r#"
-        CREATE INDEX IF NOT EXISTS typed_tickets_workspace_state_updated
-            ON typed_tickets(workspace_id, workflow_state, updated_at DESC, ticket_id);
-        CREATE INDEX IF NOT EXISTS typed_tickets_workspace_updated
-            ON typed_tickets(workspace_id, updated_at DESC, ticket_id);
-        CREATE INDEX IF NOT EXISTS typed_tickets_workspace_created
-            ON typed_tickets(workspace_id, created_at DESC, ticket_id);
-        CREATE INDEX IF NOT EXISTS typed_tickets_workspace_title
-            ON typed_tickets(workspace_id, title COLLATE NOCASE, ticket_id);
-        CREATE INDEX IF NOT EXISTS typed_ticket_events_workspace_kind_ticket
-            ON typed_ticket_events(workspace_id, kind, ticket_id, event_index);
-        CREATE INDEX IF NOT EXISTS typed_ticket_relations_workspace_source_kind
-            ON typed_ticket_relations(workspace_id, ticket_id, kind, target);
-        CREATE INDEX IF NOT EXISTS typed_ticket_relations_workspace_target_kind
-            ON typed_ticket_relations(workspace_id, target, kind, ticket_id);
-        "#,
-        )
-        .map_err(sqlite_err)
-}
-
-fn add_workspace_human_keys(connection: &Connection) -> Result<()> {
-    connection
-        .execute_batch(
-            r#"
-        CREATE TABLE IF NOT EXISTS workspace_resource_human_keys (
-            workspace_id TEXT NOT NULL,
-            resource_kind TEXT NOT NULL CHECK (resource_kind IN ('ticket', 'objective', 'worker')),
-            resource_id TEXT NOT NULL,
-            sequence INTEGER NOT NULL CHECK (sequence > 0),
-            human_key TEXT NOT NULL,
-            allocated_at TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, resource_kind, resource_id),
-            UNIQUE (workspace_id, resource_kind, sequence),
-            UNIQUE (workspace_id, human_key)
-        );
-        CREATE TABLE IF NOT EXISTS workspace_resource_human_key_counters (
-            workspace_id TEXT NOT NULL,
-            resource_kind TEXT NOT NULL CHECK (resource_kind IN ('ticket', 'objective', 'worker')),
-            next_sequence INTEGER NOT NULL CHECK (next_sequence > 0),
-            PRIMARY KEY (workspace_id, resource_kind)
-        );
-
-        INSERT OR IGNORE INTO workspace_resource_human_keys (
-            workspace_id, resource_kind, resource_id, sequence, human_key, allocated_at
-        )
-        SELECT workspace_id,
-               'ticket',
-               ticket_id,
-               ROW_NUMBER() OVER (
-                   PARTITION BY workspace_id ORDER BY created_at ASC, ticket_id ASC
-               ),
-               'T-' || ROW_NUMBER() OVER (
-                   PARTITION BY workspace_id ORDER BY created_at ASC, ticket_id ASC
-               ),
-               COALESCE(created_at, updated_at)
-        FROM typed_tickets;
-
-        INSERT INTO workspace_resource_human_key_counters (
-            workspace_id, resource_kind, next_sequence
-        )
-        SELECT workspace_id, 'ticket', MAX(sequence) + 1
-        FROM workspace_resource_human_keys
-        WHERE resource_kind = 'ticket'
-        GROUP BY workspace_id
-        ON CONFLICT(workspace_id, resource_kind) DO UPDATE SET
-            next_sequence = MAX(next_sequence, excluded.next_sequence);
-        "#,
-        )
-        .map_err(sqlite_err)
-}
-
-fn rename_workspace_resource_keys(connection: &Connection) -> Result<()> {
-    connection
-        .execute_batch(
-            r#"
-        ALTER TABLE workspace_resource_human_keys RENAME TO workspace_resource_keys;
-        ALTER TABLE workspace_resource_keys RENAME COLUMN human_key TO resource_key;
-        ALTER TABLE workspace_resource_human_key_counters RENAME TO workspace_resource_key_counters;
-        DROP INDEX IF EXISTS idx_workspace_resource_human_keys_reverse;
-        CREATE INDEX idx_workspace_resource_keys_reverse
-            ON workspace_resource_keys(workspace_id, resource_kind, resource_key);
-        "#,
-        )
-        .map_err(sqlite_err)
-}
-
-fn add_column_if_missing(
-    connection: &Connection,
-    table: &str,
-    column: &str,
-    declaration: &str,
-) -> Result<()> {
-    let columns = load_columns(connection, table)?;
-    if columns.iter().any(|found| found.name == column) {
-        return Ok(());
-    }
-    connection
-        .execute_batch(&format!(
-            "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
-        ))
+        .execute_batch(include_str!("latest_schema.sql"))
         .map_err(sqlite_err)
 }
 
@@ -796,33 +453,17 @@ fn load_applied_migrations(connection: &Connection) -> Result<BTreeMap<i64, Stri
 }
 
 fn validate_applied_migrations(applied: &BTreeMap<i64, String>) -> Result<()> {
-    for (&version, name) in applied {
-        let Some(expected) = MIGRATIONS
-            .iter()
-            .find(|migration| migration.version == version)
-        else {
-            return Err(TicketError::Sqlite(format!(
-                "unsupported Ticket schema migration version {version}; latest supported version is {LATEST_SQLITE_TICKET_SCHEMA_VERSION}"
-            )));
-        };
-        if name != expected.name {
-            return Err(TicketError::Sqlite(format!(
-                "Ticket schema migration {version} is named {name:?}, expected {:?}",
-                expected.name
-            )));
-        }
+    let expected = BTreeMap::from([(
+        LATEST_SQLITE_TICKET_SCHEMA_VERSION,
+        MIGRATIONS[0].name.to_string(),
+    )]);
+    if applied == &expected {
+        Ok(())
+    } else {
+        Err(TicketError::Sqlite(format!(
+            "Ticket schema migration history must contain only the canonical version {LATEST_SQLITE_TICKET_SCHEMA_VERSION} baseline marker"
+        )))
     }
-    for migration in MIGRATIONS {
-        if applied.keys().any(|version| *version > migration.version)
-            && !applied.contains_key(&migration.version)
-        {
-            return Err(TicketError::Sqlite(format!(
-                "Ticket schema migration history has a gap at version {}",
-                migration.version
-            )));
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -1189,223 +830,16 @@ mod tests {
         verify_sqlite_ticket_schema(&connection).unwrap();
 
         let versions = load_applied_migrations(&connection).unwrap();
-        assert_eq!(versions.len(), 6);
         assert_eq!(
-            versions.get(&LATEST_SQLITE_TICKET_SCHEMA_VERSION),
-            Some(&"rename_workspace_resource_keys".to_string())
+            versions,
+            BTreeMap::from([(
+                LATEST_SQLITE_TICKET_SCHEMA_VERSION,
+                "ticket schema baseline".to_string(),
+            )])
         );
-    }
-
-    #[test]
-    fn adopts_existing_current_schema_without_losing_data() {
-        let connection = Connection::open_in_memory().unwrap();
-        create_typed_ticket_tables(&connection).unwrap();
-        add_ticket_repository_target(&connection).unwrap();
-        connection
-            .execute(
-                "INSERT INTO typed_tickets (
-                    workspace_id, ticket_id, slug, title, status, kind, priority, body,
-                    workflow_state, workflow_state_explicit, repository_id, ref_selector
-                 ) VALUES ('workspace-1', 'ticket-1', 'ticket-1', 'kept', 'open',
-                    'task', 'medium', 'body', 'ready', 1, 'main', 'develop')",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute_batch(
-                "INSERT INTO typed_ticket_events (
-                    workspace_id, ticket_id, event_index, kind, author, at, heading, body
-                 ) VALUES (
-                    'workspace-1', 'ticket-1', 0, 'comment', 'hare',
-                    '2026-08-10T00:00:00Z', 'Evidence', 'event kept'
-                 );
-                 INSERT INTO typed_ticket_event_references (
-                    workspace_id, ticket_id, event_index, ordinal, kind, target
-                 ) VALUES ('workspace-1', 'ticket-1', 0, 0, 'commit', 'abc123');
-                 INSERT INTO typed_ticket_relations (
-                    workspace_id, ticket_id, kind, target, note, author, at
-                 ) VALUES (
-                    'workspace-1', 'ticket-1', 'related', 'ticket-2', 'relation kept',
-                    'hare', '2026-08-10T00:00:00Z'
-                 );
-                 INSERT INTO typed_ticket_orchestration_plans (
-                    workspace_id, ticket_id, record_id, kind, note, author, at
-                 ) VALUES (
-                    'workspace-1', 'ticket-1', 'plan-1', 'waiting_capacity_note',
-                    'plan kept', 'hare', '2026-08-10T00:00:00Z'
-                 );
-                 INSERT INTO typed_ticket_artifacts (
-                    workspace_id, ticket_id, relative_path, content
-                 ) VALUES ('workspace-1', 'ticket-1', 'evidence.txt', X'6b657074');",
-            )
-            .unwrap();
 
         migrate_sqlite_ticket_schema(&connection).unwrap();
-
-        let row = connection
-            .query_row(
-                "SELECT title, repository_id, ref_selector FROM typed_tickets",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(row, ("kept".into(), "main".into(), "develop".into()));
-        let preserved = connection
-            .query_row(
-                "SELECT
-                    (SELECT COUNT(*) FROM typed_ticket_events),
-                    (SELECT COUNT(*) FROM typed_ticket_event_references),
-                    (SELECT COUNT(*) FROM typed_ticket_relations),
-                    (SELECT COUNT(*) FROM typed_ticket_orchestration_plans),
-                    (SELECT COUNT(*) FROM typed_ticket_artifacts)",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, i64>(4)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(preserved, (1, 1, 1, 1, 1));
-    }
-
-    #[test]
-    fn v5_backfills_ticket_keys_and_v6_preserves_them_under_resource_key_schema() {
-        let connection = Connection::open_in_memory().unwrap();
-        migrate_sqlite_ticket_schema_through(&connection, 4).unwrap();
-        connection.execute_batch(
-            "INSERT INTO typed_tickets (
-                 workspace_id, ticket_id, slug, title, status, kind, priority, body,
-                 workflow_state, workflow_state_explicit, created_at, updated_at
-             ) VALUES
-                 ('workspace-1', 'later', 'later', 'Later', 'open', 'task', 'medium', '', 'ready', 1, '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z'),
-                 ('workspace-1', 'earlier', 'earlier', 'Earlier', 'open', 'task', 'medium', '', 'ready', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');"
-        ).unwrap();
-
-        migrate_sqlite_ticket_schema_through(&connection, 5).unwrap();
-        let legacy_keys = connection
-            .prepare(
-                "SELECT resource_id, human_key FROM workspace_resource_human_keys
-                 WHERE workspace_id = 'workspace-1' AND resource_kind = 'ticket'
-                 ORDER BY sequence",
-            )
-            .unwrap()
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(
-            legacy_keys,
-            vec![
-                ("earlier".into(), "T-1".into()),
-                ("later".into(), "T-2".into())
-            ]
-        );
-        let next: i64 = connection
-            .query_row(
-                "SELECT next_sequence FROM workspace_resource_human_key_counters
-                 WHERE workspace_id = 'workspace-1' AND resource_kind = 'ticket'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(next, 3);
-
-        migrate_sqlite_ticket_schema(&connection).unwrap();
-        let resource_keys = connection
-            .prepare(
-                "SELECT resource_id, resource_key FROM workspace_resource_keys
-                 WHERE workspace_id = 'workspace-1' AND resource_kind = 'ticket'
-                 ORDER BY sequence",
-            )
-            .unwrap()
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(resource_keys, legacy_keys);
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT next_sequence FROM workspace_resource_key_counters
-                     WHERE workspace_id = 'workspace-1' AND resource_kind = 'ticket'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            3
-        );
-        for legacy_table in [
-            "workspace_resource_human_keys",
-            "workspace_resource_human_key_counters",
-        ] {
-            assert!(
-                connection
-                    .query_row(
-                        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1",
-                        [legacy_table],
-                        |_| Ok(()),
-                    )
-                    .optional()
-                    .unwrap()
-                    .is_none(),
-                "{legacy_table} still exists"
-            );
-        }
-    }
-
-    #[test]
-    fn upgrades_legacy_schema_without_repository_target_columns() {
-        let connection = Connection::open_in_memory().unwrap();
-        create_typed_ticket_tables(&connection).unwrap();
-        connection
-            .execute(
-                "INSERT INTO typed_tickets (
-                    workspace_id, ticket_id, slug, title, status, kind, priority, body,
-                    workflow_state, workflow_state_explicit
-                 ) VALUES ('workspace-1', 'ticket-1', 'ticket-1', 'legacy', 'open',
-                    'task', 'medium', 'body', 'ready', 1)",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE ticket_schema_migrations (
-                    version INTEGER PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    applied_at TEXT NOT NULL
-                 );
-                 INSERT INTO ticket_schema_migrations (version, name, applied_at)
-                 VALUES (1, 'create_typed_ticket_tables', '2026-08-10T00:00:00Z');",
-            )
-            .unwrap();
-
-        migrate_sqlite_ticket_schema(&connection).unwrap();
-        verify_sqlite_ticket_schema(&connection).unwrap();
-
-        let columns = load_columns(&connection, "typed_tickets").unwrap();
-        assert!(columns.iter().any(|column| column.name == "repository_id"));
-        assert!(columns.iter().any(|column| column.name == "ref_selector"));
-        let title = connection
-            .query_row("SELECT title FROM typed_tickets", [], |row| {
-                row.get::<_, String>(0)
-            })
-            .unwrap();
-        assert_eq!(title, "legacy");
+        assert_eq!(load_applied_migrations(&connection).unwrap(), versions);
     }
 
     #[test]
@@ -1421,12 +855,32 @@ mod tests {
             .unwrap();
 
         let error = migrate_sqlite_ticket_schema(&connection).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported Ticket schema migration version 99")
-        );
-        assert_eq!(load_applied_migrations(&connection).unwrap().len(), 7);
+        assert!(error.to_string().contains(
+            "migration history must contain only the canonical version 6 baseline marker"
+        ));
+        assert_eq!(load_applied_migrations(&connection).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rejects_legacy_migration_marker() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE ticket_schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                 );
+                 INSERT INTO ticket_schema_migrations (version, name, applied_at)
+                 VALUES (6, 'rename_workspace_resource_keys', '2026-08-10T00:00:00Z');",
+            )
+            .unwrap();
+
+        let error = migrate_sqlite_ticket_schema(&connection).unwrap_err();
+        assert!(error.to_string().contains(
+            "migration history must contain only the canonical version 6 baseline marker"
+        ));
+        assert!(!table_exists(&connection, "typed_tickets").unwrap());
     }
 
     #[test]
@@ -1510,77 +964,6 @@ mod tests {
     }
 
     #[test]
-    fn migration_rejects_constraint_drift_and_rolls_back_version_adoption() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE typed_tickets (
-                    workspace_id TEXT NOT NULL,
-                    ticket_id TEXT NOT NULL,
-                    slug TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    priority TEXT NOT NULL,
-                    body TEXT NOT NULL,
-                    created_at TEXT,
-                    updated_at TEXT,
-                    assignee TEXT,
-                    readiness TEXT,
-                    workflow_state TEXT NOT NULL,
-                    workflow_state_explicit INTEGER NOT NULL,
-                    queued_by TEXT,
-                    queued_at TEXT,
-                    resolution TEXT,
-                    PRIMARY KEY (ticket_id, workspace_id)
-                );",
-            )
-            .unwrap();
-
-        let error = migrate_sqlite_ticket_schema(&connection).unwrap_err();
-        assert!(error.to_string().contains("primary-key position"));
-        let migration_table_exists = connection
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ticket_schema_migrations'",
-                [],
-                |_| Ok(()),
-            )
-            .optional()
-            .unwrap()
-            .is_some();
-        assert!(!migration_table_exists);
-    }
-
-    #[test]
-    fn legacy_review_upgrade_preserves_prose_as_non_authoritative_comment() {
-        let connection = Connection::open_in_memory().unwrap();
-        migrate_sqlite_ticket_schema(&connection).unwrap();
-        connection.execute("INSERT INTO typed_tickets (workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit) VALUES ('workspace-1','ticket-1','ticket-1','title','open','task','medium','body','inprogress',1)",[]).unwrap();
-        connection.execute("INSERT INTO typed_ticket_events (workspace_id,ticket_id,event_index,kind,author,at,status,heading,body) VALUES ('workspace-1','ticket-1',0,'review','reviewer','2026-08-11T00:00:00Z','approve','Review','legacy evidence')",[]).unwrap();
-        connection.execute("INSERT INTO typed_ticket_event_attributes (workspace_id,ticket_id,event_index,key,value) VALUES ('workspace-1','ticket-1',0,'result','approve')",[]).unwrap();
-        connection
-            .execute_batch(
-                "DROP TABLE workspace_resource_key_counters;
-                 DROP TABLE workspace_resource_keys;
-                 DELETE FROM ticket_schema_migrations WHERE version >= 3;",
-            )
-            .unwrap();
-        migrate_sqlite_ticket_schema(&connection).unwrap();
-        let (kind,status,heading,body):(String,Option<String>,Option<String>,Option<String>)=connection.query_row("SELECT kind,status,heading,body FROM typed_ticket_events WHERE workspace_id='workspace-1' AND ticket_id='ticket-1' AND event_index=0",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
-        assert_eq!(kind, "comment");
-        assert_eq!(status, None);
-        assert_eq!(
-            heading.as_deref(),
-            Some("Legacy review (non-authoritative)")
-        );
-        assert_eq!(body.as_deref(), Some("legacy evidence"));
-        let attributes:i64=connection.query_row("SELECT COUNT(*) FROM typed_ticket_event_attributes WHERE workspace_id='workspace-1' AND ticket_id='ticket-1'",[],|row|row.get(0)).unwrap();
-        assert_eq!(attributes, 1);
-        let legacy:String=connection.query_row("SELECT value FROM typed_ticket_event_attributes WHERE workspace_id='workspace-1' AND ticket_id='ticket-1' AND key='legacy_event_kind'",[],|row|row.get(0)).unwrap();
-        assert_eq!(legacy, "review");
-    }
-
-    #[test]
     fn concurrent_migrators_converge_on_one_version_history() {
         let directory = tempdir().unwrap();
         let database = directory.path().join("tickets.db");
@@ -1602,6 +985,6 @@ mod tests {
 
         let connection = Connection::open(database).unwrap();
         verify_sqlite_ticket_schema(&connection).unwrap();
-        assert_eq!(load_applied_migrations(&connection).unwrap().len(), 6);
+        assert_eq!(load_applied_migrations(&connection).unwrap().len(), 1);
     }
 }

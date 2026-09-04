@@ -1,43 +1,41 @@
-# Workspace database schema migration runbook
+# Workspace database schema baseline
 
-The Workspace Server owns one control-plane SQLite database. Schema changes are applied by the Server at startup; domain components such as Ticket and Merge Request contribute tables to that same database, but they do not create a second Workspace authority.
+The Workspace Server owns one control-plane SQLite database. New databases are created directly from the current canonical schema; the repository does not retain an executable chain of historical Workspace schema migrations.
 
-## Before deployment
+Domain components such as Ticket and Merge Request contribute their current tables to the same database, but they do not create a second Workspace authority.
 
-1. Stop writes and shut down every Server process using the database. Do not run two Server generations against one database during migration.
-2. Record the current binary revision and database schema version.
-3. Take a byte-for-byte backup of the database and its WAL/SHM state using a SQLite-safe backup procedure.
-4. Run the read-only plan with the new binary:
+## Compatibility boundary
 
-   ```sh
-   yoi-server migrate --dry-run --database <server.db>
+The Server accepts only the current canonical schema generation. Its `__yoi_schema_migrations` ledger must contain exactly one row naming that baseline. A database with an older, newer, or multi-generation Workspace migration history is rejected at startup.
+
+This is intentional while Yoi has only the dogfooding deployment. Schema changes may replace the baseline rather than adding permanent compatibility code. Existing dogfooding data must be migrated manually and atomically before starting the new binary.
+
+## Updating the dogfooding database
+
+1. Stop every Server and Runtime process that can write the affected SQLite or Runtime stores.
+2. Record the current binary revision and schema generation.
+3. Take a SQLite-safe backup of `server.db` and a filesystem backup of any Runtime stores whose persisted contracts change.
+4. Apply the data and schema repair explicitly. Keep Workspace SQL data and Runtime filesystem data as separate authorities; changing one does not repair the other.
+5. Replace historical migration-ledger rows with the single marker expected by the current baseline.
+6. Validate before startup:
+
+   ```sql
+   PRAGMA foreign_key_check;
+   PRAGMA integrity_check;
    ```
 
-   The plan runs against an in-memory copy. It reports the current and target schema versions, migration names, Worker identity mappings, and repairs without mutating the source database. Workspace-resource preflight failures name the relation and bounded offending row identities; repair those rows through the owning domain authority before retrying.
+7. Start exactly one Server generation and verify the affected API contracts.
 
-## Applying
+There is no in-place down migration and no automatic upgrade from an old baseline. Rollback means restoring both the prior binary and the complete matching database and Runtime-store backups.
 
-Start exactly one instance of the new Server binary against the database. Startup applies migration 39 in one SQLite transaction after the Ticket and Merge Request component schemas are available. The migration:
+## Creating a new baseline
 
-- rebuilds Ticket, Objective, assignment, Artifact, and resource-key tables with Workspace-scoped composite identity;
-- adds composite foreign keys for repository, Ticket, Objective, Worker, relation-target, and current-assignment references;
-- materializes assignment-specific Worker tombstones for pre-v39 historical assignments whose valid Worker UUID no longer has a matching live registry row (including Workers deleted by the legacy cleanup path and Workers moved between Runtimes); a Worker ID that resolves only in another Workspace remains a preflight error;
-- validates new historical assignment/event references with SQLite triggers while allowing those audit rows to survive later Ticket or Worker retention deletion; parent delete/Runtime-move triggers record exact Workspace-scoped tombstones, and startup accepts a missing live parent only when that tombstone exists, so an unrelated same ID in another Workspace cannot change the result; reservation operation ids remain intentionally unconstrained until their resources exist;
-- checks the rebuilt schema with `PRAGMA foreign_key_check` before recording the schema version; and
-- restores `PRAGMA foreign_keys = ON` whether the transaction commits or rolls back.
+A baseline change must include:
 
-After startup, verify:
+- canonical DDL that creates a fresh database directly at the new generation;
+- current-schema verification for Workspace, Ticket, and Merge Request tables;
+- tests proving a fresh database records only the canonical baseline marker;
+- an explicit, separately reviewed repair procedure for the current dogfooding data;
+- removal of obsolete migration functions, fixtures, commands, and documentation.
 
-```sql
-SELECT MAX(version) FROM __yoi_schema_migrations;
-PRAGMA foreign_key_check;
-PRAGMA integrity_check;
-```
-
-The expected migration version is `39`, `foreign_key_check` returns no rows, and `integrity_check` returns `ok`.
-
-## Failure and rollback
-
-There is no in-place down migration. A failed migration transaction leaves the prior schema version and data intact. Keep the Server stopped, preserve the failure diagnostics, and either repair the preflight data with the prior generation or restore the complete pre-migration backup before retrying.
-
-Never run an older binary after a newer schema version has committed. Startup fences this case and refuses to serve when the database schema version is newer than the binary supports. Rollback therefore means restoring both the prior binary and its matching pre-migration database backup; it does not mean pointing the old binary at the upgraded database.
+Do not put temporary legacy interpretation into normal request or projection paths. If persisted Runtime data also changes identity or shape, repair that Runtime authority explicitly instead of teaching steady-state Workspace APIs to accept both contracts indefinitely.

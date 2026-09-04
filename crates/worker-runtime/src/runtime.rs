@@ -2733,6 +2733,18 @@ impl RuntimeState {
             .unwrap_or_else(|| "worker execution restore failed".to_string());
         let diagnostic_id = self.next_diagnostic_id;
         self.next_diagnostic_id += 1;
+        let workspace_id = self
+            .workers
+            .get(&worker_ref.worker_id)
+            .and_then(|worker| worker.workspace_id.as_deref())
+            .unwrap_or("<unscoped>");
+        eprintln!(
+            "yoi-runtime: Worker execution restore failed: diagnostic_id={diagnostic_id} runtime_id={} workspace_id={workspace_id} worker_id={} operation={:?} outcome={:?}: {message}",
+            self.runtime_identity.as_deref().unwrap_or("<unbound>"),
+            worker_ref.worker_id,
+            result.operation,
+            result.outcome,
+        );
         self.diagnostics.push(RuntimeDiagnostic {
             id: diagnostic_id,
             severity: DiagnosticSeverity::Warning,

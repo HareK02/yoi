@@ -26,11 +26,7 @@ pub mod config;
 mod sqlite_schema;
 pub mod tool;
 
-pub use sqlite_schema::{
-    LATEST_SQLITE_TICKET_SCHEMA_VERSION, migrate_sqlite_ticket_resource_key_schema_in_transaction,
-    migrate_sqlite_ticket_schema, migrate_sqlite_ticket_schema_through,
-    verify_sqlite_ticket_schema,
-};
+pub use sqlite_schema::{migrate_sqlite_ticket_schema, verify_sqlite_ticket_schema};
 
 const REQUIRED_FIELDS: [&str; 4] = ["title", "state", "created_at", "updated_at"];
 const MAX_STATE_CHANGE_REASON_BYTES: usize = 1024;
@@ -2576,7 +2572,7 @@ impl SqliteTicketBackend {
         }
     }
 
-    /// Opens a standalone Ticket backend, applying all Ticket-owned migrations once.
+    /// Opens a standalone Ticket backend at the current canonical schema baseline.
     pub fn open(db_path: impl Into<PathBuf>, workspace_id: impl Into<String>) -> Result<Self> {
         let backend = Self::configured(db_path, workspace_id);
         let connection = backend.connect()?;
