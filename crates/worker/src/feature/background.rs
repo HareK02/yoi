@@ -262,6 +262,8 @@ impl FeatureBackgroundTaskRegistryBuilder {
                 next_execution_id: AtomicU64::new(1),
                 session_generation: Arc::new(AtomicU64::new(1)),
                 lifecycle: AtomicU8::new(TASK_SCOPE_ACCEPTING),
+                #[cfg(test)]
+                start_race_probe: Mutex::new(None),
             }),
         }
     }
@@ -274,6 +276,12 @@ struct RunningTask {
     handle: JoinHandle<()>,
 }
 
+#[cfg(test)]
+struct StartRaceProbe {
+    optimistic_check_passed: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
+}
+
 struct RegistryInner {
     registrations: BTreeMap<(FeatureId, String), Registration>,
     running: Mutex<BTreeMap<u64, RunningTask>>,
@@ -281,6 +289,8 @@ struct RegistryInner {
     next_execution_id: AtomicU64,
     session_generation: Arc<AtomicU64>,
     lifecycle: AtomicU8,
+    #[cfg(test)]
+    start_race_probe: Mutex<Option<StartRaceProbe>>,
 }
 
 impl Drop for RegistryInner {
@@ -394,6 +404,17 @@ impl FeatureBackgroundTaskRegistry {
                 HookErrorCategory::ScopeDisposed,
                 "background task scope is stopping",
             ));
+        }
+        #[cfg(test)]
+        if let Some(probe) = self
+            .inner
+            .start_race_probe
+            .lock()
+            .expect("start race probe poisoned")
+            .take()
+        {
+            probe.optimistic_check_passed.wait();
+            probe.resume.wait();
         }
         let key = (feature_id.clone(), task_name.to_string());
         let registration = self.inner.registrations.get(&key).ok_or_else(|| {
@@ -887,6 +908,42 @@ mod tests {
             ));
             assert!(registry.inner.running.lock().unwrap().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn starter_paused_after_optimistic_check_is_rejected_by_rewrite_barrier() {
+        let feature = FeatureId::builtin("rewrite-race");
+        let declaration = BackgroundTaskDeclaration::worker_managed("race", "race");
+        let mut builder = FeatureBackgroundTaskRegistryBuilder::default();
+        builder
+            .register(
+                feature.clone(),
+                BackgroundTaskSpec::single_flight(declaration, Duration::from_secs(1)),
+                WaitForCancellation,
+            )
+            .unwrap();
+        let registry = builder.build();
+        let optimistic_check_passed = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *registry.inner.start_race_probe.lock().unwrap() = Some(StartRaceProbe {
+            optimistic_check_passed: Arc::clone(&optimistic_check_passed),
+            resume: Arc::clone(&resume),
+        });
+        let start_registry = registry.clone();
+        let starter = tokio::task::spawn_blocking(move || {
+            start_registry.start(&feature, "race", invocation())
+        });
+
+        optimistic_check_passed.wait();
+        let rewrite_guard = registry.begin_session_rewrite().await.unwrap();
+        resume.wait();
+        let error = starter.await.unwrap().unwrap_err();
+
+        assert_eq!(error.category, HookErrorCategory::ScopeDisposed);
+        assert!(registry.inner.running.lock().unwrap().is_empty());
+        drop(rewrite_guard);
+        assert!(registry.inner.running.lock().unwrap().is_empty());
+        registry.shutdown().await.unwrap();
     }
 
     #[tokio::test]
