@@ -994,13 +994,7 @@ where
     let worker_enabled = feature_config.worker.enabled;
     let sub_worker_enabled = feature_config.sub_worker.enabled;
     let mut feature_registry = FeatureRegistryBuilder::new();
-    if feature_config.memory.enabled {
-        let config = memory_config.clone().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "[feature.memory].enabled = true requires a [memory] configuration section",
-            )
-        })?;
+    if let Some(config) = memory_config.clone() {
         let workspace_client = worker.workspace_client_handle();
         if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
             return Err(std::io::Error::new(
@@ -1009,7 +1003,7 @@ where
             ));
         }
         feature_registry.add_module(
-            crate::feature::builtin::memory_lifecycle::MemoryExtractionLifecycleFeature::new(
+            crate::feature::builtin::memory_lifecycle::MemoryLifecycleFeature::new(
                 config,
                 worker.committed_session_capture_handle(),
                 worker.session_extension_handle(),

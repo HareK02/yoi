@@ -20,7 +20,8 @@ use crate::feature::builtin::memory_staging_output::{
 };
 use crate::feature::builtin::session_explore::{SessionExploreFeature, SessionExploreState};
 use crate::feature::session::{
-    CommittedSessionCapture, CommittedSessionCaptureHandle, SessionExtensionHandle,
+    CommittedRunExit, CommittedSessionCapture, CommittedSessionCaptureHandle,
+    SessionExtensionHandle,
 };
 use crate::feature::{
     BackgroundTaskDeclaration, FeatureDescriptor, FeatureInstallContext, FeatureInstallError,
@@ -37,7 +38,7 @@ use agen::token_counter::total_tokens_at;
 use manifest::WorkerManifest;
 use protocol::Event;
 
-const TASK_NAME: &str = "memory-extraction";
+const TASK_NAME: &str = "memory-lifecycle";
 const TASK_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Parent-Worker lifecycle Feature that observes committed runs and schedules
@@ -45,12 +46,12 @@ const TASK_TIMEOUT: Duration = Duration::from_secs(300);
 /// Internal Worker, and staging disposition; Worker core owns only generic
 /// hook/task/session plumbing.
 #[derive(Clone)]
-pub(crate) struct MemoryExtractionLifecycleFeature {
-    task: MemoryExtractionTask,
+pub(crate) struct MemoryLifecycleFeature {
+    task: MemoryLifecycleTask,
 }
 
 #[derive(Clone)]
-struct MemoryExtractionTask {
+struct MemoryLifecycleTask {
     config: manifest::MemoryConfig,
     capture: CommittedSessionCaptureHandle,
     extensions: SessionExtensionHandle,
@@ -62,7 +63,7 @@ struct MemoryExtractionTask {
     event_tx: Option<broadcast::Sender<Event>>,
 }
 
-impl MemoryExtractionLifecycleFeature {
+impl MemoryLifecycleFeature {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: manifest::MemoryConfig,
@@ -76,7 +77,7 @@ impl MemoryExtractionLifecycleFeature {
         event_tx: Option<broadcast::Sender<Event>>,
     ) -> Self {
         Self {
-            task: MemoryExtractionTask {
+            task: MemoryLifecycleTask {
                 config,
                 capture,
                 extensions,
@@ -91,46 +92,133 @@ impl MemoryExtractionLifecycleFeature {
     }
 }
 
-impl FeatureModule for MemoryExtractionLifecycleFeature {
+impl FeatureModule for MemoryLifecycleFeature {
     fn descriptor(&self) -> FeatureDescriptor {
-        FeatureDescriptor::builtin("memory-extraction-lifecycle", "Memory Extraction Lifecycle")
+        FeatureDescriptor::builtin("memory-lifecycle", "Memory Lifecycle")
             .with_description(
-                "Observes terminal committed runs and schedules bounded Memory extraction.",
+                "Observes terminal committed runs and schedules bounded Memory extraction and Backend consolidation requests.",
             )
             .with_background_task(BackgroundTaskDeclaration::worker_managed(
                 TASK_NAME,
-                "Extract provenance-preserving Memory candidates after committed runs.",
+                "Extract provenance-preserving Memory candidates and request Backend consolidation after committed runs.",
             ))
     }
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
         context
             .background_tasks()
-            .register(memory_extraction_task_spec(), self.task.clone())
+            .register(memory_lifecycle_task_spec(), self.task.clone())
     }
 }
 
-fn memory_extraction_task_spec() -> BackgroundTaskSpec {
+fn memory_lifecycle_task_spec() -> BackgroundTaskSpec {
     let declaration = BackgroundTaskDeclaration::worker_managed(
         TASK_NAME,
-        "Extract provenance-preserving Memory candidates after committed runs.",
+        "Extract provenance-preserving Memory candidates and request Backend consolidation after committed runs.",
     );
     let mut spec = BackgroundTaskSpec::single_flight(declaration, TASK_TIMEOUT);
     spec.trigger = BackgroundTaskTrigger::RunCommitted;
     spec
 }
 
-#[async_trait]
-impl FeatureBackgroundTask for MemoryExtractionTask {
-    async fn run(
+impl MemoryLifecycleTask {
+    async fn run_extraction(
         &self,
         context: BackgroundTaskContext,
         cancellation: BackgroundTaskCancellation,
     ) -> Result<(), HookError> {
         context.generation_fence.ensure_current()?;
-        let capture = self.capture.capture().map_err(hook_internal)?;
-        let pointer = extract_pointer(&capture)?;
-        if !extraction_threshold_reached(&capture, pointer.as_ref(), &self.config) {
+        let audit = WorkerAuditBase::new(
+            memory::audit::AuditWorker::MemoryExtract,
+            memory::audit::AuditTrigger::TokenThreshold,
+            self.config
+                .extract_model
+                .as_ref()
+                .or(Some(&self.manifest.model))
+                .map(model_audit_from_manifest),
+        )
+        .with_memory_settings(&self.config);
+        let capture = match self.capture.capture() {
+            Ok(capture) => capture,
+            Err(error) => {
+                audit
+                    .emit(
+                        self.workspace_client.as_ref(),
+                        self.event_tx.as_ref(),
+                        memory::audit::WorkerLifecycleStatus::Failed,
+                        format!("committed_session_capture_failed: {error}"),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                return Ok(());
+            }
+        };
+        if !extraction_run_eligible(capture.run_exit) {
+            audit
+                .emit(
+                    self.workspace_client.as_ref(),
+                    self.event_tx.as_ref(),
+                    memory::audit::WorkerLifecycleStatus::Skipped,
+                    format!("parent_run_not_finished: {:?}", capture.run_exit),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            return Ok(());
+        }
+        let pointer = match extract_pointer(&capture) {
+            Ok(pointer) => pointer,
+            Err(error) => {
+                audit
+                    .emit(
+                        self.workspace_client.as_ref(),
+                        self.event_tx.as_ref(),
+                        memory::audit::WorkerLifecycleStatus::Failed,
+                        format!("extract_pointer_invalid: {error}"),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                return Ok(());
+            }
+        };
+        let Some(threshold) = self
+            .config
+            .extract_threshold
+            .filter(|threshold| *threshold > 0)
+        else {
+            audit
+                .emit(
+                    self.workspace_client.as_ref(),
+                    self.event_tx.as_ref(),
+                    memory::audit::WorkerLifecycleStatus::Skipped,
+                    "token_threshold_disabled",
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            return Ok(());
+        };
+        let tokens_since = tokens_since_pointer(&capture, pointer.as_ref());
+        if tokens_since < threshold {
+            audit
+                .emit(
+                    self.workspace_client.as_ref(),
+                    self.event_tx.as_ref(),
+                    memory::audit::WorkerLifecycleStatus::Skipped,
+                    format!(
+                        "token_threshold_not_reached tokens_since={tokens_since} threshold={threshold}"
+                    ),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
             return Ok(());
         }
 
@@ -141,6 +229,22 @@ impl FeatureBackgroundTask for MemoryExtractionTask {
             .min(capture.history.len());
         let history_end = capture.history.len();
         if history_start >= history_end || capture.entry_count == 0 {
+            audit
+                .emit(
+                    self.workspace_client.as_ref(),
+                    self.event_tx.as_ref(),
+                    memory::audit::WorkerLifecycleStatus::Skipped,
+                    "no_new_committed_session_entries",
+                    None,
+                    Some(memory::audit::ExtractAudit {
+                        session_id: Some(capture.session_id.clone()),
+                        segment_id: Some(capture.segment_id.clone()),
+                        history_range: Some([history_start as u64, history_end as u64]),
+                        ..Default::default()
+                    }),
+                    None,
+                )
+                .await;
             return Ok(());
         }
         let view = SessionCapture::from_history_entries(
@@ -155,16 +259,6 @@ impl FeatureBackgroundTask for MemoryExtractionTask {
             segment_id: capture.segment_id.clone(),
             range: [start_entry as u64, (capture.entry_count - 1) as u64],
         };
-        let audit = WorkerAuditBase::new(
-            memory::audit::AuditWorker::MemoryExtract,
-            memory::audit::AuditTrigger::TokenThreshold,
-            self.config
-                .extract_model
-                .as_ref()
-                .or(Some(&self.manifest.model))
-                .map(model_audit_from_manifest),
-        )
-        .with_memory_settings(&self.config);
         let extract_audit_base = memory::audit::ExtractAudit {
             session_id: Some(capture.session_id.clone()),
             segment_id: Some(capture.segment_id.clone()),
@@ -376,7 +470,86 @@ impl FeatureBackgroundTask for MemoryExtractionTask {
     }
 }
 
-impl MemoryExtractionTask {
+#[async_trait]
+impl FeatureBackgroundTask for MemoryLifecycleTask {
+    async fn run(
+        &self,
+        context: BackgroundTaskContext,
+        cancellation: BackgroundTaskCancellation,
+    ) -> Result<(), HookError> {
+        let extraction = self
+            .run_extraction(context.clone(), cancellation.clone())
+            .await;
+        if !cancellation.is_cancelled() {
+            context.generation_fence.ensure_current()?;
+            self.request_consolidation().await;
+        }
+        extraction
+    }
+}
+
+impl MemoryLifecycleTask {
+    async fn request_consolidation(&self) {
+        let audit = WorkerAuditBase::new(
+            memory::audit::AuditWorker::MemoryConsolidation,
+            memory::audit::AuditTrigger::StagingBacklog,
+            self.config
+                .consolidation_model
+                .as_ref()
+                .or(Some(&self.manifest.model))
+                .map(model_audit_from_manifest),
+        )
+        .with_memory_settings(&self.config);
+        let Some((threshold_files, threshold_bytes)) = consolidation_thresholds(&self.config)
+        else {
+            audit
+                .emit(
+                    self.workspace_client.as_ref(),
+                    self.event_tx.as_ref(),
+                    memory::audit::WorkerLifecycleStatus::Skipped,
+                    "consolidation_threshold_disabled",
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            return;
+        };
+        match self
+            .workspace_client
+            .request_memory_staging_consolidation(
+                memory::backend::MemoryConsolidateStagingOperation {
+                    force: false,
+                    threshold_files,
+                    threshold_bytes,
+                },
+            )
+            .await
+        {
+            Ok(output) => {
+                tracing::debug!(
+                    status = output.status.as_str(),
+                    summary = output.summary.as_str(),
+                    "requested Backend Memory staging consolidation"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, "request Backend Memory staging consolidation failed");
+                audit
+                    .emit(
+                        self.workspace_client.as_ref(),
+                        self.event_tx.as_ref(),
+                        memory::audit::WorkerLifecycleStatus::Skipped,
+                        "consolidation_backend_operation_failed",
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+        }
+    }
+
     async fn record_preparation_failure(
         &self,
         audit: &WorkerAuditBase,
@@ -473,14 +646,30 @@ fn extract_pointer(
     Ok(pointer)
 }
 
-fn extraction_threshold_reached(
+fn consolidation_thresholds(
+    config: &manifest::MemoryConfig,
+) -> Option<(Option<usize>, Option<u64>)> {
+    let threshold_files = config
+        .consolidation_threshold_files
+        .filter(|threshold| *threshold > 0);
+    let threshold_bytes = config
+        .consolidation_threshold_bytes
+        .filter(|threshold| *threshold > 0);
+    if threshold_files.is_none() && threshold_bytes.is_none() {
+        None
+    } else {
+        Some((threshold_files, threshold_bytes))
+    }
+}
+
+fn extraction_run_eligible(exit: CommittedRunExit) -> bool {
+    exit == CommittedRunExit::Finished
+}
+
+fn tokens_since_pointer(
     capture: &CommittedSessionCapture,
     pointer: Option<&memory::ExtractPointerPayload>,
-    config: &manifest::MemoryConfig,
-) -> bool {
-    if capture.history.is_empty() {
-        return false;
-    }
+) -> u64 {
     let history_pointer = pointer
         .map(|pointer| pointer.processed_through_history_len)
         .unwrap_or(0)
@@ -492,10 +681,22 @@ fn extraction_threshold_reached(
         .collect::<Vec<_>>();
     let current = total_tokens_at(&items, &capture.usage_history, capture.history.len()).tokens;
     let baseline = total_tokens_at(&items, &capture.usage_history, history_pointer).tokens;
+    current.saturating_sub(baseline)
+}
+
+#[cfg(test)]
+fn extraction_threshold_reached(
+    capture: &CommittedSessionCapture,
+    pointer: Option<&memory::ExtractPointerPayload>,
+    config: &manifest::MemoryConfig,
+) -> bool {
+    if capture.history.is_empty() {
+        return false;
+    }
     let Some(threshold) = config.extract_threshold.filter(|threshold| *threshold > 0) else {
         return false;
     };
-    current.saturating_sub(baseline) >= threshold
+    tokens_since_pointer(capture, pointer) >= threshold
 }
 
 #[derive(Clone)]
@@ -620,6 +821,7 @@ mod tests {
             segment_id: "segment-1".to_string(),
             session_revision: history_len.try_into().unwrap(),
             entry_count: history_len,
+            run_exit: CommittedRunExit::Finished,
             history: (0..history_len)
                 .map(|index| HistoryEntry {
                     item: Item::user_message(format!("message-{index}")),
@@ -635,6 +837,24 @@ mod tests {
             }],
             extensions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn consolidation_thresholds_enable_backend_request_on_either_limit() {
+        let mut config = manifest::MemoryConfig::default();
+        assert_eq!(consolidation_thresholds(&config), None);
+        config.consolidation_threshold_files = Some(3);
+        assert_eq!(consolidation_thresholds(&config), Some((Some(3), None)));
+        config.consolidation_threshold_files = None;
+        config.consolidation_threshold_bytes = Some(4096);
+        assert_eq!(consolidation_thresholds(&config), Some((None, Some(4096))));
+    }
+
+    #[test]
+    fn interrupted_parent_run_is_not_extraction_eligible() {
+        assert!(extraction_run_eligible(CommittedRunExit::Finished));
+        assert!(!extraction_run_eligible(CommittedRunExit::NonFinal));
+        assert!(!extraction_run_eligible(CommittedRunExit::Interrupted));
     }
 
     #[test]
@@ -672,7 +892,7 @@ mod tests {
 
     #[test]
     fn task_scope_cancels_and_joins_before_rewrite_and_shutdown() {
-        let spec = memory_extraction_task_spec();
+        let spec = memory_lifecycle_task_spec();
         assert_eq!(spec.trigger, BackgroundTaskTrigger::RunCommitted);
         assert_eq!(spec.max_concurrency, 1);
         assert_eq!(spec.rewrite, BackgroundTaskRewritePolicy::CancelAndWait);
@@ -759,8 +979,10 @@ mod tests {
             );
         }
         let controller_source = include_str!("../../controller.rs");
-        assert!(controller_source.contains("if feature_config.memory.enabled"));
-        assert!(controller_source.contains("MemoryExtractionLifecycleFeature::new"));
+        assert!(controller_source.contains("if let Some(config) = memory_config.clone()"));
+        assert!(controller_source.contains("MemoryLifecycleFeature::new"));
+        let lifecycle_source = include_str!("memory_lifecycle.rs");
+        assert!(lifecycle_source.contains("request_memory_staging_consolidation"));
         let internal_worker_source = include_str!("../../internal_worker.rs");
         assert!(!internal_worker_source.contains("manifest.memory = None"));
     }

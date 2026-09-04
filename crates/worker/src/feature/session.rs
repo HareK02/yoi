@@ -5,6 +5,13 @@ use serde_json::Value;
 
 use crate::session_history::SessionHistoryMetadata;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommittedRunExit {
+    Finished,
+    NonFinal,
+    Interrupted,
+}
+
 /// Immutable projection of one durably committed session-log location.
 ///
 /// Feature code receives this value only after the host has committed the
@@ -18,6 +25,7 @@ pub(crate) struct CommittedSessionCapture {
     /// Monotonic committed-log revision for the captured Segment.
     pub(crate) session_revision: u64,
     pub(crate) entry_count: usize,
+    pub(crate) run_exit: CommittedRunExit,
     pub(crate) history: Vec<HistoryEntry<SessionHistoryMetadata>>,
     pub(crate) usage_history: Vec<UsageRecord>,
     pub(crate) extensions: Vec<(String, Value)>,

@@ -44,7 +44,7 @@ use crate::feature::background::{BackgroundTaskRewriteGuard, FeatureBackgroundTa
 use crate::feature::builtin::memory::WorkspaceMemoryBackendError;
 use crate::feature::builtin::{TaskFeature, WorkerObservationProvider};
 use crate::feature::session::{
-    CommittedSessionCapture, CommittedSessionCaptureHandle, FeatureSessionError,
+    CommittedRunExit, CommittedSessionCapture, CommittedSessionCaptureHandle, FeatureSessionError,
     SessionExtensionHandle,
 };
 use crate::feature::{
@@ -2108,6 +2108,19 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             let entries = store
                 .read_all(location.session_id, location.segment_id)
                 .map_err(|error| FeatureSessionError::Capture(error.to_string()))?;
+            let run_exit = entries
+                .iter()
+                .rev()
+                .find_map(|entry| match entry {
+                    LogEntry::RunCompleted {
+                        result: EngineResult::Finished,
+                        ..
+                    } => Some(CommittedRunExit::Finished),
+                    LogEntry::RunCompleted { .. } => Some(CommittedRunExit::NonFinal),
+                    LogEntry::RunErrored { .. } => Some(CommittedRunExit::Interrupted),
+                    _ => None,
+                })
+                .unwrap_or(CommittedRunExit::NonFinal);
             let restored = segment_log::collect_state(&entries);
             let history =
                 restore_history_entries(location.session_id, location.segment_id, &entries)
@@ -2117,6 +2130,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 segment_id: location.segment_id.to_string(),
                 session_revision: entries.len().try_into().unwrap_or(u64::MAX),
                 entry_count: entries.len(),
+                run_exit,
                 history,
                 usage_history: restored.usage_history,
                 extensions: restored.extensions.into_iter().collect(),
@@ -8545,6 +8559,30 @@ mod build_summary_prompt_tests {
                 .filter(|entry| matches!(entry, LogEntry::Extension { domain, .. } if domain == "test.feature"))
                 .count(),
             1
+        );
+
+        worker
+            .commit_entry(LogEntry::RunErrored {
+                ts: segment_log::now_millis(),
+                interrupted: true,
+                message: "cancelled".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            capture_handle.capture().unwrap().run_exit,
+            CommittedRunExit::Interrupted
+        );
+        worker
+            .commit_entry(LogEntry::RunCompleted {
+                ts: segment_log::now_millis(),
+                interrupted: false,
+                result: EngineResult::Finished,
+                active_run_turn_count: None,
+            })
+            .unwrap();
+        assert_eq!(
+            capture_handle.capture().unwrap().run_exit,
+            CommittedRunExit::Finished
         );
     }
 
