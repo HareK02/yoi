@@ -15,6 +15,7 @@ export const SKILL_API_LIMITS = {
   maxBodyBytes: 1048576,
   maxPathBytes: 1024,
   maxDigestBytes: 128,
+  maxResponseBytes: 2097152,
 } as const;
 
 export type SkillDiagnosticSeverity = "error" | "warning";

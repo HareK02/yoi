@@ -1,11 +1,13 @@
 import {
   loadWorkspaceSkillCatalog,
+  loadWorkspaceSkillDetail,
   workspaceApiPath,
   workspaceRoute,
   workspaceSkillActivationPath,
   workspaceSkillCatalogPath,
   workspaceSkillDetailPath,
 } from "./http.ts";
+import { SKILL_API_LIMITS } from "$lib/generated/skill-api.ts";
 
 declare const Deno: {
   test(name: string, fn: () => Promise<void> | void): void;
@@ -122,4 +124,45 @@ Deno.test("loadWorkspaceSkillCatalog fetches lightweight catalog", async () => {
   assertEquals(result.error, null);
   assertEquals(result.data?.entries[0].name, "triage-errors");
   assertEquals(JSON.stringify(result.data).includes("SKILL.md body"), false);
+});
+
+Deno.test("Skill loaders redact and bound non-success response diagnostics", async () => {
+  const secret = "SENSITIVE-SKILL-BODY-CONTENT".repeat(300);
+  const result = await loadWorkspaceSkillCatalog(
+    (() =>
+      Promise.resolve(new Response(secret, { status: 500 }))) as typeof fetch,
+    "ws-1",
+  );
+
+  assertEquals(result.data, null);
+  assertEquals(result.error, "Skill API request failed with HTTP 500");
+  assert(
+    !result.error?.includes(secret.slice(0, 64)),
+    "Skill API diagnostic must not expose response body content",
+  );
+  assert(
+    (result.error?.length ?? 0) <= 256,
+    "Skill API diagnostic must remain bounded",
+  );
+});
+
+Deno.test("Skill loaders stop reading success responses above the wire byte limit", async () => {
+  const oversized = `{"body":"${
+    "x".repeat(SKILL_API_LIMITS.maxResponseBytes + 1)
+  }"}`;
+  const result = await loadWorkspaceSkillDetail(
+    (() =>
+      Promise.resolve(
+        new Response(oversized, { status: 200 }),
+      )) as typeof fetch,
+    "ws-1",
+    "release",
+  );
+
+  assertEquals(result.data, null);
+  assertEquals(result.error, "Skill API response exceeds its byte limit");
+  assert(
+    !result.error?.includes(oversized.slice(0, 64)),
+    "Skill API diagnostic must not expose oversized response content",
+  );
 });

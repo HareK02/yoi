@@ -1946,6 +1946,7 @@ pub const SKILL_API_MAX_LABEL_BYTES: usize = 4_096;
 pub const SKILL_API_MAX_BODY_BYTES: usize = 1_048_576;
 pub const SKILL_API_MAX_PATH_BYTES: usize = 1_024;
 pub const SKILL_API_MAX_DIGEST_BYTES: usize = 128;
+pub const SKILL_API_MAX_RESPONSE_BYTES: usize = 2_097_152;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -2425,7 +2426,7 @@ pub fn skill_api_typescript() -> String {
         SkillDetailResponse::decl(&config),
     ];
     let limits = format!(
-        "export const SKILL_API_AUTHORITY = \"{SKILL_CATALOG_AUTHORITY}\" as const;\n\nexport const SKILL_API_LIMITS = {{\n  maxSafeInteger: {SKILL_API_MAX_SAFE_INTEGER},\n  maxCatalogEntries: {SKILL_API_MAX_CATALOG_ENTRIES},\n  maxOverrides: {SKILL_API_MAX_OVERRIDES},\n  maxDiagnostics: {SKILL_API_MAX_DIAGNOSTICS},\n  maxResources: {SKILL_API_MAX_RESOURCES},\n  maxAllowedTools: {SKILL_API_MAX_ALLOWED_TOOLS},\n  maxNameBytes: {SKILL_API_MAX_NAME_BYTES},\n  maxLabelBytes: {SKILL_API_MAX_LABEL_BYTES},\n  maxBodyBytes: {SKILL_API_MAX_BODY_BYTES},\n  maxPathBytes: {SKILL_API_MAX_PATH_BYTES},\n  maxDigestBytes: {SKILL_API_MAX_DIGEST_BYTES},\n}} as const;"
+        "export const SKILL_API_AUTHORITY = \"{SKILL_CATALOG_AUTHORITY}\" as const;\n\nexport const SKILL_API_LIMITS = {{\n  maxSafeInteger: {SKILL_API_MAX_SAFE_INTEGER},\n  maxCatalogEntries: {SKILL_API_MAX_CATALOG_ENTRIES},\n  maxOverrides: {SKILL_API_MAX_OVERRIDES},\n  maxDiagnostics: {SKILL_API_MAX_DIAGNOSTICS},\n  maxResources: {SKILL_API_MAX_RESOURCES},\n  maxAllowedTools: {SKILL_API_MAX_ALLOWED_TOOLS},\n  maxNameBytes: {SKILL_API_MAX_NAME_BYTES},\n  maxLabelBytes: {SKILL_API_MAX_LABEL_BYTES},\n  maxBodyBytes: {SKILL_API_MAX_BODY_BYTES},\n  maxPathBytes: {SKILL_API_MAX_PATH_BYTES},\n  maxDigestBytes: {SKILL_API_MAX_DIGEST_BYTES},\n  maxResponseBytes: {SKILL_API_MAX_RESPONSE_BYTES},\n}} as const;"
     );
     format!(
         "// Generated from workspace-api. Do not edit by hand.\n// Regenerate: cargo run -q -p workspace-api --features typescript --example generate_skill_api_types > web/workspace/src/lib/generated/skill-api.ts\n\n{limits}\n\n{}\n",
