@@ -1390,6 +1390,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         let mut pause_requested = false;
         let mut pause_deadline = None;
         let mut batch_error = None;
+        let mut locally_enqueued_cancel = false;
         for result in synthetic_results {
             if let Err(error) = self
                 .finalize_and_commit_tool_result(
@@ -1411,6 +1412,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         let mut futures = futures;
         if batch_error.is_some() && !futures.is_empty() {
             let _ = self.cancel_tx.try_send(());
+            locally_enqueued_cancel = true;
         }
         while !futures.is_empty() {
             tokio::select! {
@@ -1435,6 +1437,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                         }
                         if !futures.is_empty() {
                             let _ = self.cancel_tx.try_send(());
+                            locally_enqueued_cancel = true;
                         }
                     }
                 }
@@ -1453,6 +1456,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 _ = tokio::time::sleep_until(pause_deadline.unwrap_or_else(TokioInstant::now)), if pause_deadline.is_some() => {
                     pause_deadline = None;
                     let _ = self.cancel_tx.try_send(());
+                    locally_enqueued_cancel = true;
                 }
                 cancel = self.cancel_rx.recv() => {
                     if cancel.is_some() {
@@ -1552,6 +1556,12 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
             }
         }
 
+        // A result-biased ready sibling can empty the batch before the local
+        // cancel signal is selected. Never let that current-batch signal leak
+        // into the next run or resume call.
+        if locally_enqueued_cancel {
+            let _ = self.cancel_rx.try_recv();
+        }
         if let Some(error) = batch_error {
             self.timeline.abort_current_block();
             return Err(error);

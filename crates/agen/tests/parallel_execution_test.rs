@@ -1367,6 +1367,7 @@ impl Interceptor for StopFirstParallelResult {
         if info.call.id != "call_fast" {
             return Ok(PostToolAction::Continue);
         }
+        tokio::time::sleep(Duration::from_millis(5)).await;
         match self.0 {
             PostToolStopMode::Abort => Ok(PostToolAction::Abort("stop parallel batch".to_string())),
             PostToolStopMode::Failure => Err(InterceptorError::new(
@@ -1380,20 +1381,29 @@ impl Interceptor for StopFirstParallelResult {
 #[tokio::test]
 async fn post_tool_stop_terminalizes_started_parallel_siblings_before_returning() {
     for mode in [PostToolStopMode::Abort, PostToolStopMode::Failure] {
-        let client = MockLlmClient::new(vec![
+        let first_response = vec![
             Event::tool_use_start(0, "call_fast", "fast"),
             Event::tool_input_delta(0, r#"{}"#),
             Event::tool_use_stop(0),
-            Event::tool_use_start(1, "call_slow", "slow"),
+            Event::tool_use_start(1, "call_ready", "ready"),
             Event::tool_input_delta(1, r#"{}"#),
             Event::tool_use_stop(1),
             Event::Status(StatusEvent {
                 status: ResponseStatus::Completed,
             }),
-        ]);
+        ];
+        let second_response = vec![
+            Event::text_block_start(0),
+            Event::text_delta(0, "next run completed"),
+            Event::text_block_stop(0, None),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ];
+        let client = MockLlmClient::with_responses(vec![first_response, second_response]);
         let mut engine = Engine::new(client);
-        engine.register_tool(SlowTool::new("fast", 1).definition());
-        engine.register_tool(SlowTool::new("slow", 10_000).definition());
+        engine.register_tool(SlowTool::new("fast", 0).definition());
+        engine.register_tool(SlowTool::new("ready", 1).definition());
         engine.set_interceptor(StopFirstParallelResult(mode));
         let mut history = History::new();
 
@@ -1422,6 +1432,10 @@ async fn post_tool_stop_terminalizes_started_parallel_siblings_before_returning(
             .collect();
         assert_eq!(terminal_ids.len(), 2);
         assert!(terminal_ids.contains(&"call_fast"));
-        assert!(terminal_ids.contains(&"call_slow"));
+        assert!(terminal_ids.contains(&"call_ready"));
+
+        let mut engine = output.engine;
+        let next = engine.run(&mut history, "next run").await;
+        assert!(matches!(next, EngineRunExit::Finished));
     }
 }
