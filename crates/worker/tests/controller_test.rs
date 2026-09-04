@@ -795,13 +795,25 @@ permission = "write"
 #[tokio::test]
 async fn builtin_orchestrator_exposes_worker_remove_and_workdir_delete() {
     let workspace = tempfile::tempdir().unwrap();
-    let resolved = ProfileResolver::new()
+    let mut resolved = ProfileResolver::new()
         .with_workspace_base(workspace.path())
         .resolve(
             &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "orchestrator"),
             ProfileResolveOptions::with_worker_name("orchestrator-worker"),
         )
         .unwrap();
+    if resolved.manifest.feature.memory.enabled() {
+        resolved
+            .manifest
+            .feature
+            .memory
+            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "workspace-test".to_string(),
+                settings_revision: 1,
+                language: "English".to_string(),
+            })
+            .unwrap();
+    }
     let workspace_context =
         WorkerWorkspaceContext::with_client(None, Arc::new(NoopWorkspaceClient));
     let client = MockClient::new(simple_text_events());
