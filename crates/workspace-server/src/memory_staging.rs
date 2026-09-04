@@ -1,65 +1,16 @@
-use memory::extract::StagingRecord;
-use memory::schema::{SourceEvidenceRef, SourceRef};
-use serde::{Deserialize, Serialize};
+use memory::extract::{CandidateKind, StagingRecord};
+use memory::schema::{EvidenceOrigin, EvidenceOriginKind, SourceEvidenceRef, SourceRef};
+use workspace_api::{
+    Diagnostic, DiagnosticSeverity, MemoryCandidateKind, MemoryEvidenceOrigin,
+    MemoryEvidenceOriginKind, MemorySourceEvidenceRef, MemorySourceRef, MemoryStagingEntry,
+    MemoryStagingEvidence, MemoryStagingListResponse, MemoryStagingRecord,
+};
 
 use crate::Result;
 use crate::authority::MemoryAuthority;
 
 const DEFAULT_MEMORY_STAGING_LIMIT: usize = 100;
 const MAX_MEMORY_STAGING_LIMIT: usize = 500;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MemoryStagingListResponse {
-    pub limit: usize,
-    pub returned_count: usize,
-    pub total_valid_count: usize,
-    pub invalid_count: usize,
-    pub truncated: bool,
-    pub order: String,
-    pub record_authority: String,
-    pub items: Vec<MemoryStagingEntrySummary>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MemoryStagingEntrySummary {
-    pub id: String,
-    pub byte_len: u64,
-    pub record: MemoryStagingRecordSummary,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MemoryStagingRecordSummary {
-    pub schema_version: u32,
-    pub id: String,
-    pub extract_run_id: String,
-    pub source: SourceRef,
-    pub kind: String,
-    pub claim: String,
-    pub why_useful: String,
-    pub staleness: Option<String>,
-    pub evidence: Vec<MemoryStagingEvidenceSummary>,
-    pub source_refs: Vec<MemorySourceEvidenceRefSummary>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MemoryStagingEvidenceSummary {
-    pub id: String,
-    pub kind: String,
-    pub entry_range: Option<[u64; 2]>,
-    pub excerpt: Option<String>,
-    pub summary: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MemorySourceEvidenceRefSummary {
-    pub session_id: Option<String>,
-    pub segment_id: Option<String>,
-    pub entry_range: Option<[u64; 2]>,
-    pub evidence_id: Option<String>,
-    pub evidence_kind: Option<String>,
-    pub label: Option<String>,
-    pub summary: Option<String>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryStagingBacklogSummary {
@@ -90,14 +41,24 @@ pub fn list_memory_staging_from_authority<A: MemoryAuthority>(
         };
         total_valid_count += 1;
         if valid_items.len() < limit {
-            valid_items.push(MemoryStagingEntrySummary {
+            valid_items.push(MemoryStagingEntry {
                 id: entry.candidate_id,
                 byte_len: entry.raw_json.len() as u64,
-                record: memory_staging_record_summary(record),
+                record: memory_staging_record_projection(record),
             });
         }
     }
     let returned_count = valid_items.len();
+    let diagnostics = (invalid_count > 0)
+        .then(|| Diagnostic {
+            code: "memory_staging_record_invalid".to_string(),
+            message: format!(
+                "{invalid_count} Memory staging record(s) were excluded because they did not match the current schema."
+            ),
+            severity: DiagnosticSeverity::Error,
+        })
+        .into_iter()
+        .collect();
     Ok(MemoryStagingListResponse {
         limit,
         returned_count,
@@ -107,6 +68,7 @@ pub fn list_memory_staging_from_authority<A: MemoryAuthority>(
         order: "imported_at_desc_candidate_id_asc".to_string(),
         record_authority: "sqlite_workspace_authority.memory_staging".to_string(),
         items: valid_items,
+        diagnostics,
     })
 }
 
@@ -133,23 +95,24 @@ pub fn memory_staging_backlog_from_authority<A: MemoryAuthority>(
     })
 }
 
-fn memory_staging_record_summary(record: StagingRecord) -> MemoryStagingRecordSummary {
-    MemoryStagingRecordSummary {
+fn memory_staging_record_projection(record: StagingRecord) -> MemoryStagingRecord {
+    MemoryStagingRecord {
         schema_version: record.schema_version,
         id: record.id,
         extract_run_id: record.extract_run_id,
-        source: record.source,
-        kind: record.kind.as_str().to_string(),
+        source: memory_source_ref_projection(record.source),
+        kind: memory_candidate_kind_projection(record.kind),
         claim: record.claim,
         why_useful: record.why_useful,
         staleness: record.staleness,
         evidence: record
             .evidence
             .into_iter()
-            .map(|evidence| MemoryStagingEvidenceSummary {
+            .map(|evidence| MemoryStagingEvidence {
                 id: evidence.id,
                 kind: evidence.kind.as_str().to_string(),
                 entry_range: evidence.entry_range,
+                origin: evidence.origin.map(memory_evidence_origin_projection),
                 excerpt: evidence.excerpt,
                 summary: evidence.summary,
             })
@@ -157,24 +120,63 @@ fn memory_staging_record_summary(record: StagingRecord) -> MemoryStagingRecordSu
         source_refs: record
             .source_refs
             .into_iter()
-            .map(memory_source_evidence_ref_summary)
+            .map(memory_source_evidence_ref_projection)
             .collect(),
     }
 }
 
-fn memory_source_evidence_ref_summary(
-    source_ref: SourceEvidenceRef,
-) -> MemorySourceEvidenceRefSummary {
-    MemorySourceEvidenceRefSummary {
+fn memory_source_ref_projection(source_ref: SourceRef) -> MemorySourceRef {
+    MemorySourceRef {
+        segment_id: source_ref.segment_id,
+        range: source_ref.range,
+    }
+}
+
+fn memory_candidate_kind_projection(kind: CandidateKind) -> MemoryCandidateKind {
+    match kind {
+        CandidateKind::Preference => MemoryCandidateKind::Preference,
+        CandidateKind::WorkingAssumption => MemoryCandidateKind::WorkingAssumption,
+        CandidateKind::Constraint => MemoryCandidateKind::Constraint,
+        CandidateKind::Decision => MemoryCandidateKind::Decision,
+        CandidateKind::OpenQuestion => MemoryCandidateKind::OpenQuestion,
+        CandidateKind::Lesson => MemoryCandidateKind::Lesson,
+    }
+}
+
+fn memory_source_evidence_ref_projection(source_ref: SourceEvidenceRef) -> MemorySourceEvidenceRef {
+    MemorySourceEvidenceRef {
         session_id: source_ref.session_id,
         segment_id: source_ref.segment_id,
         entry_range: source_ref.entry_range,
         evidence_id: source_ref.evidence_id,
+        origin: source_ref.origin.map(memory_evidence_origin_projection),
         evidence_kind: source_ref
             .evidence_kind
             .map(|evidence_kind| evidence_kind.as_str().to_string()),
         label: source_ref.label,
         summary: source_ref.summary,
+    }
+}
+
+fn memory_evidence_origin_projection(origin: EvidenceOrigin) -> MemoryEvidenceOrigin {
+    MemoryEvidenceOrigin {
+        kind: match origin.kind {
+            EvidenceOriginKind::HumanInput => MemoryEvidenceOriginKind::HumanInput,
+            EvidenceOriginKind::WorkerInput => MemoryEvidenceOriginKind::WorkerInput,
+            EvidenceOriginKind::FlowInstruction => MemoryEvidenceOriginKind::FlowInstruction,
+            EvidenceOriginKind::BackendInstruction => MemoryEvidenceOriginKind::BackendInstruction,
+            EvidenceOriginKind::ModelOutput => MemoryEvidenceOriginKind::ModelOutput,
+            EvidenceOriginKind::ToolOutput => MemoryEvidenceOriginKind::ToolOutput,
+            EvidenceOriginKind::DerivedSummary => MemoryEvidenceOriginKind::DerivedSummary,
+            EvidenceOriginKind::LegacyUnknown => MemoryEvidenceOriginKind::LegacyUnknown,
+        },
+        account_id: origin.account_id,
+        workspace_id: origin.workspace_id,
+        runtime_id: origin.runtime_id,
+        worker_id: origin.worker_id,
+        flow_selector: origin.flow_selector,
+        flow_definition_id: origin.flow_definition_id,
+        flow_definition_revision: origin.flow_definition_revision,
     }
 }
 
@@ -184,6 +186,7 @@ mod tests {
     use crate::authority::{MemoryAuthority, SqliteWorkspaceAuthority};
     use crate::store::{ControlPlaneStore, SqliteWorkspaceStore, WorkspaceRecord};
     use memory::extract::{CandidateKind, ExtractedCandidate, StagingRecord};
+    use memory::schema::{EvidenceOrigin, EvidenceOriginKind, SourceEvidenceRef};
     use tempfile::TempDir;
 
     fn source() -> SourceRef {
@@ -258,7 +261,114 @@ mod tests {
             response.record_authority,
             "sqlite_workspace_authority.memory_staging"
         );
-        assert_eq!(response.items[0].record.kind, "decision");
+        assert_eq!(response.items[0].record.kind, MemoryCandidateKind::Decision);
+        assert!(response.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn projects_every_typed_evidence_origin_without_flattening() {
+        let cases = [
+            (
+                EvidenceOriginKind::HumanInput,
+                MemoryEvidenceOriginKind::HumanInput,
+            ),
+            (
+                EvidenceOriginKind::WorkerInput,
+                MemoryEvidenceOriginKind::WorkerInput,
+            ),
+            (
+                EvidenceOriginKind::FlowInstruction,
+                MemoryEvidenceOriginKind::FlowInstruction,
+            ),
+            (
+                EvidenceOriginKind::BackendInstruction,
+                MemoryEvidenceOriginKind::BackendInstruction,
+            ),
+            (
+                EvidenceOriginKind::ModelOutput,
+                MemoryEvidenceOriginKind::ModelOutput,
+            ),
+            (
+                EvidenceOriginKind::ToolOutput,
+                MemoryEvidenceOriginKind::ToolOutput,
+            ),
+            (
+                EvidenceOriginKind::DerivedSummary,
+                MemoryEvidenceOriginKind::DerivedSummary,
+            ),
+            (
+                EvidenceOriginKind::LegacyUnknown,
+                MemoryEvidenceOriginKind::LegacyUnknown,
+            ),
+        ];
+
+        for (domain_kind, api_kind) in cases {
+            let projected = memory_source_evidence_ref_projection(SourceEvidenceRef {
+                session_id: Some("session-1".to_string()),
+                origin: Some(EvidenceOrigin {
+                    kind: domain_kind,
+                    account_id: Some("account-1".to_string()),
+                    workspace_id: Some("workspace-test".to_string()),
+                    runtime_id: Some("runtime-1".to_string()),
+                    worker_id: Some("worker-1".to_string()),
+                    flow_selector: Some("builtin:coder-review".to_string()),
+                    flow_definition_id: Some("flow-1".to_string()),
+                    flow_definition_revision: Some(7),
+                }),
+                ..SourceEvidenceRef::default()
+            });
+            let origin = projected.origin.unwrap();
+            assert_eq!(origin.kind, api_kind);
+            assert_eq!(origin.account_id.as_deref(), Some("account-1"));
+            assert_eq!(origin.workspace_id.as_deref(), Some("workspace-test"));
+            assert_eq!(origin.runtime_id.as_deref(), Some("runtime-1"));
+            assert_eq!(origin.worker_id.as_deref(), Some("worker-1"));
+            assert_eq!(
+                origin.flow_selector.as_deref(),
+                Some("builtin:coder-review")
+            );
+            assert_eq!(origin.flow_definition_id.as_deref(), Some("flow-1"));
+            assert_eq!(origin.flow_definition_revision, Some(7));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_or_newer_origin_shapes_are_excluded_with_bounded_diagnostic() {
+        let (_temp, authority) = authority().await;
+        for (id, origin) in [
+            (
+                "unknown-origin-kind",
+                serde_json::json!({"kind": "future_origin_kind"}),
+            ),
+            (
+                "newer-origin-shape",
+                serde_json::json!({"kind": "human_input", "future_field": "do not echo me"}),
+            ),
+        ] {
+            let mut record: serde_json::Value =
+                serde_json::from_str(&record_json(id, "claim")).unwrap();
+            record["source_refs"] = serde_json::json!([{"origin": origin}]);
+            authority
+                .upsert_memory_staging_record(id, &serde_json::to_string(&record).unwrap(), None)
+                .unwrap();
+        }
+
+        let response = list_memory_staging_from_authority(&authority, None).unwrap();
+
+        assert_eq!(response.returned_count, 0);
+        assert_eq!(response.invalid_count, 2);
+        assert_eq!(response.diagnostics.len(), 1);
+        assert_eq!(
+            response.diagnostics[0].code,
+            "memory_staging_record_invalid"
+        );
+        assert_eq!(response.diagnostics[0].severity, DiagnosticSeverity::Error);
+        assert!(
+            !response.diagnostics[0]
+                .message
+                .contains("future_origin_kind")
+        );
+        assert!(!response.diagnostics[0].message.contains("do not echo me"));
     }
 
     #[tokio::test]

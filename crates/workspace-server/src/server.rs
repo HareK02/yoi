@@ -41,9 +41,7 @@ use tower::ServiceExt;
 use url::Url;
 use uuid::Uuid;
 use webauthn_rs::prelude::{
-    CreationChallengeResponse, Passkey, PasskeyAuthentication, PasskeyRegistration,
-    PublicKeyCredential, RegisterPublicKeyCredential, RequestChallengeResponse, Webauthn,
-    WebauthnBuilder,
+    Passkey, PasskeyAuthentication, PasskeyRegistration, Webauthn, WebauthnBuilder,
 };
 use workdir::http::{
     WorkdirSessionOperation, WorkdirSessionOperationResult, WorkdirTransportError,
@@ -58,18 +56,26 @@ use worker::feature::builtin::{WorkerObservationSubject, WorkerObservationSubjec
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 use workspace_api::{
-    BrowserCreateWorkerResponse, BrowserWorkspaceOrchestratorResponse, CreateRemoteRuntimeRequest,
-    CreateRepositorySshCredentialRequest, CreateWorkspaceRepositoryRequest,
-    CreateWorkspaceRepositoryResponse, CreateWorkspaceWorkerRequest,
-    CreateWorkspaceWorkerTicketAssignmentRequest, DeleteRepositorySshCredentialRequest,
-    DeleteRepositorySshHostTrustRequest, ObjectiveCreateRequest, ObjectiveEditRequest,
-    ObjectiveLinkTicketRequest, ObjectiveStateRequest, ProfileSettingsResponse,
-    PutRepositorySshHostTrustRequest, RepositoryAccessProjection, RepositoryDetailResponse,
-    RepositoryListResponse, RepositoryLogResponse, RepositorySshCredential, RepositorySshHostTrust,
+    ActorAuthMethod, AuthBootstrapUserRequest, AuthPublicConfig, AuthUserResponse,
+    AuthenticatedUser, BrowserCreateWorkerResponse, BrowserWorkspaceOrchestratorResponse,
+    CreateRemoteRuntimeRequest, CreateRepositorySshCredentialRequest,
+    CreateWorkspaceRepositoryRequest, CreateWorkspaceRepositoryResponse,
+    CreateWorkspaceWorkerRequest, CreateWorkspaceWorkerTicketAssignmentRequest,
+    DeleteRepositorySshCredentialRequest, DeleteRepositorySshHostTrustRequest,
+    DeviceAccessTokenType, DeviceLoginApprovalStatus, DeviceLoginApproveRequest,
+    DeviceLoginApproveResponse, DeviceLoginPollRequest, DeviceLoginPollResponse,
+    DeviceLoginPollStatus, DeviceLoginStartRequest, DeviceLoginStartResponse, LogoutResponse,
+    LogoutStatus, MemoryDocumentResponse, MemoryStagingListResponse, ObjectiveCreateRequest,
+    ObjectiveEditRequest, ObjectiveLinkTicketRequest, ObjectiveStateRequest,
+    PasskeyLoginCompleteRequest, PasskeyLoginOptionsRequest, PasskeyLoginOptionsResponse,
+    PasskeyRegistrationCompleteRequest, PasskeyRegistrationOptionsRequest,
+    PasskeyRegistrationOptionsResponse, ProfileSettingsResponse, PutRepositorySshHostTrustRequest,
+    RepositoryAccessProjection, RepositoryDetailResponse, RepositoryListResponse,
+    RepositoryLogResponse, RepositorySshCredential, RepositorySshHostTrust, RequestActor,
     RotateRepositorySshCredentialRequest, RuntimeConnectionTestResponse, RuntimeManagementSummary,
     TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
-    UpdateWorkspaceMetadataRequest, WorkerLaunchOptionsResponse, WorkerLaunchProfileCandidate,
-    WorkerLaunchRuntimeOption, WorkerLaunchWorkerSummary,
+    UpdateWorkspaceMetadataRequest, WhoamiResponse, WorkerLaunchOptionsResponse,
+    WorkerLaunchProfileCandidate, WorkerLaunchRuntimeOption, WorkerLaunchWorkerSummary,
     WorkingDirectoryCreateRequest as BrowserWorkingDirectoryCreateRequest,
     WorkingDirectoryCreateResponse as BrowserWorkingDirectoryCreateResponse,
     WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
@@ -84,9 +90,9 @@ use workspace_api::{
 };
 
 use crate::auth::{
-    ActorAuthMethod, AuthPublicConfig, AuthenticatedUser, RequestActor, SessionCookiePolicy,
-    auth_error, is_expired, mint_secret, new_id, new_user_code, normalize_handle, parse_cookie,
-    resolve_request_actor, rfc3339_after, session_set_cookie, token_hash,
+    SessionCookiePolicy, auth_error, is_expired, mint_secret, new_id, new_user_code,
+    normalize_handle, parse_cookie, resolve_request_actor, rfc3339_after, session_set_cookie,
+    token_hash,
 };
 use crate::authority::{
     MemoryAuthority, ObjectiveAuthority, ObjectiveCreateInput, ObjectiveEditInput,
@@ -113,8 +119,7 @@ use crate::hosts::{
 use crate::identity::WorkspaceIdentity;
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
 use crate::memory_staging::{
-    MemoryStagingListResponse, list_memory_staging_from_authority,
-    memory_staging_backlog_from_authority,
+    list_memory_staging_from_authority, memory_staging_backlog_from_authority,
 };
 use crate::observation::{
     BackendObservationProxy, ObservationProxyError, RuntimeObservationClient,
@@ -7917,15 +7922,6 @@ fn find_workspace_orchestrator(api: &WorkspaceApi) -> Option<WorkerSummary> {
     None
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct MemoryDocumentResponse {
-    body_md: String,
-    created_at: String,
-    updated_at: String,
-    bytes: usize,
-    record_source: String,
-}
-
 async fn scoped_get_memory_document(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -11486,118 +11482,6 @@ async fn scoped_list_host_workers(
     list_host_workers(State(api), AxumPath(path.host_id)).await
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AuthBootstrapUserRequest {
-    handle: String,
-    #[serde(default)]
-    display_name: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct AuthUserResponse {
-    user: AuthenticatedUser,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PasskeyRegistrationOptionsRequest {
-    handle: String,
-    #[serde(default)]
-    display_name: Option<String>,
-    #[serde(default)]
-    browser_origin: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PasskeyRegistrationOptionsResponse {
-    challenge_id: String,
-    public_key: CreationChallengeResponse,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PasskeyRegistrationCompleteRequest {
-    challenge_id: String,
-    credential: RegisterPublicKeyCredential,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PasskeyLoginOptionsRequest {
-    #[serde(default)]
-    handle: Option<String>,
-    #[serde(default)]
-    browser_origin: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PasskeyLoginOptionsResponse {
-    challenge_id: String,
-    public_key: RequestChallengeResponse,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PasskeyLoginCompleteRequest {
-    challenge_id: String,
-    credential: PublicKeyCredential,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DeviceLoginStartRequest {
-    #[serde(default)]
-    client_name: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct DeviceLoginStartResponse {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
-    verification_uri_complete: String,
-    expires_in: u64,
-    interval: u64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DeviceLoginApproveRequest {
-    user_code: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct DeviceLoginApproveResponse {
-    status: String,
-    user: AuthenticatedUser,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DeviceLoginPollRequest {
-    device_code: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct DeviceLoginPollResponse {
-    status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    access_token: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    token_type: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct WhoamiResponse {
-    actor: Option<RequestActor>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LogoutResponse {
-    status: String,
-}
-
 async fn get_auth_config(State(api): State<ServerAuthApi>) -> ApiResult<Json<AuthPublicConfig>> {
     Ok(Json(auth_public_config(&api.config)))
 }
@@ -12002,7 +11886,7 @@ async fn post_device_login_approve(
         .into());
     }
     Ok(Json(DeviceLoginApproveResponse {
-        status: "approved".to_string(),
+        status: DeviceLoginApprovalStatus::Approved,
         user: actor.user(),
     }))
 }
@@ -12019,14 +11903,14 @@ async fn post_device_login_poll(
     };
     if is_expired(&flow.expires_at) {
         return Ok(Json(DeviceLoginPollResponse {
-            status: "expired".to_string(),
+            status: DeviceLoginPollStatus::Expired,
             access_token: None,
             token_type: None,
         }));
     }
     if flow.approved_at.is_none() {
         return Ok(Json(DeviceLoginPollResponse {
-            status: "pending".to_string(),
+            status: DeviceLoginPollStatus::Pending,
             access_token: None,
             token_type: None,
         }));
@@ -12036,15 +11920,15 @@ async fn post_device_login_poll(
         .consume_device_login_token(&request.device_code, &crate::auth::now_rfc3339())?
     else {
         return Ok(Json(DeviceLoginPollResponse {
-            status: "consumed".to_string(),
+            status: DeviceLoginPollStatus::Consumed,
             access_token: None,
             token_type: None,
         }));
     };
     Ok(Json(DeviceLoginPollResponse {
-        status: "approved".to_string(),
+        status: DeviceLoginPollStatus::Approved,
         access_token: consumed.issued_access_token,
-        token_type: Some("Bearer".to_string()),
+        token_type: Some(DeviceAccessTokenType::Bearer),
     }))
 }
 
@@ -12082,7 +11966,7 @@ async fn post_auth_logout(
     Ok((
         response_headers,
         Json(LogoutResponse {
-            status: "logged_out".to_string(),
+            status: LogoutStatus::LoggedOut,
         }),
     )
         .into_response())
@@ -26478,6 +26362,8 @@ mod tests {
 
         let memory_document =
             get_json(app.clone(), &format!("/api/w/{TEST_WORKSPACE_ID}/memory")).await;
+        let _: workspace_api::MemoryDocumentResponse =
+            serde_json::from_value(memory_document.clone()).unwrap();
         assert_eq!(memory_document["created_at"], "2026-01-01T00:00:00Z");
         assert_eq!(memory_document["updated_at"], "2026-01-02T00:00:00Z");
         assert_eq!(memory_document["bytes"], 63);
@@ -26494,6 +26380,8 @@ mod tests {
             &format!("/api/w/{TEST_WORKSPACE_ID}/memory/staging?limit=10"),
         )
         .await;
+        let _: workspace_api::MemoryStagingListResponse =
+            serde_json::from_value(memory_staging.clone()).unwrap();
         assert_eq!(
             memory_staging["record_authority"],
             "sqlite_workspace_authority.memory_staging"

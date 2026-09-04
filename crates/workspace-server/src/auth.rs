@@ -1,53 +1,10 @@
 use axum::http::{HeaderMap, header};
 use chrono::{DateTime, Duration, Utc};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+pub use workspace_api::{ActorAuthMethod, AuthPublicConfig, AuthenticatedUser, RequestActor};
 
 use crate::{Error, Result, store::ControlPlaneStore};
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthPublicConfig {
-    pub rp_id: String,
-    pub origin: String,
-    pub public_base_url: String,
-    pub cookie_name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RequestActor {
-    pub user_id: String,
-    pub account_id: String,
-    pub handle: String,
-    pub display_name: String,
-    pub auth_method: ActorAuthMethod,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ActorAuthMethod {
-    BrowserSession,
-    ApiToken,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthenticatedUser {
-    pub user_id: String,
-    pub account_id: String,
-    pub handle: String,
-    pub display_name: String,
-}
-
-impl RequestActor {
-    pub fn user(&self) -> AuthenticatedUser {
-        AuthenticatedUser {
-            user_id: self.user_id.clone(),
-            account_id: self.account_id.clone(),
-            handle: self.handle.clone(),
-            display_name: self.display_name.clone(),
-        }
-    }
-}
 
 pub fn normalize_handle(handle: &str) -> Result<String> {
     let normalized = handle.trim().to_ascii_lowercase();

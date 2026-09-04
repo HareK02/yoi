@@ -13,9 +13,8 @@ pkgs.mkShell {
   PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
   PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
 
-  # sccache is additive to Cargo's shared build-dir, so keep its disk usage bounded.
+  # Cache storage and limits belong to the host's sccache configuration.
   RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
-  SCCACHE_CACHE_SIZE = "5G";
 
   buildInputs = with pkgs; [
     pkg-config

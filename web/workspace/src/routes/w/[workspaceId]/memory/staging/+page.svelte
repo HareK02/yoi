@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { MemoryStagingEntry, MemoryStagingRecord } from '$lib/workspace/sidebar/types';
+  import type { MemoryStagingEntry, MemoryStagingRecord } from '$lib/generated/memory-api';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
@@ -67,6 +67,12 @@
     {#if data.staging.data.truncated}
       <p class="section-note">Showing first {data.staging.data.limit} staged record(s).</p>
     {/if}
+
+    {#each data.staging.data.diagnostics as diagnostic (diagnostic.code)}
+      <p class:error={diagnostic.severity === 'error'} class="section-note">
+        {diagnostic.message}
+      </p>
+    {/each}
 
     {#if entries.length === 0}
       <p>No Memory Staging records are present.</p>

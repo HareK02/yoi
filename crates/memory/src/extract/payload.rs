@@ -74,6 +74,7 @@ impl ExtractedPayload {
 
 /// Bounded evidence snippet copied into a flat staging record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StagingEvidence {
     pub id: String,
     pub kind: EvidenceKind,
@@ -89,6 +90,7 @@ pub struct StagingEvidence {
 
 /// One flat staging record. One record is one consolidation decision unit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StagingRecord {
     pub schema_version: u32,
     pub id: String,
