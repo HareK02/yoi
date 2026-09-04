@@ -23,7 +23,7 @@ It is not a dumping ground for external research, old plans, API inventories, or
 15. [`development/work-items.md`](development/work-items.md) — how project work is recorded and reviewed.
 16. [`development/rust-testing-strategy.md`](development/rust-testing-strategy.md) — what Yoi Rust tests should prove, where they belong, and how to name them.
 17. [`development/validation.md`](development/validation.md) — how to check changes.
-18. [`development/workspace-schema-migrations.md`](development/workspace-schema-migrations.md) — how to preflight, apply, verify, and roll back control-plane SQLite schema changes.
+18. [`development/workspace-schema-migrations.md`](development/workspace-schema-migrations.md) — the canonical SQLite baseline, compatibility fence, and manual dogfooding-data repair procedure.
 19. [`design/standalone-agent-host.md`](design/standalone-agent-host.md) — in-process standalone Worker host の依存方向、authority、lifecycle、非目標。
 
 ## What belongs here

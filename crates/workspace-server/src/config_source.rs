@@ -1513,33 +1513,6 @@ mod tests {
         assert_eq!(revision, first.snapshot);
     }
 
-    #[tokio::test]
-    async fn migration_materializes_main_for_existing_workspace_without_config() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::store::configure_sqlite(&conn).unwrap();
-        crate::store::apply_migrations_through(&conn, 30).unwrap();
-        conn.execute(
-            "INSERT INTO workspaces (
-                workspace_id, display_name, state, created_at, updated_at
-             ) VALUES ('legacy', 'Legacy', 'active', '2026-08-06T00:00:00Z', '2026-08-06T00:00:00Z')",
-            [],
-        )
-        .unwrap();
-        crate::store::persist_workspace_config_schema_bundles(&conn).unwrap();
-        crate::store::materialize_main_config_entrypoint(&conn).unwrap();
-        let state = load_state(&conn, "legacy").unwrap().unwrap();
-        assert!(
-            state
-                .snapshot
-                .entries
-                .contains_key(&path(MAIN_CONFIG_ENTRYPOINT))
-        );
-        assert_eq!(
-            state.contract.entrypoints,
-            vec![path(MAIN_CONFIG_ENTRYPOINT)]
-        );
-    }
-
     #[test]
     fn exports_typescript_transport_contract() {
         use ts_rs::TS;

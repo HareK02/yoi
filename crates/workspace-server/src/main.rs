@@ -20,7 +20,6 @@ enum Command {
     Serve(ServeOptions),
     Identity(Vec<String>),
     TrustRuntime(Vec<String>),
-    MigrateDryRun { database: Option<PathBuf> },
     Skills(SkillsCommand),
     Help,
 }
@@ -71,17 +70,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Serve(options) => run_serve(options).await,
         Command::Identity(args) => run_identity_command(args),
         Command::TrustRuntime(args) => run_trust_runtime_command(args),
-        Command::MigrateDryRun { database } => {
-            let database = database.unwrap_or_else(ServerConfig::default_server_database_path);
-            let plan = SqliteWorkspaceStore::migration_plan(&database).map_err(|error| {
-                CliError(format!(
-                    "migration dry-run failed for {}: {error}",
-                    database.display()
-                ))
-            })?;
-            println!("{}", serde_json::to_string_pretty(&plan)?);
-            Ok(())
-        }
         Command::Skills(command) => run_skills(command),
         Command::Help => Ok(()),
     }
@@ -96,7 +84,6 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
     match command.as_str() {
         "identity" => Ok(Command::Identity(rest.to_vec())),
         "trust-runtime" => Ok(Command::TrustRuntime(rest.to_vec())),
-        "migrate" => parse_migrate_command(rest),
         "skills" => parse_skills_command(rest),
         "serve" => {
             if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -625,32 +612,6 @@ fn workspace_root_from_server_data(workspace: &WorkspaceRecord) -> Result<PathBu
     ))
 }
 
-fn parse_migrate_command(args: &[String]) -> Result<Command, CliError> {
-    let mut dry_run = false;
-    let mut database = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--dry-run" => dry_run = true,
-            "--database" => {
-                index += 1;
-                database =
-                    Some(PathBuf::from(args.get(index).ok_or_else(|| {
-                        CliError("--database requires a path".to_string())
-                    })?));
-            }
-            value => {
-                return Err(CliError(format!("unknown migrate option: {value}")));
-            }
-        }
-        index += 1;
-    }
-    if !dry_run {
-        return Err(CliError("migrate currently requires --dry-run".to_string()));
-    }
-    Ok(Command::MigrateDryRun { database })
-}
-
 fn parse_skills_command(args: &[String]) -> Result<Command, CliError> {
     let Some((subcommand, rest)) = args.split_first() else {
         print_skills_help();
@@ -770,8 +731,7 @@ fn parse_listen(value: &str) -> Result<SocketAddr, CliError> {
 
 fn print_help() {
     println!(
-        "yoi-server\n\nUsage:\n  yoi-server identity init --server-id <SERVER_ID> [--replace]\n  yoi-server identity show [--json]\n  yoi-server trust-runtime add --runtime-id <RUNTIME_ID> --workspace-id <WORKSPACE_ID> --base-url <URL> --public-key <KEY> [--display-name <NAME>] [--replace]\n  yoi-server trust-runtime list [--json] [--include-revoked]\n  yoi-server trust-runtime revoke --runtime-id <RUNTIME_ID>\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server migrate --dry-run [--database <PATH>]
-  yoi-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
+        "yoi-server\n\nUsage:\n  yoi-server identity init --server-id <SERVER_ID> [--replace]\n  yoi-server identity show [--json]\n  yoi-server trust-runtime add --runtime-id <RUNTIME_ID> --workspace-id <WORKSPACE_ID> --base-url <URL> --public-key <KEY> [--display-name <NAME>] [--replace]\n  yoi-server trust-runtime list [--json] [--include-revoked]\n  yoi-server trust-runtime revoke --runtime-id <RUNTIME_ID>\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
     );
 }
 
@@ -783,8 +743,7 @@ fn print_skills_help() {
 
 fn print_serve_help() {
     println!(
-        "yoi-server serve\n\nUsage:\n  yoi-server migrate --dry-run [--database <PATH>]
-  yoi-server serve [OPTIONS]\n\nDescription:\n  Serves Workspaces recorded in the Yoi server DB. Host-level deployment settings are loaded from the explicit --config path or the canonical XDG yoi/server.toml path, and runtime sources are loaded from XDG runtimes.toml.\n\nOptions:\n      --listen <ADDR>     Listen address (default 127.0.0.1:8787)\n      --config <PATH>     Host-level Server config path\n  -h, --help              Print help"
+        "yoi-server serve\n\nUsage:\n  yoi-server serve [OPTIONS]\n\nDescription:\n  Serves Workspaces recorded in the Yoi server DB. Host-level deployment settings are loaded from the explicit --config path or the canonical XDG yoi/server.toml path, and runtime sources are loaded from XDG runtimes.toml.\n\nOptions:\n      --listen <ADDR>     Listen address (default 127.0.0.1:8787)\n      --config <PATH>     Host-level Server config path\n  -h, --help              Print help"
     );
 }
 
@@ -821,22 +780,6 @@ mod tests {
         };
         assert_eq!(workspace_id, "workspace-a");
         assert_eq!(name, "debug-rust");
-    }
-
-    #[test]
-    fn parse_migrate_requires_dry_run_and_accepts_database_path() {
-        let error = parse_migrate_command(&[]).unwrap_err();
-        assert_eq!(error.to_string(), "migrate currently requires --dry-run");
-        let command = parse_migrate_command(&[
-            "--dry-run".to_string(),
-            "--database".to_string(),
-            "/tmp/server.db".to_string(),
-        ])
-        .unwrap();
-        let Command::MigrateDryRun { database } = command else {
-            panic!("expected migration dry-run command");
-        };
-        assert_eq!(database, Some(PathBuf::from("/tmp/server.db")));
     }
 
     #[test]

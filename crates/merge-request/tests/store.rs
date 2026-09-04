@@ -301,21 +301,13 @@ fn review_revocation_invalidates_readiness() {
 }
 
 #[test]
-fn legacy_v11_migration_preserves_review_events_and_replaces_marker() {
+fn fresh_schema_uses_version_12_and_reopens_as_current() {
     let c = Connection::open_in_memory().unwrap();
-    c.execute_batch("CREATE TABLE repositories(workspace_id TEXT,repository_id TEXT,PRIMARY KEY(workspace_id,repository_id));CREATE TABLE typed_tickets(workspace_id TEXT,ticket_id TEXT,PRIMARY KEY(workspace_id,ticket_id));INSERT INTO repositories VALUES('W','R');INSERT INTO typed_tickets VALUES('W','T');CREATE TABLE merge_request_schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);INSERT INTO merge_request_schema_migrations(version) VALUES(11);CREATE TABLE merge_requests(workspace_id TEXT,merge_request_id TEXT,repository_id TEXT,state TEXT,target_ref_selector TEXT,current_revision_ordinal INTEGER,current_revision_id TEXT,created_at TEXT,updated_at TEXT,merged_revision_id TEXT,merged_at TEXT);CREATE TABLE merge_request_ticket_relations(workspace_id TEXT,merge_request_id TEXT,ticket_id TEXT,relation_kind TEXT,created_at TEXT);CREATE TABLE merge_request_revisions(workspace_id TEXT,merge_request_id TEXT,revision_id TEXT,ordinal INTEGER,base_commit TEXT,head_commit TEXT,diff_digest TEXT,summary TEXT,assignment_id TEXT,created_at TEXT);CREATE TABLE merge_request_revision_paths(workspace_id TEXT,merge_request_id TEXT,revision_id TEXT,ordinal INTEGER,path TEXT);CREATE TABLE merge_request_reviewer_child_sessions(workspace_id TEXT,child_session_id TEXT,parent_runtime_id TEXT,parent_worker_id TEXT,reviewer_profile TEXT,registered_at TEXT);CREATE TABLE merge_request_review_attempts(workspace_id TEXT,attempt_id TEXT,merge_request_id TEXT,ticket_id TEXT,revision_id TEXT,revision_ordinal INTEGER,parent_assignment_id TEXT,parent_runtime_id TEXT,parent_worker_id TEXT,child_session_id TEXT,reviewer_effective_profile TEXT,capability_token TEXT,status TEXT,created_at TEXT,consumed_at TEXT);CREATE TABLE merge_request_reviews(workspace_id TEXT,attempt_id TEXT,merge_request_id TEXT,revision_id TEXT,decision TEXT,body TEXT,submitted_at TEXT);CREATE TABLE merge_request_review_findings(workspace_id TEXT,attempt_id TEXT,ordinal INTEGER,severity TEXT,code TEXT,path TEXT,line INTEGER,body TEXT);CREATE TABLE merge_request_completion_operations(workspace_id TEXT,operation_id TEXT,ticket_id TEXT,revision_id TEXT,authority_kind TEXT,implementation_assignment_id TEXT,completion_actor_runtime_id TEXT,completion_actor_worker_id TEXT,target_commit TEXT,source_commit TEXT,result_commit TEXT,strategy TEXT,resolution TEXT,fingerprint TEXT,status TEXT,result_ticket_state TEXT,created_at TEXT,updated_at TEXT);INSERT INTO merge_requests VALUES('W','MR','R','open','develop',1,'V','2026-07-26T12:00:00Z','2026-07-26T12:00:00Z',NULL,NULL);INSERT INTO merge_request_ticket_relations VALUES('W','MR','T','implements','2026-07-26T12:00:00Z');INSERT INTO merge_request_revisions VALUES('W','MR','V',1,'base','subject','digest','summary','A','2026-07-26T12:00:00Z');INSERT INTO merge_request_review_attempts VALUES('W','AT','MR','T','V',1,'A','runtime','coder','child','builtin:reviewer','token','submitted','2026-07-26T12:00:00Z','2026-07-26T12:00:01Z');INSERT INTO merge_request_reviews VALUES('W','AT','MR','V','approve','approved','2026-07-26T12:00:01Z');INSERT INTO merge_request_review_attempts VALUES('W','PENDING','MR','T','V',1,'A','runtime','coder','pending-child','builtin:reviewer','pending-token','registered','2026-07-26T12:00:02Z',NULL);").unwrap();
     c.execute_batch(
-        "CREATE TABLE unrelated_parent(left_id TEXT,right_id TEXT,PRIMARY KEY(left_id,right_id));CREATE TABLE unrelated_child(left_id TEXT REFERENCES unrelated_parent(left_id));",
+        "CREATE TABLE repositories(workspace_id TEXT,repository_id TEXT,PRIMARY KEY(workspace_id,repository_id));CREATE TABLE typed_tickets(workspace_id TEXT,ticket_id TEXT,PRIMARY KEY(workspace_id,ticket_id));",
     )
     .unwrap();
-    let unrelated_mismatch = c
-        .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
-        .unwrap_err();
-    assert!(
-        unrelated_mismatch
-            .to_string()
-            .contains("foreign key mismatch")
-    );
+
     merge_request::migrate(&c).unwrap();
     assert_eq!(
         c.query_row("SELECT version FROM merge_request_schema", [], |r| {
@@ -324,66 +316,26 @@ fn legacy_v11_migration_preserves_review_events_and_replaces_marker() {
         .unwrap(),
         12
     );
-    let legacy_marker: bool = c
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='merge_request_schema_migrations')",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert!(!legacy_marker);
-    let selector: Option<String> = c
-        .query_row("SELECT selector_from FROM merge_requests", [], |r| r.get(0))
-        .unwrap();
-    assert!(selector.is_none());
-    let kinds: String = c
-        .query_row(
-            "SELECT group_concat(kind,',') FROM merge_request_thread_events ORDER BY sequence",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        kinds,
-        "review_requested,review,review_requested,review_cancelled"
-    );
-    let old: bool = c
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='merge_request_revisions')",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert!(!old);
+    merge_request::migrate(&c).unwrap();
 }
 
 #[test]
-fn failed_legacy_v11_migration_rolls_back_marker_bridge() {
+fn current_schema_validation_rejects_missing_tables() {
     let c = Connection::open_in_memory().unwrap();
     c.execute_batch(
-        "CREATE TABLE merge_request_schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);INSERT INTO merge_request_schema_migrations(version) VALUES(11);CREATE TABLE merge_requests(merge_request_id TEXT);",
+        "CREATE TABLE repositories(workspace_id TEXT,repository_id TEXT,PRIMARY KEY(workspace_id,repository_id));CREATE TABLE typed_tickets(workspace_id TEXT,ticket_id TEXT,PRIMARY KEY(workspace_id,ticket_id));",
     )
     .unwrap();
-
-    assert!(merge_request::migrate(&c).is_err());
-    for table in ["merge_request_schema_migrations", "merge_requests"] {
-        let exists: bool = c
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-                [table],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(exists, "{table} was not rolled back");
-    }
-    let current_marker: bool = c
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='merge_request_schema')",
-            [],
-            |r| r.get(0),
-        )
+    merge_request::migrate(&c).unwrap();
+    c.execute_batch("DROP TABLE merge_request_review_grants;")
         .unwrap();
-    assert!(!current_marker);
+
+    let error = merge_request::migrate(&c).unwrap_err();
+    assert!(matches!(
+        error,
+        MergeRequestError::Corrupt(message)
+            if message == "missing `merge_request_review_grants`"
+    ));
 }
 
 #[test]

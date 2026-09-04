@@ -91,44 +91,6 @@ pub struct WorkdirRemovalGuard {
     pub detail: &'static str,
 }
 
-pub(crate) fn create_workdir_removal_operations(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        r#"
-CREATE TABLE workdir_removal_operations (
-    workspace_id TEXT NOT NULL,
-    operation_id TEXT NOT NULL,
-    request_fingerprint TEXT NOT NULL,
-    workdir_id TEXT NOT NULL,
-    runtime_id TEXT NOT NULL,
-    repository_id TEXT NOT NULL,
-    materialization_fingerprint TEXT NOT NULL,
-    source_actor TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('pending', 'failed', 'completed')),
-    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
-    retryable INTEGER NOT NULL CHECK (retryable IN (0, 1)),
-    disposition TEXT CHECK (disposition IN ('removed', 'retained', 'attention_required')),
-    failure_category TEXT,
-    attempt_owner_pid INTEGER CHECK (attempt_owner_pid > 0),
-    attempt_owner_start_marker INTEGER CHECK (attempt_owner_start_marker >= 0),
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    completed_at TEXT,
-    PRIMARY KEY (workspace_id, operation_id),
-    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
-);
-CREATE UNIQUE INDEX idx_workdir_removal_operations_one_pending
-    ON workdir_removal_operations(workspace_id, workdir_id)
-    WHERE state = 'pending';
-CREATE INDEX idx_workdir_removal_operations_recovery
-    ON workdir_removal_operations(workspace_id, state, retryable, updated_at);
-CREATE INDEX idx_workdir_removal_operations_workdir
-    ON workdir_removal_operations(workspace_id, workdir_id, created_at DESC);
-"#,
-    )?;
-    Ok(())
-}
-
 pub fn workdir_materialization_fingerprint(record: &WorkdirRegistryRecord) -> String {
     let bytes = serde_json::to_vec(&serde_json::json!([
         record.workspace_id,
