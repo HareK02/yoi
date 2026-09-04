@@ -4,9 +4,11 @@ use config_source::{
     ConfigSchemaContribution, MarkdownDocumentProjection, VirtualPath, project_markdown_document,
 };
 use serde::Deserialize;
-use worker::skill::{
-    SkillActivationResponse, SkillCatalogEntry, SkillCatalogResponse, SkillDetailResponse,
-    SkillDiagnostic, SkillDiagnosticSeverity, SkillProvenance, SkillResourceRef, SkillSourceKind,
+use worker::skill::SkillActivationResponse;
+use workspace_api::{
+    SKILL_CATALOG_AUTHORITY, SkillActivationStatus, SkillCatalogEntry, SkillCatalogResponse,
+    SkillDetailResponse, SkillDiagnostic, SkillDiagnosticSeverity, SkillProjectionIdentity,
+    SkillProjectionStatus, SkillProvenance, SkillResourceRef, SkillSourceKind,
 };
 
 use crate::config_source::{
@@ -19,7 +21,6 @@ const BUILTIN_SKILL_VIRTUAL_PATH: &str = "builtin/skills/agent-skills/SKILL.md";
 const SKILL_SCHEMA_PROVIDER_ID: &str = "builtin:skills";
 const SKILL_SCHEMA_NAMESPACE: &str = "skills";
 const SKILL_SCHEMA_VERSION: &str = "1";
-const SKILL_CATALOG_AUTHORITY: &str = "workspace-config-skills-v1";
 
 /// Skill documents are values imported from `SKILL.md`. Known Agent Skills
 /// frontmatter is typed while extension keys remain concrete values.
@@ -101,32 +102,54 @@ pub fn catalog(state: &WorkspaceConfigState) -> Result<SkillCatalogResponse, Ski
         .into_values()
         .map(|skill| skill.catalog_entry())
         .collect();
-    Ok(SkillCatalogResponse {
+    let response = SkillCatalogResponse {
         authority: SKILL_CATALOG_AUTHORITY.to_string(),
+        projection: projection_identity(state),
         entries,
         diagnostics: Vec::new(),
-    })
+    };
+    response
+        .validate()
+        .map_err(|error| SkillError::InvalidProjection(error.to_string()))?;
+    Ok(response)
 }
 
 pub fn lint(state: &WorkspaceConfigState) -> Result<SkillCatalogResponse, SkillError> {
     catalog(state)
 }
 
+fn projection_identity(state: &WorkspaceConfigState) -> SkillProjectionIdentity {
+    SkillProjectionIdentity {
+        config_revision: state.snapshot.revision,
+        tree_digest: state.snapshot.digest.clone(),
+    }
+}
+
 pub fn detail(state: &WorkspaceConfigState, name: &str) -> Result<SkillDetailResponse, SkillError> {
     let skill = merged_skills(state)?
         .remove(name)
         .ok_or_else(|| SkillError::NotFound(name.to_string()))?;
-    Ok(SkillDetailResponse {
+    let activation_status = skill.activation_status();
+    let projection_status = skill.projection_status();
+    let response = SkillDetailResponse {
+        authority: SKILL_CATALOG_AUTHORITY.to_string(),
+        projection: projection_identity(state),
         name: skill.name,
         description: skill.description,
         provenance: skill.provenance,
         overrides: skill.overrides,
         diagnostics: skill.diagnostics,
+        activation_status,
+        projection_status,
         body: skill.body,
         allowed_tools: skill.allowed_tools,
         allowed_tools_status: "experimental_hint_only".to_string(),
         resources: skill.resources,
-    })
+    };
+    response
+        .validate()
+        .map_err(|error| SkillError::InvalidProjection(error.to_string()))?;
+    Ok(response)
 }
 
 pub fn activation(
@@ -415,10 +438,28 @@ impl ParsedSkill {
             .any(|diagnostic| diagnostic.severity == SkillDiagnosticSeverity::Error)
     }
 
+    fn activation_status(&self) -> SkillActivationStatus {
+        if self.has_errors() {
+            SkillActivationStatus::Inactive
+        } else {
+            SkillActivationStatus::Active
+        }
+    }
+
+    fn projection_status(&self) -> SkillProjectionStatus {
+        if self.has_errors() {
+            SkillProjectionStatus::Invalid
+        } else {
+            SkillProjectionStatus::Valid
+        }
+    }
+
     fn catalog_entry(&self) -> SkillCatalogEntry {
         SkillCatalogEntry {
             name: self.name.clone(),
             description: self.description.clone(),
+            activation_status: self.activation_status(),
+            projection_status: self.projection_status(),
             provenance: self.provenance.clone(),
             overrides: self.overrides.clone(),
             diagnostics: self.diagnostics.clone(),
@@ -513,12 +554,20 @@ mod tests {
             .unwrap();
         assert_eq!(item.provenance.kind, SkillSourceKind::Workspace);
         assert_eq!(item.provenance.revision, Some(9));
+        assert_eq!(catalog.projection.config_revision, 9);
+        assert_eq!(catalog.projection.tree_digest, state.snapshot.digest);
+        assert_eq!(item.activation_status, SkillActivationStatus::Active);
+        assert_eq!(item.projection_status, SkillProjectionStatus::Valid);
         assert!(
             item.diagnostics
                 .iter()
                 .all(|diagnostic| diagnostic.severity != SkillDiagnosticSeverity::Error)
         );
         let detail = detail(&state, "debug-rust").unwrap();
+        assert_eq!(detail.authority, SKILL_CATALOG_AUTHORITY);
+        assert_eq!(detail.projection.config_revision, 9);
+        assert_eq!(detail.activation_status, SkillActivationStatus::Active);
+        assert_eq!(detail.projection_status, SkillProjectionStatus::Valid);
         assert_eq!(detail.body, "# Debug Rust\n");
         assert_eq!(detail.allowed_tools, vec!["Read", "Grep"]);
         assert_eq!(
@@ -579,6 +628,8 @@ mod tests {
             .into_iter()
             .find(|item| item.name == "debug-rust")
             .unwrap();
+        assert_eq!(item.activation_status, SkillActivationStatus::Inactive);
+        assert_eq!(item.projection_status, SkillProjectionStatus::Invalid);
         assert!(
             item.diagnostics
                 .iter()

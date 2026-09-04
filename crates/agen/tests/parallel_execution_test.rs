@@ -6,13 +6,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agen::interceptor::{Interceptor, PostToolAction, PreToolAction, ToolCallInfo, ToolResultInfo};
+use agen::interceptor::{
+    Interceptor, InterceptorError, InterceptorErrorCategory, InterceptorPhase, InterceptorResult,
+    PostToolAction, PreToolAction, ToolCallInfo, ToolResultInfo,
+};
 use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use agen::tool::{
     Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput, ToolResult,
     ToolResultDisposition,
 };
-use agen::{Engine, History, Item, ToolExecutionPolicy};
+use agen::{
+    Engine, EngineError, EngineRunExit, History, Item, RunInterruptionReason, ToolExecutionPolicy,
+};
 use async_trait::async_trait;
 
 mod common;
@@ -905,24 +910,30 @@ async fn test_tool_execution_context_for_skipped_and_synthetic_paths() {
 
     #[async_trait]
     impl Interceptor for ContextPolicy {
-        async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> PreToolAction {
+        async fn pre_tool_call(
+            &self,
+            info: &mut ToolCallInfo<'_, ()>,
+        ) -> InterceptorResult<PreToolAction> {
             self.pre_contexts.lock().unwrap().push(info.context.clone());
-            match info.call.name.as_str() {
+            Ok(match info.call.name.as_str() {
                 "skip_tool" => PreToolAction::Skip,
                 "synthetic_tool" => PreToolAction::SyntheticResult(ToolResult::from_output(
                     &info.call.id,
                     ToolOutput::from("synthetic result".to_string()),
                 )),
                 _ => PreToolAction::Continue,
-            }
+            })
         }
 
-        async fn post_tool_call(&self, info: &mut ToolResultInfo) -> PostToolAction {
+        async fn post_tool_call(
+            &self,
+            info: &ToolResultInfo<'_, ()>,
+        ) -> InterceptorResult<PostToolAction> {
             self.post_contexts
                 .lock()
                 .unwrap()
                 .push(info.context.clone());
-            PostToolAction::Continue
+            Ok(PostToolAction::Continue)
         }
     }
 
@@ -994,12 +1005,15 @@ async fn test_before_tool_call_skip() {
 
     #[async_trait]
     impl Interceptor for BlockingPolicy {
-        async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> PreToolAction {
-            if info.call.name == "blocked_tool" {
+        async fn pre_tool_call(
+            &self,
+            info: &mut ToolCallInfo<'_, ()>,
+        ) -> InterceptorResult<PreToolAction> {
+            Ok(if info.call.name == "blocked_tool" {
                 PreToolAction::Skip
             } else {
                 PreToolAction::Continue
-            }
+            })
         }
     }
 
@@ -1021,9 +1035,9 @@ async fn test_before_tool_call_skip() {
     );
 }
 
-/// Hook: post_tool_call - verify that results can be modified
+/// Hook: post_tool_call - verify that the committed terminal result is observed.
 #[tokio::test]
-async fn test_post_tool_call_modification() {
+async fn test_post_tool_call_observes_committed_result() {
     // Prepare responses for multiple requests
     let client = MockLlmClient::with_responses(vec![
         // First request: tool call
@@ -1074,40 +1088,51 @@ async fn test_post_tool_call_modification() {
 
     engine.register_tool(simple_tool_definition());
 
-    // Policy to modify results
-    struct ModifyingPolicy {
-        modified_content: Arc<std::sync::Mutex<Option<String>>>,
+    // Policy to observe the committed terminal result.
+    struct ObservingPolicy {
+        observed_content: Arc<std::sync::Mutex<Option<String>>>,
     }
 
     #[async_trait]
-    impl Interceptor for ModifyingPolicy {
-        async fn post_tool_call(&self, info: &mut ToolResultInfo) -> PostToolAction {
-            info.result.summary = format!("[Modified] {}", info.result.summary);
-            *self.modified_content.lock().unwrap() = Some(info.result.summary.clone());
-            PostToolAction::Continue
+    impl Interceptor for ObservingPolicy {
+        async fn post_tool_call(
+            &self,
+            info: &ToolResultInfo<'_, ()>,
+        ) -> InterceptorResult<PostToolAction> {
+            assert_eq!(info.invocation.phase, InterceptorPhase::PostToolCall);
+            assert_eq!(
+                info.invocation.call_id,
+                Some(agen::InterceptorCallId::Tool(info.call.id.clone()))
+            );
+            assert!(matches!(
+                info.history.last().map(|entry| &entry.item),
+                Some(Item::ToolResult { call_id, .. }) if call_id == &info.call.id
+            ));
+            *self.observed_content.lock().unwrap() = Some(info.result.summary.clone());
+            Ok(PostToolAction::Continue)
         }
     }
 
-    let modified_content = Arc::new(std::sync::Mutex::new(None));
-    engine.set_interceptor(ModifyingPolicy {
-        modified_content: modified_content.clone(),
+    let observed_content = Arc::new(std::sync::Mutex::new(None));
+    engine.set_interceptor(ObservingPolicy {
+        observed_content: observed_content.clone(),
     });
 
     // Mutable::run consumes self, returns (Locked, EngineResult)
-    let result = engine.run(&mut history, "Test modification").await;
+    let result = engine.run(&mut history, "Test observation").await;
 
     assert!(
         matches!(result.result, agen::EngineRunExit::Finished),
         "Engine should complete"
     );
 
-    // Verify hook was called and content was modified
-    let content = modified_content.lock().unwrap().clone();
-    assert!(content.is_some(), "Hook should have been called");
-    assert!(
-        content.unwrap().contains("[Modified]"),
-        "Result should be modified"
-    );
+    // Verify the interceptor observed the exact committed result.
+    let observed = observed_content.lock().unwrap().clone();
+    assert_eq!(observed.as_deref(), Some("Original Result"));
+    assert!(history.items().any(|item| matches!(
+        item,
+        Item::ToolResult { summary, .. } if summary == "Original Result"
+    )));
 }
 
 /// Hook: pre_tool_call synthetic result - skipped tool gets an error result in history.
@@ -1143,11 +1168,14 @@ async fn test_before_tool_call_synthetic_result_committed() {
 
     #[async_trait]
     impl Interceptor for SyntheticPolicy {
-        async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> PreToolAction {
-            PreToolAction::SyntheticResult(ToolResult::error(
+        async fn pre_tool_call(
+            &self,
+            info: &mut ToolCallInfo<'_, ()>,
+        ) -> InterceptorResult<PreToolAction> {
+            Ok(PreToolAction::SyntheticResult(ToolResult::error(
                 info.call.id.clone(),
                 "permission denied",
-            ))
+            )))
         }
     }
 
@@ -1167,6 +1195,80 @@ async fn test_before_tool_call_synthetic_result_committed() {
     )));
 }
 
+#[derive(Clone, Copy)]
+enum InvalidIdentityMode {
+    ContinuedCall,
+    SyntheticResult,
+}
+
+struct InvalidIdentityPolicy(InvalidIdentityMode);
+
+#[async_trait]
+impl Interceptor for InvalidIdentityPolicy {
+    async fn pre_tool_call(
+        &self,
+        info: &mut ToolCallInfo<'_, ()>,
+    ) -> InterceptorResult<PreToolAction> {
+        assert_eq!(info.invocation.phase, InterceptorPhase::PreToolCall);
+        assert_eq!(
+            info.invocation.call_id,
+            Some(agen::InterceptorCallId::Tool("call_1".to_string()))
+        );
+        assert!(matches!(
+            info.history.last().map(|entry| &entry.item),
+            Some(Item::ToolCall { call_id, .. }) if call_id == "call_1"
+        ));
+        Ok(match self.0 {
+            InvalidIdentityMode::ContinuedCall => {
+                info.call.id = "different-call".to_string();
+                PreToolAction::Continue
+            }
+            InvalidIdentityMode::SyntheticResult => PreToolAction::SyntheticResult(
+                ToolResult::error("different-call", "invalid synthetic result"),
+            ),
+        })
+    }
+}
+
+#[tokio::test]
+async fn interceptor_cannot_change_tool_call_identity() {
+    for mode in [
+        InvalidIdentityMode::ContinuedCall,
+        InvalidIdentityMode::SyntheticResult,
+    ] {
+        let client = MockLlmClient::new(vec![
+            Event::tool_use_start(0, "call_1", "echo"),
+            Event::tool_input_delta(0, r#"{}"#),
+            Event::tool_use_stop(0),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ]);
+        let mut engine = Engine::new(client);
+        engine.register_tool(SlowTool::new("echo", 1).definition());
+        engine.set_interceptor(InvalidIdentityPolicy(mode));
+        let mut history = History::new();
+
+        let result = engine.run(&mut history, "identity").await;
+        let EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(
+            EngineError::Interceptor(failure),
+        )) = result.result
+        else {
+            panic!("invalid tool identity must interrupt with a typed failure");
+        };
+        assert_eq!(failure.phase(), InterceptorPhase::PreToolCall);
+        assert_eq!(
+            failure.error().category(),
+            InterceptorErrorCategory::ContractViolation
+        );
+        assert!(
+            !history
+                .items()
+                .any(|item| matches!(item, Item::ToolResult { .. }))
+        );
+    }
+}
+
 #[tokio::test]
 async fn post_tool_abort_commits_confirmed_result_before_stopping_run() {
     let client = MockLlmClient::new(vec![
@@ -1181,16 +1283,24 @@ async fn post_tool_abort_commits_confirmed_result_before_stopping_run() {
     let tool = SlowTool::new("confirmed", 1);
     engine.register_tool(tool.definition());
 
-    struct AbortAfterResult;
+    let observed = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    struct AbortAfterResult {
+        lifecycle: Arc<Mutex<Vec<&'static str>>>,
+    }
     #[async_trait]
     impl Interceptor for AbortAfterResult {
-        async fn post_tool_call(&self, _info: &mut ToolResultInfo) -> PostToolAction {
-            PostToolAction::Abort("policy stopped the run".to_string())
+        async fn post_tool_call(
+            &self,
+            _info: &ToolResultInfo<'_, ()>,
+        ) -> InterceptorResult<PostToolAction> {
+            self.lifecycle.lock().unwrap().push("post_tool_call");
+            Ok(PostToolAction::Abort("policy stopped the run".to_string()))
         }
     }
-    engine.set_interceptor(AbortAfterResult);
+    engine.set_interceptor(AbortAfterResult {
+        lifecycle: observed.clone(),
+    });
 
-    let observed = Arc::new(Mutex::new(Vec::<&'static str>::new()));
     let published = observed.clone();
     engine.on_tool_result(move |_| published.lock().unwrap().push("published"));
     let committed = observed.clone();
@@ -1210,7 +1320,7 @@ async fn post_tool_abort_commits_confirmed_result_before_stopping_run() {
     assert_eq!(tool.call_count(), 1);
     assert_eq!(
         observed.lock().unwrap().as_slice(),
-        ["committed", "published", "run-returned"]
+        ["committed", "published", "post_tool_call", "run-returned"]
     );
     assert!(matches!(
         output.result,
@@ -1238,4 +1348,94 @@ async fn post_tool_abort_commits_confirmed_result_before_stopping_run() {
             ..
         } if call_id == "call_confirmed"
     )));
+}
+
+#[derive(Clone, Copy)]
+enum PostToolStopMode {
+    Abort,
+    Failure,
+}
+
+struct StopFirstParallelResult(PostToolStopMode);
+
+#[async_trait]
+impl Interceptor for StopFirstParallelResult {
+    async fn post_tool_call(
+        &self,
+        info: &ToolResultInfo<'_, ()>,
+    ) -> InterceptorResult<PostToolAction> {
+        if info.call.id != "call_fast" {
+            return Ok(PostToolAction::Continue);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        match self.0 {
+            PostToolStopMode::Abort => Ok(PostToolAction::Abort("stop parallel batch".to_string())),
+            PostToolStopMode::Failure => Err(InterceptorError::new(
+                InterceptorErrorCategory::Policy,
+                "reject parallel batch",
+            )),
+        }
+    }
+}
+
+#[tokio::test]
+async fn post_tool_stop_terminalizes_started_parallel_siblings_before_returning() {
+    for mode in [PostToolStopMode::Abort, PostToolStopMode::Failure] {
+        let first_response = vec![
+            Event::tool_use_start(0, "call_fast", "fast"),
+            Event::tool_input_delta(0, r#"{}"#),
+            Event::tool_use_stop(0),
+            Event::tool_use_start(1, "call_ready", "ready"),
+            Event::tool_input_delta(1, r#"{}"#),
+            Event::tool_use_stop(1),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ];
+        let second_response = vec![
+            Event::text_block_start(0),
+            Event::text_delta(0, "next run completed"),
+            Event::text_block_stop(0, None),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ];
+        let client = MockLlmClient::with_responses(vec![first_response, second_response]);
+        let mut engine = Engine::new(client);
+        engine.register_tool(SlowTool::new("fast", 0).definition());
+        engine.register_tool(SlowTool::new("ready", 1).definition());
+        engine.set_interceptor(StopFirstParallelResult(mode));
+        let mut history = History::new();
+
+        let output = engine.run(&mut history, "parallel stop").await;
+        match mode {
+            PostToolStopMode::Abort => assert!(matches!(
+                output.result,
+                EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(
+                    EngineError::Aborted(ref reason)
+                )) if reason == "stop parallel batch"
+            )),
+            PostToolStopMode::Failure => assert!(matches!(
+                output.result,
+                EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(
+                    EngineError::Interceptor(ref failure)
+                )) if failure.phase() == InterceptorPhase::PostToolCall
+            )),
+        }
+
+        let terminal_ids: Vec<_> = history
+            .iter()
+            .filter_map(|entry| match &entry.item {
+                Item::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terminal_ids.len(), 2);
+        assert!(terminal_ids.contains(&"call_fast"));
+        assert!(terminal_ids.contains(&"call_ready"));
+
+        let mut engine = output.engine;
+        let next = engine.run(&mut history, "next run").await;
+        assert!(matches!(next, EngineRunExit::Finished));
+    }
 }

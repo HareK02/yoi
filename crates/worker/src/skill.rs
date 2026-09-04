@@ -2,127 +2,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::worker::WorkspaceClient;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SkillDiagnosticSeverity {
-    Error,
-    Warning,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SkillDiagnostic {
-    pub severity: SkillDiagnosticSeverity,
-    pub code: String,
-    pub message: String,
-    /// Path-free authority/provenance label such as `builtin:foo` or `workspace:foo`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-}
-
-impl SkillDiagnostic {
-    pub fn error(
-        code: impl Into<String>,
-        message: impl Into<String>,
-        source: Option<String>,
-    ) -> Self {
-        Self {
-            severity: SkillDiagnosticSeverity::Error,
-            code: code.into(),
-            message: message.into(),
-            source,
-        }
-    }
-
-    pub fn warning(
-        code: impl Into<String>,
-        message: impl Into<String>,
-        source: Option<String>,
-    ) -> Self {
-        Self {
-            severity: SkillDiagnosticSeverity::Warning,
-            code: code.into(),
-            message: message.into(),
-            source,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SkillSourceKind {
-    Builtin,
-    Workspace,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SkillProvenance {
-    pub kind: SkillSourceKind,
-    /// Stable id: `builtin:<name>` or `workspace:<name>`.
-    pub id: String,
-    /// Virtual config/resource path. Never an absolute host filesystem path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub virtual_path: Option<String>,
-    /// Active Workspace config revision for Workspace Skills.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revision: Option<u64>,
-    /// Digest of the immutable `SKILL.md` source.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_digest: Option<String>,
-    /// Digest of the active virtual config tree snapshot.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tree_digest: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SkillResourceRef {
-    pub kind: String,
-    /// Skill-relative resource name/path. Never an absolute filesystem path.
-    pub name: String,
-    pub supported: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub diagnostic: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SkillCatalogEntry {
-    pub name: String,
-    pub description: String,
-    pub provenance: SkillProvenance,
-    #[serde(default)]
-    pub overrides: Vec<SkillProvenance>,
-    #[serde(default)]
-    pub diagnostics: Vec<SkillDiagnostic>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SkillCatalogResponse {
-    /// Authority label for diagnostics; callers must not interpret it as a path.
-    pub authority: String,
-    #[serde(default)]
-    pub entries: Vec<SkillCatalogEntry>,
-    #[serde(default)]
-    pub diagnostics: Vec<SkillDiagnostic>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SkillDetailResponse {
-    pub name: String,
-    pub description: String,
-    pub provenance: SkillProvenance,
-    #[serde(default)]
-    pub overrides: Vec<SkillProvenance>,
-    #[serde(default)]
-    pub diagnostics: Vec<SkillDiagnostic>,
-    /// Imported Markdown content with YAML frontmatter delimiters removed.
-    /// This is intentionally omitted from catalog responses.
-    pub body: String,
-    #[serde(default)]
-    pub allowed_tools: Vec<String>,
-    /// Explicitly documents that allowed-tools is parsed only as an experimental hint.
-    pub allowed_tools_status: String,
-    #[serde(default)]
-    pub resources: Vec<SkillResourceRef>,
-}
+pub use workspace_api::{
+    SkillActivationStatus, SkillCatalogEntry, SkillCatalogResponse, SkillDetailResponse,
+    SkillDiagnostic, SkillDiagnosticSeverity, SkillProjectionIdentity, SkillProjectionStatus,
+    SkillProvenance, SkillResourceRef, SkillSourceKind,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillActivationResponse {
@@ -144,6 +28,8 @@ pub enum SkillClientError {
     Request(#[from] crate::worker::WorkspaceClientError),
     #[error("Skill API response JSON is invalid: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("Skill API response violates the shared contract: {0}")]
+    InvalidResponse(#[from] workspace_api::SkillApiValidationError),
     #[error("Skill API returned HTTP {status}: {body}")]
     Http {
         status: reqwest::StatusCode,
@@ -155,11 +41,15 @@ pub enum SkillClientError {
 
 impl dyn WorkspaceClient + '_ {
     pub fn list_skills(&self) -> Result<SkillCatalogResponse, SkillClientError> {
-        self.get_skill_json("skills")
+        let response: SkillCatalogResponse = self.get_skill_json("skills")?;
+        response.validate()?;
+        Ok(response)
     }
 
     pub fn read_skill(&self, name: &str) -> Result<SkillDetailResponse, SkillClientError> {
-        self.get_skill_json(&format!("skills/{name}"))
+        let response: SkillDetailResponse = self.get_skill_json(&format!("skills/{name}"))?;
+        response.validate()?;
+        Ok(response)
     }
 
     pub fn activate_skill(&self, name: &str) -> Result<SkillActivationResponse, SkillClientError> {
@@ -229,11 +119,24 @@ mod tests {
             assert_eq!(worker_header, None);
             assert_eq!(authorization, None);
             let body = serde_json::json!({
-                "authority": "workspace-backend-skills-v0",
+                "authority": "workspace-config-skills-v1",
+                "projection": {
+                    "config_revision": 7,
+                    "tree_digest": "tree-digest"
+                },
                 "entries": [{
                     "name": "triage-errors",
                     "description": "Use when triaging errors.",
-                    "provenance": { "kind": "workspace", "id": "workspace:triage-errors" },
+                    "activation_status": "active",
+                    "projection_status": "valid",
+                    "provenance": {
+                        "kind": "workspace",
+                        "id": "workspace:triage-errors",
+                        "virtual_path": "skills/triage-errors/SKILL.md",
+                        "revision": 7,
+                        "source_digest": "source-digest",
+                        "tree_digest": "tree-digest"
+                    },
                     "overrides": [],
                     "diagnostics": []
                 }],

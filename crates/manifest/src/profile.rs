@@ -20,9 +20,9 @@ use crate::config::{
 use crate::model::{AuthRef, ModelManifest};
 use crate::plugin::PluginConfig;
 use crate::{
-    EngineManifestConfig, McpConfig, McpStdioCwdPolicy, MemoryConfig, Permission, ResolveError,
-    ScopeConfig, ScopeRule, SkillsConfig, WebConfig, WorkerManifest, WorkerManifestConfig,
-    WorkerMetaConfig, paths,
+    EngineManifestConfig, McpConfig, McpStdioCwdPolicy, Permission, ResolveError, ScopeConfig,
+    ScopeRule, SkillsConfig, WebConfig, WorkerManifest, WorkerManifestConfig, WorkerMetaConfig,
+    paths,
 };
 
 const PROFILE_FORMAT_V1: &str = "yoi.profile.v1";
@@ -185,7 +185,7 @@ pub fn validate_profile_execution_target(
     if feature.manage_workdir.enabled {
         requirements.insert(WorkspaceAuthorityRequirement::ManageWorkdir);
     }
-    if feature.memory.enabled || feature.memory.staging {
+    if feature.memory.profile.enabled || feature.memory.profile.staging_tools {
         requirements.insert(WorkspaceAuthorityRequirement::Memory);
     }
     if feature.merge_request.show
@@ -642,7 +642,6 @@ fn resolve_profile_value(
         mcp: profile.mcp,
         compaction,
         web: profile.web,
-        memory: profile.memory.map(Into::into),
         skills: profile.skills,
     };
     let config =
@@ -661,51 +660,6 @@ fn resolve_profile_value(
         manifest_snapshot,
         raw_artifact,
     })
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProfileMemoryConfig {
-    #[serde(default)]
-    workspace_root: Option<PathBuf>,
-    #[serde(default)]
-    query_result_limit: Option<usize>,
-    #[serde(default)]
-    query_excerpt_lines: Option<usize>,
-    #[serde(default)]
-    inject_summary: Option<bool>,
-    #[serde(default)]
-    extract_model: Option<ModelManifest>,
-    #[serde(default)]
-    extract_threshold: Option<u64>,
-    #[serde(default)]
-    extract_worker_max_turns: Option<u32>,
-    #[serde(default)]
-    consolidation_model: Option<ModelManifest>,
-    #[serde(default)]
-    consolidation_threshold_files: Option<usize>,
-    #[serde(default)]
-    consolidation_threshold_bytes: Option<u64>,
-}
-
-impl From<ProfileMemoryConfig> for MemoryConfig {
-    fn from(profile: ProfileMemoryConfig) -> Self {
-        Self {
-            workspace_root: profile.workspace_root,
-            query_result_limit: profile.query_result_limit,
-            query_excerpt_lines: profile.query_excerpt_lines,
-            inject_summary: profile.inject_summary,
-            workspace_id: None,
-            settings_revision: None,
-            language: None,
-            extract_model: profile.extract_model,
-            extract_threshold: profile.extract_threshold,
-            extract_worker_max_turns: profile.extract_worker_max_turns,
-            consolidation_model: profile.consolidation_model,
-            consolidation_threshold_files: profile.consolidation_threshold_files,
-            consolidation_threshold_bytes: profile.consolidation_threshold_bytes,
-        }
-    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -737,8 +691,6 @@ struct ProfileConfig {
     compaction: Option<serde_json::Value>,
     #[serde(default)]
     web: Option<WebConfig>,
-    #[serde(default)]
-    memory: Option<ProfileMemoryConfig>,
     #[serde(default)]
     skills: Option<SkillsConfig>,
 }
@@ -939,12 +891,6 @@ fn validate_profile_paths(profile: &ProfileConfig) -> Result<(), ProfileError> {
         let model: ModelManifest = serde_json::from_value(model.clone())
             .map_err(|source| ProfileError::ProfileDeserialize { source })?;
         reject_absolute_auth_file(&model.auth, "compaction.model.auth.file")?;
-    }
-    if let Some(memory) = &profile.memory
-        && let Some(root) = &memory.workspace_root
-        && root.is_absolute()
-    {
-        return Err(ProfileError::InvalidProfile("field `memory.workspace_root` is a resolved path and is not allowed in reusable Profiles".into()));
     }
     if let Some(skills) = &profile.skills {
         for dir in &skills.directories {
@@ -1299,7 +1245,9 @@ mod tests {
             ("settings_revision", serde_json::json!(2)),
             ("language", serde_json::json!("Japanese")),
         ] {
-            let artifact = serde_json::json!({ "memory": { (field): value } });
+            let artifact = serde_json::json!({
+                "feature": { "memory": { (field): value } }
+            });
             let error = resolve_profile_artifact_value(
                 artifact,
                 ProfileSource::Registry {
@@ -1351,7 +1299,7 @@ mod tests {
         assert!(resolved.manifest.delegation_scope.allow.iter().any(|rule| {
             rule.permission == protocol::Permission::Write && rule.target == tmp.path()
         }));
-        assert!(!resolved.manifest.feature.memory.enabled);
+        assert!(!resolved.manifest.feature.memory.profile.enabled);
         assert!(!resolved.manifest.feature.ticket.enabled);
         assert!(!resolved.manifest.feature.objective.enabled);
         assert!(!resolved.manifest.feature.flow.enabled);
@@ -1630,7 +1578,7 @@ enabled = false
             .unwrap();
         assert_eq!(resolved.manifest.worker.name, "runtime-worker");
         assert!(resolved.manifest.feature.task.enabled);
-        assert!(!resolved.manifest.feature.memory.enabled);
+        assert!(!resolved.manifest.feature.memory.profile.enabled);
         assert!(resolved.manifest.feature.web.enabled);
         assert!(resolved.manifest.feature.sub_worker.enabled);
         assert!(resolved.manifest.feature.ticket.enabled);

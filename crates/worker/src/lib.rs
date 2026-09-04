@@ -50,6 +50,7 @@ pub use prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTem
 pub use protocol::{ErrorCode, Event, Method, TurnResult, WorkerStatus};
 pub use runtime::dir::RuntimeDir;
 pub use segment_log_sink::SegmentLogSink;
+pub use session_capture::SessionEntryRef;
 pub use session_history::{
     SessionHistoryDerivation, SessionHistoryEntryId, SessionHistoryMetadata,
     WorkerHistoryProvenance, WorkerSubjectSnapshot,

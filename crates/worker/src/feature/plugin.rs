@@ -7621,7 +7621,7 @@ mod tests {
             )))
             .install_into_pending(&mut pending, &mut hooks);
 
-        assert_eq!(pending.len(), 1);
+        assert!(pending.is_empty());
         assert_eq!(skipped_count(&report), 1);
         assert!(has_diagnostic(&report, "duplicate tool contribution"));
     }

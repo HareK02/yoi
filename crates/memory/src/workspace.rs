@@ -70,24 +70,12 @@ impl WorkspaceLayout {
         Self { root: root.into() }
     }
 
-    /// Resolve a layout from a `MemoryConfig`.
+    /// Resolve a layout from the nearest Memory marker.
     ///
-    /// An explicit `memory.workspace_root` is honored exactly. Without an
-    /// explicit root, resolution searches `default_root` and its ancestors for
-    /// the nearest `.yoi/memory` directory. This keeps child worktrees that
-    /// contain `.yoi` project records such as tickets from
-    /// becoming independent memory roots merely because they contain `.yoi`.
-    ///
-    /// If no memory marker exists, this falls back to `default_root` because
-    /// existing call sites require a concrete layout. That fallback is a
-    /// no-marker compatibility path, not a `.yoi` marker interpretation; it
-    /// must not be used as evidence that `.yoi` alone enables repo-local
-    /// memory.
-    pub fn resolve(cfg: &manifest::MemoryConfig, default_root: &Path) -> Self {
-        if let Some(root) = &cfg.workspace_root {
-            return Self::new(root.clone());
-        }
-
+    /// Resolution searches `default_root` and its ancestors for the nearest
+    /// `.yoi/memory` directory. This legacy local-storage helper owns its path
+    /// policy directly; resolved Worker Manifests do not carry storage paths.
+    pub fn resolve(default_root: &Path) -> Self {
         let root =
             find_memory_marker_root(default_root).unwrap_or_else(|| default_root.to_path_buf());
         Self::new(root)
@@ -336,16 +324,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_uses_workspace_root_when_set() {
-        let cfg = manifest::MemoryConfig {
-            workspace_root: Some(PathBuf::from("/explicit")),
-            ..Default::default()
-        };
-        let layout = WorkspaceLayout::resolve(&cfg, Path::new("/fallback"));
-        assert_eq!(layout.root(), Path::new("/explicit"));
-    }
-
-    #[test]
     fn resolve_selects_nearest_ancestor_memory_marker_when_workspace_root_missing() {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path().join("workspace");
@@ -353,8 +331,7 @@ mod tests {
         std::fs::create_dir_all(workspace.join(".yoi/memory")).unwrap();
         std::fs::create_dir_all(&child).unwrap();
 
-        let cfg = manifest::MemoryConfig::default();
-        let layout = WorkspaceLayout::resolve(&cfg, &child);
+        let layout = WorkspaceLayout::resolve(&child);
         assert_eq!(layout.root(), workspace.as_path());
     }
 
@@ -366,8 +343,7 @@ mod tests {
         std::fs::create_dir_all(workspace.join(".yoi/memory")).unwrap();
         std::fs::create_dir_all(child.join(".yoi/tickets")).unwrap();
 
-        let cfg = manifest::MemoryConfig::default();
-        let layout = WorkspaceLayout::resolve(&cfg, &child);
+        let layout = WorkspaceLayout::resolve(&child);
         assert_eq!(layout.root(), workspace.as_path());
     }
 
@@ -381,8 +357,7 @@ mod tests {
 
         assert_eq!(find_memory_marker_root(&child), None);
 
-        let cfg = manifest::MemoryConfig::default();
-        let layout = WorkspaceLayout::resolve(&cfg, &child);
+        let layout = WorkspaceLayout::resolve(&child);
         assert_eq!(layout.root(), child.as_path());
     }
 }

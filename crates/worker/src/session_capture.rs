@@ -23,14 +23,14 @@ const OVERVIEW_ANCHOR_STRIDE: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub(crate) struct SessionEntryRef(String);
+pub struct SessionEntryRef(String);
 
 impl SessionEntryRef {
-    pub(crate) fn from_history_entry_id(entry_id: &crate::SessionHistoryEntryId) -> Self {
+    pub fn from_history_entry_id(entry_id: &crate::SessionHistoryEntryId) -> Self {
         Self(format!("E{}", entry_id.0))
     }
 
-    pub(crate) fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         let suffix = value.strip_prefix('E')?;
         if suffix.is_empty()
             || suffix.len() > 64
@@ -43,7 +43,7 @@ impl SessionEntryRef {
         Some(Self(value.to_string()))
     }
 
-    pub(crate) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 

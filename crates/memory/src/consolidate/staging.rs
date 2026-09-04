@@ -21,8 +21,7 @@ pub struct StagingEntry {
     pub id: Uuid,
     pub path: PathBuf,
     pub record: StagingRecord,
-    /// このファイルのバイト長。閾値判定 (`consolidation_threshold_bytes`)
-    /// に使う。
+    /// このファイルのバイト長。Backendのconsolidation閾値判定に使用する。
     pub bytes: u64,
 }
 

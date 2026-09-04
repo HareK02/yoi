@@ -7993,17 +7993,15 @@ fn start_memory_staging_consolidation(
             total_bytes,
         });
     }
-    let reached_files = operation
-        .threshold_files
-        .is_some_and(|threshold| candidate_count >= threshold);
-    let reached_bytes = operation
-        .threshold_bytes
-        .is_some_and(|threshold| total_bytes >= threshold);
+    const CONSOLIDATION_THRESHOLD_FILES: usize = 5;
+    const CONSOLIDATION_THRESHOLD_BYTES: u64 = 50_000;
+    let reached_files = candidate_count >= CONSOLIDATION_THRESHOLD_FILES;
+    let reached_bytes = total_bytes >= CONSOLIDATION_THRESHOLD_BYTES;
     if !operation.force && !reached_files && !reached_bytes {
         return Ok(MemoryConsolidationOutput {
             status: "skipped_below_threshold".to_string(),
             summary: format!(
-                "Memory staging backlog has {candidate_count} candidate(s), {total_bytes} byte(s), below configured threshold."
+                "Memory staging backlog has {candidate_count} candidate(s), {total_bytes} byte(s), below Backend policy threshold."
             ),
             candidate_count,
             total_bytes,
@@ -19921,11 +19919,7 @@ mod tests {
 
         let output = match start_memory_staging_consolidation(
             api,
-            MemoryConsolidateStagingOperation {
-                force: true,
-                threshold_files: None,
-                threshold_bytes: None,
-            },
+            MemoryConsolidateStagingOperation { force: true },
         ) {
             Ok(output) => output,
             Err(_) => panic!("unexpected ApiError from memory consolidation trigger"),
@@ -19955,6 +19949,15 @@ mod tests {
                 None,
             )
             .unwrap();
+
+        let below_threshold = start_memory_staging_consolidation(
+            api.clone(),
+            MemoryConsolidateStagingOperation { force: false },
+        )
+        .unwrap();
+        assert_eq!(below_threshold.status, "skipped_below_threshold");
+        assert_eq!(below_threshold.candidate_count, 1);
+        assert!(below_threshold.summary.contains("Backend policy threshold"));
 
         let resolved_config_bundle = None;
         let existing = api
@@ -20010,11 +20013,7 @@ mod tests {
 
         let second = match start_memory_staging_consolidation(
             api.clone(),
-            MemoryConsolidateStagingOperation {
-                force: true,
-                threshold_files: None,
-                threshold_bytes: None,
-            },
+            MemoryConsolidateStagingOperation { force: true },
         ) {
             Ok(output) => output,
             Err(_) => panic!("unexpected ApiError from second memory consolidation trigger"),

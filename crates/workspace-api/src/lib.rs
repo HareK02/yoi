@@ -1934,6 +1934,408 @@ pub struct RepositoryAccessProjection {
     pub bindings: Vec<RepositorySshAccessBinding>,
 }
 
+pub const SKILL_CATALOG_AUTHORITY: &str = "workspace-config-skills-v1";
+pub const SKILL_API_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+pub const SKILL_API_MAX_CATALOG_ENTRIES: usize = 500;
+pub const SKILL_API_MAX_OVERRIDES: usize = 64;
+pub const SKILL_API_MAX_DIAGNOSTICS: usize = 100;
+pub const SKILL_API_MAX_RESOURCES: usize = 500;
+pub const SKILL_API_MAX_ALLOWED_TOOLS: usize = 100;
+pub const SKILL_API_MAX_NAME_BYTES: usize = 128;
+pub const SKILL_API_MAX_LABEL_BYTES: usize = 4_096;
+pub const SKILL_API_MAX_BODY_BYTES: usize = 1_048_576;
+pub const SKILL_API_MAX_PATH_BYTES: usize = 1_024;
+pub const SKILL_API_MAX_DIGEST_BYTES: usize = 128;
+pub const SKILL_API_MAX_RESPONSE_BYTES: usize = 2_097_152;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(rename_all = "snake_case"))]
+#[serde(rename_all = "snake_case")]
+pub enum SkillDiagnosticSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct SkillDiagnostic {
+    pub severity: SkillDiagnosticSeverity,
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub source: Option<String>,
+}
+
+impl SkillDiagnostic {
+    pub fn error(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        source: Option<String>,
+    ) -> Self {
+        Self {
+            severity: SkillDiagnosticSeverity::Error,
+            code: code.into(),
+            message: message.into(),
+            source,
+        }
+    }
+
+    pub fn warning(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        source: Option<String>,
+    ) -> Self {
+        Self {
+            severity: SkillDiagnosticSeverity::Warning,
+            code: code.into(),
+            message: message.into(),
+            source,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(rename_all = "snake_case"))]
+#[serde(rename_all = "snake_case")]
+pub enum SkillSourceKind {
+    Builtin,
+    Workspace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct SkillProvenance {
+    pub kind: SkillSourceKind,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub virtual_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional, type = "number"))]
+    pub revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub source_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub tree_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(rename_all = "snake_case"))]
+#[serde(rename_all = "snake_case")]
+pub enum SkillActivationStatus {
+    Active,
+    Inactive,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(rename_all = "snake_case"))]
+#[serde(rename_all = "snake_case")]
+pub enum SkillProjectionStatus {
+    Valid,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct SkillProjectionIdentity {
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub config_revision: u64,
+    pub tree_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct SkillResourceRef {
+    pub kind: String,
+    pub name: String,
+    pub supported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct SkillCatalogEntry {
+    pub name: String,
+    pub description: String,
+    pub activation_status: SkillActivationStatus,
+    pub projection_status: SkillProjectionStatus,
+    pub provenance: SkillProvenance,
+    pub overrides: Vec<SkillProvenance>,
+    pub diagnostics: Vec<SkillDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct SkillCatalogResponse {
+    pub authority: String,
+    pub projection: SkillProjectionIdentity,
+    pub entries: Vec<SkillCatalogEntry>,
+    pub diagnostics: Vec<SkillDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct SkillDetailResponse {
+    pub authority: String,
+    pub projection: SkillProjectionIdentity,
+    pub name: String,
+    pub description: String,
+    pub provenance: SkillProvenance,
+    pub overrides: Vec<SkillProvenance>,
+    pub diagnostics: Vec<SkillDiagnostic>,
+    pub activation_status: SkillActivationStatus,
+    pub projection_status: SkillProjectionStatus,
+    pub body: String,
+    pub allowed_tools: Vec<String>,
+    pub allowed_tools_status: String,
+    pub resources: Vec<SkillResourceRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillApiValidationError {
+    CollectionTooLarge,
+    StringTooLarge,
+    InvalidProjectionIdentity,
+    InvalidProvenance,
+    InvalidVirtualPath,
+    StaleProjection,
+}
+
+impl std::fmt::Display for SkillApiValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::CollectionTooLarge => "Skill API collection exceeds its limit",
+            Self::StringTooLarge => "Skill API string exceeds its limit",
+            Self::InvalidProjectionIdentity => "Skill API projection identity is invalid",
+            Self::InvalidProvenance => "Skill API provenance is invalid",
+            Self::InvalidVirtualPath => "Skill API virtual path is invalid",
+            Self::StaleProjection => "Workspace Skill projection is stale",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for SkillApiValidationError {}
+
+impl SkillProjectionIdentity {
+    fn validate(&self) -> Result<(), SkillApiValidationError> {
+        validate_safe_integer(self.config_revision)?;
+        validate_nonempty_string(&self.tree_digest, SKILL_API_MAX_DIGEST_BYTES)
+            .map_err(|_| SkillApiValidationError::InvalidProjectionIdentity)
+    }
+}
+
+impl SkillProvenance {
+    fn validate(
+        &self,
+        projection: &SkillProjectionIdentity,
+    ) -> Result<(), SkillApiValidationError> {
+        validate_nonempty_string(&self.id, SKILL_API_MAX_LABEL_BYTES)?;
+        validate_optional_string(self.virtual_path.as_deref(), SKILL_API_MAX_PATH_BYTES)?;
+        validate_optional_string(self.source_digest.as_deref(), SKILL_API_MAX_DIGEST_BYTES)?;
+        validate_optional_string(self.tree_digest.as_deref(), SKILL_API_MAX_DIGEST_BYTES)?;
+        if let Some(revision) = self.revision {
+            validate_safe_integer(revision)?;
+        }
+
+        let expected_prefix = match self.kind {
+            SkillSourceKind::Builtin => "builtin:",
+            SkillSourceKind::Workspace => "workspace:",
+        };
+        if !self.id.starts_with(expected_prefix)
+            || self
+                .virtual_path
+                .as_deref()
+                .is_none_or(|path| !is_virtual_path(path))
+            || self.source_digest.is_none()
+        {
+            return Err(SkillApiValidationError::InvalidProvenance);
+        }
+
+        match self.kind {
+            SkillSourceKind::Builtin => {
+                if self.revision.is_some() || self.tree_digest.is_some() {
+                    return Err(SkillApiValidationError::InvalidProvenance);
+                }
+            }
+            SkillSourceKind::Workspace => {
+                let Some(revision) = self.revision else {
+                    return Err(SkillApiValidationError::InvalidProvenance);
+                };
+                let Some(tree_digest) = self.tree_digest.as_deref() else {
+                    return Err(SkillApiValidationError::InvalidProvenance);
+                };
+                if revision != projection.config_revision || tree_digest != projection.tree_digest {
+                    return Err(SkillApiValidationError::StaleProjection);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SkillCatalogEntry {
+    fn validate(
+        &self,
+        projection: &SkillProjectionIdentity,
+    ) -> Result<(), SkillApiValidationError> {
+        validate_nonempty_string(&self.name, SKILL_API_MAX_NAME_BYTES)?;
+        validate_string(&self.description, SKILL_API_MAX_LABEL_BYTES)?;
+        validate_collection(&self.overrides, SKILL_API_MAX_OVERRIDES)?;
+        validate_diagnostics(&self.diagnostics)?;
+        self.provenance.validate(projection)?;
+        for provenance in &self.overrides {
+            provenance.validate(projection)?;
+        }
+        Ok(())
+    }
+}
+
+impl SkillCatalogResponse {
+    pub fn validate(&self) -> Result<(), SkillApiValidationError> {
+        validate_nonempty_string(&self.authority, SKILL_API_MAX_LABEL_BYTES)?;
+        if self.authority != SKILL_CATALOG_AUTHORITY {
+            return Err(SkillApiValidationError::InvalidProjectionIdentity);
+        }
+        self.projection.validate()?;
+        validate_collection(&self.entries, SKILL_API_MAX_CATALOG_ENTRIES)?;
+        validate_diagnostics(&self.diagnostics)?;
+        for entry in &self.entries {
+            entry.validate(&self.projection)?;
+        }
+        Ok(())
+    }
+}
+
+impl SkillDetailResponse {
+    pub fn validate(&self) -> Result<(), SkillApiValidationError> {
+        validate_nonempty_string(&self.authority, SKILL_API_MAX_LABEL_BYTES)?;
+        if self.authority != SKILL_CATALOG_AUTHORITY {
+            return Err(SkillApiValidationError::InvalidProjectionIdentity);
+        }
+        self.projection.validate()?;
+        validate_nonempty_string(&self.name, SKILL_API_MAX_NAME_BYTES)?;
+        validate_string(&self.description, SKILL_API_MAX_LABEL_BYTES)?;
+        validate_string(&self.body, SKILL_API_MAX_BODY_BYTES)?;
+        validate_strings(
+            &self.allowed_tools,
+            SKILL_API_MAX_ALLOWED_TOOLS,
+            SKILL_API_MAX_LABEL_BYTES,
+        )?;
+        validate_nonempty_string(&self.allowed_tools_status, SKILL_API_MAX_LABEL_BYTES)?;
+        validate_resources(&self.resources)?;
+        validate_collection(&self.overrides, SKILL_API_MAX_OVERRIDES)?;
+        validate_diagnostics(&self.diagnostics)?;
+        self.provenance.validate(&self.projection)?;
+        for provenance in &self.overrides {
+            provenance.validate(&self.projection)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_safe_integer(value: u64) -> Result<(), SkillApiValidationError> {
+    if value <= SKILL_API_MAX_SAFE_INTEGER {
+        Ok(())
+    } else {
+        Err(SkillApiValidationError::InvalidProjectionIdentity)
+    }
+}
+
+fn validate_collection<T>(values: &[T], limit: usize) -> Result<(), SkillApiValidationError> {
+    if values.len() <= limit {
+        Ok(())
+    } else {
+        Err(SkillApiValidationError::CollectionTooLarge)
+    }
+}
+
+fn validate_string(value: &str, limit: usize) -> Result<(), SkillApiValidationError> {
+    if value.len() <= limit {
+        Ok(())
+    } else {
+        Err(SkillApiValidationError::StringTooLarge)
+    }
+}
+
+fn validate_nonempty_string(value: &str, limit: usize) -> Result<(), SkillApiValidationError> {
+    validate_string(value, limit)?;
+    if value.is_empty() {
+        Err(SkillApiValidationError::StringTooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_optional_string(
+    value: Option<&str>,
+    limit: usize,
+) -> Result<(), SkillApiValidationError> {
+    if let Some(value) = value {
+        validate_nonempty_string(value, limit)?;
+    }
+    Ok(())
+}
+
+fn validate_strings(
+    values: &[String],
+    collection_limit: usize,
+    string_limit: usize,
+) -> Result<(), SkillApiValidationError> {
+    validate_collection(values, collection_limit)?;
+    for value in values {
+        validate_nonempty_string(value, string_limit)?;
+    }
+    Ok(())
+}
+
+fn validate_resources(resources: &[SkillResourceRef]) -> Result<(), SkillApiValidationError> {
+    validate_collection(resources, SKILL_API_MAX_RESOURCES)?;
+    for resource in resources {
+        validate_nonempty_string(&resource.kind, SKILL_API_MAX_LABEL_BYTES)?;
+        validate_nonempty_string(&resource.name, SKILL_API_MAX_PATH_BYTES)?;
+        if !is_virtual_path(&resource.name) {
+            return Err(SkillApiValidationError::InvalidVirtualPath);
+        }
+        validate_optional_string(resource.diagnostic.as_deref(), SKILL_API_MAX_LABEL_BYTES)?;
+    }
+    Ok(())
+}
+
+fn is_virtual_path(value: &str) -> bool {
+    !value.starts_with('/')
+        && !value.contains('\\')
+        && value
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+fn validate_diagnostics(diagnostics: &[SkillDiagnostic]) -> Result<(), SkillApiValidationError> {
+    validate_collection(diagnostics, SKILL_API_MAX_DIAGNOSTICS)?;
+    for diagnostic in diagnostics {
+        validate_nonempty_string(&diagnostic.code, SKILL_API_MAX_LABEL_BYTES)?;
+        validate_nonempty_string(&diagnostic.message, SKILL_API_MAX_LABEL_BYTES)?;
+        validate_optional_string(diagnostic.source.as_deref(), SKILL_API_MAX_PATH_BYTES)?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "typescript")]
 pub fn catalog_typescript() -> String {
     use ts_rs::TS;
@@ -1997,6 +2399,37 @@ pub fn repository_access_api_typescript() -> String {
     ];
     format!(
         "// Generated from workspace-api. Do not edit by hand.\n// Regenerate: cargo run -q -p workspace-api --features typescript --example generate_repository_access_types > web/workspace/src/lib/generated/repository-access-api.ts\n\n{}\n",
+        declarations
+            .into_iter()
+            .map(|declaration| format!("export {declaration}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    )
+}
+
+#[cfg(feature = "typescript")]
+pub fn skill_api_typescript() -> String {
+    use ts_rs::TS;
+
+    let config = ts_rs::Config::default();
+    let declarations = [
+        SkillDiagnosticSeverity::decl(&config),
+        SkillDiagnostic::decl(&config),
+        SkillSourceKind::decl(&config),
+        SkillProvenance::decl(&config),
+        SkillActivationStatus::decl(&config),
+        SkillProjectionStatus::decl(&config),
+        SkillProjectionIdentity::decl(&config),
+        SkillResourceRef::decl(&config),
+        SkillCatalogEntry::decl(&config),
+        SkillCatalogResponse::decl(&config),
+        SkillDetailResponse::decl(&config),
+    ];
+    let limits = format!(
+        "export const SKILL_API_AUTHORITY = \"{SKILL_CATALOG_AUTHORITY}\" as const;\n\nexport const SKILL_API_LIMITS = {{\n  maxSafeInteger: {SKILL_API_MAX_SAFE_INTEGER},\n  maxCatalogEntries: {SKILL_API_MAX_CATALOG_ENTRIES},\n  maxOverrides: {SKILL_API_MAX_OVERRIDES},\n  maxDiagnostics: {SKILL_API_MAX_DIAGNOSTICS},\n  maxResources: {SKILL_API_MAX_RESOURCES},\n  maxAllowedTools: {SKILL_API_MAX_ALLOWED_TOOLS},\n  maxNameBytes: {SKILL_API_MAX_NAME_BYTES},\n  maxLabelBytes: {SKILL_API_MAX_LABEL_BYTES},\n  maxBodyBytes: {SKILL_API_MAX_BODY_BYTES},\n  maxPathBytes: {SKILL_API_MAX_PATH_BYTES},\n  maxDigestBytes: {SKILL_API_MAX_DIGEST_BYTES},\n  maxResponseBytes: {SKILL_API_MAX_RESPONSE_BYTES},\n}} as const;"
+    );
+    format!(
+        "// Generated from workspace-api. Do not edit by hand.\n// Regenerate: cargo run -q -p workspace-api --features typescript --example generate_skill_api_types > web/workspace/src/lib/generated/skill-api.ts\n\n{limits}\n\n{}\n",
         declarations
             .into_iter()
             .map(|declaration| format!("export {declaration}"))
@@ -2173,6 +2606,36 @@ mod memory_typescript_tests {
 }
 
 #[cfg(all(test, feature = "typescript"))]
+mod skill_typescript_tests {
+    #[test]
+    fn generated_skill_api_contract_is_current() {
+        let expected = super::skill_api_typescript();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/workspace/src/lib/generated/skill-api.ts");
+        let actual = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        assert_eq!(
+            normalize(&actual),
+            normalize(&expected),
+            "regenerate Skill API TypeScript types with `cargo run -q -p workspace-api --features typescript --example generate_skill_api_types > web/workspace/src/lib/generated/skill-api.ts` and format the generated file",
+        );
+    }
+
+    fn normalize(value: &str) -> String {
+        value
+            .chars()
+            .filter_map(|character| match character {
+                character if character.is_whitespace() => None,
+                ',' => Some(';'),
+                character => Some(character),
+            })
+            .collect::<String>()
+            .replace("=|", "=")
+            .replace(";}", "}")
+    }
+}
+
+#[cfg(all(test, feature = "typescript"))]
 mod workdir_typescript_tests {
     #[test]
     fn generated_workdir_api_contract_is_current() {
@@ -2204,6 +2667,145 @@ mod workdir_typescript_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn skill_projection() -> SkillProjectionIdentity {
+        SkillProjectionIdentity {
+            config_revision: 42,
+            tree_digest: "tree-digest".to_string(),
+        }
+    }
+
+    fn builtin_skill_provenance() -> SkillProvenance {
+        SkillProvenance {
+            kind: SkillSourceKind::Builtin,
+            id: "builtin:errors".to_string(),
+            virtual_path: Some("skills/errors/SKILL.md".to_string()),
+            revision: None,
+            source_digest: Some("builtin-source-digest".to_string()),
+            tree_digest: None,
+        }
+    }
+
+    fn workspace_skill_provenance() -> SkillProvenance {
+        SkillProvenance {
+            kind: SkillSourceKind::Workspace,
+            id: "workspace:skills/release/SKILL.md".to_string(),
+            virtual_path: Some("skills/release/SKILL.md".to_string()),
+            revision: Some(42),
+            source_digest: Some("workspace-source-digest".to_string()),
+            tree_digest: Some("tree-digest".to_string()),
+        }
+    }
+
+    #[test]
+    fn skill_catalog_round_trips_builtin_workspace_and_invalid_projection_entries() {
+        let response = SkillCatalogResponse {
+            authority: "workspace-config-skills-v1".to_string(),
+            projection: skill_projection(),
+            entries: vec![
+                SkillCatalogEntry {
+                    name: "errors".to_string(),
+                    description: "Builtin guidance".to_string(),
+                    activation_status: SkillActivationStatus::Active,
+                    projection_status: SkillProjectionStatus::Valid,
+                    provenance: builtin_skill_provenance(),
+                    overrides: vec![],
+                    diagnostics: vec![],
+                },
+                SkillCatalogEntry {
+                    name: "release".to_string(),
+                    description: "Workspace guidance".to_string(),
+                    activation_status: SkillActivationStatus::Inactive,
+                    projection_status: SkillProjectionStatus::Invalid,
+                    provenance: workspace_skill_provenance(),
+                    overrides: vec![builtin_skill_provenance()],
+                    diagnostics: vec![SkillDiagnostic {
+                        severity: SkillDiagnosticSeverity::Error,
+                        code: "invalid_projection".to_string(),
+                        message: "invalid projected Skill".to_string(),
+                        source: Some("skills/release/SKILL.md".to_string()),
+                    }],
+                },
+            ],
+            diagnostics: vec![],
+        };
+
+        response.validate().expect("fixture should be valid");
+        let json = serde_json::to_string(&response).expect("serialize Skill catalog");
+        let decoded: SkillCatalogResponse =
+            serde_json::from_str(&json).expect("deserialize Skill catalog");
+        assert_eq!(decoded, response);
+        assert!(!json.contains("\"revision\":null"));
+        assert!(!json.contains("\"tree_digest\":null"));
+    }
+
+    #[test]
+    fn skill_detail_round_trips_shared_response() {
+        let response = SkillDetailResponse {
+            authority: "workspace-config-skills-v1".to_string(),
+            projection: skill_projection(),
+            name: "release".to_string(),
+            description: "Workspace guidance".to_string(),
+            body: "# Release\n".to_string(),
+            allowed_tools: vec!["Bash".to_string()],
+            allowed_tools_status: "experimental_hint_only".to_string(),
+            resources: vec![],
+            activation_status: SkillActivationStatus::Active,
+            projection_status: SkillProjectionStatus::Valid,
+            provenance: workspace_skill_provenance(),
+            overrides: vec![],
+            diagnostics: vec![],
+        };
+
+        response.validate().expect("fixture should be valid");
+        let decoded: SkillDetailResponse = serde_json::from_value(
+            serde_json::to_value(&response).expect("serialize Skill detail"),
+        )
+        .expect("deserialize Skill detail");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn skill_projection_validation_detects_stale_workspace_revision() {
+        let mut provenance = workspace_skill_provenance();
+        provenance.revision = Some(41);
+        let response = SkillCatalogResponse {
+            authority: "workspace-config-skills-v1".to_string(),
+            projection: skill_projection(),
+            entries: vec![SkillCatalogEntry {
+                name: "release".to_string(),
+                description: String::new(),
+                activation_status: SkillActivationStatus::Active,
+                projection_status: SkillProjectionStatus::Valid,
+                provenance,
+                overrides: vec![],
+                diagnostics: vec![],
+            }],
+            diagnostics: vec![],
+        };
+
+        assert_eq!(
+            response.validate(),
+            Err(SkillApiValidationError::StaleProjection)
+        );
+    }
+
+    #[test]
+    fn skill_dto_rejects_unknown_fields_and_unknown_provenance_kind() {
+        let unknown_field = serde_json::json!({
+            "authority": "workspace-config-skills-v1",
+            "projection": {"config_revision": 42, "tree_digest": "tree-digest"},
+            "entries": [],
+            "diagnostics": [],
+            "body": "must not be accepted"
+        });
+        assert!(serde_json::from_value::<SkillCatalogResponse>(unknown_field).is_err());
+
+        let mut provenance =
+            serde_json::to_value(workspace_skill_provenance()).expect("serialize provenance");
+        provenance["kind"] = serde_json::Value::String("newer_source_kind".to_string());
+        assert!(serde_json::from_value::<SkillProvenance>(provenance).is_err());
+    }
 
     #[test]
     fn memory_evidence_origins_round_trip_as_typed_provenance() {

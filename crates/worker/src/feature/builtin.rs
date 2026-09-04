@@ -8,7 +8,8 @@ pub mod flow_transition;
 pub mod manage_workdir;
 pub mod manage_worker;
 pub mod memory;
-pub mod memory_extract;
+pub(crate) mod memory_lifecycle;
+pub mod memory_staging_output;
 pub mod merge_request;
 pub mod objective;
 pub mod orchestration;
@@ -19,8 +20,6 @@ pub mod ticket;
 pub mod worker_observation;
 pub mod workspace_worker_discovery;
 
-pub(crate) use memory_extract::{MemoryExtractFeature, MemoryExtractState, render_extract_input};
-pub(crate) use session_explore::{SessionExploreFeature, SessionExploreState};
 pub use task::{TaskFeature, task_tools_feature};
 pub use ticket::{
     TicketFeature, TicketFeatureAccess, ticket_tools_feature, ticket_tools_feature_with_access,

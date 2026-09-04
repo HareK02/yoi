@@ -23,7 +23,15 @@ compaction = {
 
 feature = {
     task = { enabled = true; };
-    memory = { enabled = true; };
+    memory = {
+        enabled = true;
+        resident = { inject_summary = true; };
+        extraction = {
+            enabled = true;
+            threshold = 50000;
+        };
+        consolidation = { request_enabled = true; };
+    };
     web = { enabled = true; };
     image = { enabled = true; };
     sub_worker = { enabled = false; };
@@ -38,12 +46,6 @@ feature = {
         readiness_check = false;
         complete = false;
     };
-};
-
-memory = {
-    extract_threshold = 50000;
-    consolidation_threshold_files = 5;
-    consolidation_threshold_bytes = 50000;
 };
 
 web = {

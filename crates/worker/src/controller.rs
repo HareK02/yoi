@@ -197,8 +197,8 @@ async fn finish_controller_run<C, St>(
 {
     // history / user_segments are no longer mirrored on WorkerSharedState —
     // clients reconstruct them from `Event::Snapshot` + live
-    // `Event::Entry` deliveries driven by the session-log sink. We
-    // flip the status and kick post-run memory jobs here.
+    // `Event::Entry` deliveries driven by the session-log sink. The
+    // lifecycle hook/task registry observes the terminal commit separately.
     //
     // In-flight blocks are run-local streaming state, not durable transcript.
     // Any block not cleared by a committed AssistantItem must be discarded at
@@ -206,7 +206,6 @@ async fn finish_controller_run<C, St>(
     // partial text/tool arguments after newer entries.
     worker.clear_in_flight_events();
     set_controller_status(shared_state, runtime_dir, working_event_tx, new_status).await;
-    worker.spawn_post_run_memory_jobs();
 }
 
 /// Pending turn launch staged by an event handler for the next outer-loop
@@ -938,7 +937,6 @@ where
     let local_filesystem = worker.local_working_directory().cloned();
     let local_workspace_root = local_filesystem.as_ref().map(|local| local.root.clone());
     let task_feature = worker.task_feature();
-    let memory_config = worker.manifest().memory.clone();
     let web_config = worker.manifest().web.clone();
     let mcp_config = worker.manifest().mcp.clone();
     let spawner_name = worker.manifest().worker.name.clone();
@@ -995,6 +993,41 @@ where
     let worker_enabled = feature_config.worker.enabled;
     let sub_worker_enabled = feature_config.sub_worker.enabled;
     let mut feature_registry = FeatureRegistryBuilder::new();
+    let memory_install_plan = crate::feature::builtin::memory::MemoryFeatureInstallPlan::prepare(
+        worker.manifest(),
+        worker.workspace_client_handle(),
+        worker.prompts().load_full(),
+    )
+    .await?;
+    let memory_prompt_contribution = memory_install_plan.as_ref().map(|plan| {
+        (
+            plan.resident_summary.clone(),
+            plan.system_prompt_override.clone(),
+        )
+    });
+    let memory_lifecycle_config = memory_install_plan
+        .as_ref()
+        .map(|plan| plan.resolved_config.clone());
+    if let Some(plan) = memory_install_plan {
+        feature_registry.add_module(plan.module);
+    }
+    if let Some(memory_config) = memory_lifecycle_config
+        && let Some(memory_lifecycle) =
+            crate::feature::builtin::memory_lifecycle::MemoryLifecycleFeature::from_resolved_config(
+                worker.manifest_lifecycle_features_enabled(),
+                memory_config,
+                worker.committed_session_capture_handle(),
+                worker.session_extension_handle(),
+                worker.workspace_client_handle(),
+                spawner_manifest.clone(),
+                worker.llm_client_handle(),
+                prompts.clone(),
+                spawner_workspace_context.clone(),
+                worker.working_event_sender(),
+            )?
+    {
+        feature_registry.add_module(memory_lifecycle);
+    }
     if sub_worker_enabled && !worker_enabled {
         feature_registry.add_module(
             crate::feature::builtin::manage_worker::sub_worker_control_feature(
@@ -1148,38 +1181,6 @@ where
             }
         }
 
-        // Memory tools require explicit feature exposure. Workspace memory access
-        // is authority-bound to the Backend Workspace API; the Worker must not
-        // register local filesystem memory tools even when it has local cwd/root
-        // authority for shell/file tools.
-        if feature_config.memory.enabled {
-            let _mem = memory_config.as_ref().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "[feature.memory].enabled = true requires a [memory] configuration section",
-                )
-            })?;
-            if workspace_client.is_available() && workspace_client.workspace_id().is_some() {
-                let definitions = if feature_config.memory.staging {
-                    crate::feature::builtin::memory::workspace_http_memory_consolidation_tools(
-                        workspace_client.clone(),
-                    )
-                } else {
-                    crate::feature::builtin::memory::workspace_http_memory_tools(
-                        workspace_client.clone(),
-                    )
-                };
-                for definition in definitions {
-                    engine.register_tool(definition);
-                }
-            } else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "memory tools require Backend Workspace API authority",
-                ));
-            }
-        }
-
         let mut observation_providers: Vec<
             Arc<dyn crate::feature::builtin::worker_observation::WorkerObservationProvider>,
         > = Vec::new();
@@ -1234,6 +1235,9 @@ where
                 feature_install_report.error_message()
             ),
         ));
+    }
+    if let Some((resident_summary, system_prompt_override)) = memory_prompt_contribution {
+        worker.install_system_prompt_contribution(resident_summary, system_prompt_override);
     }
     if let Some(tracker) = tracker {
         worker.attach_tracker(tracker);
@@ -1590,7 +1594,9 @@ async fn controller_loop<C, St>(
                         &working_event_tx,
                         target,
                         expected_head_entries,
-                    ) {
+                    )
+                    .await
+                    {
                         worker.clear_in_flight_events();
                         shared_state.set_status(WorkerStatus::Idle);
                         let _ = working_event_tx.send(Event::Status {
@@ -1711,10 +1717,9 @@ async fn controller_loop<C, St>(
         tracing::warn!(%error, "Worker runtime socket cleanup failed");
     }
 
-    // Background memory jobs own extract/consolidate workers after a
-    // turn completes. Join them before closing the Workdir session so no
-    // Worker-owned task can outlive its operation attachment.
-    worker.wait_for_memory_jobs().await;
+    // Feature callbacks and tasks share the Worker scope. Stop them before
+    // Memory/Workdir teardown so they cannot observe a partially closed Worker.
+    worker.stop_feature_runtime("controller shutdown").await;
 
     if let Some(session) = worker.workdir_session()
         && let Err(error) = session.close().await
@@ -1993,7 +1998,7 @@ where
     }
 }
 
-fn apply_rewind<C, St>(
+async fn apply_rewind<C, St>(
     worker: &mut Worker<C, St>,
     working_event_tx: &broadcast::Sender<Event>,
     target: RewindTargetId,
@@ -2003,7 +2008,7 @@ where
     C: LlmClient + 'static,
     St: Store,
 {
-    match worker.rewind_to(target, expected_head_entries) {
+    match worker.rewind_to(target, expected_head_entries).await {
         Ok(applied) => {
             let session =
                 session_store::public_snapshot::project_current_session_snapshot(&applied.entries);

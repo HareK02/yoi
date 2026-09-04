@@ -125,7 +125,7 @@ impl FeatureModule for TaskFeature {
             ))
             .with_hook(HookDeclaration::new(
                 "task-reminder-pre-request",
-                FeatureHookPoint::PreRequest,
+                FeatureHookPoint::PreLlmRequest,
             ))
             .with_hook(HookDeclaration::new(
                 "task-reminder-tool-usage",
@@ -209,24 +209,27 @@ struct TaskReminderPreRequestHook {
 
 #[async_trait]
 impl Hook<PreLlmRequest> for TaskReminderPreRequestHook {
-    async fn call(&self, input: &PreRequestContext) -> HookPreRequestAction {
+    async fn call(
+        &self,
+        input: &PreRequestContext,
+    ) -> Result<HookPreRequestAction, crate::hook::HookError> {
         let tasks = self.state.task_store.list();
         if tasks.is_empty() {
-            return HookPreRequestAction::Continue;
+            return Ok(HookPreRequestAction::Continue);
         }
 
         let (since_task_management, since_reminder) = self.state.reminder_state.note_request();
         if since_task_management < TASK_REMINDER_REQUEST_THRESHOLD
             || since_reminder < TASK_REMINDER_COOLDOWN_REQUESTS
         {
-            return HookPreRequestAction::Continue;
+            return Ok(HookPreRequestAction::Continue);
         }
 
         if let Some(system_items) = input.system_items() {
             self.state.reminder_state.note_reminder();
             system_items.append_task_reminder(render_task_reminder_body(&tasks));
         }
-        HookPreRequestAction::Continue
+        Ok(HookPreRequestAction::Continue)
     }
 }
 
@@ -236,11 +239,14 @@ struct TaskReminderToolUsageHook {
 
 #[async_trait]
 impl Hook<PreToolCall> for TaskReminderToolUsageHook {
-    async fn call(&self, input: &ToolCallSummary) -> HookPreToolAction {
+    async fn call(
+        &self,
+        input: &ToolCallSummary,
+    ) -> Result<HookPreToolAction, crate::hook::HookError> {
         if is_task_management_tool(&input.tool_name) {
             self.state.reminder_state.note_task_management();
         }
-        HookPreToolAction::Continue
+        Ok(HookPreToolAction::Continue)
     }
 }
 

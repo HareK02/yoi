@@ -746,9 +746,15 @@ fn bind_workspace_memory_settings(
         ));
     }
     manifest
+        .feature
         .memory
-        .get_or_insert_with(manifest::MemoryConfig::default)
-        .bind_workspace_settings(snapshot);
+        .bind_workspace_settings(snapshot.clone())
+        .map_err(str::to_string)?;
+    manifest
+        .feature
+        .memory
+        .validate_execution()
+        .map_err(str::to_string)?;
     Ok(())
 }
 
@@ -759,10 +765,18 @@ fn validate_worker_memory_settings(
     let Some(expected) = request.memory_settings.as_ref() else {
         return Ok(());
     };
-    let actual = manifest
+    manifest
+        .feature
         .memory
-        .as_ref()
-        .and_then(manifest::MemoryConfig::workspace_settings)
+        .validate_execution()
+        .map_err(str::to_string)?;
+    if !manifest.feature.memory.profile.enabled {
+        return Ok(());
+    }
+    let actual = manifest
+        .feature
+        .memory
+        .workspace_settings()
         .ok_or_else(|| {
             "Workspace Worker restored without its bound Memory settings snapshot".to_string()
         })?;
@@ -3165,7 +3179,7 @@ mod tests {
                 Some(session_store::WorkerActiveSegmentRef::pending_segment(
                     session_id,
                 )),
-                Some(serde_json::to_value(&manifest).unwrap()),
+                Some(manifest::write_persisted_worker_manifest_snapshot(&manifest).unwrap()),
             )
             .unwrap();
 

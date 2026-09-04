@@ -222,55 +222,41 @@ permission = "write"
 # # ref = "anthropic/claude-haiku-4-5"
 
 
-# ===== [memory] =============================================================
-# Memory subsystem の opt-in。
-#   - セクションが *ある*    … memory tools (MemoryRead/Write/Edit) を登録、
-#                              `<workspace>/memory/` と `<workspace>/`
-#                              の通常 write を Worker 自体に対して deny する。
-#   - セクションが *無い*    … 何も起きない (legacy 動作)。
-# `[memory]` だけ書いて中身を省略するのも有効 (全フィールド既定値で有効化)。
-# [memory]
+# ===== [feature.memory] ======================================================
+# Memory は `feature.memory` だけを入口にする。resolved Worker Manifest では
+# Profile由来の設定を `profile` に、Backend由来のWorkspace設定snapshotを
+# `workspace_settings` に分離して保存する。`workspace_settings` はBackendだけが
+# bindする信頼済み入力で、Profile・Browser・model入力から指定できない。
+# `profile.enabled = false` の場合、Memory tools、Feature prompt contributionによる
+# resident injection、extract、consolidation requestをすべて無効にし、snapshotも保持しない。
 #
-# # 任意。デフォルト: Worker の pwd (構築時)。
-# # 必ず絶対パス (相対なら manifest base 起点で resolve)。
-# workspace_root = "/abs/path/to/workspace"
+# [feature.memory.profile]
+# enabled = true
+# staging_tools = false
 #
-# # 任意。デフォルト: tool 側既定 = 20。
-# # MemoryQuery / MemoryQuery が 1 回に返す最大件数。
-# query_result_limit = 20
+# [feature.memory.profile.resident]
+# inject_summary = true
 #
-# # 任意。デフォルト: tool 側既定 = 3。
-# # 各マッチ前後に表示するコンテキスト行数。`query` 省略時は無視。
-# query_excerpt_lines = 3
+# [feature.memory.profile.extraction]
+# enabled = true
+# threshold = 30000
+# worker_max_turns = 8
 #
-# # 任意。デフォルト: メインモデルを `clone_boxed()` で複製。
-# # extract ワーカーのモデル ([model] と同じ形式)。
-# # Haiku / 4o-mini / Flash クラスの軽量 reasoning モデル推奨。
-# # [memory.extract_model]
+# # 任意。省略時はmain modelをcloneする。
+# # [feature.memory.profile.extraction.model]
 # # ref = "anthropic/claude-haiku-4-5"
 #
-# # 任意。デフォルト: なし (extract 自動発火を完全停止)。
-# # 前回 extract pointer 以降の累積入力 token がこの値を超えると extract 起動。
-# # ※ memory tools と resident injection は extract_threshold が None でも動く。
-# extract_threshold = 30000
+# [feature.memory.profile.consolidation]
+# request_enabled = true
 #
-# # 任意。デフォルト: 8 (`defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS`)。
-# # extract worker 自身の tool loop 上限。Rust config で None の場合のみ無制限。
-# extract_worker_max_turns = 8
+# # Backendがresolved Manifestへbindする。手書き/Profile入力では指定しない。
+# # [feature.memory.workspace_settings]
+# # workspace_id = "workspace-id"
+# # settings_revision = 1
+# # language = "日本語"
 #
-# # 任意。デフォルト: メインモデルを `clone_boxed()` で複製。
-# # consolidation ワーカーのモデル。reasoning クラス推奨。
-# # [memory.consolidation_model]
-# # ref = "anthropic/claude-sonnet-4-6"
-#
-# # 任意。デフォルト: なし。
-# # `_staging/` のエントリ数がこの値以上で consolidation 発火 (files / bytes は OR)。
-# consolidation_threshold_files = 50
-#
-# # 任意。デフォルト: なし。
-# # `_staging/` の総バイト数がこの値以上で consolidation 発火 (files / bytes は OR)。
-# # files / bytes の両方が None だと consolidation 完全無効。
-# consolidation_threshold_bytes = 1048576
+# Query結果/抜粋の上限とconsolidation eligibility/thresholdはoperation/Backend
+# policyが所有し、通常Worker Manifestには含めない。legacy `[memory]` は拒否する。
 
 
 # ===== [skills] =============================================================

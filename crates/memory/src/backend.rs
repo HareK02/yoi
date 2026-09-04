@@ -152,13 +152,10 @@ pub enum MemoryStagingAffectedMemoryOperation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryConsolidateStagingOperation {
     #[serde(default)]
     pub force: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub threshold_files: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub threshold_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -451,9 +448,20 @@ mod tests {
     use crate::extract::{CandidateKind, ExtractedCandidate};
 
     #[test]
+    fn consolidation_operation_rejects_caller_owned_thresholds() {
+        let error =
+            serde_json::from_value::<MemoryConsolidateStagingOperation>(serde_json::json!({
+                "force": false,
+                "threshold_files": 1,
+            }))
+            .unwrap_err();
+        assert!(error.to_string().contains("threshold_files"));
+    }
+
+    #[test]
     fn staging_list_read_close_records_reason_and_deletes_candidate() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = WorkspaceLayout::resolve(&manifest::MemoryConfig::default(), temp.path());
+        let layout = WorkspaceLayout::resolve(temp.path());
         let source = SourceRef {
             segment_id: "segment-1".into(),
             range: [0, 1],

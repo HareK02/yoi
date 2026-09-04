@@ -39,6 +39,10 @@ name = "generate_memory_api_types"
 required-features = ["typescript"]
 
 [[example]]
+name = "generate_skill_api_types"
+required-features = ["typescript"]
+
+[[example]]
 name = "generate_auth_api_types"
 required-features = ["typescript"]
 

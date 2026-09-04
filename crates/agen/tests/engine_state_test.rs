@@ -10,9 +10,16 @@ use std::sync::{Arc, Mutex};
 
 use agen::Item;
 use agen::interceptor::{
-    Interceptor, PreRequestAction, PreToolAction, ToolCallInfo, TurnEndAction,
+    AssistantTurnEndContext, Interceptor, InterceptorError, InterceptorErrorCategory,
+    InterceptorPhase as InterceptorPoint, InterceptorResult, MAX_INTERCEPTOR_DIAGNOSTIC_BYTES,
+    PendingHistoryAppendsContext, PostToolAction, PreLlmRequestContext, PreRequestAction,
+    PreToolAction, PromptAction, PromptSubmitContext, RunExitContext, ToolCallInfo, ToolResultInfo,
+    TurnEndAction,
 };
-use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
+use agen::llm_client::{
+    ClientError, LlmClient, Request, ResponseStream,
+    event::{Event, ResponseStatus, StatusEvent},
+};
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use agen::{Engine, EngineError, EngineRunExit, History, RunInterruptionReason};
 use async_trait::async_trait;
@@ -613,12 +620,15 @@ struct YieldOnce {
 
 #[async_trait]
 impl Interceptor for YieldOnce {
-    async fn pre_llm_request(&self, _context: &mut Vec<Item>) -> PreRequestAction {
-        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+    async fn pre_llm_request(
+        &self,
+        _context: PreLlmRequestContext<'_, ()>,
+    ) -> InterceptorResult<PreRequestAction> {
+        Ok(if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             PreRequestAction::Yield
         } else {
             PreRequestAction::Continue
-        }
+        })
     }
 }
 
@@ -628,12 +638,15 @@ struct PauseToolOnce {
 
 #[async_trait]
 impl Interceptor for PauseToolOnce {
-    async fn pre_tool_call(&self, _info: &mut ToolCallInfo) -> PreToolAction {
-        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+    async fn pre_tool_call(
+        &self,
+        _info: &mut ToolCallInfo<'_, ()>,
+    ) -> InterceptorResult<PreToolAction> {
+        Ok(if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             PreToolAction::Pause
         } else {
             PreToolAction::Continue
-        }
+        })
     }
 }
 
@@ -643,13 +656,509 @@ struct ContinueTurnOnce {
 
 #[async_trait]
 impl Interceptor for ContinueTurnOnce {
-    async fn on_turn_end(&self, _history: &[Item]) -> TurnEndAction {
-        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+    async fn on_assistant_turn_end(
+        &self,
+        _context: AssistantTurnEndContext<'_, ()>,
+    ) -> InterceptorResult<TurnEndAction> {
+        Ok(if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             TurnEndAction::ContinueWithMessages(vec![Item::system_message("continue")])
         } else {
             TurnEndAction::Finish
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FailingLifecycleInterceptor {
+    failure: InterceptorPoint,
+    calls: Arc<Mutex<Vec<InterceptorPoint>>>,
+}
+
+impl FailingLifecycleInterceptor {
+    fn new(failure: InterceptorPoint) -> Self {
+        Self {
+            failure,
+            calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
+
+    fn record<T>(&self, point: InterceptorPoint, action: T) -> InterceptorResult<T> {
+        self.calls.lock().unwrap().push(point);
+        if self.failure == point {
+            Err(InterceptorError::new(
+                InterceptorErrorCategory::Policy,
+                format!("{point} rejected"),
+            ))
+        } else {
+            Ok(action)
+        }
+    }
+
+    fn calls(&self) -> Vec<InterceptorPoint> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl Interceptor for FailingLifecycleInterceptor {
+    async fn on_prompt_submit(
+        &self,
+        _context: PromptSubmitContext<'_, ()>,
+    ) -> InterceptorResult<PromptAction> {
+        tokio::task::yield_now().await;
+        self.record(InterceptorPoint::PromptSubmit, PromptAction::Continue)
+    }
+
+    async fn pending_history_appends(
+        &self,
+        _context: PendingHistoryAppendsContext<'_, ()>,
+    ) -> InterceptorResult<Vec<Item>> {
+        tokio::task::yield_now().await;
+        self.record(InterceptorPoint::PendingHistoryAppends, Vec::new())
+    }
+
+    async fn pre_llm_request(
+        &self,
+        _context: PreLlmRequestContext<'_, ()>,
+    ) -> InterceptorResult<PreRequestAction> {
+        tokio::task::yield_now().await;
+        self.record(InterceptorPoint::PreLlmRequest, PreRequestAction::Continue)
+    }
+
+    async fn pre_tool_call(
+        &self,
+        _info: &mut ToolCallInfo<'_, ()>,
+    ) -> InterceptorResult<PreToolAction> {
+        tokio::task::yield_now().await;
+        self.record(InterceptorPoint::PreToolCall, PreToolAction::Continue)
+    }
+
+    async fn post_tool_call(
+        &self,
+        _info: &ToolResultInfo<'_, ()>,
+    ) -> InterceptorResult<PostToolAction> {
+        tokio::task::yield_now().await;
+        self.record(InterceptorPoint::PostToolCall, PostToolAction::Continue)
+    }
+
+    async fn on_assistant_turn_end(
+        &self,
+        context: AssistantTurnEndContext<'_, ()>,
+    ) -> InterceptorResult<TurnEndAction> {
+        tokio::task::yield_now().await;
+        assert!(context.history.ends_with(context.assistant_entries));
+        if !context.tool_calls.is_empty() {
+            assert_eq!(
+                context
+                    .assistant_entries
+                    .iter()
+                    .filter(|entry| matches!(&entry.item, Item::ToolCall { .. }))
+                    .count(),
+                context.tool_calls.len()
+            );
+        }
+        self.record(InterceptorPoint::AssistantTurnEnd, TurnEndAction::Finish)
+    }
+
+    async fn on_run_exit(&self, _context: RunExitContext<'_, ()>) -> InterceptorResult<()> {
+        tokio::task::yield_now().await;
+        self.record(InterceptorPoint::RunExit, ())
+    }
+}
+
+fn expected_interceptor_calls(failure: InterceptorPoint) -> Vec<InterceptorPoint> {
+    use InterceptorPoint as Point;
+
+    let mut calls = match failure {
+        Point::PromptSubmit => vec![Point::PromptSubmit],
+        Point::PendingHistoryAppends => {
+            vec![Point::PromptSubmit, Point::PendingHistoryAppends]
+        }
+        Point::PreLlmRequest => vec![
+            Point::PromptSubmit,
+            Point::PendingHistoryAppends,
+            Point::PreLlmRequest,
+        ],
+        Point::PreToolCall => vec![
+            Point::PromptSubmit,
+            Point::PendingHistoryAppends,
+            Point::PreLlmRequest,
+            Point::AssistantTurnEnd,
+            Point::PreToolCall,
+        ],
+        Point::PostToolCall => vec![
+            Point::PromptSubmit,
+            Point::PendingHistoryAppends,
+            Point::PreLlmRequest,
+            Point::AssistantTurnEnd,
+            Point::PreToolCall,
+            Point::PostToolCall,
+        ],
+        Point::AssistantTurnEnd => vec![
+            Point::PromptSubmit,
+            Point::PendingHistoryAppends,
+            Point::PreLlmRequest,
+            Point::AssistantTurnEnd,
+        ],
+        Point::RunExit => vec![
+            Point::PromptSubmit,
+            Point::PendingHistoryAppends,
+            Point::PreLlmRequest,
+            Point::AssistantTurnEnd,
+        ],
+    };
+    calls.push(Point::RunExit);
+    calls
+}
+
+#[tokio::test]
+async fn interceptor_failures_are_typed_and_terminal_observer_preserves_original_exit() {
+    use InterceptorPoint as Point;
+
+    for failure_point in [
+        Point::PromptSubmit,
+        Point::PendingHistoryAppends,
+        Point::PreLlmRequest,
+        Point::PreToolCall,
+        Point::PostToolCall,
+        Point::AssistantTurnEnd,
+        Point::RunExit,
+    ] {
+        let interceptor = FailingLifecycleInterceptor::new(failure_point);
+        let needs_tool = matches!(failure_point, Point::PreToolCall | Point::PostToolCall);
+        let events = if needs_tool {
+            vec![
+                Event::tool_use_start(0, "call-1", "count_tool"),
+                Event::tool_input_delta(0, "{}"),
+                Event::tool_use_stop(0),
+                Event::Status(StatusEvent {
+                    status: ResponseStatus::Completed,
+                }),
+            ]
+        } else {
+            completed_text_events()
+        };
+        let mut engine = Engine::new(MockLlmClient::new(events));
+        engine.register_tool(CountingTool::new("count_tool").definition());
+        engine.set_interceptor(interceptor.clone());
+        let mut history = History::new();
+        let mut engine = engine.lock(&history);
+
+        let exit = engine.run(&mut history, "test").await;
+        let failure = if failure_point == Point::RunExit {
+            assert!(matches!(exit, EngineRunExit::Finished));
+            engine
+                .last_run_exit_observer_failure()
+                .expect("terminal observer diagnostic should be retained")
+        } else {
+            let EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(
+                EngineError::Interceptor(failure),
+            )) = &exit
+            else {
+                panic!("expected typed interceptor interruption at {failure_point}, got {exit:?}");
+            };
+            failure
+        };
+        assert_eq!(failure.phase(), failure_point);
+        assert_eq!(
+            failure.error().diagnostic(),
+            format!("{failure_point} rejected")
+        );
+        assert_eq!(
+            interceptor.calls(),
+            expected_interceptor_calls(failure_point)
+        );
+        if failure_point == Point::PostToolCall {
+            assert!(
+                history
+                    .items()
+                    .any(|item| matches!(item, Item::ToolResult { .. })),
+                "post-tool failure must not precede terminal output commit"
+            );
+        }
+    }
+}
+
+#[test]
+fn interceptor_error_keeps_typed_category_and_bounded_utf8_diagnostic() {
+    let error = InterceptorError::new(
+        InterceptorErrorCategory::Dependency,
+        "界".repeat(MAX_INTERCEPTOR_DIAGNOSTIC_BYTES),
+    );
+    assert_eq!(error.category(), InterceptorErrorCategory::Dependency);
+    assert!(error.diagnostic().len() <= MAX_INTERCEPTOR_DIAGNOSTIC_BYTES);
+    assert!(
+        error
+            .diagnostic()
+            .is_char_boundary(error.diagnostic().len())
+    );
+}
+
+struct FailingRunExitObserver {
+    pause: bool,
+}
+
+#[async_trait]
+impl Interceptor for FailingRunExitObserver {
+    async fn on_assistant_turn_end(
+        &self,
+        _context: AssistantTurnEndContext<'_, ()>,
+    ) -> InterceptorResult<TurnEndAction> {
+        Ok(if self.pause {
+            TurnEndAction::Pause
+        } else {
+            TurnEndAction::Finish
+        })
+    }
+
+    async fn on_run_exit(&self, _context: RunExitContext<'_, ()>) -> InterceptorResult<()> {
+        Err(InterceptorError::new(
+            InterceptorErrorCategory::Dependency,
+            "terminal audit unavailable",
+        ))
+    }
+}
+
+#[tokio::test]
+async fn terminal_observer_failure_preserves_paused_and_interrupted_exits() {
+    let mut paused_engine = Engine::new(MockLlmClient::new(completed_text_events()));
+    paused_engine.set_interceptor(FailingRunExitObserver { pause: true });
+    let mut paused_history = History::new();
+    let mut paused_engine = paused_engine.lock(&paused_history);
+    assert!(matches!(
+        paused_engine.run(&mut paused_history, "pause").await,
+        EngineRunExit::Paused
+    ));
+    assert_eq!(
+        paused_engine
+            .last_run_exit_observer_failure()
+            .expect("paused observer diagnostic")
+            .error()
+            .category(),
+        InterceptorErrorCategory::Dependency
+    );
+
+    let mut interrupted_engine = Engine::new(MockLlmClient::new(completed_text_events()));
+    interrupted_engine.set_max_turns(Some(0));
+    interrupted_engine.set_interceptor(FailingRunExitObserver { pause: false });
+    let mut interrupted_history = History::new();
+    let mut interrupted_engine = interrupted_engine.lock(&interrupted_history);
+    assert!(matches!(
+        interrupted_engine
+            .run(&mut interrupted_history, "limit")
+            .await,
+        EngineRunExit::Interrupted(RunInterruptionReason::LimitReached)
+    ));
+    assert_eq!(
+        interrupted_engine
+            .last_run_exit_observer_failure()
+            .expect("interrupted observer diagnostic")
+            .phase(),
+        InterceptorPoint::RunExit
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalMode {
+    Finish,
+    PauseOnce,
+    Yield,
+}
+
+#[derive(Debug, Clone)]
+struct RecordingTerminalInterceptor {
+    mode: TerminalMode,
+    assistant_turns: Arc<AtomicUsize>,
+    exits: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl RecordingTerminalInterceptor {
+    fn new(mode: TerminalMode) -> Self {
+        Self {
+            mode,
+            assistant_turns: Arc::new(AtomicUsize::new(0)),
+            exits: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn exits(&self) -> Vec<&'static str> {
+        self.exits.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl Interceptor for RecordingTerminalInterceptor {
+    async fn pre_llm_request(
+        &self,
+        _context: PreLlmRequestContext<'_, ()>,
+    ) -> InterceptorResult<PreRequestAction> {
+        Ok(if self.mode == TerminalMode::Yield {
+            PreRequestAction::Yield
+        } else {
+            PreRequestAction::Continue
+        })
+    }
+
+    async fn on_assistant_turn_end(
+        &self,
+        context: AssistantTurnEndContext<'_, ()>,
+    ) -> InterceptorResult<TurnEndAction> {
+        assert!(!context.assistant_entries.is_empty());
+        assert!(
+            context.history.ends_with(context.assistant_entries),
+            "assistant-turn callback must observe committed terminal items"
+        );
+        let turn = self.assistant_turns.fetch_add(1, Ordering::SeqCst);
+        Ok(if self.mode == TerminalMode::PauseOnce && turn == 0 {
+            TurnEndAction::Pause
+        } else {
+            TurnEndAction::Finish
+        })
+    }
+
+    async fn on_run_exit(&self, context: RunExitContext<'_, ()>) -> InterceptorResult<()> {
+        let kind = match context.exit {
+            EngineRunExit::Finished => "finished",
+            EngineRunExit::Paused => "paused",
+            EngineRunExit::Yielded => "yielded",
+            EngineRunExit::Interrupted(RunInterruptionReason::LimitReached) => "limit",
+            EngineRunExit::Interrupted(RunInterruptionReason::ContextWindowExceeded) => "context",
+            EngineRunExit::Interrupted(RunInterruptionReason::Cancelled) => "cancelled",
+            EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(_)) => "unexpected",
+        };
+        self.exits.lock().unwrap().push(kind);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct ContextWindowClient;
+
+#[async_trait]
+impl LlmClient for ContextWindowClient {
+    async fn stream(&self, _request: Request) -> Result<ResponseStream, ClientError> {
+        Err(ClientError::ContextWindowExceeded)
+    }
+
+    fn clone_boxed(&self) -> Box<dyn LlmClient> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn terminal_observer_runs_once_for_every_exit_and_interruption_kind() {
+    let finished = RecordingTerminalInterceptor::new(TerminalMode::Finish);
+    let mut engine = Engine::new(MockLlmClient::new(completed_text_events()));
+    engine.set_interceptor(finished.clone());
+    let mut history = History::new();
+    assert!(matches!(
+        engine.lock(&history).run(&mut history, "finish").await,
+        EngineRunExit::Finished
+    ));
+    assert_eq!(finished.exits(), ["finished"]);
+
+    let yielded = RecordingTerminalInterceptor::new(TerminalMode::Yield);
+    let mut engine = Engine::new(MockLlmClient::new(completed_text_events()));
+    engine.set_interceptor(yielded.clone());
+    let mut history = History::new();
+    assert!(matches!(
+        engine.lock(&history).run(&mut history, "yield").await,
+        EngineRunExit::Yielded
+    ));
+    assert_eq!(yielded.exits(), ["yielded"]);
+
+    let limited = RecordingTerminalInterceptor::new(TerminalMode::Finish);
+    let mut engine = Engine::new(MockLlmClient::new(completed_text_events()));
+    engine.set_max_turns(Some(0));
+    engine.set_interceptor(limited.clone());
+    let mut history = History::new();
+    assert!(matches!(
+        engine.lock(&history).run(&mut history, "limit").await,
+        EngineRunExit::Interrupted(RunInterruptionReason::LimitReached)
+    ));
+    assert_eq!(limited.exits(), ["limit"]);
+
+    let cancelled = RecordingTerminalInterceptor::new(TerminalMode::Finish);
+    let mut engine = Engine::new(MockLlmClient::new(completed_text_events()));
+    engine.set_interceptor(cancelled.clone());
+    engine.cancel();
+    let mut history = History::new();
+    assert!(matches!(
+        engine.lock(&history).run(&mut history, "cancel").await,
+        EngineRunExit::Interrupted(RunInterruptionReason::Cancelled)
+    ));
+    assert_eq!(cancelled.exits(), ["cancelled"]);
+
+    let context = RecordingTerminalInterceptor::new(TerminalMode::Finish);
+    let mut engine = Engine::new(ContextWindowClient);
+    engine.set_interceptor(context.clone());
+    let mut history = History::new();
+    assert!(matches!(
+        engine.lock(&history).run(&mut history, "context").await,
+        EngineRunExit::Interrupted(RunInterruptionReason::ContextWindowExceeded)
+    ));
+    assert_eq!(context.exits(), ["context"]);
+
+    let unexpected = FailingLifecycleInterceptor::new(InterceptorPoint::PromptSubmit);
+    let mut engine = Engine::new(MockLlmClient::new(completed_text_events()));
+    engine.set_interceptor(unexpected.clone());
+    let mut history = History::new();
+    assert!(matches!(
+        engine.lock(&history).run(&mut history, "fail").await,
+        EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(EngineError::Interceptor(
+            _
+        )))
+    ));
+    assert_eq!(
+        unexpected
+            .calls()
+            .iter()
+            .filter(|point| **point == InterceptorPoint::RunExit)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn terminal_observer_does_not_duplicate_on_resume() {
+    let interceptor = RecordingTerminalInterceptor::new(TerminalMode::PauseOnce);
+    let first_response = vec![
+        Event::tool_use_start(0, "call-1", "count_tool"),
+        Event::tool_input_delta(0, "{}"),
+        Event::tool_use_stop(0),
+        Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ];
+    let client = MockLlmClient::with_responses(vec![first_response, completed_text_events()]);
+    let tool = CountingTool::new("count_tool");
+    let mut engine = Engine::new(client);
+    engine.register_tool(tool.definition());
+    engine.set_interceptor(interceptor.clone());
+    let mut history = History::new();
+    let mut engine = engine.lock(&history);
+
+    assert!(matches!(
+        engine.run(&mut history, "pause").await,
+        EngineRunExit::Paused
+    ));
+    assert_eq!(interceptor.exits(), ["paused"]);
+    assert_eq!(
+        tool.call_count(),
+        0,
+        "pause must retain the pending tool phase"
+    );
+
+    assert!(matches!(
+        engine.resume(&mut history).await,
+        EngineRunExit::Finished
+    ));
+    assert_eq!(interceptor.exits(), ["paused", "finished"]);
+    assert_eq!(
+        tool.call_count(),
+        1,
+        "resume must execute the retained tool once"
+    );
 }
 
 #[tokio::test]

@@ -45,14 +45,17 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
 
 #[async_trait]
 impl Hook<PreToolCall> for PermissionHook {
-    async fn call(&self, input: &ToolCallSummary) -> HookPreToolAction {
-        match self.action_for(input) {
+    async fn call(
+        &self,
+        input: &ToolCallSummary,
+    ) -> Result<HookPreToolAction, crate::hook::HookError> {
+        Ok(match self.action_for(input) {
             ToolPermissionAction::Allow => HookPreToolAction::Continue,
             ToolPermissionAction::Deny => HookPreToolAction::Deny(permission_denied_message(input)),
             ToolPermissionAction::Ask => {
                 HookPreToolAction::Deny(permission_ask_unsupported_message(input))
             }
-        }
+        })
     }
 }
 
@@ -174,7 +177,7 @@ mod tests {
             ))
             .await;
         match denied {
-            HookPreToolAction::Deny(message) => {
+            Ok(HookPreToolAction::Deny(message)) => {
                 assert!(message.contains("permission denied"));
                 assert!(message.contains("Bash"));
             }
@@ -192,7 +195,7 @@ mod tests {
             ))
             .await;
         match asked {
-            HookPreToolAction::Deny(message) => {
+            Ok(HookPreToolAction::Deny(message)) => {
                 assert!(message.contains("permission ask unsupported"));
                 assert!(message.contains("denied fail-closed"));
             }

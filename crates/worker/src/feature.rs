@@ -23,7 +23,14 @@ use agen::tool::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::hook::{Hook, HookRegistryBuilder, OnTurnEnd, PostToolCall, PreLlmRequest, PreToolCall};
+use crate::hook::{
+    BeforeSessionRewrite, Hook, HookExecutionPolicy, HookRegistryBuilder, OnPromptSubmit,
+    OnTurnEnd, PostToolCall, PreLlmRequest, PreToolCall, RunCommitted, RunExit, WorkerStopping,
+};
+use background::{
+    BackgroundTaskSpec, FeatureBackgroundTask, FeatureBackgroundTaskRegistry,
+    FeatureBackgroundTaskRegistryBuilder,
+};
 
 /// Stable source-qualified identifier for a feature module.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -253,10 +260,15 @@ pub enum FeatureRuntimeKind {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeatureHookPoint {
-    PreRequest,
+    PromptSubmit,
+    PreLlmRequest,
     PreToolCall,
-    ToolResult,
-    TurnEnd,
+    PostToolCall,
+    AssistantTurnEnd,
+    RunExit,
+    RunCommitted,
+    BeforeSessionRewrite,
+    WorkerStopping,
 }
 
 /// Serializable declaration of a tool contribution. The executable factory is
@@ -379,16 +391,17 @@ impl FeatureInstructionContribution {
     }
 }
 
-/// Background task lifecycle phase represented by this registry slice.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Background tasks are always Worker-managed and execute inside the owning
+/// feature scope. Report-only and detached host-managed declarations are not
+/// accepted by the current contract.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackgroundTaskLifecycle {
-    DescriptorOnly,
-    HostManaged,
+    WorkerManaged,
 }
 
-/// Declaration for a feature-provided background task.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Declaration for a feature-provided executable background task.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BackgroundTaskDeclaration {
     pub name: String,
     pub description: String,
@@ -396,11 +409,11 @@ pub struct BackgroundTaskDeclaration {
 }
 
 impl BackgroundTaskDeclaration {
-    pub fn descriptor_only(name: impl Into<String>, description: impl Into<String>) -> Self {
+    pub fn worker_managed(name: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
-            lifecycle: BackgroundTaskLifecycle::DescriptorOnly,
+            lifecycle: BackgroundTaskLifecycle::WorkerManaged,
         }
     }
 }
@@ -772,6 +785,15 @@ impl FeatureInstallReport {
         }
     }
 
+    fn clear_installed_contributions(&mut self) {
+        self.installed = false;
+        self.installed_tools.clear();
+        self.installed_hooks.clear();
+        self.installed_instructions.clear();
+        self.declared_background_tasks.clear();
+        self.provided_services.clear();
+    }
+
     fn mark_skipped(
         &mut self,
         kind: FeatureContributionKind,
@@ -879,46 +901,6 @@ fn reject_undeclared_contribution(
     };
     report.mark_skipped(kind, name, error.to_string());
     error
-}
-
-/// Model-visible durable notification sink skeleton. The first slice exposes
-/// the boundary without implementing a new event channel.
-pub struct FeatureNotificationSink<'a> {
-    report: &'a mut FeatureInstallReport,
-}
-
-impl FeatureNotificationSink<'_> {
-    pub fn notify_model(&mut self, message: impl Into<String>) -> Result<(), FeatureInstallError> {
-        let message = message.into();
-        self.report.diagnostics.push(FeatureDiagnostic::warning(format!(
-            "model notification requested during feature installation but no durable Notify host is attached: {message}"
-        )));
-        self.report.mark_skipped(
-            FeatureContributionKind::Notification,
-            "notify_model",
-            "durable Notify/SystemItem host is not connected during feature installation",
-        );
-        Ok(())
-    }
-}
-
-/// Transient human-facing alert sink skeleton.
-pub struct FeatureAlertSink<'a> {
-    report: &'a mut FeatureInstallReport,
-}
-
-impl FeatureAlertSink<'_> {
-    pub fn alert(&mut self, message: impl Into<String>) {
-        let message = message.into();
-        self.report
-            .diagnostics
-            .push(FeatureDiagnostic::info(format!("feature alert: {message}")));
-        self.report.mark_skipped(
-            FeatureContributionKind::Alert,
-            "alert",
-            "transient alert host is not connected during feature installation",
-        );
-    }
 }
 
 /// Diagnostic sink available to feature installers.
@@ -1042,15 +1024,74 @@ impl HookContributionRegistrar<'_> {
         ))
     }
 
+    fn record(&mut self, declaration: HookDeclaration) {
+        if !self.report.installed_hooks.contains(&declaration) {
+            self.report.installed_hooks.push(declaration);
+        }
+    }
+
+    pub fn add_prompt_submit(
+        &mut self,
+        name: impl Into<String>,
+        policy: HookExecutionPolicy,
+        hook: impl Hook<OnPromptSubmit> + 'static,
+    ) -> Result<(), FeatureInstallError> {
+        let declaration = HookDeclaration::new(name, FeatureHookPoint::PromptSubmit);
+        self.require_declared(&declaration)?;
+        self.hook_builder
+            .add_named_on_prompt_submit(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
+        self.record(declaration);
+        Ok(())
+    }
+
+    pub fn add_pre_llm_request(
+        &mut self,
+        name: impl Into<String>,
+        policy: HookExecutionPolicy,
+        hook: impl Hook<PreLlmRequest> + 'static,
+    ) -> Result<(), FeatureInstallError> {
+        let declaration = HookDeclaration::new(name, FeatureHookPoint::PreLlmRequest);
+        self.require_declared(&declaration)?;
+        self.hook_builder
+            .add_named_pre_llm_request(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
+        self.record(declaration);
+        Ok(())
+    }
+
     pub fn add_pre_request(
         &mut self,
         name: impl Into<String>,
         hook: impl Hook<PreLlmRequest> + 'static,
     ) -> Result<(), FeatureInstallError> {
-        let declaration = HookDeclaration::new(name, FeatureHookPoint::PreRequest);
+        self.add_pre_llm_request(name, HookExecutionPolicy::fail_closed(), hook)
+    }
+
+    pub fn add_pre_tool_call_with_policy(
+        &mut self,
+        name: impl Into<String>,
+        policy: HookExecutionPolicy,
+        hook: impl Hook<PreToolCall> + 'static,
+    ) -> Result<(), FeatureInstallError> {
+        let declaration = HookDeclaration::new(name, FeatureHookPoint::PreToolCall);
         self.require_declared(&declaration)?;
-        self.hook_builder.add_pre_llm_request(hook);
-        self.report.installed_hooks.push(declaration);
+        self.hook_builder
+            .add_named_pre_tool_call(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
+        self.record(declaration);
         Ok(())
     }
 
@@ -1059,10 +1100,25 @@ impl HookContributionRegistrar<'_> {
         name: impl Into<String>,
         hook: impl Hook<PreToolCall> + 'static,
     ) -> Result<(), FeatureInstallError> {
-        let declaration = HookDeclaration::new(name, FeatureHookPoint::PreToolCall);
+        self.add_pre_tool_call_with_policy(name, HookExecutionPolicy::fail_closed(), hook)
+    }
+
+    pub fn add_post_tool_call(
+        &mut self,
+        name: impl Into<String>,
+        policy: HookExecutionPolicy,
+        hook: impl Hook<PostToolCall> + 'static,
+    ) -> Result<(), FeatureInstallError> {
+        let declaration = HookDeclaration::new(name, FeatureHookPoint::PostToolCall);
         self.require_declared(&declaration)?;
-        self.hook_builder.add_pre_tool_call(hook);
-        self.report.installed_hooks.push(declaration);
+        self.hook_builder
+            .add_named_post_tool_call(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
+        self.record(declaration);
         Ok(())
     }
 
@@ -1071,10 +1127,25 @@ impl HookContributionRegistrar<'_> {
         name: impl Into<String>,
         hook: impl Hook<PostToolCall> + 'static,
     ) -> Result<(), FeatureInstallError> {
-        let declaration = HookDeclaration::new(name, FeatureHookPoint::ToolResult);
+        self.add_post_tool_call(name, HookExecutionPolicy::fail_closed(), hook)
+    }
+
+    pub fn add_assistant_turn_end(
+        &mut self,
+        name: impl Into<String>,
+        policy: HookExecutionPolicy,
+        hook: impl Hook<OnTurnEnd> + 'static,
+    ) -> Result<(), FeatureInstallError> {
+        let declaration = HookDeclaration::new(name, FeatureHookPoint::AssistantTurnEnd);
         self.require_declared(&declaration)?;
-        self.hook_builder.add_post_tool_call(hook);
-        self.report.installed_hooks.push(declaration);
+        self.hook_builder
+            .add_named_on_turn_end(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
+        self.record(declaration);
         Ok(())
     }
 
@@ -1083,10 +1154,82 @@ impl HookContributionRegistrar<'_> {
         name: impl Into<String>,
         hook: impl Hook<OnTurnEnd> + 'static,
     ) -> Result<(), FeatureInstallError> {
-        let declaration = HookDeclaration::new(name, FeatureHookPoint::TurnEnd);
+        self.add_assistant_turn_end(name, HookExecutionPolicy::fail_closed(), hook)
+    }
+
+    pub fn add_run_exit(
+        &mut self,
+        name: impl Into<String>,
+        policy: HookExecutionPolicy,
+        hook: impl Hook<RunExit> + 'static,
+    ) -> Result<(), FeatureInstallError> {
+        let declaration = HookDeclaration::new(name, FeatureHookPoint::RunExit);
         self.require_declared(&declaration)?;
-        self.hook_builder.add_on_turn_end(hook);
-        self.report.installed_hooks.push(declaration);
+        self.hook_builder
+            .add_named_run_exit(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
+        self.record(declaration);
+        Ok(())
+    }
+
+    pub fn add_run_committed(
+        &mut self,
+        name: impl Into<String>,
+        policy: HookExecutionPolicy,
+        hook: impl Hook<RunCommitted> + 'static,
+    ) -> Result<(), FeatureInstallError> {
+        let declaration = HookDeclaration::new(name, FeatureHookPoint::RunCommitted);
+        self.require_declared(&declaration)?;
+        self.hook_builder
+            .add_named_run_committed(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
+        self.record(declaration);
+        Ok(())
+    }
+
+    pub fn add_before_session_rewrite(
+        &mut self,
+        name: impl Into<String>,
+        policy: HookExecutionPolicy,
+        hook: impl Hook<BeforeSessionRewrite> + 'static,
+    ) -> Result<(), FeatureInstallError> {
+        let declaration = HookDeclaration::new(name, FeatureHookPoint::BeforeSessionRewrite);
+        self.require_declared(&declaration)?;
+        self.hook_builder
+            .add_named_before_session_rewrite(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
+        self.record(declaration);
+        Ok(())
+    }
+
+    pub fn add_worker_stopping(
+        &mut self,
+        name: impl Into<String>,
+        policy: HookExecutionPolicy,
+        hook: impl Hook<WorkerStopping> + 'static,
+    ) -> Result<(), FeatureInstallError> {
+        let declaration = HookDeclaration::new(name, FeatureHookPoint::WorkerStopping);
+        self.require_declared(&declaration)?;
+        self.hook_builder
+            .add_named_worker_stopping(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
+        self.record(declaration);
         Ok(())
     }
 }
@@ -1124,33 +1267,40 @@ impl FeatureInstructionRegistrar<'_> {
     }
 }
 
-/// Background task registrar for descriptor/report-only contributions.
+/// Registrar for executable, Worker-managed background task contributions.
 pub struct BackgroundTaskRegistrar<'a> {
     feature_id: &'a FeatureId,
     declarations: &'a FeatureContributionDeclarations,
+    registry: &'a mut FeatureBackgroundTaskRegistryBuilder,
     report: &'a mut FeatureInstallReport,
 }
 
 impl BackgroundTaskRegistrar<'_> {
-    pub fn declare(
+    pub fn register(
         &mut self,
-        declaration: BackgroundTaskDeclaration,
+        spec: BackgroundTaskSpec,
+        task: impl FeatureBackgroundTask + 'static,
     ) -> Result<(), FeatureInstallError> {
-        if !self.declarations.contains_background_task(&declaration) {
+        if !self
+            .declarations
+            .contains_background_task(&spec.declaration)
+        {
             return Err(reject_undeclared_contribution(
                 self.feature_id,
                 self.report,
                 FeatureContributionKind::BackgroundTask,
-                declaration.name,
+                spec.declaration.name,
             ));
         }
+        self.registry
+            .register(self.feature_id.clone(), spec.clone(), task)?;
         if !self
             .report
             .declared_background_tasks
             .iter()
-            .any(|task| task.name == declaration.name)
+            .any(|task| task.name == spec.declaration.name)
         {
-            self.report.declared_background_tasks.push(declaration);
+            self.report.declared_background_tasks.push(spec.declaration);
         }
         Ok(())
     }
@@ -1330,15 +1480,17 @@ impl ProtocolProviderRegistrar<'_> {
             }
         }
 
-        for task in background_tasks {
-            if !self
-                .report
-                .declared_background_tasks
-                .iter()
-                .any(|declared| declared.name == task.name)
-            {
-                self.report.declared_background_tasks.push(task);
-            }
+        if let Some(task) = background_tasks.first() {
+            let reason = format!(
+                "protocol provider background task `{}` has no executable Worker-managed handler",
+                task.name
+            );
+            self.report.mark_skipped(
+                FeatureContributionKind::BackgroundTask,
+                task.name.clone(),
+                reason.clone(),
+            );
+            return Err(FeatureInstallError::InvalidDescriptor(reason));
         }
 
         Ok(())
@@ -1352,6 +1504,7 @@ pub struct FeatureInstallContext<'a> {
     pending_tools: &'a mut Vec<ToolDefinition>,
     installed_tool_names: &'a mut HashMap<String, FeatureId>,
     hook_builder: &'a mut HookRegistryBuilder,
+    background_task_builder: &'a mut FeatureBackgroundTaskRegistryBuilder,
     service_registry: &'a mut FeatureServiceRegistry,
     report: &'a mut FeatureInstallReport,
 }
@@ -1392,6 +1545,7 @@ impl FeatureInstallContext<'_> {
         BackgroundTaskRegistrar {
             feature_id: self.feature_id,
             declarations: self.declarations,
+            registry: self.background_task_builder,
             report: self.report,
         }
     }
@@ -1416,18 +1570,6 @@ impl FeatureInstallContext<'_> {
         }
     }
 
-    pub fn notifications(&mut self) -> FeatureNotificationSink<'_> {
-        FeatureNotificationSink {
-            report: self.report,
-        }
-    }
-
-    pub fn alerts(&mut self) -> FeatureAlertSink<'_> {
-        FeatureAlertSink {
-            report: self.report,
-        }
-    }
-
     pub fn diagnostics(&mut self) -> FeatureDiagnosticSink<'_> {
         FeatureDiagnosticSink {
             report: self.report,
@@ -1440,6 +1582,7 @@ impl FeatureInstallContext<'_> {
 pub struct FeatureRegistryInstallReport {
     pub reports: Vec<FeatureInstallReport>,
     pub services: FeatureServiceRegistry,
+    pub background_tasks: FeatureBackgroundTaskRegistry,
     pub plan_error: Option<FeaturePlanError>,
 }
 
@@ -1795,7 +1938,7 @@ impl FeatureRegistryBuilder {
     }
 
     /// Install modules into the existing Engine tool path and hook builder.
-    pub(crate) fn install_into_engine<C: LlmClient, A>(
+    pub(crate) fn install_into_engine<C: LlmClient, A: Send + Sync>(
         self,
         worker: &mut Engine<C, Mutable, A>,
         hook_builder: &mut HookRegistryBuilder,
@@ -1861,12 +2004,16 @@ impl FeatureRegistryBuilder {
                 return FeatureRegistryInstallReport {
                     reports,
                     services: FeatureServiceRegistry::default(),
+                    background_tasks: FeatureBackgroundTaskRegistry::default(),
                     plan_error: Some(error),
                 };
             }
         };
         let mut service_registry = FeatureServiceRegistry::default();
+        let mut background_task_builder = FeatureBackgroundTaskRegistryBuilder::default();
         let mut reports = Vec::with_capacity(plan.ordered_indices.len());
+        let install_hook_checkpoint = hook_builder.checkpoint();
+        let install_tool_checkpoint = pending_tools.len();
         let mut modules = self.modules.into_iter().map(Some).collect::<Vec<_>>();
         let ordered_modules = plan
             .ordered_indices
@@ -1884,6 +2031,11 @@ impl FeatureRegistryBuilder {
         for (module, descriptor) in ordered_modules {
             let declarations = FeatureContributionDeclarations::from_descriptor(&descriptor);
             let mut report = FeatureInstallReport::new(&descriptor);
+            let hook_checkpoint = hook_builder.checkpoint();
+            let background_checkpoint = background_task_builder.checkpoint();
+            let service_checkpoint = service_registry.clone();
+            let tool_checkpoint = pending_tools.len();
+            let installed_tool_checkpoint = installed_tool_names.clone();
 
             let mut required_service_failed = false;
             for requirement in descriptor.requires_services.iter().cloned() {
@@ -1920,10 +2072,6 @@ impl FeatureRegistryBuilder {
                 continue;
             }
 
-            for background_task in descriptor.background_tasks.iter().cloned() {
-                report.declared_background_tasks.push(background_task);
-            }
-
             let install_result = {
                 let mut context = FeatureInstallContext {
                     feature_id: &descriptor.id,
@@ -1931,6 +2079,7 @@ impl FeatureRegistryBuilder {
                     pending_tools,
                     installed_tool_names: &mut installed_tool_names,
                     hook_builder,
+                    background_task_builder: &mut background_task_builder,
                     service_registry: &mut service_registry,
                     report: &mut report,
                 };
@@ -1940,18 +2089,81 @@ impl FeatureRegistryBuilder {
             match install_result {
                 Ok(()) => report.installed = true,
                 Err(error) => {
+                    hook_builder.rollback_to(hook_checkpoint);
+                    background_task_builder.rollback_to(&background_checkpoint);
+                    service_registry = service_checkpoint.clone();
+                    pending_tools.truncate(tool_checkpoint);
+                    installed_tool_names = installed_tool_checkpoint.clone();
+                    report.clear_installed_contributions();
                     report
                         .diagnostics
                         .push(FeatureDiagnostic::error(error.to_string()));
                 }
             }
+            if report.installed {
+                for hook in &descriptor.hooks {
+                    if !report.installed_hooks.contains(hook) {
+                        report.diagnostics.push(FeatureDiagnostic::error(format!(
+                            "feature `{}` declared hook `{}` at {:?} but did not register it",
+                            descriptor.id, hook.name, hook.point
+                        )));
+                    }
+                }
+                for task in &descriptor.background_tasks {
+                    if !report.declared_background_tasks.contains(task) {
+                        report.diagnostics.push(FeatureDiagnostic::error(format!(
+                            "feature `{}` declared background task `{}` but did not register an executable handler",
+                            descriptor.id, task.name
+                        )));
+                    }
+                }
+                if report
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.severity == FeatureDiagnosticSeverity::Error)
+                {
+                    hook_builder.rollback_to(hook_checkpoint);
+                    background_task_builder.rollback_to(&background_checkpoint);
+                    service_registry = service_checkpoint.clone();
+                    pending_tools.truncate(tool_checkpoint);
+                    installed_tool_names = installed_tool_checkpoint.clone();
+                    report.clear_installed_contributions();
+                    report.clear_installed_contributions();
+                }
+            }
             reports.push(report);
         }
 
-        FeatureRegistryInstallReport {
-            reports,
-            services: service_registry,
-            plan_error: None,
+        let failed = reports.iter().any(|report| {
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == FeatureDiagnosticSeverity::Error)
+        });
+        if failed {
+            hook_builder.rollback_to(install_hook_checkpoint);
+            pending_tools.truncate(install_tool_checkpoint);
+            for report in &mut reports {
+                if report.installed {
+                    report.clear_installed_contributions();
+                    report.diagnostics.push(FeatureDiagnostic::warning(
+                        "feature scope rolled back because another contribution failed",
+                    ));
+                }
+            }
+            FeatureRegistryInstallReport {
+                reports,
+                services: FeatureServiceRegistry::default(),
+                background_tasks: FeatureBackgroundTaskRegistry::default(),
+                plan_error: None,
+            }
+        } else {
+            FeatureRegistryInstallReport {
+                reports,
+                services: service_registry,
+                background_tasks: background_task_builder.build(),
+                plan_error: None,
+            }
         }
     }
 }
@@ -1996,9 +2208,11 @@ pub enum FeatureInstallError {
     Install(String),
 }
 
+pub mod background;
 pub mod builtin;
 pub mod mcp;
 pub mod plugin;
+pub(crate) mod session;
 
 #[cfg(test)]
 mod tests {
@@ -2398,13 +2612,9 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_contributions_are_recorded() {
+    fn executable_contributions_are_recorded() {
         let descriptor = FeatureDescriptor::builtin("dummy", "Dummy")
-            .with_tool(ToolDeclaration::new("Dummy", "dummy tool"))
-            .with_background_task(BackgroundTaskDeclaration::descriptor_only(
-                "daily",
-                "descriptor-only background task",
-            ));
+            .with_tool(ToolDeclaration::new("Dummy", "dummy tool"));
         let mut hook_builder = HookRegistryBuilder::default();
         let mut pending_tools = Vec::new();
         let report = FeatureRegistryBuilder::new()
@@ -2420,7 +2630,7 @@ mod tests {
         let feature_report = &report.reports[0];
         assert!(feature_report.installed);
         assert_eq!(feature_report.installed_tools, vec!["Dummy"]);
-        assert_eq!(feature_report.declared_background_tasks[0].name, "daily");
+        assert!(feature_report.declared_background_tasks.is_empty());
     }
 
     #[test]
@@ -2480,8 +2690,9 @@ mod tests {
             })
             .install_into_pending(&mut pending_tools, &mut hook_builder);
 
-        assert_eq!(pending_tools.len(), 1);
-        assert!(report.reports[0].installed);
+        assert!(pending_tools.is_empty());
+        assert!(!report.reports[0].installed);
+        assert!(report.reports[0].installed_tools.is_empty());
         assert!(!report.reports[1].installed);
         assert!(
             report.reports[1]
@@ -2558,7 +2769,7 @@ mod tests {
                         "1.0.0",
                         "startup-discovered service",
                     ))
-                    .with_background_task(BackgroundTaskDeclaration::descriptor_only(
+                    .with_background_task(BackgroundTaskDeclaration::worker_managed(
                         "provider-poller",
                         "provider lifecycle poller",
                     ))
@@ -2568,7 +2779,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_provider_registers_startup_discovered_contributions_through_worker_path() {
+    fn protocol_provider_report_only_background_task_is_rejected_atomically() {
         let provider = ProtocolProviderDeclaration::new(
             ProviderId::builtin("dynamic-provider"),
             "test-protocol",
@@ -2599,30 +2810,18 @@ mod tests {
             .collect();
         let feature_report = &report.reports[0];
 
-        assert!(feature_report.installed);
-        assert_eq!(feature_report.installed_tools, vec!["DynamicTool"]);
-        assert_eq!(tool_names, vec!["DynamicTool"]);
+        assert!(!feature_report.installed);
+        assert!(feature_report.installed_tools.is_empty());
+        assert!(tool_names.is_empty());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(feature_report.provided_services.len(), 1);
-        assert_eq!(
-            feature_report.provided_services[0].id,
-            ServiceId::builtin("dynamic-service")
-        );
-        assert_eq!(
-            feature_report.declared_background_tasks[0].name,
-            "provider-poller"
-        );
+        assert!(feature_report.provided_services.is_empty());
+        assert!(feature_report.declared_background_tasks.is_empty());
         assert_eq!(feature_report.protocol_providers.len(), 1);
-        assert_eq!(
-            feature_report.protocol_providers[0].state,
-            ProtocolProviderLifecycleState::Ready
-        );
-        assert!(
-            feature_report
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("startup discovery completed"))
-        );
+        assert!(feature_report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("has no executable Worker-managed handler")
+        }));
     }
 
     #[test]
@@ -2779,8 +2978,8 @@ mod tests {
         async fn call(
             &self,
             _input: &crate::hook::ToolCallSummary,
-        ) -> crate::hook::HookPreToolAction {
-            crate::hook::HookPreToolAction::Continue
+        ) -> Result<crate::hook::HookPreToolAction, crate::hook::HookError> {
+            Ok(crate::hook::HookPreToolAction::Continue)
         }
     }
 
@@ -2804,6 +3003,19 @@ mod tests {
         }
     }
 
+    struct NoopBackgroundTask;
+
+    #[async_trait]
+    impl FeatureBackgroundTask for NoopBackgroundTask {
+        async fn run(
+            &self,
+            _context: background::BackgroundTaskContext,
+            _cancellation: background::BackgroundTaskCancellation,
+        ) -> Result<(), crate::hook::HookError> {
+            Ok(())
+        }
+    }
+
     struct BackgroundFeature {
         descriptor: FeatureDescriptor,
         task_name: &'static str,
@@ -2818,12 +3030,22 @@ mod tests {
             &self,
             context: &mut FeatureInstallContext<'_>,
         ) -> Result<(), FeatureInstallError> {
-            context
-                .background_tasks()
-                .declare(BackgroundTaskDeclaration::descriptor_only(
-                    self.task_name,
-                    "runtime background task",
-                ))
+            let declaration = self
+                .descriptor
+                .background_tasks
+                .iter()
+                .find(|task| task.name == self.task_name)
+                .cloned()
+                .unwrap_or_else(|| {
+                    BackgroundTaskDeclaration::worker_managed(
+                        self.task_name,
+                        "undeclared background task",
+                    )
+                });
+            context.background_tasks().register(
+                BackgroundTaskSpec::single_flight(declaration, std::time::Duration::from_secs(1)),
+                NoopBackgroundTask,
+            )
         }
     }
 
@@ -2985,25 +3207,44 @@ mod tests {
         );
     }
 
-    #[test]
-    fn background_task_declaration_is_descriptor_contribution() {
+    #[tokio::test]
+    async fn executable_background_task_is_registered_in_worker_scope() {
         let descriptor = FeatureDescriptor::builtin("background", "Background")
-            .with_background_task(BackgroundTaskDeclaration::descriptor_only(
+            .with_background_task(BackgroundTaskDeclaration::worker_managed(
                 "declared-task",
                 "descriptor contribution",
             ));
         let mut hook_builder = HookRegistryBuilder::default();
         let mut pending_tools = Vec::new();
         let report = FeatureRegistryBuilder::new()
-            .with_module(ServiceFeature { descriptor })
+            .with_module(BackgroundFeature {
+                descriptor,
+                task_name: "declared-task",
+            })
             .install_into_pending(&mut pending_tools, &mut hook_builder);
-
         assert!(report.reports[0].installed);
         assert_eq!(
             report.reports[0].declared_background_tasks[0].name,
             "declared-task"
         );
         assert!(report.reports[0].skipped.is_empty());
+        assert!(matches!(
+            report
+                .background_tasks
+                .start(
+                    &FeatureId::builtin("background"),
+                    "declared-task",
+                    crate::hook::HookInvocationContext::default(),
+                )
+                .unwrap(),
+            background::BackgroundTaskStart::Started { .. }
+        ));
+        report.background_tasks.shutdown().await.unwrap();
+        assert!(matches!(
+            report.background_tasks.diagnostics()[0].outcome,
+            background::BackgroundTaskOutcome::Completed
+                | background::BackgroundTaskOutcome::Cancelled
+        ));
     }
 
     #[test]
@@ -3118,7 +3359,10 @@ mod tests {
         assert_eq!(descriptor.runtime, FeatureRuntimeKind::Builtin);
         assert_eq!(
             hook_points,
-            vec![FeatureHookPoint::PreRequest, FeatureHookPoint::PreToolCall]
+            vec![
+                FeatureHookPoint::PreLlmRequest,
+                FeatureHookPoint::PreToolCall
+            ]
         );
         assert!(descriptor.background_tasks.is_empty());
         assert!(descriptor.provides_services.is_empty());

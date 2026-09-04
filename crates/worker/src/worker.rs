@@ -1,7 +1,7 @@
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -40,29 +40,43 @@ use manifest::{
 
 use crate::compact::state::CompactState;
 use crate::compact::usage_tracker::UsageTracker;
+use crate::feature::background::{BackgroundTaskRewriteGuard, FeatureBackgroundTaskRegistry};
 use crate::feature::builtin::memory::WorkspaceMemoryBackendError;
-use crate::feature::builtin::{
-    MemoryExtractFeature, MemoryExtractState, SessionExploreFeature, SessionExploreState,
-    TaskFeature, WorkerObservationProvider, render_extract_input,
+use crate::feature::builtin::{TaskFeature, WorkerObservationProvider};
+use crate::feature::session::{
+    CommittedRunExit, CommittedSessionCapture, CommittedSessionCaptureHandle, FeatureSessionError,
+    SessionExtensionHandle,
 };
 use crate::feature::{
     FeatureInstructionDeclaration, FeatureInstructionId, FeatureRegistryBuilder,
     FeatureRegistryInstallReport, dedupe_instruction_contributions,
 };
 use crate::hook::{
-    Hook, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest,
-    PreToolCall,
+    BeforeSessionRewriteAction, BeforeSessionRewriteContext, Hook, HookHistoryRange,
+    HookInvocationContext, HookRegistry, HookRegistryBuilder, OnPromptSubmit, OnTurnEnd,
+    PostToolCall, PreLlmRequest, PreToolCall, RunCommittedContext, RunCommittedExit,
+    RunExitContext, SessionRewriteKind, WorkerStoppingContext,
 };
 use crate::in_flight::InFlightEvents;
 use crate::internal_worker::{
     InternalWorkerAuthority, InternalWorkerIdentity, InternalWorkerSpec, InternalWorkerVisibility,
-    prepare_internal_worker_from_spec, run_internal_worker, run_internal_worker_with_cancel_sender,
+    prepare_internal_worker_from_spec,
 };
 
 const COMPACTION_EXTENSION_DOMAIN: &str = "yoi.compaction";
 const LARGE_PASTE_INLINE_MAX_BYTES: usize = 32 * 1024;
 const WORKER_ORCHESTRATION_INSTRUCTION_ID: &str = "worker.orchestration";
 const WORKER_ORCHESTRATION_PROMPT_REF: &str = "common.worker_orchestration";
+const FEATURE_HOOK_CHAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn hook_run_exit(exit: &EngineRunExit) -> RunCommittedExit {
+    match exit {
+        EngineRunExit::Finished => RunCommittedExit::Finished,
+        EngineRunExit::Paused => RunCommittedExit::Paused,
+        EngineRunExit::Yielded => RunCommittedExit::Yielded,
+        EngineRunExit::Interrupted(_) => RunCommittedExit::Interrupted,
+    }
+}
 
 fn worker_orchestration_instruction() -> FeatureInstructionDeclaration {
     FeatureInstructionDeclaration::new(
@@ -90,7 +104,6 @@ use protocol::{
 };
 use tokio::net::UnixStream;
 use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
 use workdir::{
     LocalWorkdirSession, ReadOnlyWorkdirSession, WorkdirSessionCapabilities, WorkdirSessionHandle,
 };
@@ -759,6 +772,7 @@ where
 pub struct SegmentState {
     location: ArcSwap<SegmentLocation>,
     entries_written: AtomicUsize,
+    append_lock: Mutex<()>,
 }
 
 impl SegmentState {
@@ -769,6 +783,7 @@ impl SegmentState {
                 segment_id,
             }),
             entries_written: AtomicUsize::new(entries_written),
+            append_lock: Mutex::new(()),
         })
     }
 
@@ -917,6 +932,15 @@ where
     /// mirror push → broadcast. The Store owns physical write ordering and
     /// partial-write recovery; publication happens only after it returns Ok.
     pub fn append_entry(&self, entry: LogEntry) -> Result<(), StoreError> {
+        let _append_guard = self
+            .state
+            .append_lock
+            .lock()
+            .expect("segment append lock poisoned");
+        self.append_entry_locked(entry)
+    }
+
+    fn append_entry_locked(&self, entry: LogEntry) -> Result<(), StoreError> {
         let loc = self.state.location();
         self.store.append(loc.session_id, loc.segment_id, &entry)?;
         self.state.increment_entries();
@@ -1101,10 +1125,14 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// Cloned into local WorkdirSession providers used by builtin tools, fs_view,
     /// and compaction so updates propagate at the next permission check.
     scope: SharedScope,
-    /// Filesystem authority this Worker may pass to spawned children. Direct tools
-    /// continue to use `scope`; SubWorkerSpawn validates requested child scope here.
-    delegation_scope: DelegationScope,
     hook_builder: HookRegistryBuilder,
+    /// Frozen callback set shared by Engine interception and Worker lifecycle boundaries.
+    hook_registry: Option<Arc<HookRegistry>>,
+    /// Executable background tasks registered by successfully installed features.
+    feature_background_tasks: FeatureBackgroundTaskRegistry,
+    /// Internal Workers install an explicit Feature composition and disable
+    /// manifest-derived lifecycle Features before controller startup.
+    manifest_lifecycle_features_enabled: bool,
     interceptor_installed: bool,
     /// Shared compaction state (present when threshold is configured).
     compact_state: Option<Arc<CompactState>>,
@@ -1200,32 +1228,12 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// [`Self::from_manifest`], or defaults to the builtin pack when a
     /// Worker is constructed through lower-level paths that have no loader.
     prompts: Arc<ArcSwap<PromptCatalog>>,
-    /// When true (default), the system-prompt assembler may append resident
-    /// context from the workspace Memory document. Internal disposable
-    /// workers disable this so resident memory exposure is opt-in per Worker.
+    /// Test/internal policy gate for installed resident prompt contributions.
     inject_resident_summary: bool,
-    /// When true (default), the system-prompt assembler may append resident
-    /// resident context. This is intentionally independent from
-    /// summary residency: each section has its own gate.
-    /// extract (memory.extract) reentry guard. `true` while an extract
-    /// worker is running; subsequent triggers are skipped per spec
-    /// (`docs/plan/memory.md` §Extract 並走防止). `Arc<AtomicBool>` so
-    /// the flag survives across `try_post_run_extract` calls without a
-    /// `&mut self` race.
-    extract_in_flight: Arc<AtomicBool>,
-    /// consolidation (memory.consolidation) in-process reentry guard.
-    consolidation_in_flight: Arc<AtomicBool>,
-    /// Last completed extract boundary. `None` means no extract has
-    /// run yet on this session — next extract starts from entry 0.
-    /// Restored from `RestoredState.extensions` on `restore`, updated
-    /// after each successful extract via `save_extension`.
-    extract_pointer: Arc<Mutex<Option<memory::ExtractPointerPayload>>>,
-    /// extract/consolidation memory job running outside the controller method loop.
-    /// The task owns the extract/consolidate worker execution and is joined
-    /// at shutdown. A single slot is enough: extract/consolidation implementations loop
-    /// until thresholds fall below their trigger points, and concurrent
-    /// triggers are coalesced by skipping when this handle is still active.
-    memory_task: Option<JoinHandle<()>>,
+    /// Materialized resident prompt context installed by an enabled Feature.
+    feature_resident_summary: Option<String>,
+    /// Complete system prompt replacement installed by an enabled Feature.
+    feature_system_prompt_override: Option<String>,
     /// Typed user submissions in submit order. K-th entry corresponds to
     /// the K-th `Item::user_message` in `worker.history()` (modulo seed
     /// history loaded via `AnnotatedSegmentStart.history`, whose original segments
@@ -1259,77 +1267,30 @@ pub struct Worker<C: LlmClient, St: Store> {
 }
 
 impl<C: LlmClient + 'static, St: Store + 'static> Worker<C, St> {
-    pub async fn wait_for_memory_jobs(&mut self) {
-        if let Some(handle) = self.memory_task.take()
-            && let Err(e) = handle.await
-        {
-            tracing::warn!(error = %e, "Post-run memory task join failed");
+    pub async fn stop_feature_runtime(&mut self, reason: impl Into<String>) {
+        if let Some(hooks) = self.hook_registry.clone() {
+            let context = WorkerStoppingContext {
+                invocation: self.hook_invocation_context(None),
+                reason: reason.into(),
+            };
+            match tokio::time::timeout(
+                FEATURE_HOOK_CHAIN_TIMEOUT,
+                hooks.on_worker_stopping(&context),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "worker-stopping hook requires attention");
+                }
+                Err(_) => {
+                    hooks.record_chain_timeout("worker-stopping");
+                    tracing::warn!("worker-stopping hook chain exceeded its host deadline");
+                }
+            }
         }
-    }
-}
-
-impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> {
-    fn clone_for_memory_task(&self) -> Self {
-        // The cloned Worker's worker exists only as a snapshot for the memory
-        // task: `run_extract_once` reads `worker.history()`, and the
-        // extract/consolidate workers are built fresh inside their own
-        // methods using `worker.client()` as fallback when no override
-        // model is configured. system_prompt / request_config / cache_key
-        // are unused on this path, so we deliberately skip copying them.
-        let source_worker = self.engine.as_ref().expect("worker present");
-        let worker = Engine::<C, Mutable, SessionHistoryMetadata>::new_annotated(
-            source_worker.client().clone(),
-        );
-        Self {
-            manifest: self.manifest.clone(),
-            engine: Some(worker),
-            session: self.session.clone(),
-            last_run_interrupted: false,
-            store: self.store.clone(),
-            worker_metadata_writer: None,
-            segment_state: self.segment_state.clone(),
-            filesystem_authority: self.filesystem_authority.clone(),
-            workdir_session: self.workdir_session.clone(),
-            workspace_context: self.workspace_context.clone(),
-            flow_runtime_state: self.flow_runtime_state.clone(),
-            flow_feature_enabled: self.flow_feature_enabled,
-            scope: self.scope.clone(),
-            delegation_scope: self.delegation_scope.clone(),
-            hook_builder: HookRegistryBuilder::new(),
-            interceptor_installed: false,
-            compact_state: None,
-            usage_tracker: Arc::new(UsageTracker::new()),
-            metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
-            usage_history: self.usage_history.clone(),
-            tracker: None,
-            task_feature: self.task_feature.clone(),
-            worker_observation_provider: None,
-            system_prompt_template: None,
-            feature_instructions: self.feature_instructions.clone(),
-            alerter: self.alerter.clone(),
-            working_event_tx: self.working_event_tx.clone(),
-            internal_worker_registry: self.internal_worker_registry.clone(),
-            in_flight: self.in_flight.clone(),
-            ai_activity_counter: self.ai_activity_counter.clone(),
-            pending_notifies: NotifyBuffer::new(),
-            pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
-            pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
-            scope_allocation: None,
-            callback_socket: None,
-            runtime_ticket_role: None,
-            prompts: self.prompts.clone(),
-            inject_resident_summary: self.inject_resident_summary,
-            extract_in_flight: self.extract_in_flight.clone(),
-            consolidation_in_flight: self.consolidation_in_flight.clone(),
-            extract_pointer: self.extract_pointer.clone(),
-            memory_task: None,
-            user_segments: self.user_segments.clone(),
-            // The memory-task clone never appends to the session log
-            // (it only reads `worker.history()`), so a fresh sink is
-            // fine — nothing observes its broadcast.
-            sink: SegmentLogSink::new(),
-            history_persistence_wired: false,
-            log_writer: None,
+        if let Err(error) = self.feature_background_tasks.shutdown().await {
+            tracing::warn!(error = %error, "feature background task shutdown failed");
         }
     }
 }
@@ -1421,28 +1382,6 @@ impl<C: LlmClient + 'static, St: Store + Clone + 'static> Worker<C, St> {
     }
 }
 
-impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> {
-    pub fn spawn_post_run_memory_jobs(&mut self) {
-        // Drop a finished prior handle so we can spawn a fresh task.
-        // If the prior task is still running, coalesce by skipping —
-        // extract/consolidation implementations re-evaluate thresholds on completion.
-        self.cleanup_finished_memory_task();
-        if self.memory_task.is_some() {
-            return;
-        }
-
-        let mut worker = self.clone_for_memory_task();
-        self.memory_task = Some(tokio::spawn(async move {
-            if let Err(e) = worker.try_post_run_extract().await {
-                tracing::warn!(error = %e, "Post-run memory extract task error");
-            }
-            if let Err(e) = worker.try_post_run_consolidate().await {
-                tracing::warn!(error = %e, "Post-run memory consolidate task error");
-            }
-        }));
-    }
-}
-
 impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Create a new Worker from a pre-built Engine and store.
     ///
@@ -1469,8 +1408,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let session_id = session_store::new_session_id();
         let segment_id = session_store::new_segment_id();
         let prompts = Arc::new(ArcSwap::from(PromptCatalog::builtins_only()?));
-        let delegation_scope =
-            DelegationScope::from_config(&manifest.delegation_scope).map_err(WorkerError::Scope)?;
+        DelegationScope::from_config(&manifest.delegation_scope).map_err(WorkerError::Scope)?;
         let scope = SharedScope::new(scope);
         let workdir_session = workdir_session_from_authority(&filesystem_authority, &scope);
         let mut worker = Self {
@@ -1487,8 +1425,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             flow_runtime_state: Arc::new(Mutex::new(None)),
             flow_feature_enabled: false,
             scope,
-            delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
+            hook_registry: None,
+            feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
@@ -1512,10 +1452,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             runtime_ticket_role: None,
             prompts,
             inject_resident_summary: true,
-            extract_in_flight: Arc::new(AtomicBool::new(false)),
-            consolidation_in_flight: Arc::new(AtomicBool::new(false)),
-            extract_pointer: Arc::new(Mutex::new(None)),
-            memory_task: None,
+            feature_resident_summary: None,
+            feature_system_prompt_override: None,
             user_segments: Vec::new(),
             sink: SegmentLogSink::new(),
             history_persistence_wired: false,
@@ -1553,9 +1491,18 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.inject_resident_summary = enabled;
     }
 
-    /// Toggle workspace Memory document resident injection in the system prompt.
+    /// Internal/test gate for installed resident prompt contributions.
     pub fn set_resident_summary_injection(&mut self, enabled: bool) {
         self.inject_resident_summary = enabled;
+    }
+
+    pub(crate) fn install_system_prompt_contribution(
+        &mut self,
+        resident_summary: Option<String>,
+        system_prompt_override: Option<String>,
+    ) {
+        self.feature_resident_summary = resident_summary;
+        self.feature_system_prompt_override = system_prompt_override;
     }
 
     pub fn prompts(&self) -> Arc<ArcSwap<PromptCatalog>> {
@@ -1691,37 +1638,21 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.worker_observation_provider.clone()
     }
 
-    async fn resident_summary_from_workspace_authority(
-        &self,
-    ) -> Result<Option<String>, WorkerError> {
-        let result = self
-            .workspace_client()
-            .execute_memory_backend_operation(
-                memory::backend::MemoryBackendOperation::ResidentSummary(
-                    memory::backend::MemoryResidentSummaryOperation::default(),
-                ),
-            )
-            .await?;
-        match result {
-            memory::backend::MemoryBackendOperationResult::ToolOutput(output) => Ok(output.content),
-            other => Err(WorkerError::FeatureInstall(format!(
-                "unexpected memory backend result for resident summary: {other:?}"
-            ))),
-        }
-    }
-
     /// Activate an Agent Skill through the Workspace backend/client and commit
     /// the returned SKILL.md body to history before it can influence an LLM run.
     ///
     /// This deliberately does not scan `.yoi/skills` locally: when a Workspace
     /// HTTP client is available, catalog/detail/activation authority belongs to
     /// the Workspace backend API.
-    pub fn activate_skill(&mut self, name: &str) -> Result<SkillActivationResponse, WorkerError>
+    pub async fn activate_skill(
+        &mut self,
+        name: &str,
+    ) -> Result<SkillActivationResponse, WorkerError>
     where
         St: Clone + 'static,
     {
         let activation = self.workspace_client().activate_skill(name)?;
-        self.ensure_segment_head()?;
+        self.ensure_segment_head().await?;
         let body = format!(
             "Agent Skill `{}` activated from {}.\n\n{}",
             activation.name, activation.provenance.id, activation.body
@@ -1822,6 +1753,34 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.engine.as_ref().expect("worker taken during run")
     }
 
+    fn hook_history_range(&self) -> HookHistoryRange {
+        let entries = self.session.history().entries();
+        HookHistoryRange {
+            first_entry_ref: entries.first().map(|entry| {
+                crate::SessionEntryRef::from_history_entry_id(&entry.annotation.entry_id)
+            }),
+            last_entry_ref: entries.last().map(|entry| {
+                crate::SessionEntryRef::from_history_entry_id(&entry.annotation.entry_id)
+            }),
+            entry_count: entries.len(),
+        }
+    }
+
+    fn hook_invocation_context(&self, run_id: Option<String>) -> HookInvocationContext {
+        HookInvocationContext {
+            workspace_id: self
+                .workspace_context
+                .workspace_id()
+                .map(|id| id.as_str().to_string()),
+            worker_id: self.manifest.worker.name.clone(),
+            session_id: self.session.session_id().to_string(),
+            session_revision: self.session.revision(),
+            run_id,
+            turn_index: Some(self.engine().turn_count()),
+            call_id: None,
+        }
+    }
+
     /// Mutable access to the underlying Engine.
     ///
     /// Use this to register tools, hooks, or subscribers before calling
@@ -1839,6 +1798,14 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.session.replace_history(entries);
     }
 
+    pub(crate) fn disable_manifest_lifecycle_features(&mut self) {
+        self.manifest_lifecycle_features_enabled = false;
+    }
+
+    pub(crate) fn manifest_lifecycle_features_enabled(&self) -> bool {
+        self.manifest_lifecycle_features_enabled
+    }
+
     /// Install enabled feature modules into the Worker host surfaces.
     pub fn install_features(
         &mut self,
@@ -1846,6 +1813,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     ) -> FeatureRegistryInstallReport {
         let worker = self.engine.as_mut().expect("worker taken during run");
         let report = registry.install_into_engine(worker, &mut self.hook_builder);
+        if report.has_errors() {
+            return report;
+        }
+        self.feature_background_tasks = report.background_tasks.clone();
         for instruction in report.installed_instruction_contributions() {
             self.register_feature_instruction(instruction);
         }
@@ -1943,11 +1914,15 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     }
 
     /// Truncate the current segment to just before a previously listed user input.
-    pub fn rewind_to(
+    pub async fn rewind_to(
         &mut self,
         target: RewindTargetId,
         expected_head_entries: usize,
     ) -> Result<RewindAppliedState, RewindError> {
+        let _rewrite_guard = self
+            .prepare_session_rewrite(SessionRewriteKind::Rewind)
+            .await
+            .map_err(|error| RewindError::Invalid(error.to_string()))?;
         let loc = self.segment_state.location();
         if target.segment_id != loc.segment_id {
             return Err(RewindError::Invalid(
@@ -1975,7 +1950,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let retained = entries[..truncate_entries].to_vec();
         let tool_side_effect_warning = suffix_has_tool_side_effects(&entries[truncate_entries..]);
         let state = segment_log::collect_state(&retained);
-        let extract_pointer = memory::extract::fold_pointer(&state.extensions);
         let summary = RewindSummary {
             truncated_to_entries: truncate_entries,
             discarded_entries: entries.len().saturating_sub(truncate_entries),
@@ -2006,10 +1980,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .pending_attachments
             .lock()
             .expect("pending_attachments poisoned") = Vec::new();
-        *self
-            .extract_pointer
-            .lock()
-            .expect("extract_pointer poisoned") = extract_pointer;
 
         Ok(RewindAppliedState {
             entries: retained,
@@ -2110,21 +2080,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         &self.user_segments
     }
 
-    pub fn extract_pointer(&self) -> Option<memory::ExtractPointerPayload> {
-        self.extract_pointer
-            .lock()
-            .expect("extract_pointer poisoned")
-            .clone()
-    }
-
-    /// Test/diagnostic handle to the consolidation in-flight guard. Production
-    /// callers do not need this; tests use it to assert that the reentry
-    /// guard skips an in-progress consolidation without losing data.
-    #[doc(hidden)]
-    pub fn consolidation_in_flight_handle(&self) -> Arc<AtomicBool> {
-        self.consolidation_in_flight.clone()
-    }
-
     /// Shared handle to the cumulative Usage history.
     ///
     /// Callbacks that need live access to the latest measurements (e.g.
@@ -2139,6 +2094,104 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// non-contended at every Worker lifecycle event.
     pub fn usage_history_handle(&self) -> Arc<Mutex<Vec<UsageRecord>>> {
         self.usage_history.clone()
+    }
+
+    /// Narrow read-only handle used by lifecycle Features after terminal run
+    /// persistence. The capture is rebuilt from the committed log under the
+    /// same append fence used by log writers.
+    pub(crate) fn committed_session_capture_handle(&self) -> CommittedSessionCaptureHandle
+    where
+        St: Clone + Send + Sync + 'static,
+    {
+        let store = self.store.clone();
+        let state = Arc::clone(&self.segment_state);
+        CommittedSessionCaptureHandle::new(move || {
+            let _append_guard = state
+                .append_lock
+                .lock()
+                .expect("segment append lock poisoned");
+            let location = state.location();
+            let entries = store
+                .read_all(location.session_id, location.segment_id)
+                .map_err(|error| FeatureSessionError::Capture(error.to_string()))?;
+            let run_exit = entries
+                .iter()
+                .rev()
+                .find_map(|entry| match entry {
+                    LogEntry::RunCompleted {
+                        result: EngineResult::Finished,
+                        ..
+                    } => Some(CommittedRunExit::Finished),
+                    LogEntry::RunCompleted { .. } => Some(CommittedRunExit::NonFinal),
+                    LogEntry::RunErrored { .. } => Some(CommittedRunExit::Interrupted),
+                    _ => None,
+                })
+                .unwrap_or(CommittedRunExit::NonFinal);
+            let restored = segment_log::collect_state(&entries);
+            let history =
+                restore_history_entries(location.session_id, location.segment_id, &entries)
+                    .map_err(|error| FeatureSessionError::Capture(error.to_string()))?;
+            Ok(CommittedSessionCapture {
+                session_id: location.session_id.to_string(),
+                segment_id: location.segment_id.to_string(),
+                session_revision: entries.len().try_into().unwrap_or(u64::MAX),
+                entry_count: entries.len(),
+                run_exit,
+                history,
+                usage_history: restored.usage_history,
+                extensions: restored.extensions.into_iter().collect(),
+            })
+        })
+    }
+
+    /// Narrow fenced append authority for Feature-owned Session extensions.
+    pub(crate) fn session_extension_handle(&self) -> SessionExtensionHandle
+    where
+        St: Clone + Send + Sync + 'static,
+    {
+        let writer = self.log_writer_handle();
+        SessionExtensionHandle::new(move |expected, domain, payload| {
+            let _append_guard = writer
+                .state
+                .append_lock
+                .lock()
+                .expect("segment append lock poisoned");
+            let location = writer.state.location();
+            if location.session_id.to_string() != expected.session_id
+                || location.segment_id.to_string() != expected.segment_id
+                || u64::try_from(writer.state.entries_written()).unwrap_or(u64::MAX)
+                    != expected.session_revision
+                || writer.state.entries_written() != expected.entry_count
+            {
+                return Ok(false);
+            }
+            writer
+                .append_entry_locked(LogEntry::Extension {
+                    ts: segment_log::now_millis(),
+                    domain: domain.to_string(),
+                    payload,
+                })
+                .map_err(|error| FeatureSessionError::Extension(error.to_string()))?;
+            Ok(true)
+        })
+    }
+
+    pub(crate) fn llm_client_handle(&self) -> Box<dyn LlmClient>
+    where
+        C: Clone,
+    {
+        Box::new(
+            (*self
+                .engine
+                .as_ref()
+                .expect("worker taken during run")
+                .client())
+            .clone(),
+        )
+    }
+
+    pub(crate) fn working_event_sender(&self) -> Option<broadcast::Sender<Event>> {
+        self.working_event_tx.clone()
     }
 
     /// Handle to the per-LLM-request `UsageTracker`.
@@ -2328,12 +2381,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.hook_builder.add_on_turn_end(hook);
     }
 
-    /// Register a hook that runs when execution is aborted.
-    pub fn add_on_abort_hook(&mut self, hook: impl Hook<OnAbort> + 'static) {
-        self.assert_hooks_open();
-        self.hook_builder.add_on_abort(hook);
-    }
-
     /// Install the hook-based interceptor on the Engine if not already done.
     ///
     /// When either compaction threshold (`threshold` or
@@ -2344,6 +2391,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         if !self.interceptor_installed {
             let builder = std::mem::take(&mut self.hook_builder);
             let registry = Arc::new(builder.build());
+            self.hook_registry = Some(registry.clone());
 
             let (post_run_threshold, request_threshold, retained) = self
                 .manifest
@@ -2413,27 +2461,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let Some(template) = self.system_prompt_template.take() else {
             return Ok(());
         };
-        let is_memory_consolidation = self.manifest.profile.as_ref().is_some_and(|snapshot| {
-            matches!(
-                &snapshot.source,
-                manifest::ProfileSource::Registry {
-                    source: manifest::ProfileRegistrySource::Builtin,
-                    name,
-                    ..
-                } if name == "memory-consolidation"
-            )
-        });
-        if is_memory_consolidation {
-            let memory_config = self.manifest.memory.as_ref().ok_or_else(|| {
-                WorkerError::InvalidState(
-                    "Memory consolidation Worker has no Memory configuration".to_string(),
-                )
-            })?;
-            let language = memory_language(memory_config)?;
-            let rendered = self
-                .prompts
-                .load_full()
-                .memory_consolidation_system(&language)?;
+        if let Some(rendered) = self.feature_system_prompt_override.take() {
             self.engine
                 .as_mut()
                 .expect("worker present")
@@ -2462,23 +2490,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 }
             }
         }
-        let inject_summary = self.inject_resident_summary
-            && self
-                .manifest
-                .memory
-                .as_ref()
-                .is_some_and(|m| m.inject_summary.unwrap_or(true));
-        let resident_summary: Option<String> = if inject_summary {
-            match self.resident_summary_from_workspace_authority().await {
-                Ok(summary) => summary,
-                Err(error) => {
-                    tracing::debug!(%error, "resident memory summary unavailable");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let resident_summary = self
+            .inject_resident_summary
+            .then(|| self.feature_resident_summary.clone())
+            .flatten();
         let worker_language = worker_language(&self.manifest.engine);
         let scope_snapshot = self.scope.snapshot();
         let cwd_for_prompt = self
@@ -2519,24 +2534,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.run(vec![Segment::text(s)]).await
     }
 
-    /// Drop the prior memory_task handle if it has finished. Keep it if
-    /// still running so callers can decide whether to wait or coalesce.
-    fn cleanup_finished_memory_task(&mut self) {
-        if self.memory_task.as_ref().is_some_and(|h| h.is_finished()) {
-            self.memory_task = None;
-        }
-    }
-
-    /// Wait for the in-flight memory task (if any) to finish. Used before
-    /// compact rewrites history (extract reads the same history).
-    async fn join_memory_task(&mut self) {
-        if let Some(handle) = self.memory_task.take()
-            && let Err(e) = handle.await
-        {
-            tracing::warn!(error = %e, "Memory task join failed");
-        }
-    }
-
     /// Whether `try_pre_run_compact` would actually compact. The same
     /// check is duplicated inside `try_pre_run_compact` itself for
     /// defensive reasons; this is the gate for joining the memory task
@@ -2560,11 +2557,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.refresh_prompt_projection_for_future_operations()?;
         self.ensure_interceptor_installed();
         self.ensure_system_prompt_materialized().await?;
-        self.cleanup_finished_memory_task();
-        self.ensure_segment_head()?;
-        if self.should_pre_run_compact() {
-            self.join_memory_task().await;
-        }
+        self.ensure_segment_head().await?;
+        if self.should_pre_run_compact() {}
         self.try_pre_run_compact().await;
         Ok(())
     }
@@ -3272,11 +3266,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// `ensure_system_prompt_materialized` has just rendered. Subsequent
     /// calls fall through to entry-count comparison, which auto-forks
     /// when another writer has appended behind our back.
-    fn ensure_segment_head(&mut self) -> Result<(), WorkerError> {
-        let w = self.engine.as_ref().unwrap();
+    async fn ensure_segment_head(&mut self) -> Result<(), WorkerError> {
         let loc = self.segment_state.location();
         let entries_written = self.segment_state.entries_written();
         if entries_written == 0 {
+            let w = self.engine.as_ref().unwrap();
             let initial = LogEntry::AnnotatedSegmentStart {
                 ts: segment_log::now_millis(),
                 session_id: loc.session_id,
@@ -3312,6 +3306,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // state up to that turn). The new SegmentStart replaces the mirror
         // and is broadcast through the sink so existing subscribers reset
         // their view.
+        let _rewrite_guard = self
+            .prepare_session_rewrite(SessionRewriteKind::Fork)
+            .await?;
+        let w = self.engine.as_ref().unwrap();
         let fork_segment_id = session_store::new_segment_id();
         let entry = LogEntry::AnnotatedSegmentStart {
             ts: segment_log::now_millis(),
@@ -3378,10 +3376,57 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     where
         St: Clone + 'static,
     {
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let hook_exit = hook_run_exit(&result);
+        if let Some(hooks) = self.hook_registry.clone() {
+            let context = RunExitContext {
+                invocation: self.hook_invocation_context(Some(run_id.clone())),
+                exit: hook_exit,
+                history_len: self.session.history().len(),
+            };
+            match tokio::time::timeout(FEATURE_HOOK_CHAIN_TIMEOUT, hooks.on_run_exit(&context))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "run-exit hook failed; preserving terminal commit");
+                }
+                Err(_) => {
+                    hooks.record_chain_timeout("run-exit");
+                    tracing::warn!("run-exit hook chain exceeded its host deadline");
+                }
+            }
+        }
         if matches!(&result, EngineRunExit::Interrupted(_)) {
             self.terminalize_orphan_tool_calls()?;
         }
         self.persist_turn(history_before, &result).await?;
+        let committed_invocation = self.hook_invocation_context(Some(run_id));
+        if let Some(hooks) = self.hook_registry.clone() {
+            let context = RunCommittedContext {
+                invocation: committed_invocation.clone(),
+                exit: hook_exit,
+                committed_history: self.hook_history_range(),
+            };
+            match tokio::time::timeout(FEATURE_HOOK_CHAIN_TIMEOUT, hooks.on_run_committed(&context))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "run-committed hook requires attention");
+                }
+                Err(_) => {
+                    hooks.record_chain_timeout("run-committed");
+                    tracing::warn!("run-committed hook chain exceeded its host deadline");
+                }
+            }
+        }
+        if let Err(error) = self
+            .feature_background_tasks
+            .start_run_committed(committed_invocation)
+        {
+            tracing::warn!(error = %error, "run-committed background task start failed");
+        }
 
         if matches!(result, EngineRunExit::Yielded) {
             self.last_run_interrupted = true;
@@ -3559,6 +3604,43 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// The controller only calls this while Idle. Paused turns keep their
     /// interrupted Engine state intact and are intentionally rejected before
     /// this method is reached.
+    async fn prepare_session_rewrite(
+        &mut self,
+        kind: SessionRewriteKind,
+    ) -> Result<BackgroundTaskRewriteGuard, WorkerError> {
+        let rewrite_guard = self
+            .feature_background_tasks
+            .begin_session_rewrite()
+            .await
+            .map_err(|error| WorkerError::FeatureLifecycle(error.to_string()))?;
+        if let Some(hooks) = self.hook_registry.clone() {
+            let context = BeforeSessionRewriteContext {
+                invocation: self.hook_invocation_context(None),
+                kind,
+                current_history: self.hook_history_range(),
+            };
+            let action = tokio::time::timeout(
+                FEATURE_HOOK_CHAIN_TIMEOUT,
+                hooks.before_session_rewrite(&context),
+            )
+            .await
+            .map_err(|_| {
+                hooks.record_chain_timeout("before-session-rewrite");
+                WorkerError::FeatureLifecycle(
+                    "session-rewrite hook chain exceeded its host deadline".to_string(),
+                )
+            })?
+            .map_err(|error| WorkerError::FeatureLifecycle(error.to_string()))?;
+            match action {
+                BeforeSessionRewriteAction::Continue => {}
+                BeforeSessionRewriteAction::Deny(reason) => {
+                    return Err(WorkerError::FeatureLifecycle(reason));
+                }
+            }
+        }
+        Ok(rewrite_guard)
+    }
+
     pub async fn manual_compact(&mut self) -> Result<ManualCompactResult, WorkerError> {
         if self.manifest.compaction.is_none() {
             let message =
@@ -3574,8 +3656,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         }
 
         self.ensure_interceptor_installed();
-        self.cleanup_finished_memory_task();
-        self.ensure_segment_head()?;
+        self.ensure_segment_head().await?;
 
         let state = self.compact_state.clone();
         if state.as_ref().is_some_and(|s| s.is_disabled()) {
@@ -3600,7 +3681,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             return Ok(ManualCompactResult::Skipped { message });
         }
 
-        self.join_memory_task().await;
         match self.compact(retained).await {
             Ok(new_segment_id) => {
                 info!(new_segment_id = %new_segment_id, "Manual compaction succeeded");
@@ -3774,6 +3854,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Runs one parent-owned observable compaction service and returns the new
     /// Segment ID. Lifecycle revisions are committed before they are broadcast.
     pub async fn compact(&mut self, retained_tokens: u64) -> Result<SegmentId, WorkerError> {
+        let _rewrite_guard = self
+            .prepare_session_rewrite(SessionRewriteKind::Compact)
+            .await?;
         let mut lifecycle = CompactionLifecycle {
             schema_version: 2,
             compaction_id: uuid::Uuid::now_v7().to_string(),
@@ -4405,26 +4488,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // compact layout guarantees history[0] is the summary.
         worker.set_cache_anchor(Some(0));
         // Re-key the OpenAI Responses prompt cache namespace to the new
-        // segment_id so post-compact turns share a key with extract /
-        // consolidate workers running in the same session.
+        // segment_id so post-compact turns use the rewritten session namespace.
         worker.set_cache_key(Some(new_segment_id.to_string()));
         self.usage_history
             .lock()
             .expect("usage_history poisoned")
             .clear();
-        // Reset extract pointer alongside usage_history: the compacted
-        // session has a fresh log with no `LogEntry::Extension` entries
-        // yet, so a cold restore here would set extract_pointer to None
-        // via fold_pointer. The in-memory pointer must match — otherwise
-        // `tokens_added_since(old_history_len)` would treat the new
-        // (shorter) history as if it had already been processed, and
-        // extract would stop firing for the rest of the process's
-        // lifetime.
-        *self
-            .extract_pointer
-            .lock()
-            .expect("extract_pointer poisoned") = None;
-
         Ok((new_segment_id, summary_text))
     }
 
@@ -4442,738 +4511,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let worker = self.engine.as_ref().expect("worker taken during run");
         Ok(worker.client().clone_boxed())
     }
-
-    /// Build the LlmClient for the extract (memory.extract) Engine.
-    ///
-    /// Uses `memory.extract_model` from manifest if set, otherwise clones
-    /// the main client.
-    fn build_extractor_client(
-        &self,
-        memory_cfg: &manifest::MemoryConfig,
-    ) -> Result<Box<dyn LlmClient>, WorkerError> {
-        if let Some(ref m) = memory_cfg.extract_model {
-            let client = crate::model_client::build_client(m)?;
-            return Ok(client);
-        }
-        let worker = self.engine.as_ref().expect("worker taken during run");
-        Ok(worker.client().clone_boxed())
-    }
-
-    /// pointer 以降に増えたプロンプト全長の推定。extract trigger が
-    /// 閾値判定に使う。
-    ///
-    /// `total_tokens_at(now) - total_tokens_at(pointer)` の差分で、
-    /// compact と同じ accounting (measured / interpolated / extrapolated)
-    /// に乗る。`history_len_pointer == 0` は「未抽出」扱いで現プロンプト
-    /// 全長そのものが返る。
-    ///
-    /// 素朴な `usage_history.input_total_tokens` の合計は使わない:
-    /// `input_total_tokens` は **送信時の prompt prefix 全長** であって
-    /// 増分ではないので、長い turn 内の連続 LLM call では super-set を
-    /// 何度も足し込んでしまい実消費の数倍に膨らむ。
-    fn tokens_added_since(&self, history_len_pointer: usize) -> u64 {
-        let now = self.history().len();
-        let total_now = self.total_tokens_at(now).tokens;
-        let total_at_pointer = self.total_tokens_at(history_len_pointer).tokens;
-        total_now.saturating_sub(total_at_pointer)
-    }
-
-    /// extract (memory.extract) post-run trigger.
-    ///
-    /// Called by the Controller before spawning the background memory task so
-    /// the extract worker sees a stable session-log entry range while compact
-    /// is deferred until the next turn starts. Best-effort: failures are
-    /// logged but not propagated.
-    ///
-    /// Behaviour follows `docs/plan/memory.md` §Extract 並走防止:
-    /// in-flight 中の trigger は skip し、完了時点で閾値再評価する
-    /// (the loop below). Pending state is not retained — the
-    /// re-evaluation happens naturally because the in-memory pointer
-    /// has advanced.
-    pub async fn try_post_run_extract(&mut self) -> Result<(), WorkerError> {
-        let Some(memory_cfg) = self.manifest.memory.clone() else {
-            return Ok(());
-        };
-        // `Some(0)` means disabled, same as `None`. Otherwise the
-        // `tokens_since >= 0` comparison would fire on every post-run.
-        let Some(threshold) = memory_cfg.extract_threshold.filter(|n| *n > 0) else {
-            let model = memory_cfg
-                .extract_model
-                .as_ref()
-                .unwrap_or(&self.manifest.model);
-            WorkerAuditBase::new(
-                memory::audit::AuditWorker::MemoryExtract,
-                memory::audit::AuditTrigger::TokenThreshold,
-                Some(model_audit_from_manifest(model)),
-            )
-            .with_memory_settings(&memory_cfg)
-            .emit(
-                self.workspace_client(),
-                self.working_event_tx.as_ref(),
-                memory::audit::WorkerLifecycleStatus::Skipped,
-                "extract_threshold_disabled",
-                None,
-                None,
-                None,
-            )
-            .await;
-            return Ok(());
-        };
-
-        loop {
-            // CAS the in-flight flag. If another task is already running
-            // an extract for this Worker, skip per spec.
-            if self
-                .extract_in_flight
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                let model = memory_cfg
-                    .extract_model
-                    .as_ref()
-                    .unwrap_or(&self.manifest.model);
-                WorkerAuditBase::new(
-                    memory::audit::AuditWorker::MemoryExtract,
-                    memory::audit::AuditTrigger::TokenThreshold,
-                    Some(model_audit_from_manifest(model)),
-                )
-                .with_memory_settings(&memory_cfg)
-                .emit(
-                    self.workspace_client(),
-                    self.working_event_tx.as_ref(),
-                    memory::audit::WorkerLifecycleStatus::Skipped,
-                    "extract_already_in_flight",
-                    None,
-                    None,
-                    None,
-                )
-                .await;
-                return Ok(());
-            }
-            let result = self.run_extract_once(&memory_cfg, threshold).await;
-            self.extract_in_flight.store(false, Ordering::Release);
-
-            match result {
-                Ok(ExtractDecision::Skipped) => return Ok(()),
-                Ok(ExtractDecision::Completed) => {
-                    // Re-evaluate threshold against the newly advanced
-                    // pointer. In the current synchronous architecture
-                    // this normally exits via Skipped on the next pass,
-                    // but the loop is forward-looking for the case
-                    // where new activity piles up while extract runs.
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "extract failed");
-                    self.alert(
-                        AlertLevel::Warn,
-                        AlertSource::Worker,
-                        format!("memory extract failed: {e}"),
-                    );
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    /// Single extract iteration: snapshot pointer, decide whether to
-    /// fire, run the worker if so, persist results and the new pointer.
-    async fn run_extract_once(
-        &mut self,
-        memory_cfg: &manifest::MemoryConfig,
-        threshold: u64,
-    ) -> Result<ExtractDecision, WorkerError> {
-        self.run_extract_once_with_cancel_observer(memory_cfg, threshold, None)
-            .await
-    }
-
-    async fn run_extract_once_with_cancel_observer(
-        &mut self,
-        memory_cfg: &manifest::MemoryConfig,
-        threshold: u64,
-        cancel_observer: Option<Box<dyn FnOnce(tokio::sync::mpsc::Sender<()>) + Send + 'static>>,
-    ) -> Result<ExtractDecision, WorkerError> {
-        use memory::extract;
-
-        let model = memory_cfg
-            .extract_model
-            .as_ref()
-            .unwrap_or(&self.manifest.model);
-        let audit = WorkerAuditBase::new(
-            memory::audit::AuditWorker::MemoryExtract,
-            memory::audit::AuditTrigger::TokenThreshold,
-            Some(model_audit_from_manifest(model)),
-        )
-        .with_memory_settings(memory_cfg);
-        let working_event_tx = self.working_event_tx.as_ref();
-
-        let pointer_snapshot = self
-            .extract_pointer
-            .lock()
-            .expect("extract_pointer poisoned")
-            .clone();
-        let processed_history_len = pointer_snapshot
-            .as_ref()
-            .map(|p| p.processed_through_history_len)
-            .unwrap_or(0);
-
-        let tokens_since = self.tokens_added_since(processed_history_len);
-        if tokens_since < threshold {
-            audit.emit(
-                self.workspace_client(),
-                working_event_tx,
-                memory::audit::WorkerLifecycleStatus::Skipped,
-                format!(
-                    "token_threshold_not_reached tokens_since={tokens_since} threshold={threshold}"
-                ),
-                None,
-                None,
-                None,
-            ).await;
-            return Ok(ExtractDecision::Skipped);
-        }
-
-        let current_history_len = self.session.history().len();
-        if current_history_len <= processed_history_len {
-            audit
-                .emit(
-                    self.workspace_client(),
-                    working_event_tx,
-                    memory::audit::WorkerLifecycleStatus::Skipped,
-                    "no_new_history_items",
-                    None,
-                    Some(memory::audit::ExtractAudit {
-                        history_range: Some([
-                            processed_history_len as u64,
-                            current_history_len as u64,
-                        ]),
-                        ..Default::default()
-                    }),
-                    None,
-                )
-                .await;
-            return Ok(ExtractDecision::Skipped);
-        }
-
-        // Read the session log to get the current entry count. This is
-        // the boundary for the source.range end_entry. Called once per
-        // extract, on a small local file.
-        let entries_now = self
-            .store
-            .read_all(self.session_id(), self.segment_id())?
-            .len();
-        if entries_now == 0 {
-            audit
-                .emit(
-                    self.workspace_client(),
-                    working_event_tx,
-                    memory::audit::WorkerLifecycleStatus::Skipped,
-                    "empty_segment_log",
-                    None,
-                    None,
-                    None,
-                )
-                .await;
-            return Ok(ExtractDecision::Skipped);
-        }
-        let end_entry = entries_now - 1;
-        let start_entry = pointer_snapshot
-            .as_ref()
-            .map(|p| p.processed_through_entry + 1)
-            .unwrap_or(0);
-        if start_entry > end_entry {
-            audit
-                .emit(
-                    self.workspace_client(),
-                    working_event_tx,
-                    memory::audit::WorkerLifecycleStatus::Skipped,
-                    "no_new_segment_entries",
-                    None,
-                    Some(memory::audit::ExtractAudit {
-                        session_id: Some(self.session_id().to_string()),
-                        segment_id: Some(self.segment_id().to_string()),
-                        entry_range: Some([start_entry as u64, end_entry as u64]),
-                        history_range: Some([
-                            processed_history_len as u64,
-                            current_history_len as u64,
-                        ]),
-                        ..Default::default()
-                    }),
-                    None,
-                )
-                .await;
-            return Ok(ExtractDecision::Skipped);
-        }
-
-        let extract_audit_base = memory::audit::ExtractAudit {
-            session_id: Some(self.session_id().to_string()),
-            segment_id: Some(self.segment_id().to_string()),
-            entry_range: Some([start_entry as u64, end_entry as u64]),
-            history_range: Some([processed_history_len as u64, current_history_len as u64]),
-            ..Default::default()
-        };
-        audit
-            .emit(
-                self.workspace_client(),
-                working_event_tx,
-                memory::audit::WorkerLifecycleStatus::Started,
-                format!(
-                    "token_threshold_reached tokens_since={tokens_since} threshold={threshold}"
-                ),
-                None,
-                Some(extract_audit_base.clone()),
-                None,
-            )
-            .await;
-
-        let entries_to_extract =
-            self.session.history().entries()[processed_history_len..current_history_len].to_vec();
-
-        let extract_worker_max_turns = memory_cfg
-            .extract_worker_max_turns
-            .or(manifest::defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS);
-
-        let client = match self.build_extractor_client(memory_cfg) {
-            Ok(client) => client,
-            Err(err) => {
-                audit
-                    .emit(
-                        self.workspace_client(),
-                        working_event_tx,
-                        memory::audit::WorkerLifecycleStatus::Failed,
-                        format!("client_build_failed: {err}"),
-                        None,
-                        Some(extract_audit_base),
-                        None,
-                    )
-                    .await;
-                return Err(err);
-            }
-        };
-        let memory_language = memory_language(memory_cfg)?;
-        let extract_system_prompt = match self
-            .prompts
-            .load_full()
-            .memory_extract_system(&memory_language)
-        {
-            Ok(prompt) => prompt,
-            Err(err) => {
-                audit
-                    .emit(
-                        self.workspace_client(),
-                        working_event_tx,
-                        memory::audit::WorkerLifecycleStatus::Failed,
-                        format!("prompt_render_failed: {err}"),
-                        None,
-                        Some(extract_audit_base),
-                        None,
-                    )
-                    .await;
-                return Err(WorkerError::PromptCatalog(err));
-            }
-        };
-        let source_segment_id = self.segment_state.segment_id();
-        let source = memory::schema::SourceRef {
-            segment_id: source_segment_id.to_string(),
-            range: [start_entry as u64, end_entry as u64],
-        };
-        let session_view = crate::session_capture::SessionCapture::from_history_entries(
-            source_segment_id.to_string(),
-            entries_to_extract,
-        );
-        let session_explore_state = SessionExploreState::new(session_view.clone());
-        let memory_extract_state = MemoryExtractState::new(
-            session_view,
-            self.workspace_client_handle(),
-            source,
-            audit.run_id.to_string(),
-        );
-        let input_text = render_extract_input(session_explore_state.view());
-        let features = FeatureRegistryBuilder::new()
-            .with_module(SessionExploreFeature::new(session_explore_state.clone()))
-            .with_module(MemoryExtractFeature::new(memory_extract_state.clone()));
-        let mut internal_manifest = self.manifest.clone();
-        internal_manifest.model = model.clone();
-        let internal_spec = InternalWorkerSpec {
-            identity: InternalWorkerIdentity {
-                kind: "memory-extract",
-                run_id: audit.run_id,
-            },
-            manifest: internal_manifest,
-            client,
-            system_prompt: extract_system_prompt,
-            input: input_text,
-            cache_key: Some(self.segment_id().to_string()),
-            max_turns: extract_worker_max_turns,
-            engine_configurator: None,
-            features,
-            required_tools: &[
-                "ShowOverview",
-                "SearchEntries",
-                "ReadEntry",
-                "StageMemoryCandidate",
-                "FinishMemoryExtraction",
-            ],
-            authority: InternalWorkerAuthority {
-                workspace: self.workspace_context.clone(),
-                filesystem: WorkerFilesystemAuthority::None,
-                scope: Scope::empty(),
-                workdir_session: None,
-            },
-        };
-        let internal_result = match cancel_observer {
-            Some(observer) => run_internal_worker_with_cancel_sender(internal_spec, observer).await,
-            None => run_internal_worker(internal_spec).await,
-        };
-        let usage = match internal_result {
-            Ok(result) => {
-                tracing::debug!(
-                    internal_worker_kind = result.identity.kind,
-                    internal_worker_run_id = %result.identity.run_id,
-                    history_entries = result.history_entries,
-                    lifecycle = ?result.lifecycle,
-                    "internal Worker execution completed"
-                );
-                let usage = result.usage.as_ref().map(usage_audit_from_event);
-                if let Some(error) = extract_internal_worker_lifecycle_error(&result.lifecycle) {
-                    audit
-                        .emit(
-                            self.workspace_client(),
-                            working_event_tx,
-                            memory::audit::WorkerLifecycleStatus::Cancelled,
-                            "worker_cancelled: internal Worker run rolled back before AI output",
-                            usage,
-                            Some(extract_audit_base),
-                            None,
-                        )
-                        .await;
-                    return Err(error);
-                }
-                usage
-            }
-            Err(err) => {
-                tracing::debug!(
-                    internal_worker_kind = err.identity.kind,
-                    internal_worker_run_id = %err.identity.run_id,
-                    history_entries = err.history_entries,
-                    "internal Worker execution failed"
-                );
-                let usage = err.usage.as_ref().map(usage_audit_from_event);
-                audit
-                    .emit(
-                        self.workspace_client(),
-                        working_event_tx,
-                        lifecycle_status_for_worker_error(&err.source),
-                        format!("worker_failed: {}", err.source),
-                        usage,
-                        Some(extract_audit_base),
-                        None,
-                    )
-                    .await;
-                return Err(err.source);
-            }
-        };
-
-        let staging_results = memory_extract_state.staged();
-        if !memory_extract_state.is_finished() {
-            tracing::warn!(
-                staged_count = staging_results.len(),
-                "extract worker did not call FinishMemoryExtraction; advancing pointer with staged output"
-            );
-        }
-        let staging_id = staging_results.first().cloned().unwrap_or_default();
-
-        let pointer_payload = extract::ExtractPointerPayload {
-            processed_through_entry: end_entry,
-            processed_through_history_len: current_history_len,
-            staging_id: staging_id.clone(),
-        };
-        let payload_value = serde_json::to_value(&pointer_payload)
-            .expect("ExtractPointerPayload is always JSON-serializable");
-        self.commit_entry(LogEntry::Extension {
-            ts: segment_log::now_millis(),
-            domain: extract::EXTRACT_DOMAIN.into(),
-            payload: payload_value,
-        })?;
-
-        *self
-            .extract_pointer
-            .lock()
-            .expect("extract_pointer poisoned") = Some(pointer_payload);
-
-        let mut extract_audit = extract_audit_base;
-        extract_audit.staging_count = staging_results.len();
-        for id in &staging_results {
-            extract_audit.staging_ids.push(id.clone());
-        }
-        let reason = if staging_id.is_empty() {
-            "completed_no_staging_output"
-        } else {
-            "completed_staging_written"
-        };
-        audit
-            .emit(
-                self.workspace_client(),
-                working_event_tx,
-                memory::audit::WorkerLifecycleStatus::Completed,
-                reason,
-                usage,
-                Some(extract_audit),
-                None,
-            )
-            .await;
-
-        Ok(ExtractDecision::Completed)
-    }
-
-    /// Request Backend-managed Memory staging consolidation after a Worker turn.
-    ///
-    /// Worker has no local Workspace memory authority. It only asks the Backend
-    /// Workspace to notify or spawn the dedicated consolidater Worker.
-    pub async fn try_post_run_consolidate(&mut self) -> Result<(), WorkerError> {
-        let Some(memory_cfg) = self.manifest.memory.clone() else {
-            return Ok(());
-        };
-        let model = memory_cfg
-            .consolidation_model
-            .as_ref()
-            .unwrap_or(&self.manifest.model);
-        let files_threshold = memory_cfg.consolidation_threshold_files.filter(|n| *n > 0);
-        let bytes_threshold = memory_cfg.consolidation_threshold_bytes.filter(|n| *n > 0);
-        if files_threshold.is_none() && bytes_threshold.is_none() {
-            WorkerAuditBase::new(
-                memory::audit::AuditWorker::MemoryConsolidation,
-                memory::audit::AuditTrigger::StagingBacklog,
-                Some(model_audit_from_manifest(model)),
-            )
-            .with_memory_settings(&memory_cfg)
-            .emit(
-                self.workspace_client(),
-                self.working_event_tx.as_ref(),
-                memory::audit::WorkerLifecycleStatus::Skipped,
-                "consolidation_threshold_disabled",
-                None,
-                None,
-                None,
-            )
-            .await;
-            return Ok(());
-        }
-
-        match self
-            .workspace_client()
-            .request_memory_staging_consolidation(
-                memory::backend::MemoryConsolidateStagingOperation {
-                    force: false,
-                    threshold_files: files_threshold,
-                    threshold_bytes: bytes_threshold,
-                },
-            )
-            .await
-        {
-            Ok(output) => {
-                tracing::debug!(
-                    status = output.status.as_str(),
-                    summary = output.summary.as_str(),
-                    "requested backend memory staging consolidation"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "failed to request backend memory staging consolidation"
-                );
-                WorkerAuditBase::new(
-                    memory::audit::AuditWorker::MemoryConsolidation,
-                    memory::audit::AuditTrigger::StagingBacklog,
-                    Some(model_audit_from_manifest(model)),
-                )
-                .with_memory_settings(&memory_cfg)
-                .emit(
-                    self.workspace_client(),
-                    self.working_event_tx.as_ref(),
-                    memory::audit::WorkerLifecycleStatus::Skipped,
-                    "consolidation_backend_operation_failed",
-                    None,
-                    None,
-                    None,
-                )
-                .await;
-            }
-        }
-        Ok(())
-    }
-}
-
-fn extract_internal_worker_lifecycle_error(lifecycle: &WorkerRunResult) -> Option<WorkerError> {
-    match lifecycle {
-        WorkerRunResult::RolledBack => Some(WorkerError::Engine(EngineError::Cancelled)),
-        WorkerRunResult::Interrupted { message, .. } => {
-            Some(WorkerError::Engine(EngineError::Aborted(message.clone())))
-        }
-        WorkerRunResult::Finished | WorkerRunResult::Paused | WorkerRunResult::LimitReached => None,
-    }
-}
-
-fn lifecycle_status_for_worker_error(err: &WorkerError) -> memory::audit::WorkerLifecycleStatus {
-    if matches!(err, WorkerError::Engine(EngineError::Cancelled)) {
-        memory::audit::WorkerLifecycleStatus::Cancelled
-    } else {
-        memory::audit::WorkerLifecycleStatus::Failed
-    }
-}
-
-fn usage_audit_from_event(
-    event: &agen::llm_client::event::UsageEvent,
-) -> memory::audit::UsageAudit {
-    memory::audit::UsageAudit {
-        input_tokens: event.input_tokens,
-        output_tokens: event.output_tokens,
-        total_tokens: event.total_tokens,
-        cache_read_input_tokens: event.cache_read_input_tokens,
-        cache_creation_input_tokens: event.cache_creation_input_tokens,
-    }
-}
-
-fn model_audit_from_manifest(model: &manifest::ModelManifest) -> memory::audit::ModelAudit {
-    memory::audit::ModelAudit {
-        ref_: model.ref_.clone(),
-        scheme: model.scheme.map(|scheme| format!("{scheme:?}")),
-        model_id: model.model_id.clone(),
-    }
-}
-
-fn emit_memory_worker_event(
-    working_event_tx: Option<&broadcast::Sender<Event>>,
-    run_id: uuid::Uuid,
-    worker: memory::audit::AuditWorker,
-    status: memory::audit::WorkerLifecycleStatus,
-    trigger: memory::audit::AuditTrigger,
-    reason: &str,
-) {
-    let Some(working_event_tx) = working_event_tx else {
-        return;
-    };
-    let message = format!("memory {} {}: {reason}", worker.label(), status.label());
-    let _ = working_event_tx.send(Event::MemoryWorker(protocol::MemoryWorkerEvent {
-        worker: worker.label().to_string(),
-        status: status.label().to_string(),
-        run_id: run_id.to_string(),
-        trigger: trigger.label().to_string(),
-        reason: reason.to_string(),
-        message,
-        timestamp_ms: segment_log::now_millis() as i64,
-    }));
-}
-
-#[derive(Debug, Clone)]
-struct WorkerAuditBase {
-    run_id: uuid::Uuid,
-    worker: memory::audit::AuditWorker,
-    trigger: memory::audit::AuditTrigger,
-    model: Option<memory::audit::ModelAudit>,
-    memory_settings: Option<memory::audit::MemorySettingsAudit>,
-}
-
-impl WorkerAuditBase {
-    fn new(
-        worker: memory::audit::AuditWorker,
-        trigger: memory::audit::AuditTrigger,
-        model: Option<memory::audit::ModelAudit>,
-    ) -> Self {
-        Self {
-            run_id: uuid::Uuid::now_v7(),
-            worker,
-            trigger,
-            model,
-            memory_settings: None,
-        }
-    }
-
-    fn with_memory_settings(mut self, memory_config: &manifest::MemoryConfig) -> Self {
-        self.memory_settings =
-            memory_config
-                .workspace_settings()
-                .map(|snapshot| memory::audit::MemorySettingsAudit {
-                    workspace_id: snapshot.workspace_id,
-                    settings_revision: snapshot.settings_revision,
-                    language: snapshot.language,
-                });
-        self
-    }
-
-    async fn emit(
-        &self,
-        workspace_client: &dyn WorkspaceClient,
-        working_event_tx: Option<&broadcast::Sender<Event>>,
-        status: memory::audit::WorkerLifecycleStatus,
-        reason: impl Into<String>,
-        usage: Option<memory::audit::UsageAudit>,
-        extract: Option<memory::audit::ExtractAudit>,
-        consolidation: Option<memory::audit::ConsolidationAudit>,
-    ) {
-        let reason = reason.into();
-        let payload = memory::audit::WorkerLifecycleAudit {
-            run_id: self.run_id,
-            worker: self.worker,
-            status,
-            trigger: self.trigger,
-            reason: reason.clone(),
-            memory_settings: self.memory_settings.clone(),
-            model: self.model.clone(),
-            usage,
-            extract,
-            consolidation,
-        };
-        let _ = workspace_client
-            .execute_memory_backend_operation(memory::backend::MemoryBackendOperation::AppendAudit(
-                memory::backend::MemoryAppendAuditOperation {
-                    event: memory::audit::AuditEvent::new(
-                        memory::audit::AuditPayload::WorkerLifecycle(payload),
-                    ),
-                },
-            ))
-            .await;
-        if should_emit_memory_worker_event(self.worker, status, &reason) {
-            emit_memory_worker_event(
-                working_event_tx,
-                self.run_id,
-                self.worker,
-                status,
-                self.trigger,
-                &reason,
-            );
-        }
-    }
-}
-
-fn should_emit_memory_worker_event(
-    worker: memory::audit::AuditWorker,
-    status: memory::audit::WorkerLifecycleStatus,
-    reason: &str,
-) -> bool {
-    if worker == memory::audit::AuditWorker::MemoryConsolidation
-        && status == memory::audit::WorkerLifecycleStatus::Skipped
-    {
-        return !is_idle_consolidation_skip_reason(reason);
-    }
-    true
-}
-
-fn is_idle_consolidation_skip_reason(reason: &str) -> bool {
-    reason == "no_staging_entries"
-        || reason == "consolidation_threshold_disabled"
-        || reason.starts_with("threshold_not_reached")
-}
-
-fn memory_language(cfg: &manifest::MemoryConfig) -> Result<String, WorkerError> {
-    cfg.workspace_settings()
-        .map(|snapshot| snapshot.language)
-        .ok_or_else(|| {
-            WorkerError::InvalidState(
-                "Memory operation requires a bound Workspace Memory settings snapshot".to_string(),
-            )
-        })
 }
 
 fn worker_language(cfg: &manifest::EngineManifest) -> &str {
@@ -5183,15 +4520,6 @@ fn worker_language(cfg: &manifest::EngineManifest) -> &str {
     } else {
         language
     }
-}
-
-/// Outcome of a single extract iteration. Internal to
-/// `try_post_run_extract` / `run_extract_once`.
-enum ExtractDecision {
-    /// Threshold not reached, or no items to extract.
-    Skipped,
-    /// Extract ran and pointer advanced. Caller re-evaluates threshold.
-    Completed,
 }
 
 impl<St> Worker<Box<dyn LlmClient>, St>
@@ -5249,7 +4577,6 @@ where
         filesystem_authority: WorkerFilesystemAuthority,
         model_client: Option<Box<dyn LlmClient>>,
     ) -> Result<Self, WorkerError> {
-        validate_workspace_memory_snapshot(&manifest.worker.name, &manifest, &workspace_context)?;
         let common = prepare_worker_common_with_context_and_model_client(
             &manifest,
             &loader,
@@ -5307,8 +4634,10 @@ where
             flow_runtime_state: Arc::new(Mutex::new(None)),
             flow_feature_enabled: false,
             scope,
-            delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
+            hook_registry: None,
+            feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
@@ -5332,10 +4661,8 @@ where
             runtime_ticket_role: None,
             prompts: common.prompts,
             inject_resident_summary: true,
-            extract_in_flight: Arc::new(AtomicBool::new(false)),
-            consolidation_in_flight: Arc::new(AtomicBool::new(false)),
-            extract_pointer: Arc::new(Mutex::new(None)),
-            memory_task: None,
+            feature_resident_summary: None,
+            feature_system_prompt_override: None,
             user_segments: Vec::new(),
             sink: SegmentLogSink::new(),
             history_persistence_wired: false,
@@ -5391,8 +4718,10 @@ where
             flow_runtime_state: Arc::new(Mutex::new(None)),
             flow_feature_enabled: false,
             scope,
-            delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
+            hook_registry: None,
+            feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            manifest_lifecycle_features_enabled: false,
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
@@ -5416,10 +4745,8 @@ where
             runtime_ticket_role: None,
             prompts: common.prompts,
             inject_resident_summary: true,
-            extract_in_flight: Arc::new(AtomicBool::new(false)),
-            consolidation_in_flight: Arc::new(AtomicBool::new(false)),
-            extract_pointer: Arc::new(Mutex::new(None)),
-            memory_task: None,
+            feature_resident_summary: None,
+            feature_system_prompt_override: None,
             user_segments: Vec::new(),
             sink: SegmentLogSink::new(),
             history_persistence_wired: false,
@@ -5466,7 +4793,6 @@ where
         workspace_context: WorkerWorkspaceContext,
         filesystem_authority: WorkerFilesystemAuthority,
     ) -> Result<Self, WorkerError> {
-        validate_workspace_memory_snapshot(&manifest.worker.name, &manifest, &workspace_context)?;
         let common = prepare_worker_common_with_context(
             &manifest,
             &loader,
@@ -5510,8 +4836,10 @@ where
             flow_runtime_state: Arc::new(Mutex::new(None)),
             flow_feature_enabled: false,
             scope,
-            delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
+            hook_registry: None,
+            feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
@@ -5535,10 +4863,8 @@ where
             runtime_ticket_role: None,
             prompts: common.prompts,
             inject_resident_summary: true,
-            extract_in_flight: Arc::new(AtomicBool::new(false)),
-            consolidation_in_flight: Arc::new(AtomicBool::new(false)),
-            extract_pointer: Arc::new(Mutex::new(None)),
-            memory_task: None,
+            feature_resident_summary: None,
+            feature_system_prompt_override: None,
             user_segments: Vec::new(),
             sink: SegmentLogSink::new(),
             history_persistence_wired: false,
@@ -5862,7 +5188,6 @@ where
             worker.set_cache_anchor(Some(0));
         }
 
-        let extract_pointer = memory::extract::fold_pointer(&state.extensions);
         let task_feature = TaskFeature::from_history(&state.history);
         let worker_metadata_writer = Some(worker_metadata_writer_for_store(&store));
         let scope = SharedScope::new(common.scope);
@@ -5884,8 +5209,10 @@ where
             )?)),
             flow_feature_enabled: false,
             scope,
-            delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
+            hook_registry: None,
+            feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
@@ -5911,10 +5238,8 @@ where
             runtime_ticket_role: None,
             prompts: common.prompts,
             inject_resident_summary: true,
-            extract_in_flight: Arc::new(AtomicBool::new(false)),
-            consolidation_in_flight: Arc::new(AtomicBool::new(false)),
-            extract_pointer: Arc::new(Mutex::new(extract_pointer)),
-            memory_task: None,
+            feature_resident_summary: None,
+            feature_system_prompt_override: None,
             user_segments: state.user_segments,
             // Seed the mirror with the entries we just replayed so a
             // late-attaching client sees the full prefix without an
@@ -6003,7 +5328,7 @@ where
 /// Note: `system_prompt` is intentionally not applied here. It is a
 /// minijinja template that is parsed by `Worker::from_manifest` and
 /// rendered once at first turn in `ensure_system_prompt_materialized`.
-pub fn apply_worker_manifest<C: LlmClient + 'static, A>(
+pub fn apply_worker_manifest<C: LlmClient + 'static, A: Send + Sync>(
     worker: &mut Engine<C, Mutable, A>,
     wm: &manifest::EngineManifest,
 ) {
@@ -6057,53 +5382,14 @@ fn worker_metadata_for_manifest(
         metadata = metadata.with_workspace_root(local_workspace_root.to_path_buf());
     }
     if should_persist_resolved_manifest_snapshot(manifest) {
-        metadata.resolved_manifest_snapshot = serde_json::to_value(manifest).ok();
+        metadata.resolved_manifest_snapshot =
+            manifest::write_persisted_worker_manifest_snapshot(manifest).ok();
     }
     metadata
 }
 
-fn validate_workspace_memory_snapshot(
-    worker_name: &str,
-    manifest: &WorkerManifest,
-    workspace_context: &WorkerWorkspaceContext,
-) -> Result<(), WorkerError> {
-    let Some(workspace_id) = workspace_context.workspace_id() else {
-        return Ok(());
-    };
-    let snapshot = manifest
-        .memory
-        .as_ref()
-        .and_then(manifest::MemoryConfig::workspace_settings)
-        .ok_or_else(|| {
-            WorkerError::InvalidState(format!(
-                "Workspace Worker {worker_name} has no complete persisted Memory settings snapshot"
-            ))
-        })?;
-    if snapshot.workspace_id != workspace_id.as_str() {
-        return Err(WorkerError::InvalidState(format!(
-            "Workspace Worker {worker_name} Memory settings belong to {} instead of {}",
-            snapshot.workspace_id,
-            workspace_id.as_str()
-        )));
-    }
-    if snapshot.settings_revision == 0
-        || !manifest::is_normalized_workspace_memory_language(&snapshot.language)
-    {
-        return Err(WorkerError::InvalidState(format!(
-            "Workspace Worker {worker_name} has corrupt Memory settings snapshot metadata"
-        )));
-    }
-    Ok(())
-}
-
 fn should_persist_resolved_manifest_snapshot(manifest: &WorkerManifest) -> bool {
-    manifest.profile.is_some()
-        || manifest.plugins.has_resolved_plan()
-        || manifest
-            .memory
-            .as_ref()
-            .and_then(manifest::MemoryConfig::workspace_settings)
-            .is_some()
+    manifest.requires_persisted_execution_snapshot()
 }
 
 fn restore_manifest_from_worker_metadata_snapshot(
@@ -6112,12 +5398,14 @@ fn restore_manifest_from_worker_metadata_snapshot(
     fallback: WorkerManifest,
 ) -> Result<WorkerManifest, WorkerError> {
     match snapshot {
-        Some(snapshot) => serde_json::from_value(snapshot).map_err(|source| {
-            WorkerError::WorkerMetadataManifestSnapshot {
-                worker_name: worker_name.to_string(),
-                source,
-            }
-        }),
+        Some(snapshot) => {
+            manifest::read_persisted_worker_manifest_snapshot(snapshot).map_err(|source| {
+                WorkerError::WorkerMetadataManifestSnapshot {
+                    worker_name: worker_name.to_string(),
+                    source,
+                }
+            })
+        }
         None => Ok(fallback),
     }
 }
@@ -6135,6 +5423,7 @@ fn run_interruption_reason_error_code(reason: &RunInterruptionReason) -> ErrorCo
             | EngineError::PauseRequested
             | EngineError::ConfigWarnings(_)
             | EngineError::HistoryAppend(_)
+            | EngineError::Interceptor(_)
             | EngineError::ToolAttemptFence(_),
         ) => ErrorCode::Internal,
     }
@@ -6559,6 +5848,9 @@ pub enum WorkerError {
     #[error("invalid durable Worker state: {0}")]
     InvalidState(String),
 
+    #[error("feature lifecycle rejected operation: {0}")]
+    FeatureLifecycle(String),
+
     #[error("Flow input rejected: {0}")]
     FlowInput(String),
 
@@ -6706,7 +5998,6 @@ struct WorkerCommon {
     filesystem_authority: WorkerFilesystemAuthority,
     workspace_context: WorkerWorkspaceContext,
     scope: Scope,
-    delegation_scope: DelegationScope,
     client: Box<dyn LlmClient>,
     prompts: Arc<ArcSwap<PromptCatalog>>,
     system_prompt_template: Option<SystemPromptTemplate>,
@@ -6826,11 +6117,6 @@ fn prepare_worker_common_with_context_and_model_client(
             WorkerFilesystemAuthority::Local(LocalWorkingDirectory { root, cwd })
         }
     };
-    let mut scope_config = scope_config;
-    if let (Some(mem), Some(local)) = (manifest.memory.as_ref(), filesystem_authority.as_local()) {
-        let layout = memory::WorkspaceLayout::resolve(mem, &local.root);
-        scope_config.deny.extend(memory::deny_write_rules(&layout));
-    }
     let scope = if scope_config.allow.is_empty() && filesystem_authority.as_local().is_none() {
         Scope::empty()
     } else {
@@ -6868,8 +6154,7 @@ fn prepare_worker_common_from_scope(
             });
         }
     }
-    let delegation_scope =
-        DelegationScope::from_config(&manifest.delegation_scope).map_err(WorkerError::Scope)?;
+    DelegationScope::from_config(&manifest.delegation_scope).map_err(WorkerError::Scope)?;
 
     let client = match model_client {
         Some(client) => client,
@@ -6889,7 +6174,6 @@ fn prepare_worker_common_from_scope(
         filesystem_authority,
         workspace_context,
         scope,
-        delegation_scope,
         client,
         prompts,
         system_prompt_template,
@@ -6922,8 +6206,7 @@ mod spawned_context_tests {
         std::fs::create_dir_all(&workspace_root).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
 
-        let mut manifest = minimal_manifest_for_context_test(&workspace_root, &cwd);
-        manifest.memory = Some(manifest::MemoryConfig::default());
+        let manifest = minimal_manifest_for_context_test(&workspace_root, &cwd);
         let common = prepare_worker_common_with_context(
             &manifest,
             &PromptCatalogSource::builtins_only(),
@@ -6957,8 +6240,7 @@ mod spawned_context_tests {
         let workspace_root = tmp.path().join("workspace-root");
         let cwd = workspace_root.join("nested");
         std::fs::create_dir_all(&cwd).unwrap();
-        let mut manifest = minimal_manifest_for_context_test(&workspace_root, &cwd);
-        manifest.memory = Some(manifest::MemoryConfig::default());
+        let manifest = minimal_manifest_for_context_test(&workspace_root, &cwd);
         let loader = PromptCatalogSource::builtins_only();
         let workspace_id = WorkspaceId::new("ws-api-only").unwrap();
         let common = prepare_worker_common_with_context(
@@ -7165,7 +6447,7 @@ permission = "write"
 
         let restored = restore_manifest_from_worker_metadata_snapshot(
             "restore-scope",
-            Some(serde_json::to_value(&saved).unwrap()),
+            Some(manifest::write_persisted_worker_manifest_snapshot(&saved).unwrap()),
             current,
         )
         .unwrap();
@@ -7197,7 +6479,7 @@ permission = "write"
     }
 
     #[test]
-    fn workspace_memory_settings_snapshot_is_persisted_and_scope_checked() {
+    fn workspace_memory_settings_snapshot_is_persisted_through_versioned_adapter() {
         let mut manifest = WorkerManifest::from_toml(
             r#"
 [worker]
@@ -7220,65 +6502,31 @@ permission = "read"
 "#,
         )
         .unwrap();
-        manifest.memory = Some(manifest::MemoryConfig::default());
-        manifest.memory.as_mut().unwrap().bind_workspace_settings(
-            &manifest::WorkspaceMemorySettingsSnapshot {
+        manifest.feature.memory.profile.enabled = true;
+        manifest
+            .feature
+            .memory
+            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "workspace-a".to_string(),
                 settings_revision: 7,
                 language: "Japanese".to_string(),
-            },
-        );
+            })
+            .unwrap();
 
         let metadata = worker_metadata_for_manifest(&manifest, None, None, None);
-        let restored: WorkerManifest = serde_json::from_value(
+        let restored = manifest::read_persisted_worker_manifest_snapshot(
             metadata
                 .resolved_manifest_snapshot
                 .expect("Memory settings require a resolved manifest snapshot"),
         )
         .unwrap();
         assert_eq!(
-            restored.memory.unwrap().workspace_settings(),
+            restored.feature.memory.workspace_settings(),
             Some(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "workspace-a".to_string(),
                 settings_revision: 7,
                 language: "Japanese".to_string(),
             })
-        );
-        assert!(
-            validate_workspace_memory_snapshot(
-                "memory-snapshot",
-                &manifest,
-                &WorkerWorkspaceContext::unavailable(
-                    Some(WorkspaceId::new("workspace-a").unwrap()),
-                    "test",
-                )
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_workspace_memory_snapshot(
-                "memory-snapshot",
-                &manifest,
-                &WorkerWorkspaceContext::unavailable(
-                    Some(WorkspaceId::new("workspace-b").unwrap()),
-                    "test",
-                )
-            )
-            .is_err()
-        );
-
-        let mut missing = manifest.clone();
-        missing.memory.as_mut().unwrap().settings_revision = None;
-        assert!(
-            validate_workspace_memory_snapshot(
-                "memory-snapshot",
-                &missing,
-                &WorkerWorkspaceContext::unavailable(
-                    Some(WorkspaceId::new("workspace-a").unwrap()),
-                    "test",
-                )
-            )
-            .is_err()
         );
     }
 
@@ -7345,7 +6593,7 @@ permission = "read"
         let snapshot = metadata
             .resolved_manifest_snapshot
             .expect("plugin-resolved manifest should be snapshotted");
-        let restored: WorkerManifest = serde_json::from_value(snapshot).unwrap();
+        let restored = manifest::read_persisted_worker_manifest_snapshot(snapshot).unwrap();
 
         assert!(restored.profile.is_none());
         assert_eq!(restored.plugins.resolved.len(), 1);
@@ -7354,45 +6602,6 @@ permission = "read"
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
         assert_eq!(restored.plugins.resolved[0].version, "0.1.0");
-    }
-}
-
-#[cfg(test)]
-mod memory_worker_event_tests {
-    use super::*;
-
-    #[test]
-    fn suppresses_idle_consolidation_skip_worker_events() {
-        assert!(!should_emit_memory_worker_event(
-            memory::audit::AuditWorker::MemoryConsolidation,
-            memory::audit::WorkerLifecycleStatus::Skipped,
-            "no_staging_entries",
-        ));
-        assert!(!should_emit_memory_worker_event(
-            memory::audit::AuditWorker::MemoryConsolidation,
-            memory::audit::WorkerLifecycleStatus::Skipped,
-            "threshold_not_reached files=1 bytes=64 min_files=2 min_bytes=1048576",
-        ));
-        assert!(!should_emit_memory_worker_event(
-            memory::audit::AuditWorker::MemoryConsolidation,
-            memory::audit::WorkerLifecycleStatus::Skipped,
-            "consolidation_threshold_disabled",
-        ));
-        assert!(should_emit_memory_worker_event(
-            memory::audit::AuditWorker::MemoryConsolidation,
-            memory::audit::WorkerLifecycleStatus::Skipped,
-            "no_valid_staging_entries invalid=1",
-        ));
-        assert!(should_emit_memory_worker_event(
-            memory::audit::AuditWorker::MemoryConsolidation,
-            memory::audit::WorkerLifecycleStatus::Completed,
-            "completed",
-        ));
-        assert!(should_emit_memory_worker_event(
-            memory::audit::AuditWorker::MemoryExtract,
-            memory::audit::WorkerLifecycleStatus::Skipped,
-            "threshold_not_reached files=1",
-        ));
     }
 }
 
@@ -7526,75 +6735,9 @@ mod build_summary_prompt_tests {
         assert!(prompt.contains("[1 Assistant] done"));
     }
 
-    #[derive(Clone)]
-    struct CancelBeforeAiExtractClient {
-        cancel_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<()>>>>,
-    }
-
-    #[async_trait]
-    impl LlmClient for CancelBeforeAiExtractClient {
-        async fn stream(
-            &self,
-            _request: agen::llm_client::Request,
-        ) -> Result<
-            std::pin::Pin<
-                Box<
-                    dyn futures::Stream<
-                            Item = Result<
-                                agen::llm_client::event::Event,
-                                agen::llm_client::ClientError,
-                            >,
-                        > + Send,
-                >,
-            >,
-            agen::llm_client::ClientError,
-        > {
-            let tx = self
-                .cancel_tx
-                .lock()
-                .expect("cancel sender lock")
-                .clone()
-                .expect("extract caller must install the Internal Worker cancel sender");
-            tx.send(()).await.expect("cancel Internal Worker");
-            Ok(Box::pin(futures::stream::pending()))
-        }
-
-        fn clone_boxed(&self) -> Box<dyn LlmClient> {
-            Box::new(self.clone())
-        }
-    }
-
     #[derive(Debug, Default)]
     struct RecordingAuditWorkspaceClient {
         requests: Mutex<Vec<WorkspaceRequest>>,
-    }
-
-    impl RecordingAuditWorkspaceClient {
-        fn lifecycle_audits(&self) -> Vec<memory::audit::WorkerLifecycleAudit> {
-            self.requests
-                .lock()
-                .expect("recorded workspace requests lock")
-                .iter()
-                .filter_map(|request| {
-                    let operation: memory::backend::MemoryBackendOperation = serde_json::from_str(
-                        request
-                            .body
-                            .as_deref()
-                            .expect("memory backend operation body"),
-                    )
-                    .expect("memory backend operation");
-                    match operation {
-                        memory::backend::MemoryBackendOperation::AppendAudit(operation) => {
-                            match operation.event.payload {
-                                memory::audit::AuditPayload::WorkerLifecycle(audit) => Some(audit),
-                                _ => None,
-                            }
-                        }
-                        _ => None,
-                    }
-                })
-                .collect()
-        }
     }
 
     impl WorkspaceClient for RecordingAuditWorkspaceClient {
@@ -7782,15 +6925,17 @@ mod build_summary_prompt_tests {
         async fn call(
             &self,
             _input: &crate::hook::ToolCallSummary,
-        ) -> crate::hook::HookPreToolAction {
-            if self
-                .should_pause
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                crate::hook::HookPreToolAction::Pause
-            } else {
-                crate::hook::HookPreToolAction::Continue
-            }
+        ) -> Result<crate::hook::HookPreToolAction, crate::hook::HookError> {
+            Ok(
+                if self
+                    .should_pause
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    crate::hook::HookPreToolAction::Pause
+                } else {
+                    crate::hook::HookPreToolAction::Continue
+                },
+            )
         }
     }
 
@@ -7843,7 +6988,7 @@ mod build_summary_prompt_tests {
         )
         .await
         .unwrap();
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         worker.last_run_interrupted = true;
         worker.engine_mut().set_active_run_turn_count(Some(3));
 
@@ -7886,7 +7031,7 @@ mod build_summary_prompt_tests {
         )
         .await
         .unwrap();
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         worker.engine_mut().set_turn_count(7);
         worker.last_run_interrupted = true;
         worker.engine_mut().set_active_run_turn_count(Some(3));
@@ -7906,7 +7051,7 @@ mod build_summary_prompt_tests {
             )
             .unwrap();
 
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
 
         let fork_segment_id = worker.segment_id();
         assert_ne!(fork_segment_id, source_segment_id);
@@ -7950,7 +7095,7 @@ mod build_summary_prompt_tests {
         )
         .await
         .unwrap();
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         let report = worker
             .install_runtime_flow_transition_feature()
             .expect("scoped Workspace Flow feature");
@@ -7984,7 +7129,7 @@ mod build_summary_prompt_tests {
         )
         .await
         .unwrap();
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         let disabled = worker.prepare_flow_input(vec![Segment::Flow {
             selector: "builtin:coder-review".to_string(),
         }]);
@@ -8260,7 +7405,7 @@ mod build_summary_prompt_tests {
         )
         .await
         .unwrap();
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         std::fs::write(
             temp.path()
                 .join(worker.session_id().to_string())
@@ -8309,7 +7454,7 @@ mod build_summary_prompt_tests {
         )
         .await
         .unwrap();
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         (dir, worker)
     }
 
@@ -8469,7 +7614,7 @@ mod build_summary_prompt_tests {
         let expected_truncate_entries = targets[0].truncate_entries;
         let target = targets[0].id.clone();
 
-        let applied = worker.rewind_to(target, head_entries).unwrap();
+        let applied = worker.rewind_to(target, head_entries).await.unwrap();
 
         assert_eq!(preview_segments(&applied.input), "second message");
         assert_eq!(
@@ -8526,6 +7671,7 @@ mod build_summary_prompt_tests {
 
         let applied = worker
             .rewind_to(targets[0].id.clone(), head_entries)
+            .await
             .unwrap();
         assert_eq!(applied.summary.truncated_to_entries, 5);
         assert!(matches!(
@@ -8568,7 +7714,7 @@ mod build_summary_prompt_tests {
                 payload: serde_json::json!({"value": true}),
             },
         );
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         let fork_location = worker.segment_state.location();
         assert_ne!(fork_location.segment_id, source_location.segment_id);
         let fork_entries = worker
@@ -8599,6 +7745,7 @@ mod build_summary_prompt_tests {
 
         let err = worker
             .rewind_to(targets[0].id.clone(), head_entries)
+            .await
             .unwrap_err()
             .to_string();
 
@@ -8679,7 +7826,7 @@ mod build_summary_prompt_tests {
         .await
         .unwrap();
 
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         worker.wire_history_persistence();
         worker.set_history_for_test(vec![
             Item::tool_call("call-known", "Read", "{}"),
@@ -8796,7 +7943,7 @@ mod build_summary_prompt_tests {
         .await
         .unwrap();
 
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         worker.wire_history_persistence();
         worker.set_history_for_test(vec![Item::tool_call("call-1", "Read", "{}")]);
 
@@ -8876,7 +8023,7 @@ mod build_summary_prompt_tests {
         .await
         .unwrap();
 
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         worker.wire_history_persistence();
         let dangling_call = Item::tool_call("call-1", "SideEffect", "{}");
         worker
@@ -8934,13 +8081,16 @@ mod build_summary_prompt_tests {
             },
             profile: None,
         });
-        let mut memory = manifest::MemoryConfig::default();
-        memory.bind_workspace_settings(&manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: "workspace-test".to_string(),
-            settings_revision: 3,
-            language: "Japanese".to_string(),
-        });
-        manifest.memory = Some(memory);
+        let mut memory = manifest::ResolvedMemoryFeatureConfig::default();
+        memory.profile.enabled = true;
+        memory
+            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "workspace-test".to_string(),
+                settings_revision: 3,
+                language: "Japanese".to_string(),
+            })
+            .unwrap();
+        manifest.feature.memory = memory;
         let mut worker = Worker::new(
             manifest,
             Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
@@ -8958,6 +8108,12 @@ mod build_summary_prompt_tests {
             )
             .unwrap(),
         );
+        let prompt_override = worker
+            .prompts()
+            .load_full()
+            .memory_consolidation_system("Japanese")
+            .unwrap();
+        worker.install_system_prompt_contribution(None, Some(prompt_override));
         worker.ensure_system_prompt_materialized().await.unwrap();
         let prompt = worker.engine().get_system_prompt().unwrap();
         assert!(prompt.contains("`language`: `Japanese`"));
@@ -8966,7 +8122,7 @@ mod build_summary_prompt_tests {
 
     async fn render_system_prompt_with_summary(
         summary_doc: Option<&str>,
-        memory_config: Option<manifest::MemoryConfig>,
+        memory_config: Option<manifest::ResolvedMemoryFeatureConfig>,
         resident_injection: bool,
     ) -> String {
         render_system_prompt_with_resident_sections(
@@ -8980,7 +8136,7 @@ mod build_summary_prompt_tests {
 
     async fn render_system_prompt_with_resident_sections(
         summary_doc: Option<&str>,
-        memory_config: Option<manifest::MemoryConfig>,
+        memory_config: Option<manifest::ResolvedMemoryFeatureConfig>,
         gates: ResidentInjectionGates,
         _unused: bool,
     ) -> String {
@@ -8989,18 +8145,13 @@ mod build_summary_prompt_tests {
         let cwd = dir.path().join("workspace");
         std::fs::create_dir_all(&cwd).unwrap();
         let mut manifest = minimal_manifest();
-        manifest.memory = memory_config.clone();
+        manifest.feature.memory = memory_config.clone().unwrap_or_default();
+        if memory_config.is_some() {
+            manifest.feature.memory.profile.enabled = true;
+        }
         let scope = Scope::writable(&cwd).unwrap();
         let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
-        let workspace_context = if memory_config
-            .as_ref()
-            .is_some_and(|cfg| cfg.inject_summary.unwrap_or(true))
-            && gates.summary
-        {
-            stub_memory_backend_context(summary_doc.and_then(summary_content_for_backend))
-        } else {
-            WorkerWorkspaceContext::local_filesystem(None)
-        };
+        let workspace_context = WorkerWorkspaceContext::local_filesystem(None);
         let mut worker = Worker::new(
             manifest,
             Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
@@ -9012,6 +8163,16 @@ mod build_summary_prompt_tests {
         .await
         .unwrap();
         worker.set_resident_memory_injection(gates.summary);
+        let resident_summary = if memory_config
+            .as_ref()
+            .is_some_and(|cfg| cfg.profile.resident.inject_summary)
+            && gates.summary
+        {
+            summary_doc.and_then(summary_content_for_backend)
+        } else {
+            None
+        };
+        worker.install_system_prompt_contribution(resident_summary, None);
         let template = SystemPromptTemplate::parse(
             "default",
             crate::prompt::source::PromptCatalogSource::builtins_only(),
@@ -9038,50 +8199,11 @@ mod build_summary_prompt_tests {
         Some(doc.to_string())
     }
 
-    fn stub_memory_backend_context(content: Option<String>) -> WorkerWorkspaceContext {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0_u8; 1024];
-            let _ = stream.read(&mut buffer).unwrap();
-            let body = serde_json::json!({
-                "status": "ok",
-                "result": {
-                    "kind": "tool_output",
-                    "summary": if content.is_some() {
-                        "resident memory summary collected"
-                    } else {
-                        "resident memory summary unavailable"
-                    },
-                    "content": content,
-                }
-            })
-            .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-        });
-        WorkerWorkspaceContext::with_client(
-            Some(WorkspaceId::new("test-memory").unwrap()),
-            Arc::new(TestWorkspaceHttpClient::new(
-                "test-memory",
-                format!("http://{addr}"),
-            )),
-        )
-    }
-
     #[tokio::test]
     async fn resident_summary_body_is_injected_without_frontmatter() {
         let rendered = render_system_prompt_with_summary(
             Some(&summary_doc("summary body for resident prompt\n")),
-            Some(manifest::MemoryConfig::default()),
+            Some(manifest::ResolvedMemoryFeatureConfig::default()),
             true,
         )
         .await;
@@ -9092,11 +8214,9 @@ mod build_summary_prompt_tests {
     }
 
     #[tokio::test]
-    async fn resident_summary_injection_can_be_disabled_by_manifest() {
-        let memory = manifest::MemoryConfig {
-            inject_summary: Some(false),
-            ..manifest::MemoryConfig::default()
-        };
+    async fn resident_summary_injection_can_be_disabled_by_memory_feature() {
+        let mut memory = manifest::ResolvedMemoryFeatureConfig::default();
+        memory.profile.resident.inject_summary = false;
         let rendered = render_system_prompt_with_summary(
             Some(&summary_doc("disabled summary body\n")),
             Some(memory),
@@ -9108,7 +8228,7 @@ mod build_summary_prompt_tests {
     }
 
     #[tokio::test]
-    async fn resident_summary_is_absent_without_memory_config() {
+    async fn resident_summary_is_absent_when_memory_feature_is_disabled() {
         let rendered = render_system_prompt_with_summary(
             Some(&summary_doc("memory-disabled summary body\n")),
             None,
@@ -9123,7 +8243,7 @@ mod build_summary_prompt_tests {
     async fn malformed_resident_summary_does_not_fail_render() {
         let rendered = render_system_prompt_with_summary(
             Some("---\nthis is not yaml: : :\n---\nbad summary body\n"),
-            Some(manifest::MemoryConfig::default()),
+            Some(manifest::ResolvedMemoryFeatureConfig::default()),
             true,
         )
         .await;
@@ -9136,7 +8256,7 @@ mod build_summary_prompt_tests {
     async fn resident_summary_gate_false_omits_only_summary() {
         let prompt = render_system_prompt_with_resident_sections(
             Some(&summary_doc("resident summary marker")),
-            Some(manifest::MemoryConfig::default()),
+            Some(manifest::ResolvedMemoryFeatureConfig::default()),
             ResidentInjectionGates { summary: false },
             true,
         )
@@ -9192,8 +8312,8 @@ mod build_summary_prompt_tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let scope = Scope::writable(&cwd).unwrap();
         let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
-        let mut worker = tokio::runtime::Runtime::new()
-            .unwrap()
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut worker = runtime
             .block_on(Worker::new(
                 manifest,
                 Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
@@ -9210,7 +8330,9 @@ mod build_summary_prompt_tests {
             ))
             .unwrap();
 
-        let activation = worker.activate_skill("triage-errors").unwrap();
+        let activation = runtime
+            .block_on(worker.activate_skill("triage-errors"))
+            .unwrap();
 
         assert_eq!(activation.name, "triage-errors");
         server.join().unwrap();
@@ -9248,152 +8370,87 @@ mod build_summary_prompt_tests {
     }
 
     #[tokio::test]
-    async fn cancelled_internal_extract_does_not_commit_pointer_or_completed_audit() {
+    async fn feature_session_extension_is_fenced_by_exact_committed_location() {
         let dir = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
         let cwd = dir.path().join("workspace");
         std::fs::create_dir_all(&cwd).unwrap();
-        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
-        let cancel_tx = Arc::new(Mutex::new(None));
-        let client = CancelBeforeAiExtractClient {
-            cancel_tx: cancel_tx.clone(),
-        };
-        let audit_client = Arc::new(RecordingAuditWorkspaceClient::default());
-        let mut manifest = minimal_manifest();
-        manifest.memory = Some(manifest::MemoryConfig {
-            extract_threshold: Some(1),
-            workspace_id: Some("workspace-test".to_string()),
-            settings_revision: Some(1),
-            language: Some("English".to_string()),
-            ..Default::default()
-        });
-        let memory_config = manifest.memory.clone().unwrap();
         let mut worker = Worker::new(
-            manifest,
-            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(client),
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
             store,
-            WorkerWorkspaceContext::with_client(
-                Some(WorkspaceId::new("workspace-test").unwrap()),
-                audit_client.clone(),
-            ),
+            WorkerWorkspaceContext::no_workspace(),
             WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone()),
             Scope::writable(&cwd).unwrap(),
         )
         .await
         .unwrap();
-        worker.ensure_segment_head().unwrap();
-        worker.wire_history_persistence();
-        let evidence = Item::user_message(
-            "The cancellation regression must leave this evidence available for retry.",
-        );
-        worker.set_history_for_test(vec![evidence.clone()]);
+        worker.ensure_segment_head().await.unwrap();
+
+        let capture_handle = worker.committed_session_capture_handle();
+        let extension_handle = worker.session_extension_handle();
+        let stale = capture_handle.capture().unwrap();
         worker
-            .commit_entry(LogEntry::AnnotatedUserInput {
+            .commit_entry(LogEntry::TurnEnd {
                 ts: segment_log::now_millis(),
-                extensions: vec![],
-                history: vec![crate::session_history::test_logged_history_entry(
-                    evidence.clone(),
-                )],
-                segments: vec![text_segment(
-                    "The cancellation regression must leave this evidence available for retry.",
-                )],
+                turn_count: 1,
             })
             .unwrap();
-        worker
-            .usage_history
-            .lock()
-            .expect("usage history lock")
-            .push(UsageRecord {
-                history_len: 1,
-                input_total_tokens: 100,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                output_tokens: 0,
-            });
+        assert!(
+            !extension_handle
+                .append_if_current(
+                    &stale.location(),
+                    "test.feature",
+                    serde_json::json!({"revision": "stale"}),
+                )
+                .unwrap()
+        );
 
-        let entries_before = worker
+        let current = capture_handle.capture().unwrap();
+        assert!(
+            extension_handle
+                .append_if_current(
+                    &current.location(),
+                    "test.feature",
+                    serde_json::json!({"revision": "current"}),
+                )
+                .unwrap()
+        );
+        let entries = worker
             .store
             .read_all(worker.session_id(), worker.segment_id())
             .unwrap();
-        assert!(
-            worker
-                .extract_pointer
-                .lock()
-                .expect("extract pointer lock")
-                .is_none()
-        );
-
-        let cancel_tx_for_extract = cancel_tx.clone();
-        let error = match worker
-            .run_extract_once_with_cancel_observer(
-                &memory_config,
-                1,
-                Some(Box::new(move |cancel_sender| {
-                    *cancel_tx_for_extract
-                        .lock()
-                        .expect("cancel sender slot lock") = Some(cancel_sender);
-                })),
-            )
-            .await
-        {
-            Err(error) => error,
-            Ok(_) => panic!("pre-AI cancellation must not complete extraction"),
-        };
-
-        assert!(matches!(error, WorkerError::Engine(EngineError::Cancelled)));
-        assert!(
-            worker
-                .extract_pointer
-                .lock()
-                .expect("extract pointer lock")
-                .is_none()
-        );
-        assert_eq!(worker.history(), &[evidence]);
-
-        let entries_after = worker
-            .store
-            .read_all(worker.session_id(), worker.segment_id())
-            .unwrap();
-        assert_eq!(entries_after.len(), entries_before.len());
-        assert!(!entries_after.iter().any(|entry| matches!(
-            entry,
-            LogEntry::Extension { domain, .. } if domain == memory::extract::EXTRACT_DOMAIN
-        )));
-
-        let audits = audit_client.lifecycle_audits();
-        assert_eq!(audits.len(), 2);
-        assert_eq!(audits[0].run_id, audits[1].run_id);
-        assert_eq!(audits[0].worker, memory::audit::AuditWorker::MemoryExtract);
-        assert!(audits.iter().all(|audit| {
-            audit.memory_settings
-                == Some(memory::audit::MemorySettingsAudit {
-                    workspace_id: "workspace-test".to_string(),
-                    settings_revision: 1,
-                    language: "English".to_string(),
-                })
-        }));
         assert_eq!(
-            audits.iter().map(|audit| audit.status).collect::<Vec<_>>(),
-            vec![
-                memory::audit::WorkerLifecycleStatus::Started,
-                memory::audit::WorkerLifecycleStatus::Cancelled,
-            ]
-        );
-        assert!(
-            !audits
+            entries
                 .iter()
-                .any(|audit| { audit.status == memory::audit::WorkerLifecycleStatus::Completed })
+                .filter(|entry| matches!(entry, LogEntry::Extension { domain, .. } if domain == "test.feature"))
+                .count(),
+            1
         );
-    }
 
-    #[test]
-    fn successful_internal_extract_lifecycles_enter_the_commit_path() {
-        for lifecycle in [
-            WorkerRunResult::Finished,
-            WorkerRunResult::Paused,
-            WorkerRunResult::LimitReached,
-        ] {
-            assert!(extract_internal_worker_lifecycle_error(&lifecycle).is_none());
-        }
+        worker
+            .commit_entry(LogEntry::RunErrored {
+                ts: segment_log::now_millis(),
+                interrupted: true,
+                message: "cancelled".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            capture_handle.capture().unwrap().run_exit,
+            CommittedRunExit::Interrupted
+        );
+        worker
+            .commit_entry(LogEntry::RunCompleted {
+                ts: segment_log::now_millis(),
+                interrupted: false,
+                result: EngineResult::Finished,
+                active_run_turn_count: None,
+            })
+            .unwrap();
+        assert_eq!(
+            capture_handle.capture().unwrap().run_exit,
+            CommittedRunExit::Finished
+        );
     }
 
     fn minimal_manifest() -> WorkerManifest {

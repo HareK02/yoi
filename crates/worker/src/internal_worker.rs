@@ -123,14 +123,14 @@ where
 
     // Internal identities are run-scoped and never enter the public Runtime Worker catalog.
     manifest.worker.name = format!("internal-{}-{}", identity.kind, identity.run_id);
-    // Internal jobs only receive features supplied below. A parent manifest must not accidentally
-    // grant its normal public tool surface or recursively schedule memory work.
+    // Internal jobs only receive the explicitly supplied Feature set below. A
+    // parent manifest cannot accidentally grant its normal public tool surface
+    // or recursively schedule Feature-owned background work.
     manifest.feature = Default::default();
     manifest.plugins = Default::default();
     manifest.mcp = Default::default();
     manifest.skills = None;
     manifest.compaction = None;
-    manifest.memory = None;
 
     let last_usage = Arc::new(Mutex::new(None::<UsageEvent>));
     let usage_slot = last_usage.clone();
@@ -164,6 +164,7 @@ where
         identity: identity.clone(),
         history_entries: 0,
     })?;
+    worker.disable_manifest_lifecycle_features();
     if let Some(session) = inherited_workdir_session {
         worker.bind_workdir_session(Some(session));
     }
@@ -210,7 +211,7 @@ where
     let segment_id = worker.segment_id();
     on_cancel_sender(worker.engine_mut().cancel_sender());
 
-    match worker.run_text(&input).await {
+    let outcome = match worker.run_text(&input).await {
         Ok(lifecycle @ WorkerRunResult::Finished)
         | Ok(lifecycle @ WorkerRunResult::Paused)
         | Ok(lifecycle @ WorkerRunResult::RolledBack) => Ok(InternalWorkerResult {
@@ -239,7 +240,11 @@ where
             identity,
             history_entries: store.entries_count(session_id, segment_id),
         }),
-    }
+    };
+    worker
+        .stop_feature_runtime("internal Worker terminal outcome")
+        .await;
+    outcome
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -544,7 +549,6 @@ pub(crate) async fn spawn_internal_worker_session(
         authority,
     } = spec;
     manifest.worker.name = format!("internal-{}-{}", identity.kind, identity.run_id);
-    manifest.memory = None;
 
     let last_usage = Arc::new(Mutex::new(None::<UsageEvent>));
     let usage_slot = last_usage.clone();
@@ -575,6 +579,7 @@ pub(crate) async fn spawn_internal_worker_session(
     .map_err(|source| InternalWorkerSessionError::Build {
         message: source.to_string(),
     })?;
+    worker.disable_manifest_lifecycle_features();
     if let Some(session) = inherited_workdir_session {
         worker.bind_workdir_session(Some(session));
     }
@@ -645,7 +650,6 @@ pub(crate) fn prepare_internal_worker_from_spec(
         manifest.mcp = Default::default();
         manifest.skills = None;
         manifest.compaction = None;
-        manifest.memory = None;
 
         let mut engine =
             Engine::<_, agen::state::Mutable, crate::SessionHistoryMetadata>::new_annotated(client)
@@ -669,6 +673,7 @@ pub(crate) fn prepare_internal_worker_from_spec(
         .map_err(|source| InternalWorkerSessionError::Build {
             message: source.to_string(),
         })?;
+        worker.disable_manifest_lifecycle_features();
         if let Some(session) = inherited_workdir_session {
             worker.bind_workdir_session(Some(session));
         }
@@ -782,7 +787,8 @@ pub(crate) async fn prepare_internal_worker_session(
     };
 
     tokio::spawn(async move {
-        while let Some(command) = command_rx.recv().await {
+        let mut stop_done = None;
+        'actor: while let Some(command) = command_rx.recv().await {
             match command {
                 InternalWorkerSessionCommand::Run(input) => {
                     actor_in_flight.clear();
@@ -825,21 +831,16 @@ pub(crate) async fn prepare_internal_worker_session(
                                     Some(InternalWorkerSessionCommand::Stop(done)) => {
                                         let _ = cancel_sender.send(()).await;
                                         let _ = (&mut run).await;
-                                        actor_in_flight.clear();
-                                        status.store(InternalWorkerSessionStatus::Stopped.encode(), std::sync::atomic::Ordering::Release);
-                                        let _ = event_tx.send(Event::Status { status: WorkerStatus::Stopped });
-                                        let _ = event_tx.send(Event::Shutdown);
-                                        state_changed.notify_waiters();
-                                        let _ = done.send(());
-                                        return;
+                                        stop_done = Some(done);
+                                        break 'actor;
                                     }
                                     Some(InternalWorkerSessionCommand::Run(_)) => {
                                         // `send` reserves Running atomically, so a second Run cannot be enqueued.
                                     }
                                     None => {
                                         let _ = cancel_sender.send(()).await;
-                                        actor_in_flight.clear();
-                                        return;
+                                        let _ = (&mut run).await;
+                                        break 'actor;
                                     }
                                 }
                             }
@@ -847,22 +848,27 @@ pub(crate) async fn prepare_internal_worker_session(
                     }
                 }
                 InternalWorkerSessionCommand::Stop(done) => {
-                    actor_in_flight.clear();
-                    status.store(
-                        InternalWorkerSessionStatus::Stopped.encode(),
-                        std::sync::atomic::Ordering::Release,
-                    );
-                    let _ = event_tx.send(Event::Status {
-                        status: WorkerStatus::Stopped,
-                    });
-                    let _ = event_tx.send(Event::Shutdown);
-                    state_changed.notify_waiters();
-                    let _ = done.send(());
-                    return;
+                    stop_done = Some(done);
+                    break;
                 }
             }
         }
+        worker
+            .stop_feature_runtime("internal Worker session stopped")
+            .await;
         actor_in_flight.clear();
+        status.store(
+            InternalWorkerSessionStatus::Stopped.encode(),
+            std::sync::atomic::Ordering::Release,
+        );
+        let _ = event_tx.send(Event::Status {
+            status: WorkerStatus::Stopped,
+        });
+        let _ = event_tx.send(Event::Shutdown);
+        state_changed.notify_waiters();
+        if let Some(done) = stop_done {
+            let _ = done.send(());
+        }
     });
 
     Ok(handle)
