@@ -2115,8 +2115,7 @@ read exit_notification || true
                 meta.name
             })
             .collect();
-        assert!(!names.iter().any(|name| name == "Mcp_demo_search_files"));
-        assert!(names.iter().any(|name| name == "Mcp_demo_unique"));
+        assert!(names.is_empty());
     }
 
     fn shell_tool_server(response: &str) -> McpStdioServerSpec {

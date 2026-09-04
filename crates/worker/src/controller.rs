@@ -1590,7 +1590,9 @@ async fn controller_loop<C, St>(
                         &working_event_tx,
                         target,
                         expected_head_entries,
-                    ) {
+                    )
+                    .await
+                    {
                         worker.clear_in_flight_events();
                         shared_state.set_status(WorkerStatus::Idle);
                         let _ = working_event_tx.send(Event::Status {
@@ -1710,6 +1712,10 @@ async fn controller_loop<C, St>(
     if let Err(error) = runtime_dir.close_socket().await {
         tracing::warn!(%error, "Worker runtime socket cleanup failed");
     }
+
+    // Feature callbacks and tasks share the Worker scope. Stop them before
+    // Memory/Workdir teardown so they cannot observe a partially closed Worker.
+    worker.stop_feature_runtime("controller shutdown").await;
 
     // Background memory jobs own extract/consolidate workers after a
     // turn completes. Join them before closing the Workdir session so no
@@ -1993,7 +1999,7 @@ where
     }
 }
 
-fn apply_rewind<C, St>(
+async fn apply_rewind<C, St>(
     worker: &mut Worker<C, St>,
     working_event_tx: &broadcast::Sender<Event>,
     target: RewindTargetId,
@@ -2003,7 +2009,7 @@ where
     C: LlmClient + 'static,
     St: Store,
 {
-    match worker.rewind_to(target, expected_head_entries) {
+    match worker.rewind_to(target, expected_head_entries).await {
         Ok(applied) => {
             let session =
                 session_store::public_snapshot::project_current_session_snapshot(&applied.entries);

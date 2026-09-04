@@ -246,11 +246,21 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
             input_text: extract_message_text(item).unwrap_or_default(),
             turn_index,
         };
+        let mut cancellations = Vec::new();
         for hook in &self.registry.on_prompt_submit {
-            let action = hook.call(&info).await;
-            if !matches!(action, HookPromptAction::Continue) {
-                return Ok(action.into());
+            let Some(action) = hook.call_optional(&info).await.map_err(|error| {
+                InterceptorError::new(InterceptorErrorCategory::Dependency, error.to_string())
+            })?
+            else {
+                continue;
+            };
+            if let HookPromptAction::Cancel(reason) = action {
+                cancellations.push(reason);
             }
+        }
+        cancellations.sort();
+        if let Some(reason) = cancellations.into_iter().next() {
+            return Ok(PromptAction::Cancel(reason));
         }
         let mut extras: Vec<SystemItem> = std::mem::take(
             &mut *self
@@ -344,11 +354,28 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
             .as_ref()
             .map(|_| SystemItemAppendHandle::new(Arc::clone(&pending_hook_system_items)));
         let hook_context = PreRequestContext::new(info, system_item_sink);
+        let mut cancellations = Vec::new();
+        let mut should_yield = false;
         for hook in &self.registry.pre_llm_request {
-            let action = hook.call(&hook_context).await;
-            if !matches!(action, HookPreRequestAction::Continue) {
-                return Ok(action.into());
+            let Some(action) = hook.call_optional(&hook_context).await.map_err(|error| {
+                InterceptorError::new(InterceptorErrorCategory::Dependency, error.to_string())
+            })?
+            else {
+                continue;
+            };
+
+            match action {
+                HookPreRequestAction::Continue => {}
+                HookPreRequestAction::Yield => should_yield = true,
+                HookPreRequestAction::Cancel(reason) => cancellations.push(reason),
             }
+        }
+        cancellations.sort();
+        if let Some(reason) = cancellations.into_iter().next() {
+            return Ok(PreRequestAction::Cancel(reason));
+        }
+        if should_yield {
+            return Ok(PreRequestAction::Yield);
         }
 
         let mut system_items: Vec<SystemItem> = std::mem::take(
@@ -404,11 +431,34 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
             tool_name: info.call.name.clone(),
             arguments: info.call.input.clone(),
         };
+        let mut aborts = Vec::new();
+        let mut should_pause = false;
+        let mut denials = Vec::new();
         for hook in &self.registry.pre_tool_call {
-            let action = hook.call(&summary).await;
-            if !matches!(action, HookPreToolAction::Continue) {
-                return Ok(action.into_worker_action(summary.call_id.clone()));
+            let Some(action) = hook.call_optional(&summary).await.map_err(|error| {
+                InterceptorError::new(InterceptorErrorCategory::Dependency, error.to_string())
+            })?
+            else {
+                continue;
+            };
+
+            match action {
+                HookPreToolAction::Continue => {}
+                HookPreToolAction::Pause => should_pause = true,
+                HookPreToolAction::Deny(reason) => denials.push(reason),
+                HookPreToolAction::Abort(reason) => aborts.push(reason),
             }
+        }
+        aborts.sort();
+        if let Some(reason) = aborts.into_iter().next() {
+            return Ok(HookPreToolAction::Abort(reason).into_worker_action(summary.call_id.clone()));
+        }
+        if should_pause {
+            return Ok(PreToolAction::Pause);
+        }
+        denials.sort();
+        if let Some(reason) = denials.into_iter().next() {
+            return Ok(HookPreToolAction::Deny(reason).into_worker_action(summary.call_id.clone()));
         }
         self.tool_calls_this_turn.fetch_add(1, Ordering::Relaxed);
         Ok(PreToolAction::Continue)
@@ -429,11 +479,22 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
                 attachments: Vec::new(),
             },
         };
+        let mut aborts = Vec::new();
         for hook in &self.registry.post_tool_call {
-            let action = hook.call(&summary).await;
-            if !matches!(action, HookPostToolAction::Continue) {
-                return Ok(action.into());
+            let Some(action) = hook.call_optional(&summary).await.map_err(|error| {
+                InterceptorError::new(InterceptorErrorCategory::Dependency, error.to_string())
+            })?
+            else {
+                continue;
+            };
+
+            if let HookPostToolAction::Abort(reason) = action {
+                aborts.push(reason);
             }
+        }
+        aborts.sort();
+        if let Some(reason) = aborts.into_iter().next() {
+            return Ok(PostToolAction::Abort(reason));
         }
         Ok(PostToolAction::Continue)
     }
@@ -455,11 +516,20 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
             tool_calls_count: self.tool_calls_this_turn.load(Ordering::Relaxed),
             final_text_preview,
         };
+        let mut should_pause = false;
         for hook in &self.registry.on_turn_end {
-            let action = hook.call(&info).await;
-            if !matches!(action, HookTurnEndAction::Finish) {
-                return Ok(action.into());
+            let Some(action) = hook.call_optional(&info).await.map_err(|error| {
+                InterceptorError::new(InterceptorErrorCategory::Dependency, error.to_string())
+            })?
+            else {
+                continue;
+            };
+            if matches!(action, HookTurnEndAction::Pause) {
+                should_pause = true;
             }
+        }
+        if should_pause {
+            return Ok(TurnEndAction::Pause);
         }
         Ok(TurnEndAction::Finish)
     }
@@ -541,9 +611,12 @@ mod tests {
 
     #[async_trait]
     impl Hook<PreLlmRequest> for CountingHook {
-        async fn call(&self, _info: &PreRequestContext) -> HookPreRequestAction {
+        async fn call(
+            &self,
+            _info: &PreRequestContext,
+        ) -> Result<HookPreRequestAction, crate::hook::HookError> {
             self.0.fetch_add(1, Ordering::Relaxed);
-            HookPreRequestAction::Continue
+            Ok(HookPreRequestAction::Continue)
         }
     }
 
@@ -582,12 +655,15 @@ mod tests {
 
     #[async_trait]
     impl Hook<PreLlmRequest> for AppendingPreRequestHook {
-        async fn call(&self, input: &PreRequestContext) -> HookPreRequestAction {
+        async fn call(
+            &self,
+            input: &PreRequestContext,
+        ) -> Result<HookPreRequestAction, crate::hook::HookError> {
             if let Some(system_items) = input.system_items() {
                 self.saw_handle.store(true, Ordering::Relaxed);
                 system_items.append_task_reminder("hook reminder");
             }
-            HookPreRequestAction::Continue
+            Ok(HookPreRequestAction::Continue)
         }
     }
 
@@ -982,33 +1058,42 @@ mod tests {
 
     #[async_trait]
     impl Hook<PreLlmRequest> for AbortingHook {
-        async fn call(&self, _info: &PreRequestContext) -> HookPreRequestAction {
+        async fn call(
+            &self,
+            _info: &PreRequestContext,
+        ) -> Result<HookPreRequestAction, crate::hook::HookError> {
             self.0.store(true, Ordering::Relaxed);
-            HookPreRequestAction::Cancel("nope".into())
+            Ok(HookPreRequestAction::Cancel("nope".into()))
         }
     }
 
     #[tokio::test]
-    async fn public_pre_tool_hook_deny_becomes_synthetic_error_and_short_circuits() {
+    async fn public_pre_tool_hook_denials_compose_without_short_circuiting() {
         struct DenyToolHook(Arc<AtomicUsize>);
         struct CountingToolHook(Arc<AtomicUsize>);
 
         #[async_trait]
         impl Hook<PreToolCall> for DenyToolHook {
-            async fn call(&self, input: &ToolCallSummary) -> HookPreToolAction {
+            async fn call(
+                &self,
+                input: &ToolCallSummary,
+            ) -> Result<HookPreToolAction, crate::hook::HookError> {
                 self.0.fetch_add(1, Ordering::Relaxed);
                 assert_eq!(input.call_id, "call-id");
                 assert_eq!(input.tool_name, "TaskList");
                 assert_eq!(input.arguments, serde_json::json!({"scope": "all"}));
-                HookPreToolAction::Deny("blocked by public hook".into())
+                Ok(HookPreToolAction::Deny("blocked by public hook".into()))
             }
         }
 
         #[async_trait]
         impl Hook<PreToolCall> for CountingToolHook {
-            async fn call(&self, _input: &ToolCallSummary) -> HookPreToolAction {
+            async fn call(
+                &self,
+                _input: &ToolCallSummary,
+            ) -> Result<HookPreToolAction, crate::hook::HookError> {
                 self.0.fetch_add(1, Ordering::Relaxed);
-                HookPreToolAction::Continue
+                Ok(HookPreToolAction::Continue)
             }
         }
 
@@ -1041,7 +1126,7 @@ mod tests {
             other => panic!("expected synthetic denial, got {other:?}"),
         }
         assert_eq!(first_count.load(Ordering::Relaxed), 1);
-        assert_eq!(second_count.load(Ordering::Relaxed), 0);
+        assert_eq!(second_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -1050,14 +1135,17 @@ mod tests {
 
         #[async_trait]
         impl Hook<PostToolCall> for AbortAfterToolHook {
-            async fn call(&self, input: &ToolResultSummary) -> HookPostToolAction {
+            async fn call(
+                &self,
+                input: &ToolResultSummary,
+            ) -> Result<HookPostToolAction, crate::hook::HookError> {
                 self.0.fetch_add(1, Ordering::Relaxed);
                 assert_eq!(input.call_id, "call-id");
                 assert_eq!(input.tool_name, "TaskList");
                 assert!(!input.is_error);
                 assert_eq!(input.output.summary, "ok");
                 assert_eq!(input.output.content.as_deref(), Some("full"));
-                HookPostToolAction::Abort("post tool abort".into())
+                Ok(HookPostToolAction::Abort("post tool abort".into()))
             }
         }
 
@@ -1105,12 +1193,15 @@ mod tests {
 
         #[async_trait]
         impl Hook<OnTurnEnd> for PauseTurnEndHook {
-            async fn call(&self, input: &TurnEndInfo) -> HookTurnEndAction {
+            async fn call(
+                &self,
+                input: &TurnEndInfo,
+            ) -> Result<HookTurnEndAction, crate::hook::HookError> {
                 self.0.fetch_add(1, Ordering::Relaxed);
                 assert_eq!(input.turn_index, 0);
                 assert_eq!(input.tool_calls_count, 0);
                 assert_eq!(input.final_text_preview, "done");
-                HookTurnEndAction::Pause
+                Ok(HookTurnEndAction::Pause)
             }
         }
 
@@ -1468,6 +1559,6 @@ mod tests {
 
         assert!(matches!(action, PreRequestAction::Cancel(_)));
         assert!(first_called.load(Ordering::Relaxed));
-        assert_eq!(second_count.load(Ordering::Relaxed), 0);
+        assert_eq!(second_count.load(Ordering::Relaxed), 1);
     }
 }

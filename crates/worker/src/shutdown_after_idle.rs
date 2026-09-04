@@ -70,9 +70,12 @@ impl TicketIntakeReadyShutdownHook {
 
 #[async_trait]
 impl Hook<PostToolCall> for TicketIntakeReadyShutdownHook {
-    async fn call(&self, info: &ToolResultSummary) -> HookPostToolAction {
+    async fn call(
+        &self,
+        info: &ToolResultSummary,
+    ) -> Result<HookPostToolAction, crate::hook::HookError> {
         self.observe_tool_result(info);
-        HookPostToolAction::Continue
+        Ok(HookPostToolAction::Continue)
     }
 }
 

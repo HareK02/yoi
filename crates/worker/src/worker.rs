@@ -40,6 +40,7 @@ use manifest::{
 
 use crate::compact::state::CompactState;
 use crate::compact::usage_tracker::UsageTracker;
+use crate::feature::background::FeatureBackgroundTaskRegistry;
 use crate::feature::builtin::memory::WorkspaceMemoryBackendError;
 use crate::feature::builtin::{
     MemoryExtractFeature, MemoryExtractState, SessionExploreFeature, SessionExploreState,
@@ -50,7 +51,10 @@ use crate::feature::{
     FeatureRegistryInstallReport, dedupe_instruction_contributions,
 };
 use crate::hook::{
-    Hook, HookRegistryBuilder, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest, PreToolCall,
+    BeforeSessionRewriteAction, BeforeSessionRewriteContext, Hook, HookInvocationContext,
+    HookRegistry, HookRegistryBuilder, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest,
+    PreToolCall, RunCommittedContext, RunCommittedExit, RunExitContext, SessionRewriteKind,
+    WorkerStoppingContext,
 };
 use crate::in_flight::InFlightEvents;
 use crate::internal_worker::{
@@ -62,6 +66,15 @@ const COMPACTION_EXTENSION_DOMAIN: &str = "yoi.compaction";
 const LARGE_PASTE_INLINE_MAX_BYTES: usize = 32 * 1024;
 const WORKER_ORCHESTRATION_INSTRUCTION_ID: &str = "worker.orchestration";
 const WORKER_ORCHESTRATION_PROMPT_REF: &str = "common.worker_orchestration";
+
+fn hook_run_exit(exit: &EngineRunExit) -> RunCommittedExit {
+    match exit {
+        EngineRunExit::Finished => RunCommittedExit::Finished,
+        EngineRunExit::Paused => RunCommittedExit::Paused,
+        EngineRunExit::Yielded => RunCommittedExit::Yielded,
+        EngineRunExit::Interrupted(_) => RunCommittedExit::Interrupted,
+    }
+}
 
 fn worker_orchestration_instruction() -> FeatureInstructionDeclaration {
     FeatureInstructionDeclaration::new(
@@ -1104,6 +1117,10 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// continue to use `scope`; SubWorkerSpawn validates requested child scope here.
     delegation_scope: DelegationScope,
     hook_builder: HookRegistryBuilder,
+    /// Frozen callback set shared by Engine interception and Worker lifecycle boundaries.
+    hook_registry: Option<Arc<HookRegistry>>,
+    /// Executable background tasks registered by successfully installed features.
+    feature_background_tasks: FeatureBackgroundTaskRegistry,
     interceptor_installed: bool,
     /// Shared compaction state (present when threshold is configured).
     compact_state: Option<Arc<CompactState>>,
@@ -1258,6 +1275,21 @@ pub struct Worker<C: LlmClient, St: Store> {
 }
 
 impl<C: LlmClient + 'static, St: Store + 'static> Worker<C, St> {
+    pub async fn stop_feature_runtime(&mut self, reason: impl Into<String>) {
+        if let Some(hooks) = self.hook_registry.clone() {
+            let context = WorkerStoppingContext {
+                invocation: self.hook_invocation_context(None),
+                reason: reason.into(),
+            };
+            if let Err(error) = hooks.on_worker_stopping(&context).await {
+                tracing::warn!(error = %error, "worker-stopping hook requires attention");
+            }
+        }
+        if let Err(error) = self.feature_background_tasks.shutdown().await {
+            tracing::warn!(error = %error, "feature background task shutdown failed");
+        }
+    }
+
     pub async fn wait_for_memory_jobs(&mut self) {
         if let Some(handle) = self.memory_task.take()
             && let Err(e) = handle.await
@@ -1295,6 +1327,8 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
             scope: self.scope.clone(),
             delegation_scope: self.delegation_scope.clone(),
             hook_builder: HookRegistryBuilder::new(),
+            hook_registry: None,
+            feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
@@ -1488,6 +1522,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             scope,
             delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
+            hook_registry: None,
+            feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
@@ -1715,12 +1751,15 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// This deliberately does not scan `.yoi/skills` locally: when a Workspace
     /// HTTP client is available, catalog/detail/activation authority belongs to
     /// the Workspace backend API.
-    pub fn activate_skill(&mut self, name: &str) -> Result<SkillActivationResponse, WorkerError>
+    pub async fn activate_skill(
+        &mut self,
+        name: &str,
+    ) -> Result<SkillActivationResponse, WorkerError>
     where
         St: Clone + 'static,
     {
         let activation = self.workspace_client().activate_skill(name)?;
-        self.ensure_segment_head()?;
+        self.ensure_segment_head().await?;
         let body = format!(
             "Agent Skill `{}` activated from {}.\n\n{}",
             activation.name, activation.provenance.id, activation.body
@@ -1821,6 +1860,21 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.engine.as_ref().expect("worker taken during run")
     }
 
+    fn hook_invocation_context(&self, run_id: Option<String>) -> HookInvocationContext {
+        HookInvocationContext {
+            workspace_id: self
+                .workspace_context
+                .workspace_id()
+                .map(|id| id.as_str().to_string()),
+            worker_id: self.manifest.worker.name.clone(),
+            session_id: self.session.session_id().to_string(),
+            session_revision: self.session.revision(),
+            run_id,
+            turn_index: Some(self.engine().turn_count()),
+            call_id: None,
+        }
+    }
+
     /// Mutable access to the underlying Engine.
     ///
     /// Use this to register tools, hooks, or subscribers before calling
@@ -1845,6 +1899,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     ) -> FeatureRegistryInstallReport {
         let worker = self.engine.as_mut().expect("worker taken during run");
         let report = registry.install_into_engine(worker, &mut self.hook_builder);
+        if report.has_errors() {
+            return report;
+        }
+        self.feature_background_tasks = report.background_tasks.clone();
         for instruction in report.installed_instruction_contributions() {
             self.register_feature_instruction(instruction);
         }
@@ -1942,11 +2000,14 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     }
 
     /// Truncate the current segment to just before a previously listed user input.
-    pub fn rewind_to(
+    pub async fn rewind_to(
         &mut self,
         target: RewindTargetId,
         expected_head_entries: usize,
     ) -> Result<RewindAppliedState, RewindError> {
+        self.prepare_session_rewrite(SessionRewriteKind::Rewind)
+            .await
+            .map_err(|error| RewindError::Invalid(error.to_string()))?;
         let loc = self.segment_state.location();
         if target.segment_id != loc.segment_id {
             return Err(RewindError::Invalid(
@@ -2337,6 +2398,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         if !self.interceptor_installed {
             let builder = std::mem::take(&mut self.hook_builder);
             let registry = Arc::new(builder.build());
+            self.hook_registry = Some(registry.clone());
 
             let (post_run_threshold, request_threshold, retained) = self
                 .manifest
@@ -2554,7 +2616,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.ensure_interceptor_installed();
         self.ensure_system_prompt_materialized().await?;
         self.cleanup_finished_memory_task();
-        self.ensure_segment_head()?;
+        self.ensure_segment_head().await?;
         if self.should_pre_run_compact() {
             self.join_memory_task().await;
         }
@@ -3265,11 +3327,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// `ensure_system_prompt_materialized` has just rendered. Subsequent
     /// calls fall through to entry-count comparison, which auto-forks
     /// when another writer has appended behind our back.
-    fn ensure_segment_head(&mut self) -> Result<(), WorkerError> {
-        let w = self.engine.as_ref().unwrap();
+    async fn ensure_segment_head(&mut self) -> Result<(), WorkerError> {
         let loc = self.segment_state.location();
         let entries_written = self.segment_state.entries_written();
         if entries_written == 0 {
+            let w = self.engine.as_ref().unwrap();
             let initial = LogEntry::AnnotatedSegmentStart {
                 ts: segment_log::now_millis(),
                 session_id: loc.session_id,
@@ -3305,6 +3367,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // state up to that turn). The new SegmentStart replaces the mirror
         // and is broadcast through the sink so existing subscribers reset
         // their view.
+        self.prepare_session_rewrite(SessionRewriteKind::Fork)
+            .await?;
+        let w = self.engine.as_ref().unwrap();
         let fork_segment_id = session_store::new_segment_id();
         let entry = LogEntry::AnnotatedSegmentStart {
             ts: segment_log::now_millis(),
@@ -3371,10 +3436,40 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     where
         St: Clone + 'static,
     {
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let hook_exit = hook_run_exit(&result);
+        if let Some(hooks) = self.hook_registry.clone() {
+            let context = RunExitContext {
+                invocation: self.hook_invocation_context(Some(run_id.clone())),
+                exit: hook_exit,
+                history_len: self.session.history().len(),
+            };
+            if let Err(error) = hooks.on_run_exit(&context).await {
+                tracing::warn!(error = %error, "run-exit hook failed; preserving terminal commit");
+            }
+        }
         if matches!(&result, EngineRunExit::Interrupted(_)) {
             self.terminalize_orphan_tool_calls()?;
         }
         self.persist_turn(history_before, &result).await?;
+        let committed_invocation = self.hook_invocation_context(Some(run_id));
+        if let Some(hooks) = self.hook_registry.clone() {
+            let context = RunCommittedContext {
+                invocation: committed_invocation.clone(),
+                exit: hook_exit,
+                committed_history: self.session.history().entries().to_vec(),
+                committed_history_len: self.session.history().len(),
+            };
+            if let Err(error) = hooks.on_run_committed(&context).await {
+                tracing::warn!(error = %error, "run-committed hook requires attention");
+            }
+        }
+        if let Err(error) = self
+            .feature_background_tasks
+            .start_run_committed(committed_invocation)
+        {
+            tracing::warn!(error = %error, "run-committed background task start failed");
+        }
 
         if matches!(result, EngineRunExit::Yielded) {
             self.last_run_interrupted = true;
@@ -3552,6 +3647,35 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// The controller only calls this while Idle. Paused turns keep their
     /// interrupted Engine state intact and are intentionally rejected before
     /// this method is reached.
+    async fn prepare_session_rewrite(
+        &mut self,
+        kind: SessionRewriteKind,
+    ) -> Result<(), WorkerError> {
+        self.feature_background_tasks
+            .before_session_rewrite()
+            .await
+            .map_err(|error| WorkerError::FeatureLifecycle(error.to_string()))?;
+        if let Some(hooks) = self.hook_registry.clone() {
+            let context = BeforeSessionRewriteContext {
+                invocation: self.hook_invocation_context(None),
+                kind,
+                current_history: self.session.history().entries().to_vec(),
+                current_history_len: self.session.history().len(),
+            };
+            match hooks
+                .before_session_rewrite(&context)
+                .await
+                .map_err(|error| WorkerError::FeatureLifecycle(error.to_string()))?
+            {
+                BeforeSessionRewriteAction::Continue => {}
+                BeforeSessionRewriteAction::Deny(reason) => {
+                    return Err(WorkerError::FeatureLifecycle(reason));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn manual_compact(&mut self) -> Result<ManualCompactResult, WorkerError> {
         if self.manifest.compaction.is_none() {
             let message =
@@ -3568,7 +3692,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
 
         self.ensure_interceptor_installed();
         self.cleanup_finished_memory_task();
-        self.ensure_segment_head()?;
+        self.ensure_segment_head().await?;
 
         let state = self.compact_state.clone();
         if state.as_ref().is_some_and(|s| s.is_disabled()) {
@@ -3767,6 +3891,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Runs one parent-owned observable compaction service and returns the new
     /// Segment ID. Lifecycle revisions are committed before they are broadcast.
     pub async fn compact(&mut self, retained_tokens: u64) -> Result<SegmentId, WorkerError> {
+        self.prepare_session_rewrite(SessionRewriteKind::Compact)
+            .await?;
         let mut lifecycle = CompactionLifecycle {
             schema_version: 2,
             compaction_id: uuid::Uuid::now_v7().to_string(),
@@ -5302,6 +5428,8 @@ where
             scope,
             delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
+            hook_registry: None,
+            feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
@@ -5386,6 +5514,8 @@ where
             scope,
             delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
+            hook_registry: None,
+            feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
@@ -5505,6 +5635,8 @@ where
             scope,
             delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
+            hook_registry: None,
+            feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
@@ -5879,6 +6011,8 @@ where
             scope,
             delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
+            hook_registry: None,
+            feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
@@ -6552,6 +6686,9 @@ fn restored_flow_runtime_state(
 pub enum WorkerError {
     #[error("invalid durable Worker state: {0}")]
     InvalidState(String),
+
+    #[error("feature lifecycle rejected operation: {0}")]
+    FeatureLifecycle(String),
 
     #[error("Flow input rejected: {0}")]
     FlowInput(String),
@@ -7776,15 +7913,17 @@ mod build_summary_prompt_tests {
         async fn call(
             &self,
             _input: &crate::hook::ToolCallSummary,
-        ) -> crate::hook::HookPreToolAction {
-            if self
-                .should_pause
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                crate::hook::HookPreToolAction::Pause
-            } else {
-                crate::hook::HookPreToolAction::Continue
-            }
+        ) -> Result<crate::hook::HookPreToolAction, crate::hook::HookError> {
+            Ok(
+                if self
+                    .should_pause
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    crate::hook::HookPreToolAction::Pause
+                } else {
+                    crate::hook::HookPreToolAction::Continue
+                },
+            )
         }
     }
 
@@ -7837,7 +7976,7 @@ mod build_summary_prompt_tests {
         )
         .await
         .unwrap();
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         worker.last_run_interrupted = true;
         worker.engine_mut().set_active_run_turn_count(Some(3));
 
@@ -7880,7 +8019,7 @@ mod build_summary_prompt_tests {
         )
         .await
         .unwrap();
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         worker.engine_mut().set_turn_count(7);
         worker.last_run_interrupted = true;
         worker.engine_mut().set_active_run_turn_count(Some(3));
@@ -7900,7 +8039,7 @@ mod build_summary_prompt_tests {
             )
             .unwrap();
 
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
 
         let fork_segment_id = worker.segment_id();
         assert_ne!(fork_segment_id, source_segment_id);
@@ -7944,7 +8083,7 @@ mod build_summary_prompt_tests {
         )
         .await
         .unwrap();
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         let report = worker
             .install_runtime_flow_transition_feature()
             .expect("scoped Workspace Flow feature");
@@ -7978,7 +8117,7 @@ mod build_summary_prompt_tests {
         )
         .await
         .unwrap();
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         let disabled = worker.prepare_flow_input(vec![Segment::Flow {
             selector: "builtin:coder-review".to_string(),
         }]);
@@ -8254,7 +8393,7 @@ mod build_summary_prompt_tests {
         )
         .await
         .unwrap();
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         std::fs::write(
             temp.path()
                 .join(worker.session_id().to_string())
@@ -8303,7 +8442,7 @@ mod build_summary_prompt_tests {
         )
         .await
         .unwrap();
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         (dir, worker)
     }
 
@@ -8463,7 +8602,7 @@ mod build_summary_prompt_tests {
         let expected_truncate_entries = targets[0].truncate_entries;
         let target = targets[0].id.clone();
 
-        let applied = worker.rewind_to(target, head_entries).unwrap();
+        let applied = worker.rewind_to(target, head_entries).await.unwrap();
 
         assert_eq!(preview_segments(&applied.input), "second message");
         assert_eq!(
@@ -8520,6 +8659,7 @@ mod build_summary_prompt_tests {
 
         let applied = worker
             .rewind_to(targets[0].id.clone(), head_entries)
+            .await
             .unwrap();
         assert_eq!(applied.summary.truncated_to_entries, 5);
         assert!(matches!(
@@ -8562,7 +8702,7 @@ mod build_summary_prompt_tests {
                 payload: serde_json::json!({"value": true}),
             },
         );
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         let fork_location = worker.segment_state.location();
         assert_ne!(fork_location.segment_id, source_location.segment_id);
         let fork_entries = worker
@@ -8593,6 +8733,7 @@ mod build_summary_prompt_tests {
 
         let err = worker
             .rewind_to(targets[0].id.clone(), head_entries)
+            .await
             .unwrap_err()
             .to_string();
 
@@ -8673,7 +8814,7 @@ mod build_summary_prompt_tests {
         .await
         .unwrap();
 
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         worker.wire_history_persistence();
         worker.set_history_for_test(vec![
             Item::tool_call("call-known", "Read", "{}"),
@@ -8790,7 +8931,7 @@ mod build_summary_prompt_tests {
         .await
         .unwrap();
 
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         worker.wire_history_persistence();
         worker.set_history_for_test(vec![Item::tool_call("call-1", "Read", "{}")]);
 
@@ -8870,7 +9011,7 @@ mod build_summary_prompt_tests {
         .await
         .unwrap();
 
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         worker.wire_history_persistence();
         let dangling_call = Item::tool_call("call-1", "SideEffect", "{}");
         worker
@@ -9186,8 +9327,8 @@ mod build_summary_prompt_tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let scope = Scope::writable(&cwd).unwrap();
         let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
-        let mut worker = tokio::runtime::Runtime::new()
-            .unwrap()
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut worker = runtime
             .block_on(Worker::new(
                 manifest,
                 Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
@@ -9204,7 +9345,9 @@ mod build_summary_prompt_tests {
             ))
             .unwrap();
 
-        let activation = worker.activate_skill("triage-errors").unwrap();
+        let activation = runtime
+            .block_on(worker.activate_skill("triage-errors"))
+            .unwrap();
 
         assert_eq!(activation.name, "triage-errors");
         server.join().unwrap();
@@ -9274,7 +9417,7 @@ mod build_summary_prompt_tests {
         )
         .await
         .unwrap();
-        worker.ensure_segment_head().unwrap();
+        worker.ensure_segment_head().await.unwrap();
         worker.wire_history_persistence();
         let evidence = Item::user_message(
             "The cancellation regression must leave this evidence available for retry.",
