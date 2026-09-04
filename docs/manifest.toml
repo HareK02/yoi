@@ -246,6 +246,9 @@ permission = "write"
 # # [feature.memory.profile.extraction.model]
 # # ref = "anthropic/claude-haiku-4-5"
 #
+# [feature.memory.profile.consolidation]
+# request_enabled = true
+#
 # # Backendがresolved Manifestへbindする。手書き/Profile入力では指定しない。
 # # [feature.memory.workspace_settings]
 # # workspace_id = "workspace-id"

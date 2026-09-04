@@ -18,11 +18,11 @@ use crate::model::{AuthRef, ModelManifest, ReasoningControl};
 use crate::plugin::PluginConfig;
 use crate::{
     CompactionConfig, EngineManifest, FeatureConfig, FeatureFlagConfig, FileUploadLimits,
-    McpConfig, McpEnvValue, McpStdioCwdPolicy, MemoryExtractionProfileConfig,
-    MemoryFeatureProfileConfig, MemoryResidentProfileConfig, MergeRequestFeatureConfig,
-    ResolvedMemoryFeatureConfig, ScopeConfig, SessionConfig, SkillsConfig, TicketFeatureConfig,
-    ToolOutputLimits, ToolPermissionConfig, ToolPermissionRule, WebConfig, WorkerFeatureConfig,
-    WorkerManifest, WorkerMeta,
+    McpConfig, McpEnvValue, McpStdioCwdPolicy, MemoryConsolidationProfileConfig,
+    MemoryExtractionProfileConfig, MemoryFeatureProfileConfig, MemoryResidentProfileConfig,
+    MergeRequestFeatureConfig, ResolvedMemoryFeatureConfig, ScopeConfig, SessionConfig,
+    SkillsConfig, TicketFeatureConfig, ToolOutputLimits, ToolPermissionConfig, ToolPermissionRule,
+    WebConfig, WorkerFeatureConfig, WorkerManifest, WorkerMeta,
 };
 
 /// Partial-form Worker manifest. Every field is optional; one or more
@@ -201,6 +201,8 @@ pub struct MemoryFeatureConfigPartial {
     pub resident: Option<MemoryResidentProfileConfigPartial>,
     #[serde(default)]
     pub extraction: Option<MemoryExtractionProfileConfigPartial>,
+    #[serde(default)]
+    pub consolidation: Option<MemoryConsolidationProfileConfigPartial>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -223,6 +225,13 @@ pub struct MemoryExtractionProfileConfigPartial {
     pub worker_max_turns: Option<u32>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryConsolidationProfileConfigPartial {
+    #[serde(default)]
+    pub request_enabled: Option<bool>,
+}
+
 impl MemoryFeatureConfigPartial {
     fn merge(self, other: Self) -> Self {
         Self {
@@ -237,6 +246,11 @@ impl MemoryFeatureConfigPartial {
                 self.extraction,
                 other.extraction,
                 MemoryExtractionProfileConfigPartial::merge,
+            ),
+            consolidation: merge_option(
+                self.consolidation,
+                other.consolidation,
+                MemoryConsolidationProfileConfigPartial::merge,
             ),
         }
     }
@@ -301,6 +315,14 @@ impl MergeRequestFeatureConfigPartial {
             review: other.review.or(self.review),
             readiness_check: other.readiness_check.or(self.readiness_check),
             complete: other.complete.or(self.complete),
+        }
+    }
+}
+
+impl MemoryConsolidationProfileConfigPartial {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            request_enabled: other.request_enabled.or(self.request_enabled),
         }
     }
 }
@@ -385,6 +407,7 @@ impl From<MemoryFeatureConfigPartial> for ResolvedMemoryFeatureConfig {
     fn from(value: MemoryFeatureConfigPartial) -> Self {
         let resident = value.resident.unwrap_or_default();
         let extraction = value.extraction.unwrap_or_default();
+        let consolidation = value.consolidation.unwrap_or_default();
         Self {
             profile: MemoryFeatureProfileConfig {
                 enabled: value.enabled.unwrap_or_default(),
@@ -399,6 +422,9 @@ impl From<MemoryFeatureConfigPartial> for ResolvedMemoryFeatureConfig {
                     worker_max_turns: extraction
                         .worker_max_turns
                         .or(defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS),
+                },
+                consolidation: MemoryConsolidationProfileConfig {
+                    request_enabled: consolidation.request_enabled.unwrap_or(true),
                 },
             },
             workspace_settings: None,
@@ -419,6 +445,9 @@ impl From<ResolvedMemoryFeatureConfig> for MemoryFeatureConfigPartial {
                 model: value.profile.extraction.model,
                 threshold: value.profile.extraction.threshold,
                 worker_max_turns: value.profile.extraction.worker_max_turns,
+            }),
+            consolidation: Some(MemoryConsolidationProfileConfigPartial {
+                request_enabled: Some(value.profile.consolidation.request_enabled),
             }),
         }
     }
@@ -1899,6 +1928,9 @@ inject_summary = false
 enabled = true
 threshold = 42000
 worker_max_turns = 2
+
+[feature.memory.consolidation]
+request_enabled = false
 "#,
         )
         .unwrap();
@@ -1906,6 +1938,7 @@ worker_max_turns = 2
         assert_eq!(memory.enabled, Some(true));
         assert_eq!(memory.staging_tools, Some(false));
         assert_eq!(memory.resident.unwrap().inject_summary, Some(false));
+        assert_eq!(memory.consolidation.unwrap().request_enabled, Some(false));
         let extraction = memory.extraction.unwrap();
         assert_eq!(extraction.enabled, Some(true));
         assert_eq!(extraction.threshold, Some(42_000));

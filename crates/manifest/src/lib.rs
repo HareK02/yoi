@@ -226,6 +226,7 @@ pub struct MemoryFeatureProfileConfig {
     pub staging_tools: bool,
     pub resident: MemoryResidentProfileConfig,
     pub extraction: MemoryExtractionProfileConfig,
+    pub consolidation: MemoryConsolidationProfileConfig,
 }
 
 impl MemoryFeatureProfileConfig {
@@ -248,6 +249,7 @@ impl Default for MemoryFeatureProfileConfig {
             staging_tools: false,
             resident: MemoryResidentProfileConfig::default(),
             extraction: MemoryExtractionProfileConfig::default(),
+            consolidation: MemoryConsolidationProfileConfig::default(),
         }
     }
 }
@@ -282,6 +284,20 @@ impl Default for MemoryExtractionProfileConfig {
             model: None,
             threshold: Some(50_000),
             worker_max_turns: defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryConsolidationProfileConfig {
+    pub request_enabled: bool,
+}
+
+impl Default for MemoryConsolidationProfileConfig {
+    fn default() -> Self {
+        Self {
+            request_enabled: true,
         }
     }
 }
@@ -1070,6 +1086,31 @@ fn migrate_legacy_resolved_manifest_snapshot(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     let extraction_enabled = !extraction_threshold.is_null();
+    if legacy_memory
+        .get("consolidation_model")
+        .is_some_and(|model| !model.is_null())
+    {
+        return Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "legacy resolved Worker manifest uses a Worker-owned consolidation model that cannot be migrated to Backend authority",
+        )));
+    }
+    let threshold_files = legacy_memory
+        .get("consolidation_threshold_files")
+        .and_then(serde_json::Value::as_u64);
+    let threshold_bytes = legacy_memory
+        .get("consolidation_threshold_bytes")
+        .and_then(serde_json::Value::as_u64);
+    let consolidation_enabled = match (threshold_files, threshold_bytes) {
+        (None, None) => false,
+        (Some(5), Some(50_000)) => true,
+        _ => {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "legacy resolved Worker manifest uses custom consolidation thresholds that cannot be migrated to Backend policy",
+            )));
+        }
+    };
     let mut resolved = serde_json::json!({
         "profile": {
             "enabled": enabled,
@@ -1088,6 +1129,9 @@ fn migrate_legacy_resolved_manifest_snapshot(
                     .get("extract_worker_max_turns")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null),
+            },
+            "consolidation": {
+                "request_enabled": consolidation_enabled,
             },
         },
     });
@@ -1490,7 +1534,8 @@ model_id = "claude-sonnet-4-20250514"
             "language": "Français",
             "extract_threshold": 1234,
             "extract_worker_max_turns": 3,
-            "consolidation_threshold_files": 99,
+            "consolidation_threshold_files": 5,
+            "consolidation_threshold_bytes": 50000,
         });
 
         let migrated = read_persisted_worker_manifest_snapshot(manifest).unwrap();
@@ -1500,6 +1545,14 @@ model_id = "claude-sonnet-4-20250514"
         assert_eq!(
             migrated.feature.memory.profile.extraction.threshold,
             Some(1234)
+        );
+        assert!(
+            migrated
+                .feature
+                .memory
+                .profile
+                .consolidation
+                .request_enabled
         );
         assert_eq!(
             migrated
@@ -1523,6 +1576,19 @@ model_id = "claude-sonnet-4-20250514"
         mixed["feature"]["memory"] = serde_json::json!({ "enabled": true, "profile": {} });
         mixed["memory"] = serde_json::json!({});
         assert!(read_persisted_worker_manifest_snapshot(mixed).is_err());
+
+        let mut custom_policy =
+            serde_json::to_value(WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap()).unwrap();
+        custom_policy["feature"]["memory"] = serde_json::json!({ "enabled": true });
+        custom_policy["memory"] = serde_json::json!({
+            "workspace_id": "workspace-1",
+            "settings_revision": 1,
+            "language": "English",
+            "consolidation_threshold_files": 99,
+            "consolidation_threshold_bytes": 50000,
+        });
+        assert!(read_persisted_worker_manifest_snapshot(custom_policy).is_err());
+
         assert!(
             read_persisted_worker_manifest_snapshot(serde_json::json!({
                 "schema_version": 3,

@@ -526,7 +526,9 @@ impl FeatureBackgroundTask for MemoryLifecycleTask {
             .await;
         if !cancellation.is_cancelled() {
             context.generation_fence.ensure_current()?;
-            self.request_consolidation().await;
+            if self.config.profile.consolidation.request_enabled {
+                self.request_consolidation().await;
+            }
         }
         extraction
     }
@@ -1318,6 +1320,36 @@ permission = "write"
                         .body
                         .as_deref()
                         .is_some_and(|body| body == "{\"force\":false}")
+            }),
+            "recorded requests: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_task_does_not_request_consolidation_when_profile_disables_it() {
+        let client = ScriptClient::new(Vec::new());
+        let extension_writes = Arc::new(Mutex::new(Vec::new()));
+        let (event_tx, _) = broadcast::channel(16);
+        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
+        let mut interrupted = capture(2, 250);
+        interrupted.run_exit = CommittedRunExit::Interrupted;
+        let mut task = test_task(
+            interrupted,
+            Box::new(client),
+            extension_writes,
+            event_tx,
+            workspace_client.clone(),
+        );
+        task.config.profile.consolidation.request_enabled = false;
+        run_background_task(task).await;
+
+        let requests = workspace_client.requests.lock().unwrap();
+        assert!(
+            !requests.iter().any(|request| {
+                request
+                    .body
+                    .as_deref()
+                    .is_some_and(|body| body == "{\"force\":false}")
             }),
             "recorded requests: {requests:?}"
         );

@@ -30,6 +30,7 @@ feature = {
             enabled = true;
             threshold = 50000;
         };
+        consolidation = { request_enabled = true; };
     };
     web = { enabled = true; };
     image = { enabled = true; };
