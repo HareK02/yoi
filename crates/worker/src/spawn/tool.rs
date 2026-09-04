@@ -425,6 +425,8 @@ impl Tool for SubWorkerSpawnTool {
             WorkerManifestConfig::resolution_defaults().merge(child_config),
         )
         .map_err(|error| ToolError::ExecutionFailed(format!("resolve child manifest: {error}")))?;
+        bind_child_memory_settings(&self.spawner_manifest, &mut child_manifest)
+            .map_err(ToolError::ExecutionFailed)?;
         // Delegated children stay bound to their scoped session and cannot use
         // Workspace attachment tools to replace it with parent-level authority.
         child_manifest.feature.manage_workdir.enabled = false;
@@ -827,6 +829,33 @@ fn profile_error_with_available(error: ProfileError, available: &AvailableProfil
     )
 }
 
+fn bind_child_memory_settings(
+    parent: &manifest::WorkerManifest,
+    child: &mut manifest::WorkerManifest,
+) -> Result<(), String> {
+    if !child.feature.memory.profile.enabled {
+        return child
+            .feature
+            .memory
+            .validate_execution()
+            .map_err(str::to_string);
+    }
+    let workspace_settings = parent.feature.memory.workspace_settings().ok_or_else(|| {
+        "enabled child Memory feature requires the parent's trusted Workspace settings snapshot"
+            .to_string()
+    })?;
+    child
+        .feature
+        .memory
+        .bind_workspace_settings(workspace_settings)
+        .map_err(str::to_string)?;
+    child
+        .feature
+        .memory
+        .validate_execution()
+        .map_err(str::to_string)
+}
+
 fn manifest_to_reusable_config(manifest: &WorkerManifest) -> WorkerManifestConfig {
     WorkerManifestConfig {
         worker: WorkerMetaConfig {
@@ -894,7 +923,6 @@ fn manifest_to_reusable_config(manifest: &WorkerManifest) -> WorkerManifestConfi
                 model: c.model.clone(),
             }),
         web: manifest.web.clone(),
-        memory: manifest.memory.clone(),
         skills: manifest.skills.clone(),
     }
 }
@@ -1091,10 +1119,7 @@ enabled = true
 thread = true
 
 [feature.memory]
-enabled = true
-
-[memory]
-extract_threshold = 4000
+enabled = false
 "#;
 
     #[tokio::test]
@@ -1524,6 +1549,33 @@ extract_threshold = 4000
         }
         .try_into()
         .unwrap()
+    }
+
+    #[test]
+    fn child_memory_inherits_only_the_parents_trusted_settings_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut parent = parent_manifest(temp.path(), None);
+        parent.feature.memory.profile.enabled = true;
+        parent
+            .feature
+            .memory
+            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "workspace-1".to_string(),
+                settings_revision: 4,
+                language: "日本語".to_string(),
+            })
+            .unwrap();
+        let mut child = parent.clone();
+        child.feature.memory.workspace_settings = None;
+
+        bind_child_memory_settings(&parent, &mut child).unwrap();
+        assert_eq!(
+            child.feature.memory.workspace_settings(),
+            parent.feature.memory.workspace_settings()
+        );
+
+        child.feature.memory.profile.enabled = false;
+        assert!(bind_child_memory_settings(&parent, &mut child).is_err());
     }
 
     fn write_project_profile_registry(

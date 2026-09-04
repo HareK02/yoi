@@ -52,7 +52,7 @@ pub(crate) struct MemoryLifecycleFeature {
 
 #[derive(Clone)]
 struct MemoryLifecycleTask {
-    config: manifest::MemoryConfig,
+    config: manifest::ResolvedMemoryFeatureConfig,
     capture: CommittedSessionCaptureHandle,
     extensions: SessionExtensionHandle,
     workspace_client: Arc<dyn WorkspaceClient>,
@@ -66,7 +66,7 @@ struct MemoryLifecycleTask {
 impl MemoryLifecycleFeature {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        config: manifest::MemoryConfig,
+        config: manifest::ResolvedMemoryFeatureConfig,
         capture: CommittedSessionCaptureHandle,
         extensions: SessionExtensionHandle,
         workspace_client: Arc<dyn WorkspaceClient>,
@@ -132,7 +132,9 @@ impl MemoryLifecycleTask {
             memory::audit::AuditWorker::MemoryExtract,
             memory::audit::AuditTrigger::TokenThreshold,
             self.config
-                .extract_model
+                .profile
+                .extraction
+                .model
                 .as_ref()
                 .or(Some(&self.manifest.model))
                 .map(model_audit_from_manifest),
@@ -188,7 +190,9 @@ impl MemoryLifecycleTask {
         };
         let Some(threshold) = self
             .config
-            .extract_threshold
+            .profile
+            .extraction
+            .threshold
             .filter(|threshold| *threshold > 0)
         else {
             audit
@@ -283,7 +287,7 @@ impl MemoryLifecycleTask {
             source,
             audit.run_id.to_string(),
         );
-        let client = if let Some(model) = self.config.extract_model.as_ref() {
+        let client = if let Some(model) = self.config.profile.extraction.model.as_ref() {
             match crate::model_client::build_client(model) {
                 Ok(client) => client,
                 Err(error) => {
@@ -321,7 +325,7 @@ impl MemoryLifecycleTask {
             }
         };
         let mut manifest = self.manifest.clone();
-        if let Some(model) = self.config.extract_model.clone() {
+        if let Some(model) = self.config.profile.extraction.model.clone() {
             manifest.model = model;
         }
 
@@ -349,7 +353,9 @@ impl MemoryLifecycleTask {
                 cache_key: Some(capture.segment_id.clone()),
                 max_turns: self
                     .config
-                    .extract_worker_max_turns
+                    .profile
+                    .extraction
+                    .worker_max_turns
                     .or(manifest::defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS),
                 engine_configurator: None,
                 features,
@@ -493,36 +499,13 @@ impl MemoryLifecycleTask {
         let audit = WorkerAuditBase::new(
             memory::audit::AuditWorker::MemoryConsolidation,
             memory::audit::AuditTrigger::StagingBacklog,
-            self.config
-                .consolidation_model
-                .as_ref()
-                .or(Some(&self.manifest.model))
-                .map(model_audit_from_manifest),
+            Some(model_audit_from_manifest(&self.manifest.model)),
         )
         .with_memory_settings(&self.config);
-        let Some((threshold_files, threshold_bytes)) = consolidation_thresholds(&self.config)
-        else {
-            audit
-                .emit(
-                    self.workspace_client.as_ref(),
-                    self.event_tx.as_ref(),
-                    memory::audit::WorkerLifecycleStatus::Skipped,
-                    "consolidation_threshold_disabled",
-                    None,
-                    None,
-                    None,
-                )
-                .await;
-            return;
-        };
         match self
             .workspace_client
             .request_memory_staging_consolidation(
-                memory::backend::MemoryConsolidateStagingOperation {
-                    force: false,
-                    threshold_files,
-                    threshold_bytes,
-                },
+                memory::backend::MemoryConsolidateStagingOperation { force: false },
             )
             .await
         {
@@ -646,22 +629,6 @@ fn extract_pointer(
     Ok(pointer)
 }
 
-fn consolidation_thresholds(
-    config: &manifest::MemoryConfig,
-) -> Option<(Option<usize>, Option<u64>)> {
-    let threshold_files = config
-        .consolidation_threshold_files
-        .filter(|threshold| *threshold > 0);
-    let threshold_bytes = config
-        .consolidation_threshold_bytes
-        .filter(|threshold| *threshold > 0);
-    if threshold_files.is_none() && threshold_bytes.is_none() {
-        None
-    } else {
-        Some((threshold_files, threshold_bytes))
-    }
-}
-
 fn extraction_run_eligible(exit: CommittedRunExit) -> bool {
     exit == CommittedRunExit::Finished
 }
@@ -688,12 +655,17 @@ fn tokens_since_pointer(
 fn extraction_threshold_reached(
     capture: &CommittedSessionCapture,
     pointer: Option<&memory::ExtractPointerPayload>,
-    config: &manifest::MemoryConfig,
+    config: &manifest::ResolvedMemoryFeatureConfig,
 ) -> bool {
     if capture.history.is_empty() {
         return false;
     }
-    let Some(threshold) = config.extract_threshold.filter(|threshold| *threshold > 0) else {
+    let Some(threshold) = config
+        .profile
+        .extraction
+        .threshold
+        .filter(|threshold| *threshold > 0)
+    else {
         return false;
     };
     tokens_since_pointer(capture, pointer) >= threshold
@@ -723,7 +695,7 @@ impl WorkerAuditBase {
         }
     }
 
-    fn with_memory_settings(mut self, config: &manifest::MemoryConfig) -> Self {
+    fn with_memory_settings(mut self, config: &manifest::ResolvedMemoryFeatureConfig) -> Self {
         self.memory_settings =
             config
                 .workspace_settings()
@@ -1014,16 +986,18 @@ permission = "write"
         .unwrap()
     }
 
-    fn test_config() -> manifest::MemoryConfig {
-        let mut config = manifest::MemoryConfig {
-            extract_threshold: Some(1),
-            ..Default::default()
-        };
-        config.bind_workspace_settings(&manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: "workspace-1".to_string(),
-            settings_revision: 1,
-            language: "English".to_string(),
-        });
+    fn test_config() -> manifest::ResolvedMemoryFeatureConfig {
+        let mut config = manifest::ResolvedMemoryFeatureConfig::default();
+        config.profile.enabled = true;
+        config.profile.extraction.enabled = true;
+        config.profile.extraction.threshold = Some(1);
+        config
+            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "workspace-1".to_string(),
+                settings_revision: 1,
+                language: "English".to_string(),
+            })
+            .unwrap();
         config
     }
 
@@ -1282,30 +1256,30 @@ permission = "write"
     }
 
     #[tokio::test]
-    async fn lifecycle_task_requests_backend_consolidation_from_configured_threshold() {
+    async fn lifecycle_task_requests_backend_owned_consolidation_eligibility() {
         let client = ScriptClient::new(Vec::new());
         let extension_writes = Arc::new(Mutex::new(Vec::new()));
         let (event_tx, _) = broadcast::channel(16);
         let workspace_client = Arc::new(RecordingWorkspaceClient::default());
         let mut interrupted = capture(2, 250);
         interrupted.run_exit = CommittedRunExit::Interrupted;
-        let mut task = test_task(
+        let task = test_task(
             interrupted,
             Box::new(client),
             extension_writes,
             event_tx,
             workspace_client.clone(),
         );
-        task.config.consolidation_threshold_files = Some(3);
         run_background_task(task).await;
 
         let requests = workspace_client.requests.lock().unwrap();
         assert!(
             requests.iter().any(|request| {
                 request.path.contains("memory")
-                    && request.body.as_deref().is_some_and(|body| {
-                        body.contains("\"threshold_files\":3") && body.contains("\"force\":false")
-                    })
+                    && request
+                        .body
+                        .as_deref()
+                        .is_some_and(|body| body == "{\"force\":false}")
             }),
             "recorded requests: {requests:?}"
         );
@@ -1347,17 +1321,6 @@ permission = "write"
             }],
             extensions: Vec::new(),
         }
-    }
-
-    #[test]
-    fn consolidation_thresholds_enable_backend_request_on_either_limit() {
-        let mut config = manifest::MemoryConfig::default();
-        assert_eq!(consolidation_thresholds(&config), None);
-        config.consolidation_threshold_files = Some(3);
-        assert_eq!(consolidation_thresholds(&config), Some((Some(3), None)));
-        config.consolidation_threshold_files = None;
-        config.consolidation_threshold_bytes = Some(4096);
-        assert_eq!(consolidation_thresholds(&config), Some((None, Some(4096))));
     }
 
     #[test]
@@ -1412,8 +1375,8 @@ permission = "write"
     #[test]
     fn threshold_uses_committed_usage_after_pointer() {
         let capture = capture(2, 250);
-        let mut config = manifest::MemoryConfig::default();
-        config.extract_threshold = Some(1);
+        let mut config = manifest::ResolvedMemoryFeatureConfig::default();
+        config.profile.extraction.threshold = Some(1);
         assert!(extraction_threshold_reached(
             &capture,
             Some(&memory::ExtractPointerPayload {
@@ -1500,8 +1463,8 @@ permission = "write"
     #[test]
     fn empty_capture_never_schedules_extraction() {
         let capture = capture(0, 500);
-        let mut config = manifest::MemoryConfig::default();
-        config.extract_threshold = Some(1);
+        let mut config = manifest::ResolvedMemoryFeatureConfig::default();
+        config.profile.extraction.threshold = Some(1);
         assert!(!extraction_threshold_reached(&capture, None, &config));
     }
 }

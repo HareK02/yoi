@@ -2478,11 +2478,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             )
         });
         if is_memory_consolidation {
-            let memory_config = self.manifest.memory.as_ref().ok_or_else(|| {
-                WorkerError::InvalidState(
-                    "Memory consolidation Worker has no Memory configuration".to_string(),
-                )
-            })?;
+            let memory_config = &self.manifest.feature.memory;
+            memory_config
+                .validate_execution()
+                .map_err(|message| WorkerError::InvalidState(message.to_string()))?;
             let language = memory_language(memory_config)?;
             let rendered = self
                 .prompts
@@ -2517,11 +2516,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             }
         }
         let inject_summary = self.inject_resident_summary
-            && self
-                .manifest
-                .memory
-                .as_ref()
-                .is_some_and(|m| m.inject_summary.unwrap_or(true));
+            && self.manifest.feature.memory.profile.enabled
+            && self.manifest.feature.memory.profile.resident.inject_summary;
         let resident_summary: Option<String> = if inject_summary {
             match self.resident_summary_from_workspace_authority().await {
                 Ok(summary) => summary,
@@ -4552,7 +4548,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     }
 }
 
-fn memory_language(config: &manifest::MemoryConfig) -> Result<String, WorkerError> {
+fn memory_language(config: &manifest::ResolvedMemoryFeatureConfig) -> Result<String, WorkerError> {
     config
         .workspace_settings()
         .map(|snapshot| snapshot.language)
@@ -5426,7 +5422,8 @@ fn worker_metadata_for_manifest(
         metadata = metadata.with_workspace_root(local_workspace_root.to_path_buf());
     }
     if should_persist_resolved_manifest_snapshot(manifest) {
-        metadata.resolved_manifest_snapshot = serde_json::to_value(manifest).ok();
+        metadata.resolved_manifest_snapshot =
+            manifest::write_persisted_worker_manifest_snapshot(manifest).ok();
     }
     metadata
 }
@@ -5439,10 +5436,20 @@ fn validate_workspace_memory_snapshot(
     let Some(workspace_id) = workspace_context.workspace_id() else {
         return Ok(());
     };
-    let snapshot = manifest
+    manifest
+        .feature
         .memory
-        .as_ref()
-        .and_then(manifest::MemoryConfig::workspace_settings)
+        .validate_execution()
+        .map_err(|message| {
+            WorkerError::InvalidState(format!("Workspace Worker {worker_name}: {message}"))
+        })?;
+    if !manifest.feature.memory.profile.enabled {
+        return Ok(());
+    }
+    let snapshot = manifest
+        .feature
+        .memory
+        .workspace_settings()
         .ok_or_else(|| {
             WorkerError::InvalidState(format!(
                 "Workspace Worker {worker_name} has no complete persisted Memory settings snapshot"
@@ -5468,11 +5475,7 @@ fn validate_workspace_memory_snapshot(
 fn should_persist_resolved_manifest_snapshot(manifest: &WorkerManifest) -> bool {
     manifest.profile.is_some()
         || manifest.plugins.has_resolved_plan()
-        || manifest
-            .memory
-            .as_ref()
-            .and_then(manifest::MemoryConfig::workspace_settings)
-            .is_some()
+        || manifest.feature.memory.workspace_settings.is_some()
 }
 
 fn restore_manifest_from_worker_metadata_snapshot(
@@ -5481,12 +5484,14 @@ fn restore_manifest_from_worker_metadata_snapshot(
     fallback: WorkerManifest,
 ) -> Result<WorkerManifest, WorkerError> {
     match snapshot {
-        Some(snapshot) => serde_json::from_value(snapshot).map_err(|source| {
-            WorkerError::WorkerMetadataManifestSnapshot {
-                worker_name: worker_name.to_string(),
-                source,
-            }
-        }),
+        Some(snapshot) => {
+            manifest::read_persisted_worker_manifest_snapshot(snapshot).map_err(|source| {
+                WorkerError::WorkerMetadataManifestSnapshot {
+                    worker_name: worker_name.to_string(),
+                    source,
+                }
+            })
+        }
         None => Ok(fallback),
     }
 }
@@ -6198,11 +6203,6 @@ fn prepare_worker_common_with_context_and_model_client(
             WorkerFilesystemAuthority::Local(LocalWorkingDirectory { root, cwd })
         }
     };
-    let mut scope_config = scope_config;
-    if let (Some(mem), Some(local)) = (manifest.memory.as_ref(), filesystem_authority.as_local()) {
-        let layout = memory::WorkspaceLayout::resolve(mem, &local.root);
-        scope_config.deny.extend(memory::deny_write_rules(&layout));
-    }
     let scope = if scope_config.allow.is_empty() && filesystem_authority.as_local().is_none() {
         Scope::empty()
     } else {
@@ -6292,8 +6292,7 @@ mod spawned_context_tests {
         std::fs::create_dir_all(&workspace_root).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
 
-        let mut manifest = minimal_manifest_for_context_test(&workspace_root, &cwd);
-        manifest.memory = Some(manifest::MemoryConfig::default());
+        let manifest = minimal_manifest_for_context_test(&workspace_root, &cwd);
         let common = prepare_worker_common_with_context(
             &manifest,
             &PromptCatalogSource::builtins_only(),
@@ -6327,8 +6326,7 @@ mod spawned_context_tests {
         let workspace_root = tmp.path().join("workspace-root");
         let cwd = workspace_root.join("nested");
         std::fs::create_dir_all(&cwd).unwrap();
-        let mut manifest = minimal_manifest_for_context_test(&workspace_root, &cwd);
-        manifest.memory = Some(manifest::MemoryConfig::default());
+        let manifest = minimal_manifest_for_context_test(&workspace_root, &cwd);
         let loader = PromptCatalogSource::builtins_only();
         let workspace_id = WorkspaceId::new("ws-api-only").unwrap();
         let common = prepare_worker_common_with_context(
@@ -6535,7 +6533,7 @@ permission = "write"
 
         let restored = restore_manifest_from_worker_metadata_snapshot(
             "restore-scope",
-            Some(serde_json::to_value(&saved).unwrap()),
+            Some(manifest::write_persisted_worker_manifest_snapshot(&saved).unwrap()),
             current,
         )
         .unwrap();
@@ -6590,24 +6588,26 @@ permission = "read"
 "#,
         )
         .unwrap();
-        manifest.memory = Some(manifest::MemoryConfig::default());
-        manifest.memory.as_mut().unwrap().bind_workspace_settings(
-            &manifest::WorkspaceMemorySettingsSnapshot {
+        manifest.feature.memory.profile.enabled = true;
+        manifest
+            .feature
+            .memory
+            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "workspace-a".to_string(),
                 settings_revision: 7,
                 language: "Japanese".to_string(),
-            },
-        );
+            })
+            .unwrap();
 
         let metadata = worker_metadata_for_manifest(&manifest, None, None, None);
-        let restored: WorkerManifest = serde_json::from_value(
+        let restored = manifest::read_persisted_worker_manifest_snapshot(
             metadata
                 .resolved_manifest_snapshot
                 .expect("Memory settings require a resolved manifest snapshot"),
         )
         .unwrap();
         assert_eq!(
-            restored.memory.unwrap().workspace_settings(),
+            restored.feature.memory.workspace_settings(),
             Some(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "workspace-a".to_string(),
                 settings_revision: 7,
@@ -6638,7 +6638,7 @@ permission = "read"
         );
 
         let mut missing = manifest.clone();
-        missing.memory.as_mut().unwrap().settings_revision = None;
+        missing.feature.memory.workspace_settings = None;
         assert!(
             validate_workspace_memory_snapshot(
                 "memory-snapshot",
@@ -6715,7 +6715,7 @@ permission = "read"
         let snapshot = metadata
             .resolved_manifest_snapshot
             .expect("plugin-resolved manifest should be snapshotted");
-        let restored: WorkerManifest = serde_json::from_value(snapshot).unwrap();
+        let restored = manifest::read_persisted_worker_manifest_snapshot(snapshot).unwrap();
 
         assert!(restored.profile.is_none());
         assert_eq!(restored.plugins.resolved.len(), 1);
@@ -8203,13 +8203,16 @@ mod build_summary_prompt_tests {
             },
             profile: None,
         });
-        let mut memory = manifest::MemoryConfig::default();
-        memory.bind_workspace_settings(&manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: "workspace-test".to_string(),
-            settings_revision: 3,
-            language: "Japanese".to_string(),
-        });
-        manifest.memory = Some(memory);
+        let mut memory = manifest::ResolvedMemoryFeatureConfig::default();
+        memory.profile.enabled = true;
+        memory
+            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "workspace-test".to_string(),
+                settings_revision: 3,
+                language: "Japanese".to_string(),
+            })
+            .unwrap();
+        manifest.feature.memory = memory;
         let mut worker = Worker::new(
             manifest,
             Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
@@ -8235,7 +8238,7 @@ mod build_summary_prompt_tests {
 
     async fn render_system_prompt_with_summary(
         summary_doc: Option<&str>,
-        memory_config: Option<manifest::MemoryConfig>,
+        memory_config: Option<manifest::ResolvedMemoryFeatureConfig>,
         resident_injection: bool,
     ) -> String {
         render_system_prompt_with_resident_sections(
@@ -8249,7 +8252,7 @@ mod build_summary_prompt_tests {
 
     async fn render_system_prompt_with_resident_sections(
         summary_doc: Option<&str>,
-        memory_config: Option<manifest::MemoryConfig>,
+        memory_config: Option<manifest::ResolvedMemoryFeatureConfig>,
         gates: ResidentInjectionGates,
         _unused: bool,
     ) -> String {
@@ -8258,12 +8261,15 @@ mod build_summary_prompt_tests {
         let cwd = dir.path().join("workspace");
         std::fs::create_dir_all(&cwd).unwrap();
         let mut manifest = minimal_manifest();
-        manifest.memory = memory_config.clone();
+        manifest.feature.memory = memory_config.clone().unwrap_or_default();
+        if memory_config.is_some() {
+            manifest.feature.memory.profile.enabled = true;
+        }
         let scope = Scope::writable(&cwd).unwrap();
         let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
         let workspace_context = if memory_config
             .as_ref()
-            .is_some_and(|cfg| cfg.inject_summary.unwrap_or(true))
+            .is_some_and(|cfg| cfg.profile.resident.inject_summary)
             && gates.summary
         {
             stub_memory_backend_context(summary_doc.and_then(summary_content_for_backend))
@@ -8350,7 +8356,7 @@ mod build_summary_prompt_tests {
     async fn resident_summary_body_is_injected_without_frontmatter() {
         let rendered = render_system_prompt_with_summary(
             Some(&summary_doc("summary body for resident prompt\n")),
-            Some(manifest::MemoryConfig::default()),
+            Some(manifest::ResolvedMemoryFeatureConfig::default()),
             true,
         )
         .await;
@@ -8362,10 +8368,8 @@ mod build_summary_prompt_tests {
 
     #[tokio::test]
     async fn resident_summary_injection_can_be_disabled_by_manifest() {
-        let memory = manifest::MemoryConfig {
-            inject_summary: Some(false),
-            ..manifest::MemoryConfig::default()
-        };
+        let mut memory = manifest::ResolvedMemoryFeatureConfig::default();
+        memory.profile.resident.inject_summary = false;
         let rendered = render_system_prompt_with_summary(
             Some(&summary_doc("disabled summary body\n")),
             Some(memory),
@@ -8377,7 +8381,7 @@ mod build_summary_prompt_tests {
     }
 
     #[tokio::test]
-    async fn resident_summary_is_absent_without_memory_config() {
+    async fn resident_summary_is_absent_when_memory_feature_is_disabled() {
         let rendered = render_system_prompt_with_summary(
             Some(&summary_doc("memory-disabled summary body\n")),
             None,
@@ -8392,7 +8396,7 @@ mod build_summary_prompt_tests {
     async fn malformed_resident_summary_does_not_fail_render() {
         let rendered = render_system_prompt_with_summary(
             Some("---\nthis is not yaml: : :\n---\nbad summary body\n"),
-            Some(manifest::MemoryConfig::default()),
+            Some(manifest::ResolvedMemoryFeatureConfig::default()),
             true,
         )
         .await;
@@ -8405,7 +8409,7 @@ mod build_summary_prompt_tests {
     async fn resident_summary_gate_false_omits_only_summary() {
         let prompt = render_system_prompt_with_resident_sections(
             Some(&summary_doc("resident summary marker")),
-            Some(manifest::MemoryConfig::default()),
+            Some(manifest::ResolvedMemoryFeatureConfig::default()),
             ResidentInjectionGates { summary: false },
             true,
         )

@@ -901,27 +901,39 @@ pub(crate) fn wire_event_bridges_on_engine<C, St>(
     // per-item commit channel is wired at the top of this function.
 }
 
-fn add_memory_lifecycle_if_configured<M>(
+fn add_memory_tools_if_configured<M>(
     registry: &mut FeatureRegistryBuilder,
-    config: Option<manifest::MemoryConfig>,
-    workspace_bound: bool,
-    build: impl FnOnce(manifest::MemoryConfig) -> std::io::Result<M>,
+    config: &manifest::ResolvedMemoryFeatureConfig,
+    build: impl FnOnce() -> std::io::Result<M>,
 ) -> std::io::Result<bool>
 where
     M: crate::feature::FeatureModule + 'static,
 {
-    let Some(config) = config else {
-        return Ok(false);
-    };
-    if config.workspace_settings().is_none() {
-        if workspace_bound {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Workspace-bound Memory requires a Backend-authored settings snapshot",
-            ));
-        }
+    if !config.profile.enabled {
         return Ok(false);
     }
+    config
+        .validate_execution()
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+    registry.add_module(build()?);
+    Ok(true)
+}
+
+fn add_memory_lifecycle_if_configured<M>(
+    registry: &mut FeatureRegistryBuilder,
+    config: manifest::ResolvedMemoryFeatureConfig,
+    lifecycle_enabled: bool,
+    build: impl FnOnce(manifest::ResolvedMemoryFeatureConfig) -> std::io::Result<M>,
+) -> std::io::Result<bool>
+where
+    M: crate::feature::FeatureModule + 'static,
+{
+    if !lifecycle_enabled || !config.profile.enabled || !config.profile.extraction.enabled {
+        return Ok(false);
+    }
+    config
+        .validate_execution()
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
     registry.add_module(build(config)?);
     Ok(true)
 }
@@ -962,7 +974,7 @@ where
     let local_filesystem = worker.local_working_directory().cloned();
     let local_workspace_root = local_filesystem.as_ref().map(|local| local.root.clone());
     let task_feature = worker.task_feature();
-    let memory_config = worker.manifest().memory.clone();
+    let memory_config = feature_config.memory.clone();
     let web_config = worker.manifest().web.clone();
     let mcp_config = worker.manifest().mcp.clone();
     let spawner_name = worker.manifest().worker.name.clone();
@@ -1019,13 +1031,23 @@ where
     let worker_enabled = feature_config.worker.enabled;
     let sub_worker_enabled = feature_config.sub_worker.enabled;
     let mut feature_registry = FeatureRegistryBuilder::new();
+    add_memory_tools_if_configured(&mut feature_registry, &memory_config, || {
+        let workspace_client = worker.workspace_client_handle();
+        if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Memory tools require Backend Workspace API authority",
+            ));
+        }
+        Ok(crate::feature::builtin::memory::MemoryToolsFeature::new(
+            workspace_client,
+            memory_config.profile.staging_tools,
+        ))
+    })?;
     add_memory_lifecycle_if_configured(
         &mut feature_registry,
-        worker
-            .manifest_lifecycle_features_enabled()
-            .then(|| memory_config.clone())
-            .flatten(),
-        spawner_workspace_context.workspace_id().is_some(),
+        memory_config.clone(),
+        worker.manifest_lifecycle_features_enabled(),
         |config| {
             let workspace_client = worker.workspace_client_handle();
             if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
@@ -1198,38 +1220,6 @@ where
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "objective tools require Backend Workspace API authority",
-                ));
-            }
-        }
-
-        // Memory tools require explicit feature exposure. Workspace memory access
-        // is authority-bound to the Backend Workspace API; the Worker must not
-        // register local filesystem memory tools even when it has local cwd/root
-        // authority for shell/file tools.
-        if feature_config.memory.enabled {
-            let _mem = memory_config.as_ref().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "[feature.memory].enabled = true requires a [memory] configuration section",
-                )
-            })?;
-            if workspace_client.is_available() && workspace_client.workspace_id().is_some() {
-                let definitions = if feature_config.memory.staging {
-                    crate::feature::builtin::memory::workspace_http_memory_consolidation_tools(
-                        workspace_client.clone(),
-                    )
-                } else {
-                    crate::feature::builtin::memory::workspace_http_memory_tools(
-                        workspace_client.clone(),
-                    )
-                };
-                for definition in definitions {
-                    engine.register_tool(definition);
-                }
-            } else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "memory tools require Backend Workspace API authority",
                 ));
             }
         }
@@ -2169,7 +2159,7 @@ mod tests {
     use tokio::net::UnixListener;
 
     #[test]
-    fn memory_lifecycle_registration_requires_bound_workspace_memory_config() {
+    fn memory_feature_registration_requires_bound_workspace_memory_config() {
         #[derive(Clone)]
         struct TestMemoryLifecycleModule;
 
@@ -2190,15 +2180,42 @@ mod tests {
         }
 
         let mut registry = FeatureRegistryBuilder::new();
+        let installed = add_memory_tools_if_configured::<TestMemoryLifecycleModule>(
+            &mut registry,
+            &manifest::ResolvedMemoryFeatureConfig::default(),
+            || panic!("disabled Memory must not construct its tools Feature"),
+        )
+        .unwrap();
+        assert!(!installed);
+
+        let mut missing_snapshot = manifest::ResolvedMemoryFeatureConfig::default();
+        missing_snapshot.profile.enabled = true;
+        let error = add_memory_tools_if_configured::<TestMemoryLifecycleModule>(
+            &mut registry,
+            &missing_snapshot,
+            || panic!("invalid Memory config must fail before tools Feature construction"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires trusted Workspace settings")
+        );
+
+        let mut registry = FeatureRegistryBuilder::new();
         let configured = std::cell::Cell::new(false);
-        let mut memory_config = manifest::MemoryConfig::default();
-        memory_config.bind_workspace_settings(&manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: "workspace-1".to_string(),
-            settings_revision: 1,
-            language: "English".to_string(),
-        });
+        let mut memory_config = manifest::ResolvedMemoryFeatureConfig::default();
+        memory_config.profile.enabled = true;
+        memory_config.profile.extraction.enabled = true;
+        memory_config
+            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "workspace-1".to_string(),
+                settings_revision: 1,
+                language: "English".to_string(),
+            })
+            .unwrap();
         let installed =
-            add_memory_lifecycle_if_configured(&mut registry, Some(memory_config), true, |_| {
+            add_memory_lifecycle_if_configured(&mut registry, memory_config, true, |_| {
                 configured.set(true);
                 Ok(TestMemoryLifecycleModule)
             })
@@ -2209,25 +2226,38 @@ mod tests {
         let mut registry = FeatureRegistryBuilder::new();
         let installed = add_memory_lifecycle_if_configured::<TestMemoryLifecycleModule>(
             &mut registry,
-            None,
-            false,
+            manifest::ResolvedMemoryFeatureConfig::default(),
+            true,
             |_| panic!("disabled Memory must not construct its lifecycle Feature"),
         )
         .unwrap();
         assert!(!installed);
 
+        let mut lifecycle_disabled = manifest::ResolvedMemoryFeatureConfig::default();
+        lifecycle_disabled.profile.enabled = true;
+        lifecycle_disabled.profile.extraction.enabled = true;
+        lifecycle_disabled
+            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "workspace-1".to_string(),
+                settings_revision: 1,
+                language: "English".to_string(),
+            })
+            .unwrap();
         let installed = add_memory_lifecycle_if_configured::<TestMemoryLifecycleModule>(
             &mut registry,
-            Some(manifest::MemoryConfig::default()),
+            lifecycle_disabled,
             false,
-            |_| panic!("Memory without a Backend-authored settings snapshot must stay disabled"),
+            |_| panic!("disabled lifecycle must not construct its Feature"),
         )
         .unwrap();
         assert!(!installed);
 
+        let mut missing_snapshot = manifest::ResolvedMemoryFeatureConfig::default();
+        missing_snapshot.profile.enabled = true;
+        missing_snapshot.profile.extraction.enabled = true;
         let error = add_memory_lifecycle_if_configured::<TestMemoryLifecycleModule>(
             &mut registry,
-            Some(manifest::MemoryConfig::default()),
+            missing_snapshot,
             true,
             |_| panic!("invalid Workspace Memory config must fail before Feature construction"),
         )
@@ -2235,7 +2265,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("Backend-authored settings snapshot")
+                .contains("requires trusted Workspace settings")
         );
     }
 

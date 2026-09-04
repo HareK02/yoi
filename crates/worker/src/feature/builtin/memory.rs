@@ -18,6 +18,10 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
+use crate::feature::{
+    FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureModule, ToolContribution,
+    ToolDeclaration,
+};
 use crate::worker::{
     WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
 };
@@ -338,6 +342,44 @@ fn query_schema() -> serde_json::Value {
     })
 }
 
+#[derive(Clone)]
+pub struct MemoryToolsFeature {
+    tools: Vec<ToolDefinition>,
+}
+
+impl MemoryToolsFeature {
+    pub fn new(client: Arc<dyn WorkspaceClient>, staging_tools: bool) -> Self {
+        let tools = if staging_tools {
+            workspace_http_memory_consolidation_tools(client)
+        } else {
+            workspace_http_memory_tools(client)
+        };
+        Self { tools }
+    }
+}
+
+impl FeatureModule for MemoryToolsFeature {
+    fn descriptor(&self) -> FeatureDescriptor {
+        let mut descriptor = FeatureDescriptor::builtin("memory", "Memory")
+            .with_description("Workspace Memory document, query, and staging tools.");
+        for tool in &self.tools {
+            let (meta, _) = tool();
+            descriptor = descriptor.with_tool(ToolDeclaration::new(meta.name, meta.description));
+        }
+        descriptor
+    }
+
+    fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
+        for tool in &self.tools {
+            let (meta, _) = tool();
+            context
+                .tools()
+                .register(ToolContribution::new(meta.name, tool.clone()))?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +408,20 @@ mod tests {
             .find(|meta| meta.name == name)
             .unwrap_or_else(|| panic!("missing tool meta for {name}"))
             .input_schema
+    }
+
+    #[test]
+    fn memory_feature_owns_normal_and_staging_tool_surfaces() {
+        let normal = MemoryToolsFeature::new(test_client(), false);
+        let normal_names = tool_names(normal.tools);
+        assert!(normal_names.contains(&"MemoryQuery".to_string()));
+        assert!(!normal_names.contains(&"MemoryStagingList".to_string()));
+
+        let staging = MemoryToolsFeature::new(test_client(), true);
+        assert_eq!(staging.descriptor().id.as_str(), "builtin:memory");
+        let staging_names = tool_names(staging.tools);
+        assert!(staging_names.contains(&"MemoryQuery".to_string()));
+        assert!(staging_names.contains(&"MemoryStagingList".to_string()));
     }
 
     #[test]

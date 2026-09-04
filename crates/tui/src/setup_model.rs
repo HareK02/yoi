@@ -228,7 +228,7 @@ worker_context_max_tokens = 100000
 enabled = true
 
 [feature.memory]
-enabled = true
+enabled = false
 
 [feature.web]
 enabled = true
@@ -240,11 +240,6 @@ enabled = false
 enabled = true
 authoring = true
 thread = true
-
-[memory]
-extract_threshold = 50000
-consolidation_threshold_files = 5
-consolidation_threshold_bytes = 50000
 
 [web]
 enabled = true

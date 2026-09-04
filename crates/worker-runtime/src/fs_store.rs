@@ -759,8 +759,8 @@ fn migrate_worker_aggregate_document(
         .get_mut("resolved_manifest_snapshot")
         .filter(|snapshot| !snapshot.is_null())
     {
-        let manifest: manifest::WorkerManifest =
-            serde_json::from_value(snapshot.clone()).map_err(|error| {
+        let mut manifest = manifest::read_persisted_worker_manifest_snapshot(snapshot.clone())
+            .map_err(|error| {
                 runtime_store_corrupt(
                     metadata_path,
                     format!("decode Worker aggregate resolved manifest snapshot: {error}"),
@@ -775,20 +775,14 @@ fn migrate_worker_aggregate_document(
                 ),
             ));
         }
-        snapshot
-            .as_object_mut()
-            .and_then(|manifest| manifest.get_mut("worker"))
-            .and_then(serde_json::Value::as_object_mut)
-            .ok_or_else(|| {
+        manifest.worker.name = expected_name.clone();
+        *snapshot =
+            manifest::write_persisted_worker_manifest_snapshot(&manifest).map_err(|error| {
                 runtime_store_corrupt(
                     metadata_path,
-                    "Worker aggregate resolved manifest is missing worker metadata".to_string(),
+                    format!("encode migrated Worker aggregate resolved manifest: {error}"),
                 )
-            })?
-            .insert(
-                "name".to_string(),
-                serde_json::Value::String(expected_name.clone()),
-            );
+            })?;
     }
     metadata.insert(
         "worker_name".to_string(),
@@ -809,8 +803,8 @@ fn migrate_worker_aggregate_document(
         ));
     }
     if let Some(snapshot) = metadata.resolved_manifest_snapshot {
-        let manifest: manifest::WorkerManifest =
-            serde_json::from_value(snapshot).map_err(|error| {
+        let manifest =
+            manifest::read_persisted_worker_manifest_snapshot(snapshot).map_err(|error| {
                 runtime_store_corrupt(
                     metadata_path,
                     format!("decode migrated Worker aggregate resolved manifest: {error}"),

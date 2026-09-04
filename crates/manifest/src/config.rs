@@ -18,8 +18,9 @@ use crate::model::{AuthRef, ModelManifest, ReasoningControl};
 use crate::plugin::PluginConfig;
 use crate::{
     CompactionConfig, EngineManifest, FeatureConfig, FeatureFlagConfig, FileUploadLimits,
-    McpConfig, McpEnvValue, McpStdioCwdPolicy, MemoryConfig, MemoryFeatureConfig,
-    MergeRequestFeatureConfig, ScopeConfig, SessionConfig, SkillsConfig, TicketFeatureConfig,
+    McpConfig, McpEnvValue, McpStdioCwdPolicy, MemoryExtractionProfileConfig,
+    MemoryFeatureProfileConfig, MemoryResidentProfileConfig, MergeRequestFeatureConfig,
+    ResolvedMemoryFeatureConfig, ScopeConfig, SessionConfig, SkillsConfig, TicketFeatureConfig,
     ToolOutputLimits, ToolPermissionConfig, ToolPermissionRule, WebConfig, WorkerFeatureConfig,
     WorkerManifest, WorkerMeta,
 };
@@ -67,9 +68,6 @@ pub struct WorkerManifestConfig {
     /// First-class web tool opt-in. See [`WebConfig`].
     #[serde(default)]
     pub web: Option<WebConfig>,
-    /// Memory subsystem opt-in. See [`MemoryConfig`].
-    #[serde(default)]
-    pub memory: Option<MemoryConfig>,
     /// External Agent Skills directories. See [`crate::SkillsConfig`].
     #[serde(default)]
     pub skills: Option<SkillsConfig>,
@@ -193,18 +191,72 @@ impl From<WorkerFeatureConfigPartial> for WorkerFeatureConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryFeatureConfigPartial {
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
-    pub staging: Option<bool>,
+    pub staging_tools: Option<bool>,
+    #[serde(default)]
+    pub resident: Option<MemoryResidentProfileConfigPartial>,
+    #[serde(default)]
+    pub extraction: Option<MemoryExtractionProfileConfigPartial>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryResidentProfileConfigPartial {
+    #[serde(default)]
+    pub inject_summary: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryExtractionProfileConfigPartial {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub model: Option<ModelManifest>,
+    #[serde(default)]
+    pub threshold: Option<u64>,
+    #[serde(default)]
+    pub worker_max_turns: Option<u32>,
 }
 
 impl MemoryFeatureConfigPartial {
     fn merge(self, other: Self) -> Self {
         Self {
             enabled: other.enabled.or(self.enabled),
-            staging: other.staging.or(self.staging),
+            staging_tools: other.staging_tools.or(self.staging_tools),
+            resident: merge_option(
+                self.resident,
+                other.resident,
+                MemoryResidentProfileConfigPartial::merge,
+            ),
+            extraction: merge_option(
+                self.extraction,
+                other.extraction,
+                MemoryExtractionProfileConfigPartial::merge,
+            ),
+        }
+    }
+}
+
+impl MemoryResidentProfileConfigPartial {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            inject_summary: other.inject_summary.or(self.inject_summary),
+        }
+    }
+}
+
+impl MemoryExtractionProfileConfigPartial {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            enabled: other.enabled.or(self.enabled),
+            model: other.model.or(self.model),
+            threshold: other.threshold.or(self.threshold),
+            worker_max_turns: other.worker_max_turns.or(self.worker_max_turns),
         }
     }
 }
@@ -259,7 +311,7 @@ impl From<FeatureConfigPartial> for FeatureConfig {
             task: value.task.map(FeatureFlagConfig::from).unwrap_or_default(),
             memory: value
                 .memory
-                .map(MemoryFeatureConfig::from)
+                .map(ResolvedMemoryFeatureConfig::from)
                 .unwrap_or_default(),
             web: value.web.map(FeatureFlagConfig::from).unwrap_or_default(),
             image: value.image.map(FeatureFlagConfig::from).unwrap_or_default(),
@@ -329,20 +381,45 @@ impl From<WorkerFeatureConfig> for WorkerFeatureConfigPartial {
     }
 }
 
-impl From<MemoryFeatureConfigPartial> for MemoryFeatureConfig {
+impl From<MemoryFeatureConfigPartial> for ResolvedMemoryFeatureConfig {
     fn from(value: MemoryFeatureConfigPartial) -> Self {
+        let resident = value.resident.unwrap_or_default();
+        let extraction = value.extraction.unwrap_or_default();
         Self {
-            enabled: value.enabled.unwrap_or_default(),
-            staging: value.staging.unwrap_or_default(),
+            profile: MemoryFeatureProfileConfig {
+                enabled: value.enabled.unwrap_or_default(),
+                staging_tools: value.staging_tools.unwrap_or_default(),
+                resident: MemoryResidentProfileConfig {
+                    inject_summary: resident.inject_summary.unwrap_or(true),
+                },
+                extraction: MemoryExtractionProfileConfig {
+                    enabled: extraction.enabled.unwrap_or(true),
+                    model: extraction.model,
+                    threshold: extraction.threshold.or(Some(50_000)),
+                    worker_max_turns: extraction
+                        .worker_max_turns
+                        .or(defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS),
+                },
+            },
+            workspace_settings: None,
         }
     }
 }
 
-impl From<MemoryFeatureConfig> for MemoryFeatureConfigPartial {
-    fn from(value: MemoryFeatureConfig) -> Self {
+impl From<ResolvedMemoryFeatureConfig> for MemoryFeatureConfigPartial {
+    fn from(value: ResolvedMemoryFeatureConfig) -> Self {
         Self {
-            enabled: Some(value.enabled),
-            staging: Some(value.staging),
+            enabled: Some(value.profile.enabled),
+            staging_tools: Some(value.profile.staging_tools),
+            resident: Some(MemoryResidentProfileConfigPartial {
+                inject_summary: Some(value.profile.resident.inject_summary),
+            }),
+            extraction: Some(MemoryExtractionProfileConfigPartial {
+                enabled: Some(value.profile.extraction.enabled),
+                model: value.profile.extraction.model,
+                threshold: value.profile.extraction.threshold,
+                worker_max_turns: value.profile.extraction.worker_max_turns,
+            }),
         }
     }
 }
@@ -543,13 +620,9 @@ pub(crate) fn reject_removed_manifest_fields(s: &str) -> Result<(), toml::de::Er
              (removed; use compaction.prune_protected_tokens)",
         ));
     }
-    if value
-        .get("memory")
-        .and_then(toml::Value::as_table)
-        .is_some_and(|table| table.contains_key("extract_worker_max_input_tokens"))
-    {
+    if value.get("memory").is_some() {
         return Err(toml::de::Error::custom(
-            "unknown field in manifest: memory.extract_worker_max_input_tokens (removed)",
+            "unknown field in manifest: memory (removed; configure feature.memory)",
         ));
     }
     if value
@@ -633,11 +706,6 @@ impl WorkerManifestConfig {
         for rule in &mut self.delegation_scope.deny {
             rule.target = join_if_relative(base, &rule.target);
         }
-        if let Some(ref mut memory) = self.memory
-            && let Some(ref mut root) = memory.workspace_root
-        {
-            *root = join_if_relative(base, root);
-        }
         if let Some(ref mut compaction) = self.compaction
             && let Some(ref mut cp) = compaction.model
         {
@@ -682,7 +750,6 @@ impl WorkerManifestConfig {
                 CompactionConfigPartial::merge,
             ),
             web: merge_option(self.web, upper.web, WebConfig::merge),
-            memory: merge_option(self.memory, upper.memory, MemoryConfig::merge),
             skills: merge_option(self.skills, upper.skills, SkillsConfig::merge),
         }
     }
@@ -750,32 +817,6 @@ impl crate::WebFetchConfig {
             allow_private_addresses: upper
                 .allow_private_addresses
                 .or(self.allow_private_addresses),
-        }
-    }
-}
-
-impl MemoryConfig {
-    fn merge(self, upper: Self) -> Self {
-        Self {
-            workspace_root: upper.workspace_root.or(self.workspace_root),
-            query_result_limit: upper.query_result_limit.or(self.query_result_limit),
-            query_excerpt_lines: upper.query_excerpt_lines.or(self.query_excerpt_lines),
-            inject_summary: upper.inject_summary.or(self.inject_summary),
-            workspace_id: upper.workspace_id.or(self.workspace_id),
-            settings_revision: upper.settings_revision.or(self.settings_revision),
-            language: upper.language.or(self.language),
-            extract_model: upper.extract_model.or(self.extract_model),
-            extract_threshold: upper.extract_threshold.or(self.extract_threshold),
-            extract_worker_max_turns: upper
-                .extract_worker_max_turns
-                .or(self.extract_worker_max_turns),
-            consolidation_model: upper.consolidation_model.or(self.consolidation_model),
-            consolidation_threshold_files: upper
-                .consolidation_threshold_files
-                .or(self.consolidation_threshold_files),
-            consolidation_threshold_bytes: upper
-                .consolidation_threshold_bytes
-                .or(self.consolidation_threshold_bytes),
         }
     }
 }
@@ -1223,7 +1264,6 @@ impl TryFrom<WorkerManifestConfig> for WorkerManifest {
             mcp: cfg.mcp,
             compaction,
             web: cfg.web,
-            memory: cfg.memory,
             skills: cfg.skills,
             profile: None,
         })
@@ -1271,7 +1311,6 @@ mod tests {
             session: None,
             compaction: None,
             web: None,
-            memory: None,
             skills: None,
         }
     }
@@ -1846,29 +1885,46 @@ prune_protected_turns = 3
     }
 
     #[test]
-    fn from_toml_rejects_removed_extract_worker_max_input_tokens_field() {
-        let bad = r#"
-[memory]
-extract_worker_max_input_tokens = 30000
-"#;
-        let err = WorkerManifestConfig::from_toml(bad).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("memory.extract_worker_max_input_tokens"),
-            "unexpected error: {err}"
-        );
+    fn from_toml_accepts_memory_extraction_settings_only_under_feature_memory() {
+        let cfg = WorkerManifestConfig::from_toml(
+            r#"
+[feature.memory]
+enabled = true
+staging_tools = false
+
+[feature.memory.resident]
+inject_summary = false
+
+[feature.memory.extraction]
+enabled = true
+threshold = 42000
+worker_max_turns = 2
+"#,
+        )
+        .unwrap();
+        let memory = cfg.feature.memory.unwrap();
+        assert_eq!(memory.enabled, Some(true));
+        assert_eq!(memory.staging_tools, Some(false));
+        assert_eq!(memory.resident.unwrap().inject_summary, Some(false));
+        let extraction = memory.extraction.unwrap();
+        assert_eq!(extraction.enabled, Some(true));
+        assert_eq!(extraction.threshold, Some(42_000));
+        assert_eq!(extraction.worker_max_turns, Some(2));
     }
 
     #[test]
-    fn from_toml_accepts_extract_worker_max_turns() {
-        let cfg = WorkerManifestConfig::from_toml(
+    fn from_toml_rejects_legacy_top_level_memory_authority() {
+        let err = WorkerManifestConfig::from_toml(
             r#"
 [memory]
 extract_worker_max_turns = 2
 "#,
         )
-        .unwrap();
-        assert_eq!(cfg.memory.unwrap().extract_worker_max_turns, Some(2));
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("memory"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1948,7 +2004,7 @@ worker_max_turns = 7
     fn feature_flags_default_disabled_in_resolved_manifest() {
         let manifest: WorkerManifest = minimal_valid().try_into().unwrap();
         assert!(!manifest.feature.task.enabled);
-        assert!(!manifest.feature.memory.enabled);
+        assert!(!manifest.feature.memory.profile.enabled);
         assert!(!manifest.feature.web.enabled);
         assert!(!manifest.feature.sub_worker.enabled);
         assert!(!manifest.feature.objective.enabled);
@@ -2025,8 +2081,8 @@ enabled = false
             }
         );
         assert!(!manifest.feature.orchestration.enabled);
-        assert!(!manifest.feature.memory.enabled);
-        assert!(!manifest.feature.memory.staging);
+        assert!(!manifest.feature.memory.profile.enabled);
+        assert!(!manifest.feature.memory.profile.staging_tools);
         assert!(!manifest.feature.objective.enabled);
     }
 
@@ -2074,7 +2130,7 @@ readiness_check = true
 enabled = true
 
 [feature.memory]
-staging = true
+staging_tools = true
 
 [feature.manage_workdir]
 enabled = true
@@ -2111,8 +2167,8 @@ enabled = true
             })
             .try_into()
             .unwrap();
-        assert!(manifest.feature.memory.enabled);
-        assert!(manifest.feature.memory.staging);
+        assert!(manifest.feature.memory.profile.enabled);
+        assert!(manifest.feature.memory.profile.staging_tools);
         assert!(manifest.feature.manage_workdir.enabled);
         assert!(manifest.feature.ticket.enabled);
         assert!(!manifest.feature.ticket.authoring);

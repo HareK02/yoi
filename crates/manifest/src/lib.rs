@@ -47,6 +47,7 @@ use serde::{Deserialize, Serialize};
 /// part of the manifest — it is the process's `std::env::current_dir()`
 /// at construction time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerManifest {
     pub worker: WorkerMeta,
     pub model: ModelManifest,
@@ -80,11 +81,6 @@ pub struct WorkerManifest {
     pub mcp: McpConfig,
     #[serde(default)]
     pub compaction: Option<CompactionConfig>,
-    /// Memory subsystem configuration. Presence of `[memory]` configures memory
-    /// storage, extraction, consolidation, and resident injection, but memory
-    /// tools are surfaced only when `[feature.memory].enabled = true`.
-    #[serde(default)]
-    pub memory: Option<MemoryConfig>,
     /// First-class web tools configuration. Network access remains fail-closed
     /// under this config; WebSearch/WebFetch schemas are surfaced only when
     /// `[feature.web].enabled = true`.
@@ -109,12 +105,12 @@ pub struct WorkerManifest {
 /// profile/config data only: they do not carry runtime Worker names, sockets,
 /// sessions, secrets, or resolved host state. Tool registration still applies
 /// the normal scope, host-authority, backend, memory, and network checks.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FeatureConfig {
     #[serde(default)]
     pub task: FeatureFlagConfig,
     #[serde(default)]
-    pub memory: MemoryFeatureConfig,
+    pub memory: ResolvedMemoryFeatureConfig,
     #[serde(default)]
     pub web: FeatureFlagConfig,
     #[serde(default)]
@@ -147,7 +143,7 @@ impl Default for FeatureConfig {
     fn default() -> Self {
         Self {
             task: FeatureFlagConfig::disabled(),
-            memory: MemoryFeatureConfig::disabled(),
+            memory: ResolvedMemoryFeatureConfig::default(),
             web: FeatureFlagConfig::disabled(),
             image: FeatureFlagConfig::disabled(),
             sub_worker: FeatureFlagConfig::disabled(),
@@ -222,34 +218,117 @@ const fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MemoryFeatureConfig {
-    #[serde(default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryFeatureProfileConfig {
     pub enabled: bool,
     /// Exposes Memory staging queue tools in addition to normal Memory CRUD/query tools.
-    #[serde(default)]
-    pub staging: bool,
+    pub staging_tools: bool,
+    pub resident: MemoryResidentProfileConfig,
+    pub extraction: MemoryExtractionProfileConfig,
 }
 
-impl MemoryFeatureConfig {
-    pub const fn disabled() -> Self {
-        Self {
-            enabled: false,
-            staging: false,
-        }
+impl MemoryFeatureProfileConfig {
+    pub fn disabled() -> Self {
+        Self::default()
     }
 
-    pub const fn enabled() -> Self {
+    pub fn enabled() -> Self {
         Self {
             enabled: true,
-            staging: false,
+            ..Self::default()
         }
     }
 }
 
-impl Default for MemoryFeatureConfig {
+impl Default for MemoryFeatureProfileConfig {
     fn default() -> Self {
-        Self::disabled()
+        Self {
+            enabled: false,
+            staging_tools: false,
+            resident: MemoryResidentProfileConfig::default(),
+            extraction: MemoryExtractionProfileConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryResidentProfileConfig {
+    pub inject_summary: bool,
+}
+
+impl Default for MemoryResidentProfileConfig {
+    fn default() -> Self {
+        Self {
+            inject_summary: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryExtractionProfileConfig {
+    pub enabled: bool,
+    pub model: Option<ModelManifest>,
+    pub threshold: Option<u64>,
+    pub worker_max_turns: Option<u32>,
+}
+
+impl Default for MemoryExtractionProfileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: None,
+            threshold: Some(50_000),
+            worker_max_turns: defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS,
+        }
+    }
+}
+
+/// Immutable Memory execution configuration persisted in a resolved Worker Manifest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResolvedMemoryFeatureConfig {
+    pub profile: MemoryFeatureProfileConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_settings: Option<WorkspaceMemorySettingsSnapshot>,
+}
+
+impl ResolvedMemoryFeatureConfig {
+    pub fn enabled(&self) -> bool {
+        self.profile.enabled
+    }
+
+    pub fn bind_workspace_settings(
+        &mut self,
+        settings: WorkspaceMemorySettingsSnapshot,
+    ) -> Result<(), &'static str> {
+        if !self.profile.enabled {
+            if self.workspace_settings.is_some() {
+                return Err("disabled Memory feature must not carry Workspace settings");
+            }
+            return Ok(());
+        }
+        if self.workspace_settings.is_some() {
+            return Err("memory Workspace settings are already bound");
+        }
+        self.workspace_settings = Some(settings);
+        Ok(())
+    }
+
+    pub fn workspace_settings(&self) -> Option<WorkspaceMemorySettingsSnapshot> {
+        self.workspace_settings.clone()
+    }
+
+    pub fn validate_execution(&self) -> Result<(), &'static str> {
+        if self.profile.enabled && self.workspace_settings.is_none() {
+            return Err("enabled Memory feature requires trusted Workspace settings");
+        }
+        if !self.profile.enabled && self.workspace_settings.is_some() {
+            return Err("disabled Memory feature must not carry Workspace settings");
+        }
+        Ok(())
     }
 }
 
@@ -482,98 +561,6 @@ pub struct WorkspaceMemorySettingsSnapshot {
     pub settings_revision: u64,
     /// Normalized language used for Memory extraction and consolidation output.
     pub language: String,
-}
-
-/// Memory subsystem configuration. Presence in the manifest enables
-/// memory; `workspace_root` pins the memory workspace explicitly. When it
-/// is absent, memory resolution searches upward from the Worker's pwd for a
-/// `.yoi/memory` marker rather than treating `.yoi` project records alone
-/// as a memory root.
-///
-/// All fields are `Option`; defaults are applied at the consumer
-/// (`.unwrap_or(defaults::...)`). This keeps cascade `merge` simple
-/// (`upper.x.or(self.x)`) without a separate partial/resolved split.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MemoryConfig {
-    /// Override for the memory workspace root. When `None`, consumers resolve
-    /// the root from their default path and ancestor `.yoi/memory` markers.
-    /// When set, must be an absolute path.
-    #[serde(default)]
-    pub workspace_root: Option<PathBuf>,
-    /// Maximum number of records returned by `MemoryQuery` /
-    /// `MemoryQuery` per call. `None` ⇒ tool default (20).
-    #[serde(default)]
-    pub query_result_limit: Option<usize>,
-    /// Lines of context before and after each match in query excerpts.
-    /// Ignored when the request omits `query`. `None` ⇒ tool default (3).
-    #[serde(default)]
-    pub query_excerpt_lines: Option<usize>,
-    /// Whether the body of `memory/summary.md` is exposed in the resident
-    /// system-prompt section. `None` ⇒ enabled.
-    #[serde(default)]
-    pub inject_summary: Option<bool>,
-    /// Workspace that owns the bound Memory settings revision.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_id: Option<String>,
-    /// Monotonic revision of the bound Workspace Memory settings.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub settings_revision: Option<u64>,
-    /// Language from the bound Workspace Memory settings revision.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub language: Option<String>,
-    /// Optional model for the extract worker. When `None`,
-    /// the main engine model is cloned via `clone_boxed()`. Lightweight
-    /// reasoning-capable models (Haiku / 4o-mini / Flash class) are
-    /// recommended.
-    #[serde(default)]
-    pub extract_model: Option<ModelManifest>,
-    /// Cumulative input-token threshold (since the last extract pointer)
-    /// that triggers an extract run. `None` disables the extract trigger
-    /// entirely; memory tools and resident injection still work, only
-    /// the auto-extract trigger is dormant.
-    #[serde(default)]
-    pub extract_threshold: Option<u64>,
-    /// Optional maximum extract-worker tool-loop depth. `None` leaves
-    /// the worker unlimited; the default bounds runaway short-context
-    /// loops. Falls through to
-    /// [`defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS`] when unset.
-    #[serde(default)]
-    pub extract_worker_max_turns: Option<u32>,
-    /// Optional model for the consolidation worker. When
-    /// `None`, the main engine model is cloned via `clone_boxed()`.
-    /// Reasoning-class models are recommended.
-    #[serde(default)]
-    pub consolidation_model: Option<ModelManifest>,
-    /// Consolidation trigger: file-count threshold of `_staging/`. The
-    /// consolidation run fires when the staging directory has at least
-    /// this many entries. Either threshold reaching its limit fires
-    /// consolidation (logical OR). `None` for both thresholds ⇒
-    /// consolidation disabled.
-    #[serde(default)]
-    pub consolidation_threshold_files: Option<usize>,
-    /// Consolidation trigger: byte-size threshold across all `_staging/`
-    /// entries. Either threshold reaching its limit fires consolidation.
-    /// `None` for both thresholds ⇒ consolidation disabled.
-    #[serde(default)]
-    pub consolidation_threshold_bytes: Option<u64>,
-}
-
-impl MemoryConfig {
-    /// Replace any untrusted manifest values with a trusted Workspace snapshot.
-    pub fn bind_workspace_settings(&mut self, snapshot: &WorkspaceMemorySettingsSnapshot) {
-        self.workspace_id = Some(snapshot.workspace_id.clone());
-        self.settings_revision = Some(snapshot.settings_revision);
-        self.language = Some(snapshot.language.clone());
-    }
-
-    /// Return the complete bound Workspace settings snapshot, if every field is present.
-    pub fn workspace_settings(&self) -> Option<WorkspaceMemorySettingsSnapshot> {
-        Some(WorkspaceMemorySettingsSnapshot {
-            workspace_id: self.workspace_id.clone()?,
-            settings_revision: self.settings_revision?,
-            language: self.language.clone()?,
-        })
-    }
 }
 
 /// Worker metadata.
@@ -941,6 +928,167 @@ impl WorkerManifest {
     }
 }
 
+const RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION: u64 = 2;
+
+/// Serialize a resolved Worker Manifest for durable Worker-specific storage.
+pub fn write_persisted_worker_manifest_snapshot(
+    manifest: &WorkerManifest,
+) -> Result<serde_json::Value, serde_json::Error> {
+    Ok(serde_json::json!({
+        "schema_version": RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION,
+        "manifest": serde_json::to_value(manifest)?,
+    }))
+}
+
+/// Read a durable resolved Worker Manifest through the versioned compatibility
+/// boundary. Runtime code must not deserialize persisted snapshots directly.
+pub fn read_persisted_worker_manifest_snapshot(
+    snapshot: serde_json::Value,
+) -> Result<WorkerManifest, serde_json::Error> {
+    let object = snapshot.as_object().ok_or_else(|| {
+        serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "resolved Worker manifest snapshot must be an object",
+        ))
+    })?;
+    if let Some(version) = object.get("schema_version") {
+        let version = version.as_u64().ok_or_else(|| {
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "resolved Worker manifest snapshot schema_version must be an integer",
+            ))
+        })?;
+        if version != RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported resolved Worker manifest snapshot schema version {version}"),
+            )));
+        }
+        if object.len() != 2 {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "resolved Worker manifest snapshot contains unknown fields",
+            )));
+        }
+        let manifest = object.get("manifest").cloned().ok_or_else(|| {
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "resolved Worker manifest snapshot is missing manifest",
+            ))
+        })?;
+        return serde_json::from_value(manifest);
+    }
+
+    migrate_legacy_resolved_manifest_snapshot(snapshot)
+}
+
+fn migrate_legacy_resolved_manifest_snapshot(
+    mut snapshot: serde_json::Value,
+) -> Result<WorkerManifest, serde_json::Error> {
+    let root = snapshot.as_object_mut().ok_or_else(|| {
+        serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "legacy resolved Worker manifest snapshot must be an object",
+        ))
+    })?;
+    let legacy_memory = root.remove("memory");
+    let feature = root
+        .entry("feature")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "legacy resolved Worker manifest feature must be an object",
+            ))
+        })?;
+    let legacy_feature_memory = feature
+        .remove("memory")
+        .unwrap_or_else(|| serde_json::json!({}));
+    let legacy_feature_memory = legacy_feature_memory.as_object().ok_or_else(|| {
+        serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "legacy resolved Worker manifest feature.memory must be an object",
+        ))
+    })?;
+    if legacy_feature_memory
+        .keys()
+        .any(|key| !matches!(key.as_str(), "enabled" | "staging"))
+    {
+        return Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "legacy resolved Worker manifest mixes old and new Memory configuration",
+        )));
+    }
+    let enabled = legacy_feature_memory
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let staging_tools = legacy_feature_memory
+        .get("staging")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    let legacy_memory = legacy_memory.unwrap_or_else(|| serde_json::json!({}));
+    let legacy_memory = legacy_memory.as_object().ok_or_else(|| {
+        serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "legacy resolved Worker manifest memory must be an object",
+        ))
+    })?;
+    let workspace_id = legacy_memory.get("workspace_id").cloned();
+    let settings_revision = legacy_memory.get("settings_revision").cloned();
+    let language = legacy_memory.get("language").cloned();
+    let workspace_settings = match (workspace_id, settings_revision, language) {
+        (Some(workspace_id), Some(settings_revision), Some(language)) => Some(serde_json::json!({
+            "workspace_id": workspace_id,
+            "settings_revision": settings_revision,
+            "language": language,
+        })),
+        (None, None, None) => None,
+        _ => {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "legacy resolved Worker manifest contains a partial Memory settings snapshot",
+            )));
+        }
+    };
+    let extraction_threshold = legacy_memory
+        .get("extract_threshold")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let extraction_enabled = !extraction_threshold.is_null();
+    let mut resolved = serde_json::json!({
+        "profile": {
+            "enabled": enabled,
+            "staging_tools": staging_tools,
+            "resident": {
+                "inject_summary": legacy_memory
+                    .get("inject_summary")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+            },
+            "extraction": {
+                "enabled": extraction_enabled,
+                "model": legacy_memory.get("extract_model").cloned().unwrap_or(serde_json::Value::Null),
+                "threshold": extraction_threshold,
+                "worker_max_turns": legacy_memory
+                    .get("extract_worker_max_turns")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            },
+        },
+    });
+    if let Some(workspace_settings) = workspace_settings {
+        resolved
+            .as_object_mut()
+            .expect("resolved Memory config is an object")
+            .insert("workspace_settings".to_string(), workspace_settings);
+    }
+    feature.insert("memory".to_string(), resolved);
+    serde_json::from_value(snapshot)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1246,36 +1394,129 @@ model_id = "claude-sonnet-4-20250514"
     }
 
     #[test]
-    fn omitted_memory_is_none() {
+    fn omitted_memory_feature_is_disabled() {
         let manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
-        assert!(manifest.memory.is_none());
+        assert!(!manifest.feature.memory.profile.enabled);
+        assert!(manifest.feature.memory.workspace_settings.is_none());
     }
 
     #[test]
-    fn empty_memory_section_enables_with_default_root() {
-        let toml = format!("{MINIMAL_REQUIRED}\n[memory]\n");
+    fn resolved_memory_feature_requires_nested_profile_and_trusted_snapshot() {
+        let toml = format!(
+            "{MINIMAL_REQUIRED}\n\
+             [feature.memory.profile]\n\
+             enabled = true\n\
+             staging_tools = false\n\n\
+             [feature.memory.profile.resident]\n\
+             inject_summary = false\n\n\
+             [feature.memory.profile.extraction]\n\
+             enabled = true\n\
+             threshold = 42000\n\
+             worker_max_turns = 2\n\n\
+             [feature.memory.workspace_settings]\n\
+             workspace_id = \"workspace-1\"\n\
+             settings_revision = 7\n\
+             language = \"日本語\"\n"
+        );
         let manifest = WorkerManifest::from_toml(&toml).unwrap();
-        let mem = manifest.memory.expect("memory section parsed");
-        assert!(mem.workspace_root.is_none());
-        assert_eq!(mem.inject_summary, None);
-    }
-
-    #[test]
-    fn memory_section_with_inject_summary_false() {
-        let toml = format!("{MINIMAL_REQUIRED}\n[memory]\ninject_summary = false\n");
-        let manifest = WorkerManifest::from_toml(&toml).unwrap();
-        let mem = manifest.memory.unwrap();
-        assert_eq!(mem.inject_summary, Some(false));
-    }
-
-    #[test]
-    fn memory_section_with_explicit_root() {
-        let toml = format!("{MINIMAL_REQUIRED}\n[memory]\nworkspace_root = \"/some/where\"\n");
-        let manifest = WorkerManifest::from_toml(&toml).unwrap();
-        let mem = manifest.memory.unwrap();
+        assert!(manifest.feature.memory.profile.enabled);
+        assert!(!manifest.feature.memory.profile.resident.inject_summary);
         assert_eq!(
-            mem.workspace_root.unwrap(),
-            std::path::PathBuf::from("/some/where")
+            manifest.feature.memory.profile.extraction.threshold,
+            Some(42_000)
+        );
+        assert_eq!(
+            manifest
+                .feature
+                .memory
+                .workspace_settings()
+                .unwrap()
+                .language,
+            "日本語"
+        );
+    }
+
+    #[test]
+    fn resolved_memory_execution_validation_fails_closed() {
+        let snapshot = WorkspaceMemorySettingsSnapshot {
+            workspace_id: "workspace-1".to_string(),
+            settings_revision: 1,
+            language: "English".to_string(),
+        };
+        let mut enabled = ResolvedMemoryFeatureConfig::default();
+        enabled.profile.enabled = true;
+        assert!(enabled.validate_execution().is_err());
+        enabled.bind_workspace_settings(snapshot.clone()).unwrap();
+        assert!(enabled.validate_execution().is_ok());
+
+        let mut disabled = ResolvedMemoryFeatureConfig::default();
+        disabled.workspace_settings = Some(snapshot.clone());
+        assert!(disabled.validate_execution().is_err());
+        assert!(disabled.bind_workspace_settings(snapshot).is_err());
+    }
+
+    #[test]
+    fn current_manifest_rejects_legacy_top_level_memory_authority() {
+        let toml = format!("{MINIMAL_REQUIRED}\n[memory]\nlanguage = \"Japanese\"\n");
+        assert!(WorkerManifest::from_toml(&toml).is_err());
+    }
+
+    #[test]
+    fn persisted_manifest_adapter_migrates_legacy_memory_authority() {
+        let mut manifest =
+            serde_json::to_value(WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap()).unwrap();
+        manifest["feature"]["memory"] = serde_json::json!({
+            "enabled": true,
+            "staging": true,
+        });
+        manifest["memory"] = serde_json::json!({
+            "workspace_root": "/discarded",
+            "query_result_limit": 999,
+            "inject_summary": false,
+            "workspace_id": "workspace-1",
+            "settings_revision": 9,
+            "language": "Français",
+            "extract_threshold": 1234,
+            "extract_worker_max_turns": 3,
+            "consolidation_threshold_files": 99,
+        });
+
+        let migrated = read_persisted_worker_manifest_snapshot(manifest).unwrap();
+        assert!(migrated.feature.memory.profile.enabled);
+        assert!(migrated.feature.memory.profile.staging_tools);
+        assert!(!migrated.feature.memory.profile.resident.inject_summary);
+        assert_eq!(
+            migrated.feature.memory.profile.extraction.threshold,
+            Some(1234)
+        );
+        assert_eq!(
+            migrated
+                .feature
+                .memory
+                .workspace_settings()
+                .unwrap()
+                .language,
+            "Français"
+        );
+        let current = write_persisted_worker_manifest_snapshot(&migrated).unwrap();
+        assert_eq!(current["schema_version"], 2);
+        assert!(current["manifest"].get("memory").is_none());
+    }
+
+    #[test]
+    fn persisted_manifest_adapter_rejects_mixed_or_future_authority() {
+        let manifest =
+            serde_json::to_value(WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap()).unwrap();
+        let mut mixed = manifest.clone();
+        mixed["feature"]["memory"] = serde_json::json!({ "enabled": true, "profile": {} });
+        mixed["memory"] = serde_json::json!({});
+        assert!(read_persisted_worker_manifest_snapshot(mixed).is_err());
+        assert!(
+            read_persisted_worker_manifest_snapshot(serde_json::json!({
+                "schema_version": 3,
+                "manifest": manifest,
+            }))
+            .is_err()
         );
     }
 
@@ -1289,14 +1530,6 @@ model_id = "claude-sonnet-4-20250514"
         assert!(!is_normalized_workspace_memory_language(
             &"x".repeat(MAX_WORKSPACE_MEMORY_LANGUAGE_CHARS + 1)
         ));
-    }
-
-    #[test]
-    fn memory_section_with_language() {
-        let toml = format!("{MINIMAL_REQUIRED}\n[memory]\nlanguage = \"Japanese\"\n");
-        let manifest = WorkerManifest::from_toml(&toml).unwrap();
-        let mem = manifest.memory.unwrap();
-        assert_eq!(mem.language.as_deref(), Some("Japanese"));
     }
 
     #[test]
