@@ -104,13 +104,55 @@ impl BackgroundTaskSpec {
     }
 }
 
+#[derive(Clone)]
+pub struct BackgroundTaskGenerationFence {
+    expected: u64,
+    current: Arc<AtomicU64>,
+}
+
+impl BackgroundTaskGenerationFence {
+    pub fn generation(&self) -> u64 {
+        self.expected
+    }
+
+    pub fn ensure_current(&self) -> Result<(), HookError> {
+        if self.current.load(Ordering::Acquire) == self.expected {
+            Ok(())
+        } else {
+            Err(HookError::new(
+                HookErrorCategory::Cancelled,
+                "background task belongs to a stale Session generation",
+            ))
+        }
+    }
+}
+
+impl std::fmt::Debug for BackgroundTaskGenerationFence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BackgroundTaskGenerationFence")
+            .field("expected", &self.expected)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for BackgroundTaskGenerationFence {
+    fn eq(&self, other: &Self) -> bool {
+        self.expected == other.expected && Arc::ptr_eq(&self.current, &other.current)
+    }
+}
+
+impl Eq for BackgroundTaskGenerationFence {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackgroundTaskContext {
     pub invocation: HookInvocationContext,
     pub feature_id: FeatureId,
     pub task_name: String,
     pub execution_id: u64,
-    pub session_generation: u64,
+    /// Token that must be checked by any separately granted mutation handle
+    /// immediately before committing output derived by this task.
+    pub generation_fence: BackgroundTaskGenerationFence,
     pub attempt: u16,
 }
 
@@ -215,7 +257,7 @@ impl FeatureBackgroundTaskRegistryBuilder {
                 running: Mutex::new(BTreeMap::new()),
                 diagnostics: Mutex::new(Vec::new()),
                 next_execution_id: AtomicU64::new(1),
-                session_generation: AtomicU64::new(1),
+                session_generation: Arc::new(AtomicU64::new(1)),
                 accepting: AtomicBool::new(true),
             }),
         }
@@ -234,7 +276,7 @@ struct RegistryInner {
     running: Mutex<BTreeMap<u64, RunningTask>>,
     diagnostics: Mutex<Vec<BackgroundTaskDiagnostic>>,
     next_execution_id: AtomicU64,
-    session_generation: AtomicU64,
+    session_generation: Arc<AtomicU64>,
     accepting: AtomicBool,
 }
 
@@ -338,6 +380,15 @@ impl FeatureBackgroundTaskRegistry {
             .running
             .lock()
             .expect("background tasks poisoned");
+        // `shutdown()` flips accepting before taking this same lock. Recheck
+        // while holding the spawn/drain serialization boundary so a starter
+        // that passed the optimistic check cannot publish a task after drain.
+        if !self.inner.accepting.load(Ordering::Acquire) {
+            return Err(HookError::new(
+                HookErrorCategory::ScopeDisposed,
+                "background task scope is stopping",
+            ));
+        }
         running.retain(|_, running| !running.handle.is_finished());
         let active = running
             .values()
@@ -349,6 +400,10 @@ impl FeatureBackgroundTaskRegistry {
 
         let execution_id = self.inner.next_execution_id.fetch_add(1, Ordering::Relaxed);
         let session_generation = self.inner.session_generation.load(Ordering::Acquire);
+        let generation_fence = BackgroundTaskGenerationFence {
+            expected: session_generation,
+            current: Arc::clone(&self.inner.session_generation),
+        };
         let cancellation = BackgroundTaskCancellation::default();
         let task_cancellation = cancellation.clone();
         let task = Arc::clone(&registration.task);
@@ -366,17 +421,16 @@ impl FeatureBackgroundTaskRegistry {
                 task_feature_id.clone(),
                 task_task_name.clone(),
                 execution_id,
-                session_generation,
+                generation_fence.clone(),
                 task_cancellation,
             )
             .await;
             if let Some(inner) = weak_inner.upgrade() {
-                let outcome =
-                    if inner.session_generation.load(Ordering::Acquire) == session_generation {
-                        outcome
-                    } else {
-                        BackgroundTaskOutcome::StaleGenerationDiscarded
-                    };
+                let outcome = if generation_fence.ensure_current().is_ok() {
+                    outcome
+                } else {
+                    BackgroundTaskOutcome::StaleGenerationDiscarded
+                };
                 let mut diagnostics = inner.diagnostics.lock().expect("diagnostics poisoned");
                 diagnostics.push(BackgroundTaskDiagnostic {
                     execution_id,
@@ -546,7 +600,7 @@ async fn execute_task(
     feature_id: FeatureId,
     task_name: String,
     execution_id: u64,
-    session_generation: u64,
+    generation_fence: BackgroundTaskGenerationFence,
     cancellation: BackgroundTaskCancellation,
 ) -> (u16, BackgroundTaskOutcome) {
     let (max_attempts, delay_ms) = match spec.retry {
@@ -569,7 +623,7 @@ async fn execute_task(
             feature_id: feature_id.clone(),
             task_name: task_name.clone(),
             execution_id,
-            session_generation,
+            generation_fence: generation_fence.clone(),
             attempt,
         };
         let result =
@@ -738,6 +792,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_start_and_shutdown_leave_no_task_after_drain() {
+        for _ in 0..100 {
+            let feature = FeatureId::builtin("shutdown-race");
+            let declaration = BackgroundTaskDeclaration::worker_managed("race", "race");
+            let mut builder = FeatureBackgroundTaskRegistryBuilder::default();
+            builder
+                .register(
+                    feature.clone(),
+                    BackgroundTaskSpec::single_flight(declaration, Duration::from_secs(1)),
+                    WaitForCancellation,
+                )
+                .unwrap();
+            let registry = builder.build();
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            let start_registry = registry.clone();
+            let start_feature = feature.clone();
+            let start_gate = Arc::clone(&gate);
+            let starter = tokio::task::spawn_blocking(move || {
+                start_gate.wait();
+                start_registry.start(&start_feature, "race", invocation())
+            });
+
+            gate.wait();
+            registry.shutdown().await.unwrap();
+            let start_result = starter.await.unwrap();
+            assert!(matches!(
+                start_result,
+                Ok(BackgroundTaskStart::Started { .. })
+                    | Err(HookError {
+                        category: HookErrorCategory::ScopeDisposed,
+                        ..
+                    })
+            ));
+            assert!(registry.inner.running.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn cancellation_observed_when_cancel_races_with_wait_registration() {
         for _ in 0..100 {
             let cancellation = BackgroundTaskCancellation::default();
@@ -814,6 +906,10 @@ mod tests {
             )
             .unwrap();
         let registry = builder.build();
+        let stale_fence = BackgroundTaskGenerationFence {
+            expected: registry.inner.session_generation.load(Ordering::Acquire),
+            current: Arc::clone(&registry.inner.session_generation),
+        };
         registry
             .start(&feature, "generation", invocation())
             .unwrap();
@@ -822,6 +918,10 @@ mod tests {
         registry.before_session_rewrite().await.unwrap();
 
         assert_eq!(registry.inner.session_generation.load(Ordering::Acquire), 2);
+        assert_eq!(
+            stale_fence.ensure_current().unwrap_err().category,
+            HookErrorCategory::Cancelled
+        );
         assert_eq!(registry.diagnostics().len(), 1);
         assert_eq!(
             registry.diagnostics()[0].outcome,
