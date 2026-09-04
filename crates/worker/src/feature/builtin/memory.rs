@@ -23,7 +23,8 @@ use crate::feature::{
     ToolDeclaration,
 };
 use crate::worker::{
-    WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
+    SystemPromptContributionSource, WorkspaceClient, WorkspaceClientError, WorkspaceRequest,
+    WorkspaceRequestMethod,
 };
 
 #[derive(Clone, Debug)]
@@ -342,15 +343,44 @@ fn query_schema() -> serde_json::Value {
     })
 }
 
-pub struct MemoryFeatureInstallPlan {
-    pub module: MemoryToolsFeature,
-    pub resident_summary: Option<String>,
-    pub system_prompt_override: Option<String>,
+struct WorkspaceResidentSummarySource {
+    client: Arc<dyn WorkspaceClient>,
+}
+
+#[async_trait]
+impl SystemPromptContributionSource for WorkspaceResidentSummarySource {
+    async fn load(&self) -> Option<String> {
+        match self
+            .client
+            .execute_memory_backend_operation(
+                memory::backend::MemoryBackendOperation::ResidentSummary(
+                    memory::backend::MemoryResidentSummaryOperation::default(),
+                ),
+            )
+            .await
+        {
+            Ok(memory::backend::MemoryBackendOperationResult::ToolOutput(output)) => output.content,
+            Ok(other) => {
+                tracing::debug!(?other, "unexpected resident Memory Backend result");
+                None
+            }
+            Err(error) => {
+                tracing::debug!(%error, "resident Memory summary unavailable");
+                None
+            }
+        }
+    }
+}
+
+pub(crate) struct MemoryFeatureInstallPlan {
+    pub(crate) module: MemoryToolsFeature,
+    pub(crate) resident_summary_source: Option<Arc<dyn SystemPromptContributionSource>>,
+    pub(crate) system_prompt_override: Option<String>,
     pub(crate) resolved_config: manifest::ResolvedMemoryFeatureConfig,
 }
 
 impl MemoryFeatureInstallPlan {
-    pub async fn prepare(
+    pub fn prepare(
         manifest: &manifest::WorkerManifest,
         client: Arc<dyn WorkspaceClient>,
         prompts: Arc<crate::prompt::catalog::PromptCatalog>,
@@ -361,10 +391,9 @@ impl MemoryFeatureInstallPlan {
             prompts,
             manifest.profile.clone(),
         )
-        .await
     }
 
-    async fn prepare_resolved(
+    fn prepare_resolved(
         config: manifest::ResolvedMemoryFeatureConfig,
         client: Arc<dyn WorkspaceClient>,
         prompts: Arc<crate::prompt::catalog::PromptCatalog>,
@@ -405,30 +434,11 @@ impl MemoryFeatureInstallPlan {
             ));
         }
 
-        let resident_summary = if config.profile.resident.inject_summary {
-            match client
-                .execute_memory_backend_operation(
-                    memory::backend::MemoryBackendOperation::ResidentSummary(
-                        memory::backend::MemoryResidentSummaryOperation::default(),
-                    ),
-                )
-                .await
-            {
-                Ok(memory::backend::MemoryBackendOperationResult::ToolOutput(output)) => {
-                    output.content
-                }
-                Ok(other) => {
-                    tracing::debug!(?other, "unexpected resident Memory Backend result");
-                    None
-                }
-                Err(error) => {
-                    tracing::debug!(%error, "resident Memory summary unavailable");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let resident_summary_source = config.profile.resident.inject_summary.then(|| {
+            Arc::new(WorkspaceResidentSummarySource {
+                client: Arc::clone(&client),
+            }) as Arc<dyn SystemPromptContributionSource>
+        });
         let system_prompt_override = if memory_consolidation_worker {
             let language = settings.language;
             Some(
@@ -442,7 +452,7 @@ impl MemoryFeatureInstallPlan {
 
         Ok(Some(Self {
             module: MemoryToolsFeature::new(client, config.profile.staging_tools),
-            resident_summary,
+            resident_summary_source,
             system_prompt_override,
             resolved_config: config,
         }))
@@ -559,7 +569,6 @@ mod tests {
             prompts.clone(),
             None,
         )
-        .await
         .unwrap();
         assert!(disabled.is_none());
 
@@ -573,7 +582,6 @@ mod tests {
                 prompts.clone(),
                 None,
             )
-            .await
             .is_err()
         );
         enabled
@@ -592,7 +600,6 @@ mod tests {
                 prompts.clone(),
                 None,
             )
-            .await
             .is_err()
         );
         let plan = MemoryFeatureInstallPlan::prepare_resolved(
@@ -601,10 +608,9 @@ mod tests {
             prompts.clone(),
             None,
         )
-        .await
         .unwrap()
         .unwrap();
-        assert!(plan.resident_summary.is_none());
+        assert!(plan.resident_summary_source.is_none());
         assert!(plan.system_prompt_override.is_none());
 
         enabled.profile.resident.inject_summary = true;
@@ -614,14 +620,20 @@ mod tests {
             prompts,
             None,
         )
-        .await
         .unwrap()
         .unwrap();
-        assert_eq!(plan.resident_summary.as_deref(), Some("# Durable Memory"));
+        assert_eq!(
+            plan.resident_summary_source
+                .unwrap()
+                .load()
+                .await
+                .as_deref(),
+            Some("# Durable Memory")
+        );
     }
 
     #[tokio::test]
-    async fn memory_prompt_contribution_rereads_resident_summary_for_each_install() {
+    async fn memory_prompt_contribution_defers_resident_summary_until_loaded() {
         let prompts = crate::prompt::catalog::PromptCatalog::builtins_only().unwrap();
         let mut config = manifest::ResolvedMemoryFeatureConfig::default();
         config.profile.enabled = true;
@@ -639,7 +651,6 @@ mod tests {
             prompts.clone(),
             None,
         )
-        .await
         .unwrap()
         .unwrap();
         let restored = MemoryFeatureInstallPlan::prepare_resolved(
@@ -648,16 +659,25 @@ mod tests {
             prompts,
             None,
         )
-        .await
         .unwrap()
         .unwrap();
 
         assert_eq!(
-            first.resident_summary.as_deref(),
+            first
+                .resident_summary_source
+                .unwrap()
+                .load()
+                .await
+                .as_deref(),
             Some("first resident summary")
         );
         assert_eq!(
-            restored.resident_summary.as_deref(),
+            restored
+                .resident_summary_source
+                .unwrap()
+                .load()
+                .await
+                .as_deref(),
             Some("updated resident summary")
         );
     }
