@@ -1207,11 +1207,17 @@ impl RepositorySshAgent {
         working_directory_id: &str,
         access: &RepositorySshMaterializationAccess,
     ) -> Result<Self, WorkingDirectoryDiagnostic> {
-        let root = runtime_root.join(".repository-agents").join(format!(
-            "{}-{}",
-            sanitize_path_component(working_directory_id),
-            next_working_directory_id("agent")
-        ));
+        let mut digest = Sha256::new();
+        digest.update(working_directory_id.as_bytes());
+        digest.update([0]);
+        digest.update(next_working_directory_id("agent").as_bytes());
+        let agent_id = digest
+            .finalize()
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let root = runtime_root.join(".repository-agents").join(agent_id);
         fs::create_dir_all(&root).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
                 "working_directory_repository_agent_failed",
@@ -1862,11 +1868,20 @@ impl RepositoryCommandAccess {
         repository_id: &str,
         ssh: &RepositorySshMaterializationAccess,
     ) -> Result<Self, WorkingDirectoryDiagnostic> {
-        let root = runtime_root.join(REPOSITORY_ACCESS_DIR).join(format!(
-            "{}-{}",
-            sanitize_path_component(operation_id),
-            next_working_directory_id(repository_id)
-        ));
+        let mut digest = Sha256::new();
+        digest.update(operation_id.as_bytes());
+        digest.update([0]);
+        digest.update(repository_id.as_bytes());
+        digest.update([0]);
+        digest.update(next_working_directory_id("access").as_bytes());
+        let access_id = digest
+            .finalize()
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        // Keep operation-scoped Unix socket paths below sockaddr_un::sun_path on deep runtime roots.
+        let root = runtime_root.join(REPOSITORY_ACCESS_DIR).join(access_id);
         fs::create_dir_all(&root).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
                 "working_directory_repository_access_setup_failed",
