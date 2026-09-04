@@ -795,11 +795,291 @@ fn model_audit_from_manifest(model: &manifest::ModelManifest) -> memory::audit::
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use agen::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
+    use agen::llm_client::{ClientError, Request};
     use agen::{HistoryEntry, Item, UsageRecord};
+    use futures::Stream;
 
     use super::*;
+    use crate::feature::background::FeatureBackgroundTaskRegistryBuilder;
     use crate::feature::background::{BackgroundTaskRewritePolicy, BackgroundTaskShutdownPolicy};
+    use crate::feature::session::CommittedSessionLocation;
+    use crate::hook::HookInvocationContext;
     use crate::session_history::SessionHistoryMetadata;
+
+    #[derive(Debug, Default)]
+    struct RecordingWorkspaceClient {
+        requests: Mutex<Vec<crate::worker::WorkspaceRequest>>,
+    }
+
+    impl WorkspaceClient for RecordingWorkspaceClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace-1")
+        }
+
+        fn kind(&self) -> &str {
+            "memory-lifecycle-test"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: crate::worker::WorkspaceRequest,
+        ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
+            self.requests.lock().unwrap().push(request);
+            Err(crate::worker::WorkspaceClientError::Unavailable(
+                "recording client".to_string(),
+            ))
+        }
+    }
+
+    #[derive(Clone)]
+    struct ScriptClient {
+        responses: Arc<Vec<Vec<LlmEvent>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ScriptClient {
+        fn new(responses: Vec<Vec<LlmEvent>>) -> Self {
+            Self {
+                responses: Arc::new(responses),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for ScriptClient {
+        fn clone_boxed(&self) -> Box<dyn LlmClient> {
+            Box::new(self.clone())
+        }
+
+        async fn stream(
+            &self,
+            _request: Request,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, ClientError>> + Send>>, ClientError>
+        {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            let events = self.responses.get(index).cloned().ok_or_else(|| {
+                ClientError::Config("memory lifecycle test client exhausted".to_string())
+            })?;
+            Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+        }
+    }
+
+    fn finish_empty_events(call_id: &str) -> Vec<LlmEvent> {
+        vec![
+            LlmEvent::tool_use_start(0, call_id, "FinishMemoryExtraction"),
+            LlmEvent::tool_input_delta(
+                0,
+                serde_json::json!({
+                    "staged_count": 0,
+                    "no_candidates_reason": "no durable candidates"
+                })
+                .to_string(),
+            ),
+            LlmEvent::tool_use_stop(0),
+            LlmEvent::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ]
+    }
+
+    fn completed_events() -> Vec<LlmEvent> {
+        vec![
+            LlmEvent::text_block_start(0),
+            LlmEvent::text_delta(0, "done"),
+            LlmEvent::text_block_stop(0, None),
+            LlmEvent::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ]
+    }
+
+    fn test_manifest() -> WorkerManifest {
+        WorkerManifest::from_toml(
+            r#"
+[worker]
+name = "memory-lifecycle-test"
+scope = "main"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[engine]
+
+[[scope.allow]]
+target = "/memory-lifecycle-test"
+permission = "write"
+"#,
+        )
+        .unwrap()
+    }
+
+    fn test_config() -> manifest::MemoryConfig {
+        let mut config = manifest::MemoryConfig {
+            extract_threshold: Some(1),
+            ..Default::default()
+        };
+        config.bind_workspace_settings(&manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: "workspace-1".to_string(),
+            settings_revision: 1,
+            language: "English".to_string(),
+        });
+        config
+    }
+
+    fn test_task(
+        capture: CommittedSessionCapture,
+        client: ScriptClient,
+        extension_writes: Arc<Mutex<Vec<(CommittedSessionLocation, String, serde_json::Value)>>>,
+        event_tx: broadcast::Sender<Event>,
+        workspace_client: Arc<dyn WorkspaceClient>,
+    ) -> MemoryLifecycleTask {
+        let capture_handle = CommittedSessionCaptureHandle::new(move || Ok(capture.clone()));
+        let extensions = SessionExtensionHandle::new(move |location, domain, payload| {
+            extension_writes
+                .lock()
+                .unwrap()
+                .push((location.clone(), domain.to_string(), payload));
+            Ok(true)
+        });
+        MemoryLifecycleTask {
+            config: test_config(),
+            capture: capture_handle,
+            extensions,
+            workspace_client,
+            manifest: test_manifest(),
+            client: Box::new(client),
+            prompts: Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),
+            workspace_context: WorkerWorkspaceContext::no_workspace(),
+            event_tx: Some(event_tx),
+        }
+    }
+
+    async fn run_background_task(task: MemoryLifecycleTask) {
+        let mut builder = FeatureBackgroundTaskRegistryBuilder::default();
+        builder
+            .register(
+                crate::feature::FeatureId::builtin("memory-lifecycle"),
+                memory_lifecycle_task_spec(),
+                task,
+            )
+            .unwrap();
+        let registry = builder.build();
+        registry
+            .start_run_committed(HookInvocationContext {
+                worker_id: "worker-1".to_string(),
+                session_id: "session-1".to_string(),
+                session_revision: 1,
+                run_id: Some("run-1".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !registry.diagnostics().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("memory lifecycle background task should finish");
+        registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_committed_background_task_finishes_empty_extraction_and_commits_pointer() {
+        let client = ScriptClient::new(vec![finish_empty_events("finish-1"), completed_events()]);
+        let calls = Arc::clone(&client.calls);
+        let extension_writes = Arc::new(Mutex::new(Vec::new()));
+        let (event_tx, _) = broadcast::channel(16);
+        let workspace_client: Arc<dyn WorkspaceClient> =
+            Arc::new(RecordingWorkspaceClient::default());
+        run_background_task(test_task(
+            capture(2, 250),
+            client,
+            Arc::clone(&extension_writes),
+            event_tx,
+            workspace_client,
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let writes = extension_writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].1, extract::EXTRACT_DOMAIN);
+        let pointer: memory::ExtractPointerPayload =
+            serde_json::from_value(writes[0].2.clone()).unwrap();
+        assert_eq!(pointer.processed_through_history_len, 2);
+        assert_eq!(pointer.processed_through_entry, 1);
+    }
+
+    #[tokio::test]
+    async fn interrupted_committed_run_skips_internal_worker_and_pointer_commit() {
+        let client = ScriptClient::new(Vec::new());
+        let calls = Arc::clone(&client.calls);
+        let extension_writes = Arc::new(Mutex::new(Vec::new()));
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+        let workspace_client: Arc<dyn WorkspaceClient> =
+            Arc::new(RecordingWorkspaceClient::default());
+        let mut interrupted = capture(2, 250);
+        interrupted.run_exit = CommittedRunExit::Interrupted;
+        run_background_task(test_task(
+            interrupted,
+            client,
+            Arc::clone(&extension_writes),
+            event_tx,
+            workspace_client,
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(extension_writes.lock().unwrap().is_empty());
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            matches!(event, Event::MemoryWorker(event) if event.reason.contains("parent_run_not_finished"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_task_requests_backend_consolidation_from_configured_threshold() {
+        let client = ScriptClient::new(Vec::new());
+        let extension_writes = Arc::new(Mutex::new(Vec::new()));
+        let (event_tx, _) = broadcast::channel(16);
+        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
+        let mut interrupted = capture(2, 250);
+        interrupted.run_exit = CommittedRunExit::Interrupted;
+        let mut task = test_task(
+            interrupted,
+            client,
+            extension_writes,
+            event_tx,
+            workspace_client.clone(),
+        );
+        task.config.consolidation_threshold_files = Some(3);
+        run_background_task(task).await;
+
+        let requests = workspace_client.requests.lock().unwrap();
+        assert!(
+            requests.iter().any(|request| {
+                request.path.contains("memory")
+                    && request.body.as_deref().is_some_and(|body| {
+                        body.contains("\"threshold_files\":3") && body.contains("\"force\":false")
+                    })
+            }),
+            "recorded requests: {requests:?}"
+        );
+    }
 
     fn internal_result(
         lifecycle: WorkerRunResult,
