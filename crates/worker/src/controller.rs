@@ -901,43 +901,6 @@ pub(crate) fn wire_event_bridges_on_engine<C, St>(
     // per-item commit channel is wired at the top of this function.
 }
 
-fn add_memory_tools_if_configured<M>(
-    registry: &mut FeatureRegistryBuilder,
-    config: &manifest::ResolvedMemoryFeatureConfig,
-    build: impl FnOnce() -> std::io::Result<M>,
-) -> std::io::Result<bool>
-where
-    M: crate::feature::FeatureModule + 'static,
-{
-    if !config.profile.enabled {
-        return Ok(false);
-    }
-    config
-        .validate_execution()
-        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
-    registry.add_module(build()?);
-    Ok(true)
-}
-
-fn add_memory_lifecycle_if_configured<M>(
-    registry: &mut FeatureRegistryBuilder,
-    config: manifest::ResolvedMemoryFeatureConfig,
-    lifecycle_enabled: bool,
-    build: impl FnOnce(manifest::ResolvedMemoryFeatureConfig) -> std::io::Result<M>,
-) -> std::io::Result<bool>
-where
-    M: crate::feature::FeatureModule + 'static,
-{
-    if !lifecycle_enabled || !config.profile.enabled || !config.profile.extraction.enabled {
-        return Ok(false);
-    }
-    config
-        .validate_execution()
-        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
-    registry.add_module(build(config)?);
-    Ok(true)
-}
-
 /// Register the builtin file-manipulation tools, optional memory tools,
 /// and the Worker-orchestration tools (SubWorkerSpawn + comm) on the Worker's
 /// Engine. Returns the WorkdirSession handle used to attach a `WorkerFsView` to
@@ -974,7 +937,6 @@ where
     let local_filesystem = worker.local_working_directory().cloned();
     let local_workspace_root = local_filesystem.as_ref().map(|local| local.root.clone());
     let task_feature = worker.task_feature();
-    let memory_config = feature_config.memory.clone();
     let web_config = worker.manifest().web.clone();
     let mcp_config = worker.manifest().mcp.clone();
     let spawner_name = worker.manifest().worker.name.clone();
@@ -1031,46 +993,41 @@ where
     let worker_enabled = feature_config.worker.enabled;
     let sub_worker_enabled = feature_config.sub_worker.enabled;
     let mut feature_registry = FeatureRegistryBuilder::new();
-    add_memory_tools_if_configured(&mut feature_registry, &memory_config, || {
-        let workspace_client = worker.workspace_client_handle();
-        if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Memory tools require Backend Workspace API authority",
-            ));
-        }
-        Ok(crate::feature::builtin::memory::MemoryToolsFeature::new(
-            workspace_client,
-            memory_config.profile.staging_tools,
-        ))
-    })?;
-    add_memory_lifecycle_if_configured(
-        &mut feature_registry,
-        memory_config.clone(),
-        worker.manifest_lifecycle_features_enabled(),
-        |config| {
-            let workspace_client = worker.workspace_client_handle();
-            if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Memory extraction requires Backend Workspace API authority",
-                ));
-            }
-            Ok(
-                crate::feature::builtin::memory_lifecycle::MemoryLifecycleFeature::new(
-                    config,
-                    worker.committed_session_capture_handle(),
-                    worker.session_extension_handle(),
-                    workspace_client,
-                    spawner_manifest.clone(),
-                    worker.llm_client_handle(),
-                    prompts.clone(),
-                    spawner_workspace_context.clone(),
-                    worker.working_event_sender(),
-                ),
-            )
-        },
-    )?;
+    let memory_install_plan = crate::feature::builtin::memory::MemoryFeatureInstallPlan::prepare(
+        worker.manifest(),
+        worker.workspace_client_handle(),
+        worker.prompts().load_full(),
+    )
+    .await?;
+    let memory_prompt_contribution = memory_install_plan.as_ref().map(|plan| {
+        (
+            plan.resident_summary.clone(),
+            plan.system_prompt_override.clone(),
+        )
+    });
+    let memory_lifecycle_config = memory_install_plan
+        .as_ref()
+        .map(|plan| plan.resolved_config.clone());
+    if let Some(plan) = memory_install_plan {
+        feature_registry.add_module(plan.module);
+    }
+    if let Some(memory_config) = memory_lifecycle_config
+        && let Some(memory_lifecycle) =
+            crate::feature::builtin::memory_lifecycle::MemoryLifecycleFeature::from_resolved_config(
+                worker.manifest_lifecycle_features_enabled(),
+                memory_config,
+                worker.committed_session_capture_handle(),
+                worker.session_extension_handle(),
+                worker.workspace_client_handle(),
+                spawner_manifest.clone(),
+                worker.llm_client_handle(),
+                prompts.clone(),
+                spawner_workspace_context.clone(),
+                worker.working_event_sender(),
+            )?
+    {
+        feature_registry.add_module(memory_lifecycle);
+    }
     if sub_worker_enabled && !worker_enabled {
         feature_registry.add_module(
             crate::feature::builtin::manage_worker::sub_worker_control_feature(
@@ -1278,6 +1235,9 @@ where
                 feature_install_report.error_message()
             ),
         ));
+    }
+    if let Some((resident_summary, system_prompt_override)) = memory_prompt_contribution {
+        worker.install_system_prompt_contribution(resident_summary, system_prompt_override);
     }
     if let Some(tracker) = tracker {
         worker.attach_tracker(tracker);
@@ -2157,117 +2117,6 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::net::UnixListener;
-
-    #[test]
-    fn memory_feature_registration_requires_bound_workspace_memory_config() {
-        #[derive(Clone)]
-        struct TestMemoryLifecycleModule;
-
-        impl crate::feature::FeatureModule for TestMemoryLifecycleModule {
-            fn descriptor(&self) -> crate::feature::FeatureDescriptor {
-                crate::feature::FeatureDescriptor::builtin(
-                    "test-memory-lifecycle",
-                    "Test Memory Lifecycle",
-                )
-            }
-
-            fn install(
-                &self,
-                _context: &mut crate::feature::FeatureInstallContext<'_>,
-            ) -> Result<(), crate::feature::FeatureInstallError> {
-                Ok(())
-            }
-        }
-
-        let mut registry = FeatureRegistryBuilder::new();
-        let installed = add_memory_tools_if_configured::<TestMemoryLifecycleModule>(
-            &mut registry,
-            &manifest::ResolvedMemoryFeatureConfig::default(),
-            || panic!("disabled Memory must not construct its tools Feature"),
-        )
-        .unwrap();
-        assert!(!installed);
-
-        let mut missing_snapshot = manifest::ResolvedMemoryFeatureConfig::default();
-        missing_snapshot.profile.enabled = true;
-        let error = add_memory_tools_if_configured::<TestMemoryLifecycleModule>(
-            &mut registry,
-            &missing_snapshot,
-            || panic!("invalid Memory config must fail before tools Feature construction"),
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("requires trusted Workspace settings")
-        );
-
-        let mut registry = FeatureRegistryBuilder::new();
-        let configured = std::cell::Cell::new(false);
-        let mut memory_config = manifest::ResolvedMemoryFeatureConfig::default();
-        memory_config.profile.enabled = true;
-        memory_config.profile.extraction.enabled = true;
-        memory_config
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
-                workspace_id: "workspace-1".to_string(),
-                settings_revision: 1,
-                language: "English".to_string(),
-            })
-            .unwrap();
-        let installed =
-            add_memory_lifecycle_if_configured(&mut registry, memory_config, true, |_| {
-                configured.set(true);
-                Ok(TestMemoryLifecycleModule)
-            })
-            .unwrap();
-        assert!(installed);
-        assert!(configured.get());
-
-        let mut registry = FeatureRegistryBuilder::new();
-        let installed = add_memory_lifecycle_if_configured::<TestMemoryLifecycleModule>(
-            &mut registry,
-            manifest::ResolvedMemoryFeatureConfig::default(),
-            true,
-            |_| panic!("disabled Memory must not construct its lifecycle Feature"),
-        )
-        .unwrap();
-        assert!(!installed);
-
-        let mut lifecycle_disabled = manifest::ResolvedMemoryFeatureConfig::default();
-        lifecycle_disabled.profile.enabled = true;
-        lifecycle_disabled.profile.extraction.enabled = true;
-        lifecycle_disabled
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
-                workspace_id: "workspace-1".to_string(),
-                settings_revision: 1,
-                language: "English".to_string(),
-            })
-            .unwrap();
-        let installed = add_memory_lifecycle_if_configured::<TestMemoryLifecycleModule>(
-            &mut registry,
-            lifecycle_disabled,
-            false,
-            |_| panic!("disabled lifecycle must not construct its Feature"),
-        )
-        .unwrap();
-        assert!(!installed);
-
-        let mut missing_snapshot = manifest::ResolvedMemoryFeatureConfig::default();
-        missing_snapshot.profile.enabled = true;
-        missing_snapshot.profile.extraction.enabled = true;
-        let error = add_memory_lifecycle_if_configured::<TestMemoryLifecycleModule>(
-            &mut registry,
-            missing_snapshot,
-            true,
-            |_| panic!("invalid Workspace Memory config must fail before Feature construction"),
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("requires trusted Workspace settings")
-        );
-    }
 
     #[test]
     fn image_attachment_gate_requires_vision_and_supported_openai_scheme() {

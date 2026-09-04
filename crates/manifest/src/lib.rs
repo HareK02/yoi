@@ -328,6 +328,12 @@ impl ResolvedMemoryFeatureConfig {
         if !self.profile.enabled && self.workspace_settings.is_some() {
             return Err("disabled Memory feature must not carry Workspace settings");
         }
+        if let Some(settings) = &self.workspace_settings
+            && (settings.settings_revision == 0
+                || !is_normalized_workspace_memory_language(&settings.language))
+        {
+            return Err("Memory Workspace settings snapshot metadata is invalid");
+        }
         Ok(())
     }
 }
@@ -918,6 +924,12 @@ impl Default for CompactionConfig {
 }
 
 impl WorkerManifest {
+    pub fn requires_persisted_execution_snapshot(&self) -> bool {
+        self.profile.is_some()
+            || self.plugins.has_resolved_plan()
+            || self.feature.memory.workspace_settings.is_some()
+    }
+
     /// Parse a manifest from a TOML string.
     pub fn from_toml(s: &str) -> Result<Self, toml::de::Error> {
         config::reject_removed_manifest_fields(s)?;

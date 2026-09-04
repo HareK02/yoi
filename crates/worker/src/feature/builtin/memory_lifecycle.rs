@@ -65,6 +65,44 @@ struct MemoryLifecycleTask {
 
 impl MemoryLifecycleFeature {
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_resolved_config(
+        lifecycle_enabled: bool,
+        config: manifest::ResolvedMemoryFeatureConfig,
+        capture: CommittedSessionCaptureHandle,
+        extensions: SessionExtensionHandle,
+        workspace_client: Arc<dyn WorkspaceClient>,
+        manifest: WorkerManifest,
+        client: Box<dyn LlmClient>,
+        prompts: Arc<ArcSwap<PromptCatalog>>,
+        workspace_context: WorkerWorkspaceContext,
+        event_tx: Option<broadcast::Sender<Event>>,
+    ) -> std::io::Result<Option<Self>> {
+        if !lifecycle_enabled || !config.profile.enabled || !config.profile.extraction.enabled {
+            return Ok(None);
+        }
+        config
+            .validate_execution()
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+        if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Memory extraction requires Backend Workspace API authority",
+            ));
+        }
+        Ok(Some(Self::new(
+            config,
+            capture,
+            extensions,
+            workspace_client,
+            manifest,
+            client,
+            prompts,
+            workspace_context,
+            event_tx,
+        )))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: manifest::ResolvedMemoryFeatureConfig,
         capture: CommittedSessionCaptureHandle,
@@ -1452,8 +1490,12 @@ permission = "write"
             );
         }
         let controller_source = include_str!("../../controller.rs");
-        assert!(controller_source.contains("add_memory_lifecycle_if_configured"));
-        assert!(controller_source.contains("MemoryLifecycleFeature::new"));
+        assert!(controller_source.contains("MemoryFeatureInstallPlan::prepare"));
+        assert!(controller_source.contains("MemoryLifecycleFeature::from_resolved_config"));
+        let worker_production = worker_source.split("#[cfg(test)]").next().unwrap();
+        let controller_production = controller_source.split("#[cfg(test)]").next().unwrap();
+        assert!(!worker_production.contains(".feature.memory"));
+        assert!(!controller_production.contains(".feature.memory"));
         let lifecycle_source = include_str!("memory_lifecycle.rs");
         assert!(lifecycle_source.contains("request_memory_staging_consolidation"));
         let internal_worker_source = include_str!("../../internal_worker.rs");

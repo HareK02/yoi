@@ -227,8 +227,8 @@ permission = "write"
 # Profile由来の設定を `profile` に、Backend由来のWorkspace設定snapshotを
 # `workspace_settings` に分離して保存する。`workspace_settings` はBackendだけが
 # bindする信頼済み入力で、Profile・Browser・model入力から指定できない。
-# `profile.enabled = false` の場合、Memory tools、resident injection、extract、
-# consolidation requestをすべて無効にし、snapshotも保持しない。
+# `profile.enabled = false` の場合、Memory tools、Feature prompt contributionによる
+# resident injection、extract、consolidation requestをすべて無効にし、snapshotも保持しない。
 #
 # [feature.memory.profile]
 # enabled = true

@@ -1228,10 +1228,12 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// [`Self::from_manifest`], or defaults to the builtin pack when a
     /// Worker is constructed through lower-level paths that have no loader.
     prompts: Arc<ArcSwap<PromptCatalog>>,
-    /// When true (default), the system-prompt assembler may append resident
-    /// context from the workspace Memory document. Internal disposable
-    /// workers disable this so resident memory exposure is opt-in per Worker.
+    /// Test/internal policy gate for installed resident prompt contributions.
     inject_resident_summary: bool,
+    /// Materialized resident prompt context installed by an enabled Feature.
+    feature_resident_summary: Option<String>,
+    /// Complete system prompt replacement installed by an enabled Feature.
+    feature_system_prompt_override: Option<String>,
     /// Typed user submissions in submit order. K-th entry corresponds to
     /// the K-th `Item::user_message` in `worker.history()` (modulo seed
     /// history loaded via `AnnotatedSegmentStart.history`, whose original segments
@@ -1450,6 +1452,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             runtime_ticket_role: None,
             prompts,
             inject_resident_summary: true,
+            feature_resident_summary: None,
+            feature_system_prompt_override: None,
             user_segments: Vec::new(),
             sink: SegmentLogSink::new(),
             history_persistence_wired: false,
@@ -1487,9 +1491,18 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.inject_resident_summary = enabled;
     }
 
-    /// Toggle workspace Memory document resident injection in the system prompt.
+    /// Internal/test gate for installed resident prompt contributions.
     pub fn set_resident_summary_injection(&mut self, enabled: bool) {
         self.inject_resident_summary = enabled;
+    }
+
+    pub(crate) fn install_system_prompt_contribution(
+        &mut self,
+        resident_summary: Option<String>,
+        system_prompt_override: Option<String>,
+    ) {
+        self.feature_resident_summary = resident_summary;
+        self.feature_system_prompt_override = system_prompt_override;
     }
 
     pub fn prompts(&self) -> Arc<ArcSwap<PromptCatalog>> {
@@ -1623,25 +1636,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
 
     pub(crate) fn worker_observation_provider(&self) -> Option<Arc<dyn WorkerObservationProvider>> {
         self.worker_observation_provider.clone()
-    }
-
-    async fn resident_summary_from_workspace_authority(
-        &self,
-    ) -> Result<Option<String>, WorkerError> {
-        let result = self
-            .workspace_client()
-            .execute_memory_backend_operation(
-                memory::backend::MemoryBackendOperation::ResidentSummary(
-                    memory::backend::MemoryResidentSummaryOperation::default(),
-                ),
-            )
-            .await?;
-        match result {
-            memory::backend::MemoryBackendOperationResult::ToolOutput(output) => Ok(output.content),
-            other => Err(WorkerError::FeatureInstall(format!(
-                "unexpected memory backend result for resident summary: {other:?}"
-            ))),
-        }
     }
 
     /// Activate an Agent Skill through the Workspace backend/client and commit
@@ -2467,26 +2461,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let Some(template) = self.system_prompt_template.take() else {
             return Ok(());
         };
-        let is_memory_consolidation = self.manifest.profile.as_ref().is_some_and(|snapshot| {
-            matches!(
-                &snapshot.source,
-                manifest::ProfileSource::Registry {
-                    source: manifest::ProfileRegistrySource::Builtin,
-                    name,
-                    ..
-                } if name == "memory-consolidation"
-            )
-        });
-        if is_memory_consolidation {
-            let memory_config = &self.manifest.feature.memory;
-            memory_config
-                .validate_execution()
-                .map_err(|message| WorkerError::InvalidState(message.to_string()))?;
-            let language = memory_language(memory_config)?;
-            let rendered = self
-                .prompts
-                .load_full()
-                .memory_consolidation_system(&language)?;
+        if let Some(rendered) = self.feature_system_prompt_override.take() {
             self.engine
                 .as_mut()
                 .expect("worker present")
@@ -2515,20 +2490,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 }
             }
         }
-        let inject_summary = self.inject_resident_summary
-            && self.manifest.feature.memory.profile.enabled
-            && self.manifest.feature.memory.profile.resident.inject_summary;
-        let resident_summary: Option<String> = if inject_summary {
-            match self.resident_summary_from_workspace_authority().await {
-                Ok(summary) => summary,
-                Err(error) => {
-                    tracing::debug!(%error, "resident memory summary unavailable");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let resident_summary = self
+            .inject_resident_summary
+            .then(|| self.feature_resident_summary.clone())
+            .flatten();
         let worker_language = worker_language(&self.manifest.engine);
         let scope_snapshot = self.scope.snapshot();
         let cwd_for_prompt = self
@@ -4548,17 +4513,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     }
 }
 
-fn memory_language(config: &manifest::ResolvedMemoryFeatureConfig) -> Result<String, WorkerError> {
-    config
-        .workspace_settings()
-        .map(|snapshot| snapshot.language)
-        .ok_or_else(|| {
-            WorkerError::InvalidState(
-                "Memory is enabled without a bound Workspace Memory settings snapshot".to_string(),
-            )
-        })
-}
-
 fn worker_language(cfg: &manifest::EngineManifest) -> &str {
     let language = cfg.language.trim();
     if language.is_empty() {
@@ -4623,7 +4577,6 @@ where
         filesystem_authority: WorkerFilesystemAuthority,
         model_client: Option<Box<dyn LlmClient>>,
     ) -> Result<Self, WorkerError> {
-        validate_workspace_memory_snapshot(&manifest.worker.name, &manifest, &workspace_context)?;
         let common = prepare_worker_common_with_context_and_model_client(
             &manifest,
             &loader,
@@ -4708,6 +4661,8 @@ where
             runtime_ticket_role: None,
             prompts: common.prompts,
             inject_resident_summary: true,
+            feature_resident_summary: None,
+            feature_system_prompt_override: None,
             user_segments: Vec::new(),
             sink: SegmentLogSink::new(),
             history_persistence_wired: false,
@@ -4790,6 +4745,8 @@ where
             runtime_ticket_role: None,
             prompts: common.prompts,
             inject_resident_summary: true,
+            feature_resident_summary: None,
+            feature_system_prompt_override: None,
             user_segments: Vec::new(),
             sink: SegmentLogSink::new(),
             history_persistence_wired: false,
@@ -4836,7 +4793,6 @@ where
         workspace_context: WorkerWorkspaceContext,
         filesystem_authority: WorkerFilesystemAuthority,
     ) -> Result<Self, WorkerError> {
-        validate_workspace_memory_snapshot(&manifest.worker.name, &manifest, &workspace_context)?;
         let common = prepare_worker_common_with_context(
             &manifest,
             &loader,
@@ -4907,6 +4863,8 @@ where
             runtime_ticket_role: None,
             prompts: common.prompts,
             inject_resident_summary: true,
+            feature_resident_summary: None,
+            feature_system_prompt_override: None,
             user_segments: Vec::new(),
             sink: SegmentLogSink::new(),
             history_persistence_wired: false,
@@ -5280,6 +5238,8 @@ where
             runtime_ticket_role: None,
             prompts: common.prompts,
             inject_resident_summary: true,
+            feature_resident_summary: None,
+            feature_system_prompt_override: None,
             user_segments: state.user_segments,
             // Seed the mirror with the entries we just replayed so a
             // late-attaching client sees the full prefix without an
@@ -5428,54 +5388,8 @@ fn worker_metadata_for_manifest(
     metadata
 }
 
-fn validate_workspace_memory_snapshot(
-    worker_name: &str,
-    manifest: &WorkerManifest,
-    workspace_context: &WorkerWorkspaceContext,
-) -> Result<(), WorkerError> {
-    let Some(workspace_id) = workspace_context.workspace_id() else {
-        return Ok(());
-    };
-    manifest
-        .feature
-        .memory
-        .validate_execution()
-        .map_err(|message| {
-            WorkerError::InvalidState(format!("Workspace Worker {worker_name}: {message}"))
-        })?;
-    if !manifest.feature.memory.profile.enabled {
-        return Ok(());
-    }
-    let snapshot = manifest
-        .feature
-        .memory
-        .workspace_settings()
-        .ok_or_else(|| {
-            WorkerError::InvalidState(format!(
-                "Workspace Worker {worker_name} has no complete persisted Memory settings snapshot"
-            ))
-        })?;
-    if snapshot.workspace_id != workspace_id.as_str() {
-        return Err(WorkerError::InvalidState(format!(
-            "Workspace Worker {worker_name} Memory settings belong to {} instead of {}",
-            snapshot.workspace_id,
-            workspace_id.as_str()
-        )));
-    }
-    if snapshot.settings_revision == 0
-        || !manifest::is_normalized_workspace_memory_language(&snapshot.language)
-    {
-        return Err(WorkerError::InvalidState(format!(
-            "Workspace Worker {worker_name} has corrupt Memory settings snapshot metadata"
-        )));
-    }
-    Ok(())
-}
-
 fn should_persist_resolved_manifest_snapshot(manifest: &WorkerManifest) -> bool {
-    manifest.profile.is_some()
-        || manifest.plugins.has_resolved_plan()
-        || manifest.feature.memory.workspace_settings.is_some()
+    manifest.requires_persisted_execution_snapshot()
 }
 
 fn restore_manifest_from_worker_metadata_snapshot(
@@ -6565,7 +6479,7 @@ permission = "write"
     }
 
     #[test]
-    fn workspace_memory_settings_snapshot_is_persisted_and_scope_checked() {
+    fn workspace_memory_settings_snapshot_is_persisted_through_versioned_adapter() {
         let mut manifest = WorkerManifest::from_toml(
             r#"
 [worker]
@@ -6613,42 +6527,6 @@ permission = "read"
                 settings_revision: 7,
                 language: "Japanese".to_string(),
             })
-        );
-        assert!(
-            validate_workspace_memory_snapshot(
-                "memory-snapshot",
-                &manifest,
-                &WorkerWorkspaceContext::unavailable(
-                    Some(WorkspaceId::new("workspace-a").unwrap()),
-                    "test",
-                )
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_workspace_memory_snapshot(
-                "memory-snapshot",
-                &manifest,
-                &WorkerWorkspaceContext::unavailable(
-                    Some(WorkspaceId::new("workspace-b").unwrap()),
-                    "test",
-                )
-            )
-            .is_err()
-        );
-
-        let mut missing = manifest.clone();
-        missing.feature.memory.workspace_settings = None;
-        assert!(
-            validate_workspace_memory_snapshot(
-                "memory-snapshot",
-                &missing,
-                &WorkerWorkspaceContext::unavailable(
-                    Some(WorkspaceId::new("workspace-a").unwrap()),
-                    "test",
-                )
-            )
-            .is_err()
         );
     }
 
@@ -8230,6 +8108,12 @@ mod build_summary_prompt_tests {
             )
             .unwrap(),
         );
+        let prompt_override = worker
+            .prompts()
+            .load_full()
+            .memory_consolidation_system("Japanese")
+            .unwrap();
+        worker.install_system_prompt_contribution(None, Some(prompt_override));
         worker.ensure_system_prompt_materialized().await.unwrap();
         let prompt = worker.engine().get_system_prompt().unwrap();
         assert!(prompt.contains("`language`: `Japanese`"));
@@ -8267,15 +8151,7 @@ mod build_summary_prompt_tests {
         }
         let scope = Scope::writable(&cwd).unwrap();
         let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
-        let workspace_context = if memory_config
-            .as_ref()
-            .is_some_and(|cfg| cfg.profile.resident.inject_summary)
-            && gates.summary
-        {
-            stub_memory_backend_context(summary_doc.and_then(summary_content_for_backend))
-        } else {
-            WorkerWorkspaceContext::local_filesystem(None)
-        };
+        let workspace_context = WorkerWorkspaceContext::local_filesystem(None);
         let mut worker = Worker::new(
             manifest,
             Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
@@ -8287,6 +8163,16 @@ mod build_summary_prompt_tests {
         .await
         .unwrap();
         worker.set_resident_memory_injection(gates.summary);
+        let resident_summary = if memory_config
+            .as_ref()
+            .is_some_and(|cfg| cfg.profile.resident.inject_summary)
+            && gates.summary
+        {
+            summary_doc.and_then(summary_content_for_backend)
+        } else {
+            None
+        };
+        worker.install_system_prompt_contribution(resident_summary, None);
         let template = SystemPromptTemplate::parse(
             "default",
             crate::prompt::source::PromptCatalogSource::builtins_only(),
@@ -8313,45 +8199,6 @@ mod build_summary_prompt_tests {
         Some(doc.to_string())
     }
 
-    fn stub_memory_backend_context(content: Option<String>) -> WorkerWorkspaceContext {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0_u8; 1024];
-            let _ = stream.read(&mut buffer).unwrap();
-            let body = serde_json::json!({
-                "status": "ok",
-                "result": {
-                    "kind": "tool_output",
-                    "summary": if content.is_some() {
-                        "resident memory summary collected"
-                    } else {
-                        "resident memory summary unavailable"
-                    },
-                    "content": content,
-                }
-            })
-            .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-        });
-        WorkerWorkspaceContext::with_client(
-            Some(WorkspaceId::new("test-memory").unwrap()),
-            Arc::new(TestWorkspaceHttpClient::new(
-                "test-memory",
-                format!("http://{addr}"),
-            )),
-        )
-    }
-
     #[tokio::test]
     async fn resident_summary_body_is_injected_without_frontmatter() {
         let rendered = render_system_prompt_with_summary(
@@ -8367,7 +8214,7 @@ mod build_summary_prompt_tests {
     }
 
     #[tokio::test]
-    async fn resident_summary_injection_can_be_disabled_by_manifest() {
+    async fn resident_summary_injection_can_be_disabled_by_memory_feature() {
         let mut memory = manifest::ResolvedMemoryFeatureConfig::default();
         memory.profile.resident.inject_summary = false;
         let rendered = render_system_prompt_with_summary(

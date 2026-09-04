@@ -342,6 +342,113 @@ fn query_schema() -> serde_json::Value {
     })
 }
 
+pub struct MemoryFeatureInstallPlan {
+    pub module: MemoryToolsFeature,
+    pub resident_summary: Option<String>,
+    pub system_prompt_override: Option<String>,
+    pub(crate) resolved_config: manifest::ResolvedMemoryFeatureConfig,
+}
+
+impl MemoryFeatureInstallPlan {
+    pub async fn prepare(
+        manifest: &manifest::WorkerManifest,
+        client: Arc<dyn WorkspaceClient>,
+        prompts: Arc<crate::prompt::catalog::PromptCatalog>,
+    ) -> std::io::Result<Option<Self>> {
+        Self::prepare_resolved(
+            manifest.feature.memory.clone(),
+            client,
+            prompts,
+            manifest.profile.clone(),
+        )
+        .await
+    }
+
+    async fn prepare_resolved(
+        config: manifest::ResolvedMemoryFeatureConfig,
+        client: Arc<dyn WorkspaceClient>,
+        prompts: Arc<crate::prompt::catalog::PromptCatalog>,
+        profile: Option<manifest::ProfileManifestSnapshot>,
+    ) -> std::io::Result<Option<Self>> {
+        let memory_consolidation_worker = profile.as_ref().is_some_and(|snapshot| {
+            matches!(
+                &snapshot.source,
+                manifest::ProfileSource::Registry {
+                    source: manifest::ProfileRegistrySource::Builtin,
+                    name,
+                    ..
+                } if name == "memory-consolidation"
+            )
+        });
+        config
+            .validate_execution()
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+        if !config.profile.enabled {
+            return Ok(None);
+        }
+        let workspace_id = client.workspace_id().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Memory tools require Backend Workspace API authority",
+            )
+        })?;
+        let settings = config
+            .workspace_settings()
+            .expect("validated enabled Memory config has Workspace settings");
+        if settings.workspace_id != workspace_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Memory settings belong to {} instead of {}",
+                    settings.workspace_id, workspace_id
+                ),
+            ));
+        }
+
+        let resident_summary = if config.profile.resident.inject_summary {
+            match client
+                .execute_memory_backend_operation(
+                    memory::backend::MemoryBackendOperation::ResidentSummary(
+                        memory::backend::MemoryResidentSummaryOperation::default(),
+                    ),
+                )
+                .await
+            {
+                Ok(memory::backend::MemoryBackendOperationResult::ToolOutput(output)) => {
+                    output.content
+                }
+                Ok(other) => {
+                    tracing::debug!(?other, "unexpected resident Memory Backend result");
+                    None
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "resident Memory summary unavailable");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let system_prompt_override = if memory_consolidation_worker {
+            let language = settings.language;
+            Some(
+                prompts
+                    .memory_consolidation_system(&language)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+
+        Ok(Some(Self {
+            module: MemoryToolsFeature::new(client, config.profile.staging_tools),
+            resident_summary,
+            system_prompt_override,
+            resolved_config: config,
+        }))
+    }
+}
+
 #[derive(Clone)]
 pub struct MemoryToolsFeature {
     tools: Vec<ToolDefinition>,
@@ -392,6 +499,39 @@ mod tests {
         ))
     }
 
+    fn resident_client(content: &str) -> Arc<dyn WorkspaceClient> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let content = content.to_string();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            let body = serde_json::json!({
+                "status": "ok",
+                "result": {
+                    "kind": "tool_output",
+                    "summary": "resident Memory summary collected",
+                    "content": content,
+                }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        Arc::new(crate::worker::TestWorkspaceHttpClient::new(
+            "workspace",
+            format!("http://{addr}"),
+        ))
+    }
+
     fn tool_names(definitions: Vec<ToolDefinition>) -> Vec<String> {
         let mut names = definitions
             .into_iter()
@@ -408,6 +548,76 @@ mod tests {
             .find(|meta| meta.name == name)
             .unwrap_or_else(|| panic!("missing tool meta for {name}"))
             .input_schema
+    }
+
+    #[tokio::test]
+    async fn memory_install_plan_is_the_fail_closed_config_boundary() {
+        let prompts = crate::prompt::catalog::PromptCatalog::builtins_only().unwrap();
+        let disabled = MemoryFeatureInstallPlan::prepare_resolved(
+            manifest::ResolvedMemoryFeatureConfig::default(),
+            test_client(),
+            prompts.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(disabled.is_none());
+
+        let mut enabled = manifest::ResolvedMemoryFeatureConfig::default();
+        enabled.profile.enabled = true;
+        enabled.profile.resident.inject_summary = false;
+        assert!(
+            MemoryFeatureInstallPlan::prepare_resolved(
+                enabled.clone(),
+                test_client(),
+                prompts.clone(),
+                None,
+            )
+            .await
+            .is_err()
+        );
+        enabled
+            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "workspace".to_string(),
+                settings_revision: 1,
+                language: "English".to_string(),
+            })
+            .unwrap();
+        let mut foreign = enabled.clone();
+        foreign.workspace_settings.as_mut().unwrap().workspace_id = "other-workspace".to_string();
+        assert!(
+            MemoryFeatureInstallPlan::prepare_resolved(
+                foreign,
+                test_client(),
+                prompts.clone(),
+                None,
+            )
+            .await
+            .is_err()
+        );
+        let plan = MemoryFeatureInstallPlan::prepare_resolved(
+            enabled.clone(),
+            test_client(),
+            prompts.clone(),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(plan.resident_summary.is_none());
+        assert!(plan.system_prompt_override.is_none());
+
+        enabled.profile.resident.inject_summary = true;
+        let plan = MemoryFeatureInstallPlan::prepare_resolved(
+            enabled,
+            resident_client("# Durable Memory"),
+            prompts,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan.resident_summary.as_deref(), Some("# Durable Memory"));
     }
 
     #[test]
