@@ -1389,20 +1389,29 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         let mut terminal_call_ids = HashSet::new();
         let mut pause_requested = false;
         let mut pause_deadline = None;
+        let mut batch_error = None;
         for result in synthetic_results {
-            self.finalize_and_commit_tool_result(
-                history,
-                annotate,
-                result,
-                None,
-                &call_info_map,
-                &mut attempt_fence,
-                &mut terminal_call_ids,
-            )
-            .await?;
+            if let Err(error) = self
+                .finalize_and_commit_tool_result(
+                    history,
+                    annotate,
+                    result,
+                    None,
+                    &call_info_map,
+                    &mut attempt_fence,
+                    &mut terminal_call_ids,
+                )
+                .await
+                && batch_error.is_none()
+            {
+                batch_error = Some(error);
+            }
         }
 
         let mut futures = futures;
+        if batch_error.is_some() && !futures.is_empty() {
+            let _ = self.cancel_tx.try_send(());
+        }
         while !futures.is_empty() {
             tokio::select! {
                 // If cancellation and a completed result are both ready, drain
@@ -1412,7 +1421,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 result = futures.next() => {
                     let (attempt_id, result) =
                         result.expect("non-empty FuturesUnordered returns a result");
-                    self.finalize_and_commit_tool_result(
+                    if let Err(error) = self.finalize_and_commit_tool_result(
                         history,
                         annotate,
                         result,
@@ -1420,7 +1429,14 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                         &call_info_map,
                         &mut attempt_fence,
                         &mut terminal_call_ids,
-                    ).await?;
+                    ).await {
+                        if batch_error.is_none() {
+                            batch_error = Some(error);
+                        }
+                        if !futures.is_empty() {
+                            let _ = self.cancel_tx.try_send(());
+                        }
+                    }
                 }
                 pause = self.pause_rx.recv(), if !pause_requested => {
                     if pause.is_some() {
@@ -1482,7 +1498,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                             result = futures.next() => {
                                 let (attempt_id, result) =
                                     result.expect("non-empty FuturesUnordered returns a result");
-                                self.finalize_and_commit_tool_result(
+                                if let Err(error) = self.finalize_and_commit_tool_result(
                                     history,
                                     annotate,
                                     result,
@@ -1490,7 +1506,11 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                     &call_info_map,
                                     &mut attempt_fence,
                                     &mut terminal_call_ids,
-                                ).await?;
+                                ).await
+                                    && batch_error.is_none()
+                                {
+                                    batch_error = Some(error);
+                                }
                             }
                             _ = tokio::time::sleep_until(deadline) => break,
                         }
@@ -1504,7 +1524,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                             if let Some(handle) = execution_handles.get(call_id) {
                                 handle.force_close();
                             }
-                            self.finalize_and_commit_tool_result(
+                            if let Err(error) = self.finalize_and_commit_tool_result(
                                 history,
                                 annotate,
                                 ToolResult::outcome_unknown(call_id),
@@ -1512,11 +1532,18 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                 &call_info_map,
                                 &mut attempt_fence,
                                 &mut terminal_call_ids,
-                            ).await?;
+                            ).await
+                                && batch_error.is_none()
+                            {
+                                batch_error = Some(error);
+                            }
                         }
                     }
 
                     self.timeline.abort_current_block();
+                    if let Some(error) = batch_error.take() {
+                        return Err(error);
+                    }
                     if pause_requested {
                         return Ok(ToolExecutionResult::Paused);
                     }
@@ -1525,6 +1552,10 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
             }
         }
 
+        if let Some(error) = batch_error {
+            self.timeline.abort_current_block();
+            return Err(error);
+        }
         Ok(if pause_requested {
             ToolExecutionResult::Paused
         } else {

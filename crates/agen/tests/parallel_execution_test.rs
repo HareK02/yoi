@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agen::interceptor::{
-    Interceptor, InterceptorErrorCategory, InterceptorPhase, InterceptorResult, PostToolAction,
-    PreToolAction, ToolCallInfo, ToolResultInfo,
+    Interceptor, InterceptorError, InterceptorErrorCategory, InterceptorPhase, InterceptorResult,
+    PostToolAction, PreToolAction, ToolCallInfo, ToolResultInfo,
 };
 use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use agen::tool::{
@@ -1348,4 +1348,80 @@ async fn post_tool_abort_commits_confirmed_result_before_stopping_run() {
             ..
         } if call_id == "call_confirmed"
     )));
+}
+
+#[derive(Clone, Copy)]
+enum PostToolStopMode {
+    Abort,
+    Failure,
+}
+
+struct StopFirstParallelResult(PostToolStopMode);
+
+#[async_trait]
+impl Interceptor for StopFirstParallelResult {
+    async fn post_tool_call(
+        &self,
+        info: &ToolResultInfo<'_, ()>,
+    ) -> InterceptorResult<PostToolAction> {
+        if info.call.id != "call_fast" {
+            return Ok(PostToolAction::Continue);
+        }
+        match self.0 {
+            PostToolStopMode::Abort => Ok(PostToolAction::Abort("stop parallel batch".to_string())),
+            PostToolStopMode::Failure => Err(InterceptorError::new(
+                InterceptorErrorCategory::Policy,
+                "reject parallel batch",
+            )),
+        }
+    }
+}
+
+#[tokio::test]
+async fn post_tool_stop_terminalizes_started_parallel_siblings_before_returning() {
+    for mode in [PostToolStopMode::Abort, PostToolStopMode::Failure] {
+        let client = MockLlmClient::new(vec![
+            Event::tool_use_start(0, "call_fast", "fast"),
+            Event::tool_input_delta(0, r#"{}"#),
+            Event::tool_use_stop(0),
+            Event::tool_use_start(1, "call_slow", "slow"),
+            Event::tool_input_delta(1, r#"{}"#),
+            Event::tool_use_stop(1),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ]);
+        let mut engine = Engine::new(client);
+        engine.register_tool(SlowTool::new("fast", 1).definition());
+        engine.register_tool(SlowTool::new("slow", 10_000).definition());
+        engine.set_interceptor(StopFirstParallelResult(mode));
+        let mut history = History::new();
+
+        let output = engine.run(&mut history, "parallel stop").await;
+        match mode {
+            PostToolStopMode::Abort => assert!(matches!(
+                output.result,
+                EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(
+                    EngineError::Aborted(ref reason)
+                )) if reason == "stop parallel batch"
+            )),
+            PostToolStopMode::Failure => assert!(matches!(
+                output.result,
+                EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(
+                    EngineError::Interceptor(ref failure)
+                )) if failure.phase() == InterceptorPhase::PostToolCall
+            )),
+        }
+
+        let terminal_ids: Vec<_> = history
+            .iter()
+            .filter_map(|entry| match &entry.item {
+                Item::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terminal_ids.len(), 2);
+        assert!(terminal_ids.contains(&"call_fast"));
+        assert!(terminal_ids.contains(&"call_slow"));
+    }
 }
