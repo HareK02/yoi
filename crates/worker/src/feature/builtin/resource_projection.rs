@@ -124,7 +124,6 @@ struct ModelBlocker {
     ticket: String,
     kind: String,
     state: Option<String>,
-    resolved: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -436,7 +435,6 @@ fn project_blocker(value: &Value) -> Result<ModelBlocker, String> {
         ticket: resource_ref(blocker, "blocking_resource_key", "T-")?,
         kind: string_field(blocker, "relation_kind")?,
         state: optional_string(blocker, "blocking_state")?,
-        resolved: bool_field(blocker, "resolved")?,
     })
 }
 
@@ -758,6 +756,70 @@ mod tests {
         assert!(objective_json.contains("\"summary\":null"));
         assert!(!objective_json.contains("00001OBJECTIVEINTERNAL"));
         assert!(!objective_json.contains("00001TICKETINTERNAL"));
+    }
+
+    #[test]
+    fn ticket_detail_projection_accepts_current_blocker_shape() {
+        let projected = project_ticket_detail(json!({
+            "id": "internal-ticket",
+            "resource_key": "T-588",
+            "title": "Queued Submit",
+            "body": "Body",
+            "state": "planning",
+            "readiness": null,
+            "priority": "P2",
+            "created_at": "2026-09-03T00:00:00Z",
+            "updated_at": "2026-09-03T00:00:00Z",
+            "events": [],
+            "relations": {
+                "outgoing": [],
+                "incoming": [],
+                "blockers": [{
+                    "blocking_ticket": "internal-blocker",
+                    "blocking_resource_key": "T-584",
+                    "reason_kind": "depends_on",
+                    "relation_kind": "depends_on",
+                    "note": "required foundation",
+                    "blocking_state": "planning"
+                }],
+                "notices": []
+            },
+            "linked_objectives": [],
+            "implementation_reports": [],
+            "assignments": [],
+            "current_coder": null,
+            "merge_request": null,
+            "evidence": {
+                "has_merge_request": false,
+                "has_current_subject_ref": false,
+                "has_review_request": false,
+                "has_commit": false,
+                "review_status": null,
+                "approved_current_subject": false,
+                "unresolved_request_changes": false,
+                "complete_for_integration": false,
+                "missing": ["merge_request"]
+            },
+            "action_eligibility": {
+                "can_assign_orchestrator": true,
+                "can_unassign_orchestrator": false,
+                "can_queue": false,
+                "can_start_manual_coder": false
+            },
+            "event_page": {"next_cursor": null, "has_more": false}
+        }))
+        .expect("current Ticket blocker shape must project");
+
+        let projected = serde_json::to_value(projected).expect("serialize Ticket detail");
+        assert_eq!(
+            projected["relations"]["blockers"],
+            json!([{
+                "ticket": "T-584",
+                "kind": "depends_on",
+                "state": "planning"
+            }])
+        );
+        assert!(!projected.to_string().contains("internal-blocker"));
     }
 
     #[test]
