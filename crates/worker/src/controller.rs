@@ -901,6 +901,21 @@ pub(crate) fn wire_event_bridges_on_engine<C, St>(
     // per-item commit channel is wired at the top of this function.
 }
 
+fn add_memory_lifecycle_if_configured<M>(
+    registry: &mut FeatureRegistryBuilder,
+    config: Option<manifest::MemoryConfig>,
+    build: impl FnOnce(manifest::MemoryConfig) -> std::io::Result<M>,
+) -> std::io::Result<bool>
+where
+    M: crate::feature::FeatureModule + 'static,
+{
+    let Some(config) = config else {
+        return Ok(false);
+    };
+    registry.add_module(build(config)?);
+    Ok(true)
+}
+
 /// Register the builtin file-manipulation tools, optional memory tools,
 /// and the Worker-orchestration tools (SubWorkerSpawn + comm) on the Worker's
 /// Engine. Returns the WorkdirSession handle used to attach a `WorkerFsView` to
@@ -994,7 +1009,7 @@ where
     let worker_enabled = feature_config.worker.enabled;
     let sub_worker_enabled = feature_config.sub_worker.enabled;
     let mut feature_registry = FeatureRegistryBuilder::new();
-    if let Some(config) = memory_config.clone() {
+    add_memory_lifecycle_if_configured(&mut feature_registry, memory_config.clone(), |config| {
         let workspace_client = worker.workspace_client_handle();
         if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
             return Err(std::io::Error::new(
@@ -1002,7 +1017,7 @@ where
                 "Memory extraction requires Backend Workspace API authority",
             ));
         }
-        feature_registry.add_module(
+        Ok(
             crate::feature::builtin::memory_lifecycle::MemoryLifecycleFeature::new(
                 config,
                 worker.committed_session_capture_handle(),
@@ -1014,8 +1029,8 @@ where
                 spawner_workspace_context.clone(),
                 worker.working_event_sender(),
             ),
-        );
-    }
+        )
+    })?;
     if sub_worker_enabled && !worker_enabled {
         feature_registry.add_module(
             crate::feature::builtin::manage_worker::sub_worker_control_feature(
@@ -2134,6 +2149,51 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::net::UnixListener;
+
+    #[test]
+    fn memory_lifecycle_registration_depends_only_on_memory_config_presence() {
+        #[derive(Clone)]
+        struct TestMemoryLifecycleModule;
+
+        impl crate::feature::FeatureModule for TestMemoryLifecycleModule {
+            fn descriptor(&self) -> crate::feature::FeatureDescriptor {
+                crate::feature::FeatureDescriptor::builtin(
+                    "test-memory-lifecycle",
+                    "Test Memory Lifecycle",
+                )
+            }
+
+            fn install(
+                &self,
+                _context: &mut crate::feature::FeatureInstallContext<'_>,
+            ) -> Result<(), crate::feature::FeatureInstallError> {
+                Ok(())
+            }
+        }
+
+        let mut registry = FeatureRegistryBuilder::new();
+        let configured = std::cell::Cell::new(false);
+        let installed = add_memory_lifecycle_if_configured(
+            &mut registry,
+            Some(manifest::MemoryConfig::default()),
+            |_| {
+                configured.set(true);
+                Ok(TestMemoryLifecycleModule)
+            },
+        )
+        .unwrap();
+        assert!(installed);
+        assert!(configured.get());
+
+        let mut registry = FeatureRegistryBuilder::new();
+        let installed = add_memory_lifecycle_if_configured::<TestMemoryLifecycleModule>(
+            &mut registry,
+            None,
+            |_| panic!("disabled Memory must not construct its lifecycle Feature"),
+        )
+        .unwrap();
+        assert!(!installed);
+    }
 
     #[test]
     fn image_attachment_gate_requires_vision_and_supported_openai_scheme() {
