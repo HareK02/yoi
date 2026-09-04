@@ -904,6 +904,7 @@ pub(crate) fn wire_event_bridges_on_engine<C, St>(
 fn add_memory_lifecycle_if_configured<M>(
     registry: &mut FeatureRegistryBuilder,
     config: Option<manifest::MemoryConfig>,
+    workspace_bound: bool,
     build: impl FnOnce(manifest::MemoryConfig) -> std::io::Result<M>,
 ) -> std::io::Result<bool>
 where
@@ -912,6 +913,15 @@ where
     let Some(config) = config else {
         return Ok(false);
     };
+    if config.workspace_settings().is_none() {
+        if workspace_bound {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Workspace-bound Memory requires a Backend-authored settings snapshot",
+            ));
+        }
+        return Ok(false);
+    }
     registry.add_module(build(config)?);
     Ok(true)
 }
@@ -1009,28 +1019,36 @@ where
     let worker_enabled = feature_config.worker.enabled;
     let sub_worker_enabled = feature_config.sub_worker.enabled;
     let mut feature_registry = FeatureRegistryBuilder::new();
-    add_memory_lifecycle_if_configured(&mut feature_registry, memory_config.clone(), |config| {
-        let workspace_client = worker.workspace_client_handle();
-        if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Memory extraction requires Backend Workspace API authority",
-            ));
-        }
-        Ok(
-            crate::feature::builtin::memory_lifecycle::MemoryLifecycleFeature::new(
-                config,
-                worker.committed_session_capture_handle(),
-                worker.session_extension_handle(),
-                workspace_client,
-                spawner_manifest.clone(),
-                worker.llm_client_handle(),
-                prompts.clone(),
-                spawner_workspace_context.clone(),
-                worker.working_event_sender(),
-            ),
-        )
-    })?;
+    add_memory_lifecycle_if_configured(
+        &mut feature_registry,
+        worker
+            .manifest_lifecycle_features_enabled()
+            .then(|| memory_config.clone())
+            .flatten(),
+        spawner_workspace_context.workspace_id().is_some(),
+        |config| {
+            let workspace_client = worker.workspace_client_handle();
+            if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Memory extraction requires Backend Workspace API authority",
+                ));
+            }
+            Ok(
+                crate::feature::builtin::memory_lifecycle::MemoryLifecycleFeature::new(
+                    config,
+                    worker.committed_session_capture_handle(),
+                    worker.session_extension_handle(),
+                    workspace_client,
+                    spawner_manifest.clone(),
+                    worker.llm_client_handle(),
+                    prompts.clone(),
+                    spawner_workspace_context.clone(),
+                    worker.working_event_sender(),
+                ),
+            )
+        },
+    )?;
     if sub_worker_enabled && !worker_enabled {
         feature_registry.add_module(
             crate::feature::builtin::manage_worker::sub_worker_control_feature(
@@ -2151,7 +2169,7 @@ mod tests {
     use tokio::net::UnixListener;
 
     #[test]
-    fn memory_lifecycle_registration_depends_only_on_memory_config_presence() {
+    fn memory_lifecycle_registration_requires_bound_workspace_memory_config() {
         #[derive(Clone)]
         struct TestMemoryLifecycleModule;
 
@@ -2173,15 +2191,18 @@ mod tests {
 
         let mut registry = FeatureRegistryBuilder::new();
         let configured = std::cell::Cell::new(false);
-        let installed = add_memory_lifecycle_if_configured(
-            &mut registry,
-            Some(manifest::MemoryConfig::default()),
-            |_| {
+        let mut memory_config = manifest::MemoryConfig::default();
+        memory_config.bind_workspace_settings(&manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: "workspace-1".to_string(),
+            settings_revision: 1,
+            language: "English".to_string(),
+        });
+        let installed =
+            add_memory_lifecycle_if_configured(&mut registry, Some(memory_config), true, |_| {
                 configured.set(true);
                 Ok(TestMemoryLifecycleModule)
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert!(installed);
         assert!(configured.get());
 
@@ -2189,10 +2210,33 @@ mod tests {
         let installed = add_memory_lifecycle_if_configured::<TestMemoryLifecycleModule>(
             &mut registry,
             None,
+            false,
             |_| panic!("disabled Memory must not construct its lifecycle Feature"),
         )
         .unwrap();
         assert!(!installed);
+
+        let installed = add_memory_lifecycle_if_configured::<TestMemoryLifecycleModule>(
+            &mut registry,
+            Some(manifest::MemoryConfig::default()),
+            false,
+            |_| panic!("Memory without a Backend-authored settings snapshot must stay disabled"),
+        )
+        .unwrap();
+        assert!(!installed);
+
+        let error = add_memory_lifecycle_if_configured::<TestMemoryLifecycleModule>(
+            &mut registry,
+            Some(manifest::MemoryConfig::default()),
+            true,
+            |_| panic!("invalid Workspace Memory config must fail before Feature construction"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Backend-authored settings snapshot")
+        );
     }
 
     #[test]

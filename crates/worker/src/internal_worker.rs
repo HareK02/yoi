@@ -164,6 +164,7 @@ where
         identity: identity.clone(),
         history_entries: 0,
     })?;
+    worker.disable_manifest_lifecycle_features();
     if let Some(session) = inherited_workdir_session {
         worker.bind_workdir_session(Some(session));
     }
@@ -578,6 +579,7 @@ pub(crate) async fn spawn_internal_worker_session(
     .map_err(|source| InternalWorkerSessionError::Build {
         message: source.to_string(),
     })?;
+    worker.disable_manifest_lifecycle_features();
     if let Some(session) = inherited_workdir_session {
         worker.bind_workdir_session(Some(session));
     }
@@ -671,6 +673,7 @@ pub(crate) fn prepare_internal_worker_from_spec(
         .map_err(|source| InternalWorkerSessionError::Build {
             message: source.to_string(),
         })?;
+        worker.disable_manifest_lifecycle_features();
         if let Some(session) = inherited_workdir_session {
             worker.bind_workdir_session(Some(session));
         }

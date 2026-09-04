@@ -1130,6 +1130,9 @@ pub struct Worker<C: LlmClient, St: Store> {
     hook_registry: Option<Arc<HookRegistry>>,
     /// Executable background tasks registered by successfully installed features.
     feature_background_tasks: FeatureBackgroundTaskRegistry,
+    /// Internal Workers install an explicit Feature composition and disable
+    /// manifest-derived lifecycle Features before controller startup.
+    manifest_lifecycle_features_enabled: bool,
     interceptor_installed: bool,
     /// Shared compaction state (present when threshold is configured).
     compact_state: Option<Arc<CompactState>>,
@@ -1423,6 +1426,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             hook_builder: HookRegistryBuilder::new(),
             hook_registry: None,
             feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
@@ -1798,6 +1802,14 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .map(|item| HistoryEntry::new(item, SessionHistoryMetadata::legacy_unknown()))
             .collect();
         self.session.replace_history(entries);
+    }
+
+    pub(crate) fn disable_manifest_lifecycle_features(&mut self) {
+        self.manifest_lifecycle_features_enabled = false;
+    }
+
+    pub(crate) fn manifest_lifecycle_features_enabled(&self) -> bool {
+        self.manifest_lifecycle_features_enabled
     }
 
     /// Install enabled feature modules into the Worker host surfaces.
@@ -4676,6 +4688,7 @@ where
             hook_builder: HookRegistryBuilder::new(),
             hook_registry: None,
             feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
@@ -4757,6 +4770,7 @@ where
             hook_builder: HookRegistryBuilder::new(),
             hook_registry: None,
             feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            manifest_lifecycle_features_enabled: false,
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
@@ -4873,6 +4887,7 @@ where
             hook_builder: HookRegistryBuilder::new(),
             hook_registry: None,
             feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
@@ -5243,6 +5258,7 @@ where
             hook_builder: HookRegistryBuilder::new(),
             hook_registry: None,
             feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
