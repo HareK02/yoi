@@ -28,7 +28,7 @@ const FINISH_DESCRIPTION: &str =
     "Finish Memory extraction after validating the number of candidates staged during this run.";
 
 #[derive(Clone)]
-pub(crate) struct MemoryExtractState {
+pub(crate) struct MemoryStagingOutputState {
     view: Arc<SessionCapture>,
     workspace_client: Arc<dyn WorkspaceClient>,
     source: SourceRef,
@@ -37,7 +37,7 @@ pub(crate) struct MemoryExtractState {
     finished: Arc<Mutex<Option<FinishMemoryExtractionParams>>>,
 }
 
-impl MemoryExtractState {
+impl MemoryStagingOutputState {
     pub(crate) fn new(
         view: SessionCapture,
         workspace_client: Arc<dyn WorkspaceClient>,
@@ -70,22 +70,20 @@ impl MemoryExtractState {
 }
 
 #[derive(Clone)]
-pub(crate) struct MemoryExtractFeature {
-    state: MemoryExtractState,
+pub(crate) struct MemoryStagingOutputFeature {
+    state: MemoryStagingOutputState,
 }
 
-impl MemoryExtractFeature {
-    pub(crate) fn new(state: MemoryExtractState) -> Self {
+impl MemoryStagingOutputFeature {
+    pub(crate) fn new(state: MemoryStagingOutputState) -> Self {
         Self { state }
     }
 }
 
-impl FeatureModule for MemoryExtractFeature {
+impl FeatureModule for MemoryStagingOutputFeature {
     fn descriptor(&self) -> FeatureDescriptor {
-        FeatureDescriptor::builtin("memory-extract", "Memory Extract")
-            .with_description(
-                "Memory staging and extraction completion, independent from session exploration.",
-            )
+        FeatureDescriptor::builtin("memory-staging-output", "Memory Staging Output")
+            .with_description("Restricted Memory staging output for an extraction Internal Worker.")
             .with_tool(ToolDeclaration::new(
                 "StageMemoryCandidate",
                 STAGE_DESCRIPTION,
@@ -109,7 +107,7 @@ impl FeatureModule for MemoryExtractFeature {
     }
 }
 
-fn stage_definition(state: MemoryExtractState) -> ToolDefinition {
+fn stage_definition(state: MemoryStagingOutputState) -> ToolDefinition {
     Arc::new(move || {
         let schema = serde_json::to_value(schemars::schema_for!(StageMemoryCandidateParams))
             .unwrap_or_else(|_| serde_json::json!({}));
@@ -123,7 +121,7 @@ fn stage_definition(state: MemoryExtractState) -> ToolDefinition {
     })
 }
 
-fn finish_definition(state: MemoryExtractState) -> ToolDefinition {
+fn finish_definition(state: MemoryStagingOutputState) -> ToolDefinition {
     Arc::new(move || {
         let schema = serde_json::to_value(schemars::schema_for!(FinishMemoryExtractionParams))
             .unwrap_or_else(|_| serde_json::json!({}));
@@ -157,7 +155,7 @@ struct FinishMemoryExtractionParams {
 }
 
 struct StageMemoryCandidateTool {
-    state: MemoryExtractState,
+    state: MemoryStagingOutputState,
 }
 
 #[async_trait]
@@ -252,7 +250,7 @@ impl Tool for StageMemoryCandidateTool {
 }
 
 struct FinishMemoryExtractionTool {
-    state: MemoryExtractState,
+    state: MemoryStagingOutputState,
 }
 
 #[async_trait]
@@ -431,8 +429,8 @@ mod tests {
 
     use super::*;
 
-    fn state() -> MemoryExtractState {
-        MemoryExtractState::new(
+    fn state() -> MemoryStagingOutputState {
+        MemoryStagingOutputState::new(
             SessionCapture::new("segment-1", vec![Item::user_message("durable decision")]),
             crate::worker::marker_workspace_client(None, "test-backend"),
             SourceRef {
@@ -445,8 +443,8 @@ mod tests {
 
     #[test]
     fn memory_extract_declares_only_memory_mutation_tools() {
-        let descriptor = MemoryExtractFeature::new(state()).descriptor();
-        assert_eq!(descriptor.id.as_str(), "builtin:memory-extract");
+        let descriptor = MemoryStagingOutputFeature::new(state()).descriptor();
+        assert_eq!(descriptor.id.as_str(), "builtin:memory-staging-output");
         assert_eq!(
             descriptor
                 .tools

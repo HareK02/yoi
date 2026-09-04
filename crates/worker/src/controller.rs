@@ -197,8 +197,8 @@ async fn finish_controller_run<C, St>(
 {
     // history / user_segments are no longer mirrored on WorkerSharedState —
     // clients reconstruct them from `Event::Snapshot` + live
-    // `Event::Entry` deliveries driven by the session-log sink. We
-    // flip the status and kick post-run memory jobs here.
+    // `Event::Entry` deliveries driven by the session-log sink. The
+    // lifecycle hook/task registry observes the terminal commit separately.
     //
     // In-flight blocks are run-local streaming state, not durable transcript.
     // Any block not cleared by a committed AssistantItem must be discarded at
@@ -206,7 +206,6 @@ async fn finish_controller_run<C, St>(
     // partial text/tool arguments after newer entries.
     worker.clear_in_flight_events();
     set_controller_status(shared_state, runtime_dir, working_event_tx, new_status).await;
-    worker.spawn_post_run_memory_jobs();
 }
 
 /// Pending turn launch staged by an event handler for the next outer-loop
@@ -995,6 +994,34 @@ where
     let worker_enabled = feature_config.worker.enabled;
     let sub_worker_enabled = feature_config.sub_worker.enabled;
     let mut feature_registry = FeatureRegistryBuilder::new();
+    if feature_config.memory.enabled {
+        let config = memory_config.clone().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "[feature.memory].enabled = true requires a [memory] configuration section",
+            )
+        })?;
+        let workspace_client = worker.workspace_client_handle();
+        if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Memory extraction requires Backend Workspace API authority",
+            ));
+        }
+        feature_registry.add_module(
+            crate::feature::builtin::memory_lifecycle::MemoryExtractionLifecycleFeature::new(
+                config,
+                worker.committed_session_capture_handle(),
+                worker.session_extension_handle(),
+                workspace_client,
+                spawner_manifest.clone(),
+                worker.llm_client_handle(),
+                prompts.clone(),
+                spawner_workspace_context.clone(),
+                worker.working_event_sender(),
+            ),
+        );
+    }
     if sub_worker_enabled && !worker_enabled {
         feature_registry.add_module(
             crate::feature::builtin::manage_worker::sub_worker_control_feature(
@@ -1716,11 +1743,6 @@ async fn controller_loop<C, St>(
     // Feature callbacks and tasks share the Worker scope. Stop them before
     // Memory/Workdir teardown so they cannot observe a partially closed Worker.
     worker.stop_feature_runtime("controller shutdown").await;
-
-    // Background memory jobs own extract/consolidate workers after a
-    // turn completes. Join them before closing the Workdir session so no
-    // Worker-owned task can outlive its operation attachment.
-    worker.wait_for_memory_jobs().await;
 
     if let Some(session) = worker.workdir_session()
         && let Err(error) = session.close().await

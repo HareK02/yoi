@@ -123,14 +123,14 @@ where
 
     // Internal identities are run-scoped and never enter the public Runtime Worker catalog.
     manifest.worker.name = format!("internal-{}-{}", identity.kind, identity.run_id);
-    // Internal jobs only receive features supplied below. A parent manifest must not accidentally
-    // grant its normal public tool surface or recursively schedule memory work.
+    // Internal jobs only receive the explicitly supplied Feature set below. A
+    // parent manifest cannot accidentally grant its normal public tool surface
+    // or recursively schedule Feature-owned background work.
     manifest.feature = Default::default();
     manifest.plugins = Default::default();
     manifest.mcp = Default::default();
     manifest.skills = None;
     manifest.compaction = None;
-    manifest.memory = None;
 
     let last_usage = Arc::new(Mutex::new(None::<UsageEvent>));
     let usage_slot = last_usage.clone();
@@ -548,7 +548,6 @@ pub(crate) async fn spawn_internal_worker_session(
         authority,
     } = spec;
     manifest.worker.name = format!("internal-{}-{}", identity.kind, identity.run_id);
-    manifest.memory = None;
 
     let last_usage = Arc::new(Mutex::new(None::<UsageEvent>));
     let usage_slot = last_usage.clone();
@@ -649,7 +648,6 @@ pub(crate) fn prepare_internal_worker_from_spec(
         manifest.mcp = Default::default();
         manifest.skills = None;
         manifest.compaction = None;
-        manifest.memory = None;
 
         let mut engine =
             Engine::<_, agen::state::Mutable, crate::SessionHistoryMetadata>::new_annotated(client)

@@ -2212,6 +2212,7 @@ pub mod background;
 pub mod builtin;
 pub mod mcp;
 pub mod plugin;
+pub(crate) mod session;
 
 #[cfg(test)]
 mod tests {
