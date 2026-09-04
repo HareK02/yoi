@@ -40,7 +40,7 @@ use manifest::{
 
 use crate::compact::state::CompactState;
 use crate::compact::usage_tracker::UsageTracker;
-use crate::feature::background::FeatureBackgroundTaskRegistry;
+use crate::feature::background::{BackgroundTaskRewriteGuard, FeatureBackgroundTaskRegistry};
 use crate::feature::builtin::memory::WorkspaceMemoryBackendError;
 use crate::feature::builtin::{
     MemoryExtractFeature, MemoryExtractState, SessionExploreFeature, SessionExploreState,
@@ -2031,7 +2031,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         target: RewindTargetId,
         expected_head_entries: usize,
     ) -> Result<RewindAppliedState, RewindError> {
-        self.prepare_session_rewrite(SessionRewriteKind::Rewind)
+        let _rewrite_guard = self
+            .prepare_session_rewrite(SessionRewriteKind::Rewind)
             .await
             .map_err(|error| RewindError::Invalid(error.to_string()))?;
         let loc = self.segment_state.location();
@@ -3393,7 +3394,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // state up to that turn). The new SegmentStart replaces the mirror
         // and is broadcast through the sink so existing subscribers reset
         // their view.
-        self.prepare_session_rewrite(SessionRewriteKind::Fork)
+        let _rewrite_guard = self
+            .prepare_session_rewrite(SessionRewriteKind::Fork)
             .await?;
         let w = self.engine.as_ref().unwrap();
         let fork_segment_id = session_store::new_segment_id();
@@ -3693,9 +3695,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     async fn prepare_session_rewrite(
         &mut self,
         kind: SessionRewriteKind,
-    ) -> Result<(), WorkerError> {
-        self.feature_background_tasks
-            .before_session_rewrite()
+    ) -> Result<BackgroundTaskRewriteGuard, WorkerError> {
+        let rewrite_guard = self
+            .feature_background_tasks
+            .begin_session_rewrite()
             .await
             .map_err(|error| WorkerError::FeatureLifecycle(error.to_string()))?;
         if let Some(hooks) = self.hook_registry.clone() {
@@ -3723,7 +3726,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 }
             }
         }
-        Ok(())
+        Ok(rewrite_guard)
     }
 
     pub async fn manual_compact(&mut self) -> Result<ManualCompactResult, WorkerError> {
@@ -3941,7 +3944,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Runs one parent-owned observable compaction service and returns the new
     /// Segment ID. Lifecycle revisions are committed before they are broadcast.
     pub async fn compact(&mut self, retained_tokens: u64) -> Result<SegmentId, WorkerError> {
-        self.prepare_session_rewrite(SessionRewriteKind::Compact)
+        let _rewrite_guard = self
+            .prepare_session_rewrite(SessionRewriteKind::Compact)
             .await?;
         let mut lifecycle = CompactionLifecycle {
             schema_version: 2,

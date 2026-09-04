@@ -6,7 +6,7 @@
 //! feature was explicitly granted at install time.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,6 +25,9 @@ const MAX_TASK_ATTEMPTS: u16 = 16;
 const MAX_TASK_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_RETAINED_DIAGNOSTICS: usize = 128;
 const TASK_SETTLE_TIMEOUT_MS: u64 = 30_000;
+const TASK_SCOPE_ACCEPTING: u8 = 0;
+const TASK_SCOPE_REWRITING: u8 = 1;
+const TASK_SCOPE_STOPPING: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -258,7 +261,7 @@ impl FeatureBackgroundTaskRegistryBuilder {
                 diagnostics: Mutex::new(Vec::new()),
                 next_execution_id: AtomicU64::new(1),
                 session_generation: Arc::new(AtomicU64::new(1)),
-                accepting: AtomicBool::new(true),
+                lifecycle: AtomicU8::new(TASK_SCOPE_ACCEPTING),
             }),
         }
     }
@@ -277,7 +280,7 @@ struct RegistryInner {
     diagnostics: Mutex<Vec<BackgroundTaskDiagnostic>>,
     next_execution_id: AtomicU64,
     session_generation: Arc<AtomicU64>,
-    accepting: AtomicBool,
+    lifecycle: AtomicU8,
 }
 
 impl Drop for RegistryInner {
@@ -295,6 +298,31 @@ impl Drop for RegistryInner {
 #[derive(Clone)]
 pub struct FeatureBackgroundTaskRegistry {
     inner: Arc<RegistryInner>,
+}
+
+/// Holds the task registry quiescent across the entire Session rewrite. Drop
+/// reopens starts only when shutdown has not moved the scope to Stopping.
+pub struct BackgroundTaskRewriteGuard {
+    inner: Arc<RegistryInner>,
+}
+
+impl std::fmt::Debug for BackgroundTaskRewriteGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BackgroundTaskRewriteGuard")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for BackgroundTaskRewriteGuard {
+    fn drop(&mut self) {
+        let _ = self.inner.lifecycle.compare_exchange(
+            TASK_SCOPE_REWRITING,
+            TASK_SCOPE_ACCEPTING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 impl Default for FeatureBackgroundTaskRegistry {
@@ -361,7 +389,7 @@ impl FeatureBackgroundTaskRegistry {
         task_name: &str,
         invocation: HookInvocationContext,
     ) -> Result<BackgroundTaskStart, HookError> {
-        if !self.inner.accepting.load(Ordering::Acquire) {
+        if self.inner.lifecycle.load(Ordering::Acquire) != TASK_SCOPE_ACCEPTING {
             return Err(HookError::new(
                 HookErrorCategory::ScopeDisposed,
                 "background task scope is stopping",
@@ -380,10 +408,11 @@ impl FeatureBackgroundTaskRegistry {
             .running
             .lock()
             .expect("background tasks poisoned");
-        // `shutdown()` flips accepting before taking this same lock. Recheck
-        // while holding the spawn/drain serialization boundary so a starter
-        // that passed the optimistic check cannot publish a task after drain.
-        if !self.inner.accepting.load(Ordering::Acquire) {
+        // `shutdown()` and `begin_session_rewrite()` change lifecycle before
+        // taking this same lock. Recheck while holding the spawn/drain
+        // serialization boundary so a starter that passed the optimistic
+        // check cannot publish after either barrier.
+        if self.inner.lifecycle.load(Ordering::Acquire) != TASK_SCOPE_ACCEPTING {
             return Err(HookError::new(
                 HookErrorCategory::ScopeDisposed,
                 "background task scope is stopping",
@@ -484,14 +513,45 @@ impl FeatureBackgroundTaskRegistry {
             .clone()
     }
 
-    pub async fn before_session_rewrite(&self) -> Result<(), HookError> {
+    pub async fn begin_session_rewrite(&self) -> Result<BackgroundTaskRewriteGuard, HookError> {
+        match self.inner.lifecycle.compare_exchange(
+            TASK_SCOPE_ACCEPTING,
+            TASK_SCOPE_REWRITING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(TASK_SCOPE_REWRITING) => {
+                return Err(HookError::new(
+                    HookErrorCategory::Dependency,
+                    "another Session rewrite already owns the background task barrier",
+                ));
+            }
+            Err(_) => {
+                return Err(HookError::new(
+                    HookErrorCategory::ScopeDisposed,
+                    "background task scope is stopping",
+                ));
+            }
+        }
+        let guard = BackgroundTaskRewriteGuard {
+            inner: Arc::clone(&self.inner),
+        };
         self.settle(false).await?;
+        if self.inner.lifecycle.load(Ordering::Acquire) != TASK_SCOPE_REWRITING {
+            return Err(HookError::new(
+                HookErrorCategory::ScopeDisposed,
+                "background task scope stopped during Session rewrite preparation",
+            ));
+        }
         self.inner.session_generation.fetch_add(1, Ordering::AcqRel);
-        Ok(())
+        Ok(guard)
     }
 
     pub async fn shutdown(&self) -> Result<(), HookError> {
-        self.inner.accepting.store(false, Ordering::Release);
+        self.inner
+            .lifecycle
+            .store(TASK_SCOPE_STOPPING, Ordering::Release);
         self.settle(true).await
     }
 
@@ -668,7 +728,7 @@ async fn execute_task(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn invocation() -> HookInvocationContext {
         HookInvocationContext {
@@ -893,6 +953,73 @@ mod tests {
         );
     }
 
+    struct StartsTaskFromRewriteHook {
+        registry: FeatureBackgroundTaskRegistry,
+        feature: FeatureId,
+        rejected: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl crate::hook::Hook<crate::hook::BeforeSessionRewrite> for StartsTaskFromRewriteHook {
+        async fn call(
+            &self,
+            _input: &crate::hook::BeforeSessionRewriteContext,
+        ) -> Result<crate::hook::BeforeSessionRewriteAction, HookError> {
+            let error = self
+                .registry
+                .start(&self.feature, "hook-start", invocation())
+                .unwrap_err();
+            self.rejected.store(
+                error.category == HookErrorCategory::ScopeDisposed,
+                Ordering::Release,
+            );
+            Ok(crate::hook::BeforeSessionRewriteAction::Continue)
+        }
+    }
+
+    #[tokio::test]
+    async fn rewrite_hook_cannot_start_task_while_quiescence_guard_is_held() {
+        let feature = FeatureId::builtin("hook-start-test");
+        let declaration = BackgroundTaskDeclaration::worker_managed("hook-start", "hook-start");
+        let mut task_builder = FeatureBackgroundTaskRegistryBuilder::default();
+        task_builder
+            .register(
+                feature.clone(),
+                BackgroundTaskSpec::single_flight(declaration, Duration::from_secs(1)),
+                WaitForCancellation,
+            )
+            .unwrap();
+        let tasks = task_builder.build();
+        let rejected = Arc::new(AtomicBool::new(false));
+        let mut hook_builder = crate::hook::HookRegistryBuilder::new();
+        hook_builder
+            .add_named_before_session_rewrite(
+                "hook-start-test",
+                crate::hook::HookExecutionPolicy::fail_closed(),
+                StartsTaskFromRewriteHook {
+                    registry: tasks.clone(),
+                    feature,
+                    rejected: Arc::clone(&rejected),
+                },
+            )
+            .unwrap();
+        let hooks = hook_builder.build();
+        let guard = tasks.begin_session_rewrite().await.unwrap();
+        let context = crate::hook::BeforeSessionRewriteContext {
+            invocation: invocation(),
+            kind: crate::hook::SessionRewriteKind::Compact,
+            current_history: crate::hook::HookHistoryRange::default(),
+        };
+
+        assert_eq!(
+            hooks.before_session_rewrite(&context).await.unwrap(),
+            crate::hook::BeforeSessionRewriteAction::Continue
+        );
+        assert!(rejected.load(Ordering::Acquire));
+        drop(guard);
+        tasks.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn rewrite_joins_old_tasks_before_advancing_session_generation() {
         let feature = FeatureId::builtin("generation-test");
@@ -915,9 +1042,16 @@ mod tests {
             .unwrap();
         assert_eq!(registry.inner.session_generation.load(Ordering::Acquire), 1);
 
-        registry.before_session_rewrite().await.unwrap();
+        let rewrite_guard = registry.begin_session_rewrite().await.unwrap();
 
         assert_eq!(registry.inner.session_generation.load(Ordering::Acquire), 2);
+        assert!(matches!(
+            registry.start(&feature, "generation", invocation()),
+            Err(HookError {
+                category: HookErrorCategory::ScopeDisposed,
+                ..
+            })
+        ));
         assert_eq!(
             stale_fence.ensure_current().unwrap_err().category,
             HookErrorCategory::Cancelled
@@ -927,6 +1061,27 @@ mod tests {
             registry.diagnostics()[0].outcome,
             BackgroundTaskOutcome::Cancelled
         );
+        drop(rewrite_guard);
+        assert!(matches!(
+            registry
+                .start(&feature, "generation", invocation())
+                .unwrap(),
+            BackgroundTaskStart::Started { .. }
+        ));
+        registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_rewrite_prevents_guard_drop_from_reopening_starts() {
+        let registry = FeatureBackgroundTaskRegistry::default();
+        let guard = registry.begin_session_rewrite().await.unwrap();
+        registry.shutdown().await.unwrap();
+        drop(guard);
+
+        let error = registry
+            .start(&FeatureId::builtin("missing"), "missing", invocation())
+            .unwrap_err();
+        assert_eq!(error.category, HookErrorCategory::ScopeDisposed);
     }
 
     #[tokio::test]
@@ -942,7 +1097,7 @@ mod tests {
         let registry = builder.build();
         registry.start(&feature, "rewrite", invocation()).unwrap();
 
-        let error = registry.before_session_rewrite().await.unwrap_err();
+        let error = registry.begin_session_rewrite().await.unwrap_err();
         assert_eq!(error.category, HookErrorCategory::Dependency);
         registry.shutdown().await.unwrap();
         assert_eq!(registry.diagnostics().len(), 1);
