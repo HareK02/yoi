@@ -51,10 +51,10 @@ use crate::feature::{
     FeatureRegistryInstallReport, dedupe_instruction_contributions,
 };
 use crate::hook::{
-    BeforeSessionRewriteAction, BeforeSessionRewriteContext, Hook, HookInvocationContext,
-    HookRegistry, HookRegistryBuilder, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest,
-    PreToolCall, RunCommittedContext, RunCommittedExit, RunExitContext, SessionRewriteKind,
-    WorkerStoppingContext,
+    BeforeSessionRewriteAction, BeforeSessionRewriteContext, Hook, HookHistoryRange,
+    HookInvocationContext, HookRegistry, HookRegistryBuilder, OnPromptSubmit, OnTurnEnd,
+    PostToolCall, PreLlmRequest, PreToolCall, RunCommittedContext, RunCommittedExit,
+    RunExitContext, SessionRewriteKind, WorkerStoppingContext,
 };
 use crate::in_flight::InFlightEvents;
 use crate::internal_worker::{
@@ -66,6 +66,7 @@ const COMPACTION_EXTENSION_DOMAIN: &str = "yoi.compaction";
 const LARGE_PASTE_INLINE_MAX_BYTES: usize = 32 * 1024;
 const WORKER_ORCHESTRATION_INSTRUCTION_ID: &str = "worker.orchestration";
 const WORKER_ORCHESTRATION_PROMPT_REF: &str = "common.worker_orchestration";
+const FEATURE_HOOK_CHAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn hook_run_exit(exit: &EngineRunExit) -> RunCommittedExit {
     match exit {
@@ -1281,8 +1282,20 @@ impl<C: LlmClient + 'static, St: Store + 'static> Worker<C, St> {
                 invocation: self.hook_invocation_context(None),
                 reason: reason.into(),
             };
-            if let Err(error) = hooks.on_worker_stopping(&context).await {
-                tracing::warn!(error = %error, "worker-stopping hook requires attention");
+            match tokio::time::timeout(
+                FEATURE_HOOK_CHAIN_TIMEOUT,
+                hooks.on_worker_stopping(&context),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "worker-stopping hook requires attention");
+                }
+                Err(_) => {
+                    hooks.record_chain_timeout("worker-stopping");
+                    tracing::warn!("worker-stopping hook chain exceeded its host deadline");
+                }
             }
         }
         if let Err(error) = self.feature_background_tasks.shutdown().await {
@@ -1858,6 +1871,19 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Direct access to the underlying Engine.
     pub fn engine(&self) -> &Engine<C, Mutable, SessionHistoryMetadata> {
         self.engine.as_ref().expect("worker taken during run")
+    }
+
+    fn hook_history_range(&self) -> HookHistoryRange {
+        let entries = self.session.history().entries();
+        HookHistoryRange {
+            first_entry_ref: entries.first().map(|entry| {
+                crate::SessionEntryRef::from_history_entry_id(&entry.annotation.entry_id)
+            }),
+            last_entry_ref: entries.last().map(|entry| {
+                crate::SessionEntryRef::from_history_entry_id(&entry.annotation.entry_id)
+            }),
+            entry_count: entries.len(),
+        }
     }
 
     fn hook_invocation_context(&self, run_id: Option<String>) -> HookInvocationContext {
@@ -3444,8 +3470,17 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 exit: hook_exit,
                 history_len: self.session.history().len(),
             };
-            if let Err(error) = hooks.on_run_exit(&context).await {
-                tracing::warn!(error = %error, "run-exit hook failed; preserving terminal commit");
+            match tokio::time::timeout(FEATURE_HOOK_CHAIN_TIMEOUT, hooks.on_run_exit(&context))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "run-exit hook failed; preserving terminal commit");
+                }
+                Err(_) => {
+                    hooks.record_chain_timeout("run-exit");
+                    tracing::warn!("run-exit hook chain exceeded its host deadline");
+                }
             }
         }
         if matches!(&result, EngineRunExit::Interrupted(_)) {
@@ -3457,11 +3492,19 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             let context = RunCommittedContext {
                 invocation: committed_invocation.clone(),
                 exit: hook_exit,
-                committed_history: self.session.history().entries().to_vec(),
-                committed_history_len: self.session.history().len(),
+                committed_history: self.hook_history_range(),
             };
-            if let Err(error) = hooks.on_run_committed(&context).await {
-                tracing::warn!(error = %error, "run-committed hook requires attention");
+            match tokio::time::timeout(FEATURE_HOOK_CHAIN_TIMEOUT, hooks.on_run_committed(&context))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "run-committed hook requires attention");
+                }
+                Err(_) => {
+                    hooks.record_chain_timeout("run-committed");
+                    tracing::warn!("run-committed hook chain exceeded its host deadline");
+                }
             }
         }
         if let Err(error) = self
@@ -3659,14 +3702,21 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             let context = BeforeSessionRewriteContext {
                 invocation: self.hook_invocation_context(None),
                 kind,
-                current_history: self.session.history().entries().to_vec(),
-                current_history_len: self.session.history().len(),
+                current_history: self.hook_history_range(),
             };
-            match hooks
-                .before_session_rewrite(&context)
-                .await
-                .map_err(|error| WorkerError::FeatureLifecycle(error.to_string()))?
-            {
+            let action = tokio::time::timeout(
+                FEATURE_HOOK_CHAIN_TIMEOUT,
+                hooks.before_session_rewrite(&context),
+            )
+            .await
+            .map_err(|_| {
+                hooks.record_chain_timeout("before-session-rewrite");
+                WorkerError::FeatureLifecycle(
+                    "session-rewrite hook chain exceeded its host deadline".to_string(),
+                )
+            })?
+            .map_err(|error| WorkerError::FeatureLifecycle(error.to_string()))?;
+            match action {
                 BeforeSessionRewriteAction::Continue => {}
                 BeforeSessionRewriteAction::Deny(reason) => {
                     return Err(WorkerError::FeatureLifecycle(reason));

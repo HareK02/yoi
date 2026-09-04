@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::hook::{
-    BeforeSessionRewrite, Hook, HookFailurePolicy, HookRegistryBuilder, OnPromptSubmit, OnTurnEnd,
-    PostToolCall, PreLlmRequest, PreToolCall, RunCommitted, RunExit, WorkerStopping,
+    BeforeSessionRewrite, Hook, HookExecutionPolicy, HookRegistryBuilder, OnPromptSubmit,
+    OnTurnEnd, PostToolCall, PreLlmRequest, PreToolCall, RunCommitted, RunExit, WorkerStopping,
 };
 use background::{
     BackgroundTaskSpec, FeatureBackgroundTask, FeatureBackgroundTaskRegistry,
@@ -903,46 +903,6 @@ fn reject_undeclared_contribution(
     error
 }
 
-/// Model-visible durable notification sink skeleton. The first slice exposes
-/// the boundary without implementing a new event channel.
-pub struct FeatureNotificationSink<'a> {
-    report: &'a mut FeatureInstallReport,
-}
-
-impl FeatureNotificationSink<'_> {
-    pub fn notify_model(&mut self, message: impl Into<String>) -> Result<(), FeatureInstallError> {
-        let message = message.into();
-        self.report.diagnostics.push(FeatureDiagnostic::warning(format!(
-            "model notification requested during feature installation but no durable Notify host is attached: {message}"
-        )));
-        self.report.mark_skipped(
-            FeatureContributionKind::Notification,
-            "notify_model",
-            "durable Notify/SystemItem host is not connected during feature installation",
-        );
-        Ok(())
-    }
-}
-
-/// Transient human-facing alert sink skeleton.
-pub struct FeatureAlertSink<'a> {
-    report: &'a mut FeatureInstallReport,
-}
-
-impl FeatureAlertSink<'_> {
-    pub fn alert(&mut self, message: impl Into<String>) {
-        let message = message.into();
-        self.report
-            .diagnostics
-            .push(FeatureDiagnostic::info(format!("feature alert: {message}")));
-        self.report.mark_skipped(
-            FeatureContributionKind::Alert,
-            "alert",
-            "transient alert host is not connected during feature installation",
-        );
-    }
-}
-
 /// Diagnostic sink available to feature installers.
 pub struct FeatureDiagnosticSink<'a> {
     report: &'a mut FeatureInstallReport,
@@ -1073,16 +1033,18 @@ impl HookContributionRegistrar<'_> {
     pub fn add_prompt_submit(
         &mut self,
         name: impl Into<String>,
-        policy: HookFailurePolicy,
+        policy: HookExecutionPolicy,
         hook: impl Hook<OnPromptSubmit> + 'static,
     ) -> Result<(), FeatureInstallError> {
         let declaration = HookDeclaration::new(name, FeatureHookPoint::PromptSubmit);
         self.require_declared(&declaration)?;
-        self.hook_builder.add_named_on_prompt_submit(
-            format!("{}:{}", self.feature_id, declaration.name),
-            policy,
-            hook,
-        );
+        self.hook_builder
+            .add_named_on_prompt_submit(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
         self.record(declaration);
         Ok(())
     }
@@ -1090,16 +1052,18 @@ impl HookContributionRegistrar<'_> {
     pub fn add_pre_llm_request(
         &mut self,
         name: impl Into<String>,
-        policy: HookFailurePolicy,
+        policy: HookExecutionPolicy,
         hook: impl Hook<PreLlmRequest> + 'static,
     ) -> Result<(), FeatureInstallError> {
         let declaration = HookDeclaration::new(name, FeatureHookPoint::PreLlmRequest);
         self.require_declared(&declaration)?;
-        self.hook_builder.add_named_pre_llm_request(
-            format!("{}:{}", self.feature_id, declaration.name),
-            policy,
-            hook,
-        );
+        self.hook_builder
+            .add_named_pre_llm_request(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
         self.record(declaration);
         Ok(())
     }
@@ -1109,22 +1073,24 @@ impl HookContributionRegistrar<'_> {
         name: impl Into<String>,
         hook: impl Hook<PreLlmRequest> + 'static,
     ) -> Result<(), FeatureInstallError> {
-        self.add_pre_llm_request(name, HookFailurePolicy::FailClosed, hook)
+        self.add_pre_llm_request(name, HookExecutionPolicy::fail_closed(), hook)
     }
 
     pub fn add_pre_tool_call_with_policy(
         &mut self,
         name: impl Into<String>,
-        policy: HookFailurePolicy,
+        policy: HookExecutionPolicy,
         hook: impl Hook<PreToolCall> + 'static,
     ) -> Result<(), FeatureInstallError> {
         let declaration = HookDeclaration::new(name, FeatureHookPoint::PreToolCall);
         self.require_declared(&declaration)?;
-        self.hook_builder.add_named_pre_tool_call(
-            format!("{}:{}", self.feature_id, declaration.name),
-            policy,
-            hook,
-        );
+        self.hook_builder
+            .add_named_pre_tool_call(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
         self.record(declaration);
         Ok(())
     }
@@ -1134,22 +1100,24 @@ impl HookContributionRegistrar<'_> {
         name: impl Into<String>,
         hook: impl Hook<PreToolCall> + 'static,
     ) -> Result<(), FeatureInstallError> {
-        self.add_pre_tool_call_with_policy(name, HookFailurePolicy::FailClosed, hook)
+        self.add_pre_tool_call_with_policy(name, HookExecutionPolicy::fail_closed(), hook)
     }
 
     pub fn add_post_tool_call(
         &mut self,
         name: impl Into<String>,
-        policy: HookFailurePolicy,
+        policy: HookExecutionPolicy,
         hook: impl Hook<PostToolCall> + 'static,
     ) -> Result<(), FeatureInstallError> {
         let declaration = HookDeclaration::new(name, FeatureHookPoint::PostToolCall);
         self.require_declared(&declaration)?;
-        self.hook_builder.add_named_post_tool_call(
-            format!("{}:{}", self.feature_id, declaration.name),
-            policy,
-            hook,
-        );
+        self.hook_builder
+            .add_named_post_tool_call(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
         self.record(declaration);
         Ok(())
     }
@@ -1159,22 +1127,24 @@ impl HookContributionRegistrar<'_> {
         name: impl Into<String>,
         hook: impl Hook<PostToolCall> + 'static,
     ) -> Result<(), FeatureInstallError> {
-        self.add_post_tool_call(name, HookFailurePolicy::FailClosed, hook)
+        self.add_post_tool_call(name, HookExecutionPolicy::fail_closed(), hook)
     }
 
     pub fn add_assistant_turn_end(
         &mut self,
         name: impl Into<String>,
-        policy: HookFailurePolicy,
+        policy: HookExecutionPolicy,
         hook: impl Hook<OnTurnEnd> + 'static,
     ) -> Result<(), FeatureInstallError> {
         let declaration = HookDeclaration::new(name, FeatureHookPoint::AssistantTurnEnd);
         self.require_declared(&declaration)?;
-        self.hook_builder.add_named_on_turn_end(
-            format!("{}:{}", self.feature_id, declaration.name),
-            policy,
-            hook,
-        );
+        self.hook_builder
+            .add_named_on_turn_end(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
         self.record(declaration);
         Ok(())
     }
@@ -1184,22 +1154,24 @@ impl HookContributionRegistrar<'_> {
         name: impl Into<String>,
         hook: impl Hook<OnTurnEnd> + 'static,
     ) -> Result<(), FeatureInstallError> {
-        self.add_assistant_turn_end(name, HookFailurePolicy::FailClosed, hook)
+        self.add_assistant_turn_end(name, HookExecutionPolicy::fail_closed(), hook)
     }
 
     pub fn add_run_exit(
         &mut self,
         name: impl Into<String>,
-        policy: HookFailurePolicy,
+        policy: HookExecutionPolicy,
         hook: impl Hook<RunExit> + 'static,
     ) -> Result<(), FeatureInstallError> {
         let declaration = HookDeclaration::new(name, FeatureHookPoint::RunExit);
         self.require_declared(&declaration)?;
-        self.hook_builder.add_named_run_exit(
-            format!("{}:{}", self.feature_id, declaration.name),
-            policy,
-            hook,
-        );
+        self.hook_builder
+            .add_named_run_exit(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
         self.record(declaration);
         Ok(())
     }
@@ -1207,16 +1179,18 @@ impl HookContributionRegistrar<'_> {
     pub fn add_run_committed(
         &mut self,
         name: impl Into<String>,
-        policy: HookFailurePolicy,
+        policy: HookExecutionPolicy,
         hook: impl Hook<RunCommitted> + 'static,
     ) -> Result<(), FeatureInstallError> {
         let declaration = HookDeclaration::new(name, FeatureHookPoint::RunCommitted);
         self.require_declared(&declaration)?;
-        self.hook_builder.add_named_run_committed(
-            format!("{}:{}", self.feature_id, declaration.name),
-            policy,
-            hook,
-        );
+        self.hook_builder
+            .add_named_run_committed(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
         self.record(declaration);
         Ok(())
     }
@@ -1224,16 +1198,18 @@ impl HookContributionRegistrar<'_> {
     pub fn add_before_session_rewrite(
         &mut self,
         name: impl Into<String>,
-        policy: HookFailurePolicy,
+        policy: HookExecutionPolicy,
         hook: impl Hook<BeforeSessionRewrite> + 'static,
     ) -> Result<(), FeatureInstallError> {
         let declaration = HookDeclaration::new(name, FeatureHookPoint::BeforeSessionRewrite);
         self.require_declared(&declaration)?;
-        self.hook_builder.add_named_before_session_rewrite(
-            format!("{}:{}", self.feature_id, declaration.name),
-            policy,
-            hook,
-        );
+        self.hook_builder
+            .add_named_before_session_rewrite(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
         self.record(declaration);
         Ok(())
     }
@@ -1241,16 +1217,18 @@ impl HookContributionRegistrar<'_> {
     pub fn add_worker_stopping(
         &mut self,
         name: impl Into<String>,
-        policy: HookFailurePolicy,
+        policy: HookExecutionPolicy,
         hook: impl Hook<WorkerStopping> + 'static,
     ) -> Result<(), FeatureInstallError> {
         let declaration = HookDeclaration::new(name, FeatureHookPoint::WorkerStopping);
         self.require_declared(&declaration)?;
-        self.hook_builder.add_named_worker_stopping(
-            format!("{}:{}", self.feature_id, declaration.name),
-            policy,
-            hook,
-        );
+        self.hook_builder
+            .add_named_worker_stopping(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
         self.record(declaration);
         Ok(())
     }
@@ -1588,18 +1566,6 @@ impl FeatureInstallContext<'_> {
             pending_tools: self.pending_tools,
             installed_tool_names: self.installed_tool_names,
             service_registry: self.service_registry,
-            report: self.report,
-        }
-    }
-
-    pub fn notifications(&mut self) -> FeatureNotificationSink<'_> {
-        FeatureNotificationSink {
-            report: self.report,
-        }
-    }
-
-    pub fn alerts(&mut self) -> FeatureAlertSink<'_> {
-        FeatureAlertSink {
             report: self.report,
         }
     }

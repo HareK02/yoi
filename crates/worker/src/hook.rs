@@ -18,7 +18,6 @@
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
-use agen::HistoryEntry;
 use agen::interceptor::{
     PostToolAction, PreRequestAction, PreToolAction, PromptAction, TurnEndAction,
 };
@@ -29,7 +28,7 @@ use serde_json::Value;
 use session_store::{SystemItem, SystemReminder};
 use thiserror::Error;
 
-use crate::session_history::SessionHistoryMetadata;
+use crate::SessionEntryRef;
 
 const HOOK_DIAGNOSTIC_MAX_BYTES: usize = 1_024;
 
@@ -77,6 +76,39 @@ pub enum HookFailurePolicy {
     FailOpenWithDiagnostic,
     /// Keep committed state intact and mark the failure for operator attention.
     AttentionRequired,
+}
+
+const DEFAULT_HOOK_TIMEOUT_MS: u64 = 30_000;
+const MAX_HOOK_TIMEOUT_MS: u64 = 120_000;
+
+/// Host-enforced execution and failure budget for one hook registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookExecutionPolicy {
+    pub failure: HookFailurePolicy,
+    pub timeout_ms: u64,
+}
+
+impl HookExecutionPolicy {
+    pub const fn new(failure: HookFailurePolicy, timeout_ms: u64) -> Self {
+        Self {
+            failure,
+            timeout_ms,
+        }
+    }
+
+    pub const fn fail_closed() -> Self {
+        Self::new(HookFailurePolicy::FailClosed, DEFAULT_HOOK_TIMEOUT_MS)
+    }
+
+    fn validate(self) -> Result<Self, HookError> {
+        if self.timeout_ms == 0 || self.timeout_ms > MAX_HOOK_TIMEOUT_MS {
+            return Err(HookError::new(
+                HookErrorCategory::InvalidInput,
+                format!("hook timeout_ms must be within 1..={MAX_HOOK_TIMEOUT_MS}"),
+            ));
+        }
+        Ok(self)
+    }
 }
 
 fn bounded_utf8(mut value: String, max_bytes: usize) -> String {
@@ -421,6 +453,16 @@ pub trait Hook<E: HookEventKind>: Send + Sync {
 // Hook Registry
 // =============================================================================
 
+/// Bounded identity-only view of the committed history visible at a lifecycle
+/// boundary. Hook context never carries history payloads; a Feature that needs
+/// content must use a separately granted session-exploration service.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HookHistoryRange {
+    pub first_entry_ref: Option<SessionEntryRef>,
+    pub last_entry_ref: Option<SessionEntryRef>,
+    pub entry_count: usize,
+}
+
 /// Stable provenance attached to every Worker lifecycle callback.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HookInvocationContext {
@@ -452,8 +494,7 @@ pub struct RunExitContext {
 pub struct RunCommittedContext {
     pub invocation: HookInvocationContext,
     pub exit: RunCommittedExit,
-    pub committed_history: Vec<HistoryEntry<SessionHistoryMetadata>>,
-    pub committed_history_len: usize,
+    pub committed_history: HookHistoryRange,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -468,8 +509,7 @@ pub enum SessionRewriteKind {
 pub struct BeforeSessionRewriteContext {
     pub invocation: HookInvocationContext,
     pub kind: SessionRewriteKind,
-    pub current_history: Vec<HistoryEntry<SessionHistoryMetadata>>,
-    pub current_history_len: usize,
+    pub current_history: HookHistoryRange,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -511,20 +551,28 @@ impl HookEventKind for WorkerStopping {
 
 pub(crate) struct RegisteredHook<E: HookEventKind> {
     owner: String,
-    policy: HookFailurePolicy,
+    policy: HookExecutionPolicy,
     hook: Box<dyn Hook<E>>,
 }
 
 impl<E: HookEventKind> RegisteredHook<E> {
     pub(crate) async fn call(&self, input: &E::Input) -> Result<E::Output, HookExecutionError> {
-        self.hook
-            .call(input)
-            .await
-            .map_err(|source| HookExecutionError {
-                owner: self.owner.clone(),
-                policy: self.policy,
-                source,
-            })
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(self.policy.timeout_ms),
+            self.hook.call(input),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(HookError::new(
+                HookErrorCategory::Timeout,
+                "hook exceeded its host-enforced execution deadline",
+            ))
+        });
+        result.map_err(|source| HookExecutionError {
+            owner: self.owner.clone(),
+            policy: self.policy.failure,
+            source,
+        })
     }
 
     pub(crate) async fn call_optional(
@@ -567,20 +615,23 @@ pub struct HookRegistryBuilder {
 macro_rules! add_hook_methods {
     ($default:ident, $named:ident, $field:ident, $event:ty) => {
         pub fn $default(&mut self, hook: impl Hook<$event> + 'static) {
-            self.$named("worker.host", HookFailurePolicy::FailClosed, hook);
+            self.$named("worker.host", HookExecutionPolicy::fail_closed(), hook)
+                .expect("host hook policy is valid");
         }
 
         pub fn $named(
             &mut self,
             owner: impl Into<String>,
-            policy: HookFailurePolicy,
+            policy: HookExecutionPolicy,
             hook: impl Hook<$event> + 'static,
-        ) {
+        ) -> Result<(), HookError> {
+            let policy = policy.validate()?;
             self.$field.push(RegisteredHook {
                 owner: owner.into(),
                 policy,
                 hook: Box::new(hook),
             });
+            Ok(())
         }
     };
 }
@@ -704,6 +755,17 @@ impl HookRegistry {
             let remove = diagnostics.len() - 128;
             diagnostics.drain(..remove);
         }
+    }
+
+    pub(crate) fn record_chain_timeout(&self, lifecycle: &str) {
+        self.record_diagnostic(HookExecutionError {
+            owner: format!("worker.{lifecycle}"),
+            policy: HookFailurePolicy::AttentionRequired,
+            source: HookError::new(
+                HookErrorCategory::Timeout,
+                "hook chain exceeded its host-enforced lifecycle deadline",
+            ),
+        });
     }
 
     pub fn diagnostics(&self) -> Vec<HookExecutionError> {
@@ -899,28 +961,31 @@ mod tests {
                 call_id: None,
             },
             kind: SessionRewriteKind::Compact,
-            current_history: Vec::new(),
-            current_history_len: 8,
+            current_history: HookHistoryRange::default(),
         }
     }
 
     #[tokio::test]
     async fn rewrite_denials_are_resolved_by_owner_not_registration_order() {
         let mut builder = HookRegistryBuilder::new();
-        builder.add_named_before_session_rewrite(
-            "z-feature",
-            HookFailurePolicy::FailClosed,
-            RewriteHook {
-                action: BeforeSessionRewriteAction::Deny("z denied".into()),
-            },
-        );
-        builder.add_named_before_session_rewrite(
-            "a-feature",
-            HookFailurePolicy::FailClosed,
-            RewriteHook {
-                action: BeforeSessionRewriteAction::Deny("a denied".into()),
-            },
-        );
+        builder
+            .add_named_before_session_rewrite(
+                "z-feature",
+                HookExecutionPolicy::fail_closed(),
+                RewriteHook {
+                    action: BeforeSessionRewriteAction::Deny("z denied".into()),
+                },
+            )
+            .unwrap();
+        builder
+            .add_named_before_session_rewrite(
+                "a-feature",
+                HookExecutionPolicy::fail_closed(),
+                RewriteHook {
+                    action: BeforeSessionRewriteAction::Deny("a denied".into()),
+                },
+            )
+            .unwrap();
 
         assert_eq!(
             builder
@@ -935,11 +1000,13 @@ mod tests {
     #[tokio::test]
     async fn hook_failure_policy_is_applied_at_the_registry_boundary() {
         let mut fail_open = HookRegistryBuilder::new();
-        fail_open.add_named_before_session_rewrite(
-            "feature",
-            HookFailurePolicy::FailOpenWithDiagnostic,
-            FailingRewriteHook,
-        );
+        fail_open
+            .add_named_before_session_rewrite(
+                "feature",
+                HookExecutionPolicy::new(HookFailurePolicy::FailOpenWithDiagnostic, 30_000),
+                FailingRewriteHook,
+            )
+            .unwrap();
         let fail_open = fail_open.build();
         assert_eq!(
             fail_open
@@ -951,17 +1018,67 @@ mod tests {
         assert_eq!(fail_open.diagnostics().len(), 1);
 
         let mut fail_closed = HookRegistryBuilder::new();
-        fail_closed.add_named_before_session_rewrite(
-            "feature",
-            HookFailurePolicy::FailClosed,
-            FailingRewriteHook,
-        );
+        fail_closed
+            .add_named_before_session_rewrite(
+                "feature",
+                HookExecutionPolicy::fail_closed(),
+                FailingRewriteHook,
+            )
+            .unwrap();
         let error = fail_closed
             .build()
             .before_session_rewrite(&rewrite_context())
             .await
             .unwrap_err();
         assert_eq!(error.source.category, HookErrorCategory::Dependency);
+    }
+
+    struct NeverReturns;
+
+    #[async_trait]
+    impl Hook<BeforeSessionRewrite> for NeverReturns {
+        async fn call(
+            &self,
+            _input: &BeforeSessionRewriteContext,
+        ) -> Result<BeforeSessionRewriteAction, HookError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_execution_deadline_cancels_a_non_cooperative_callback() {
+        let mut builder = HookRegistryBuilder::new();
+        builder
+            .add_named_before_session_rewrite(
+                "feature",
+                HookExecutionPolicy::new(HookFailurePolicy::FailClosed, 10),
+                NeverReturns,
+            )
+            .unwrap();
+        let registry = builder.build();
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            registry.before_session_rewrite(&rewrite_context()),
+        )
+        .await
+        .expect("host hook deadline must terminate the callback")
+        .unwrap_err();
+        assert_eq!(error.source.category, HookErrorCategory::Timeout);
+        assert_eq!(registry.diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn invalid_hook_execution_budget_is_rejected_before_registration() {
+        let mut builder = HookRegistryBuilder::new();
+        let error = builder
+            .add_named_before_session_rewrite(
+                "feature",
+                HookExecutionPolicy::new(HookFailurePolicy::FailClosed, 0),
+                NeverReturns,
+            )
+            .unwrap_err();
+        assert_eq!(error.category, HookErrorCategory::InvalidInput);
     }
 
     #[test]

@@ -30,9 +30,9 @@ use crate::compact::usage_tracker::UsageTracker;
 use session_store::SystemItem;
 
 use crate::hook::{
-    HookPostToolAction, HookPreRequestAction, HookPreToolAction, HookPromptAction, HookRegistry,
-    HookTurnEndAction, PreRequestContext, PreRequestInfo, PromptSubmitInfo, SystemItemAppendHandle,
-    ToolCallSummary, ToolResultSummary, TurnEndInfo,
+    HookEventKind, HookPostToolAction, HookPreRequestAction, HookPreToolAction, HookPromptAction,
+    HookRegistry, HookTurnEndAction, PreRequestContext, PreRequestInfo, PromptSubmitInfo,
+    RegisteredHook, SystemItemAppendHandle, ToolCallSummary, ToolResultSummary, TurnEndInfo,
 };
 use crate::ipc::notify_buffer::{NotifyBuffer, build_system_item_with_provenance};
 use crate::prompt::catalog::PromptCatalog;
@@ -43,6 +43,32 @@ use agen::token_counter::total_tokens;
 
 /// Maximum number of bytes copied into `TurnEndInfo::final_text_preview`.
 const FINAL_TEXT_PREVIEW_LIMIT: usize = 512;
+const INLINE_HOOK_CHAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn call_hook_before_deadline<E: HookEventKind>(
+    hook: &RegisteredHook<E>,
+    input: &E::Input,
+    deadline: tokio::time::Instant,
+) -> Result<Option<E::Output>, InterceptorError> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(InterceptorError::new(
+            InterceptorErrorCategory::Policy,
+            "Worker hook chain exceeded its host-enforced lifecycle deadline",
+        ));
+    }
+    tokio::time::timeout(remaining, hook.call_optional(input))
+        .await
+        .map_err(|_| {
+            InterceptorError::new(
+                InterceptorErrorCategory::Policy,
+                "Worker hook chain exceeded its host-enforced lifecycle deadline",
+            )
+        })?
+        .map_err(|error| {
+            InterceptorError::new(InterceptorErrorCategory::Dependency, error.to_string())
+        })
+}
 
 pub(crate) struct WorkerInterceptor {
     registry: Arc<HookRegistry>,
@@ -246,12 +272,10 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
             input_text: extract_message_text(item).unwrap_or_default(),
             turn_index,
         };
+        let deadline = tokio::time::Instant::now() + INLINE_HOOK_CHAIN_TIMEOUT;
         let mut cancellations = Vec::new();
         for hook in &self.registry.on_prompt_submit {
-            let Some(action) = hook.call_optional(&info).await.map_err(|error| {
-                InterceptorError::new(InterceptorErrorCategory::Dependency, error.to_string())
-            })?
-            else {
+            let Some(action) = call_hook_before_deadline(hook, &info, deadline).await? else {
                 continue;
             };
             if let HookPromptAction::Cancel(reason) = action {
@@ -354,12 +378,11 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
             .as_ref()
             .map(|_| SystemItemAppendHandle::new(Arc::clone(&pending_hook_system_items)));
         let hook_context = PreRequestContext::new(info, system_item_sink);
+        let deadline = tokio::time::Instant::now() + INLINE_HOOK_CHAIN_TIMEOUT;
         let mut cancellations = Vec::new();
         let mut should_yield = false;
         for hook in &self.registry.pre_llm_request {
-            let Some(action) = hook.call_optional(&hook_context).await.map_err(|error| {
-                InterceptorError::new(InterceptorErrorCategory::Dependency, error.to_string())
-            })?
+            let Some(action) = call_hook_before_deadline(hook, &hook_context, deadline).await?
             else {
                 continue;
             };
@@ -431,14 +454,12 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
             tool_name: info.call.name.clone(),
             arguments: info.call.input.clone(),
         };
+        let deadline = tokio::time::Instant::now() + INLINE_HOOK_CHAIN_TIMEOUT;
         let mut aborts = Vec::new();
         let mut should_pause = false;
         let mut denials = Vec::new();
         for hook in &self.registry.pre_tool_call {
-            let Some(action) = hook.call_optional(&summary).await.map_err(|error| {
-                InterceptorError::new(InterceptorErrorCategory::Dependency, error.to_string())
-            })?
-            else {
+            let Some(action) = call_hook_before_deadline(hook, &summary, deadline).await? else {
                 continue;
             };
 
@@ -479,12 +500,10 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
                 attachments: Vec::new(),
             },
         };
+        let deadline = tokio::time::Instant::now() + INLINE_HOOK_CHAIN_TIMEOUT;
         let mut aborts = Vec::new();
         for hook in &self.registry.post_tool_call {
-            let Some(action) = hook.call_optional(&summary).await.map_err(|error| {
-                InterceptorError::new(InterceptorErrorCategory::Dependency, error.to_string())
-            })?
-            else {
+            let Some(action) = call_hook_before_deadline(hook, &summary, deadline).await? else {
                 continue;
             };
 
@@ -516,12 +535,10 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
             tool_calls_count: self.tool_calls_this_turn.load(Ordering::Relaxed),
             final_text_preview,
         };
+        let deadline = tokio::time::Instant::now() + INLINE_HOOK_CHAIN_TIMEOUT;
         let mut should_pause = false;
         for hook in &self.registry.on_turn_end {
-            let Some(action) = hook.call_optional(&info).await.map_err(|error| {
-                InterceptorError::new(InterceptorErrorCategory::Dependency, error.to_string())
-            })?
-            else {
+            let Some(action) = call_hook_before_deadline(hook, &info, deadline).await? else {
                 continue;
             };
             if matches!(action, HookTurnEndAction::Pause) {

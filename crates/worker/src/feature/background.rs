@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use tokio::sync::Notify;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use super::{BackgroundTaskDeclaration, FeatureId, FeatureInstallError};
@@ -22,6 +24,7 @@ const MAX_TASK_CONCURRENCY: u16 = 64;
 const MAX_TASK_ATTEMPTS: u16 = 16;
 const MAX_TASK_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_RETAINED_DIAGNOSTICS: usize = 128;
+const TASK_SETTLE_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -107,31 +110,43 @@ pub struct BackgroundTaskContext {
     pub feature_id: FeatureId,
     pub task_name: String,
     pub execution_id: u64,
+    pub session_generation: u64,
     pub attempt: u16,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct BackgroundTaskCancellation {
-    cancelled: Arc<AtomicBool>,
-    notify: Arc<Notify>,
+    sender: Arc<watch::Sender<bool>>,
+}
+
+impl Default for BackgroundTaskCancellation {
+    fn default() -> Self {
+        let (sender, _receiver) = watch::channel(false);
+        Self {
+            sender: Arc::new(sender),
+        }
+    }
 }
 
 impl BackgroundTaskCancellation {
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        *self.sender.borrow()
     }
 
     pub async fn cancelled(&self) {
-        if self.is_cancelled() {
+        let mut receiver = self.sender.subscribe();
+        if *receiver.borrow_and_update() {
             return;
         }
-        self.notify.notified().await;
+        while receiver.changed().await.is_ok() {
+            if *receiver.borrow_and_update() {
+                return;
+            }
+        }
     }
 
     fn cancel(&self) {
-        if !self.cancelled.swap(true, Ordering::AcqRel) {
-            self.notify.notify_one();
-        }
+        self.sender.send_replace(true);
     }
 }
 
@@ -200,6 +215,7 @@ impl FeatureBackgroundTaskRegistryBuilder {
                 running: Mutex::new(BTreeMap::new()),
                 diagnostics: Mutex::new(Vec::new()),
                 next_execution_id: AtomicU64::new(1),
+                session_generation: AtomicU64::new(1),
                 accepting: AtomicBool::new(true),
             }),
         }
@@ -218,6 +234,7 @@ struct RegistryInner {
     running: Mutex<BTreeMap<u64, RunningTask>>,
     diagnostics: Mutex<Vec<BackgroundTaskDiagnostic>>,
     next_execution_id: AtomicU64,
+    session_generation: AtomicU64,
     accepting: AtomicBool,
 }
 
@@ -280,6 +297,7 @@ pub enum BackgroundTaskOutcome {
     TimedOut,
     Failed(HookError),
     JoinFailed,
+    StaleGenerationDiscarded,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -330,6 +348,7 @@ impl FeatureBackgroundTaskRegistry {
         }
 
         let execution_id = self.inner.next_execution_id.fetch_add(1, Ordering::Relaxed);
+        let session_generation = self.inner.session_generation.load(Ordering::Acquire);
         let cancellation = BackgroundTaskCancellation::default();
         let task_cancellation = cancellation.clone();
         let task = Arc::clone(&registration.task);
@@ -347,10 +366,17 @@ impl FeatureBackgroundTaskRegistry {
                 task_feature_id.clone(),
                 task_task_name.clone(),
                 execution_id,
+                session_generation,
                 task_cancellation,
             )
             .await;
             if let Some(inner) = weak_inner.upgrade() {
+                let outcome =
+                    if inner.session_generation.load(Ordering::Acquire) == session_generation {
+                        outcome
+                    } else {
+                        BackgroundTaskOutcome::StaleGenerationDiscarded
+                    };
                 let mut diagnostics = inner.diagnostics.lock().expect("diagnostics poisoned");
                 diagnostics.push(BackgroundTaskDiagnostic {
                     execution_id,
@@ -405,7 +431,9 @@ impl FeatureBackgroundTaskRegistry {
     }
 
     pub async fn before_session_rewrite(&self) -> Result<(), HookError> {
-        self.settle(false).await
+        self.settle(false).await?;
+        self.inner.session_generation.fetch_add(1, Ordering::AcqRel);
+        Ok(())
     }
 
     pub async fn shutdown(&self) -> Result<(), HookError> {
@@ -469,17 +497,31 @@ impl FeatureBackgroundTaskRegistry {
             }
         }
 
+        let settle_deadline =
+            tokio::time::Instant::now() + Duration::from_millis(TASK_SETTLE_TIMEOUT_MS);
         let mut join_failed = false;
-        for (execution_id, feature_id, task_name, handle) in waiting {
-            if handle.await.is_err() {
-                join_failed = true;
+        for (execution_id, feature_id, task_name, mut handle) in waiting {
+            let outcome = match tokio::time::timeout_at(settle_deadline, &mut handle).await {
+                Ok(Ok(())) => None,
+                Ok(Err(_)) => {
+                    join_failed = true;
+                    Some(BackgroundTaskOutcome::JoinFailed)
+                }
+                Err(_) => {
+                    join_failed = true;
+                    handle.abort();
+                    let _ = handle.await;
+                    Some(BackgroundTaskOutcome::TimedOut)
+                }
+            };
+            if let Some(outcome) = outcome {
                 let mut diagnostics = self.inner.diagnostics.lock().expect("diagnostics poisoned");
                 diagnostics.push(BackgroundTaskDiagnostic {
                     execution_id,
                     feature_id,
                     task_name,
                     attempts: 0,
-                    outcome: BackgroundTaskOutcome::JoinFailed,
+                    outcome,
                 });
                 if diagnostics.len() > MAX_RETAINED_DIAGNOSTICS {
                     let remove = diagnostics.len() - MAX_RETAINED_DIAGNOSTICS;
@@ -490,7 +532,7 @@ impl FeatureBackgroundTaskRegistry {
         if join_failed {
             return Err(HookError::new(
                 HookErrorCategory::Internal,
-                "feature background task join failed",
+                "feature background task settlement failed or exceeded its host deadline",
             ));
         }
         Ok(())
@@ -504,6 +546,7 @@ async fn execute_task(
     feature_id: FeatureId,
     task_name: String,
     execution_id: u64,
+    session_generation: u64,
     cancellation: BackgroundTaskCancellation,
 ) -> (u16, BackgroundTaskOutcome) {
     let (max_attempts, delay_ms) = match spec.retry {
@@ -513,22 +556,24 @@ async fn execute_task(
             delay_ms,
         } => (max_attempts, delay_ms),
     };
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(spec.timeout_ms);
     for attempt in 1..=max_attempts {
         if cancellation.is_cancelled() {
             return (attempt, BackgroundTaskOutcome::Cancelled);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return (attempt, BackgroundTaskOutcome::TimedOut);
         }
         let context = BackgroundTaskContext {
             invocation: invocation.clone(),
             feature_id: feature_id.clone(),
             task_name: task_name.clone(),
             execution_id,
+            session_generation,
             attempt,
         };
-        let result = tokio::time::timeout(
-            Duration::from_millis(spec.timeout_ms),
-            task.run(context, cancellation.clone()),
-        )
-        .await;
+        let result =
+            tokio::time::timeout_at(deadline, task.run(context, cancellation.clone())).await;
         match result {
             Ok(Ok(())) => return (attempt, BackgroundTaskOutcome::Completed),
             Ok(Err(_error)) if cancellation.is_cancelled() => {
@@ -541,8 +586,16 @@ async fn execute_task(
             Err(_) => return (attempt, BackgroundTaskOutcome::TimedOut),
         }
         if delay_ms > 0 {
+            let retry_at = std::cmp::min(
+                deadline,
+                tokio::time::Instant::now() + Duration::from_millis(delay_ms),
+            );
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                () = tokio::time::sleep_until(retry_at) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return (attempt, BackgroundTaskOutcome::TimedOut);
+                    }
+                }
                 () = cancellation.cancelled() => {
                     return (attempt, BackgroundTaskOutcome::Cancelled);
                 }
@@ -681,6 +734,98 @@ mod tests {
         assert_eq!(
             registry.diagnostics()[0].outcome,
             BackgroundTaskOutcome::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_observed_when_cancel_races_with_wait_registration() {
+        for _ in 0..100 {
+            let cancellation = BackgroundTaskCancellation::default();
+            let waiter = cancellation.clone();
+            let task = tokio::spawn(async move {
+                waiter.cancelled().await;
+            });
+            cancellation.cancel();
+            tokio::time::timeout(Duration::from_millis(100), task)
+                .await
+                .expect("watch-backed cancellation must not lose the transition")
+                .unwrap();
+        }
+    }
+
+    struct AlwaysFails {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl FeatureBackgroundTask for AlwaysFails {
+        async fn run(
+            &self,
+            _context: BackgroundTaskContext,
+            _cancellation: BackgroundTaskCancellation,
+        ) -> Result<(), HookError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(HookError::new(HookErrorCategory::Dependency, "retry"))
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_delay_consumes_one_total_execution_deadline() {
+        let feature = FeatureId::builtin("deadline-test");
+        let declaration = BackgroundTaskDeclaration::worker_managed("deadline", "deadline");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = FeatureBackgroundTaskRegistryBuilder::default();
+        let mut spec = BackgroundTaskSpec::single_flight(declaration, Duration::from_millis(20));
+        spec.shutdown = BackgroundTaskShutdownPolicy::Wait;
+        spec.retry = BackgroundTaskRetryPolicy::Bounded {
+            max_attempts: 3,
+            delay_ms: 100,
+        };
+        builder
+            .register(
+                feature.clone(),
+                spec,
+                AlwaysFails {
+                    calls: Arc::clone(&calls),
+                },
+            )
+            .unwrap();
+        let registry = builder.build();
+        registry.start(&feature, "deadline", invocation()).unwrap();
+        registry.shutdown().await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            registry.diagnostics()[0].outcome,
+            BackgroundTaskOutcome::TimedOut
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_joins_old_tasks_before_advancing_session_generation() {
+        let feature = FeatureId::builtin("generation-test");
+        let declaration = BackgroundTaskDeclaration::worker_managed("generation", "generation");
+        let mut builder = FeatureBackgroundTaskRegistryBuilder::default();
+        builder
+            .register(
+                feature.clone(),
+                BackgroundTaskSpec::single_flight(declaration, Duration::from_secs(1)),
+                WaitForCancellation,
+            )
+            .unwrap();
+        let registry = builder.build();
+        registry
+            .start(&feature, "generation", invocation())
+            .unwrap();
+        assert_eq!(registry.inner.session_generation.load(Ordering::Acquire), 1);
+
+        registry.before_session_rewrite().await.unwrap();
+
+        assert_eq!(registry.inner.session_generation.load(Ordering::Acquire), 2);
+        assert_eq!(registry.diagnostics().len(), 1);
+        assert_eq!(
+            registry.diagnostics()[0].outcome,
+            BackgroundTaskOutcome::Cancelled
         );
     }
 
