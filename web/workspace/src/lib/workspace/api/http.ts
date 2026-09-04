@@ -1,58 +1,18 @@
+import type {
+  SkillCatalogResponse,
+  SkillDetailResponse,
+} from "$lib/generated/skill-api.ts";
+import {
+  parseSkillCatalogResponse,
+  parseSkillDetailResponse,
+} from "$lib/workspace/skills/api.ts";
+
 export type ApiResult<T> = {
   data: T | null;
   error: string | null;
 };
 
-export type SkillDiagnosticSeverity = "error" | "warning";
-
-export type SkillDiagnostic = {
-  severity: SkillDiagnosticSeverity;
-  code: string;
-  message: string;
-  source?: string;
-};
-
-export type SkillProvenance = {
-  kind: "builtin" | "workspace";
-  id: string;
-  virtual_path?: string;
-  revision?: number;
-  source_digest?: string;
-  tree_digest?: string;
-};
-
-export type SkillCatalogEntry = {
-  name: string;
-  description: string;
-  provenance: SkillProvenance;
-  overrides: SkillProvenance[];
-  diagnostics: SkillDiagnostic[];
-};
-
-export type SkillCatalogResponse = {
-  authority: string;
-  entries: SkillCatalogEntry[];
-  diagnostics: SkillDiagnostic[];
-};
-
-export type SkillResourceRef = {
-  kind: string;
-  name: string;
-  supported: boolean;
-  diagnostic?: string;
-};
-
-export type SkillDetailResponse = {
-  name: string;
-  description: string;
-  provenance: SkillProvenance;
-  overrides: SkillProvenance[];
-  diagnostics: SkillDiagnostic[];
-  body: string;
-  allowed_tools: string[];
-  allowed_tools_status: string;
-  resources: SkillResourceRef[];
-};
+export type { SkillCatalogResponse, SkillDetailResponse };
 
 function normalizePath(path: string): string {
   if (!path || path === "/") return "";
@@ -95,6 +55,8 @@ export async function loadWorkspaceSkillCatalog(
   return loadJson<SkillCatalogResponse>(
     fetchFn,
     workspaceSkillCatalogPath(workspaceId),
+    undefined,
+    parseSkillCatalogResponse,
   );
 }
 
@@ -106,6 +68,8 @@ export async function loadWorkspaceSkillDetail(
   return loadJson<SkillDetailResponse>(
     fetchFn,
     workspaceSkillDetailPath(workspaceId, name),
+    undefined,
+    parseSkillDetailResponse,
   );
 }
 

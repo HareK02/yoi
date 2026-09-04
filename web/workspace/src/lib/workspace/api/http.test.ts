@@ -89,11 +89,24 @@ Deno.test("loadWorkspaceSkillCatalog fetches lightweight catalog", async () => {
       return Promise.resolve(
         new Response(
           JSON.stringify({
-            authority: "workspace-backend-skills-v0",
+            authority: "workspace-config-skills-v1",
+            projection: {
+              config_revision: 7,
+              tree_digest: "tree-digest",
+            },
             entries: [{
               name: "triage-errors",
               description: "Use when triaging errors.",
-              provenance: { kind: "workspace", id: "workspace:triage-errors" },
+              activation_status: "active",
+              projection_status: "valid",
+              provenance: {
+                kind: "workspace",
+                id: "workspace:triage-errors",
+                virtual_path: "skills/triage-errors/SKILL.md",
+                revision: 7,
+                source_digest: "source-digest",
+                tree_digest: "tree-digest",
+              },
               overrides: [],
               diagnostics: [],
             }],
