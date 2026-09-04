@@ -956,6 +956,34 @@ impl WorkerManifest {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LegacyMemoryFeatureConfig {
+    enabled: bool,
+    staging: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LegacyMemoryConfig {
+    #[serde(rename = "workspace_root")]
+    _workspace_root: Option<PathBuf>,
+    #[serde(rename = "query_result_limit")]
+    _query_result_limit: Option<usize>,
+    #[serde(rename = "query_excerpt_lines")]
+    _query_excerpt_lines: Option<usize>,
+    inject_summary: Option<bool>,
+    workspace_id: Option<String>,
+    settings_revision: Option<u64>,
+    language: Option<String>,
+    extract_model: Option<ModelManifest>,
+    extract_threshold: Option<u64>,
+    extract_worker_max_turns: Option<u32>,
+    consolidation_model: Option<ModelManifest>,
+    consolidation_threshold_files: Option<usize>,
+    consolidation_threshold_bytes: Option<u64>,
+}
+
 const RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION: u64 = 2;
 
 /// Serialize a resolved Worker Manifest for durable Worker-specific storage.
@@ -1004,10 +1032,35 @@ pub fn read_persisted_worker_manifest_snapshot(
                 "resolved Worker manifest snapshot is missing manifest",
             ))
         })?;
-        return serde_json::from_value(manifest);
+        if manifest
+            .as_object()
+            .is_some_and(|manifest| manifest.contains_key("memory"))
+        {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "current resolved Worker manifest contains removed top-level memory authority",
+            )));
+        }
+        return validate_persisted_worker_manifest(serde_json::from_value(manifest)?);
     }
 
     migrate_legacy_resolved_manifest_snapshot(snapshot)
+}
+
+fn validate_persisted_worker_manifest(
+    manifest: WorkerManifest,
+) -> Result<WorkerManifest, serde_json::Error> {
+    manifest
+        .feature
+        .memory
+        .validate_execution()
+        .map_err(|message| {
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                message,
+            ))
+        })?;
+    Ok(manifest)
 }
 
 fn migrate_legacy_resolved_manifest_snapshot(
@@ -1030,44 +1083,21 @@ fn migrate_legacy_resolved_manifest_snapshot(
                 "legacy resolved Worker manifest feature must be an object",
             ))
         })?;
-    let legacy_feature_memory = feature
-        .remove("memory")
-        .unwrap_or_else(|| serde_json::json!({}));
-    let legacy_feature_memory = legacy_feature_memory.as_object().ok_or_else(|| {
-        serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "legacy resolved Worker manifest feature.memory must be an object",
-        ))
-    })?;
-    if legacy_feature_memory
-        .keys()
-        .any(|key| !matches!(key.as_str(), "enabled" | "staging"))
-    {
-        return Err(serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "legacy resolved Worker manifest mixes old and new Memory configuration",
-        )));
-    }
-    let enabled = legacy_feature_memory
-        .get("enabled")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let staging_tools = legacy_feature_memory
-        .get("staging")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let legacy_feature_memory: LegacyMemoryFeatureConfig = serde_json::from_value(
+        feature
+            .remove("memory")
+            .unwrap_or_else(|| serde_json::json!({})),
+    )?;
+    let enabled = legacy_feature_memory.enabled;
+    let staging_tools = legacy_feature_memory.staging;
 
-    let legacy_memory = legacy_memory.unwrap_or_else(|| serde_json::json!({}));
-    let legacy_memory = legacy_memory.as_object().ok_or_else(|| {
-        serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "legacy resolved Worker manifest memory must be an object",
-        ))
-    })?;
-    let workspace_id = legacy_memory.get("workspace_id").cloned();
-    let settings_revision = legacy_memory.get("settings_revision").cloned();
-    let language = legacy_memory.get("language").cloned();
-    let workspace_settings = match (workspace_id, settings_revision, language) {
+    let legacy_memory: LegacyMemoryConfig =
+        serde_json::from_value(legacy_memory.unwrap_or_else(|| serde_json::json!({})))?;
+    let mut workspace_settings = match (
+        legacy_memory.workspace_id,
+        legacy_memory.settings_revision,
+        legacy_memory.language,
+    ) {
         (Some(workspace_id), Some(settings_revision), Some(language)) => Some(serde_json::json!({
             "workspace_id": workspace_id,
             "settings_revision": settings_revision,
@@ -1081,27 +1111,20 @@ fn migrate_legacy_resolved_manifest_snapshot(
             )));
         }
     };
-    let extraction_threshold = legacy_memory
-        .get("extract_threshold")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let extraction_enabled = !extraction_threshold.is_null();
-    if legacy_memory
-        .get("consolidation_model")
-        .is_some_and(|model| !model.is_null())
-    {
+    if !enabled {
+        workspace_settings = None;
+    }
+    let extraction_enabled = legacy_memory.extract_threshold.is_some();
+    if legacy_memory.consolidation_model.is_some() {
         return Err(serde_json::Error::io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "legacy resolved Worker manifest uses a Worker-owned consolidation model that cannot be migrated to Backend authority",
         )));
     }
-    let threshold_files = legacy_memory
-        .get("consolidation_threshold_files")
-        .and_then(serde_json::Value::as_u64);
-    let threshold_bytes = legacy_memory
-        .get("consolidation_threshold_bytes")
-        .and_then(serde_json::Value::as_u64);
-    let consolidation_enabled = match (threshold_files, threshold_bytes) {
+    let consolidation_enabled = match (
+        legacy_memory.consolidation_threshold_files,
+        legacy_memory.consolidation_threshold_bytes,
+    ) {
         (None, None) => false,
         (Some(5), Some(50_000)) => true,
         _ => {
@@ -1116,19 +1139,13 @@ fn migrate_legacy_resolved_manifest_snapshot(
             "enabled": enabled,
             "staging_tools": staging_tools,
             "resident": {
-                "inject_summary": legacy_memory
-                    .get("inject_summary")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(true),
+                "inject_summary": legacy_memory.inject_summary.unwrap_or(true),
             },
             "extraction": {
                 "enabled": extraction_enabled,
-                "model": legacy_memory.get("extract_model").cloned().unwrap_or(serde_json::Value::Null),
-                "threshold": extraction_threshold,
-                "worker_max_turns": legacy_memory
-                    .get("extract_worker_max_turns")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
+                "model": serde_json::to_value(legacy_memory.extract_model)?,
+                "threshold": legacy_memory.extract_threshold,
+                "worker_max_turns": legacy_memory.extract_worker_max_turns,
             },
             "consolidation": {
                 "request_enabled": consolidation_enabled,
@@ -1142,7 +1159,7 @@ fn migrate_legacy_resolved_manifest_snapshot(
             .insert("workspace_settings".to_string(), workspace_settings);
     }
     feature.insert("memory".to_string(), resolved);
-    serde_json::from_value(snapshot)
+    validate_persisted_worker_manifest(serde_json::from_value(snapshot)?)
 }
 
 #[cfg(test)]
@@ -1566,6 +1583,18 @@ model_id = "claude-sonnet-4-20250514"
         let current = write_persisted_worker_manifest_snapshot(&migrated).unwrap();
         assert_eq!(current["schema_version"], 2);
         assert!(current["manifest"].get("memory").is_none());
+
+        let mut disabled =
+            serde_json::to_value(WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap()).unwrap();
+        disabled["feature"]["memory"] = serde_json::json!({ "enabled": false });
+        disabled["memory"] = serde_json::json!({
+            "workspace_id": "workspace-1",
+            "settings_revision": 9,
+            "language": "Français",
+        });
+        let disabled = read_persisted_worker_manifest_snapshot(disabled).unwrap();
+        assert!(!disabled.feature.memory.profile.enabled);
+        assert!(disabled.feature.memory.workspace_settings.is_none());
     }
 
     #[test]
@@ -1588,6 +1617,25 @@ model_id = "claude-sonnet-4-20250514"
             "consolidation_threshold_bytes": 50000,
         });
         assert!(read_persisted_worker_manifest_snapshot(custom_policy).is_err());
+
+        let current = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        let mut current = write_persisted_worker_manifest_snapshot(&current).unwrap();
+        current["manifest"]["memory"] = serde_json::json!({
+            "workspace_id": "workspace-1",
+            "settings_revision": 1,
+            "language": "English",
+        });
+        assert!(read_persisted_worker_manifest_snapshot(current).is_err());
+
+        let mut missing_settings = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        missing_settings.feature.memory.profile.enabled = true;
+        let missing_settings = write_persisted_worker_manifest_snapshot(&missing_settings).unwrap();
+        assert!(read_persisted_worker_manifest_snapshot(missing_settings).is_err());
+
+        let mut malformed_legacy = manifest.clone();
+        malformed_legacy["feature"]["memory"] = serde_json::json!({ "enabled": "yes" });
+        malformed_legacy["memory"] = serde_json::json!({ "unknown": true });
+        assert!(read_persisted_worker_manifest_snapshot(malformed_legacy).is_err());
 
         assert!(
             read_persisted_worker_manifest_snapshot(serde_json::json!({

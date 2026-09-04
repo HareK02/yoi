@@ -620,6 +620,48 @@ mod tests {
         assert_eq!(plan.resident_summary.as_deref(), Some("# Durable Memory"));
     }
 
+    #[tokio::test]
+    async fn memory_prompt_contribution_rereads_resident_summary_for_each_install() {
+        let prompts = crate::prompt::catalog::PromptCatalog::builtins_only().unwrap();
+        let mut config = manifest::ResolvedMemoryFeatureConfig::default();
+        config.profile.enabled = true;
+        config
+            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "workspace".to_string(),
+                settings_revision: 1,
+                language: "English".to_string(),
+            })
+            .unwrap();
+
+        let first = MemoryFeatureInstallPlan::prepare_resolved(
+            config.clone(),
+            resident_client("first resident summary"),
+            prompts.clone(),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let restored = MemoryFeatureInstallPlan::prepare_resolved(
+            config,
+            resident_client("updated resident summary"),
+            prompts,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            first.resident_summary.as_deref(),
+            Some("first resident summary")
+        );
+        assert_eq!(
+            restored.resident_summary.as_deref(),
+            Some("updated resident summary")
+        );
+    }
+
     #[test]
     fn memory_feature_owns_normal_and_staging_tool_surfaces() {
         let normal = MemoryToolsFeature::new(test_client(), false);

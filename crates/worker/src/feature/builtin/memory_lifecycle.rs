@@ -77,7 +77,10 @@ impl MemoryLifecycleFeature {
         workspace_context: WorkerWorkspaceContext,
         event_tx: Option<broadcast::Sender<Event>>,
     ) -> std::io::Result<Option<Self>> {
-        if !lifecycle_enabled || !config.profile.enabled || !config.profile.extraction.enabled {
+        if !lifecycle_enabled
+            || !config.profile.enabled
+            || (!config.profile.extraction.enabled && !config.profile.consolidation.request_enabled)
+        {
             return Ok(None);
         }
         config
@@ -521,9 +524,12 @@ impl FeatureBackgroundTask for MemoryLifecycleTask {
         context: BackgroundTaskContext,
         cancellation: BackgroundTaskCancellation,
     ) -> Result<(), HookError> {
-        let extraction = self
-            .run_extraction(context.clone(), cancellation.clone())
-            .await;
+        let extraction = if self.config.profile.extraction.enabled {
+            self.run_extraction(context.clone(), cancellation.clone())
+                .await
+        } else {
+            Ok(())
+        };
         if !cancellation.is_cancelled() {
             context.generation_fence.ensure_current()?;
             if self.config.profile.consolidation.request_enabled {
@@ -1346,6 +1352,38 @@ permission = "write"
         let requests = workspace_client.requests.lock().unwrap();
         assert!(
             !requests.iter().any(|request| {
+                request
+                    .body
+                    .as_deref()
+                    .is_some_and(|body| body == "{\"force\":false}")
+            }),
+            "recorded requests: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_task_requests_consolidation_when_extraction_is_disabled() {
+        let client = ScriptClient::new(Vec::new());
+        let extension_writes = Arc::new(Mutex::new(Vec::new()));
+        let (event_tx, _) = broadcast::channel(16);
+        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
+        let mut interrupted = capture(2, 250);
+        interrupted.run_exit = CommittedRunExit::Interrupted;
+        let mut task = test_task(
+            interrupted,
+            Box::new(client),
+            extension_writes.clone(),
+            event_tx,
+            workspace_client.clone(),
+        );
+        task.config.profile.extraction.enabled = false;
+        task.config.profile.consolidation.request_enabled = true;
+        run_background_task(task).await;
+
+        assert!(extension_writes.lock().unwrap().is_empty());
+        let requests = workspace_client.requests.lock().unwrap();
+        assert!(
+            requests.iter().any(|request| {
                 request
                     .body
                     .as_deref()
