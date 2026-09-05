@@ -21,9 +21,9 @@ use crate::segment_log::LogEntry;
 use crate::store::{Store, StoreError};
 use crate::uploaded_file::{
     bind_uploaded_file, clear_uploaded_file_binding, copy_committed_uploaded_files,
-    delete_uncommitted_uploaded_files, delete_uploaded_file, list_uploaded_file_refs,
-    pin_uploaded_file, read_uploaded_file, read_uploaded_file_by_id, release_uploaded_file_pin,
-    write_uploaded_file,
+    delete_uncommitted_uploaded_files, delete_uploaded_file, finalize_uploaded_file_binding,
+    list_uploaded_file_refs, pin_uploaded_file, read_uploaded_file, read_uploaded_file_by_id,
+    release_uploaded_file_pin, uploaded_file_has_pending_owner, write_uploaded_file,
 };
 use crate::{
     PasteArtifactLimits, SegmentId, SessionId, UploadedFileLimits, UploadedFileUploadContext,
@@ -545,6 +545,23 @@ impl Store for FsStore {
         release_uploaded_file_pin(&self.paste_artifact_dir(session_id), artifact_id, owner_id)
     }
 
+    fn finalize_uploaded_file_binding(
+        &self,
+        session_id: SessionId,
+        artifact_id: &str,
+        source_entry_id: &str,
+    ) -> Result<(), StoreError> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("session store append lock was poisoned"))?;
+        finalize_uploaded_file_binding(
+            &self.paste_artifact_dir(session_id),
+            artifact_id,
+            source_entry_id,
+        )
+    }
+
     fn delete_uploaded_file(
         &self,
         session_id: SessionId,
@@ -568,13 +585,18 @@ impl Store for FsStore {
             let Some(source_entry_id) = reference.source_entry_id.as_deref() else {
                 continue;
             };
-            if !self.uploaded_file_is_referenced(session_id, &reference.artifact_id)? {
-                clear_uploaded_file_binding(&dir, &reference.artifact_id, source_entry_id)?;
-                if delete_uploaded_file(&dir, &reference.artifact_id)? {
-                    removed = removed
-                        .checked_add(1)
-                        .ok_or(StoreError::ArtifactQuotaExceeded)?;
-                }
+            if self.uploaded_file_is_referenced(session_id, &reference.artifact_id)? {
+                finalize_uploaded_file_binding(&dir, &reference.artifact_id, source_entry_id)?;
+                continue;
+            }
+            if uploaded_file_has_pending_owner(&dir, &reference.artifact_id)? {
+                continue;
+            }
+            clear_uploaded_file_binding(&dir, &reference.artifact_id, source_entry_id)?;
+            if delete_uploaded_file(&dir, &reference.artifact_id)? {
+                removed = removed
+                    .checked_add(1)
+                    .ok_or(StoreError::ArtifactQuotaExceeded)?;
             }
         }
         Ok(removed)
@@ -930,19 +952,26 @@ mod tests {
             store
                 .copy_committed_uploaded_files(session_id, fork_session_id)
                 .unwrap(),
-            1
+            0
         );
-        assert_eq!(
+        assert!(
             store
                 .read_uploaded_file_by_id(fork_session_id, &pending.artifact_id)
-                .unwrap()
-                .1,
-            b"pending"
+                .is_err()
         );
 
         let committed = store
             .bind_uploaded_file(session_id, &pending, "entry-1")
             .unwrap();
+        assert_eq!(
+            store.delete_uncommitted_uploaded_files(session_id).unwrap(),
+            0
+        );
+        assert!(
+            store
+                .read_uploaded_file_by_id(session_id, &pending.artifact_id)
+                .is_ok()
+        );
         store
             .create_segment(
                 session_id,
@@ -958,6 +987,11 @@ mod tests {
         assert_eq!(
             store.delete_uncommitted_uploaded_files(session_id).unwrap(),
             0
+        );
+        assert!(
+            store
+                .release_uploaded_file_pin(session_id, &pending.artifact_id, "submission-1")
+                .is_err()
         );
 
         let releasable = store

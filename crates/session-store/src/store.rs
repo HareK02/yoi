@@ -246,6 +246,16 @@ pub trait Store: Send + Sync {
         Err(StoreError::PasteArtifactUnsupported)
     }
 
+    /// Complete the pending-to-history handoff after the history entry commits.
+    fn finalize_uploaded_file_binding(
+        &self,
+        _session_id: SessionId,
+        _artifact_id: &str,
+        _source_entry_id: &str,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::PasteArtifactUnsupported)
+    }
+
     /// Delete an uncommitted uploaded file owned by `session_id`.
     fn delete_uploaded_file(
         &self,

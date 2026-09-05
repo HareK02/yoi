@@ -1012,12 +1012,16 @@ async fn send_peer_notify(socket_path: &Path, message: String) -> io::Result<()>
 }
 
 async fn send_notify(socket_path: &Path, message: String, auto_run: bool) -> io::Result<()> {
+    let notification_request_id = protocol::new_submission_request_id();
     connect_and_send(
         socket_path,
-        &Method::Notify {
-            notification_request_id: protocol::new_submission_request_id(),
+        &Method::NotifyTracked {
+            notification_request_id: notification_request_id.clone(),
             message,
             auto_run,
+            source: protocol::AuthenticatedInputSource::Backend {
+                operation_id: notification_request_id,
+            },
         },
     )
     .await
@@ -1546,7 +1550,7 @@ mod tests {
                 .await
                 .unwrap();
             let method = reader.next::<Method>().await.unwrap().unwrap();
-            if let Method::Notify {
+            if let Method::NotifyTracked {
                 message, auto_run, ..
             } = method
             {
@@ -1668,7 +1672,7 @@ mod tests {
                 .await
                 .unwrap();
             let method = reader.next::<Method>().await.unwrap().unwrap();
-            if let Method::Notify {
+            if let Method::NotifyTracked {
                 message, auto_run, ..
             } = method
             {

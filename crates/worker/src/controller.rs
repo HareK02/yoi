@@ -229,6 +229,60 @@ enum PendingRun {
     Resume,
 }
 
+fn resolved_input_source<St: Store + Clone>(
+    pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
+    source: &protocol::AuthenticatedInputSource,
+) -> (String, session_store::LoggedSessionHistoryOrigin) {
+    if matches!(source, protocol::AuthenticatedInputSource::UntrustedWire) {
+        return (
+            pending_submissions.direct_client_namespace(),
+            session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
+        );
+    }
+    (
+        source.namespace(),
+        crate::worker::authenticated_input_provenance(source),
+    )
+}
+
+fn durable_parent_notification_target<St: Store + Clone + Send + Sync + 'static>(
+    pending_submissions: crate::worker::PendingSubmissionHandle<St>,
+    notify_buffer: NotifyBuffer,
+) -> crate::spawn::tool::ParentNotificationTarget {
+    crate::spawn::tool::ParentNotificationTarget::Durable(Arc::new(move |method| {
+        let Method::NotifyTracked {
+            notification_request_id,
+            message,
+            auto_run,
+            source,
+        } = method
+        else {
+            return;
+        };
+        let (source_namespace, provenance) = resolved_input_source(&pending_submissions, &source);
+        match pending_submissions.accept_notification_from_source(
+            notification_request_id.clone(),
+            message,
+            source_namespace.clone(),
+            provenance,
+            auto_run,
+        ) {
+            Ok(_) if !auto_run => {
+                stage_pending_notification(
+                    &pending_submissions,
+                    &notify_buffer,
+                    &source_namespace,
+                    &notification_request_id,
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "failed to durably accept SubWorker notification");
+            }
+        }
+    }))
+}
+
 fn stage_pending_notification<St: Store + Clone>(
     pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
     notify_buffer: &NotifyBuffer,
@@ -264,6 +318,25 @@ fn stage_oldest_passive_notification<St: Store + Clone>(
                 &request_id,
             )
         })
+}
+
+fn prepare_restored_auto_notification<St: Store + Clone>(
+    pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
+    notify_buffer: &NotifyBuffer,
+) -> Option<PendingRun> {
+    let notification = pending_submissions.prepare_oldest_auto_notification()?;
+    let extension = pending_submissions.notification_activation_extension();
+    let notification_request_id = notification.notification_request_id.clone();
+    notify_buffer.push_durable_notify(
+        notification.message,
+        true,
+        notification.provenance,
+        extension,
+    );
+    Some(PendingRun::RunForNotification {
+        invoke_kind: protocol::InvokeKind::Notify,
+        notification_request_id: Some(notification_request_id),
+    })
 }
 
 fn prepare_pending_run<St: Store + Clone>(
@@ -1007,11 +1080,17 @@ where
     let spawner_name = worker.manifest().worker.name.clone();
     let spawner_manifest = worker.manifest().clone();
     let spawner_workspace_context = worker.workspace_context_handle();
-    let parent_notifications = parent_method_tx
-        .map(crate::spawn::tool::ParentNotificationTarget::Controller)
-        .unwrap_or_else(|| {
-            crate::spawn::tool::ParentNotificationTarget::Buffer(worker.notify_buffer_handle())
-        });
+    let pending_submissions = worker.pending_submission_handle();
+    let notify_buffer = worker.notify_buffer_handle();
+    let durable_parent_notifications =
+        durable_parent_notification_target(pending_submissions.clone(), notify_buffer.clone());
+    let parent_notifications = match parent_method_tx {
+        Some(sender) => crate::spawn::tool::ParentNotificationTarget::with_controller_fallback(
+            sender,
+            durable_parent_notifications,
+        ),
+        None => durable_parent_notifications,
+    };
     let prompts = worker.prompts().clone();
     let paste_store = worker.store().clone();
     let paste_session_id = worker.session_id();
@@ -1354,9 +1433,9 @@ async fn controller_loop<C, St>(
         discovery_cwd,
         spawned_registry.clone(),
     );
-    let mut pending: Option<PendingRun> = None;
     let pending_submissions = worker.pending_submission_handle();
     stage_oldest_passive_notification(&pending_submissions, &notify_buffer);
+    let mut pending = prepare_restored_auto_notification(&pending_submissions, &notify_buffer);
 
     loop {
         // Top-of-iteration: if an event handler staged a run, fire it
@@ -1553,11 +1632,13 @@ async fn controller_loop<C, St>(
                 source,
             } => {
                 let request_id = submission_request_id.clone();
+                let (source_namespace, provenance) =
+                    resolved_input_source(&pending_submissions, &source);
                 match pending_submissions.accept_from_source(
                     submission_request_id,
                     input,
-                    source.namespace(),
-                    crate::worker::authenticated_input_provenance(&source),
+                    source_namespace,
+                    provenance,
                     true,
                 ) {
                     Ok(acceptance) => {
@@ -1630,12 +1711,13 @@ async fn controller_loop<C, St>(
                 source,
             } => {
                 let request_id = notification_request_id.clone();
-                let source_namespace = source.namespace();
+                let (source_namespace, provenance) =
+                    resolved_input_source(&pending_submissions, &source);
                 match pending_submissions.accept_notification_from_source(
                     notification_request_id,
                     message,
                     source_namespace.clone(),
-                    crate::worker::authenticated_input_provenance(&source),
+                    provenance,
                     auto_run,
                 ) {
                     Ok(_) if auto_run => {
@@ -2240,11 +2322,13 @@ where
                         source,
                     }) => {
                         let request_id = submission_request_id.clone();
+                        let (source_namespace, provenance) =
+                            resolved_input_source(pending_submissions, &source);
                         match pending_submissions.accept_from_source(
                             submission_request_id,
                             input,
-                            source.namespace(),
-                            crate::worker::authenticated_input_provenance(&source),
+                            source_namespace,
+                            provenance,
                             false,
                         ) {
                             Ok(acceptance) => {
@@ -2353,12 +2437,13 @@ where
                         source,
                     }) => {
                         let request_id = notification_request_id.clone();
-                        let source_namespace = source.namespace();
+                        let (source_namespace, provenance) =
+                            resolved_input_source(pending_submissions, &source);
                         match pending_submissions.accept_notification_from_source(
                             notification_request_id,
                             message,
                             source_namespace.clone(),
-                            crate::worker::authenticated_input_provenance(&source),
+                            provenance,
                             auto_run,
                         ) {
                             Ok(_) if !auto_run => {
@@ -2556,6 +2641,36 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::net::UnixListener;
+
+    #[test]
+    fn no_controller_parent_notification_uses_durable_pending_authority() {
+        let temp = TempDir::new().unwrap();
+        let pending =
+            crate::worker::PendingSubmissionHandle::for_test(&temp.path().join("sessions"));
+        let target = durable_parent_notification_target(pending.clone(), NotifyBuffer::new());
+        let (wire_namespace, wire_provenance) =
+            resolved_input_source(&pending, &protocol::AuthenticatedInputSource::UntrustedWire);
+        assert_eq!(wire_namespace, pending.direct_client_namespace());
+        assert!(matches!(
+            wire_provenance,
+            session_store::LoggedSessionHistoryOrigin::LegacyUnknown
+        ));
+
+        target.notify("child-session".into(), "completed".into(), true);
+
+        let snapshot = pending.snapshot();
+        assert_eq!(snapshot.notification_count, 1);
+        assert!(snapshot.head_id.is_some());
+        let notify_buffer = NotifyBuffer::new();
+        assert!(matches!(
+            prepare_restored_auto_notification(&pending, &notify_buffer),
+            Some(PendingRun::RunForNotification {
+                notification_request_id: Some(_),
+                ..
+            })
+        ));
+        assert!(notify_buffer.has_auto_run_pending());
+    }
 
     #[test]
     fn image_attachment_gate_requires_vision_and_supported_openai_scheme() {

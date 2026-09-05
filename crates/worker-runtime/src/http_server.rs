@@ -1204,6 +1204,37 @@ async fn worker_protocol_ws(
 }
 
 #[cfg(feature = "ws-server")]
+fn authorize_runtime_protocol_method(method: protocol::Method) -> protocol::Method {
+    match method {
+        protocol::Method::SubmitTracked {
+            submission_request_id,
+            input,
+            ..
+        } => protocol::Method::SubmitTracked {
+            source: protocol::AuthenticatedInputSource::Backend {
+                operation_id: submission_request_id.clone(),
+            },
+            submission_request_id,
+            input,
+        },
+        protocol::Method::NotifyTracked {
+            notification_request_id,
+            message,
+            auto_run,
+            ..
+        } => protocol::Method::NotifyTracked {
+            source: protocol::AuthenticatedInputSource::Backend {
+                operation_id: notification_request_id.clone(),
+            },
+            notification_request_id,
+            message,
+            auto_run,
+        },
+        other => other,
+    }
+}
+
+#[cfg(feature = "ws-server")]
 async fn worker_protocol_ws_session(
     runtime: Runtime,
     scope: Option<RuntimeWorkspaceScope>,
@@ -1291,6 +1322,7 @@ async fn worker_protocol_ws_session(
                 match inbound {
                     Some(Ok(WsMessage::Text(text))) => match decode_method(&text) {
                         Ok(method) => {
+                            let method = authorize_runtime_protocol_method(method);
                             let result = match scope.as_ref() {
                                 Some(scope) => {
                                     runtime.send_protocol_method_scoped(scope, &worker_ref, method)
@@ -2083,6 +2115,33 @@ mod tests {
         GrepOutputMode, GrepRequest, LocalWorkdirSession, ReadRequest, StatRequest, Workdir,
         WorkdirPath, WorkdirSessionCapabilities,
     };
+
+    #[test]
+    fn runtime_protocol_replaces_serialized_tracked_source() {
+        let wire = serde_json::to_string(&protocol::Method::SubmitTracked {
+            submission_request_id: "request-1".into(),
+            input: vec![protocol::Segment::text("hello")],
+            source: protocol::AuthenticatedInputSource::Account {
+                account_id: "forged".into(),
+            },
+        })
+        .unwrap();
+        let decoded: protocol::Method = serde_json::from_str(&wire).unwrap();
+        assert!(matches!(
+            decoded,
+            protocol::Method::SubmitTracked {
+                source: protocol::AuthenticatedInputSource::UntrustedWire,
+                ..
+            }
+        ));
+        assert!(matches!(
+            authorize_runtime_protocol_method(decoded),
+            protocol::Method::SubmitTracked {
+                source: protocol::AuthenticatedInputSource::Backend { operation_id },
+                ..
+            } if operation_id == "request-1"
+        ));
+    }
 
     #[test]
     fn attachment_routes_require_worker_input_permission() {

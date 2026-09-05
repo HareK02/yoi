@@ -39,6 +39,9 @@ fn is_false(value: &bool) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthenticatedInputSource {
+    /// Assigned whenever a serialized tracked method crosses an untrusted
+    /// protocol boundary. Receivers must handle it exactly like public input.
+    UntrustedWire,
     Account {
         account_id: String,
     },
@@ -46,19 +49,30 @@ pub enum AuthenticatedInputSource {
         runtime_id: String,
         worker_id: String,
     },
+    SubWorker {
+        session_id: String,
+    },
     Backend {
         operation_id: String,
     },
 }
 
+impl Default for AuthenticatedInputSource {
+    fn default() -> Self {
+        Self::UntrustedWire
+    }
+}
+
 impl AuthenticatedInputSource {
     pub fn namespace(&self) -> String {
         match self {
+            Self::UntrustedWire => "untrusted-wire".into(),
             Self::Account { account_id } => format!("account:{account_id}"),
             Self::Worker {
                 runtime_id,
                 worker_id,
             } => format!("worker:{runtime_id}:{worker_id}"),
+            Self::SubWorker { session_id } => format!("sub_worker:{session_id}"),
             Self::Backend { operation_id } => format!("backend:{operation_id}"),
         }
     }
@@ -83,6 +97,7 @@ pub enum Method {
     SubmitTracked {
         submission_request_id: String,
         input: Vec<Segment>,
+        #[serde(skip_deserializing, default)]
         source: AuthenticatedInputSource,
     },
     /// Human-readable text injected into the target Worker's LLM context
@@ -104,6 +119,7 @@ pub enum Method {
         message: String,
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         auto_run: bool,
+        #[serde(skip_deserializing, default)]
         source: AuthenticatedInputSource,
     },
     /// Typed lifecycle report from a child Worker to its direct parent.
@@ -1538,7 +1554,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_submit_round_trips_trusted_source() {
+    fn authenticated_submit_replaces_wire_source_with_transport_identity() {
         let method = Method::SubmitTracked {
             input: vec![Segment::text("private")],
             submission_request_id: "request-1".to_string(),
@@ -1551,9 +1567,9 @@ mod tests {
         assert!(matches!(
             decoded,
             Method::SubmitTracked {
-                source: AuthenticatedInputSource::Account { account_id },
+                source: AuthenticatedInputSource::UntrustedWire,
                 ..
-            } if account_id == "account-1"
+            }
         ));
         assert!(
             serde_json::from_str::<Method>(

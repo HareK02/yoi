@@ -208,6 +208,7 @@ pub(crate) fn authenticated_input_provenance(
     source: &protocol::AuthenticatedInputSource,
 ) -> WorkerHistoryProvenance {
     match source {
+        protocol::AuthenticatedInputSource::UntrustedWire => WorkerHistoryProvenance::LegacyUnknown,
         protocol::AuthenticatedInputSource::Account { account_id } => {
             WorkerHistoryProvenance::HumanInput {
                 account_id: account_id.clone(),
@@ -223,6 +224,15 @@ pub(crate) fn authenticated_input_provenance(
                 worker_id: worker_id.clone(),
             },
         },
+        protocol::AuthenticatedInputSource::SubWorker { session_id } => {
+            WorkerHistoryProvenance::WorkerInput {
+                actor: session_store::LoggedWorkerSubject {
+                    workspace_id: None,
+                    runtime_id: None,
+                    worker_id: session_id.clone(),
+                },
+            }
+        }
         protocol::AuthenticatedInputSource::Backend { operation_id } => {
             WorkerHistoryProvenance::BackendInstruction {
                 operation_id: Some(operation_id.clone()),
@@ -1599,6 +1609,27 @@ where
             .pending_notifications
             .remove(index)
             .expect("located pending notification must exist");
+        state.activating_notification = Some(notification.clone());
+        state.revision = state.revision.saturating_add(1);
+        Some(notification)
+    }
+
+    pub(crate) fn prepare_oldest_auto_notification(&self) -> Option<PendingNotification> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("pending activation state poisoned");
+        if state.activating.is_some() || state.activating_notification.is_some() {
+            return None;
+        }
+        let index = state
+            .pending_notifications
+            .iter()
+            .position(|notification| notification.auto_run)?;
+        let notification = state
+            .pending_notifications
+            .remove(index)
+            .expect("located auto-run notification must exist");
         state.activating_notification = Some(notification.clone());
         state.revision = state.revision.saturating_add(1);
         Some(notification)
@@ -3822,6 +3853,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 .map(to_logged_history_entry)
                 .collect(),
         })?;
+        self.finalize_uploaded_segment_bindings(
+            &input,
+            &projected_entry_ids,
+            flow_projection.is_some(),
+        );
         if let Some(state) = pending_flow_state {
             *self
                 .flow_runtime_state
@@ -4042,6 +4078,36 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             ts: segment_log::now_millis(),
         })?;
         Ok(())
+    }
+
+    fn finalize_uploaded_segment_bindings(
+        &self,
+        input: &[Segment],
+        projected_entry_ids: &[SessionHistoryEntryId],
+        one_entry_per_segment: bool,
+    ) {
+        for (index, segment) in input.iter().enumerate() {
+            let Segment::UploadedFile { file } = segment else {
+                continue;
+            };
+            let entry_index = if one_entry_per_segment { index } else { 0 };
+            let source_entry_id = projected_entry_ids
+                .get(entry_index)
+                .expect("projected input id exists for every uploaded file")
+                .0
+                .as_str();
+            if let Err(error) = self.store.finalize_uploaded_file_binding(
+                self.session_id(),
+                &file.artifact_id,
+                source_entry_id,
+            ) {
+                tracing::warn!(
+                    artifact_id = %file.artifact_id,
+                    error = %error,
+                    "deferred uploaded file pin finalization to cleanup reconciliation"
+                );
+            }
+        }
     }
 
     fn materialize_large_pastes(

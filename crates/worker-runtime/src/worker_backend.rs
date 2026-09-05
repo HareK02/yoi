@@ -1898,15 +1898,19 @@ where
                 && busy
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok();
+            let notification_request_id = input
+                .submission_request_id
+                .unwrap_or_else(protocol::new_submission_request_id);
             let result = self.send_method(
                 WorkerExecutionOperation::Input,
                 worker,
-                Method::Notify {
-                    notification_request_id: input
-                        .submission_request_id
-                        .unwrap_or_else(protocol::new_submission_request_id),
+                Method::NotifyTracked {
+                    notification_request_id: notification_request_id.clone(),
                     message: input.content,
                     auto_run: true,
+                    source: protocol::AuthenticatedInputSource::Backend {
+                        operation_id: notification_request_id,
+                    },
                 },
                 accepted_run_state,
             );
@@ -2066,8 +2070,12 @@ where
             }
         };
 
-        if let Method::Notify { auto_run, .. } = &method {
-            let auto_run = *auto_run;
+        if let Some(auto_run) = match &method {
+            Method::Notify { auto_run, .. } | Method::NotifyTracked { auto_run, .. } => {
+                Some(*auto_run)
+            }
+            _ => None,
+        } {
             let status = worker.shared_state.get_status();
             let accepted_run_state = accepted_notify_run_state(status, auto_run);
             let claimed_here = status == WorkerStatus::Idle
