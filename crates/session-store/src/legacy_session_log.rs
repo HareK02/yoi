@@ -183,6 +183,7 @@ fn canonicalize_history_entry(
                 item,
                 metadata: legacy_metadata(segment_id, line_index, 0),
             },
+            extensions: Vec::new(),
         },
     }
 }

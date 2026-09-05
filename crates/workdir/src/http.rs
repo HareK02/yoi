@@ -68,12 +68,10 @@ pub enum WorkdirSessionOperation {
     CommandCancel(CommandHandle),
 }
 
-/// Wire envelope for an operation and its optional provider-enforced child scope.
+/// Wire envelope for one provider operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkdirSessionOperationRequest {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub delegations: Vec<crate::WorkdirDelegationRequest>,
     pub operation: WorkdirSessionOperation,
 }
 
@@ -289,7 +287,7 @@ mod client {
     use reqwest::{Client, StatusCode, Url};
 
     use super::*;
-    use crate::{Workdir, WorkdirSession, WorkdirSessionHandle};
+    use crate::{Workdir, WorkdirSession};
 
     /// Provides a fresh bearer token for each Runtime request. Backend
     /// implementations can mint short-lived capability tokens without making a
@@ -324,7 +322,6 @@ mod client {
         workdir: Workdir,
         session_id: WorkdirSessionId,
         capabilities: WorkdirSessionCapabilities,
-        delegations: Vec<crate::WorkdirDelegationRequest>,
         closed: AtomicBool,
     }
 
@@ -377,7 +374,6 @@ mod client {
                 workdir: Workdir::new(opened.workdir_id.as_str()),
                 session_id: opened.session_id,
                 capabilities: opened.capabilities,
-                delegations: Vec::new(),
                 closed: AtomicBool::new(false),
             })
         }
@@ -404,10 +400,7 @@ mod client {
                     "operations",
                 ],
             )?;
-            let operation = WorkdirSessionOperationRequest {
-                delegations: self.delegations.clone(),
-                operation,
-            };
+            let operation = WorkdirSessionOperationRequest { operation };
             let response = self
                 .client
                 .post(url)
@@ -434,37 +427,6 @@ mod client {
 
         fn capabilities(&self) -> WorkdirSessionCapabilities {
             self.capabilities
-        }
-
-        fn transports_delegation_context(&self) -> bool {
-            true
-        }
-
-        async fn capture_delegation_source(
-            &self,
-            request: &crate::WorkdirDelegationRequest,
-        ) -> Result<WorkdirSessionHandle, WorkdirError> {
-            if self.closed.load(Ordering::Acquire) {
-                return Err(WorkdirError::SessionClosed);
-            }
-            let mut delegations = self.delegations.clone();
-            delegations.push(request.clone());
-            let candidate = Arc::new(Self {
-                client: self.client.clone(),
-                base_url: self.base_url.clone(),
-                authorization: self.authorization.clone(),
-                workdir: self.workdir.clone(),
-                session_id: self.session_id.clone(),
-                capabilities: self.capabilities,
-                delegations,
-                closed: AtomicBool::new(false),
-            });
-            candidate
-                .stat(StatRequest {
-                    path: fs_operation::FsPath::new("").expect("empty Workdir path is valid"),
-                })
-                .await?;
-            Ok(candidate)
         }
 
         async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {

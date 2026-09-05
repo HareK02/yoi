@@ -120,12 +120,15 @@ mod tests {
         let mut client = Client::new(socket);
 
         client
-            .send(&Method::run_text("hello"))
+            .send(&Method::submit_text(
+                protocol::new_submission_request_id(),
+                "hello",
+            ))
             .await
             .expect("send method");
         assert!(matches!(
             decode_method(&client.socket.sent[0]),
-            Ok(Method::Run { .. })
+            Ok(Method::Submit { .. })
         ));
         assert!(matches!(
             client.next_event().await,

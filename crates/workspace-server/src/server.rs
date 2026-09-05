@@ -48,8 +48,7 @@ use workdir::http::{
 };
 use workdir::workspace::{
     MaterializerKind, WorkingDirectoryCleanupTarget, WorkingDirectoryOccupancy,
-    WorkingDirectoryStatusKind, WorkingDirectorySummary, WorkspaceWorkdirSessionFence,
-    WorkspaceWorkdirSessionOperationRequest,
+    WorkingDirectoryStatusKind, WorkingDirectorySummary, WorkspaceWorkdirSessionOperationRequest,
 };
 use workdir::{CommandHandle, WorkdirSessionHandle};
 use worker::feature::builtin::{WorkerObservationSubject, WorkerObservationSubjectRef};
@@ -355,7 +354,6 @@ static EMBEDDED_RUNTIME_REQUEST_IDENTITY: std::sync::LazyLock<
 struct WorkdirCommandSession {
     source: WorkdirSessionHandle,
     provider_handle: CommandHandle,
-    delegations: Vec<workdir::WorkdirDelegationRequest>,
 }
 
 enum RegisteredWorkdirSession {
@@ -398,7 +396,6 @@ impl WorkdirSessionRegistry {
         worker: RuntimeWorkerRef,
         source: WorkdirSessionHandle,
         provider_handle: CommandHandle,
-        delegations: Vec<workdir::WorkdirDelegationRequest>,
     ) -> CommandHandle {
         let external_handle = loop {
             let candidate = CommandHandle(Uuid::now_v7().to_string());
@@ -414,7 +411,6 @@ impl WorkdirSessionRegistry {
             WorkdirCommandSession {
                 source,
                 provider_handle,
-                delegations,
             },
         );
         external_handle
@@ -2652,10 +2648,6 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
             "/api/w/{workspace_id}/workers/self/workdir-attachment",
             post(scoped_attach_current_worker_workdir)
                 .delete(scoped_detach_current_worker_workdir),
-        )
-        .route(
-            "/api/w/{workspace_id}/workers/self/workdir-session/fence",
-            get(scoped_current_worker_workdir_session_fence),
         )
         .route(
             "/api/w/{workspace_id}/workers/self/workdir-session/operations",
@@ -7412,46 +7404,11 @@ async fn scoped_detach_current_worker_workdir(
     }))
 }
 
-async fn scoped_current_worker_workdir_session_fence(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    headers: HeaderMap,
-) -> ApiResult<Json<WorkspaceWorkdirSessionFence>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    let worker = current_worker_identity(&api, &path.workspace_id, &headers)?;
-    let session_lock = current_worker_session_lock(&api, &worker);
-    let _session_guard = session_lock.lock().await;
-    let link = current_worker_active_attachment(&api, &worker)?;
-    Ok(Json(WorkspaceWorkdirSessionFence {
-        value: current_worker_workdir_session_fence(&link),
-    }))
-}
-
-fn current_worker_workdir_session_fence(link: &WorkerWorkdirLinkRecord) -> String {
-    format!("v1:{}\0{}", link.workdir_id, link.linked_at)
-}
-
-fn validate_current_worker_workdir_session_fence(
-    link: &WorkerWorkdirLinkRecord,
-    expected: Option<&str>,
-) -> Result<()> {
-    if expected.is_some_and(|expected| expected != current_worker_workdir_session_fence(link)) {
-        Err(Error::WorkdirAttachmentConflict(
-            "delegated Workdir session attachment changed".to_string(),
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 fn validated_current_worker_attachment(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
-    expected_session_fence: Option<&str>,
 ) -> ApiResult<WorkerWorkdirLinkRecord> {
-    let link = current_worker_active_attachment(api, worker)?;
-    validate_current_worker_workdir_session_fence(&link, expected_session_fence)?;
-    Ok(link)
+    current_worker_active_attachment(api, worker)
 }
 
 #[derive(Debug)]
@@ -7506,23 +7463,13 @@ async fn scoped_execute_current_worker_workdir_operation(
 ) -> std::result::Result<Json<WorkdirSessionOperationResult>, WorkdirOperationApiError> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let worker = current_worker_identity(&api, &path.workspace_id, &headers)?;
-    let expected_session_fence = request.expected_session_fence;
-    let delegations = request.delegations;
     let result = match request.operation {
         WorkdirSessionOperation::CommandStart(command) => {
             let session_lock = current_worker_session_lock(&api, &worker);
             let _session_guard = session_lock.lock().await;
-            let link = validated_current_worker_attachment(
-                &api,
-                &worker,
-                expected_session_fence.as_deref(),
-            )?;
+            let link = validated_current_worker_attachment(&api, &worker)?;
             let source = open_current_worker_workdir_session_locked(&api, &worker, &link).await?;
-            let applied =
-                apply_current_worker_delegations(&worker, source.clone(), delegations.clone())
-                    .await?;
-            let provider_handle = applied
-                .scoped_session
+            let provider_handle = source
                 .start_command(command)
                 .await
                 .map_err(|error| current_worker_workdir_operation_error(&worker, error))?;
@@ -7541,58 +7488,32 @@ async fn scoped_execute_current_worker_workdir_operation(
                 .workdir_sessions
                 .lock()
                 .expect("Workdir session registry lock poisoned")
-                .register_command(
-                    worker.clone(),
-                    registered_source,
-                    provider_handle,
-                    delegations,
-                );
+                .register_command(worker.clone(), registered_source, provider_handle);
             WorkdirSessionOperationResult::CommandStart(external_handle)
         }
         WorkdirSessionOperation::CommandStatus(external_handle) => {
-            let (session, provider_handle) = current_worker_command_session(
-                &api,
-                &worker,
-                &external_handle,
-                &delegations,
-                expected_session_fence.as_deref(),
-            )
-            .await?;
+            let (session, provider_handle) =
+                current_worker_command_session(&api, &worker, &external_handle)?;
             session
-                .scoped_session
                 .command_status(provider_handle)
                 .await
                 .map(WorkdirSessionOperationResult::CommandStatus)
                 .map_err(|error| current_worker_workdir_operation_error(&worker, error))?
         }
         WorkdirSessionOperation::CommandOutput(mut output) => {
-            let (session, provider_handle) = current_worker_command_session(
-                &api,
-                &worker,
-                &output.handle,
-                &delegations,
-                expected_session_fence.as_deref(),
-            )
-            .await?;
+            let (session, provider_handle) =
+                current_worker_command_session(&api, &worker, &output.handle)?;
             output.handle = provider_handle;
             session
-                .scoped_session
                 .command_output(output)
                 .await
                 .map(WorkdirSessionOperationResult::CommandOutput)
                 .map_err(|error| current_worker_workdir_operation_error(&worker, error))?
         }
         WorkdirSessionOperation::CommandCancel(external_handle) => {
-            let (session, provider_handle) = current_worker_command_session(
-                &api,
-                &worker,
-                &external_handle,
-                &delegations,
-                expected_session_fence.as_deref(),
-            )
-            .await?;
+            let (session, provider_handle) =
+                current_worker_command_session(&api, &worker, &external_handle)?;
             session
-                .scoped_session
                 .cancel_command(provider_handle)
                 .await
                 .map(|()| WorkdirSessionOperationResult::CommandCancel)
@@ -7607,14 +7528,9 @@ async fn scoped_execute_current_worker_workdir_operation(
         | WorkdirSessionOperation::Grep(_)) => {
             let session_lock = current_worker_session_lock(&api, &worker);
             let _session_guard = session_lock.lock().await;
-            let link = validated_current_worker_attachment(
-                &api,
-                &worker,
-                expected_session_fence.as_deref(),
-            )?;
+            let link = validated_current_worker_attachment(&api, &worker)?;
             let source = open_current_worker_workdir_session_locked(&api, &worker, &link).await?;
-            let applied = apply_current_worker_delegations(&worker, source, delegations).await?;
-            execute_workdir_session_operation(&applied.scoped_session, operation)
+            execute_workdir_session_operation(&source, operation)
                 .await
                 .map_err(|error| current_worker_workdir_operation_error(&worker, error))?
         }
@@ -7622,29 +7538,12 @@ async fn scoped_execute_current_worker_workdir_operation(
     Ok(Json(result))
 }
 
-async fn apply_current_worker_delegations(
-    worker: &RuntimeWorkerRef,
-    source: WorkdirSessionHandle,
-    delegations: Vec<workdir::WorkdirDelegationRequest>,
-) -> Result<workdir::AppliedWorkdirDelegation> {
-    workdir::apply_delegation_chain(source, delegations)
-        .await
-        .map_err(|error| Error::RuntimeOperationFailed {
-            runtime_id: worker.runtime_id.clone(),
-            code: "workdir_session_delegation_failed".to_string(),
-            message: error.to_string(),
-        })
-}
-
-async fn current_worker_command_session(
+fn current_worker_command_session(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
     external_handle: &CommandHandle,
-    delegations: &[workdir::WorkdirDelegationRequest],
-    expected_session_fence: Option<&str>,
-) -> std::result::Result<(workdir::AppliedWorkdirDelegation, CommandHandle), WorkdirOperationApiError>
-{
-    let _link = validated_current_worker_attachment(api, worker, expected_session_fence)?;
+) -> std::result::Result<(WorkdirSessionHandle, CommandHandle), WorkdirOperationApiError> {
+    let _link = validated_current_worker_attachment(api, worker)?;
     let command = api
         .workdir_sessions
         .lock()
@@ -7656,15 +7555,7 @@ async fn current_worker_command_session(
                 workdir::WorkdirError::UnknownCommand(external_handle.0.clone()),
             ))
         })?;
-    if command.delegations != delegations {
-        return Err(Error::WorkdirAttachmentConflict(
-            "command lifecycle delegation differs from CommandStart".to_string(),
-        )
-        .into());
-    }
-    let session =
-        apply_current_worker_delegations(worker, command.source, command.delegations).await?;
-    Ok((session, command.provider_handle))
+    Ok((command.source, command.provider_handle))
 }
 
 fn current_worker_workdir_operation_error(
@@ -8606,13 +8497,15 @@ async fn scoped_list_runtimes(
 
 async fn scoped_workspace_protocol_ws(
     State(api): State<WorkspaceApi>,
+    Extension(actor): Extension<RequestActor>,
     AxumPath(workspace_id): AxumPath<String>,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> std::result::Result<Response, Response> {
     validate_workspace_scope(&api, &workspace_id).map_err(|error| error.into_response())?;
+    let input_source = authenticated_browser_input_source(&actor);
     Ok(ws
         .on_upgrade(move |socket| {
-            crate::workspace_subscription::serve_workspace_subscription(api, socket)
+            crate::workspace_subscription::serve_workspace_subscription(api, socket, input_source)
         })
         .into_response())
 }
@@ -9318,7 +9211,7 @@ async fn scoped_capture_worker_observation_session(
         return Err(ApiError::from(Error::UnknownWorker { worker: target }));
     }
 
-    let mut connection = connect_workspace_worker_protocol(&api, &target).await?;
+    let mut connection = connect_workspace_worker_protocol(&api, &target, None).await?;
     let event = tokio::time::timeout(std::time::Duration::from_secs(10), connection.events.recv())
         .await
         .map_err(|_| {
@@ -11741,6 +11634,7 @@ async fn scoped_cancel_runtime_worker(
 async fn scoped_worker_protocol_ws(
     ws: WebSocketUpgrade,
     State(api): State<WorkspaceApi>,
+    Extension(actor): Extension<RequestActor>,
     AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
 ) -> Response {
     if let Err(err) = validate_workspace_scope(&api, &path.workspace_id) {
@@ -11748,6 +11642,7 @@ async fn scoped_worker_protocol_ws(
     }
     worker_protocol_ws(
         State(api),
+        Extension(actor),
         AxumPath((path.worker.runtime_id, path.worker.worker_id)),
         ws,
     )
@@ -14140,8 +14035,45 @@ async fn cancel_runtime_worker(
     Ok(Json(result))
 }
 
+fn authenticated_browser_input_source(actor: &RequestActor) -> protocol::AuthenticatedInputSource {
+    protocol::AuthenticatedInputSource::Account {
+        account_id: actor.account_id.clone(),
+    }
+}
+
+pub(crate) fn authorize_browser_worker_method(
+    method: protocol::Method,
+    source: &protocol::AuthenticatedInputSource,
+) -> std::result::Result<protocol::Method, &'static str> {
+    match method {
+        protocol::Method::Submit {
+            submission_request_id,
+            input,
+        } => Ok(protocol::Method::SubmitTracked {
+            submission_request_id,
+            input,
+            source: source.clone(),
+        }),
+        protocol::Method::Notify {
+            notification_request_id,
+            message,
+            auto_run,
+        } => Ok(protocol::Method::NotifyTracked {
+            notification_request_id,
+            message,
+            auto_run,
+            source: source.clone(),
+        }),
+        protocol::Method::SubmitTracked { .. } | protocol::Method::NotifyTracked { .. } => {
+            Err("authenticated Worker input source is server-owned")
+        }
+        other => Ok(other),
+    }
+}
+
 async fn worker_protocol_ws(
     State(api): State<WorkspaceApi>,
+    Extension(actor): Extension<RequestActor>,
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
@@ -14165,7 +14097,8 @@ async fn worker_protocol_ws(
                 .into_response();
         }
     };
-    ws.on_upgrade(move |socket| worker_protocol_ws_session(source, socket))
+    let input_source = authenticated_browser_input_source(&actor);
+    ws.on_upgrade(move |socket| worker_protocol_ws_session(source, socket, input_source))
 }
 
 pub(crate) struct WorkspaceWorkerProtocolConnection {
@@ -14176,6 +14109,7 @@ pub(crate) struct WorkspaceWorkerProtocolConnection {
 pub(crate) async fn connect_workspace_worker_protocol(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
+    input_source: Option<&protocol::AuthenticatedInputSource>,
 ) -> Result<WorkspaceWorkerProtocolConnection> {
     let source = match api.observation_proxy.source(worker) {
         Ok(source) => source,
@@ -14192,15 +14126,39 @@ pub(crate) async fn connect_workspace_worker_protocol(
         }
     };
     match source {
-        RuntimeObservationSource::RemoteWs(config) => connect_remote_worker_protocol(config).await,
+        RuntimeObservationSource::RemoteWs(config) => {
+            connect_remote_worker_protocol(config, input_source).await
+        }
         RuntimeObservationSource::Embedded(source) => {
             connect_embedded_worker_protocol(source).await
         }
     }
 }
 
+fn insert_authenticated_input_source_header(
+    headers: &mut HeaderMap,
+    input_source: Option<&protocol::AuthenticatedInputSource>,
+) -> Result<()> {
+    let Some(input_source) = input_source else {
+        return Ok(());
+    };
+    let protocol::AuthenticatedInputSource::Account { account_id } = input_source else {
+        return Err(Error::Config(
+            "remote Worker protocol transport supports only Account input source".into(),
+        ));
+    };
+    headers.insert(
+        protocol::AUTHENTICATED_ACCOUNT_ID_HEADER,
+        account_id.parse().map_err(|error| {
+            Error::Config(format!("invalid authenticated Account identity: {error}"))
+        })?,
+    );
+    Ok(())
+}
+
 async fn connect_remote_worker_protocol(
     config: RuntimeObservationSourceConfig,
+    input_source: Option<&protocol::AuthenticatedInputSource>,
 ) -> Result<WorkspaceWorkerProtocolConnection> {
     let mut request = config
         .endpoint
@@ -14215,6 +14173,7 @@ async fn connect_remote_worker_protocol(
             })?,
         );
     }
+    insert_authenticated_input_source_header(request.headers_mut(), input_source)?;
     let (socket, _) =
         connect_async(request)
             .await
@@ -14292,13 +14251,17 @@ async fn connect_embedded_worker_protocol(
     Ok(WorkspaceWorkerProtocolConnection { methods, events })
 }
 
-async fn worker_protocol_ws_session(source: RuntimeObservationSource, socket: WebSocket) {
+async fn worker_protocol_ws_session(
+    source: RuntimeObservationSource,
+    socket: WebSocket,
+    input_source: protocol::AuthenticatedInputSource,
+) {
     match source {
         RuntimeObservationSource::RemoteWs(config) => {
-            remote_worker_protocol_ws_session(config, socket).await;
+            remote_worker_protocol_ws_session(config, socket, input_source).await;
         }
         RuntimeObservationSource::Embedded(source) => {
-            embedded_worker_protocol_ws_session(source, socket).await;
+            embedded_worker_protocol_ws_session(source, socket, input_source).await;
         }
     }
 }
@@ -14306,6 +14269,7 @@ async fn worker_protocol_ws_session(source: RuntimeObservationSource, socket: We
 async fn remote_worker_protocol_ws_session(
     config: RuntimeObservationSourceConfig,
     socket: WebSocket,
+    input_source: protocol::AuthenticatedInputSource,
 ) {
     let mut request = match config.endpoint.clone().into_client_request() {
         Ok(request) => request,
@@ -14333,6 +14297,16 @@ async fn remote_worker_protocol_ws_session(
             }
         }
     }
+    if let Err(error) =
+        insert_authenticated_input_source_header(request.headers_mut(), Some(&input_source))
+    {
+        let mut socket = socket;
+        let event = protocol_error_event(format!(
+            "failed to build authenticated Account identity header: {error}"
+        ));
+        let _ = send_protocol_event(&mut socket, &event).await;
+        return;
+    }
 
     let (upstream, _) = match connect_async(request).await {
         Ok(connection) => connection,
@@ -14354,14 +14328,33 @@ async fn remote_worker_protocol_ws_session(
             inbound = client_stream.next() => {
                 match inbound {
                     Some(Ok(WsMessage::Text(text))) => {
-                        if upstream_sink.send(TungsteniteMessage::Text(text.to_string().into())).await.is_err() {
+                        let method = match protocol::stream::decode_method(text.as_ref()) {
+                            Ok(method) => match authorize_browser_worker_method(method, &input_source) {
+                                Ok(method) => method,
+                                Err(message) => {
+                                    if let Ok(event) = protocol::stream::encode_event(&protocol_error_event(message)) {
+                                        let _ = client_sink.send(WsMessage::Text(event.into())).await;
+                                    }
+                                    break;
+                                }
+                            },
+                            Err(error) => {
+                                if let Ok(event) = protocol::stream::encode_event(&protocol_error_event(error.to_string())) {
+                                    let _ = client_sink.send(WsMessage::Text(event.into())).await;
+                                }
+                                break;
+                            }
+                        };
+                        let Ok(method) = protocol::stream::encode_method(&method) else { break };
+                        if upstream_sink.send(TungsteniteMessage::Text(method.into())).await.is_err() {
                             break;
                         }
                     }
-                    Some(Ok(WsMessage::Binary(binary))) => {
-                        if upstream_sink.send(TungsteniteMessage::Binary(binary.to_vec().into())).await.is_err() {
-                            break;
+                    Some(Ok(WsMessage::Binary(_))) => {
+                        if let Ok(event) = protocol::stream::encode_event(&protocol_error_event("binary Worker methods are not accepted")) {
+                            let _ = client_sink.send(WsMessage::Text(event.into())).await;
                         }
+                        break;
                     }
                     Some(Ok(WsMessage::Close(_))) | None => {
                         let _ = upstream_sink.send(TungsteniteMessage::Close(None)).await;
@@ -14417,6 +14410,7 @@ async fn remote_worker_protocol_ws_session(
 async fn embedded_worker_protocol_ws_session(
     source: crate::observation::EmbeddedRuntimeObservationSource,
     mut socket: WebSocket,
+    input_source: protocol::AuthenticatedInputSource,
 ) {
     let mut upstream = match RuntimeObservationClient::connect(&RuntimeObservationSource::Embedded(
         source.clone(),
@@ -14436,24 +14430,32 @@ async fn embedded_worker_protocol_ws_session(
             inbound = socket.next() => {
                 match inbound {
                     Some(Ok(WsMessage::Text(text))) => match decode_method(&text) {
-                        Ok(method) => match source.runtime.send_protocol_method(&source.worker_ref, method) {
-                            Ok(events) => {
-                                for event in events {
+                        Ok(method) => match authorize_browser_worker_method(method, &input_source) {
+                            Ok(method) => match source.runtime.send_protocol_method(&source.worker_ref, method) {
+                                Ok(events) => {
+                                    for event in events {
+                                        if !send_protocol_event(&mut socket, &event).await {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    let event = protocol_error_event(error.to_string());
                                     if !send_protocol_event(&mut socket, &event).await {
                                         return;
                                     }
                                 }
-                            }
-                            Err(error) => {
-                                let event = protocol_error_event(error.to_string());
-                                if !send_protocol_event(&mut socket, &event).await {
-                                    return;
-                                }
+                            },
+                            Err(message) => {
+                                let event = protocol_error_event(message);
+                                let _ = send_protocol_event(&mut socket, &event).await;
+                                return;
                             }
                         },
                         Err(error) => {
-                            let event =
-                                protocol_error_event(format!("malformed protocol method frame: {error}"));
+                            let event = protocol_error_event(format!(
+                                "malformed protocol method frame: {error}"
+                            ));
                             if !send_protocol_event(&mut socket, &event).await {
                                 return;
                             }
@@ -16594,6 +16596,48 @@ mod tests {
     }
 
     #[test]
+    fn browser_worker_methods_receive_server_owned_account_source() {
+        let source = protocol::AuthenticatedInputSource::Account {
+            account_id: "account-1".into(),
+        };
+        let method = authorize_browser_worker_method(
+            protocol::Method::Submit {
+                submission_request_id: "request-1".into(),
+                input: vec![protocol::Segment::text("hello")],
+            },
+            &source,
+        )
+        .unwrap();
+        assert!(matches!(
+            method,
+            protocol::Method::SubmitTracked {
+                source: protocol::AuthenticatedInputSource::Account { ref account_id },
+                ..
+            } if account_id == "account-1"
+        ));
+        assert!(authorize_browser_worker_method(method, &source).is_err());
+    }
+
+    #[test]
+    fn remote_worker_protocol_header_preserves_authenticated_account_source() {
+        let mut headers = HeaderMap::new();
+        insert_authenticated_input_source_header(
+            &mut headers,
+            Some(&protocol::AuthenticatedInputSource::Account {
+                account_id: "account-1".into(),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            headers
+                .get(protocol::AUTHENTICATED_ACCOUNT_ID_HEADER)
+                .unwrap(),
+            "account-1"
+        );
+    }
+
+    #[test]
     fn merge_request_http_paths_observe_refs_through_runtime_provider_authority() {
         let source = include_str!("server.rs");
         for handler in [
@@ -16788,6 +16832,7 @@ mod tests {
                 command: "printf ready; sleep 30".to_string(),
                 timeout_secs: 60,
                 output_limit: 4096,
+                cwd: None,
                 spill_dir: None,
                 tool_call_id: Some("tool-call-command-session".to_string()),
             })
@@ -16797,12 +16842,8 @@ mod tests {
         let mut registry = WorkdirSessionRegistry::default();
         registry.insert_attachment(worker.clone(), source.clone());
         let registered_source = registry.remove_attachment(&worker).unwrap();
-        let external_handle = registry.register_command(
-            worker.clone(),
-            registered_source,
-            provider_handle.clone(),
-            Vec::new(),
-        );
+        let external_handle =
+            registry.register_command(worker.clone(), registered_source, provider_handle.clone());
         assert_ne!(external_handle, provider_handle);
 
         let refreshed: WorkdirSessionHandle = Arc::new(workdir::LocalWorkdirSession::new(
@@ -18843,7 +18884,7 @@ mod tests {
                 .get(handle.worker_ref())
                 .cloned()
                 .expect("execution context");
-            let submission_id = input.submission_id.clone();
+            let submission_request_id = input.submission_request_id.clone();
             let content = input.content.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -18851,11 +18892,13 @@ mod tests {
                     text: format!("server companion echoed: {content}"),
                 });
             });
-            if let Some(submission_id) = submission_id {
-                worker_runtime::execution::WorkerExecutionResult::accepted_input_committed(
+            if let Some(submission_request_id) = submission_request_id {
+                worker_runtime::execution::WorkerExecutionResult::accepted_submission(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
                     worker_runtime::execution::WorkerExecutionRunState::Idle,
-                    submission_id,
+                    submission_request_id,
+                    uuid::Uuid::now_v7().to_string(),
+                    protocol::SubmissionDisposition::Started,
                 )
             } else {
                 worker_runtime::execution::WorkerExecutionResult::accepted(
@@ -23747,30 +23790,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    #[test]
-    fn delegated_workdir_session_fence_rejects_reattached_link() {
-        let first = WorkerWorkdirLinkRecord {
-            workspace_id: "workspace-a".to_string(),
-            worker: workdir::workspace::RuntimeWorkerRef::new("runtime-a", "worker-a"),
-            workdir_id: "workdir-a".to_string(),
-            role: "primary".to_string(),
-            linked_at: "2026-01-01T00:00:00Z".to_string(),
-            unlinked_at: None,
-        };
-        let expected = current_worker_workdir_session_fence(&first);
-        assert!(validate_current_worker_workdir_session_fence(&first, None).is_ok());
-        assert!(validate_current_worker_workdir_session_fence(&first, Some(&expected)).is_ok());
-
-        let reattached = WorkerWorkdirLinkRecord {
-            linked_at: "2026-01-01T00:00:01Z".to_string(),
-            ..first
-        };
-        assert!(matches!(
-            validate_current_worker_workdir_session_fence(&reattached, Some(&expected)),
-            Err(Error::WorkdirAttachmentConflict(_))
-        ));
-    }
-
     #[tokio::test]
     async fn backend_workdir_session_proxy_executes_typed_operations() {
         use manifest::Scope;
@@ -27638,6 +27657,16 @@ mod tests {
         (runtime, worker_ref, endpoint)
     }
 
+    fn test_browser_request_actor() -> RequestActor {
+        RequestActor {
+            user_id: "test-user".into(),
+            account_id: format!("account-{TEST_WORKSPACE_ID}"),
+            handle: "test".into(),
+            display_name: "Test".into(),
+            auth_method: ActorAuthMethod::BrowserSession,
+        }
+    }
+
     async fn spawn_workspace_proxy(
         source: RuntimeObservationSourceConfig,
     ) -> (String, tempfile::TempDir) {
@@ -27656,11 +27685,8 @@ mod tests {
         .unwrap();
         let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let app_addr = app_listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(app_listener, build_inner_router(api))
-                .await
-                .unwrap()
-        });
+        let app = build_inner_router(api).layer(Extension(test_browser_request_actor()));
+        tokio::spawn(async move { axum::serve(app_listener, app).await.unwrap() });
         (
             format!("ws://{app_addr}/api/runtimes/{runtime_id}/workers/{worker_id}/protocol/ws"),
             dir,
@@ -27672,7 +27698,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let app = build_inner_router(test_api(dir.path()).await);
+        let app = build_inner_router(test_api(dir.path()).await)
+            .layer(Extension(test_browser_request_actor()));
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -27720,7 +27747,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let app = build_inner_router(api);
+        let app = build_inner_router(api).layer(Extension(test_browser_request_actor()));
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });

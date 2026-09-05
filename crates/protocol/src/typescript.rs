@@ -8,11 +8,11 @@ use crate::{
     CompletionKind, ErrorCode, Event, Greeting, InFlightBlock, InFlightSnapshot,
     InFlightToolCallState, InternalWorkerKind, InternalWorkerRef, InternalWorkerSnapshot,
     InvokeKind, MemoryWorkerEvent, Method, PasteArtifactAvailability, PasteArtifactMediaType,
-    PasteArtifactRef, Permission, RewindSummary, RewindTarget, RewindTargetId, RunResult,
-    ScopeRule, Segment, SessionContentPart, SessionEntryProvenance, SessionMessageRole,
-    SessionSnapshot, SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment,
-    ToolResultDisposition, TurnResult, UploadedFileAvailability, UploadedFileRef, WorkerEvent,
-    WorkerStatus,
+    PasteArtifactRef, PendingSubmissionSummary, PendingSubmissionsSnapshot, Permission,
+    RewindSummary, RewindTarget, RewindTargetId, RunResult, ScopeRule, Segment, SessionContentPart,
+    SessionEntryProvenance, SessionMessageRole, SessionSnapshot, SessionSnapshotEntry,
+    SessionSnapshotEntryData, SessionToolAttachment, SubmissionDisposition, ToolResultDisposition,
+    TurnResult, UploadedFileAvailability, UploadedFileRef, WorkerEvent, WorkerStatus,
     subscription::{
         EventSubscriptionSelector, SubscriptionEvent, SubscriptionEventPayload, SubscriptionFrame,
         SubscriptionFramePayload, SubscriptionId, SubscriptionRejectionCode, SubscriptionRequest,
@@ -75,6 +75,9 @@ pub fn generated_protocol_types() -> String {
     push_decl::<SessionToolAttachment>(&cfg, &mut output);
     push_decl::<SessionSnapshotEntryData>(&cfg, &mut output);
     push_decl::<SessionSnapshotEntry>(&cfg, &mut output);
+    push_decl::<PendingSubmissionSummary>(&cfg, &mut output);
+    push_decl::<PendingSubmissionsSnapshot>(&cfg, &mut output);
+    push_decl::<SubmissionDisposition>(&cfg, &mut output);
     push_decl::<SessionSnapshot>(&cfg, &mut output);
     push_decl::<InternalWorkerKind>(&cfg, &mut output);
     push_decl::<InternalWorkerRef>(&cfg, &mut output);

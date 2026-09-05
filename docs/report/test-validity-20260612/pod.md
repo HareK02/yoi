@@ -34,7 +34,7 @@
 - いくつかの async/socket tests はまだ fixed sleeps と process-wide environment mutation (`YOI_RUNTIME_DIR`, `YOI_HOME`, `XDG_RUNTIME_DIR`) に依存している。一部ファイルでは env-changing tests を guards で serialize しているが、fixed timing と global env は高負荷 CI や parallel execution 下で flakiness risk のまま。
 - Real provider wire behavior は意図的に `pod` の外側だが、crate と streaming edge cases の interaction はまだ大部分が mock されている。tests は重要な `Worker` outcomes をカバーしているが、malformed/partial provider streams を real provider adapter 経由では exercise していない。
 - Prompt tests は数が多く有用だが、一部は behavior-coupled というより prose-coupled である。critical safety wording に対して、その文字列を意図的に stable contract として扱う場合だけこれは許容できる。そうでなければ maintenance noise になる。
-- startup profile resolution、socket server、`Method::Run`、session persistence、shutdown、restore を跨ぐ full lifecycle integration は slice ごとにしかカバーされておらず、1 つの scenario としてはカバーされていない。
+- startup profile resolution、socket server、`Method::Submit`、session persistence、shutdown、restore を跨ぐ full lifecycle integration は slice ごとにしかカバーされておらず、1 つの scenario としてはカバーされていない。
 
 ## 追加を提案するもの
 

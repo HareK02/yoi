@@ -5,10 +5,10 @@
 //! bound to one Worker. Tools consume sessions; they do not own Workdir
 //! materialization or cleanup.
 
-mod delegation;
 pub mod http;
 mod local;
 mod operation;
+mod scope;
 pub mod workspace;
 
 use std::path::{Path, PathBuf};
@@ -18,11 +18,6 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-pub use delegation::{
-    AppliedWorkdirDelegation, ReadOnlyWorkdirSession, WorkdirDelegation,
-    WorkdirDelegationPermission, WorkdirDelegationRequest, WorkdirDelegationRule,
-    apply_delegation_chain, delegation_capable_session,
-};
 pub use fs_operation::{
     ContentHash, EditRequest, EditResult, EntryKind, FsPath as WorkdirPath, GlobRequest,
     GlobResult, GrepOutputMode, GrepRequest, GrepResult, ListEntry, ListRequest, ListResult,
@@ -32,6 +27,10 @@ pub use local::{
     LocalWorkdirSession, SymlinkInfo, WorkdirSessionResource, direct_symlink, first_symlink,
 };
 pub use operation::*;
+pub use scope::{
+    ReadOnlyWorkdirSession, WorkdirScopeLease, WorkdirToolBroker, WorkdirToolScope,
+    WorkdirToolScopePermission, WorkdirToolScopeRule,
+};
 
 /// Persistent, opaque identity of one materialized Workdir.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -147,39 +146,6 @@ pub type WriteOutcome = WriteResult;
 pub trait WorkdirSession: std::fmt::Debug + Send + Sync {
     fn workdir(&self) -> &Workdir;
     fn capabilities(&self) -> WorkdirSessionCapabilities;
-
-    fn is_delegation_capable(&self) -> bool {
-        false
-    }
-
-    /// Whether this session transports the delegation chain to another
-    /// provider boundary that will apply logical cwd/path resolution there.
-    fn transports_delegation_context(&self) -> bool {
-        false
-    }
-
-    /// Capture a provider-specific source for a delegated child session.
-    /// Remote providers use this boundary to pin attachment identity without
-    /// exposing transport handles or host paths.
-    async fn capture_delegation_source(
-        &self,
-        _request: &WorkdirDelegationRequest,
-    ) -> Result<WorkdirSessionHandle, WorkdirError> {
-        Err(WorkdirError::Denied(
-            "workdir provider does not support delegated sessions".into(),
-        ))
-    }
-
-    /// Attenuate this session into a revocable child lease. Only sessions
-    /// created with [`delegation_capable_session`] implement this operation.
-    async fn delegate(
-        &self,
-        _request: WorkdirDelegationRequest,
-    ) -> Result<WorkdirDelegation, WorkdirError> {
-        Err(WorkdirError::Denied(
-            "workdir session is not delegation-capable".into(),
-        ))
-    }
 
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError>;
     async fn read(&self, request: ReadRequest) -> Result<ReadResult, WorkdirError>;

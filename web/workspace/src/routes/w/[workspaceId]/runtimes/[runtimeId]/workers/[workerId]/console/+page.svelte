@@ -6,6 +6,11 @@
     import ComposerInput from "$lib/workspace/console/ComposerInput.svelte";
     import type { ComposerDraftSnapshot } from "$lib/workspace/console/composer-draft";
     import {
+        canDeliverComposerDraft,
+        sendComposerDelivery,
+        type ComposerDelivery,
+    } from "$lib/workspace/console/composer-delivery";
+    import {
         buildComposerSegmentsRequest,
         type WorkerConsoleInputRequest,
     } from "$lib/workspace/console/composer-command";
@@ -31,7 +36,13 @@
         type ConsoleViewMode,
         type ConsoleViewScroll,
     } from "$lib/workspace/console/model";
-    import type { Event as ProtocolEvent, Method as ProtocolMethod, RewindTarget, Segment } from "$lib/generated/protocol";
+    import type {
+        Event as ProtocolEvent,
+        Method as ProtocolMethod,
+        PendingSubmissionsSnapshot,
+        RewindTarget,
+        Segment,
+    } from "$lib/generated/protocol";
     import {
         MAX_FILES_PER_SUBMISSION,
         uploadAttachment,
@@ -152,6 +163,13 @@
         "connecting",
     );
     let protocolSubscription: WorkspaceMultiplexerSubscription | null = null;
+    let pendingSubmissions = $state<PendingSubmissionsSnapshot>({
+        revision: 0,
+        notification_count: 0,
+        head_id: null,
+        submissions: [],
+    });
+    let pendingSubmissionItems = $derived(pendingSubmissions.submissions ?? []);
     let pendingCompletionRequest: {
         resolve: (entries: ComposerCompletionEntry[]) => void;
         reject: (error: Error) => void;
@@ -234,13 +252,42 @@
     const workerState = $derived(liveWorkerState ?? worker?.state ?? "loading");
     const workerRunning = $derived(workerState === "running");
     const workerPaused = $derived(workerState === "paused");
-    const inputReady = $derived(workerState === "idle");
     const composerEditable = $derived(protocolState === "open" && !sending);
-    const canSubmitDraft = $derived(inputReady && composerEditable);
-    const canSend = $derived(canSubmitDraft && draft.content.trim().length > 0);
+    const draftHasText = $derived(draft.content.trim().length > 0);
+    const draftHasAttachments = $derived(attachments.length > 0);
+    const canSubmitDraft = $derived(
+        canDeliverComposerDraft({
+            delivery: "submit",
+            workerState,
+            protocolOpen: protocolState === "open",
+            sending,
+            hasText: draftHasText,
+            hasAttachments: draftHasAttachments,
+        }),
+    );
+    const canQueueDraft = $derived(
+        canDeliverComposerDraft({
+            delivery: "queue",
+            workerState,
+            protocolOpen: protocolState === "open",
+            sending,
+            hasText: draftHasText,
+            hasAttachments: draftHasAttachments,
+        }),
+    );
+    const canNotifyDraft = $derived(
+        canDeliverComposerDraft({
+            delivery: "notify",
+            workerState,
+            protocolOpen: protocolState === "open",
+            sending,
+            hasText: draftHasText,
+            hasAttachments: draftHasAttachments,
+        }),
+    );
     const canStopFromComposer = $derived(workerRunning && composerEditable);
     const composerSubmitDisabled = $derived(
-        workerRunning ? !canStopFromComposer : !canSend,
+        workerRunning ? !canStopFromComposer : !canSubmitDraft,
     );
 
     async function getJson<T>(path: string): Promise<T> {
@@ -334,6 +381,13 @@
 
     function handleIncomingProtocolEvent(payload: ProtocolEvent) {
         handleProtocolCommandEvent(payload);
+        if (payload.event === "snapshot") {
+            pendingSubmissions = payload.data.session.pending_submissions;
+        } else if (payload.event === "segment_rotated") {
+            pendingSubmissions = payload.data.session.pending_submissions;
+        } else if (payload.event === "pending_submissions_changed") {
+            pendingSubmissions = payload.data.pending;
+        }
         if (payload.event === "error") {
             queueObservationDiagnostic({
                 code: payload.data.code,
@@ -556,8 +610,9 @@
         switch (request.kind) {
             case "user":
                 return {
-                    method: "run",
+                    method: "submit",
                     params: {
+                        submission_request_id: crypto.randomUUID(),
                         input: request.segments ?? [
                             { kind: "text", content: request.content },
                         ],
@@ -566,7 +621,11 @@
             case "notify":
                 return {
                     method: "notify",
-                    params: { message: request.content, auto_run: true },
+                    params: {
+                        notification_request_id: crypto.randomUUID(),
+                        message: request.content,
+                        auto_run: true,
+                    },
                 };
             case "compact":
                 return { method: "compact" };
@@ -636,6 +695,14 @@
             return;
         }
         void submitDraft(composerInputElement?.snapshot() ?? draft);
+    }
+
+    function handleQueueSubmit() {
+        void submitDraft(composerInputElement?.snapshot() ?? draft, "queue");
+    }
+
+    function handleNotifySubmit() {
+        void submitDraft(composerInputElement?.snapshot() ?? draft, "notify");
     }
 
     function attachmentPath(): string {
@@ -737,7 +804,15 @@
         if (event.dataTransfer?.files) addAttachmentFiles(event.dataTransfer.files);
     }
 
-    async function submitDraft(value: ComposerDraftSnapshot) {
+    async function submitDraft(
+        value: ComposerDraftSnapshot,
+        delivery: ComposerDelivery = "submit",
+    ) {
+        if (delivery === "notify" && attachments.length > 0) {
+            composerNotice = null;
+            sendError = "Notify accepts text only; remove attachments or queue a Submit.";
+            return;
+        }
         const incompleteAttachment = attachments.find((attachment) =>
             attachment.state !== "uploaded" || !attachment.reference
         );
@@ -767,19 +842,38 @@
             composerInputElement?.clear();
             return;
         }
-        if (sending || !inputReady) {
+        const deliveryState = {
+            delivery,
+            workerState,
+            protocolOpen: protocolState === "open",
+            sending,
+            hasText: value.content.trim().length > 0,
+            hasAttachments: attachments.length > 0,
+        };
+        if (!canDeliverComposerDraft(deliveryState)) {
             return;
         }
 
+        let request: WorkerConsoleInputRequest = command.request;
+        if (delivery === "notify") {
+            if (request.kind !== "user") {
+                composerNotice = null;
+                sendError = "Notify accepts ordinary text, not a Composer command.";
+                return;
+            }
+            request = { kind: "notify", content: request.content };
+        }
         sending = true;
         sendError = null;
         try {
-            const method = composerRequestToProtocolMethod(command.request);
-            sendProtocolMethod(method);
+            const method = composerRequestToProtocolMethod(request);
+            if (!sendComposerDelivery(deliveryState, method, sendProtocolMethod)) {
+                return;
+            }
             composerInputElement?.recordHistory(value);
             composerInputElement?.clear();
             attachments = [];
-            if (method.method === "run" || method.method === "notify") {
+            if (method.method === "submit" || method.method === "notify") {
                 liveWorkerState = "running";
             }
             composerNotice = "Sent through Worker protocol.";
@@ -1722,6 +1816,62 @@
         </aside>
     {/if}
 
+    {#if pendingSubmissionItems.length > 0 || pendingSubmissions.notification_count > 0}
+        <details class="pending-submissions">
+            <summary>
+                Pending activations ({pendingSubmissionItems.length} submissions · {pendingSubmissions.notification_count} notifications)
+            </summary>
+            <ol>
+                {#each pendingSubmissionItems as submission (submission.submission_id)}
+                    <li>
+                        <code>{submission.submission_id}</code>
+                        <span>{submission.segment_count} segments · {submission.byte_len} bytes</span>
+                        <button
+                            type="button"
+                            onclick={() =>
+                                sendControl(
+                                    {
+                                        method: "cancel_pending_submission",
+                                        params: {
+                                            submission_id: submission.submission_id,
+                                            expected_revision: pendingSubmissions.revision,
+                                        },
+                                    },
+                                    "Pending submission cancellation",
+                                )}
+                        >Cancel</button>
+                    </li>
+                {/each}
+            </ol>
+            <button
+                type="button"
+                disabled={workerRunning || pendingSubmissions.head_id === null}
+                onclick={() =>
+                    sendControl(
+                        {
+                            method: "continue_pending",
+                            params: {
+                                expected_revision: pendingSubmissions.revision,
+                                expected_head_id: pendingSubmissions.head_id ?? "",
+                            },
+                        },
+                        "Pending activation continue",
+                    )}
+            >Continue next</button>
+            <button
+                type="button"
+                onclick={() =>
+                    sendControl(
+                        {
+                            method: "clear_pending_submissions",
+                            params: { expected_revision: pendingSubmissions.revision },
+                        },
+                        "Pending submissions clear",
+                    )}
+            >Clear all</button>
+        </details>
+    {/if}
+
     {#if workerRunning}
         <WorkerRunStatus
             startedAtMs={consoleProjection.runActivity.startedAtMs}
@@ -1854,6 +2004,18 @@
             </div>
         </div>
         <div class="composer-actions">
+            {#if workerRunning}
+                <button
+                    type="button"
+                    disabled={!canQueueDraft}
+                    onclick={handleQueueSubmit}
+                >Queue Submit</button>
+                <button
+                    type="button"
+                    disabled={!canNotifyDraft}
+                    onclick={handleNotifySubmit}
+                >Notify</button>
+            {/if}
             {#if composerNotice}
                 <span class="composer-notice">{composerNotice}</span>
             {/if}
@@ -2033,6 +2195,31 @@
 
     .console-scroll::-webkit-scrollbar {
         display: none;
+    }
+
+    .pending-submissions {
+        margin: 0 var(--space-3);
+        color: var(--muted);
+        font-size: 0.75rem;
+    }
+
+    .pending-submissions ol {
+        display: grid;
+        gap: var(--space-1);
+        margin: var(--space-2) 0;
+        padding-left: var(--space-5);
+    }
+
+    .pending-submissions li {
+        display: flex;
+        gap: var(--space-2);
+        align-items: center;
+    }
+
+    .pending-submissions code {
+        max-width: 16rem;
+        overflow: hidden;
+        text-overflow: ellipsis;
     }
 
     .console-log {

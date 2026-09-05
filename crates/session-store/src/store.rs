@@ -226,6 +226,47 @@ pub trait Store: Send + Sync {
         Err(StoreError::PasteArtifactUnsupported)
     }
 
+    /// Retain an uploaded file while a durable pending operation owns it.
+    fn pin_uploaded_file(
+        &self,
+        _session_id: SessionId,
+        _reference: &UploadedFileRef,
+        _owner_id: &str,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::PasteArtifactUnsupported)
+    }
+
+    /// Release a pending-operation pin without changing committed ownership.
+    fn release_uploaded_file_pin(
+        &self,
+        _session_id: SessionId,
+        _artifact_id: &str,
+        _owner_id: &str,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::PasteArtifactUnsupported)
+    }
+
+    /// Complete the pending-to-history handoff after the history entry commits.
+    fn finalize_uploaded_file_binding(
+        &self,
+        _session_id: SessionId,
+        _artifact_id: &str,
+        _source_entry_id: &str,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::PasteArtifactUnsupported)
+    }
+
+    /// Clear pending-operation pins that have no owner in restored durable
+    /// Worker Session state. This repairs an interrupted pin-before-checkpoint
+    /// acceptance without disturbing live queue owners or committed history.
+    fn reconcile_uploaded_file_pins(
+        &self,
+        _session_id: SessionId,
+        _live_owner_ids: &[String],
+    ) -> Result<u64, StoreError> {
+        Ok(0)
+    }
+
     /// Delete an uncommitted uploaded file owned by `session_id`.
     fn delete_uploaded_file(
         &self,

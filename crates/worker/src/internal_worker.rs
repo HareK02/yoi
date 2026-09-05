@@ -709,7 +709,7 @@ pub(crate) fn prepare_internal_worker_from_spec(
         }
 
         Box::pin(prepare_internal_worker_session(
-            worker, store, visibility, None, None,
+            worker, store, visibility, None, None, None,
         ))
         .await
     })
@@ -746,13 +746,16 @@ pub(crate) async fn prepare_internal_worker_session(
     visibility: InternalWorkerVisibility,
     child_registry: Option<Arc<SpawnedWorkerRegistry>>,
     on_turn_end: Option<Arc<dyn Fn(InternalWorkerSessionStatus) + Send + Sync>>,
+    command_event_broker: Option<workdir::WorkdirToolBroker>,
 ) -> Result<InternalWorkerSessionHandle, InternalWorkerSessionError> {
     let (event_tx, _event_rx) = broadcast::channel(256);
     let sink = worker.sink();
     spawn_internal_log_event_bridge(sink.clone(), event_tx.clone());
     let alerter = Alerter::new(event_tx.clone());
     let in_flight = InFlightEvents::new(event_tx.clone());
-    if let Some(session) = worker.workdir_session() {
+    if let Some(broker) = command_event_broker.as_ref() {
+        wire_workdir_command_events(&broker.tool_session(), &in_flight);
+    } else if let Some(session) = worker.workdir_session() {
         wire_workdir_command_events(session, &in_flight);
     }
     let actor_in_flight = in_flight.clone();
@@ -887,6 +890,7 @@ pub(crate) async fn spawn_prepared_internal_worker_session(
         InternalWorkerVisibility::ServicePrivate,
         None,
         on_turn_end,
+        None,
     )
     .await?;
     handle.send(input).await?;

@@ -2150,6 +2150,12 @@ Deno.test("snapshot restores TaskStore state from system history", () => {
   const event = snapshotEvent("/repo");
   if (event.event !== "snapshot") throw new Error("snapshot fixture expected");
   event.data.session = {
+    pending_submissions: {
+      revision: 0,
+      notification_count: 0,
+      head_id: null,
+      submissions: [],
+    },
     entries: [{
       entry_id: "task-reminder-1",
       timestamp: 1,
