@@ -118,6 +118,7 @@ impl Tool for BashTool {
                 command: params.command,
                 timeout_secs,
                 output_limit: INLINE_BYTE_BUDGET,
+                cwd: None,
                 spill_dir: Some(self.output_dir.clone()),
                 tool_call_id: Some(call_id.clone()),
             })

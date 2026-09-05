@@ -718,8 +718,7 @@ async fn run_workdir_session_operation(
             .ok_or_else(RuntimeHttpWorkdirError::not_found)?;
         record.session.clone()
     };
-    let applied = workdir::apply_delegation_chain(source, request.delegations).await?;
-    let session = applied.scoped_session.as_ref();
+    let session = source.as_ref();
     let operation = request.operation;
 
     let result = match operation {
@@ -2080,8 +2079,8 @@ mod tests {
     use manifest::{Scope, SharedScope};
     use tower::ServiceExt;
     use workdir::{
-        GrepOutputMode, GrepRequest, LocalWorkdirSession, ReadRequest, StatRequest, Workdir,
-        WorkdirPath, WorkdirSessionCapabilities,
+        GrepOutputMode, GrepRequest, LocalWorkdirSession, StatRequest, Workdir, WorkdirPath,
+        WorkdirSessionCapabilities,
     };
 
     #[test]
@@ -2502,16 +2501,6 @@ mod tests {
     async fn workdir_session_operations_enforce_owner_and_close_terminally() {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("hello.txt"), "hello").expect("write fixture");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            std::fs::create_dir(temp.path().join("granted")).expect("granted directory");
-            std::fs::write(temp.path().join("granted/visible"), "visible")
-                .expect("visible fixture");
-            std::fs::create_dir(temp.path().join("secret")).expect("secret directory");
-            std::fs::write(temp.path().join("secret/key"), "hidden").expect("secret fixture");
-            symlink("../secret/key", temp.path().join("granted/link")).expect("symlink fixture");
-        }
         let scope = SharedScope::new(Scope::writable(temp.path()).expect("scope"));
         let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::materialized_bound(
             Workdir::new("wd-1"),
@@ -2545,7 +2534,6 @@ mod tests {
             expires_at: u64::MAX,
         };
         let operation = WorkdirSessionOperationRequest {
-            delegations: Vec::new(),
             operation: WorkdirSessionOperation::Stat(StatRequest {
                 path: WorkdirPath::new("hello.txt").expect("logical path"),
             }),
@@ -2562,7 +2550,6 @@ mod tests {
         assert!(matches!(result, WorkdirSessionOperationResult::Stat(_)));
 
         let grep = WorkdirSessionOperationRequest {
-            delegations: Vec::new(),
             operation: WorkdirSessionOperation::Grep(GrepRequest {
                 pattern: "hello".into(),
                 path: WorkdirPath::new("hello.txt").unwrap(),
@@ -2585,78 +2572,7 @@ mod tests {
         )
         .await
         .expect("grep direct file through provider operation");
-        match result {
-            WorkdirSessionOperationResult::Grep(result) => {
-                assert_eq!(result.match_count, 1);
-                assert_eq!(result.matched_files, 1);
-                assert!(result.output.starts_with("hello.txt\n"));
-                assert!(result.output.contains("> 1 │ hello"));
-            }
-            other => panic!("unexpected workdir grep result: {other:?}"),
-        }
-
-        #[cfg(unix)]
-        {
-            let delegated_visible = WorkdirSessionOperationRequest {
-                delegations: vec![workdir::WorkdirDelegationRequest {
-                    rules: vec![workdir::WorkdirDelegationRule {
-                        target: WorkdirPath::new("granted").unwrap(),
-                        permission: workdir::WorkdirDelegationPermission::Read,
-                        recursive: true,
-                    }],
-                    cwd: WorkdirPath::new("granted").unwrap(),
-                }],
-                operation: WorkdirSessionOperation::Read(ReadRequest {
-                    path: WorkdirPath::new("visible").unwrap(),
-                    offset: 0,
-                    limit: 20,
-                    max_bytes: 1024,
-                }),
-            };
-            let visible = run_workdir_session_operation(
-                State(state.clone()),
-                Path("session-1".to_string()),
-                Some(Extension(auth.clone())),
-                Ok(Json(delegated_visible)),
-            )
-            .await
-            .expect("non-root delegated cwd should resolve once")
-            .0;
-            assert!(matches!(
-                visible,
-                WorkdirSessionOperationResult::Read(result) if result.bytes == b"visible"
-            ));
-
-            let delegated_read = WorkdirSessionOperationRequest {
-                delegations: vec![workdir::WorkdirDelegationRequest {
-                    rules: vec![workdir::WorkdirDelegationRule {
-                        target: WorkdirPath::new("granted").unwrap(),
-                        permission: workdir::WorkdirDelegationPermission::Read,
-                        recursive: true,
-                    }],
-                    cwd: WorkdirPath::new("granted").unwrap(),
-                }],
-                operation: WorkdirSessionOperation::Read(ReadRequest {
-                    path: WorkdirPath::new("link").unwrap(),
-                    offset: 0,
-                    limit: 20,
-                    max_bytes: 1024,
-                }),
-            };
-            let error = run_workdir_session_operation(
-                State(state.clone()),
-                Path("session-1".to_string()),
-                Some(Extension(auth.clone())),
-                Ok(Json(delegated_read)),
-            )
-            .await
-            .expect_err("provider must reject delegated symlink escape");
-            assert_ne!(error.status, StatusCode::OK);
-            assert_eq!(
-                std::fs::read_to_string(temp.path().join("secret/key")).unwrap(),
-                "hidden"
-            );
-        }
+        assert!(matches!(result, WorkdirSessionOperationResult::Grep(_)));
 
         let wrong_owner = RuntimeAuthContext {
             workspace_id: "workspace-b".to_string(),

@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use workdir::http::{WorkdirSessionOperation, WorkdirSessionOperationResult};
-use workdir::workspace::{WorkspaceWorkdirSessionFence, WorkspaceWorkdirSessionOperationRequest};
+use workdir::workspace::WorkspaceWorkdirSessionOperationRequest;
 use workdir::{
     CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
     EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
@@ -156,8 +156,6 @@ struct WorkspaceHttpWorkdirBackend {
 pub struct WorkspaceAttachedWorkdirSession {
     client: Arc<dyn WorkspaceClient>,
     workdir: Workdir,
-    expected_session_fence: Option<String>,
-    delegations: Vec<workdir::WorkdirDelegationRequest>,
 }
 
 impl WorkspaceAttachedWorkdirSession {
@@ -165,8 +163,6 @@ impl WorkspaceAttachedWorkdirSession {
         Arc::new(Self {
             client,
             workdir: Workdir::new("workspace-attachment"),
-            expected_session_fence: None,
-            delegations: Vec::new(),
         })
     }
 
@@ -183,16 +179,13 @@ impl WorkspaceAttachedWorkdirSession {
                 "/api/w/{}/workers/self/workdir-session/operations",
                 encode_path_segment(workspace_id)
             ),
-            serde_json::to_string(&WorkspaceWorkdirSessionOperationRequest {
-                expected_session_fence: self.expected_session_fence.clone(),
-                delegations: self.delegations.clone(),
-                operation,
-            })
-            .map_err(|error| {
-                WorkdirError::Transport(format!(
-                    "failed to encode Workspace Workdir operation: {error}"
-                ))
-            })?,
+            serde_json::to_string(&WorkspaceWorkdirSessionOperationRequest { operation }).map_err(
+                |error| {
+                    WorkdirError::Transport(format!(
+                        "failed to encode Workspace Workdir operation: {error}"
+                    ))
+                },
+            )?,
         );
         let response = self
             .client
@@ -239,59 +232,6 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
 
     fn capabilities(&self) -> WorkdirSessionCapabilities {
         WorkdirSessionCapabilities::ALL
-    }
-
-    fn transports_delegation_context(&self) -> bool {
-        true
-    }
-
-    async fn capture_delegation_source(
-        &self,
-        request: &workdir::WorkdirDelegationRequest,
-    ) -> Result<WorkdirSessionHandle, WorkdirError> {
-        let expected_session_fence = if let Some(fence) = &self.expected_session_fence {
-            fence.clone()
-        } else {
-            let workspace_id = self.client.workspace_id().ok_or_else(|| {
-                WorkdirError::Unavailable("Workspace identity is unavailable".to_string())
-            })?;
-            let response = self
-                .client
-                .execute(WorkspaceRequest {
-                    method: WorkspaceRequestMethod::Get,
-                    path: format!(
-                        "/api/w/{}/workers/self/workdir-session/fence",
-                        encode_path_segment(workspace_id)
-                    ),
-                    body: None,
-                })
-                .map_err(|error| {
-                    WorkdirError::Unavailable(format!(
-                        "failed to capture Workdir attachment fence: {error}"
-                    ))
-                })?;
-            let fence: WorkspaceWorkdirSessionFence = serde_json::from_str(&response.body)
-                .map_err(|error| {
-                    WorkdirError::Unavailable(format!(
-                        "invalid Workdir attachment fence response: {error}"
-                    ))
-                })?;
-            fence.value
-        };
-        let mut delegations = self.delegations.clone();
-        delegations.push(request.clone());
-        let candidate = Arc::new(Self {
-            client: self.client.clone(),
-            workdir: self.workdir.clone(),
-            expected_session_fence: Some(expected_session_fence),
-            delegations,
-        });
-        candidate
-            .stat(StatRequest {
-                path: workdir::WorkdirPath::new("").expect("empty Workdir path is valid"),
-            })
-            .await?;
-        Ok(candidate)
     }
 
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
@@ -1155,6 +1095,7 @@ mod tests {
                 command: "true".to_string(),
                 timeout_secs: 120,
                 output_limit: 1024,
+                cwd: None,
                 spill_dir: Some("/worker-local/bash-output".into()),
                 tool_call_id: Some("call-1".to_string()),
             })
@@ -1176,83 +1117,6 @@ mod tests {
                 .unwrap()
                 .contains("/worker-local/bash-output")
         );
-    }
-
-    #[tokio::test]
-    async fn delegated_attached_session_carries_captured_fence_on_operations() {
-        let client = Arc::new(RecordingWorkspaceClient::new(vec![
-            response(json!({"value": "attachment-fence"})),
-            response(json!({
-                "operation": "stat",
-                "result": {"path": "", "kind": "directory", "size": 0}
-            })),
-            response(json!({
-                "operation": "stat",
-                "result": {"path": "visible.txt", "kind": "file", "size": 8}
-            })),
-        ]));
-        let parent = workdir::delegation_capable_session(WorkspaceAttachedWorkdirSession::handle(
-            client.clone(),
-        ));
-        let delegation = parent
-            .delegate(workdir::WorkdirDelegationRequest {
-                rules: vec![workdir::WorkdirDelegationRule {
-                    target: workdir::WorkdirPath::new("").unwrap(),
-                    permission: workdir::WorkdirDelegationPermission::Read,
-                    recursive: false,
-                }],
-                cwd: workdir::WorkdirPath::new("").unwrap(),
-            })
-            .await
-            .unwrap();
-        delegation
-            .scoped_session
-            .stat(StatRequest {
-                path: workdir::WorkdirPath::new("visible.txt").unwrap(),
-            })
-            .await
-            .unwrap();
-
-        let requests = client.requests();
-        assert_eq!(requests.len(), 3);
-        assert_eq!(
-            requests[0].path,
-            "/api/w/workspace%2Ftest/workers/self/workdir-session/fence"
-        );
-        let body: serde_json::Value =
-            serde_json::from_str(requests[2].body.as_deref().unwrap()).unwrap();
-        assert_eq!(body["expected_session_fence"], "attachment-fence");
-        assert_eq!(body["operation"]["operation"], "stat");
-        assert_eq!(body["delegations"][0]["rules"][0]["target"], "");
-    }
-
-    #[tokio::test]
-    async fn attached_provider_rejection_happens_before_delegation_is_returned() {
-        let client = Arc::new(RecordingWorkspaceClient::new(vec![
-            response(json!({"value": "attachment-fence"})),
-            response(json!({"error": "provider rejected delegated write target"})),
-        ]));
-        let parent = workdir::delegation_capable_session(WorkspaceAttachedWorkdirSession::handle(
-            client.clone(),
-        ));
-        let result = parent
-            .delegate(workdir::WorkdirDelegationRequest {
-                rules: vec![workdir::WorkdirDelegationRule {
-                    target: workdir::WorkdirPath::new("linked-target").unwrap(),
-                    permission: workdir::WorkdirDelegationPermission::Write,
-                    recursive: true,
-                }],
-                cwd: workdir::WorkdirPath::new("linked-target").unwrap(),
-            })
-            .await;
-
-        assert!(result.is_err(), "provider rejection must fail before lease");
-        let requests = client.requests();
-        assert_eq!(requests.len(), 2);
-        let validation: serde_json::Value =
-            serde_json::from_str(requests[1].body.as_deref().unwrap()).unwrap();
-        assert_eq!(validation["operation"]["operation"], "stat");
-        assert_eq!(validation["delegations"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1298,73 +1162,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nested_attached_session_preserves_full_delegation_chain() {
+    async fn scoped_broker_operations_carry_no_child_context() {
         let client = Arc::new(RecordingWorkspaceClient::new(vec![
-            response(json!({"value": "attachment-fence"})),
             response(json!({
                 "operation": "stat",
-                "result": {"path": "", "kind": "directory", "size": 0}
+                "result": {"path": "visible.txt", "kind": "file", "size": 8}
             })),
             response(json!({
                 "operation": "stat",
-                "result": {"path": "nested", "kind": "directory", "size": 0}
-            })),
-            response(json!({
-                "operation": "stat",
-                "result": {"path": "nested/file", "kind": "file", "size": 1}
+                "result": {"path": "visible.txt", "kind": "file", "size": 8}
             })),
         ]));
-        let parent = workdir::delegation_capable_session(WorkspaceAttachedWorkdirSession::handle(
+        let broker = workdir::WorkdirToolBroker::new(WorkspaceAttachedWorkdirSession::handle(
             client.clone(),
         ));
-        let outer = parent
-            .delegate(workdir::WorkdirDelegationRequest {
-                rules: vec![workdir::WorkdirDelegationRule {
+        let scoped = broker
+            .scope(workdir::WorkdirToolScope {
+                rules: vec![workdir::WorkdirToolScopeRule {
                     target: workdir::WorkdirPath::new("").unwrap(),
-                    permission: workdir::WorkdirDelegationPermission::Read,
+                    permission: workdir::WorkdirToolScopePermission::Read,
                     recursive: true,
                 }],
                 cwd: workdir::WorkdirPath::new("").unwrap(),
+                command: false,
             })
             .await
             .unwrap();
-        let nested = outer
-            .scoped_session
-            .delegate(workdir::WorkdirDelegationRequest {
-                rules: vec![workdir::WorkdirDelegationRule {
-                    target: workdir::WorkdirPath::new("nested").unwrap(),
-                    permission: workdir::WorkdirDelegationPermission::Read,
-                    recursive: true,
-                }],
-                cwd: workdir::WorkdirPath::new("nested").unwrap(),
-            })
-            .await
-            .unwrap();
-        nested
-            .scoped_session
+        scoped
             .stat(StatRequest {
-                path: workdir::WorkdirPath::new("file").unwrap(),
+                path: workdir::WorkdirPath::new("visible.txt").unwrap(),
             })
             .await
             .unwrap();
 
         let requests = client.requests();
-        assert_eq!(requests.len(), 4);
-        let outer_validation: serde_json::Value =
-            serde_json::from_str(requests[1].body.as_deref().unwrap()).unwrap();
-        let nested_validation: serde_json::Value =
-            serde_json::from_str(requests[2].body.as_deref().unwrap()).unwrap();
-        assert_eq!(outer_validation["delegations"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            nested_validation["delegations"].as_array().unwrap().len(),
-            2
-        );
-        let body: serde_json::Value =
-            serde_json::from_str(requests[3].body.as_deref().unwrap()).unwrap();
-        assert_eq!(body["delegations"].as_array().unwrap().len(), 2);
-        assert_eq!(body["delegations"][0]["rules"][0]["target"], "");
-        assert_eq!(body["delegations"][1]["rules"][0]["target"], "nested");
-        assert_eq!(body["operation"]["request"]["path"], "file");
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert_eq!(
+                request.path,
+                "/api/w/workspace%2Ftest/workers/self/workdir-session/operations"
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            assert!(body.get("delegations").is_none());
+            assert!(body.get("child").is_none());
+            assert!(body.get("expected_session_fence").is_none());
+        }
     }
 
     #[test]

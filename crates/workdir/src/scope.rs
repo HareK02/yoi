@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -18,92 +18,151 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkdirDelegationPermission {
+pub enum WorkdirToolScopePermission {
     Read,
     Write,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkdirDelegationRule {
+pub struct WorkdirToolScopeRule {
     pub target: FsPath,
-    pub permission: WorkdirDelegationPermission,
+    pub permission: WorkdirToolScopePermission,
     pub recursive: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkdirDelegationRequest {
-    pub rules: Vec<WorkdirDelegationRule>,
+pub struct WorkdirToolScope {
+    pub rules: Vec<WorkdirToolScopeRule>,
     pub cwd: FsPath,
+    pub command: bool,
 }
 
-pub struct WorkdirDelegation {
-    pub scoped_session: WorkdirSessionHandle,
+#[derive(Clone)]
+pub struct WorkdirToolBroker {
+    authority: Arc<ScopedWorkdirSession>,
+    session: WorkdirSessionHandle,
+    event_forwarder: Option<Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>>,
+}
+
+impl std::fmt::Debug for WorkdirToolBroker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkdirToolBroker")
+            .field("workdir", self.session.workdir())
+            .field("capabilities", &self.session.capabilities())
+            .finish_non_exhaustive()
+    }
+}
+
+impl WorkdirToolBroker {
+    /// Own the parent Worker's active session and mediate every scoped child operation.
+    pub fn new(source: WorkdirSessionHandle) -> Self {
+        let capabilities = source.capabilities();
+        let (command_events, _) = broadcast::channel(64);
+        let authority = Arc::new(ScopedWorkdirSession {
+            source,
+            cwd: FsPath::new("").expect("empty Workdir path is valid"),
+            scope: None,
+            capabilities,
+            validity: SessionValidity::root(),
+            child_write_leases: Mutex::new(HashMap::new()),
+            next_lease_id: AtomicU64::new(1),
+            owned_commands: Arc::new(Mutex::new(HashSet::new())),
+            command_events,
+            closes_source: true,
+        });
+        Self {
+            session: authority.clone(),
+            authority,
+            event_forwarder: None,
+        }
+    }
+
+    /// Session used only by tools registered by the owning Worker.
+    pub fn tool_session(&self) -> WorkdirSessionHandle {
+        self.session.clone()
+    }
+
+    /// Create a revocable, attenuated tool route without delegating a provider session.
+    pub async fn scope(
+        &self,
+        request: WorkdirToolScope,
+    ) -> Result<WorkdirScopeLease, WorkdirError> {
+        self.authority.scope(request).await
+    }
+}
+
+impl std::ops::Deref for WorkdirToolBroker {
+    type Target = WorkdirSessionHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+pub struct WorkdirScopeLease {
+    broker: WorkdirToolBroker,
     pub capabilities: WorkdirSessionCapabilities,
     validity: Arc<SessionValidity>,
 }
 
-impl std::fmt::Debug for WorkdirDelegation {
+impl std::fmt::Debug for WorkdirScopeLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WorkdirDelegation")
-            .field("workdir", &self.scoped_session.workdir())
+        f.debug_struct("WorkdirScopeLease")
+            .field("workdir", self.broker.session.workdir())
             .field("capabilities", &self.capabilities)
             .field("active", &self.is_active())
             .finish()
     }
 }
 
-impl WorkdirDelegation {
+impl WorkdirScopeLease {
+    pub fn broker(&self) -> WorkdirToolBroker {
+        self.broker.clone()
+    }
+
+    pub fn tool_session(&self) -> WorkdirSessionHandle {
+        self.broker.tool_session()
+    }
+
+    pub async fn scope(
+        &self,
+        request: WorkdirToolScope,
+    ) -> Result<WorkdirScopeLease, WorkdirError> {
+        self.broker.scope(request).await
+    }
+
     pub fn is_active(&self) -> bool {
         self.validity.is_active()
     }
 
     pub fn release(&self) {
         self.validity.active.store(false, Ordering::Release);
+        if let Some(forwarder) = &self.broker.event_forwarder
+            && let Some(handle) = forwarder
+                .lock()
+                .expect("scoped command forwarder mutex poisoned")
+                .take()
+        {
+            handle.abort();
+        }
     }
 }
 
-impl Drop for WorkdirDelegation {
+impl std::ops::Deref for WorkdirScopeLease {
+    type Target = WorkdirSessionHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.broker.session
+    }
+}
+
+impl Drop for WorkdirScopeLease {
     fn drop(&mut self) {
         self.release();
     }
-}
-
-pub struct AppliedWorkdirDelegation {
-    pub scoped_session: WorkdirSessionHandle,
-    _leases: Vec<WorkdirDelegation>,
-}
-
-impl std::fmt::Debug for AppliedWorkdirDelegation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AppliedWorkdirDelegation")
-            .field("workdir", self.scoped_session.workdir())
-            .field("lease_count", &self._leases.len())
-            .finish()
-    }
-}
-
-pub async fn apply_delegation_chain(
-    source: WorkdirSessionHandle,
-    requests: impl IntoIterator<Item = WorkdirDelegationRequest>,
-) -> Result<AppliedWorkdirDelegation, WorkdirError> {
-    let mut current = source;
-    let mut leases = Vec::new();
-    for request in requests {
-        let authority = if current.is_delegation_capable() {
-            current.clone()
-        } else {
-            delegation_capable_session(current.clone())
-        };
-        let lease = authority.delegate(request).await?;
-        current = lease.scoped_session.clone();
-        leases.push(lease);
-    }
-    Ok(AppliedWorkdirDelegation {
-        scoped_session: current,
-        _leases: leases,
-    })
 }
 
 #[derive(Debug)]
@@ -136,23 +195,25 @@ impl SessionValidity {
 #[derive(Clone, Debug)]
 struct ActiveWriteLease {
     validity: Weak<SessionValidity>,
-    rules: Vec<WorkdirDelegationRule>,
+    rules: Vec<WorkdirToolScopeRule>,
 }
 
-struct DelegatingWorkdirSession {
+struct ScopedWorkdirSession {
     source: WorkdirSessionHandle,
     cwd: FsPath,
-    scope: Option<Vec<WorkdirDelegationRule>>,
+    scope: Option<Vec<WorkdirToolScopeRule>>,
     capabilities: WorkdirSessionCapabilities,
     validity: Arc<SessionValidity>,
     child_write_leases: Mutex<HashMap<u64, ActiveWriteLease>>,
     next_lease_id: AtomicU64,
+    owned_commands: Arc<Mutex<HashSet<String>>>,
+    command_events: broadcast::Sender<CommandEvent>,
     closes_source: bool,
 }
 
-impl std::fmt::Debug for DelegatingWorkdirSession {
+impl std::fmt::Debug for ScopedWorkdirSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DelegatingWorkdirSession")
+        f.debug_struct("ScopedWorkdirSession")
             .field("workdir", &self.source.workdir())
             .field("scope", &self.scope)
             .field("capabilities", &self.capabilities)
@@ -161,22 +222,7 @@ impl std::fmt::Debug for DelegatingWorkdirSession {
     }
 }
 
-/// Wrap a provider session with logical-path delegation and parent write gates.
-pub fn delegation_capable_session(source: WorkdirSessionHandle) -> WorkdirSessionHandle {
-    let capabilities = source.capabilities();
-    Arc::new(DelegatingWorkdirSession {
-        source,
-        cwd: FsPath::new("").expect("empty Workdir path is valid"),
-        scope: None,
-        capabilities,
-        validity: SessionValidity::root(),
-        child_write_leases: Mutex::new(HashMap::new()),
-        next_lease_id: AtomicU64::new(1),
-        closes_source: true,
-    })
-}
-
-impl DelegatingWorkdirSession {
+impl ScopedWorkdirSession {
     fn ensure_active(&self) -> Result<(), WorkdirError> {
         if self.validity.is_active() {
             Ok(())
@@ -195,7 +241,7 @@ impl DelegatingWorkdirSession {
             Ok(())
         } else {
             Err(WorkdirError::Denied(format!(
-                "delegated workdir session does not permit {operation}"
+                "scoped Workdir tools do not permit {operation}"
             )))
         }
     }
@@ -203,7 +249,7 @@ impl DelegatingWorkdirSession {
     fn ensure_path(
         &self,
         path: &FsPath,
-        permission: WorkdirDelegationPermission,
+        permission: WorkdirToolScopePermission,
     ) -> Result<(), WorkdirError> {
         self.ensure_active()?;
         if let Some(scope) = &self.scope {
@@ -212,11 +258,11 @@ impl DelegatingWorkdirSession {
                 .any(|rule| rule_allows_path(rule, path, permission))
             {
                 return Err(WorkdirError::Denied(format!(
-                    "logical workdir path `{path}` is outside the delegated {permission:?} scope"
+                    "logical workdir path `{path}` is outside the scoped {permission:?} scope"
                 )));
             }
         }
-        if permission == WorkdirDelegationPermission::Write {
+        if permission == WorkdirToolScopePermission::Write {
             self.ensure_parent_write_available(path)?;
         }
         Ok(())
@@ -239,7 +285,7 @@ impl DelegatingWorkdirSession {
         capability: WorkdirSessionCapability,
     ) -> Result<(), WorkdirError> {
         self.ensure_capability(capability, "read operations")?;
-        self.ensure_path(path, WorkdirDelegationPermission::Read)
+        self.ensure_path(path, WorkdirToolScopePermission::Read)
     }
 
     fn ensure_write(
@@ -248,57 +294,132 @@ impl DelegatingWorkdirSession {
         capability: WorkdirSessionCapability,
     ) -> Result<(), WorkdirError> {
         self.ensure_capability(capability, "write operations")?;
-        self.ensure_path(path, WorkdirDelegationPermission::Write)
+        self.ensure_path(path, WorkdirToolScopePermission::Write)
     }
 
     fn ensure_command(&self) -> Result<(), WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Command, "command execution")
     }
 
+    fn ensure_owned_command(&self, handle: &CommandHandle) -> Result<(), WorkdirError> {
+        self.ensure_command()?;
+        if self.scope.is_none()
+            || self
+                .owned_commands
+                .lock()
+                .expect("scoped command set mutex poisoned")
+                .contains(&handle.0)
+        {
+            Ok(())
+        } else {
+            Err(WorkdirError::UnknownCommand(handle.0.clone()))
+        }
+    }
+
     fn ensure_parent_write_available(&self, path: &FsPath) -> Result<(), WorkdirError> {
         let mut leases = self
             .child_write_leases
             .lock()
-            .expect("workdir delegation lease mutex poisoned");
+            .expect("Workdir tool scope lease mutex poisoned");
         leases.retain(|_, lease| lease.validity.upgrade().is_some_and(|v| v.is_active()));
         if leases.values().any(|lease| {
             lease.rules.iter().any(|rule| {
-                rule.permission == WorkdirDelegationPermission::Write
-                    && rule_allows_path(rule, path, WorkdirDelegationPermission::Write)
+                rule.permission == WorkdirToolScopePermission::Write
+                    && rule_allows_path(rule, path, WorkdirToolScopePermission::Write)
             })
         }) {
             Err(WorkdirError::Denied(format!(
-                "logical workdir path `{path}` is leased to a child session"
+                "logical workdir path `{path}` is leased to child Workdir tools"
             )))
         } else {
             Ok(())
         }
     }
 
-    fn validate_delegation_rules(
+    async fn ensure_source_path_has_no_symlink(&self, path: &FsPath) -> Result<(), WorkdirError> {
+        let mut current = String::new();
+        for component in Path::new(path.as_str()).components() {
+            let component = component.as_os_str().to_string_lossy();
+            if component.is_empty() || component == "." {
+                continue;
+            }
+            if !current.is_empty() {
+                current.push('/');
+            }
+            current.push_str(&component);
+            let current = FsPath::new(&current).map_err(|error| {
+                WorkdirError::Denied(format!("invalid scoped Workdir path: {error}"))
+            })?;
+            match self.source.stat(StatRequest { path: current }).await {
+                Ok(result) if result.kind == fs_operation::EntryKind::Symlink => {
+                    return Err(WorkdirError::Denied(format!(
+                        "scoped Workdir path `{path}` traverses a symlink"
+                    )));
+                }
+                Ok(_) => {}
+                Err(WorkdirError::NotFound(_)) => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure_scope_targets_do_not_traverse_symlinks(
         &self,
-        rules: &[WorkdirDelegationRule],
+        rules: &[WorkdirToolScopeRule],
+    ) -> Result<(), WorkdirError> {
+        for rule in rules {
+            self.ensure_source_path_has_no_symlink(&rule.target).await?;
+        }
+        Ok(())
+    }
+
+    async fn resolve_operation_path(&self, path: &FsPath) -> Result<FsPath, WorkdirError> {
+        self.ensure_active()?;
+        let resolved = self.resolve_path(path)?;
+        if self.scope.is_some() {
+            self.ensure_source_path_has_no_symlink(&resolved).await?;
+        }
+        Ok(resolved)
+    }
+
+    fn validate_scope(
+        &self,
+        rules: &[WorkdirToolScopeRule],
+        command: bool,
     ) -> Result<WorkdirSessionCapabilities, WorkdirError> {
         self.ensure_active()?;
         if rules.is_empty() {
             return Err(WorkdirError::Denied(
-                "workdir delegation requires at least one logical scope rule".into(),
+                "workdir tool scope requires at least one logical scope rule".into(),
             ));
         }
         let writable = rules
             .iter()
-            .any(|rule| rule.permission == WorkdirDelegationPermission::Write);
+            .any(|rule| rule.permission == WorkdirToolScopePermission::Write);
         if !self.capabilities.supports(WorkdirSessionCapability::Read)
             || (writable
                 && (!self.capabilities.supports(WorkdirSessionCapability::Write)
-                    || !self.capabilities.supports(WorkdirSessionCapability::Edit)
-                    || !self
-                        .capabilities
-                        .supports(WorkdirSessionCapability::Command)))
+                    || !self.capabilities.supports(WorkdirSessionCapability::Edit)))
         {
             return Err(WorkdirError::Denied(
-                "parent workdir session cannot delegate the requested capabilities".into(),
+                "parent Workdir session cannot scope the requested capabilities".into(),
             ));
+        }
+        if command {
+            if !writable {
+                return Err(WorkdirError::Denied(
+                    "command execution requires a writable scoped path".into(),
+                ));
+            }
+            if !self
+                .capabilities
+                .supports(WorkdirSessionCapability::Command)
+            {
+                return Err(WorkdirError::Denied(
+                    "parent Workdir session does not support Command".into(),
+                ));
+            }
         }
         for requested in rules {
             if let Some(scope) = &self.scope {
@@ -307,7 +428,7 @@ impl DelegatingWorkdirSession {
                     .any(|parent| rule_contains_rule(parent, requested))
                 {
                     return Err(WorkdirError::Denied(format!(
-                        "logical workdir scope `{}` exceeds the parent delegation",
+                        "logical workdir scope `{}` exceeds the parent tool scope",
                         requested.target
                     )));
                 }
@@ -325,69 +446,40 @@ impl DelegatingWorkdirSession {
         if writable {
             delegated.push(WorkdirSessionCapability::Write);
             delegated.push(WorkdirSessionCapability::Edit);
+        }
+        if command {
             delegated.push(WorkdirSessionCapability::Command);
         }
         Ok(WorkdirSessionCapabilities::from_capabilities(delegated))
     }
-}
 
-#[async_trait]
-impl WorkdirSession for DelegatingWorkdirSession {
-    fn workdir(&self) -> &Workdir {
-        self.source.workdir()
-    }
-
-    fn capabilities(&self) -> WorkdirSessionCapabilities {
-        self.capabilities
-    }
-
-    fn is_delegation_capable(&self) -> bool {
-        true
-    }
-
-    fn transports_delegation_context(&self) -> bool {
-        self.source.transports_delegation_context()
-    }
-
-    async fn capture_delegation_source(
-        &self,
-        request: &WorkdirDelegationRequest,
-    ) -> Result<WorkdirSessionHandle, WorkdirError> {
-        self.ensure_active()?;
-        if self.scope.is_some() {
-            return Err(WorkdirError::Denied(
-                "scoped Workdir sessions cannot expose their provider source".into(),
-            ));
-        }
-        self.source.capture_delegation_source(request).await
-    }
-
-    async fn delegate(
-        &self,
-        request: WorkdirDelegationRequest,
-    ) -> Result<WorkdirDelegation, WorkdirError> {
-        let capabilities = self.validate_delegation_rules(&request.rules)?;
+    async fn scope(
+        self: &Arc<Self>,
+        request: WorkdirToolScope,
+    ) -> Result<WorkdirScopeLease, WorkdirError> {
+        let capabilities = self.validate_scope(&request.rules, request.command)?;
         if !request
             .rules
             .iter()
-            .any(|rule| rule_allows_path(rule, &request.cwd, WorkdirDelegationPermission::Read))
+            .any(|rule| rule_allows_path(rule, &request.cwd, WorkdirToolScopePermission::Read))
         {
             return Err(WorkdirError::Denied(format!(
-                "delegated cwd `{}` is outside the delegated readable scope",
+                "scoped tool cwd `{}` is outside the readable scope",
                 request.cwd
             )));
         }
-        let source = self.source.capture_delegation_source(&request).await?;
+        self.ensure_scope_targets_do_not_traverse_symlinks(&request.rules)
+            .await?;
         let validity = SessionValidity::child(self.validity.clone());
         let id = self.next_lease_id.fetch_add(1, Ordering::Relaxed);
         if request
             .rules
             .iter()
-            .any(|rule| rule.permission == WorkdirDelegationPermission::Write)
+            .any(|rule| rule.permission == WorkdirToolScopePermission::Write)
         {
             self.child_write_leases
                 .lock()
-                .expect("workdir delegation lease mutex poisoned")
+                .expect("Workdir tool scope lease mutex poisoned")
                 .insert(
                     id,
                     ActiveWriteLease {
@@ -396,99 +488,125 @@ impl WorkdirSession for DelegatingWorkdirSession {
                     },
                 );
         }
-        let child: WorkdirSessionHandle = Arc::new(DelegatingWorkdirSession {
-            source,
+        let owned_commands = Arc::new(Mutex::new(HashSet::new()));
+        let (command_events, _) = broadcast::channel(64);
+        let event_forwarder = forward_owned_command_events(
+            self.source.subscribe_command_events(),
+            owned_commands.clone(),
+            command_events.clone(),
+        )
+        .map(|handle| Arc::new(Mutex::new(Some(handle))));
+        let child = Arc::new(ScopedWorkdirSession {
+            source: self.source.clone(),
             cwd: request.cwd,
             scope: Some(request.rules),
             capabilities,
             validity: validity.clone(),
             child_write_leases: Mutex::new(HashMap::new()),
             next_lease_id: AtomicU64::new(1),
+            owned_commands,
+            command_events,
             closes_source: false,
         });
-        let scoped_session: WorkdirSessionHandle =
-            if capabilities == WorkdirSessionCapabilities::READ_ONLY {
-                Arc::new(ReadOnlyWorkdirSession::new(child))
-            } else {
-                child
-            };
-        Ok(WorkdirDelegation {
-            scoped_session,
+        let broker = WorkdirToolBroker {
+            session: child.clone(),
+            authority: child,
+            event_forwarder,
+        };
+        Ok(WorkdirScopeLease {
+            broker,
             capabilities,
             validity,
         })
     }
+}
+
+#[async_trait]
+impl WorkdirSession for ScopedWorkdirSession {
+    fn workdir(&self) -> &Workdir {
+        self.source.workdir()
+    }
+
+    fn capabilities(&self) -> WorkdirSessionCapabilities {
+        self.capabilities
+    }
 
     async fn stat(&self, mut request: StatRequest) -> Result<StatResult, WorkdirError> {
-        let path = self.resolve_path(&request.path)?;
+        let path = self.resolve_operation_path(&request.path).await?;
         self.ensure_read(&path, WorkdirSessionCapability::Read)?;
-        if !self.source.transports_delegation_context() {
-            request.path = path;
-        }
+        request.path = path;
         self.source.stat(request).await
     }
 
     async fn read(&self, mut request: ReadRequest) -> Result<ReadResult, WorkdirError> {
-        let path = self.resolve_path(&request.path)?;
+        let path = self.resolve_operation_path(&request.path).await?;
         self.ensure_read(&path, WorkdirSessionCapability::Read)?;
-        if !self.source.transports_delegation_context() {
-            request.path = path;
-        }
+        request.path = path;
         self.source.read(request).await
     }
 
     async fn write(&self, mut request: WriteRequest) -> Result<WriteResult, WorkdirError> {
-        let path = self.resolve_path(&request.path)?;
+        let path = self.resolve_operation_path(&request.path).await?;
         self.ensure_write(&path, WorkdirSessionCapability::Write)?;
-        if !self.source.transports_delegation_context() {
-            request.path = path;
-        }
+        request.path = path;
         self.source.write(request).await
     }
 
     async fn edit(&self, mut request: EditRequest) -> Result<EditResult, WorkdirError> {
-        let path = self.resolve_path(&request.path)?;
+        let path = self.resolve_operation_path(&request.path).await?;
         self.ensure_write(&path, WorkdirSessionCapability::Edit)?;
-        if !self.source.transports_delegation_context() {
-            request.path = path;
-        }
+        request.path = path;
         self.source.edit(request).await
     }
 
     async fn list(&self, mut request: ListRequest) -> Result<ListResult, WorkdirError> {
-        let path = self.resolve_path(&request.path)?;
+        let path = self.resolve_operation_path(&request.path).await?;
         self.ensure_read(&path, WorkdirSessionCapability::Read)?;
-        if !self.source.transports_delegation_context() {
-            request.path = path;
-        }
+        request.path = path;
         self.source.list(request).await
     }
 
     async fn glob(&self, mut request: GlobRequest) -> Result<GlobResult, WorkdirError> {
-        let path = self.resolve_path(&request.path)?;
+        let path = self.resolve_operation_path(&request.path).await?;
         self.ensure_read(&path, WorkdirSessionCapability::Glob)?;
-        if !self.source.transports_delegation_context() {
-            request.path = path;
-        }
+        request.path = path;
         self.source.glob(request).await
     }
 
     async fn grep(&self, mut request: GrepRequest) -> Result<GrepResult, WorkdirError> {
-        let path = self.resolve_path(&request.path)?;
+        let path = self.resolve_operation_path(&request.path).await?;
         self.ensure_read(&path, WorkdirSessionCapability::Grep)?;
-        if !self.source.transports_delegation_context() {
-            request.path = path;
-        }
+        request.path = path;
         self.source.grep(request).await
     }
 
-    async fn start_command(&self, request: CommandRequest) -> Result<CommandHandle, WorkdirError> {
+    async fn start_command(
+        &self,
+        mut request: CommandRequest,
+    ) -> Result<CommandHandle, WorkdirError> {
         self.ensure_command()?;
-        self.source.start_command(request).await
+        let tool_call_id = request.tool_call_id.clone();
+        if self.scope.is_some() {
+            request.cwd = Some(match request.cwd.as_ref() {
+                Some(cwd) => self.resolve_path(cwd)?,
+                None => self.cwd.clone(),
+            });
+        }
+        let handle = self.source.start_command(request).await?;
+        self.owned_commands
+            .lock()
+            .expect("scoped command set mutex poisoned")
+            .insert(handle.0.clone());
+        let _ = self.command_events.send(CommandEvent::Started {
+            command_id: handle.0.clone(),
+            tool_call_id,
+            observed_at_ms: unix_timestamp_ms(),
+        });
+        Ok(handle)
     }
 
     async fn command_status(&self, handle: CommandHandle) -> Result<CommandStatus, WorkdirError> {
-        self.ensure_command()?;
+        self.ensure_owned_command(&handle)?;
         self.source.command_status(handle).await
     }
 
@@ -496,29 +614,56 @@ impl WorkdirSession for DelegatingWorkdirSession {
         &self,
         request: CommandOutputRequest,
     ) -> Result<CommandOutput, WorkdirError> {
-        self.ensure_command()?;
-        self.source.command_output(request).await
+        self.ensure_owned_command(&request.handle)?;
+        let command_id = request.handle.0.clone();
+        let output = self.source.command_output(request).await?;
+        if !matches!(output.status, CommandStatus::Running) {
+            self.owned_commands
+                .lock()
+                .expect("scoped command set mutex poisoned")
+                .remove(&command_id);
+        }
+        Ok(output)
     }
 
     async fn cancel_command(&self, handle: CommandHandle) -> Result<(), WorkdirError> {
-        self.ensure_command()?;
+        self.ensure_owned_command(&handle)?;
         self.source.cancel_command(handle).await
     }
 
     fn subscribe_command_events(&self) -> Option<broadcast::Receiver<CommandEvent>> {
-        self.ensure_capability(WorkdirSessionCapability::Command, "command observation")
-            .ok()?;
-        self.source.subscribe_command_events()
+        if !self
+            .capabilities
+            .supports(WorkdirSessionCapability::Command)
+        {
+            return None;
+        }
+        if self.scope.is_none() {
+            self.source.subscribe_command_events()
+        } else {
+            Some(self.command_events.subscribe())
+        }
     }
 
     fn command_snapshot(&self) -> Vec<CommandSnapshot> {
-        if self
-            .ensure_capability(WorkdirSessionCapability::Command, "command observation")
-            .is_err()
+        if !self
+            .capabilities
+            .supports(WorkdirSessionCapability::Command)
         {
             return Vec::new();
         }
-        self.source.command_snapshot()
+        if self.scope.is_none() {
+            return self.source.command_snapshot();
+        }
+        let owned = self
+            .owned_commands
+            .lock()
+            .expect("scoped command set mutex poisoned");
+        self.source
+            .command_snapshot()
+            .into_iter()
+            .filter(|snapshot| owned.contains(&snapshot.command_id))
+            .collect()
     }
 
     async fn close(&self) -> Result<(), WorkdirError> {
@@ -531,7 +676,7 @@ impl WorkdirSession for DelegatingWorkdirSession {
     }
 }
 
-/// A fail-closed read-only view over an already scoped delegated session.
+/// A fail-closed read-only view over an already scoped scoped tool route.
 #[derive(Debug)]
 pub struct ReadOnlyWorkdirSession {
     inner: WorkdirSessionHandle,
@@ -551,30 +696,6 @@ impl WorkdirSession for ReadOnlyWorkdirSession {
 
     fn capabilities(&self) -> WorkdirSessionCapabilities {
         WorkdirSessionCapabilities::READ_ONLY
-    }
-
-    fn is_delegation_capable(&self) -> bool {
-        true
-    }
-
-    fn transports_delegation_context(&self) -> bool {
-        self.inner.transports_delegation_context()
-    }
-
-    async fn delegate(
-        &self,
-        request: WorkdirDelegationRequest,
-    ) -> Result<WorkdirDelegation, WorkdirError> {
-        if request
-            .rules
-            .iter()
-            .any(|rule| rule.permission == WorkdirDelegationPermission::Write)
-        {
-            return Err(WorkdirError::Denied(
-                "read-only workdir session cannot delegate write access".into(),
-            ));
-        }
-        self.inner.delegate(request).await
     }
 
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
@@ -629,20 +750,57 @@ impl WorkdirSession for ReadOnlyWorkdirSession {
     }
 }
 
+fn forward_owned_command_events(
+    receiver: Option<broadcast::Receiver<CommandEvent>>,
+    owned_commands: Arc<Mutex<HashSet<String>>>,
+    sender: broadcast::Sender<CommandEvent>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let mut receiver = receiver?;
+    Some(tokio::spawn(async move {
+        loop {
+            let event = match receiver.recv().await {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+            let command_id = match &event {
+                CommandEvent::Started { .. } => continue,
+                CommandEvent::Output { command_id, .. }
+                | CommandEvent::Terminal { command_id, .. } => command_id.clone(),
+            };
+            let owned = owned_commands
+                .lock()
+                .expect("scoped command set mutex poisoned")
+                .contains(&command_id);
+            if owned {
+                let _ = sender.send(event);
+            }
+        }
+    }))
+}
+
+fn unix_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 fn rule_allows_path(
-    rule: &WorkdirDelegationRule,
+    rule: &WorkdirToolScopeRule,
     path: &FsPath,
-    required: WorkdirDelegationPermission,
+    required: WorkdirToolScopePermission,
 ) -> bool {
-    if required == WorkdirDelegationPermission::Write
-        && rule.permission != WorkdirDelegationPermission::Write
+    if required == WorkdirToolScopePermission::Write
+        && rule.permission != WorkdirToolScopePermission::Write
     {
         return false;
     }
     path_in_rule(rule, path)
 }
 
-fn path_in_rule(rule: &WorkdirDelegationRule, path: &FsPath) -> bool {
+fn path_in_rule(rule: &WorkdirToolScopeRule, path: &FsPath) -> bool {
     let target = Path::new(rule.target.as_str());
     let path = Path::new(path.as_str());
     if path == target {
@@ -655,9 +813,9 @@ fn path_in_rule(rule: &WorkdirDelegationRule, path: &FsPath) -> bool {
     rule.recursive || depth <= 1
 }
 
-fn rule_contains_rule(parent: &WorkdirDelegationRule, child: &WorkdirDelegationRule) -> bool {
-    if child.permission == WorkdirDelegationPermission::Write
-        && parent.permission != WorkdirDelegationPermission::Write
+fn rule_contains_rule(parent: &WorkdirToolScopeRule, child: &WorkdirToolScopeRule) -> bool {
+    if child.permission == WorkdirToolScopePermission::Write
+        && parent.permission != WorkdirToolScopePermission::Write
     {
         return false;
     }
@@ -684,7 +842,7 @@ mod tests {
         FsPath::new(path).unwrap()
     }
 
-    fn session(root: &Path) -> WorkdirSessionHandle {
+    fn session(root: &Path) -> WorkdirToolBroker {
         let scope = SharedScope::new(
             Scope::from_config(&ScopeConfig {
                 allow: vec![ScopeRule {
@@ -696,7 +854,7 @@ mod tests {
             })
             .unwrap(),
         );
-        delegation_capable_session(Arc::new(LocalWorkdirSession::materialized_bound(
+        WorkdirToolBroker::new(Arc::new(LocalWorkdirSession::materialized_bound(
             Workdir::new("delegation-test"),
             root.to_path_buf(),
             root.to_path_buf(),
@@ -705,14 +863,15 @@ mod tests {
         )))
     }
 
-    fn request(path: &str, permission: WorkdirDelegationPermission) -> WorkdirDelegationRequest {
-        WorkdirDelegationRequest {
-            rules: vec![WorkdirDelegationRule {
+    fn request(path: &str, permission: WorkdirToolScopePermission) -> WorkdirToolScope {
+        WorkdirToolScope {
+            rules: vec![WorkdirToolScopeRule {
                 target: fs_path(path),
                 permission,
                 recursive: true,
             }],
             cwd: fs_path(path),
+            command: permission == WorkdirToolScopePermission::Write,
         }
     }
 
@@ -743,6 +902,7 @@ mod tests {
                 command: command.into(),
                 timeout_secs: 5,
                 output_limit: 1024,
+                cwd: None,
                 spill_dir: None,
                 tool_call_id: Some(tool_call_id.into()),
             })
@@ -760,7 +920,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegation_capable_session_forwards_command_telemetry() {
+    async fn workdir_tool_broker_session_forwards_command_telemetry() {
         let root = TempDir::new().unwrap();
         let parent = session(root.path());
         let mut events = parent
@@ -771,6 +931,7 @@ mod tests {
                 command: "printf ready; sleep 0.2; printf done".into(),
                 timeout_secs: 5,
                 output_limit: 1024,
+                cwd: None,
                 spill_dir: None,
                 tool_call_id: Some("tool-delegated".into()),
             })
@@ -807,11 +968,109 @@ mod tests {
         assert!(parent.command_snapshot().is_empty());
     }
 
+    #[tokio::test]
+    async fn write_scope_without_command_grant_has_no_command_capability() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("work")).unwrap();
+        let parent = session(root.path());
+        let child = parent
+            .scope(WorkdirToolScope {
+                rules: vec![WorkdirToolScopeRule {
+                    target: fs_path("work"),
+                    permission: WorkdirToolScopePermission::Write,
+                    recursive: true,
+                }],
+                cwd: fs_path("work"),
+                command: false,
+            })
+            .await
+            .unwrap();
+
+        assert!(child.capabilities.supports(WorkdirSessionCapability::Write));
+        assert!(
+            !child
+                .capabilities
+                .supports(WorkdirSessionCapability::Command)
+        );
+        let error = child
+            .start_command(CommandRequest {
+                command: "pwd".into(),
+                timeout_secs: 5,
+                output_limit: 1024,
+                cwd: None,
+                spill_dir: None,
+                tool_call_id: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, WorkdirError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn scoped_commands_use_child_cwd_and_do_not_leak_between_siblings() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("one")).unwrap();
+        fs::create_dir_all(root.path().join("two")).unwrap();
+        let parent = session(root.path());
+        let first = parent
+            .scope(request("one", WorkdirToolScopePermission::Write))
+            .await
+            .unwrap();
+        let second = parent
+            .scope(request("two", WorkdirToolScopePermission::Write))
+            .await
+            .unwrap();
+        let mut first_events = first.subscribe_command_events().unwrap();
+        let mut second_events = second.subscribe_command_events().unwrap();
+
+        let handle = first
+            .start_command(CommandRequest {
+                command: "pwd; sleep 0.2".into(),
+                timeout_secs: 5,
+                output_limit: 4096,
+                cwd: None,
+                spill_dir: None,
+                tool_call_id: Some("first-command".into()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            first_events.recv().await.unwrap(),
+            CommandEvent::Started { .. }
+        ));
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), second_events.recv()).await,
+            Err(_)
+        ));
+        assert!(matches!(
+            second.command_status(handle.clone()).await,
+            Err(WorkdirError::UnknownCommand(_))
+        ));
+
+        let output = first
+            .command_output(CommandOutputRequest {
+                handle,
+                cursor: 0,
+                limit: 4096,
+                wait: true,
+            })
+            .await
+            .unwrap();
+        let expected = root.path().join("one").to_string_lossy().into_owned();
+        assert!(
+            output
+                .content
+                .lines()
+                .next()
+                .is_some_and(|line| line == expected)
+        );
+    }
+
     #[test]
     fn non_recursive_rule_covers_target_and_direct_children_only() {
-        let rule = WorkdirDelegationRule {
+        let rule = WorkdirToolScopeRule {
             target: fs_path("docs"),
-            permission: WorkdirDelegationPermission::Read,
+            permission: WorkdirToolScopePermission::Read,
             recursive: false,
         };
         assert!(path_in_rule(&rule, &fs_path("docs")));
@@ -829,21 +1088,16 @@ mod tests {
         let parent = session(root.path());
 
         let child = parent
-            .delegate(request("docs", WorkdirDelegationPermission::Read))
+            .scope(request("docs", WorkdirToolScopePermission::Read))
             .await
             .unwrap();
         assert_eq!(child.capabilities, WorkdirSessionCapabilities::READ_ONLY);
         assert_eq!(
-            child
-                .scoped_session
-                .read(read("readme.md"))
-                .await
-                .unwrap()
-                .bytes,
+            child.read(read("readme.md")).await.unwrap().bytes,
             b"visible"
         );
         assert!(matches!(
-            child.scoped_session.write(write("new.md", "no")).await,
+            child.write(write("new.md", "no")).await,
             Err(WorkdirError::Denied(_))
         ));
         assert!(
@@ -851,15 +1105,15 @@ mod tests {
                 .capabilities
                 .supports(WorkdirSessionCapability::Command)
         );
-        assert!(child.scoped_session.subscribe_command_events().is_none());
-        assert!(child.scoped_session.command_snapshot().is_empty());
+        assert!(child.subscribe_command_events().is_none());
+        assert!(child.command_snapshot().is_empty());
         assert!(matches!(
             child
-                .scoped_session
                 .start_command(CommandRequest {
                     command: "printf denied".into(),
                     timeout_secs: 5,
                     output_limit: 1024,
+                    cwd: None,
                     spill_dir: None,
                     tool_call_id: Some("read-only-command".into()),
                 })
@@ -880,11 +1134,11 @@ mod tests {
         symlink("../secret/key", root.path().join("granted/link")).unwrap();
         let parent = session(root.path());
         let child = parent
-            .delegate(request("granted", WorkdirDelegationPermission::Read))
+            .scope(request("granted", WorkdirToolScopePermission::Read))
             .await
             .unwrap();
 
-        let result = child.scoped_session.read(read("link")).await;
+        let result = child.read(read("link")).await;
         assert!(
             result.is_err(),
             "symlink read escaped provider scope: {result:?}"
@@ -902,14 +1156,11 @@ mod tests {
         symlink("../secret", root.path().join("granted/outside")).unwrap();
         let parent = session(root.path());
         let child = parent
-            .delegate(request("granted", WorkdirDelegationPermission::Write))
+            .scope(request("granted", WorkdirToolScopePermission::Write))
             .await
             .unwrap();
 
-        let result = child
-            .scoped_session
-            .write(write("outside/new", "forbidden"))
-            .await;
+        let result = child.write(write("outside/new", "forbidden")).await;
         assert!(
             result.is_err(),
             "symlink write escaped provider scope: {result:?}"
@@ -930,9 +1181,9 @@ mod tests {
 
         assert!(matches!(
             parent
-                .delegate(request(
+                .scope(request(
                     "granted/outside",
-                    WorkdirDelegationPermission::Write
+                    WorkdirToolScopePermission::Write
                 ))
                 .await,
             Err(WorkdirError::Denied(_))
@@ -950,7 +1201,7 @@ mod tests {
         fs::create_dir_all(root.path().join("other")).unwrap();
         let parent = session(root.path());
         let child = parent
-            .delegate(request("leased", WorkdirDelegationPermission::Write))
+            .scope(request("leased", WorkdirToolScopePermission::Write))
             .await
             .unwrap();
         assert!(
@@ -958,12 +1209,8 @@ mod tests {
                 .capabilities
                 .supports(WorkdirSessionCapability::Command)
         );
-        let child_output = run_command(
-            &child.scoped_session,
-            "printf child-command",
-            "delegated-child-command",
-        )
-        .await;
+        let child_output =
+            run_command(&child, "printf child-command", "delegated-child-command").await;
         assert_eq!(child_output.content, "child-command");
         let parent_output = run_command(
             &parent,
@@ -983,19 +1230,15 @@ mod tests {
             Err(WorkdirError::Denied(_))
         ));
         parent.write(write("other/file", "parent")).await.unwrap();
-        child
-            .scoped_session
-            .write(write("file", "child"))
-            .await
-            .unwrap();
+        child.write(write("file", "child")).await.unwrap();
         child.release();
         assert!(matches!(
             child
-                .scoped_session
                 .start_command(CommandRequest {
                     command: "printf revoked".into(),
                     timeout_secs: 5,
                     output_limit: 1024,
+                    cwd: None,
                     spill_dir: None,
                     tool_call_id: Some("revoked-child-command".into()),
                 })
@@ -1007,7 +1250,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            child.scoped_session.read(read("file")).await,
+            child.read(read("file")).await,
             Err(WorkdirError::SessionClosed)
         ));
     }
@@ -1021,34 +1264,31 @@ mod tests {
         fs::write(root.path().join("docs/peer/b"), "b").unwrap();
         let root_session = session(root.path());
         let child = root_session
-            .delegate(request("docs", WorkdirDelegationPermission::Read))
+            .scope(request("docs", WorkdirToolScopePermission::Read))
             .await
             .unwrap();
         let nested = child
-            .scoped_session
-            .delegate(request("docs/sub", WorkdirDelegationPermission::Read))
+            .scope(request("docs/sub", WorkdirToolScopePermission::Read))
             .await
             .unwrap();
 
-        nested.scoped_session.read(read("a")).await.unwrap();
+        nested.read(read("a")).await.unwrap();
         assert!(
             child
-                .scoped_session
-                .delegate(request("other", WorkdirDelegationPermission::Read))
+                .scope(request("other", WorkdirToolScopePermission::Read))
                 .await
                 .is_err()
         );
         assert!(
             child
-                .scoped_session
-                .delegate(request("docs/sub", WorkdirDelegationPermission::Write))
+                .scope(request("docs/sub", WorkdirToolScopePermission::Write))
                 .await
                 .is_err()
         );
 
         child.release();
         assert!(matches!(
-            nested.scoped_session.read(read("a")).await,
+            nested.read(read("a")).await,
             Err(WorkdirError::SessionClosed)
         ));
     }
@@ -1059,22 +1299,21 @@ mod tests {
         fs::create_dir_all(root.path().join("docs/sub")).unwrap();
         let root_session = session(root.path());
         let child = root_session
-            .delegate(request("docs", WorkdirDelegationPermission::Write))
+            .scope(request("docs", WorkdirToolScopePermission::Write))
             .await
             .unwrap();
         let nested = child
-            .scoped_session
-            .delegate(request("docs/sub", WorkdirDelegationPermission::Write))
+            .scope(request("docs/sub", WorkdirToolScopePermission::Write))
             .await
             .unwrap();
 
         for (session, label) in [
-            (&root_session, "root"),
-            (&child.scoped_session, "child"),
-            (&nested.scoped_session, "nested"),
+            (root_session.tool_session(), "root"),
+            (child.tool_session(), "child"),
+            (nested.tool_session(), "nested"),
         ] {
             let output = run_command(
-                session,
+                &session,
                 format!("printf {label}"),
                 format!("{label}-command-during-nested-write"),
             )
@@ -1088,83 +1327,23 @@ mod tests {
             Err(WorkdirError::Denied(_))
         ));
         assert!(matches!(
-            child
-                .scoped_session
-                .write(write("sub/child", "blocked"))
-                .await,
+            child.write(write("sub/child", "blocked")).await,
             Err(WorkdirError::Denied(_))
         ));
-        nested
-            .scoped_session
-            .write(write("nested", "allowed"))
-            .await
-            .unwrap();
+        nested.write(write("nested", "allowed")).await.unwrap();
 
         nested.release();
         child.release();
     }
 
     #[tokio::test]
-    async fn reapplied_write_delegation_chain_forwards_command_lifecycle() {
-        let root = TempDir::new().unwrap();
-        fs::create_dir_all(root.path().join("delegated")).unwrap();
-        let applied = apply_delegation_chain(
-            session(root.path()),
-            [request("delegated", WorkdirDelegationPermission::Write)],
-        )
-        .await
-        .unwrap();
-
-        let output = run_command(
-            &applied.scoped_session,
-            "printf reapplied",
-            "reapplied-command",
-        )
-        .await;
-        assert_eq!(output.status, CommandStatus::Completed);
-        assert_eq!(output.content, "reapplied");
-    }
-
-    #[tokio::test]
-    async fn applied_chain_cannot_replace_outer_provider_attenuation() {
-        let root = TempDir::new().unwrap();
-        fs::create_dir_all(root.path().join("outer")).unwrap();
-        fs::create_dir_all(root.path().join("outside")).unwrap();
-        let result = apply_delegation_chain(
-            Arc::new(LocalWorkdirSession::materialized_bound(
-                Workdir::new("delegation-chain-test"),
-                root.path().to_path_buf(),
-                root.path().to_path_buf(),
-                SharedScope::new(
-                    Scope::from_config(&ScopeConfig {
-                        allow: vec![ScopeRule {
-                            target: root.path().to_path_buf(),
-                            permission: Permission::Write,
-                            recursive: true,
-                        }],
-                        deny: Vec::new(),
-                    })
-                    .unwrap(),
-                ),
-                WorkdirSessionCapabilities::ALL,
-            )),
-            [
-                request("outer", WorkdirDelegationPermission::Read),
-                request("outside", WorkdirDelegationPermission::Read),
-            ],
-        )
-        .await;
-        assert!(matches!(result, Err(WorkdirError::Denied(_))));
-    }
-
-    #[tokio::test]
-    async fn closing_parent_invalidates_delegated_sessions() {
+    async fn closing_parent_invalidates_scoped_tools() {
         let root = TempDir::new().unwrap();
         fs::create_dir_all(root.path().join("docs")).unwrap();
         fs::write(root.path().join("docs/a"), "a").unwrap();
         let parent = session(root.path());
         let child = parent
-            .delegate(request("docs", WorkdirDelegationPermission::Read))
+            .scope(request("docs", WorkdirToolScopePermission::Read))
             .await
             .unwrap();
 
@@ -1175,15 +1354,17 @@ mod tests {
                     command: "printf closed".into(),
                     timeout_secs: 5,
                     output_limit: 1024,
+                    cwd: None,
                     spill_dir: None,
                     tool_call_id: Some("closed-parent-command".into()),
                 })
                 .await,
             Err(WorkdirError::SessionClosed)
         ));
-        assert!(matches!(
-            child.scoped_session.read(read("a")).await,
-            Err(WorkdirError::SessionClosed)
-        ));
+        let child_result = child.read(read("a")).await;
+        assert!(
+            matches!(child_result, Err(WorkdirError::SessionClosed)),
+            "child result after parent close: {child_result:?}"
+        );
     }
 }

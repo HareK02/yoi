@@ -25,7 +25,7 @@ use session_store::{
 };
 use tokio::sync::broadcast;
 use tracing::warn;
-use workdir::WorkdirDelegation;
+use workdir::WorkdirScopeLease;
 
 use crate::internal_worker::{InternalWorkerSessionHandle, InternalWorkerVisibility};
 use crate::runtime::dir::{RuntimeDir, SpawnedWorkerRecord};
@@ -68,7 +68,7 @@ pub(crate) struct SubWorkerStopSummary {
 pub(crate) struct InternalSpawnedWorkerRecord {
     pub worker_name: String,
     pub scope_delegated: Vec<ScopeRule>,
-    pub workdir_delegation: Arc<WorkdirDelegation>,
+    pub workdir_tool_scope: Arc<WorkdirScopeLease>,
     #[cfg(test)]
     pub installed_tools: Arc<[String]>,
     pub session: InternalWorkerSessionHandle,
@@ -86,7 +86,7 @@ impl InternalSpawnedWorkerRecord {
     pub(crate) fn new(
         worker_name: String,
         scope_delegated: Vec<ScopeRule>,
-        workdir_delegation: WorkdirDelegation,
+        workdir_tool_scope: WorkdirScopeLease,
         #[cfg(test)] installed_tools: Vec<String>,
         session: InternalWorkerSessionHandle,
         change_tracker: Option<tools::Tracker>,
@@ -94,7 +94,7 @@ impl InternalSpawnedWorkerRecord {
         Self {
             worker_name,
             scope_delegated,
-            workdir_delegation: Arc::new(workdir_delegation),
+            workdir_tool_scope: Arc::new(workdir_tool_scope),
             #[cfg(test)]
             installed_tools: installed_tools.into(),
             session,
@@ -690,7 +690,7 @@ impl SpawnedWorkerRegistry {
         if !record.claim_scope_reclaim() {
             return Ok(false);
         }
-        record.workdir_delegation.release();
+        record.workdir_tool_scope.release();
         let result = if let Some(parent_scope) = &self.parent_scope {
             parent_scope
                 .update(|current| current.with_removed_deny_rules(delegated_write_rules(record)))
@@ -966,7 +966,7 @@ mod tests {
             deny: Vec::new(),
         })
         .unwrap();
-        let source = workdir::delegation_capable_session(Arc::new(
+        let source = workdir::WorkdirToolBroker::new(Arc::new(
             workdir::LocalWorkdirSession::materialized_bound(
                 workdir::Workdir::new("registry-test"),
                 root.clone(),
@@ -976,13 +976,14 @@ mod tests {
             ),
         ));
         let delegation = source
-            .delegate(workdir::WorkdirDelegationRequest {
-                rules: vec![workdir::WorkdirDelegationRule {
+            .scope(workdir::WorkdirToolScope {
+                rules: vec![workdir::WorkdirToolScopeRule {
                     target: workdir::WorkdirPath::new("").unwrap(),
-                    permission: workdir::WorkdirDelegationPermission::Read,
+                    permission: workdir::WorkdirToolScopePermission::Read,
                     recursive: true,
                 }],
                 cwd: workdir::WorkdirPath::new("").unwrap(),
+                command: false,
             })
             .await
             .unwrap();

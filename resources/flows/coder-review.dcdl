@@ -15,7 +15,7 @@
         };
 
         review = {
-            instructions = "Use the current Ticket Merge Request as review authority. Call `ShowMergeRequest` and confirm its source selector resolves to exact committed implementation HEAD, then spawn one actual direct-child SubWorker with profile builtin:reviewer, write scope for Workdir inspection and command validation, and only the Ticket id in the structured review handoff. The trusted spawn layer records `ReviewRequested` with the exact source ref and injects review capability; do not place commit/ref identity, capability material, or a prewritten verdict in model input. The child must commit `ReviewMergeRequest`; prose output and Worker observation are not approval authority. After the structured result for the exact current source ref exists, request a Flow transition.";
+            instructions = "Use the current Ticket Merge Request as review authority. Call `ShowMergeRequest` and confirm its source selector resolves to exact committed implementation HEAD, then spawn one actual direct-child SubWorker with profile builtin:reviewer, write scope plus an explicit command grant for Workdir inspection and command validation, and only the Ticket id in the structured review handoff. The trusted spawn layer records `ReviewRequested` with the exact source ref and injects review capability; do not place commit/ref identity, capability material, or a prewritten verdict in model input. The child must commit `ReviewMergeRequest`; prose output and Worker observation are not approval authority. After the structured result for the exact current source ref exists, request a Flow transition.";
             transitions = {
                 approved = {
                     target = "complete";

@@ -514,6 +514,7 @@ impl WorkerController {
             runtime_base.to_path_buf(),
             spawned_registry.clone(),
             Some(method_tx.downgrade()),
+            None,
         )
         .await?;
         if let Some(session) = fs_for_view.as_ref() {
@@ -911,6 +912,7 @@ pub(crate) async fn register_worker_tools<C, St>(
     runtime_base: PathBuf,
     spawned_registry: Arc<SpawnedWorkerRegistry>,
     parent_method_tx: Option<mpsc::WeakSender<Method>>,
+    inherited_workdir_tool_broker: Option<workdir::WorkdirToolBroker>,
 ) -> std::io::Result<Option<workdir::WorkdirSessionHandle>>
 where
     C: LlmClient + Clone + 'static,
@@ -919,21 +921,26 @@ where
     // Worker-immutable snapshots taken before the mutable worker borrow
     // below so the worker borrow doesn't conflict with reads on `worker`.
     let feature_config = worker.manifest().feature.clone();
+    let mut workdir_tool_broker = inherited_workdir_tool_broker;
     if feature_config.manage_workdir.enabled && worker.workdir_session().is_none() {
         let workspace_client = worker.workspace_client_handle();
-        worker.bind_workdir_session(Some(workdir::delegation_capable_session(
+        let broker = workdir::WorkdirToolBroker::new(
             crate::feature::builtin::manage_workdir::WorkspaceAttachedWorkdirSession::handle(
                 workspace_client,
             ),
-        )));
-    }
-    if feature_config.sub_worker.enabled
+        );
+        worker.bind_workdir_session(Some(broker.tool_session()));
+        workdir_tool_broker = Some(broker);
+    } else if workdir_tool_broker.is_none()
         && let Some(existing) = worker.workdir_session().cloned()
-        && !existing.is_delegation_capable()
     {
-        worker.bind_workdir_session(Some(workdir::delegation_capable_session(existing)));
+        let broker = workdir::WorkdirToolBroker::new(existing);
+        worker.bind_workdir_session(Some(broker.tool_session()));
+        workdir_tool_broker = Some(broker);
     }
-    let worker_workdir = worker.workdir_session().cloned();
+    let worker_workdir = workdir_tool_broker
+        .as_ref()
+        .map(workdir::WorkdirToolBroker::tool_session);
     let local_filesystem = worker.local_working_directory().cloned();
     let local_workspace_root = local_filesystem.as_ref().map(|local| local.root.clone());
     let task_feature = worker.task_feature();
@@ -1157,7 +1164,6 @@ where
     }
 
     let host_worker_observation_provider = worker.worker_observation_provider();
-    let source_workdir_session = worker.workdir_session().cloned();
     {
         let workspace_client = worker.workspace_client_handle();
         let engine = worker.engine_mut();
@@ -1199,7 +1205,7 @@ where
                 runtime_base.clone(),
                 bash_output_dir.clone(),
                 spawner_workspace_root,
-                source_workdir_session,
+                workdir_tool_broker,
                 spawned_registry.clone(),
                 spawner_manifest,
                 prompts,
