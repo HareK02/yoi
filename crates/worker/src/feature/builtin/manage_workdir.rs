@@ -5,6 +5,8 @@
 //! endpoints, credentials, materializer handles, and operation sessions stay
 //! behind [`WorkspaceClient`].
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
@@ -52,16 +54,43 @@ const LIST_DESCRIPTION: &str = "List persistent Workdirs in the current Workspac
 const CREATE_DESCRIPTION: &str = "Materialize a persistent Workdir on a selected Runtime from a Workspace repository and optional selector. This does not change this Worker's attachment; use WorkdirAttach explicitly after creation.";
 const ATTACH_DESCRIPTION: &str = "Attach this Worker to one existing Workdir. The Backend enforces one active Workdir per Worker and one active Worker per Workdir, then opens an ephemeral operation session.";
 const DETACH_DESCRIPTION: &str = "Detach this Worker from its active Workdir and release Workdir occupancy. Any ephemeral operation session is closed.";
+pub(crate) type BeforeWorkdirRelease =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> + Send + Sync>;
+
 const DELETE_DESCRIPTION: &str = "Request removal of one persistent Workdir by id through durable Backend Workspace authority. The input includes only the Workdir id and a bounded reason. The result reports removed, retained, or attention_required without exposing operation-table or provider internals.";
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ManageWorkdirFeature {
     client: Arc<dyn WorkspaceClient>,
+    before_workdir_release: Option<BeforeWorkdirRelease>,
+}
+
+impl std::fmt::Debug for ManageWorkdirFeature {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManageWorkdirFeature")
+            .field("client_kind", &self.client.kind())
+            .field("release_guard", &self.before_workdir_release.is_some())
+            .finish()
+    }
 }
 
 impl ManageWorkdirFeature {
     pub fn new(client: Arc<dyn WorkspaceClient>) -> Self {
-        Self { client }
+        Self {
+            client,
+            before_workdir_release: None,
+        }
+    }
+
+    pub(crate) fn with_before_workdir_release(
+        client: Arc<dyn WorkspaceClient>,
+        before_workdir_release: BeforeWorkdirRelease,
+    ) -> Self {
+        Self {
+            client,
+            before_workdir_release: Some(before_workdir_release),
+        }
     }
 }
 
@@ -81,7 +110,8 @@ impl FeatureModule for ManageWorkdirFeature {
     }
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
-        let backend = WorkspaceHttpWorkdirBackend::new(self.client.clone());
+        let backend = WorkspaceHttpWorkdirBackend::new(self.client.clone())
+            .with_before_workdir_release(self.before_workdir_release.clone());
         for (name, definition) in [
             (
                 LIST_TOOL,
@@ -142,9 +172,20 @@ impl FeatureModule for ManageWorkdirFeature {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct WorkspaceHttpWorkdirBackend {
     client: Arc<dyn WorkspaceClient>,
+    before_workdir_release: Option<BeforeWorkdirRelease>,
+}
+
+impl std::fmt::Debug for WorkspaceHttpWorkdirBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkspaceHttpWorkdirBackend")
+            .field("client_kind", &self.client.kind())
+            .field("release_guard", &self.before_workdir_release.is_some())
+            .finish()
+    }
 }
 
 /// Worker-local Workdir handle whose operation authority remains in the Workspace Backend.
@@ -327,7 +368,18 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
 
 impl WorkspaceHttpWorkdirBackend {
     fn new(client: Arc<dyn WorkspaceClient>) -> Self {
-        Self { client }
+        Self {
+            client,
+            before_workdir_release: None,
+        }
+    }
+
+    fn with_before_workdir_release(
+        mut self,
+        before_workdir_release: Option<BeforeWorkdirRelease>,
+    ) -> Self {
+        self.before_workdir_release = before_workdir_release;
+        self
     }
 
     fn workspace_id(&self) -> Result<&str, ToolError> {
@@ -510,6 +562,13 @@ impl Tool for WorkspaceHttpWorkdirTool {
                 .attach(parse_input::<WorkdirAttachInput>(input_json)?),
             WorkdirOperation::Detach => {
                 let _input = parse_input::<WorkdirDetachInput>(input_json)?;
+                if let Some(before_release) = &self.backend.before_workdir_release {
+                    before_release().await.map_err(|error| {
+                        ToolError::ExecutionFailed(format!(
+                            "stop Internal SubWorkers before Workdir detach: {error}"
+                        ))
+                    })?;
+                }
                 self.backend.detach()
             }
             WorkdirOperation::Delete => self
@@ -705,6 +764,7 @@ struct WorkdirDeleteInput {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::feature::{FeatureModule, FeatureRegistryBuilder};
@@ -1258,5 +1318,59 @@ mod tests {
         assert!(matches!(error, ToolError::InvalidArgument(_)));
         assert!(client.requests().is_empty());
         assert!(parse_input::<WorkdirListInput>(r#"{"path":"/tmp"}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn detach_stops_internal_subworkers_before_backend_release() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
+            "workspace_id": "workspace/test",
+            "workdir_id": "wd-attached",
+            "attached": false
+        }))]));
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let cleanup_calls_for_guard = cleanup_calls.clone();
+        let before_release: BeforeWorkdirRelease = Arc::new(move || {
+            let cleanup_calls = cleanup_calls_for_guard.clone();
+            Box::pin(async move {
+                cleanup_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        let tool = WorkspaceHttpWorkdirTool {
+            backend: WorkspaceHttpWorkdirBackend::new(client.clone())
+                .with_before_workdir_release(Some(before_release)),
+            operation: WorkdirOperation::Detach,
+        };
+
+        tool.execute("{}", ToolExecutionContext::default())
+            .await
+            .unwrap();
+
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(client.requests().len(), 1);
+        assert_eq!(
+            client.requests()[0].path,
+            "/api/w/workspace%2Ftest/workers/self/workdir-attachment"
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_does_not_release_backend_when_child_cleanup_fails() {
+        let client = Arc::new(RecordingWorkspaceClient::new(Vec::new()));
+        let before_release: BeforeWorkdirRelease =
+            Arc::new(|| Box::pin(async { Err(std::io::Error::other("child cleanup failed")) }));
+        let tool = WorkspaceHttpWorkdirTool {
+            backend: WorkspaceHttpWorkdirBackend::new(client.clone())
+                .with_before_workdir_release(Some(before_release)),
+            operation: WorkdirOperation::Detach,
+        };
+
+        let error = tool
+            .execute("{}", ToolExecutionContext::default())
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("stop Internal SubWorkers"));
+        assert!(client.requests().is_empty());
     }
 }

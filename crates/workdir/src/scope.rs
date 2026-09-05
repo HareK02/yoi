@@ -70,6 +70,9 @@ impl WorkdirToolBroker {
             child_write_leases: Mutex::new(HashMap::new()),
             next_lease_id: AtomicU64::new(1),
             owned_commands: Arc::new(Mutex::new(HashSet::new())),
+            pending_command_events: Arc::new(Mutex::new(HashMap::new())),
+            starting_tool_calls: Arc::new(Mutex::new(HashSet::new())),
+            forwarded_terminals: Arc::new(Mutex::new(HashSet::new())),
             command_events,
             closes_source: true,
         });
@@ -107,6 +110,7 @@ pub struct WorkdirScopeLease {
     pub capabilities: WorkdirSessionCapabilities,
     validity: Arc<SessionValidity>,
     cleanup_pending: Arc<AtomicBool>,
+    close_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for WorkdirScopeLease {
@@ -136,6 +140,10 @@ impl WorkdirScopeLease {
     }
 
     pub async fn close(&self) -> Result<(), WorkdirError> {
+        let _close_guard = self.close_lock.lock().await;
+        if !self.cleanup_pending.load(Ordering::Acquire) {
+            return Ok(());
+        }
         self.validity.active.store(false, Ordering::Release);
         let command_ids = self
             .broker
@@ -167,9 +175,28 @@ impl WorkdirScopeLease {
                 })
                 .await;
             match (cancel, terminal) {
-                (_, Ok(_))
-                | (Ok(()), Err(WorkdirError::UnknownCommand(_)))
+                (_, Ok(output)) => {
+                    self.broker.authority.publish_terminal_if_missing(
+                        &command_id,
+                        output.status,
+                        output.exit_code,
+                        output.next_cursor.unwrap_or(output.content.len()) as u64,
+                    );
+                    self.broker
+                        .authority
+                        .owned_commands
+                        .lock()
+                        .expect("scoped command set mutex poisoned")
+                        .remove(&command_id);
+                }
+                (Ok(()), Err(WorkdirError::UnknownCommand(_)))
                 | (Err(WorkdirError::UnknownCommand(_)), Err(WorkdirError::UnknownCommand(_))) => {
+                    self.broker.authority.publish_terminal_if_missing(
+                        &command_id,
+                        CommandStatus::Cancelled,
+                        None,
+                        0,
+                    );
                     self.broker
                         .authority
                         .owned_commands
@@ -271,6 +298,9 @@ struct ScopedWorkdirSession {
     child_write_leases: Mutex<HashMap<u64, ActiveWriteLease>>,
     next_lease_id: AtomicU64,
     owned_commands: Arc<Mutex<HashSet<String>>>,
+    pending_command_events: Arc<Mutex<HashMap<String, Vec<CommandEvent>>>>,
+    starting_tool_calls: Arc<Mutex<HashSet<String>>>,
+    forwarded_terminals: Arc<Mutex<HashSet<String>>>,
     command_events: broadcast::Sender<CommandEvent>,
     closes_source: bool,
 }
@@ -380,12 +410,42 @@ impl ScopedWorkdirSession {
         }
     }
 
+    fn publish_terminal_if_missing(
+        &self,
+        command_id: &str,
+        status: CommandStatus,
+        exit_code: Option<i32>,
+        offset: u64,
+    ) {
+        publish_owned_command_event(
+            &self.command_events,
+            &self.forwarded_terminals,
+            CommandEvent::Terminal {
+                command_id: command_id.to_string(),
+                status,
+                exit_code,
+                stdout_end_offset: offset,
+                stderr_end_offset: 0,
+                observed_at_ms: unix_timestamp_ms(),
+            },
+        );
+    }
+
     fn ensure_parent_write_available(&self, path: &FsPath) -> Result<(), WorkdirError> {
         let mut leases = self
             .child_write_leases
             .lock()
             .expect("Workdir tool scope lease mutex poisoned");
-        leases.retain(|_, lease| lease.validity.upgrade().is_some_and(|v| v.is_active()));
+        leases.retain(|_, lease| {
+            lease
+                .validity
+                .upgrade()
+                .is_some_and(|validity| validity.is_active())
+                || lease
+                    .cleanup_pending
+                    .upgrade()
+                    .is_some_and(|pending| pending.load(Ordering::Acquire))
+        });
         if leases.values().any(|lease| {
             lease.rules.iter().any(|rule| {
                 rule.permission == WorkdirToolScopePermission::Write
@@ -583,10 +643,16 @@ impl ScopedWorkdirSession {
             );
         }
         let owned_commands = Arc::new(Mutex::new(HashSet::new()));
+        let pending_command_events = Arc::new(Mutex::new(HashMap::new()));
+        let starting_tool_calls = Arc::new(Mutex::new(HashSet::new()));
+        let forwarded_terminals = Arc::new(Mutex::new(HashSet::new()));
         let (command_events, _) = broadcast::channel(64);
         let event_forwarder = forward_owned_command_events(
             self.source.subscribe_command_events(),
             owned_commands.clone(),
+            pending_command_events.clone(),
+            starting_tool_calls.clone(),
+            forwarded_terminals.clone(),
             command_events.clone(),
         )
         .map(|handle| Arc::new(Mutex::new(Some(handle))));
@@ -599,6 +665,9 @@ impl ScopedWorkdirSession {
             child_write_leases: Mutex::new(HashMap::new()),
             next_lease_id: AtomicU64::new(1),
             owned_commands,
+            pending_command_events,
+            starting_tool_calls,
+            forwarded_terminals,
             command_events,
             closes_source: false,
         });
@@ -612,6 +681,7 @@ impl ScopedWorkdirSession {
             capabilities,
             validity,
             cleanup_pending,
+            close_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 }
@@ -687,16 +757,59 @@ impl WorkdirSession for ScopedWorkdirSession {
                 None => self.cwd.clone(),
             });
         }
-        let handle = self.source.start_command(request).await?;
-        self.owned_commands
+        if let Some(tool_call_id) = &tool_call_id {
+            self.starting_tool_calls
+                .lock()
+                .expect("starting tool call mutex poisoned")
+                .insert(tool_call_id.clone());
+        }
+        let handle = match self.source.start_command(request).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Some(tool_call_id) = &tool_call_id {
+                    self.starting_tool_calls
+                        .lock()
+                        .expect("starting tool call mutex poisoned")
+                        .remove(tool_call_id);
+                }
+                return Err(error);
+            }
+        };
+        let mut owned = self
+            .owned_commands
             .lock()
-            .expect("scoped command set mutex poisoned")
-            .insert(handle.0.clone());
-        let _ = self.command_events.send(CommandEvent::Started {
-            command_id: handle.0.clone(),
-            tool_call_id,
-            observed_at_ms: unix_timestamp_ms(),
-        });
+            .expect("scoped command set mutex poisoned");
+        owned.insert(handle.0.clone());
+        if let Some(tool_call_id) = &tool_call_id {
+            self.starting_tool_calls
+                .lock()
+                .expect("starting tool call mutex poisoned")
+                .remove(tool_call_id);
+        }
+        let pending = self
+            .pending_command_events
+            .lock()
+            .expect("pending scoped command event mutex poisoned")
+            .remove(&handle.0)
+            .unwrap_or_default();
+        drop(owned);
+        if !pending
+            .iter()
+            .any(|event| matches!(event, CommandEvent::Started { .. }))
+        {
+            publish_owned_command_event(
+                &self.command_events,
+                &self.forwarded_terminals,
+                CommandEvent::Started {
+                    command_id: handle.0.clone(),
+                    tool_call_id,
+                    observed_at_ms: unix_timestamp_ms(),
+                },
+            );
+        }
+        for event in pending {
+            publish_owned_command_event(&self.command_events, &self.forwarded_terminals, event);
+        }
         Ok(handle)
     }
 
@@ -713,6 +826,12 @@ impl WorkdirSession for ScopedWorkdirSession {
         let command_id = request.handle.0.clone();
         let output = self.source.command_output(request).await?;
         if !matches!(output.status, CommandStatus::Running) {
+            self.publish_terminal_if_missing(
+                &command_id,
+                output.status,
+                output.exit_code,
+                output.next_cursor.unwrap_or(output.content.len()) as u64,
+            );
             self.owned_commands
                 .lock()
                 .expect("scoped command set mutex poisoned")
@@ -848,6 +967,9 @@ impl WorkdirSession for ReadOnlyWorkdirSession {
 fn forward_owned_command_events(
     receiver: Option<broadcast::Receiver<CommandEvent>>,
     owned_commands: Arc<Mutex<HashSet<String>>>,
+    pending_command_events: Arc<Mutex<HashMap<String, Vec<CommandEvent>>>>,
+    starting_tool_calls: Arc<Mutex<HashSet<String>>>,
+    forwarded_terminals: Arc<Mutex<HashSet<String>>>,
     sender: broadcast::Sender<CommandEvent>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let mut receiver = receiver?;
@@ -858,20 +980,71 @@ fn forward_owned_command_events(
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
             };
-            let command_id = match &event {
-                CommandEvent::Started { .. } => continue,
-                CommandEvent::Output { command_id, .. }
-                | CommandEvent::Terminal { command_id, .. } => command_id.clone(),
-            };
-            let owned = owned_commands
+            let command_id = command_event_id(&event).to_string();
+            let mut owned = owned_commands
                 .lock()
-                .expect("scoped command set mutex poisoned")
-                .contains(&command_id);
-            if owned {
-                let _ = sender.send(event);
+                .expect("scoped command set mutex poisoned");
+            if !owned.contains(&command_id) {
+                let claimed = matches!(
+                    &event,
+                    CommandEvent::Started {
+                        tool_call_id: Some(tool_call_id),
+                        ..
+                    } if starting_tool_calls
+                        .lock()
+                        .expect("starting tool call mutex poisoned")
+                        .contains(tool_call_id)
+                );
+                if !claimed {
+                    continue;
+                }
+                owned.insert(command_id.clone());
+                pending_command_events
+                    .lock()
+                    .expect("pending scoped command event mutex poisoned")
+                    .entry(command_id)
+                    .or_default()
+                    .push(event);
+                continue;
             }
+            let mut pending = pending_command_events
+                .lock()
+                .expect("pending scoped command event mutex poisoned");
+            if let Some(events) = pending.get_mut(&command_id) {
+                if events.len() < 64 {
+                    events.push(event);
+                }
+                continue;
+            }
+            drop(pending);
+            drop(owned);
+            publish_owned_command_event(&sender, &forwarded_terminals, event);
         }
     }))
+}
+
+fn command_event_id(event: &CommandEvent) -> &str {
+    match event {
+        CommandEvent::Started { command_id, .. }
+        | CommandEvent::Output { command_id, .. }
+        | CommandEvent::Terminal { command_id, .. } => command_id,
+    }
+}
+
+fn publish_owned_command_event(
+    sender: &broadcast::Sender<CommandEvent>,
+    forwarded_terminals: &Mutex<HashSet<String>>,
+    event: CommandEvent,
+) {
+    if let CommandEvent::Terminal { command_id, .. } = &event
+        && !forwarded_terminals
+            .lock()
+            .expect("forwarded terminal command mutex poisoned")
+            .insert(command_id.clone())
+    {
+        return;
+    }
+    let _ = sender.send(event);
 }
 
 fn unix_timestamp_ms() -> u64 {
@@ -1380,6 +1553,43 @@ mod tests {
             .unwrap();
         other.close().await.unwrap();
         first.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fast_command_keeps_started_output_terminal_event_order() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("work")).unwrap();
+        let parent = session(root.path());
+        let child = parent
+            .scope(request("work", WorkdirToolScopePermission::Write))
+            .await
+            .unwrap();
+        let mut events = child.subscribe_command_events().unwrap();
+
+        let output = run_command(&child.tool_session(), "printf fast-output", "fast-command").await;
+        assert_eq!(output.content, "fast-output");
+
+        let mut kinds = Vec::new();
+        let mut streamed = String::new();
+        while kinds.last().is_none_or(|kind| *kind != "terminal") {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+                .await
+                .expect("fast command event timeout")
+                .expect("fast command event channel");
+            match event {
+                CommandEvent::Started { .. } => kinds.push("started"),
+                CommandEvent::Output { content, .. } => {
+                    kinds.push("output");
+                    streamed.push_str(&content);
+                }
+                CommandEvent::Terminal { .. } => kinds.push("terminal"),
+            }
+        }
+        assert_eq!(kinds.first(), Some(&"started"));
+        assert_eq!(kinds.last(), Some(&"terminal"));
+        assert!(kinds.contains(&"output"));
+        assert!(streamed.contains("fast-output"));
+        child.close().await.unwrap();
     }
 
     #[tokio::test]

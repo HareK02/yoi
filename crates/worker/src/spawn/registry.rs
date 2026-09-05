@@ -679,13 +679,6 @@ impl SpawnedWorkerRegistry {
             .unwrap_or_default()
     }
 
-    pub(crate) fn reclaim_internal_scope(&self, worker_name: &str) -> io::Result<bool> {
-        let record = self.get_internal(worker_name).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "internal SubWorker not found")
-        })?;
-        self.reclaim_record_scope(&record)
-    }
-
     fn reclaim_record_scope(&self, record: &InternalSpawnedWorkerRecord) -> io::Result<bool> {
         if !record.claim_scope_reclaim() {
             return Ok(false);
@@ -703,6 +696,35 @@ impl SpawnedWorkerRegistry {
             record.restore_scope_reclaim();
         }
         result
+    }
+
+    pub(crate) async fn close_internal_scope(&self, name: &str) -> io::Result<bool> {
+        let Some(record) = self.get_internal(name) else {
+            return Ok(false);
+        };
+        record
+            .workdir_tool_scope
+            .close()
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        self.reclaim_record_scope(&record)
+    }
+
+    pub(crate) async fn shutdown_internal(&self) -> io::Result<()> {
+        let names = self
+            .internal_records
+            .lock()
+            .expect("internal Worker registry lock poisoned")
+            .iter()
+            .map(|record| record.worker_name.clone())
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for name in names {
+            if let Err(error) = self.remove_internal(&name).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Stop one direct Internal SubWorker and discard its registry/scope state.
@@ -1234,6 +1256,24 @@ mod tests {
                 assert!(revision > terminal_revision);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn parent_shutdown_stops_all_internal_workers_before_returning() {
+        let registry = registry();
+        for name in ["first", "second"] {
+            let (record, _events) = record(name, InternalWorkerVisibility::ParentClient).await;
+            record
+                .session
+                .force_status(InternalWorkerSessionStatus::Running);
+            install_record(&registry, record);
+        }
+
+        registry.shutdown_internal().await.unwrap();
+
+        assert!(registry.list_internal().is_empty());
+        assert!(registry.get_internal("first").is_none());
+        assert!(registry.get_internal("second").is_none());
     }
 
     #[tokio::test]

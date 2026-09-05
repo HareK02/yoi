@@ -1101,8 +1101,15 @@ where
                 "manage Workdir tools require Backend Workspace API authority",
             ));
         }
+        let child_registry = spawned_registry.clone();
         feature_registry.add_module(
-            crate::feature::builtin::manage_workdir::manage_workdir_feature(workspace_client),
+            crate::feature::builtin::manage_workdir::ManageWorkdirFeature::with_before_workdir_release(
+                workspace_client,
+                Arc::new(move || {
+                    let child_registry = child_registry.clone();
+                    Box::pin(async move { child_registry.shutdown_internal().await })
+                }),
+            ),
         );
     }
     if feature_config.workspace_worker_discovery.enabled {
@@ -1726,7 +1733,16 @@ async fn controller_loop<C, St>(
     // Memory/Workdir teardown so they cannot observe a partially closed Worker.
     worker.stop_feature_runtime("controller shutdown").await;
 
-    if let Some(session) = worker.workdir_session()
+    let child_cleanup_succeeded = match spawned_registry.shutdown_internal().await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "Internal SubWorker cleanup failed before Workdir shutdown");
+            false
+        }
+    };
+
+    if child_cleanup_succeeded
+        && let Some(session) = worker.workdir_session()
         && let Err(error) = session.close().await
     {
         tracing::warn!(%error, "Workdir session close failed");
@@ -2603,5 +2619,22 @@ mod tests {
             }
             other => panic!("expected compact rejection error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn controller_shutdown_orders_child_cleanup_before_workdir_close() {
+        let source = include_str!("controller.rs");
+        let shutdown_start = source
+            .rfind("worker.stop_feature_runtime(\"controller shutdown\")")
+            .expect("controller shutdown block");
+        let shutdown = &source[shutdown_start..];
+        let children = shutdown
+            .find("spawned_registry.shutdown_internal().await")
+            .expect("Internal SubWorker cleanup");
+        let workdir = shutdown
+            .find("session.close().await")
+            .expect("parent Workdir close");
+        assert!(children < workdir);
+        assert!(shutdown.contains("if child_cleanup_succeeded"));
     }
 }

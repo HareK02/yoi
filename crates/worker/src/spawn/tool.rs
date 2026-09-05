@@ -532,13 +532,16 @@ impl Tool for SubWorkerSpawnTool {
                     InternalWorkerSessionStatus::Failed | InternalWorkerSessionStatus::Stopped
                 ) {
                     if let Some(registry) = registry.upgrade() {
-                        if let Err(error) = registry.reclaim_internal_scope(&child_name) {
-                            tracing::warn!(
-                                child_name,
-                                %error,
-                                "failed to reclaim delegated scope after Internal SubWorker failure"
-                            );
-                        }
+                        let child_name = child_name.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = registry.close_internal_scope(&child_name).await {
+                                tracing::warn!(
+                                    child_name,
+                                    %error,
+                                    "failed to close parent-owned Workdir tools after Internal SubWorker failure"
+                                );
+                            }
+                        });
                     }
                 }
                 let message = format!(
