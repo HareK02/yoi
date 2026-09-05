@@ -1068,21 +1068,29 @@ Deno.test("Web Console uses Notify while running and exposes durable pending con
     ),
   );
 
-  for (const token of [
-    'method: "submit"',
-    'method: "notify"',
-    "notification_request_id: crypto.randomUUID()",
-    "submission_request_id: crypto.randomUUID()",
-    'payload.event === "pending_submissions_changed"',
-    'method: "cancel_pending_submission"',
-    'method: "clear_pending_submissions"',
-    'method: "continue_pending"',
-    "handleQueueSubmit",
-    "handleNotifySubmit",
-    ">Queue Submit</button>",
-    ">Notify</button>",
-  ]) {
-    assert(consolePage.includes(token), `missing durable pending control token: ${token}`);
+  for (
+    const token of [
+      'method: "submit"',
+      'method: "notify"',
+      "notification_request_id: crypto.randomUUID()",
+      "submission_request_id: crypto.randomUUID()",
+      'payload.event === "pending_submissions_changed"',
+      'method: "cancel_pending_submission"',
+      'method: "clear_pending_submissions"',
+      'method: "continue_pending"',
+      "handleQueueSubmit",
+      "handleNotifySubmit",
+      'submitDraft(composerInputElement?.snapshot() ?? draft, "queue")',
+      "disabled={!canQueueDraft}",
+      "disabled={!canNotifyDraft}",
+      ">Queue Submit</button>",
+      ">Notify</button>",
+    ]
+  ) {
+    assert(
+      consolePage.includes(token),
+      `missing durable pending control token: ${token}`,
+    );
   }
 
   const userCase = consolePage.slice(

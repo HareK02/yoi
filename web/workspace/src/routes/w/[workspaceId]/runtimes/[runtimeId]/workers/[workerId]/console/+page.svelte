@@ -6,6 +6,11 @@
     import ComposerInput from "$lib/workspace/console/ComposerInput.svelte";
     import type { ComposerDraftSnapshot } from "$lib/workspace/console/composer-draft";
     import {
+        canDeliverComposerDraft,
+        sendComposerDelivery,
+        type ComposerDelivery,
+    } from "$lib/workspace/console/composer-delivery";
+    import {
         buildComposerSegmentsRequest,
         type WorkerConsoleInputRequest,
     } from "$lib/workspace/console/composer-command";
@@ -247,13 +252,42 @@
     const workerState = $derived(liveWorkerState ?? worker?.state ?? "loading");
     const workerRunning = $derived(workerState === "running");
     const workerPaused = $derived(workerState === "paused");
-    const inputReady = $derived(workerState === "idle");
     const composerEditable = $derived(protocolState === "open" && !sending);
-    const canSubmitDraft = $derived(inputReady && composerEditable);
-    const canSend = $derived(canSubmitDraft && draft.content.trim().length > 0);
+    const draftHasText = $derived(draft.content.trim().length > 0);
+    const draftHasAttachments = $derived(attachments.length > 0);
+    const canSubmitDraft = $derived(
+        canDeliverComposerDraft({
+            delivery: "submit",
+            workerState,
+            protocolOpen: protocolState === "open",
+            sending,
+            hasText: draftHasText,
+            hasAttachments: draftHasAttachments,
+        }),
+    );
+    const canQueueDraft = $derived(
+        canDeliverComposerDraft({
+            delivery: "queue",
+            workerState,
+            protocolOpen: protocolState === "open",
+            sending,
+            hasText: draftHasText,
+            hasAttachments: draftHasAttachments,
+        }),
+    );
+    const canNotifyDraft = $derived(
+        canDeliverComposerDraft({
+            delivery: "notify",
+            workerState,
+            protocolOpen: protocolState === "open",
+            sending,
+            hasText: draftHasText,
+            hasAttachments: draftHasAttachments,
+        }),
+    );
     const canStopFromComposer = $derived(workerRunning && composerEditable);
     const composerSubmitDisabled = $derived(
-        workerRunning ? !canStopFromComposer : !canSend,
+        workerRunning ? !canStopFromComposer : !canSubmitDraft,
     );
 
     async function getJson<T>(path: string): Promise<T> {
@@ -664,7 +698,7 @@
     }
 
     function handleQueueSubmit() {
-        void submitDraft(composerInputElement?.snapshot() ?? draft);
+        void submitDraft(composerInputElement?.snapshot() ?? draft, "queue");
     }
 
     function handleNotifySubmit() {
@@ -772,7 +806,7 @@
 
     async function submitDraft(
         value: ComposerDraftSnapshot,
-        delivery: "submit" | "notify" = "submit",
+        delivery: ComposerDelivery = "submit",
     ) {
         if (delivery === "notify" && attachments.length > 0) {
             composerNotice = null;
@@ -808,7 +842,15 @@
             composerInputElement?.clear();
             return;
         }
-        if (sending || !inputReady) {
+        const deliveryState = {
+            delivery,
+            workerState,
+            protocolOpen: protocolState === "open",
+            sending,
+            hasText: value.content.trim().length > 0,
+            hasAttachments: attachments.length > 0,
+        };
+        if (!canDeliverComposerDraft(deliveryState)) {
             return;
         }
 
@@ -825,7 +867,9 @@
         sendError = null;
         try {
             const method = composerRequestToProtocolMethod(request);
-            sendProtocolMethod(method);
+            if (!sendComposerDelivery(deliveryState, method, sendProtocolMethod)) {
+                return;
+            }
             composerInputElement?.recordHistory(value);
             composerInputElement?.clear();
             attachments = [];
@@ -1963,12 +2007,12 @@
             {#if workerRunning}
                 <button
                     type="button"
-                    disabled={sending || !inputReady}
+                    disabled={!canQueueDraft}
                     onclick={handleQueueSubmit}
                 >Queue Submit</button>
                 <button
                     type="button"
-                    disabled={sending || !inputReady}
+                    disabled={!canNotifyDraft}
                     onclick={handleNotifySubmit}
                 >Notify</button>
             {/if}
