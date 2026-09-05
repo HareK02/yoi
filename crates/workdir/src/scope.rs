@@ -10,9 +10,11 @@ use fs_operation::{
 };
 use tokio::sync::broadcast;
 
+const MAX_SCOPED_COMMANDS: usize = 16;
+
 use crate::{
     CommandEvent, CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest,
-    CommandSnapshot, CommandStatus, Workdir, WorkdirError, WorkdirSession,
+    CommandSnapshot, CommandStatus, CommandStream, Workdir, WorkdirError, WorkdirSession,
     WorkdirSessionCapabilities, WorkdirSessionCapability, WorkdirSessionHandle,
 };
 
@@ -69,12 +71,15 @@ impl WorkdirToolBroker {
             validity: SessionValidity::root(),
             child_write_leases: Mutex::new(HashMap::new()),
             next_lease_id: AtomicU64::new(1),
+            close_lock: Arc::new(tokio::sync::Mutex::new(())),
             owned_commands: Arc::new(Mutex::new(HashSet::new())),
             pending_command_events: Arc::new(Mutex::new(HashMap::new())),
             starting_tool_calls: Arc::new(Mutex::new(HashSet::new())),
             forwarded_terminals: Arc::new(Mutex::new(HashSet::new())),
             command_events,
             closes_source: true,
+            #[cfg(test)]
+            command_start_gate: Mutex::new(None),
         });
         Self {
             session: authority.clone(),
@@ -181,6 +186,7 @@ impl WorkdirScopeLease {
                         output.status,
                         output.exit_code,
                         output.next_cursor.unwrap_or(output.content.len()) as u64,
+                        &output.content,
                     );
                     self.broker
                         .authority
@@ -196,6 +202,7 @@ impl WorkdirScopeLease {
                         CommandStatus::Cancelled,
                         None,
                         0,
+                        "",
                     );
                     self.broker
                         .authority
@@ -289,6 +296,12 @@ struct ActiveWriteLease {
     rules: Vec<WorkdirToolScopeRule>,
 }
 
+#[cfg(test)]
+struct TestCommandStartGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
 struct ScopedWorkdirSession {
     source: WorkdirSessionHandle,
     cwd: FsPath,
@@ -297,12 +310,15 @@ struct ScopedWorkdirSession {
     validity: Arc<SessionValidity>,
     child_write_leases: Mutex<HashMap<u64, ActiveWriteLease>>,
     next_lease_id: AtomicU64,
+    close_lock: Arc<tokio::sync::Mutex<()>>,
     owned_commands: Arc<Mutex<HashSet<String>>>,
     pending_command_events: Arc<Mutex<HashMap<String, Vec<CommandEvent>>>>,
     starting_tool_calls: Arc<Mutex<HashSet<String>>>,
     forwarded_terminals: Arc<Mutex<HashSet<String>>>,
     command_events: broadcast::Sender<CommandEvent>,
     closes_source: bool,
+    #[cfg(test)]
+    command_start_gate: Mutex<Option<Arc<TestCommandStartGate>>>,
 }
 
 impl std::fmt::Debug for ScopedWorkdirSession {
@@ -416,19 +432,33 @@ impl ScopedWorkdirSession {
         status: CommandStatus,
         exit_code: Option<i32>,
         offset: u64,
+        fallback_output: &str,
     ) {
-        publish_owned_command_event(
-            &self.command_events,
-            &self.forwarded_terminals,
-            CommandEvent::Terminal {
+        let mut terminals = self
+            .forwarded_terminals
+            .lock()
+            .expect("forwarded terminal command mutex poisoned");
+        if !terminals.insert(command_id.to_string()) {
+            return;
+        }
+        if !fallback_output.is_empty() {
+            let _ = self.command_events.send(CommandEvent::Output {
                 command_id: command_id.to_string(),
-                status,
-                exit_code,
-                stdout_end_offset: offset,
-                stderr_end_offset: 0,
+                stream: CommandStream::Stdout,
+                start_offset: 0,
+                end_offset: fallback_output.len() as u64,
+                content: fallback_output.to_string(),
                 observed_at_ms: unix_timestamp_ms(),
-            },
-        );
+            });
+        }
+        let _ = self.command_events.send(CommandEvent::Terminal {
+            command_id: command_id.to_string(),
+            status,
+            exit_code,
+            stdout_end_offset: offset,
+            stderr_end_offset: 0,
+            observed_at_ms: unix_timestamp_ms(),
+        });
     }
 
     fn ensure_parent_write_available(&self, path: &FsPath) -> Result<(), WorkdirError> {
@@ -656,6 +686,7 @@ impl ScopedWorkdirSession {
             command_events.clone(),
         )
         .map(|handle| Arc::new(Mutex::new(Some(handle))));
+        let close_lock = Arc::new(tokio::sync::Mutex::new(()));
         let child = Arc::new(ScopedWorkdirSession {
             source: self.source.clone(),
             cwd: request.cwd,
@@ -664,12 +695,15 @@ impl ScopedWorkdirSession {
             validity: validity.clone(),
             child_write_leases: Mutex::new(HashMap::new()),
             next_lease_id: AtomicU64::new(1),
+            close_lock: close_lock.clone(),
             owned_commands,
             pending_command_events,
             starting_tool_calls,
             forwarded_terminals,
             command_events,
             closes_source: false,
+            #[cfg(test)]
+            command_start_gate: Mutex::new(None),
         });
         let broker = WorkdirToolBroker {
             session: child.clone(),
@@ -681,7 +715,7 @@ impl ScopedWorkdirSession {
             capabilities,
             validity,
             cleanup_pending,
-            close_lock: Arc::new(tokio::sync::Mutex::new(())),
+            close_lock,
         })
     }
 }
@@ -749,7 +783,36 @@ impl WorkdirSession for ScopedWorkdirSession {
         &self,
         mut request: CommandRequest,
     ) -> Result<CommandHandle, WorkdirError> {
+        let _admission_guard = self.close_lock.lock().await;
+        // Command is an explicit capability, not a typed path mutation. We
+        // intentionally keep an ancestor's Command capability available while
+        // a child holds a write scope; only typed Write/Edit operations use the
+        // best-effort overlapping-path guard below.
         self.ensure_command()?;
+        #[cfg(test)]
+        {
+            let gate = self
+                .command_start_gate
+                .lock()
+                .expect("command start gate mutex poisoned")
+                .clone();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+        }
+        if self.scope.is_some()
+            && self
+                .owned_commands
+                .lock()
+                .expect("scoped command set mutex poisoned")
+                .len()
+                >= MAX_SCOPED_COMMANDS
+        {
+            return Err(WorkdirError::Unavailable(format!(
+                "scoped command limit of {MAX_SCOPED_COMMANDS} is reached"
+            )));
+        }
         let tool_call_id = request.tool_call_id.clone();
         if self.scope.is_some() {
             request.cwd = Some(match request.cwd.as_ref() {
@@ -831,6 +894,7 @@ impl WorkdirSession for ScopedWorkdirSession {
                 output.status,
                 output.exit_code,
                 output.next_cursor.unwrap_or(output.content.len()) as u64,
+                &output.content,
             );
             self.owned_commands
                 .lock()
@@ -1036,14 +1100,20 @@ fn publish_owned_command_event(
     forwarded_terminals: &Mutex<HashSet<String>>,
     event: CommandEvent,
 ) {
-    if let CommandEvent::Terminal { command_id, .. } = &event
-        && !forwarded_terminals
-            .lock()
-            .expect("forwarded terminal command mutex poisoned")
-            .insert(command_id.clone())
-    {
-        return;
+    let command_id = command_event_id(&event);
+    let mut terminals = forwarded_terminals
+        .lock()
+        .expect("forwarded terminal command mutex poisoned");
+    match &event {
+        CommandEvent::Terminal { .. } if !terminals.insert(command_id.to_string()) => return,
+        CommandEvent::Started { .. } | CommandEvent::Output { .. }
+            if terminals.contains(command_id) =>
+        {
+            return;
+        }
+        _ => {}
     }
+    drop(terminals);
     let _ = sender.send(event);
 }
 
@@ -1590,6 +1660,99 @@ mod tests {
         assert!(kinds.contains(&"output"));
         assert!(streamed.contains("fast-output"));
         child.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scoped_command_ceiling_rejects_the_seventeenth_live_command() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("work")).unwrap();
+        let parent = session(root.path());
+        let child = parent
+            .scope(request("work", WorkdirToolScopePermission::Write))
+            .await
+            .unwrap();
+        for index in 0..MAX_SCOPED_COMMANDS {
+            child
+                .start_command(CommandRequest {
+                    command: "sleep 30".into(),
+                    timeout_secs: 60,
+                    output_limit: 1024,
+                    cwd: None,
+                    spill_dir: None,
+                    tool_call_id: Some(format!("command-{index}")),
+                })
+                .await
+                .unwrap();
+        }
+
+        let error = child
+            .start_command(CommandRequest {
+                command: "sleep 30".into(),
+                timeout_secs: 60,
+                output_limit: 1024,
+                cwd: None,
+                spill_dir: None,
+                tool_call_id: Some("command-over-limit".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, WorkdirError::Unavailable(message) if message.contains("limit")));
+        child.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_serializes_with_inflight_command_admission() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("work")).unwrap();
+        let parent = session(root.path());
+        let child = Arc::new(
+            parent
+                .scope(request("work", WorkdirToolScopePermission::Write))
+                .await
+                .unwrap(),
+        );
+        let gate = Arc::new(TestCommandStartGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *child.broker.authority.command_start_gate.lock().unwrap() = Some(gate.clone());
+        let entered = gate.entered.notified();
+        let command_child = child.clone();
+        let command = tokio::spawn(async move {
+            command_child
+                .start_command(CommandRequest {
+                    command: "sleep 30".into(),
+                    timeout_secs: 60,
+                    output_limit: 1024,
+                    cwd: None,
+                    spill_dir: None,
+                    tool_call_id: Some("racing-command".into()),
+                })
+                .await
+        });
+        entered.await;
+        let close_child = child.clone();
+        let mut close = tokio::spawn(async move { close_child.close().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut close)
+                .await
+                .is_err(),
+            "close must wait for command admission to commit or fail"
+        );
+
+        gate.release.notify_one();
+        command.await.unwrap().unwrap();
+        close.await.unwrap().unwrap();
+        assert!(!child.is_active());
+        assert!(
+            child
+                .broker
+                .authority
+                .owned_commands
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
