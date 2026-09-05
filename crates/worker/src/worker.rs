@@ -173,6 +173,14 @@ impl PendingActivationState {
         }
     }
 
+    fn live_artifact_pin_owner_ids(&self) -> Vec<String> {
+        self.activating
+            .iter()
+            .chain(self.pending.iter())
+            .map(|submission| submission.submission_id.clone())
+            .collect()
+    }
+
     fn remember_notification_receipt(&mut self, receipt: NotificationReceipt) {
         self.notification_receipts.push_back(receipt);
         while self.notification_receipts.len() > MAX_SUBMISSION_RECEIPTS {
@@ -1828,6 +1836,18 @@ where
             .lock()
             .expect("pending activation state poisoned")
             .snapshot()
+    }
+
+    fn reconcile_uploaded_file_pins(&self) -> Result<u64, StoreError> {
+        let live_owner_ids = self
+            .state
+            .lock()
+            .expect("pending activation state poisoned")
+            .live_artifact_pin_owner_ids();
+        Ok(self
+            .writer
+            .store
+            .reconcile_uploaded_file_pins(self.writer.state.session_id(), &live_owner_ids)?)
     }
 
     pub(crate) fn cancel(
@@ -6340,6 +6360,9 @@ where
         worker
             .session
             .restore_pending_activations(&state.extensions);
+        worker
+            .pending_submission_handle()
+            .reconcile_uploaded_file_pins()?;
         worker.apply_permissions_from_manifest();
         worker.apply_prune_from_manifest();
         worker.write_worker_metadata_active(SegmentLocation {
@@ -9701,6 +9724,56 @@ mod build_summary_prompt_tests {
         let state = handle.state.lock().unwrap();
         assert_eq!(state.pending[0].provenance, account_a);
         assert_eq!(state.pending[1].provenance, account_b);
+    }
+
+    #[test]
+    fn restore_reconciliation_clears_interrupted_acceptance_pin_for_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        let session_id = handle.writer.state.session_id();
+        let segment_id = handle.writer.state.location().segment_id;
+        let limits = session_store::UploadedFileLimits {
+            max_file_bytes: 1024,
+            max_session_bytes: 2048,
+        };
+        let file = handle
+            .writer
+            .store
+            .write_uploaded_file(session_id, "retry.txt", "text/plain", b"retry", limits)
+            .unwrap();
+        handle
+            .writer
+            .store
+            .pin_uploaded_file(session_id, &file, "interrupted-before-checkpoint")
+            .unwrap();
+        drop(handle);
+        let handle = PendingSubmissionHandle {
+            state: Arc::new(Mutex::new(PendingActivationState::default())),
+            writer: LogWriterHandle {
+                store: session_store::FsStore::new(temp.path()).unwrap(),
+                state: SegmentState::new(session_id, segment_id, 0),
+                sink: SegmentLogSink::new(),
+                in_flight: None,
+            },
+        };
+
+        assert_eq!(handle.reconcile_uploaded_file_pins().unwrap(), 1);
+        let accepted = handle
+            .accept(
+                "request-after-restore".into(),
+                vec![Segment::UploadedFile { file: file.clone() }],
+                false,
+            )
+            .unwrap();
+        assert!(!accepted.submission_id.is_empty());
+        assert_eq!(handle.reconcile_uploaded_file_pins().unwrap(), 0);
+        assert!(matches!(
+            handle
+                .writer
+                .store
+                .delete_uploaded_file(session_id, &file.artifact_id),
+            Err(StoreError::ArtifactAlreadyCommitted)
+        ));
     }
 
     #[test]

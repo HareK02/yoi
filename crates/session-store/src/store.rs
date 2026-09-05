@@ -256,6 +256,17 @@ pub trait Store: Send + Sync {
         Err(StoreError::PasteArtifactUnsupported)
     }
 
+    /// Clear pending-operation pins that have no owner in restored durable
+    /// Worker Session state. This repairs an interrupted pin-before-checkpoint
+    /// acceptance without disturbing live queue owners or committed history.
+    fn reconcile_uploaded_file_pins(
+        &self,
+        _session_id: SessionId,
+        _live_owner_ids: &[String],
+    ) -> Result<u64, StoreError> {
+        Ok(0)
+    }
+
     /// Delete an uncommitted uploaded file owned by `session_id`.
     fn delete_uploaded_file(
         &self,

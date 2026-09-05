@@ -23,7 +23,8 @@ use crate::uploaded_file::{
     bind_uploaded_file, clear_uploaded_file_binding, copy_committed_uploaded_files,
     delete_uncommitted_uploaded_files, delete_uploaded_file, finalize_uploaded_file_binding,
     list_uploaded_file_refs, pin_uploaded_file, read_uploaded_file, read_uploaded_file_by_id,
-    release_uploaded_file_pin, uploaded_file_has_pending_owner, write_uploaded_file,
+    reconcile_uploaded_file_pins, release_uploaded_file_pin, uploaded_file_has_pending_owner,
+    write_uploaded_file,
 };
 use crate::{
     PasteArtifactLimits, SegmentId, SessionId, UploadedFileLimits, UploadedFileUploadContext,
@@ -560,6 +561,18 @@ impl Store for FsStore {
             artifact_id,
             source_entry_id,
         )
+    }
+
+    fn reconcile_uploaded_file_pins(
+        &self,
+        session_id: SessionId,
+        live_owner_ids: &[String],
+    ) -> Result<u64, StoreError> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("session store append lock was poisoned"))?;
+        reconcile_uploaded_file_pins(&self.paste_artifact_dir(session_id), live_owner_ids)
     }
 
     fn delete_uploaded_file(

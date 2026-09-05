@@ -586,6 +586,40 @@ pub(crate) fn copy_committed_uploaded_files(source_dir: &Path, target_dir: &Path
     Ok(copied)
 }
 
+pub(crate) fn reconcile_uploaded_file_pins(dir: &Path, live_owner_ids: &[String]) -> Result<u64> {
+    fs::create_dir_all(dir)?;
+    let aggregate_lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(dir.join(".aggregate.lock"))?;
+    FileExt::lock_exclusive(&aggregate_lock)?;
+    let mut reconciled = 0_u64;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(artifact_id) = file_name.strip_suffix(".file.json") else {
+            continue;
+        };
+        let mut stored: StoredUploadedFile = serde_json::from_slice(&fs::read(&path)?)?;
+        let Some(owner_id) = stored.pending_owner_id.as_deref() else {
+            continue;
+        };
+        if live_owner_ids.iter().any(|live| live == owner_id) {
+            continue;
+        }
+        stored.pending_owner_id = None;
+        let temp = dir.join(format!(".{artifact_id}.file.reconcile.tmp"));
+        fs::write(&temp, serde_json::to_vec(&stored)?)?;
+        fs::rename(temp, path)?;
+        reconciled = reconciled.saturating_add(1);
+    }
+    Ok(reconciled)
+}
+
 pub(crate) fn delete_uncommitted_uploaded_files(dir: &Path) -> Result<u64> {
     fs::create_dir_all(dir)?;
     let aggregate_lock = fs::OpenOptions::new()

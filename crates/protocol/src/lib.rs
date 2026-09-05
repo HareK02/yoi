@@ -154,8 +154,8 @@ pub enum Method {
     /// Stop the in-flight turn and transition to `Paused`.
     ///
     /// Unlike `Cancel` (which discards and returns to `Idle`), a paused
-    /// Worker can resume the interrupted work via `Resume`, or start a
-    /// fresh turn via `Run` (orphan `tool_use` items are closed with a
+    /// Worker can resume the interrupted work via `Resume`, or accept a
+    /// fresh `Submit` (orphan `tool_use` items are closed with a
     /// synthetic tool result before the new user message is appended).
     Pause,
     /// Request an explicit compaction while the Worker is otherwise idle.
