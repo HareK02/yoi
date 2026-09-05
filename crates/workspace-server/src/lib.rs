@@ -40,7 +40,7 @@ pub use authority::{
     ObjectiveAuthority, SqliteWorkspaceAuthority, TicketAuthority, TicketMergeRevisionSource,
     WorkspaceAuthority,
 };
-pub use config::{BackendRuntimesConfigFile, ResolvedWorkspaceBackendConfig, ServerHostConfigFile};
+pub use config::{ResolvedWorkspaceBackendConfig, ServerHostConfigFile};
 pub use identity::{WORKSPACE_IDENTITY_RELATIVE_PATH, WorkspaceIdentity};
 pub use records::{ObjectiveDetail, ObjectiveSummary, TicketDetail, TicketSummary};
 pub use repositories::{ConfiguredRepository, RepositoryLogRead, RepositoryRegistryReader};
@@ -118,6 +118,8 @@ pub enum Error {
     WorkspacePermissionDenied(String),
     #[error("Workspace config update conflict: {0}")]
     WorkspaceConfigConflict(String),
+    #[error("Runtime binding conflict: {0}")]
+    RuntimeBindingConflict(String),
     #[error("Repository conflict: {0}")]
     RepositoryConflict(String),
     #[error("Registry inconsistency: {0}")]

@@ -433,15 +433,21 @@ CREATE TABLE ticket_worker_assignments (
                 (principal_kind != 'worker' AND runtime_id IS NULL AND worker_id IS NULL AND principal_id IS NOT NULL AND length(trim(principal_id)) > 0)
             )
         );
-CREATE TABLE trusted_runtime_records (
-    runtime_id TEXT PRIMARY KEY,
+CREATE TABLE workspace_runtime_bindings (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
     display_name TEXT NOT NULL,
     base_url TEXT NOT NULL,
-    public_key TEXT NOT NULL,
+    public_key TEXT,
+    public_key_fingerprint TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    revoked_at TEXT
-, workspace_id TEXT REFERENCES workspaces(workspace_id) ON DELETE RESTRICT);
+    revoked_at TEXT,
+    PRIMARY KEY (workspace_id, runtime_id),
+    UNIQUE (workspace_id, public_key_fingerprint),
+    CHECK ((public_key IS NULL) = (public_key_fingerprint IS NULL)),
+    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT
+);
 CREATE TABLE typed_ticket_artifacts (
     workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, relative_path TEXT NOT NULL, content BLOB NOT NULL,
     PRIMARY KEY (workspace_id, ticket_id, relative_path),
@@ -651,11 +657,12 @@ CREATE TABLE worker_diagnostics_archives (
         FOREIGN KEY(operation_id) REFERENCES worker_removal_operations(operation_id),
         FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE);
 CREATE TABLE worker_mutation_source_proof_jtis (
+            workspace_id TEXT NOT NULL,
             runtime_id TEXT NOT NULL,
             jti TEXT NOT NULL,
             expires_at INTEGER NOT NULL,
             consumed_at TEXT NOT NULL,
-            PRIMARY KEY (runtime_id, jti)
+            PRIMARY KEY (workspace_id, runtime_id, jti)
         );
 CREATE TABLE worker_orphan_diagnostics (
         diagnostic_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL, worker_id TEXT NOT NULL,
@@ -857,8 +864,8 @@ CREATE INDEX idx_ticket_worker_assignments_principal
             ON ticket_worker_assignments(workspace_id, role, principal_kind, principal_id, runtime_id, worker_id, assigned_at DESC);
 CREATE INDEX idx_ticket_worker_assignments_ticket
             ON ticket_worker_assignments(workspace_id, ticket_id, role, assigned_at DESC);
-CREATE INDEX idx_trusted_runtime_records_workspace
-            ON trusted_runtime_records(workspace_id, revoked_at, runtime_id);
+CREATE INDEX idx_workspace_runtime_bindings_workspace
+            ON workspace_runtime_bindings(workspace_id, revoked_at, runtime_id);
 CREATE INDEX idx_typed_ticket_relations_workspace_target
     ON typed_ticket_relations(workspace_id, target, at DESC);
 CREATE INDEX idx_typed_tickets_workspace_state_updated

@@ -57,16 +57,15 @@ pub async fn verify_runtime_request_source_proof_with_store(
         .map_err(|_| WorkerMutationSourceProofError::Invalid)?;
     let audience = remote_audience(config, &unverified.iss, workspace_id)?;
     let trusted = store
-        .get_trusted_runtime(&unverified.iss)
+        .get_workspace_runtime_binding(workspace_id, &unverified.iss)
         .await
         .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?
-        .filter(|record| record.revoked_at.is_none())
+        .filter(|record| record.revoked_at.is_none() && record.public_key.is_some())
         .ok_or(WorkerMutationSourceProofError::RevokedRuntimeTrust)?;
-    let trusted_for_workspace = trusted.workspace_id.as_deref() == Some(workspace_id)
-        || (unverified.iss == crate::hosts::EMBEDDED_RUNTIME_ID && trusted.workspace_id.is_none());
-    if !trusted_for_workspace {
-        return Err(WorkerMutationSourceProofError::WrongWorkspace);
-    }
+    let public_key = trusted
+        .public_key
+        .as_deref()
+        .ok_or(WorkerMutationSourceProofError::RevokedRuntimeTrust)?;
     let expected = RuntimeRequestSourceExpectation {
         identity_id: &unverified.iss,
         audience: audience.as_ref(),
@@ -78,8 +77,8 @@ pub async fn verify_runtime_request_source_proof_with_store(
         body_digest,
         now_unix: i64::try_from(unix_now_seconds()).unwrap_or(i64::MAX),
     };
-    let claims = verify_runtime_request_source(proof, &trusted.public_key, &expected)
-        .map_err(map_auth_error)?;
+    let claims =
+        verify_runtime_request_source(proof, public_key, &expected).map_err(map_auth_error)?;
     let now_seconds = u64::try_from(expected.now_unix).unwrap_or(u64::MAX);
     let expires_at = u64::try_from(claims.exp).unwrap_or(0);
     let consumed_at = chrono::DateTime::from_timestamp(expected.now_unix, 0)
@@ -87,6 +86,7 @@ pub async fn verify_runtime_request_source_proof_with_store(
         .to_rfc3339();
     if !store
         .consume_worker_mutation_source_jti(
+            workspace_id,
             &claims.iss,
             &claims.jti,
             expires_at,
@@ -206,14 +206,15 @@ async fn verify_worker_remove_source_with(
                 .map_err(|_| WorkerMutationSourceProofError::Invalid)?;
             let audience = remote_audience(config, &unverified.iss, &config.workspace_id)?;
             let trusted = store
-                .get_trusted_runtime(&unverified.iss)
+                .get_workspace_runtime_binding(&config.workspace_id, &unverified.iss)
                 .await
                 .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?
-                .filter(|record| record.revoked_at.is_none())
+                .filter(|record| record.revoked_at.is_none() && record.public_key.is_some())
                 .ok_or(WorkerMutationSourceProofError::RevokedRuntimeTrust)?;
-            if trusted.workspace_id.as_deref() != Some(config.workspace_id.as_str()) {
-                return Err(WorkerMutationSourceProofError::WrongWorkspace);
-            }
+            let public_key = trusted
+                .public_key
+                .as_deref()
+                .ok_or(WorkerMutationSourceProofError::RevokedRuntimeTrust)?;
             let expected = WorkerMutationSourceExpectation {
                 runtime_id: &unverified.iss,
                 audience: audience.as_ref(),
@@ -225,7 +226,7 @@ async fn verify_worker_remove_source_with(
                 target_worker_id,
                 permission: required_permission,
             };
-            verify_worker_mutation_source_proof(&trusted.public_key, token, &expected, now)
+            verify_worker_mutation_source_proof(public_key, token, &expected, now)
                 .map_err(map_auth_error)?
         }
         PresentedWorkerMutationSourceProof::InProcess(proof) => {
@@ -263,7 +264,14 @@ async fn verify_worker_remove_source_with(
 
     let consumed_at = chrono::Utc::now().to_rfc3339();
     let consumed = store
-        .consume_worker_mutation_source_jti(&claims.iss, &claims.jti, claims.exp, now, &consumed_at)
+        .consume_worker_mutation_source_jti(
+            &config.workspace_id,
+            &claims.iss,
+            &claims.jti,
+            claims.exp,
+            now,
+            &consumed_at,
+        )
         .await
         .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?;
     if !consumed {

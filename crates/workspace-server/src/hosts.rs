@@ -60,7 +60,7 @@ use worker_runtime::retention::{
     WorkerRetentionExecutionRequest, WorkerRetentionExecutionResult, WorkerRetentionInventory,
 };
 
-pub(crate) const EMBEDDED_RUNTIME_ID: &str = "embedded-worker-runtime";
+pub const EMBEDDED_RUNTIME_ID: &str = "embedded-worker-runtime";
 const EMBEDDED_HOST_KIND: &str = "embedded-worker-runtime-host";
 const REMOTE_HOST_KIND: &str = "remote-worker-runtime-host";
 const MAX_DIAGNOSTICS: usize = 16;

@@ -9,10 +9,10 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use worker_runtime::auth::{RuntimeIdentityMaterial, decode_public_key};
 use yoi_workspace_server::hosts::{RemoteRuntimeAuthConfig, RemoteRuntimeConfig};
-use yoi_workspace_server::store::{SqliteWorkspaceStore, TrustedRuntimeRecord};
+use yoi_workspace_server::store::{SqliteWorkspaceStore, WorkspaceRuntimeBinding};
 use yoi_workspace_server::{
-    BackendRuntimesConfigFile, ControlPlaneStore, ResolvedWorkspaceBackendConfig, ServerConfig,
-    ServerHostConfigFile, WorkspaceIdentity, WorkspaceRecord, serve_workspace_catalog,
+    ControlPlaneStore, ResolvedWorkspaceBackendConfig, ServerConfig, ServerHostConfigFile,
+    WorkspaceIdentity, WorkspaceRecord, serve_workspace_catalog,
 };
 
 #[derive(Debug)]
@@ -315,40 +315,47 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
             let public_key = public_key
                 .ok_or_else(|| CliError("trust-runtime add requires --public-key".to_string()))?;
             decode_public_key(&public_key)?;
-            ensure_trusted_runtime_replace_allowed(&store, &runtime_id, replace)?;
-            if let Some(existing) = store
-                .list_trusted_runtimes(true)?
-                .into_iter()
-                .find(|runtime| runtime.runtime_id == runtime_id)
-            {
-                if existing.workspace_id.as_deref() != Some(workspace_id.as_str()) {
-                    return Err(Box::new(CliError(format!(
-                        "runtime `{runtime_id}` is already assigned to Workspace `{}` and cannot be reparented",
-                        existing.workspace_id.as_deref().unwrap_or("unassigned")
-                    ))));
-                }
-            }
             let now = Utc::now().to_rfc3339();
-            store.upsert_trusted_runtime(&TrustedRuntimeRecord {
-                runtime_id: runtime_id.clone(),
-                workspace_id: Some(workspace_id.clone()),
-                display_name: display_name.unwrap_or_else(|| runtime_id.clone()),
-                base_url,
-                public_key,
-                created_at: now.clone(),
-                updated_at: now,
-                revoked_at: None,
-            })?;
-            println!("trusted_runtime_id={runtime_id}");
+            let outcome = store.upsert_workspace_runtime_binding(
+                WorkspaceRuntimeBinding {
+                    workspace_id: workspace_id.clone(),
+                    runtime_id: runtime_id.clone(),
+                    display_name: display_name.unwrap_or_else(|| runtime_id.clone()),
+                    base_url,
+                    public_key: Some(public_key),
+                    public_key_fingerprint: None,
+                    created_at: now.clone(),
+                    updated_at: now,
+                    revoked_at: None,
+                },
+                replace,
+            )?;
+            println!("workspace_id={workspace_id}");
+            println!("runtime_id={runtime_id}");
+            println!(
+                "result={}",
+                match outcome {
+                    yoi_workspace_server::store::WorkspaceRuntimeBindingUpsert::Created =>
+                        "created",
+                    yoi_workspace_server::store::WorkspaceRuntimeBindingUpsert::Unchanged =>
+                        "unchanged",
+                    yoi_workspace_server::store::WorkspaceRuntimeBindingUpsert::Replaced =>
+                        "replaced",
+                }
+            );
             println!("server_db={}", database_path.display());
             Ok(())
         }
         "list" => {
+            let mut workspace_id = None;
             let mut json = false;
             let mut include_revoked = false;
             while let Some(arg) = args.pop_front() {
                 let (flag, inline_value) = split_flag_value(arg)?;
                 match flag.as_str() {
+                    "--workspace-id" => {
+                        workspace_id = Some(take_value(&flag, inline_value, &mut args)?)
+                    }
                     "--json" => {
                         ensure_no_inline_value(&flag, inline_value.as_deref())?;
                         json = true;
@@ -364,17 +371,20 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
                     }
                 }
             }
-            let records = store.list_trusted_runtimes(include_revoked)?;
+            let workspace_id = workspace_id.ok_or_else(|| {
+                CliError("trust-runtime list requires --workspace-id".to_string())
+            })?;
+            let records = store.list_workspace_runtime_bindings(&workspace_id, include_revoked)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&records)?);
             } else {
                 for runtime in records {
                     println!(
-                        "runtime_id={} workspace_id={} base_url={} public_key={} revoked_at={}",
+                        "workspace_id={} runtime_id={} base_url={} public_key_fingerprint={} revoked_at={}",
+                        runtime.workspace_id,
                         runtime.runtime_id,
-                        runtime.workspace_id.unwrap_or_default(),
                         runtime.base_url,
-                        runtime.public_key,
+                        runtime.public_key_fingerprint.as_deref().unwrap_or(""),
                         runtime.revoked_at.unwrap_or_default()
                     );
                 }
@@ -382,10 +392,14 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
             Ok(())
         }
         "revoke" => {
+            let mut workspace_id = None;
             let mut runtime_id = None;
             while let Some(arg) = args.pop_front() {
                 let (flag, inline_value) = split_flag_value(arg)?;
                 match flag.as_str() {
+                    "--workspace-id" => {
+                        workspace_id = Some(take_value(&flag, inline_value, &mut args)?)
+                    }
                     "--runtime-id" => {
                         runtime_id = Some(take_value(&flag, inline_value, &mut args)?)
                     }
@@ -396,11 +410,14 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
                     }
                 }
             }
+            let workspace_id = workspace_id.ok_or_else(|| {
+                CliError("trust-runtime revoke requires --workspace-id".to_string())
+            })?;
             let runtime_id = runtime_id.ok_or_else(|| {
                 CliError("trust-runtime revoke requires --runtime-id".to_string())
             })?;
             let now = Utc::now().to_rfc3339();
-            if !store.revoke_trusted_runtime(&runtime_id, &now)? {
+            if !store.revoke_workspace_runtime_binding(&workspace_id, &runtime_id, &now)? {
                 return Err(Box::new(CliError(format!(
                     "trusted runtime `{runtime_id}` is not registered or is already revoked"
                 ))));
@@ -412,24 +429,6 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
             "unknown trust-runtime subcommand `{subcommand}`"
         )))),
     }
-}
-
-fn ensure_trusted_runtime_replace_allowed(
-    store: &SqliteWorkspaceStore,
-    runtime_id: &str,
-    replace: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if store
-        .list_trusted_runtimes(true)?
-        .iter()
-        .any(|runtime| runtime.runtime_id == runtime_id)
-        && !replace
-    {
-        return Err(Box::new(CliError(format!(
-            "trusted runtime `{runtime_id}` already exists; pass --replace to update it"
-        ))));
-    }
-    Ok(())
 }
 
 fn split_flag_value(arg: String) -> Result<(String, Option<String>), CliError> {
@@ -543,16 +542,11 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
         Some(path) => ServerHostConfigFile::load_from_path(path)?,
         None => ServerHostConfigFile::load_default()?,
     };
-    let runtime_config = BackendRuntimesConfigFile::load_default()?;
-    let mut resolved = ResolvedWorkspaceBackendConfig::local_dev(
-        &workspace_root,
-        identity,
-        &host_config,
-        &runtime_config,
-    )?;
+    let mut resolved =
+        ResolvedWorkspaceBackendConfig::local_dev(&workspace_root, identity, &host_config)?;
     resolved.database_path = database_path.clone();
     resolved.server.database_path = database_path.clone();
-    append_trusted_runtime_sources(store.as_ref(), &mut resolved.server.remote_runtime_sources)?;
+    append_workspace_runtime_sources(store.as_ref(), &mut resolved.server.remote_runtime_sources)?;
     if let Some(listen) = options.listen {
         resolved = resolved.with_listen(listen);
     }
@@ -572,22 +566,38 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-fn append_trusted_runtime_sources(
+fn append_workspace_runtime_sources(
     store: &SqliteWorkspaceStore,
     remote_runtime_sources: &mut Vec<RemoteRuntimeConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let workspaces = store.list_workspaces()?;
+    let bindings = workspaces
+        .iter()
+        .map(|workspace| {
+            store
+                .list_workspace_runtime_bindings(&workspace.workspace_id, false)
+                .map(|bindings| {
+                    bindings
+                        .into_iter()
+                        .filter(|binding| {
+                            binding.runtime_id != yoi_workspace_server::hosts::EMBEDDED_RUNTIME_ID
+                        })
+                        .collect::<Vec<_>>()
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     let Some(server_identity) = read_server_identity_file(&server_identity_path())? else {
-        if !store.list_trusted_runtimes(false)?.is_empty() {
+        if !bindings.is_empty() {
             return Err(Box::new(CliError(
-                "trusted runtimes are registered but server identity is not initialized; run `yoi-server identity init`".to_string(),
+                "Runtime bindings are registered but server identity is not initialized; run `yoi-server identity init`".to_string(),
             )));
         }
         return Ok(());
     };
-    for runtime in store.list_trusted_runtimes(false)? {
-        let Some(workspace_id) = runtime.workspace_id.clone() else {
-            continue;
-        };
+    for runtime in bindings {
         let auth = RemoteRuntimeAuthConfig {
             server_id: server_identity.identity.identity_id.clone(),
             server_private_key: server_identity.identity.private_key.clone(),
@@ -598,9 +608,12 @@ fn append_trusted_runtime_sources(
             runtime.base_url,
             None,
         )
-        .with_workspace_id(workspace_id)
+        .with_workspace_id(runtime.workspace_id.clone())
         .with_auth(auth);
-        remote_runtime_sources.retain(|existing| existing.runtime_id != runtime.runtime_id);
+        remote_runtime_sources.retain(|existing| {
+            existing.workspace_id.as_deref() != Some(runtime.workspace_id.as_str())
+                || existing.runtime_id != runtime.runtime_id
+        });
         remote_runtime_sources.push(remote);
     }
     Ok(())
@@ -731,7 +744,7 @@ fn parse_listen(value: &str) -> Result<SocketAddr, CliError> {
 
 fn print_help() {
     println!(
-        "yoi-server\n\nUsage:\n  yoi-server identity init --server-id <SERVER_ID> [--replace]\n  yoi-server identity show [--json]\n  yoi-server trust-runtime add --runtime-id <RUNTIME_ID> --workspace-id <WORKSPACE_ID> --base-url <URL> --public-key <KEY> [--display-name <NAME>] [--replace]\n  yoi-server trust-runtime list [--json] [--include-revoked]\n  yoi-server trust-runtime revoke --runtime-id <RUNTIME_ID>\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
+        "yoi-server\n\nUsage:\n  yoi-server identity init --server-id <SERVER_ID> [--replace]\n  yoi-server identity show [--json]\n  yoi-server trust-runtime add --runtime-id <RUNTIME_ID> --workspace-id <WORKSPACE_ID> --base-url <URL> --public-key <KEY> [--display-name <NAME>] [--replace]\n  yoi-server trust-runtime list --workspace-id <WORKSPACE_ID> [--json] [--include-revoked]\n  yoi-server trust-runtime revoke --workspace-id <WORKSPACE_ID> --runtime-id <RUNTIME_ID>\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
     );
 }
 
@@ -743,7 +756,7 @@ fn print_skills_help() {
 
 fn print_serve_help() {
     println!(
-        "yoi-server serve\n\nUsage:\n  yoi-server serve [OPTIONS]\n\nDescription:\n  Serves Workspaces recorded in the Yoi server DB. Host-level deployment settings are loaded from the explicit --config path or the canonical XDG yoi/server.toml path, and runtime sources are loaded from XDG runtimes.toml.\n\nOptions:\n      --listen <ADDR>     Listen address (default 127.0.0.1:8787)\n      --config <PATH>     Host-level Server config path\n  -h, --help              Print help"
+        "yoi-server serve\n\nUsage:\n  yoi-server serve [OPTIONS]\n\nDescription:\n  Serves Workspaces recorded in the Yoi server DB. Host-level deployment settings are loaded from the explicit --config path or the canonical XDG yoi/server.toml path, and Runtime bindings are loaded from the Server DB.\n\nOptions:\n      --listen <ADDR>     Listen address (default 127.0.0.1:8787)\n      --config <PATH>     Host-level Server config path\n  -h, --help              Print help"
     );
 }
 
@@ -823,30 +836,51 @@ mod tests {
     }
 
     #[test]
-    fn trusted_runtime_add_requires_replace_for_existing_record() {
+    fn runtime_binding_requires_explicit_replace_for_changed_authority() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SqliteWorkspaceStore::open(temp.path().join("server.db")).unwrap();
+        let path = temp.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO accounts(account_id, kind, handle, display_name, created_at, updated_at)
+                 VALUES ('owner', 'user', 'owner', 'Owner', '1', '1');
+                 INSERT INTO workspaces(workspace_id, owner_account_id, display_name, state, created_at, updated_at)
+                 VALUES ('workspace-a', 'owner', 'Workspace A', 'active', '1', '1');",
+            )
+            .unwrap();
         let public_key = RuntimeIdentityMaterial::generate("runtime-a")
             .unwrap()
             .public_key;
+        let binding = WorkspaceRuntimeBinding {
+            workspace_id: "workspace-a".to_string(),
+            runtime_id: "runtime-a".to_string(),
+            display_name: "Runtime A".to_string(),
+            base_url: "http://127.0.0.1:18080".to_string(),
+            public_key: Some(public_key),
+            public_key_fingerprint: None,
+            created_at: "2026-07-26T00:00:00Z".to_string(),
+            updated_at: "2026-07-26T00:00:00Z".to_string(),
+            revoked_at: None,
+        };
         store
-            .upsert_trusted_runtime(&TrustedRuntimeRecord {
-                runtime_id: "runtime-a".to_string(),
-                workspace_id: None,
-                display_name: "Runtime A".to_string(),
-                base_url: "http://127.0.0.1:18080".to_string(),
-                public_key,
-                created_at: "2026-07-26T00:00:00Z".to_string(),
-                updated_at: "2026-07-26T00:00:00Z".to_string(),
-                revoked_at: None,
-            })
+            .upsert_workspace_runtime_binding(binding.clone(), false)
             .unwrap();
-
-        let error = ensure_trusted_runtime_replace_allowed(&store, "runtime-a", false).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "trusted runtime `runtime-a` already exists; pass --replace to update it"
+        assert!(matches!(
+            store
+                .upsert_workspace_runtime_binding(binding.clone(), false)
+                .unwrap(),
+            yoi_workspace_server::store::WorkspaceRuntimeBindingUpsert::Unchanged
+        ));
+        let mut changed = binding;
+        changed.base_url = "http://127.0.0.1:18081".to_string();
+        assert!(
+            store
+                .upsert_workspace_runtime_binding(changed.clone(), false)
+                .is_err()
         );
-        ensure_trusted_runtime_replace_allowed(&store, "runtime-a", true).unwrap();
+        store
+            .upsert_workspace_runtime_binding(changed, true)
+            .unwrap();
     }
 }

@@ -102,7 +102,6 @@ use crate::companion::{
     CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
     CompanionStatusResponse, CompanionTranscriptProjection,
 };
-use crate::config::{BackendRuntimesConfigFile, RemoteRuntimeConfigFile, resolve_remote_runtime};
 use crate::config_source::ConfigCommitRequest;
 use crate::hosts::{
     ConfigBundleCheckResult, ConfigBundleSyncResult, DiagnosticSeverity, EMBEDDED_RUNTIME_ID,
@@ -149,7 +148,7 @@ use crate::store::{
     RepositoryRecord, TicketAssignmentPrincipal, TicketAssignmentRole, TicketCoderAssignmentRecord,
     TicketRoleAssignmentRecord, UserRecord, WorkdirCreateOperationRecord, WorkdirRegistryRecord,
     WorkerControlGrantRecord, WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord,
-    WorkspaceResourceKind,
+    WorkspaceResourceKind, WorkspaceRuntimeBinding,
 };
 use crate::workdir_removal::{
     WorkdirRemovalAttemptOwner, WorkdirRemovalDisposition, WorkdirRemovalOperation,
@@ -189,7 +188,6 @@ pub struct ServerConfig {
     pub repositories: Vec<ConfiguredRepository>,
     pub runtime_event_sources: Vec<RuntimeObservationSourceConfig>,
     pub remote_runtime_sources: Vec<RemoteRuntimeConfig>,
-    pub runtime_config_path: Option<PathBuf>,
     pub backend_base_url: Option<String>,
 }
 
@@ -217,7 +215,6 @@ impl ServerConfig {
             repositories: Vec::new(),
             runtime_event_sources: Vec::new(),
             remote_runtime_sources: Vec::new(),
-            runtime_config_path: BackendRuntimesConfigFile::default_path(),
             backend_base_url: None,
         }
     }
@@ -1561,18 +1558,28 @@ impl WorkspaceApi {
 
     pub async fn new(config: ServerConfig, store: Arc<dyn ControlPlaneStore>) -> Result<Self> {
         let resource_broker = BackendResourceBroker::default();
+        if store.get_workspace(&config.workspace_id).await?.is_none() {
+            return Err(crate::Error::Config(format!(
+                "Workspace {} is not registered in the Server DB",
+                config.workspace_id
+            )));
+        }
         let embedded_identity = (*EMBEDDED_RUNTIME_REQUEST_IDENTITY).clone();
         store
-            .upsert_trusted_runtime_record(&crate::store::TrustedRuntimeRecord {
-                runtime_id: EMBEDDED_RUNTIME_ID.to_owned(),
-                workspace_id: None,
-                display_name: "Embedded Runtime".to_owned(),
-                base_url: "in-process://embedded".to_owned(),
-                public_key: embedded_identity.public_key.clone(),
-                created_at: config.workspace_created_at.clone(),
-                updated_at: config.workspace_created_at.clone(),
-                revoked_at: None,
-            })
+            .upsert_workspace_runtime_binding_record(
+                crate::store::WorkspaceRuntimeBinding {
+                    workspace_id: config.workspace_id.clone(),
+                    runtime_id: EMBEDDED_RUNTIME_ID.to_owned(),
+                    display_name: "Embedded Runtime".to_owned(),
+                    base_url: "in-process://embedded".to_owned(),
+                    public_key: Some(embedded_identity.public_key.clone()),
+                    public_key_fingerprint: None,
+                    created_at: config.workspace_created_at.clone(),
+                    updated_at: config.workspace_created_at.clone(),
+                    revoked_at: None,
+                },
+                false,
+            )
             .await?;
         let embedded_audience = format!("embedded:{}", config.workspace_id);
         let worker_remove_dispatcher = Arc::new(
@@ -8528,11 +8535,9 @@ async fn scoped_list_runtimes(
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
 ) -> ApiResult<Json<workspace_api::ListResponse<WorkspaceRuntimeResource>>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let runtime_config = load_backend_runtimes_config_for_settings(&api)?;
-    Ok(Json(workspace_runtime_resources_response(
-        &api,
-        &runtime_config,
-    )))
+    Ok(Json(
+        workspace_runtime_resources_response(&api, &api.config.workspace_id).await?,
+    ))
 }
 
 async fn scoped_workspace_protocol_ws(
@@ -12395,7 +12400,6 @@ async fn create_remote_runtime(
     Json(request): Json<CreateRemoteRuntimeRequest>,
 ) -> ApiResult<(StatusCode, Json<WorkspaceRuntimeResource>)> {
     validate_runtime_connection_request(&request)?;
-    let mut runtime_config = load_backend_runtimes_config_for_settings(&api)?;
     let id = request.runtime_id.trim().to_string();
     if id == EMBEDDED_WORKER_RUNTIME_ID {
         return Err(settings_bad_request(
@@ -12413,32 +12417,31 @@ async fn create_remote_runtime(
             "remote Runtime token_ref persistence is not supported",
         ));
     }
-    if runtime_config
-        .runtimes
-        .remote
-        .iter()
-        .any(|remote| remote.id == id)
-    {
-        return Err(settings_bad_request(
-            "remote_runtime_already_exists",
-            "a remote Runtime with that id already exists",
-        ));
-    }
-    let remote_config = RemoteRuntimeConfigFile {
-        id: id.clone(),
-        endpoint: request.endpoint.trim().to_string(),
+    let now = Utc::now().to_rfc3339();
+    let binding = WorkspaceRuntimeBinding {
+        workspace_id: api.config.workspace_id.clone(),
+        runtime_id: id.clone(),
         display_name: request
             .display_name
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned),
-        token_ref: None,
+            .unwrap_or(&id)
+            .to_owned(),
+        base_url: request.endpoint.trim().to_string(),
+        public_key: None,
+        public_key_fingerprint: None,
+        created_at: now.clone(),
+        updated_at: now,
+        revoked_at: None,
     };
-    let active_config = remote_runtime_config_from_file(&remote_config).map_err(|diagnostic| {
+    api.store
+        .upsert_workspace_runtime_binding_record(binding.clone(), false)
+        .await?;
+    let active_config = remote_runtime_config_from_binding(&binding).map_err(|diagnostic| {
         ApiError::with_diagnostics(
             Error::RuntimeOperationFailed {
-                runtime_id: remote_config.id.clone(),
+                runtime_id: binding.runtime_id.clone(),
                 code: diagnostic.code.clone(),
                 message: diagnostic.message.clone(),
             },
@@ -12455,10 +12458,9 @@ async fn create_remote_runtime(
     )
     .map(|host| host.with_resource_broker(api.resource_broker.clone()))
     .map_err(|err| err.into_error())?;
-    runtime_config.runtimes.remote.push(remote_config);
-    write_backend_runtimes_config_for_settings(&api, &runtime_config)?;
     api.runtime.register_or_replace(active_runtime);
-    let resource = workspace_runtime_resource_by_id(&api, &runtime_config, &id)
+    let resource = workspace_runtime_resource_by_id(&api, &id)
+        .await?
         .ok_or_else(|| Error::UnknownRuntime(id.clone()))?;
     Ok((StatusCode::CREATED, Json(resource)))
 }
@@ -12473,15 +12475,12 @@ async fn delete_remote_runtime(
             "the embedded Runtime is built in and cannot be deleted",
         ));
     }
-    let mut runtime_config = load_backend_runtimes_config_for_settings(&api)?;
-    let before = runtime_config.runtimes.remote.len();
-    runtime_config
-        .runtimes
-        .remote
-        .retain(|remote| remote.id != runtime_id);
-    if before == runtime_config.runtimes.remote.len() {
-        return Err(Error::UnknownRuntime(runtime_id).into());
-    }
+    let binding = api
+        .store
+        .get_workspace_runtime_binding(&api.config.workspace_id, &runtime_id)
+        .await?
+        .filter(|binding| binding.revoked_at.is_none())
+        .ok_or_else(|| Error::UnknownRuntime(runtime_id.clone()))?;
     match api
         .runtime
         .unregister_if_idle(&runtime_id, api.config.max_records.min(200))
@@ -12510,7 +12509,14 @@ async fn delete_remote_runtime(
             ));
         }
     }
-    write_backend_runtimes_config_for_settings(&api, &runtime_config)?;
+    let now = Utc::now().to_rfc3339();
+    if !api
+        .store
+        .revoke_workspace_runtime_binding_record(&binding.workspace_id, &binding.runtime_id, &now)
+        .await?
+    {
+        return Err(Error::UnknownRuntime(runtime_id).into());
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -12518,14 +12524,13 @@ async fn test_runtime_connection(
     State(api): State<WorkspaceApi>,
     AxumPath(runtime_id): AxumPath<String>,
 ) -> ApiResult<Json<RuntimeConnectionTestResponse>> {
-    let runtime_config = load_backend_runtimes_config_for_settings(&api)?;
-    let remote = runtime_config
-        .runtimes
-        .remote
-        .iter()
-        .find(|remote| remote.id == runtime_id)
+    let binding = api
+        .store
+        .get_workspace_runtime_binding(&api.config.workspace_id, &runtime_id)
+        .await?
+        .filter(|binding| binding.revoked_at.is_none())
         .ok_or_else(|| Error::UnknownRuntime(runtime_id.clone()))?;
-    Ok(Json(test_remote_runtime_config(&api, remote).await))
+    Ok(Json(test_remote_runtime_binding(&api, &binding).await))
 }
 
 async fn get_worker_launch_options(
@@ -14384,92 +14389,49 @@ fn workers_response(
     })
 }
 
-fn load_backend_runtimes_config_for_settings(
+async fn workspace_runtime_resources_response(
     api: &WorkspaceApi,
-) -> ApiResult<BackendRuntimesConfigFile> {
-    api.config
-        .runtime_config_path
-        .as_ref()
-        .map(BackendRuntimesConfigFile::load_from_path)
-        .transpose()
-        .map_err(|error| {
-            Error::Config(format!(
-                "failed to read Backend runtimes config for Runtime connections: {}",
-                sanitize_backend_error(&error.to_string())
-            ))
-            .into()
-        })
-        .map(|config| config.unwrap_or_default())
-}
-
-fn write_backend_runtimes_config_for_settings(
-    api: &WorkspaceApi,
-    runtime_config: &BackendRuntimesConfigFile,
-) -> ApiResult<()> {
-    let path = api.config.runtime_config_path.as_ref().ok_or_else(|| {
-        Error::Config(
-            "Backend runtimes config path is unavailable; set YOI_CONFIG_DIR, YOI_HOME, XDG_CONFIG_HOME, or HOME"
-                .to_string(),
-        )
-    })?;
-    runtime_config.write_to_path(path).map_err(|error| {
-        Error::Config(format!(
-            "failed to write Backend runtimes config for Runtime connections: {}",
-            sanitize_backend_error(&error.to_string())
-        ))
-        .into()
-    })
-}
-
-fn workspace_runtime_resources_response(
-    api: &WorkspaceApi,
-    runtime_config: &BackendRuntimesConfigFile,
-) -> workspace_api::ListResponse<WorkspaceRuntimeResource> {
+    workspace_id: &str,
+) -> ApiResult<workspace_api::ListResponse<WorkspaceRuntimeResource>> {
     let limit = api.config.max_records.min(200);
     let runtimes = api.runtime.list_runtimes(limit);
+    let bindings = api
+        .store
+        .list_workspace_runtime_bindings(workspace_id, false)
+        .await?;
     let mut items = runtimes
         .items
         .into_iter()
         .map(|runtime| {
-            let remote = runtime_config
-                .runtimes
-                .remote
+            let binding = bindings
                 .iter()
-                .find(|remote| remote.id == runtime.runtime_id);
+                .find(|binding| binding.runtime_id == runtime.runtime_id);
             let built_in = runtime.runtime_id == EMBEDDED_WORKER_RUNTIME_ID;
             WorkspaceRuntimeResource {
                 runtime: runtime.into(),
                 management: RuntimeManagementSummary {
                     built_in,
-                    config_managed: remote.is_some(),
-                    removable: remote.is_some() && !built_in,
-                    endpoint_configured: remote
-                        .is_some_and(|remote| !remote.endpoint.trim().is_empty()),
-                    token_ref_configured: remote.is_some_and(|remote| {
-                        remote
-                            .token_ref
-                            .as_deref()
-                            .is_some_and(|value| !value.trim().is_empty())
-                    }),
+                    config_managed: binding.is_some(),
+                    removable: binding.is_some() && !built_in,
+                    endpoint_configured: binding
+                        .is_some_and(|binding| !binding.base_url.trim().is_empty()),
+                    token_ref_configured: false,
                 },
             }
         })
         .collect::<Vec<_>>();
 
-    for remote in &runtime_config.runtimes.remote {
+    for binding in &bindings {
         if items
             .iter()
-            .any(|resource| resource.runtime.runtime_id == remote.id)
+            .any(|resource| resource.runtime.runtime_id == binding.runtime_id)
         {
             continue;
         }
         items.push(WorkspaceRuntimeResource {
             runtime: workspace_api::RuntimeSummary {
-                runtime_id: remote.id.clone(),
-                label: remote
-                    .display_name
-                    .clone()
-                    .unwrap_or_else(|| remote.id.clone()),
+                runtime_id: binding.runtime_id.clone(),
+                label: binding.display_name.clone(),
                 kind: "remote_http".to_string(),
                 status: "unavailable".to_string(),
                 source: workspace_api::RuntimeSourceSummary {
@@ -14477,7 +14439,7 @@ fn workspace_runtime_resources_response(
                     status: workspace_api::RuntimeSourceStatus::Reserved,
                     identity_authority:
                         workspace_api::RuntimeIdentityAuthority::ServerRuntimeConfiguration,
-                    note: "The configured Runtime is not present in the active Runtime registry."
+                    note: "The registered Runtime is not present in the active Runtime registry."
                         .to_string(),
                 },
                 host_ids: Vec::new(),
@@ -14486,9 +14448,9 @@ fn workspace_runtime_resources_response(
                 arch: String::new(),
                 diagnostics: vec![
                     settings_diagnostic(
-                        "configured_runtime_unavailable",
+                        "registered_runtime_unavailable",
                         DiagnosticSeverity::Warning,
-                        "The configured Runtime is not present in the active Runtime registry.",
+                        "The registered Runtime is not present in the active Runtime registry.",
                     )
                     .into(),
                 ],
@@ -14497,33 +14459,32 @@ fn workspace_runtime_resources_response(
                 built_in: false,
                 config_managed: true,
                 removable: true,
-                endpoint_configured: !remote.endpoint.trim().is_empty(),
-                token_ref_configured: remote
-                    .token_ref
-                    .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty()),
+                endpoint_configured: !binding.base_url.trim().is_empty(),
+                token_ref_configured: false,
             },
         });
     }
 
-    workspace_api::ListResponse {
-        workspace_id: api.config.workspace_id.clone(),
+    Ok(workspace_api::ListResponse {
+        workspace_id: workspace_id.to_string(),
         limit,
         items,
-        source: "workspace-runtime-resources".to_string(),
+        source: "workspace-runtime-bindings".to_string(),
         diagnostics: runtimes.diagnostics.into_iter().map(Into::into).collect(),
-    }
+    })
 }
 
-fn workspace_runtime_resource_by_id(
+async fn workspace_runtime_resource_by_id(
     api: &WorkspaceApi,
-    runtime_config: &BackendRuntimesConfigFile,
     runtime_id: &str,
-) -> Option<WorkspaceRuntimeResource> {
-    workspace_runtime_resources_response(api, runtime_config)
-        .items
-        .into_iter()
-        .find(|resource| resource.runtime.runtime_id == runtime_id)
+) -> ApiResult<Option<WorkspaceRuntimeResource>> {
+    Ok(
+        workspace_runtime_resources_response(api, &api.config.workspace_id)
+            .await?
+            .items
+            .into_iter()
+            .find(|resource| resource.runtime.runtime_id == runtime_id),
+    )
 }
 
 fn validate_runtime_connection_request(request: &CreateRemoteRuntimeRequest) -> ApiResult<()> {
@@ -14569,46 +14530,24 @@ fn validate_public_runtime_id(runtime_id: &str) -> ApiResult<()> {
     Ok(())
 }
 
-fn remote_runtime_config_from_file(
-    remote: &RemoteRuntimeConfigFile,
+fn remote_runtime_config_from_binding(
+    binding: &WorkspaceRuntimeBinding,
 ) -> std::result::Result<RemoteRuntimeConfig, RuntimeDiagnostic> {
-    resolve_remote_runtime(remote).map_err(|err| {
-        settings_diagnostic(
-            "remote_runtime_apply_failed",
-            DiagnosticSeverity::Error,
-            err.to_string(),
-        )
-    })
+    let remote = RemoteRuntimeConfig::new(
+        binding.runtime_id.clone(),
+        binding.display_name.clone(),
+        binding.base_url.clone(),
+        None,
+    )
+    .with_workspace_id(binding.workspace_id.clone());
+    Ok(remote)
 }
 
-async fn test_remote_runtime_config(
+async fn test_remote_runtime_binding(
     api: &WorkspaceApi,
-    remote: &RemoteRuntimeConfigFile,
+    remote: &WorkspaceRuntimeBinding,
 ) -> RuntimeConnectionTestResponse {
     let checked_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    if remote
-        .token_ref
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        return RuntimeConnectionTestResponse {
-            workspace_id: api.config.workspace_id.clone(),
-            runtime_id: remote.id.clone(),
-            checked_at,
-            state: "rejected".to_string(),
-            protocol_version: None,
-            compatibility_basis: "not_checked_token_ref_unsupported".to_string(),
-            capabilities: Vec::new(),
-            health_result: "not_checked".to_string(),
-            diagnostics: vec![settings_diagnostic(
-                "remote_runtime_token_ref_unsupported",
-                DiagnosticSeverity::Error,
-                "Remote Runtime test cannot use token_ref in v0; no token or secret value was exposed to the Browser.",
-            )
-            .into()],
-        };
-    }
-
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -14866,7 +14805,7 @@ async fn test_remote_runtime_config(
 
     RuntimeConnectionTestResponse {
         workspace_id: api.config.workspace_id.clone(),
-        runtime_id: remote.id.clone(),
+        runtime_id: remote.runtime_id.clone(),
         checked_at,
         state: observation.state().to_string(),
         protocol_version,
@@ -14889,14 +14828,14 @@ async fn test_remote_runtime_config(
 
 fn remote_runtime_test_failed(
     api: &WorkspaceApi,
-    remote: &RemoteRuntimeConfigFile,
+    remote: &WorkspaceRuntimeBinding,
     checked_at: String,
     code: impl Into<String>,
     message: impl Into<String>,
 ) -> RuntimeConnectionTestResponse {
     RuntimeConnectionTestResponse {
         workspace_id: api.config.workspace_id.clone(),
-        runtime_id: remote.id.clone(),
+        runtime_id: remote.runtime_id.clone(),
         checked_at,
         state: "failed".to_string(),
         protocol_version: None,
@@ -14953,10 +14892,10 @@ impl RuntimeCompatibilityObservation {
 }
 
 fn remote_probe_url(
-    remote: &RemoteRuntimeConfigFile,
+    remote: &WorkspaceRuntimeBinding,
     path: &str,
 ) -> std::result::Result<String, RuntimeDiagnostic> {
-    let endpoint = remote.endpoint.trim();
+    let endpoint = remote.base_url.trim();
     if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
         return Err(settings_diagnostic(
             "remote_runtime_endpoint_invalid",
@@ -16400,6 +16339,7 @@ impl IntoResponse for ApiError {
             Error::TicketAssignmentConflict(_)
             | Error::WorkdirAttachmentConflict(_)
             | Error::WorkspaceConfigConflict(_)
+            | Error::RuntimeBindingConflict(_)
             | Error::RepositoryConflict(_) => StatusCode::CONFLICT,
             Error::WorkerSourceIdentity(_) | Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
             Error::InvalidRuntimeIdentifier { .. } | Error::ReservedWorkerName(_) => {
@@ -16539,7 +16479,6 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::WorkspaceBackendRuntimesConfig;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use futures::{SinkExt, StreamExt};
@@ -16565,7 +16504,7 @@ mod tests {
     use crate::store::{
         AccountRecord, ApiTokenRecord, BrowserSessionRecord, MemoryDocumentRecord,
         MemoryStagingRecord, ObjectiveRecord, ObjectiveResourceRecord, ObjectiveTicketLinkRecord,
-        SqliteWorkspaceStore, TrustedRuntimeRecord, UserRecord, WorkspaceRecord,
+        SqliteWorkspaceStore, UserRecord, WorkspaceRecord, WorkspaceRuntimeBinding,
     };
 
     fn handler_source<'a>(source: &'a str, name: &str) -> &'a str {
@@ -16926,16 +16865,20 @@ mod tests {
         });
         SqliteWorkspaceStore::open(&api.config.database_path)
             .unwrap()
-            .upsert_trusted_runtime(&TrustedRuntimeRecord {
-                runtime_id: runtime_id.to_owned(),
-                workspace_id: Some(api.workspace_id().to_owned()),
-                display_name: runtime_id.to_owned(),
-                base_url: "https://runtime.test".to_owned(),
-                public_key: identity.public_key.clone(),
-                created_at: "2026-01-01T00:00:00Z".to_owned(),
-                updated_at: "2026-01-01T00:00:00Z".to_owned(),
-                revoked_at: None,
-            })
+            .upsert_workspace_runtime_binding(
+                WorkspaceRuntimeBinding {
+                    workspace_id: api.workspace_id().to_owned(),
+                    runtime_id: runtime_id.to_owned(),
+                    display_name: runtime_id.to_owned(),
+                    base_url: "https://runtime.test".to_owned(),
+                    public_key: Some(identity.public_key.clone()),
+                    public_key_fingerprint: None,
+                    created_at: "2026-01-01T00:00:00Z".to_owned(),
+                    updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                    revoked_at: None,
+                },
+                false,
+            )
             .unwrap();
     }
 
@@ -18901,13 +18844,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn catalog_runtime_sources_are_scoped_by_workspace_and_runtime_id() {
+        let mut base = test_server_config(tempfile::tempdir().unwrap().path());
+        base.remote_runtime_sources = vec![
+            RemoteRuntimeConfig::new("shared", "A", "https://a.runtime.test", None)
+                .with_workspace_id("workspace-a"),
+            RemoteRuntimeConfig::new("shared", "B", "https://b.runtime.test", None)
+                .with_workspace_id("workspace-b"),
+        ];
+        let workspace = WorkspaceRecord {
+            workspace_id: "workspace-b".to_string(),
+            display_name: "Workspace B".to_string(),
+            state: "active".to_string(),
+            owner_account_id: "owner-account".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        let source = workspace_api::RepositorySource {
+            kind: workspace_api::RepositorySourceKind::Https,
+            uri: "https://example.test/org/repository.git".to_string(),
+        };
+        let repositories = vec![RepositoryRecord {
+            workspace_id: "workspace-b".to_string(),
+            repository_id: "main".to_string(),
+            repository_key: "main".to_string(),
+            kind: "git".to_string(),
+            provider: Some("git".to_string()),
+            source_fingerprint: crate::repository_source::repository_source_fingerprint(&source),
+            source,
+            default_ref: Some("main".to_string()),
+            source_revision: 1,
+            observed_status: workspace_api::RepositoryObservedStatus::Unverified,
+            observed_at: None,
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        }];
+        let scoped = base
+            .for_catalog_workspace(&workspace, repositories)
+            .unwrap();
+        assert_eq!(scoped.remote_runtime_sources.len(), 1);
+        assert_eq!(scoped.remote_runtime_sources[0].runtime_id, "shared");
+        assert_eq!(
+            scoped.remote_runtime_sources[0].base_url,
+            "https://b.runtime.test"
+        );
+    }
+
     fn test_server_config(workspace_root: impl Into<PathBuf>) -> ServerConfig {
         let workspace_root = workspace_root.into();
         let store_root = workspace_root.join(".test-embedded-runtime-store");
         let mut config = ServerConfig::local_dev(workspace_root.clone(), test_identity())
             .with_embedded_runtime_store_root(store_root);
         config.database_path = workspace_root.join(".test-yoi-server.db");
-        config.runtime_config_path = Some(workspace_root.join(".test-config/runtimes.toml"));
         let source = workspace_api::RepositorySource {
             kind: workspace_api::RepositorySourceKind::LocalPath,
             uri: workspace_root.display().to_string(),
@@ -22906,17 +22895,20 @@ mod tests {
             })
             .await
             .unwrap();
-        let trust = crate::store::TrustedRuntimeRecord {
+        let trust = crate::store::WorkspaceRuntimeBinding {
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
             runtime_id: "runtime-remote".to_string(),
-            workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
             display_name: "Remote Runtime".to_string(),
             base_url: "https://runtime.invalid".to_string(),
-            public_key: identity.public_key.clone(),
+            public_key: Some(identity.public_key.clone()),
+            public_key_fingerprint: None,
             created_at: "2026-08-11T00:00:00Z".to_string(),
             updated_at: "2026-08-11T00:00:00Z".to_string(),
             revoked_at: None,
         };
-        store.upsert_trusted_runtime(&trust).unwrap();
+        store
+            .upsert_workspace_runtime_binding(trust.clone(), false)
+            .unwrap();
         let api = WorkspaceApi::new_with_execution_backend(
             config,
             Arc::new(store),
@@ -23179,7 +23171,9 @@ mod tests {
         let mut revoked = trust;
         revoked.revoked_at = Some("2026-08-11T00:01:00Z".to_string());
         let authority = SqliteWorkspaceStore::open(api.config.database_path.clone()).unwrap();
-        authority.upsert_trusted_runtime(&revoked).unwrap();
+        authority
+            .upsert_workspace_runtime_binding(revoked, true)
+            .unwrap();
         let revoked_token = signer
             .issue_worker_remove(
                 "server-main",
@@ -23190,16 +23184,20 @@ mod tests {
                 60,
             )
             .unwrap();
-        assert!(matches!(
-            crate::worker_source::verify_worker_remove_source(
-                &api,
-                crate::worker_source::PresentedWorkerMutationSourceProof::Remote(&revoked_token),
-                "runtime-target",
-                "target-worker",
-            )
-            .await,
-            Err(crate::worker_source::WorkerMutationSourceProofError::RevokedRuntimeTrust)
-        ));
+        let revoked_result = crate::worker_source::verify_worker_remove_source(
+            &api,
+            crate::worker_source::PresentedWorkerMutationSourceProof::Remote(&revoked_token),
+            "runtime-target",
+            "target-worker",
+        )
+        .await;
+        assert!(
+            matches!(
+                revoked_result,
+                Err(crate::worker_source::WorkerMutationSourceProofError::RevokedRuntimeTrust)
+            ),
+            "unexpected revoked trust result: {revoked_result:?}"
+        );
     }
 
     fn seed_worker_source_member(api: &WorkspaceApi, runtime_id: &str, worker_id: &str) {
@@ -24431,7 +24429,7 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            Err(crate::worker_source::WorkerMutationSourceProofError::WrongWorkspace)
+            Err(crate::worker_source::WorkerMutationSourceProofError::RevokedRuntimeTrust)
         ));
     }
 
@@ -25413,7 +25411,9 @@ mod tests {
     #[tokio::test]
     async fn runtime_rest_resource_create_list_and_delete_apply_live_registry() {
         let dir = tempfile::tempdir().unwrap();
-        let app = test_app(dir.path()).await;
+        let api = test_api(dir.path()).await;
+        let store = api.store.clone();
+        let app = build_inner_router(api);
         let runtimes_uri = format!("/api/w/{TEST_WORKSPACE_ID}/runtimes");
 
         let initial = get_json(app.clone(), &runtimes_uri).await;
@@ -25460,16 +25460,14 @@ mod tests {
         let projected = serde_json::to_string(&added).unwrap();
         assert!(!projected.contains("runtime.example.invalid"));
 
-        let persisted = BackendRuntimesConfigFile::load_from_path(
-            dir.path().join(".test-config/runtimes.toml"),
-        )
-        .unwrap();
-        assert_eq!(persisted.runtimes.remote.len(), 1);
-        assert_eq!(persisted.runtimes.remote[0].id, "team-runtime");
-        assert_eq!(
-            persisted.runtimes.remote[0].endpoint,
-            "https://runtime.example.invalid"
-        );
+        let persisted = store
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, "team-runtime")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.runtime_id, "team-runtime");
+        assert_eq!(persisted.base_url, "https://runtime.example.invalid");
+        assert!(persisted.revoked_at.is_none());
 
         let launch_options = get_json(app.clone(), "/api/workers/launch-options").await;
         let runtimes = launch_options["runtimes"].as_array().unwrap();
@@ -25501,11 +25499,12 @@ mod tests {
                 .iter()
                 .any(|runtime| runtime["runtime_id"] == "team-runtime")
         );
-        let persisted = BackendRuntimesConfigFile::load_from_path(
-            dir.path().join(".test-config/runtimes.toml"),
-        )
-        .unwrap();
-        assert!(persisted.runtimes.remote.is_empty());
+        let persisted = store
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, "team-runtime")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(persisted.revoked_at.is_some());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -25568,11 +25567,6 @@ mod tests {
                 .iter()
                 .any(|diagnostic| { diagnostic["code"] == "remote_runtime_delete_blocked" })
         );
-        let persisted = BackendRuntimesConfigFile::load_from_path(
-            dir.path().join(".test-config/runtimes.toml"),
-        )
-        .unwrap();
-        assert_eq!(persisted.runtimes.remote.len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -25592,19 +25586,25 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let endpoint = format!("http://{runtime_addr}");
-        BackendRuntimesConfigFile {
-            runtimes: WorkspaceBackendRuntimesConfig {
-                remote: vec![RemoteRuntimeConfigFile {
-                    id: "probe-runtime".to_string(),
-                    endpoint: endpoint.clone(),
-                    display_name: Some("Probe Runtime".to_string()),
-                    token_ref: None,
-                }],
-            },
-        }
-        .write_to_path(dir.path().join(".test-config/runtimes.toml"))
-        .unwrap();
-        let app = test_app(dir.path()).await;
+        let api = test_api(dir.path()).await;
+        api.store
+            .upsert_workspace_runtime_binding_record(
+                WorkspaceRuntimeBinding {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    runtime_id: "probe-runtime".to_string(),
+                    display_name: "Probe Runtime".to_string(),
+                    base_url: endpoint.clone(),
+                    public_key: None,
+                    public_key_fingerprint: None,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    revoked_at: None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let app = build_inner_router(api);
 
         let response = post_json(
             app,
@@ -25656,19 +25656,25 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let endpoint = format!("http://{runtime_addr}");
-        BackendRuntimesConfigFile {
-            runtimes: WorkspaceBackendRuntimesConfig {
-                remote: vec![RemoteRuntimeConfigFile {
-                    id: "control-only-runtime".to_string(),
-                    display_name: Some("Control-only Runtime".to_string()),
-                    endpoint,
-                    token_ref: None,
-                }],
-            },
-        }
-        .write_to_path(dir.path().join(".test-config/runtimes.toml"))
-        .unwrap();
-        let app = test_app(dir.path()).await;
+        let api = test_api(dir.path()).await;
+        api.store
+            .upsert_workspace_runtime_binding_record(
+                WorkspaceRuntimeBinding {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    runtime_id: "control-only-runtime".to_string(),
+                    display_name: "Control-only Runtime".to_string(),
+                    base_url: endpoint,
+                    public_key: None,
+                    public_key_fingerprint: None,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    revoked_at: None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let app = build_inner_router(api);
 
         let response = post_json(
             app,

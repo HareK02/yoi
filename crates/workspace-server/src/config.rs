@@ -5,12 +5,10 @@ use std::{fs, io};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::hosts::RemoteRuntimeConfig;
 use crate::identity::WorkspaceIdentity;
 use crate::server::{AuthConfig, ServerConfig};
 use crate::{Error, Result};
 
-pub const BACKEND_RUNTIMES_CONFIG_FILE_NAME: &str = "runtimes.toml";
 pub const SERVER_HOST_CONFIG_FILE_NAME: &str = "server.toml";
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 const DEFAULT_BROWSER_PUBLIC_URL: &str = "http://localhost:5173";
@@ -49,31 +47,6 @@ impl Default for ServerBrowserConfig {
 
 fn default_browser_public_url() -> String {
     DEFAULT_BROWSER_PUBLIC_URL.to_string()
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct BackendRuntimesConfigFile {
-    #[serde(default)]
-    pub runtimes: WorkspaceBackendRuntimesConfig,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct WorkspaceBackendRuntimesConfig {
-    #[serde(default)]
-    pub remote: Vec<RemoteRuntimeConfigFile>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RemoteRuntimeConfigFile {
-    pub id: String,
-    pub endpoint: String,
-    #[serde(default)]
-    pub display_name: Option<String>,
-    #[serde(default)]
-    pub token_ref: Option<String>,
 }
 
 #[derive(Clone)]
@@ -124,80 +97,11 @@ impl ServerHostConfigFile {
     }
 }
 
-impl BackendRuntimesConfigFile {
-    pub fn path_for_config_dir(config_dir: impl AsRef<Path>) -> PathBuf {
-        config_dir.as_ref().join(BACKEND_RUNTIMES_CONFIG_FILE_NAME)
-    }
-
-    pub fn default_path() -> Option<PathBuf> {
-        manifest::paths::config_dir().map(Self::path_for_config_dir)
-    }
-
-    pub fn load_default() -> Result<Self> {
-        match Self::default_path() {
-            Some(path) => Self::load_from_path(path),
-            None => Ok(Self::default()),
-        }
-    }
-
-    pub fn load_from_config_dir(config_dir: impl AsRef<Path>) -> Result<Self> {
-        Self::load_from_path(Self::path_for_config_dir(config_dir))
-    }
-
-    pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        match fs::read_to_string(path) {
-            Ok(raw) => Self::parse_str(&raw, path),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(Error::Io(error)),
-        }
-    }
-
-    pub fn write_default(&self) -> Result<PathBuf> {
-        let path = Self::default_path().ok_or_else(|| {
-            Error::Config(
-                "YOI_CONFIG_DIR, YOI_HOME, XDG_CONFIG_HOME, or HOME is required to write Backend runtimes config"
-                    .to_string(),
-            )
-        })?;
-        self.write_to_path(&path)?;
-        Ok(path)
-    }
-
-    pub fn write_to_config_dir(&self, config_dir: impl AsRef<Path>) -> Result<()> {
-        self.write_to_path(Self::path_for_config_dir(config_dir))
-    }
-
-    pub fn write_to_path(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let raw = toml::to_string_pretty(self).map_err(|error| {
-            Error::Config(format!(
-                "failed to serialize Backend runtimes config: {error}"
-            ))
-        })?;
-        fs::write(path, raw)?;
-        Ok(())
-    }
-
-    pub fn parse_str(raw: &str, path: impl AsRef<Path>) -> Result<Self> {
-        toml::from_str(raw).map_err(|error| {
-            Error::Config(format!(
-                "failed to parse Backend runtimes config `{}`: {error}",
-                path.as_ref().display()
-            ))
-        })
-    }
-}
-
 impl ResolvedWorkspaceBackendConfig {
     pub fn local_dev(
         workspace_root: impl AsRef<Path>,
         identity: WorkspaceIdentity,
         host_config: &ServerHostConfigFile,
-        runtime_config: &BackendRuntimesConfigFile,
     ) -> Result<Self> {
         let workspace_root = workspace_root.as_ref();
         let data_root = ServerConfig::default_workspace_backend_data_root(&identity.workspace_id);
@@ -208,12 +112,7 @@ impl ResolvedWorkspaceBackendConfig {
         server.database_path = database_path.clone();
         server.embedded_runtime_store_root = data_root.join("embedded-runtime");
         server.max_records = DEFAULT_MAX_RECORDS;
-        server.remote_runtime_sources = runtime_config
-            .runtimes
-            .remote
-            .iter()
-            .map(resolve_remote_runtime)
-            .collect::<Result<Vec<_>>>()?;
+        server.remote_runtime_sources = Vec::new();
         server.auth = AuthConfig::Passkey {
             rp_id: browser_rp_id,
             origin: browser_public_url.clone(),
@@ -250,26 +149,6 @@ fn normalize_required_string(field: &str, value: &str) -> Result<String> {
         return Err(Error::Config(format!("{field} must not be empty")));
     }
     Ok(trimmed.to_string())
-}
-
-pub(crate) fn resolve_remote_runtime(
-    config: &RemoteRuntimeConfigFile,
-) -> Result<RemoteRuntimeConfig> {
-    if let Some(token_ref) = config.token_ref.as_deref() {
-        return Err(Error::Config(format!(
-            "remote runtime `{}` uses token_ref `{token_ref}`, but secret ref resolution is not implemented for Backend runtime settings yet",
-            config.id
-        )));
-    }
-    Ok(RemoteRuntimeConfig::new(
-        config.id.clone(),
-        config
-            .display_name
-            .clone()
-            .unwrap_or_else(|| config.id.clone()),
-        config.endpoint.clone(),
-        None,
-    ))
 }
 
 fn resolve_browser_public_url(value: &str) -> Result<(String, String)> {
@@ -314,22 +193,19 @@ mod tests {
         }
     }
 
-    fn resolved_with_runtimes(
-        runtimes: &BackendRuntimesConfigFile,
-    ) -> ResolvedWorkspaceBackendConfig {
+    fn resolved() -> ResolvedWorkspaceBackendConfig {
         let dir = tempfile::tempdir().unwrap();
         ResolvedWorkspaceBackendConfig::local_dev(
             dir.path(),
             identity(),
             &ServerHostConfigFile::default(),
-            runtimes,
         )
         .unwrap()
     }
 
     #[test]
     fn default_settings_resolve_without_a_repository_file() {
-        let resolved = resolved_with_runtimes(&BackendRuntimesConfigFile::default());
+        let resolved = resolved();
 
         assert_eq!(resolved.listen, "127.0.0.1:8787".parse().unwrap());
         let AuthConfig::Passkey {
@@ -354,7 +230,7 @@ mod tests {
     #[test]
     fn backend_base_url_is_explicit_and_normalized() {
         let listen = "127.0.0.1:48787".parse().unwrap();
-        let resolved = resolved_with_runtimes(&BackendRuntimesConfigFile::default())
+        let resolved = resolved()
             .with_listen(listen)
             .with_backend_base_url("http://127.0.0.1:48787/");
 
@@ -376,7 +252,6 @@ mod tests {
             tempfile::tempdir().unwrap().path(),
             identity(),
             &host_config,
-            &BackendRuntimesConfigFile::default(),
         )
         .unwrap();
 
@@ -407,7 +282,6 @@ mod tests {
                 tempfile::tempdir().unwrap().path(),
                 identity(),
                 &host_config,
-                &BackendRuntimesConfigFile::default(),
             );
             let error = match result {
                 Ok(_) => panic!("expected {value} to be rejected"),
@@ -446,92 +320,8 @@ mod tests {
     }
 
     #[test]
-    fn backend_runtimes_config_loads_from_config_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = BackendRuntimesConfigFile {
-            runtimes: WorkspaceBackendRuntimesConfig {
-                remote: vec![RemoteRuntimeConfigFile {
-                    id: "arc".to_string(),
-                    endpoint: "http://127.0.0.1:38800".to_string(),
-                    display_name: Some("arc".to_string()),
-                    token_ref: None,
-                }],
-            },
-        };
-        config.write_to_config_dir(dir.path()).unwrap();
-        let loaded = BackendRuntimesConfigFile::load_from_config_dir(dir.path()).unwrap();
-        assert_eq!(loaded, config);
-        assert_eq!(
-            BackendRuntimesConfigFile::path_for_config_dir(dir.path()),
-            dir.path().join("runtimes.toml")
-        );
-    }
-
-    #[test]
-    fn backend_runtimes_config_is_the_only_runtime_source() {
-        let runtime_config = BackendRuntimesConfigFile::parse_str(
-            r#"
-[[runtimes.remote]]
-id = "arc"
-endpoint = "http://xdg.example.test"
-display_name = "xdg arc"
-"#,
-            "runtimes.toml",
-        )
-        .unwrap();
-        let resolved = resolved_with_runtimes(&runtime_config);
-        assert_eq!(resolved.server.remote_runtime_sources.len(), 1);
-        assert_eq!(resolved.server.remote_runtime_sources[0].runtime_id, "arc");
-        assert_eq!(
-            resolved.server.remote_runtime_sources[0].base_url.as_str(),
-            "http://xdg.example.test"
-        );
-    }
-
-    #[test]
-    fn token_value_field_is_not_in_runtime_schema() {
-        let error = BackendRuntimesConfigFile::parse_str(
-            r#"
-[[runtimes.remote]]
-id = "remote"
-endpoint = "http://127.0.0.1:8790"
-token = "secret"
-"#,
-            "runtimes.toml",
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("unknown field"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn token_ref_fails_closed_until_secret_resolution_exists() {
-        let runtime_config = BackendRuntimesConfigFile::parse_str(
-            r#"
-[[runtimes.remote]]
-id = "remote"
-endpoint = "http://127.0.0.1:8790"
-token_ref = "local:remote-token"
-"#,
-            "runtimes.toml",
-        )
-        .unwrap();
-        let error = match ResolvedWorkspaceBackendConfig::local_dev(
-            tempfile::tempdir().unwrap().path(),
-            identity(),
-            &ServerHostConfigFile::default(),
-            &runtime_config,
-        ) {
-            Ok(_) => panic!("token_ref should fail closed until secret resolution exists"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("secret ref resolution is not implemented"),
-            "unexpected error: {error}"
-        );
+    fn local_host_config_does_not_supply_runtime_authority() {
+        let resolved = resolved();
+        assert!(resolved.server.remote_runtime_sources.is_empty());
     }
 }
