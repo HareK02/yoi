@@ -12,6 +12,7 @@
   } from '$lib/workspace/sidebar/context';
   import { createOverrideStack } from '$lib/workspace/sidebar/override-stack';
   import { disposeWorkspaceMultiplexer } from '$lib/workspace/multiplexer';
+  import { disposeWorkspaceWorkersStore } from '$lib/workspace/sidebar/worker-subscription';
   import WorkspaceSidebar from '$lib/workspace/sidebar/WorkspaceSidebar.svelte';
   import '$lib/workspace/styles/workspace-pages.css';
   import '$lib/workspace/styles/tickets.css';
@@ -32,7 +33,10 @@
   $effect(() => {
     const workspaceId = data.workspace?.workspace_id;
     if (!workspaceId) return;
-    return () => disposeWorkspaceMultiplexer(workspaceId);
+    return () => {
+      disposeWorkspaceMultiplexer(workspaceId);
+      disposeWorkspaceWorkersStore(workspaceId);
+    };
   });
 </script>
 

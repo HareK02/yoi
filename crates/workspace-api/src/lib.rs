@@ -607,6 +607,124 @@ pub struct WorkspaceMetadataMutationResponse {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+pub const WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES: usize = 128;
+pub const WORKSPACE_DELETION_MAX_REVISION_BYTES: usize = 128;
+pub const WORKSPACE_DELETION_MAX_CONFIRMATION_BYTES: usize = 256;
+pub const WORKSPACE_DELETION_MAX_BLOCKERS: usize = 1024;
+pub const WORKSPACE_DELETION_MAX_CHILD_OPERATION_IDS: usize = 4096;
+pub const WORKSPACE_DELETION_MAX_RESOURCE_VALUE_BYTES: usize = 128;
+pub const WORKSPACE_DELETION_MAX_BLOCKER_MESSAGE_BYTES: usize = 512;
+
+fn deserialize_workspace_deletion_operation_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() > WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES {
+        return Err(serde::de::Error::custom(
+            "Workspace deletion operation_id is too long",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_workspace_deletion_revision<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() > WORKSPACE_DELETION_MAX_REVISION_BYTES {
+        return Err(serde::de::Error::custom(
+            "Workspace deletion revision is too long",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_workspace_deletion_confirmation<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() > WORKSPACE_DELETION_MAX_CONFIRMATION_BYTES {
+        return Err(serde::de::Error::custom(
+            "Workspace deletion confirmation is too long",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_workspace_deletion_resource_value<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if value
+        .as_ref()
+        .is_some_and(|value| value.len() > WORKSPACE_DELETION_MAX_RESOURCE_VALUE_BYTES)
+    {
+        return Err(serde::de::Error::custom(
+            "Workspace deletion resource value is too long",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_workspace_deletion_blocker_message<'de, D>(
+    deserializer: D,
+) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() > WORKSPACE_DELETION_MAX_BLOCKER_MESSAGE_BYTES {
+        return Err(serde::de::Error::custom(
+            "Workspace deletion blocker message is too long",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_workspace_deletion_blockers<'de, D>(
+    deserializer: D,
+) -> Result<Vec<WorkspaceDeletionBlocker>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Vec::<WorkspaceDeletionBlocker>::deserialize(deserializer)?;
+    if value.len() > WORKSPACE_DELETION_MAX_BLOCKERS {
+        return Err(serde::de::Error::custom(
+            "too many Workspace deletion blockers",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_workspace_deletion_child_operation_ids<'de, D>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Vec::<String>::deserialize(deserializer)?;
+    if value.len() > WORKSPACE_DELETION_MAX_CHILD_OPERATION_IDS {
+        return Err(serde::de::Error::custom(
+            "too many Workspace deletion child operations",
+        ));
+    }
+    if value
+        .iter()
+        .any(|operation_id| operation_id.len() > WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES)
+    {
+        return Err(serde::de::Error::custom(
+            "Workspace deletion child operation_id is too long",
+        ));
+    }
+    Ok(value)
+}
+
 /// Lifecycle state for one durable Workspace deletion operation.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -634,9 +752,8 @@ pub enum WorkspaceDeletionBlockerKind {
 }
 
 /// One bounded, user-actionable blocker returned by preflight or execution.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
 pub struct WorkspaceDeletionBlocker {
     pub kind: WorkspaceDeletionBlockerKind,
     pub resource_kind: Option<String>,
@@ -664,9 +781,8 @@ pub struct WorkspaceDeletionResourceCounts {
 }
 
 /// Owner-only impact preview for deleting one Workspace.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
 pub struct WorkspaceDeletionPreflightResponse {
     pub workspace_id: String,
     pub display_name: String,
@@ -678,9 +794,8 @@ pub struct WorkspaceDeletionPreflightResponse {
 }
 
 /// Idempotent request to start or resume Workspace deletion.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
 pub struct WorkspaceDeletionRequest {
     pub operation_id: String,
     pub expected_revision: String,
@@ -688,9 +803,8 @@ pub struct WorkspaceDeletionRequest {
 }
 
 /// Durable deletion operation projection used by request responses and polling.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
 pub struct WorkspaceDeletionOperationResponse {
     pub operation_id: String,
     pub workspace_id: String,
@@ -703,6 +817,129 @@ pub struct WorkspaceDeletionOperationResponse {
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceDeletionBlockerWire {
+    kind: WorkspaceDeletionBlockerKind,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_resource_value")]
+    resource_kind: Option<String>,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_resource_value")]
+    resource_key: Option<String>,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_blocker_message")]
+    message: String,
+}
+
+impl<'de> Deserialize<'de> for WorkspaceDeletionBlocker {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = WorkspaceDeletionBlockerWire::deserialize(deserializer)?;
+        Ok(Self {
+            kind: wire.kind,
+            resource_kind: wire.resource_kind,
+            resource_key: wire.resource_key,
+            message: wire.message,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceDeletionPreflightResponseWire {
+    workspace_id: String,
+    display_name: String,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_revision")]
+    expected_revision: String,
+    can_delete: bool,
+    resources: WorkspaceDeletionResourceCounts,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_blockers")]
+    blockers: Vec<WorkspaceDeletionBlocker>,
+}
+
+impl<'de> Deserialize<'de> for WorkspaceDeletionPreflightResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = WorkspaceDeletionPreflightResponseWire::deserialize(deserializer)?;
+        Ok(Self {
+            workspace_id: wire.workspace_id,
+            display_name: wire.display_name,
+            expected_revision: wire.expected_revision,
+            can_delete: wire.can_delete,
+            resources: wire.resources,
+            blockers: wire.blockers,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceDeletionRequestWire {
+    #[serde(deserialize_with = "deserialize_workspace_deletion_operation_id")]
+    operation_id: String,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_revision")]
+    expected_revision: String,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_confirmation")]
+    confirmation: String,
+}
+
+impl<'de> Deserialize<'de> for WorkspaceDeletionRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = WorkspaceDeletionRequestWire::deserialize(deserializer)?;
+        Ok(Self {
+            operation_id: wire.operation_id,
+            expected_revision: wire.expected_revision,
+            confirmation: wire.confirmation,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceDeletionOperationResponseWire {
+    #[serde(deserialize_with = "deserialize_workspace_deletion_operation_id")]
+    operation_id: String,
+    workspace_id: String,
+    display_name: String,
+    state: WorkspaceDeletionState,
+    resources: WorkspaceDeletionResourceCounts,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_child_operation_ids")]
+    child_operation_ids: Vec<String>,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_blockers")]
+    blockers: Vec<WorkspaceDeletionBlocker>,
+    failure_category: Option<String>,
+    created_at: String,
+    updated_at: String,
+    completed_at: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for WorkspaceDeletionOperationResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = WorkspaceDeletionOperationResponseWire::deserialize(deserializer)?;
+        Ok(Self {
+            operation_id: wire.operation_id,
+            workspace_id: wire.workspace_id,
+            display_name: wire.display_name,
+            state: wire.state,
+            resources: wire.resources,
+            child_operation_ids: wire.child_operation_ids,
+            blockers: wire.blockers,
+            failure_category: wire.failure_category,
+            created_at: wire.created_at,
+            updated_at: wire.updated_at,
+            completed_at: wire.completed_at,
+        })
+    }
 }
 
 /// Read-only Profile catalog projected from one active Workspace config revision.
@@ -3285,6 +3522,42 @@ mod tests {
                 "expected_revision": "revision-7",
                 "confirmation": "Test",
                 "workspace_id": "caller-controlled"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<WorkspaceDeletionRequest>(serde_json::json!({
+                "operation_id": "x".repeat(WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES + 1),
+                "expected_revision": "revision-7",
+                "confirmation": "Test"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<WorkspaceDeletionOperationResponse>(serde_json::json!({
+                "operation_id": "delete-test",
+                "workspace_id": "workspace-test",
+                "display_name": "Test",
+                "state": "blocked",
+                "resources": {
+                    "workers": 0,
+                    "workdirs": 0,
+                    "repositories": 0,
+                    "runtime_bindings": 0,
+                    "secrets": 0,
+                    "artifacts": 0
+                },
+                "child_operation_ids": [],
+                "blockers": (0..=WORKSPACE_DELETION_MAX_BLOCKERS).map(|_| serde_json::json!({
+                    "kind": "cleanup_unavailable",
+                    "resource_kind": null,
+                    "resource_key": null,
+                    "message": "blocked"
+                })).collect::<Vec<_>>(),
+                "failure_category": null,
+                "created_at": "1",
+                "updated_at": "1",
+                "completed_at": null
             }))
             .is_err()
         );

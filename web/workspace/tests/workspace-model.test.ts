@@ -169,6 +169,22 @@ Deno.test("Workspace deletion DTOs fail closed and preserve durable operation st
       }),
     ".state is invalid",
   );
+  assertThrows(
+    () =>
+      parseWorkspaceDeletionOperationResponse({
+        ...operation,
+        operation_id: "x".repeat(129),
+      }),
+    ".operation_id is too long",
+  );
+  assertThrows(
+    () =>
+      parseWorkspaceDeletionOperationResponse({
+        ...operation,
+        blockers: Array.from({ length: 1025 }, () => operation.blockers[0]),
+      }),
+    ".blockers has too many items",
+  );
 });
 
 Deno.test("Workspace settings exposes owner-gated typed destructive confirmation", async () => {
@@ -185,6 +201,10 @@ Deno.test("Workspace settings exposes owner-gated typed destructive confirmation
       "startWorkspaceDeletion",
       "deletionConfirmation",
       "disposeWorkspaceMultiplexer(workspaceId)",
+      "disposeWorkspaceWorkersStore(workspaceId)",
+      "sessionStorage.setItem(deletionStorageKey",
+      "storedDeletionRequest()",
+      "trackDeletion(request.operation_id)",
     ]
   ) {
     if (!source.includes(token)) {

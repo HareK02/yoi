@@ -22,6 +22,10 @@ export type WorkspaceWorkersState = {
 
 const stores = new Map<string, Readable<WorkspaceWorkersState>>();
 
+export function disposeWorkspaceWorkersStore(workspaceId: string): void {
+  stores.delete(workspaceId);
+}
+
 export function workspaceWorkersStore(workspaceId: string): Readable<WorkspaceWorkersState> {
   const cached = stores.get(workspaceId);
   if (cached) return cached;

@@ -583,6 +583,37 @@ export function parseRepositoryDetailResponse(
   };
 }
 
+const WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES = 128;
+const WORKSPACE_DELETION_MAX_REVISION_BYTES = 128;
+const WORKSPACE_DELETION_MAX_BLOCKERS = 1024;
+const WORKSPACE_DELETION_MAX_CHILD_OPERATION_IDS = 4096;
+const WORKSPACE_DELETION_MAX_RESOURCE_VALUE_BYTES = 128;
+const WORKSPACE_DELETION_MAX_BLOCKER_MESSAGE_BYTES = 512;
+
+function deletionBoundedString(
+  value: unknown,
+  path: string,
+  maxBytes: number,
+): string {
+  const candidate = string(value, path);
+  if (new TextEncoder().encode(candidate).length > maxBytes) {
+    throw new Error(`${path} is too long`);
+  }
+  return candidate;
+}
+
+function deletionBoundedArray(
+  value: unknown,
+  path: string,
+  maxItems: number,
+): unknown[] {
+  const candidate = array(value, path);
+  if (candidate.length > maxItems) {
+    throw new Error(`${path} has too many items`);
+  }
+  return candidate;
+}
+
 const deletionStates = new Set<WorkspaceDeletionState>([
   "queued",
   "running",
@@ -619,14 +650,35 @@ function deletionBlocker(
   if (!deletionBlockerKinds.has(kind)) {
     throw new Error(`${path}.kind is invalid`);
   }
+  const resourceKind = optionalNullableString(
+    item.resource_kind,
+    `${path}.resource_kind`,
+  );
+  const resourceKey = optionalNullableString(
+    item.resource_key,
+    `${path}.resource_key`,
+  );
   return {
     kind,
-    resource_kind:
-      optionalNullableString(item.resource_kind, `${path}.resource_kind`) ??
-        null,
-    resource_key:
-      optionalNullableString(item.resource_key, `${path}.resource_key`) ?? null,
-    message: string(item.message, `${path}.message`),
+    resource_kind: resourceKind === undefined || resourceKind === null
+      ? null
+      : deletionBoundedString(
+        resourceKind,
+        `${path}.resource_kind`,
+        WORKSPACE_DELETION_MAX_RESOURCE_VALUE_BYTES,
+      ),
+    resource_key: resourceKey === undefined || resourceKey === null
+      ? null
+      : deletionBoundedString(
+        resourceKey,
+        `${path}.resource_key`,
+        WORKSPACE_DELETION_MAX_RESOURCE_VALUE_BYTES,
+      ),
+    message: deletionBoundedString(
+      item.message,
+      `${path}.message`,
+      WORKSPACE_DELETION_MAX_BLOCKER_MESSAGE_BYTES,
+    ),
   };
 }
 
@@ -677,9 +729,10 @@ export function parseWorkspaceDeletionPreflightResponse(
       item.display_name,
       "Workspace deletion preflight.display_name",
     ),
-    expected_revision: string(
+    expected_revision: deletionBoundedString(
       item.expected_revision,
       "Workspace deletion preflight.expected_revision",
+      WORKSPACE_DELETION_MAX_REVISION_BYTES,
     ),
     can_delete: boolean(
       item.can_delete,
@@ -689,7 +742,11 @@ export function parseWorkspaceDeletionPreflightResponse(
       item.resources,
       "Workspace deletion preflight.resources",
     ),
-    blockers: array(item.blockers, "Workspace deletion preflight.blockers").map(
+    blockers: deletionBoundedArray(
+      item.blockers,
+      "Workspace deletion preflight.blockers",
+      WORKSPACE_DELETION_MAX_BLOCKERS,
+    ).map(
       (entry, index) =>
         deletionBlocker(
           entry,
@@ -717,9 +774,10 @@ export function parseWorkspaceDeletionOperationResponse(
     "completed_at",
   ], "Workspace deletion operation");
   return {
-    operation_id: string(
+    operation_id: deletionBoundedString(
       item.operation_id,
       "Workspace deletion operation.operation_id",
+      WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES,
     ),
     workspace_id: string(
       item.workspace_id,
@@ -734,16 +792,22 @@ export function parseWorkspaceDeletionOperationResponse(
       item.resources,
       "Workspace deletion operation.resources",
     ),
-    child_operation_ids: array(
+    child_operation_ids: deletionBoundedArray(
       item.child_operation_ids,
       "Workspace deletion operation.child_operation_ids",
+      WORKSPACE_DELETION_MAX_CHILD_OPERATION_IDS,
     ).map((entry, index) =>
-      string(
+      deletionBoundedString(
         entry,
         `Workspace deletion operation.child_operation_ids[${index}]`,
+        WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES,
       )
     ),
-    blockers: array(item.blockers, "Workspace deletion operation.blockers").map(
+    blockers: deletionBoundedArray(
+      item.blockers,
+      "Workspace deletion operation.blockers",
+      WORKSPACE_DELETION_MAX_BLOCKERS,
+    ).map(
       (entry, index) =>
         deletionBlocker(
           entry,

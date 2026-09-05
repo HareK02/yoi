@@ -3,6 +3,9 @@ use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use workspace_api::{
+    WORKSPACE_DELETION_MAX_BLOCKER_MESSAGE_BYTES, WORKSPACE_DELETION_MAX_BLOCKERS,
+    WORKSPACE_DELETION_MAX_CHILD_OPERATION_IDS, WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES,
+    WORKSPACE_DELETION_MAX_RESOURCE_VALUE_BYTES, WORKSPACE_DELETION_MAX_REVISION_BYTES,
     WorkspaceDeletionBlocker, WorkspaceDeletionBlockerKind, WorkspaceDeletionOperationResponse,
     WorkspaceDeletionPreflightResponse, WorkspaceDeletionRequest, WorkspaceDeletionResourceCounts,
     WorkspaceDeletionState,
@@ -10,8 +13,6 @@ use workspace_api::{
 
 use crate::store::{SqliteWorkspaceStore, WorkspaceRecord};
 use crate::{Error, Result};
-
-const MAX_OPERATION_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceDeletionReservation {
@@ -45,6 +46,13 @@ pub trait WorkspaceDeletionStore: Send + Sync {
         runtime_id: &str,
         worker_id: &str,
     ) -> Result<Option<String>>;
+
+    fn workspace_deletion_operation_for_recovery(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<WorkspaceDeletionOperationResponse>>;
+
+    fn resumable_workspace_deletion_operation_ids(&self) -> Result<Vec<String>>;
 
     fn update_workspace_deletion_operation(
         &self,
@@ -84,6 +92,19 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                     message: "You cannot delete your last accessible Workspace.".to_string(),
                 });
             }
+            if resources.workers.saturating_add(resources.workdirs)
+                > WORKSPACE_DELETION_MAX_CHILD_OPERATION_IDS as u64
+            {
+                blockers.push(WorkspaceDeletionBlocker {
+                    kind: WorkspaceDeletionBlockerKind::CleanupUnavailable,
+                    resource_kind: None,
+                    resource_key: None,
+                    message:
+                        "Workspace cleanup exceeds the supported durable child-operation bound."
+                            .to_string(),
+                });
+            }
+            bound_workspace_deletion_blockers(&mut blockers);
             Ok(WorkspaceDeletionPreflightResponse {
                 workspace_id: workspace.workspace_id,
                 display_name: workspace.display_name,
@@ -102,6 +123,13 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
         request: &WorkspaceDeletionRequest,
     ) -> Result<WorkspaceDeletionReservation> {
         validate_operation_id(&request.operation_id)?;
+        if request.expected_revision.len() > WORKSPACE_DELETION_MAX_REVISION_BYTES
+            || request.confirmation.len() > workspace_api::WORKSPACE_DELETION_MAX_CONFIRMATION_BYTES
+        {
+            return Err(Error::InvalidInput(
+                "Workspace deletion request exceeds bounded field limits".to_string(),
+            ));
+        }
         self.with_transaction(|tx| {
             if let Some(existing) = read_operation(tx, &request.operation_id)? {
                 if existing.actor_account_id != actor_account_id {
@@ -228,6 +256,26 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
         })
     }
 
+    fn workspace_deletion_operation_for_recovery(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<WorkspaceDeletionOperationResponse>> {
+        self.with_conn(|conn| Ok(read_operation(conn, operation_id)?.map(|stored| stored.response)))
+    }
+
+    fn resumable_workspace_deletion_operation_ids(&self) -> Result<Vec<String>> {
+        self.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT operation_id FROM workspace_deletion_operations
+                 WHERE state IN ('queued', 'running') ORDER BY created_at, operation_id",
+            )?;
+            statement
+                .query_map([], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+    }
+
     fn update_workspace_deletion_operation(
         &self,
         operation_id: &str,
@@ -236,6 +284,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
         blockers: &[WorkspaceDeletionBlocker],
         failure_category: Option<&str>,
     ) -> Result<WorkspaceDeletionOperationResponse> {
+        validate_operation_projection(child_operation_ids, blockers)?;
         self.with_transaction(|tx| {
             let now = Utc::now().to_rfc3339();
             let completed_at =
@@ -458,6 +507,45 @@ fn owner_workspace(
     Ok(workspace)
 }
 
+pub(crate) fn bound_workspace_deletion_blockers(blockers: &mut Vec<WorkspaceDeletionBlocker>) {
+    for blocker in blockers.iter_mut() {
+        blocker.resource_kind = blocker
+            .resource_kind
+            .take()
+            .map(|value| truncate_utf8(value, WORKSPACE_DELETION_MAX_RESOURCE_VALUE_BYTES));
+        blocker.resource_key = blocker
+            .resource_key
+            .take()
+            .map(|value| truncate_utf8(value, WORKSPACE_DELETION_MAX_RESOURCE_VALUE_BYTES));
+        blocker.message = truncate_utf8(
+            std::mem::take(&mut blocker.message),
+            WORKSPACE_DELETION_MAX_BLOCKER_MESSAGE_BYTES,
+        );
+    }
+    if blockers.len() > WORKSPACE_DELETION_MAX_BLOCKERS {
+        blockers.truncate(WORKSPACE_DELETION_MAX_BLOCKERS - 1);
+        blockers.push(WorkspaceDeletionBlocker {
+            kind: WorkspaceDeletionBlockerKind::CleanupUnavailable,
+            resource_kind: None,
+            resource_key: None,
+            message: "Additional deletion blockers exist; reduce Workspace resources and run preflight again."
+                .to_string(),
+        });
+    }
+}
+
+fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value
+}
+
 fn workspace_database_blockers(
     conn: &rusqlite::Connection,
     workspace_id: &str,
@@ -573,9 +661,36 @@ fn table_count(conn: &rusqlite::Connection, table: &str, workspace_id: &str) -> 
     .map_err(Into::into)
 }
 
+fn validate_operation_projection(
+    child_operation_ids: &[String],
+    blockers: &[WorkspaceDeletionBlocker],
+) -> Result<()> {
+    let invalid_child_ids = child_operation_ids.len() > WORKSPACE_DELETION_MAX_CHILD_OPERATION_IDS
+        || child_operation_ids
+            .iter()
+            .any(|value| value.len() > WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES);
+    let invalid_blockers =
+        blockers.len() > WORKSPACE_DELETION_MAX_BLOCKERS
+            || blockers.iter().any(|blocker| {
+                blocker.message.len() > WORKSPACE_DELETION_MAX_BLOCKER_MESSAGE_BYTES
+                    || blocker.resource_kind.as_ref().is_some_and(|value| {
+                        value.len() > WORKSPACE_DELETION_MAX_RESOURCE_VALUE_BYTES
+                    })
+                    || blocker.resource_key.as_ref().is_some_and(|value| {
+                        value.len() > WORKSPACE_DELETION_MAX_RESOURCE_VALUE_BYTES
+                    })
+            });
+    if invalid_child_ids || invalid_blockers {
+        return Err(Error::Store(
+            "Workspace deletion operation projection exceeds bounded limits".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_operation_id(operation_id: &str) -> Result<()> {
     if operation_id.is_empty()
-        || operation_id.len() > MAX_OPERATION_ID_BYTES
+        || operation_id.len() > WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES
         || !operation_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
@@ -672,10 +787,26 @@ mod tests {
             .reserve_workspace_deletion(&owner, &workspace_id, &request)
             .expect("reserve");
         assert!(!first.replay);
+        assert_eq!(
+            store
+                .resumable_workspace_deletion_operation_ids()
+                .expect("resumable operations"),
+            vec![request.operation_id.clone()]
+        );
         let replay = store
             .reserve_workspace_deletion(&owner, &workspace_id, &request)
             .expect("replay");
         assert!(replay.replay);
+        assert!(matches!(
+            store.update_workspace_deletion_operation(
+                &request.operation_id,
+                WorkspaceDeletionState::Running,
+                &vec!["child".to_string(); WORKSPACE_DELETION_MAX_CHILD_OPERATION_IDS + 1],
+                &[],
+                None,
+            ),
+            Err(Error::Store(_))
+        ));
         let completed = store
             .finalize_workspace_deletion(&request.operation_id)
             .expect("finalize");
@@ -684,6 +815,12 @@ mod tests {
             .finalize_workspace_deletion(&request.operation_id)
             .expect("finalize replay");
         assert_eq!(completed, replayed);
+        assert!(
+            store
+                .resumable_workspace_deletion_operation_ids()
+                .expect("terminal operations")
+                .is_empty()
+        );
         let workspace_count: u64 = store
             .with_conn(|conn| {
                 conn.query_row(
@@ -765,6 +902,39 @@ mod tests {
             store.reserve_workspace_deletion(&owner, &workspace_id, &request),
             Err(Error::WorkspaceConfigConflict(_))
         ));
+    }
+
+    #[test]
+    fn preflight_counts_complete_inventory_and_bounds_blocker_projection() {
+        let (store, owner, workspace_id) = setup();
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "WITH RECURSIVE seq(value) AS (
+                        SELECT 1 UNION ALL SELECT value + 1 FROM seq WHERE value < 10001
+                     )
+                     INSERT INTO worker_registry (
+                        workspace_id, runtime_id, worker_id, display_name,
+                        created_at, updated_at, retention_state
+                     )
+                     SELECT ?1, 'runtime-a', 'worker-' || value, 'Pinned ' || value,
+                            '1', '1', 'pinned'
+                     FROM seq",
+                    params![workspace_id],
+                )?;
+                Ok(())
+            })
+            .expect("worker inventory");
+        let preflight = store
+            .workspace_deletion_preflight(&owner, &workspace_id)
+            .expect("preflight");
+        assert_eq!(preflight.resources.workers, 10_001);
+        assert_eq!(preflight.blockers.len(), WORKSPACE_DELETION_MAX_BLOCKERS);
+        assert!(preflight.blockers.iter().any(|blocker| {
+            blocker
+                .message
+                .contains("Additional deletion blockers exist")
+        }));
     }
 
     #[test]

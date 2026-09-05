@@ -3,10 +3,13 @@
     Diagnostic,
     WorkspaceDeletionOperationResponse,
     WorkspaceDeletionPreflightResponse,
+    WorkspaceDeletionRequest,
     WorkspaceMetadataSettingsResponse,
   } from '$lib/generated/workspace-api';
   import { goto } from '$app/navigation';
+  import { onMount } from 'svelte';
   import { disposeWorkspaceMultiplexer } from '$lib/workspace/multiplexer';
+  import { disposeWorkspaceWorkersStore } from '$lib/workspace/sidebar/worker-subscription';
   import {
     getWorkspaceDeletion,
     preflightWorkspaceDeletion,
@@ -34,8 +37,11 @@
   let deletionConfirmation = $state('');
   let deletionPreflight = $state<WorkspaceDeletionPreflightResponse | null>(null);
   let deletionOperation = $state<WorkspaceDeletionOperationResponse | null>(null);
-  let deletionOperationId = $state('');
+  let deletionRequest = $state<WorkspaceDeletionRequest | null>(null);
   let deletionError = $state<string | null>(null);
+  function deletionStorageKey(): string {
+    return `yoi:workspace-deletion:${workspaceId}`;
+  }
 
   $effect(() => {
     if (!workspaceId) {
@@ -92,7 +98,8 @@
     deletionLoading = true;
     deletionError = null;
     deletionOperation = null;
-    deletionOperationId = crypto.randomUUID();
+    deletionRequest = null;
+    sessionStorage.removeItem(deletionStorageKey());
     deletionConfirmation = '';
     try {
       deletionPreflight = await preflightWorkspaceDeletion(workspaceId);
@@ -103,26 +110,76 @@
     }
   }
 
+  async function trackDeletion(operationId: string) {
+    let operation = await getWorkspaceDeletion(operationId);
+    deletionOperation = operation;
+    while (operation.state === 'queued' || operation.state === 'running') {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      operation = await getWorkspaceDeletion(operation.operation_id);
+      deletionOperation = operation;
+    }
+    if (operation.state === 'succeeded') {
+      sessionStorage.removeItem(deletionStorageKey());
+      disposeWorkspaceMultiplexer(workspaceId);
+      disposeWorkspaceWorkersStore(workspaceId);
+      await goto('/');
+    }
+  }
+
+  function storedDeletionRequest(): WorkspaceDeletionRequest | null {
+    try {
+      const value: unknown = JSON.parse(sessionStorage.getItem(deletionStorageKey()) ?? 'null');
+      if (typeof value !== 'object' || value === null) return null;
+      const record = value as Record<string, unknown>;
+      if (
+        Object.keys(record).sort().join(',') !== 'confirmation,expected_revision,operation_id' ||
+        typeof record.operation_id !== 'string' || record.operation_id.length === 0 || record.operation_id.length > 128 ||
+        !/^[A-Za-z0-9_-]+$/.test(record.operation_id) ||
+        typeof record.expected_revision !== 'string' || record.expected_revision.length > 128 ||
+        typeof record.confirmation !== 'string' || record.confirmation !== data.workspace?.display_name || record.confirmation.length > 256
+      ) return null;
+      return {
+        operation_id: record.operation_id,
+        expected_revision: record.expected_revision,
+        confirmation: record.confirmation,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  onMount(() => {
+    if (!data.workspace?.permissions.delete_workspace) return;
+    const request = storedDeletionRequest();
+    if (!request) return;
+    deletionRequest = request;
+    deletionConfirmation = request.confirmation;
+    deletionOpen = true;
+    deletionSubmitting = true;
+    void trackDeletion(request.operation_id)
+      .catch((err) => {
+        deletionError = err instanceof Error ? err.message : 'Workspace deletion status failed';
+      })
+      .finally(() => {
+        deletionSubmitting = false;
+      });
+  });
+
   async function deleteWorkspace() {
-    if (!deletionPreflight) return;
+    if (!deletionPreflight && !deletionRequest) return;
     deletionSubmitting = true;
     deletionError = null;
     try {
-      let operation = await startWorkspaceDeletion(workspaceId, {
-        operation_id: deletionOperationId,
-        expected_revision: deletionPreflight.expected_revision,
+      const request = deletionRequest ?? {
+        operation_id: crypto.randomUUID(),
+        expected_revision: deletionPreflight!.expected_revision,
         confirmation: deletionConfirmation,
-      });
+      };
+      deletionRequest = request;
+      sessionStorage.setItem(deletionStorageKey(), JSON.stringify(request));
+      const operation = await startWorkspaceDeletion(workspaceId, request);
       deletionOperation = operation;
-      while (operation.state === 'queued' || operation.state === 'running') {
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        operation = await getWorkspaceDeletion(operation.operation_id);
-        deletionOperation = operation;
-      }
-      if (operation.state === 'succeeded') {
-        disposeWorkspaceMultiplexer(workspaceId);
-        await goto('/');
-      }
+      await trackDeletion(operation.operation_id);
     } catch (err) {
       deletionError = err instanceof Error ? err.message : 'Workspace deletion failed';
     } finally {
@@ -187,7 +244,7 @@
 {#if deletionOpen}
   <div class="modal-backdrop" role="presentation">
     <div class="deletion-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-workspace-title">
-      <h2 id="delete-workspace-title">Delete {deletionPreflight?.display_name ?? 'Workspace'}?</h2>
+      <h2 id="delete-workspace-title">Delete {deletionPreflight?.display_name ?? deletionRequest?.confirmation ?? 'Workspace'}?</h2>
       {#if deletionLoading}
         <p>Loading deletion impact…</p>
       {:else if deletionPreflight}
@@ -221,7 +278,7 @@
           class="danger-button"
           type="button"
           onclick={() => void deleteWorkspace()}
-          disabled={deletionSubmitting || !deletionPreflight?.can_delete || deletionConfirmation !== (deletionPreflight?.display_name ?? '')}
+          disabled={deletionSubmitting || (!deletionRequest && !deletionPreflight?.can_delete) || deletionConfirmation !== (deletionPreflight?.display_name ?? deletionRequest?.confirmation ?? '')}
         >{deletionSubmitting ? 'Deleting…' : 'Delete Workspace'}</button>
       </div>
     </div>

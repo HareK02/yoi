@@ -3,34 +3,44 @@ import type {
   WorkspaceDeletionPreflightResponse,
   WorkspaceDeletionRequest,
 } from "$lib/generated/workspace-api";
+import { loadJson } from "$lib/workspace/api/http";
 import {
   parseWorkspaceDeletionOperationResponse,
   parseWorkspaceDeletionPreflightResponse,
 } from "$lib/workspace/api/workspace-model";
 
-async function responseJson(
-  response: Response,
-  context: string,
-): Promise<unknown> {
-  const value: unknown = await response.json().catch(() => null);
-  if (!response.ok) {
-    const message = typeof value === "object" && value !== null &&
-        "error" in value && typeof value.error === "string"
-      ? value.error
-      : `${context} failed (${response.status})`;
-    throw new Error(message);
+const deletionResponsePolicy = {
+  maxResponseBytes: 2 * 1024 * 1024,
+  diagnosticLabel: "Workspace deletion",
+} as const;
+
+async function deletionJson<T>(
+  path: string,
+  init: RequestInit | undefined,
+  parse: (value: unknown) => T,
+): Promise<T> {
+  const result = await loadJson(
+    fetch,
+    path,
+    init,
+    parse,
+    deletionResponsePolicy,
+  );
+  if (result.error !== null || result.data === null) {
+    throw new Error(
+      result.error ?? "Workspace deletion response is unavailable",
+    );
   }
-  return value;
+  return result.data;
 }
 
 export async function preflightWorkspaceDeletion(
   workspaceId: string,
 ): Promise<WorkspaceDeletionPreflightResponse> {
-  const response = await fetch(
+  return await deletionJson(
     `/api/workspaces/${encodeURIComponent(workspaceId)}/deletion`,
-  );
-  return parseWorkspaceDeletionPreflightResponse(
-    await responseJson(response, "Workspace deletion preflight"),
+    undefined,
+    parseWorkspaceDeletionPreflightResponse,
   );
 }
 
@@ -38,26 +48,23 @@ export async function startWorkspaceDeletion(
   workspaceId: string,
   request: WorkspaceDeletionRequest,
 ): Promise<WorkspaceDeletionOperationResponse> {
-  const response = await fetch(
+  return await deletionJson(
     `/api/workspaces/${encodeURIComponent(workspaceId)}/deletion`,
     {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(request),
     },
-  );
-  return parseWorkspaceDeletionOperationResponse(
-    await responseJson(response, "Workspace deletion"),
+    parseWorkspaceDeletionOperationResponse,
   );
 }
 
 export async function getWorkspaceDeletion(
   operationId: string,
 ): Promise<WorkspaceDeletionOperationResponse> {
-  const response = await fetch(
+  return await deletionJson(
     `/api/workspace-deletions/${encodeURIComponent(operationId)}`,
-  );
-  return parseWorkspaceDeletionOperationResponse(
-    await responseJson(response, "Workspace deletion status"),
+    undefined,
+    parseWorkspaceDeletionOperationResponse,
   );
 }

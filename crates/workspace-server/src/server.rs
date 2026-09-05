@@ -1008,6 +1008,20 @@ pub struct WorkspaceServerApi {
     catalog: WorkspaceCatalogService,
     routers: Arc<AsyncMutex<HashMap<String, Router>>>,
     apis: Arc<AsyncMutex<HashMap<String, WorkspaceApi>>>,
+    mutation_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    running_deletions: Arc<AsyncMutex<HashSet<String>>>,
+    hook_handles: Arc<AsyncMutex<HashMap<String, tokio::task::AbortHandle>>>,
+}
+
+async fn workspace_mutation_lock(
+    locks: &Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    workspace_id: &str,
+) -> Arc<AsyncMutex<()>> {
+    let mut locks = locks.lock().await;
+    locks
+        .entry(workspace_id.to_string())
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
 }
 
 impl WorkspaceServerApi {
@@ -1018,7 +1032,14 @@ impl WorkspaceServerApi {
             store,
             routers: Arc::new(AsyncMutex::new(HashMap::new())),
             apis: Arc::new(AsyncMutex::new(HashMap::new())),
+            mutation_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            running_deletions: Arc::new(AsyncMutex::new(HashSet::new())),
+            hook_handles: Arc::new(AsyncMutex::new(HashMap::new())),
         }
+    }
+
+    async fn mutation_lock(&self, workspace_id: &str) -> Arc<AsyncMutex<()>> {
+        workspace_mutation_lock(&self.mutation_locks, workspace_id).await
     }
 
     async fn api_for_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceApi>> {
@@ -1038,6 +1059,47 @@ impl WorkspaceServerApi {
         Ok(Some(api))
     }
 
+    async fn schedule_workspace_deletion(&self, operation_id: String) {
+        let mut running = self.running_deletions.lock().await;
+        if !running.insert(operation_id.clone()) {
+            return;
+        }
+        drop(running);
+        let api = self.clone();
+        tokio::spawn(async move {
+            if api.execute_workspace_deletion(&operation_id).await.is_err() {
+                let operation = api
+                    .store
+                    .workspace_deletion_operation_for_recovery(&operation_id)
+                    .ok()
+                    .flatten();
+                let child_operation_ids = operation
+                    .as_ref()
+                    .map(|operation| operation.child_operation_ids.as_slice())
+                    .unwrap_or_default();
+                let blockers = operation
+                    .as_ref()
+                    .map(|operation| operation.blockers.as_slice())
+                    .unwrap_or_default();
+                let _ = api.store.update_workspace_deletion_operation(
+                    &operation_id,
+                    WorkspaceDeletionState::Failed,
+                    child_operation_ids,
+                    blockers,
+                    Some("workspace_deletion_execution_failed"),
+                );
+            }
+            api.running_deletions.lock().await.remove(&operation_id);
+        });
+    }
+
+    async fn recover_workspace_deletions(&self) -> Result<()> {
+        for operation_id in self.store.resumable_workspace_deletion_operation_ids()? {
+            self.schedule_workspace_deletion(operation_id).await;
+        }
+        Ok(())
+    }
+
     async fn workspace_deletion_preflight(
         &self,
         actor_account_id: &str,
@@ -1049,7 +1111,10 @@ impl WorkspaceServerApi {
         let Some(api) = self.api_for_workspace(workspace_id).await? else {
             return Err(Error::InvalidInput("Workspace does not exist".to_string()));
         };
-        for registry_worker in self.store.list_worker_registry(workspace_id, 10_000)? {
+        for registry_worker in self
+            .store
+            .list_worker_registry(workspace_id, i64::MAX as usize)?
+        {
             let worker_key = registry_worker.display_name;
             match api.runtime.worker(&registry_worker.worker) {
                 Ok(worker) if worker.state == "stopped" && worker.singleton_key.is_none() => {}
@@ -1078,6 +1143,7 @@ impl WorkspaceServerApi {
                 }),
             }
         }
+        crate::workspace_deletion::bound_workspace_deletion_blockers(&mut preflight.blockers);
         preflight.can_delete = preflight.blockers.is_empty();
         Ok(preflight)
     }
@@ -1102,7 +1168,7 @@ impl WorkspaceServerApi {
         let mut blockers = Vec::new();
         for worker in self
             .store
-            .list_worker_registry(&operation.workspace_id, 10_000)?
+            .list_worker_registry(&operation.workspace_id, i64::MAX as usize)?
         {
             let worker_key = worker.display_name.clone();
             let target = worker.worker;
@@ -1130,7 +1196,7 @@ impl WorkspaceServerApi {
         if blockers.is_empty() {
             for workdir in self
                 .store
-                .list_workdir_registry(&operation.workspace_id, 10_000)?
+                .list_workdir_registry(&operation.workspace_id, i64::MAX as usize)?
             {
                 match execute_workdir_removal_for_workspace_deletion(
                     &api,
@@ -1183,7 +1249,19 @@ impl WorkspaceServerApi {
         }
         let completed = self.store.finalize_workspace_deletion(operation_id)?;
         self.routers.lock().await.remove(&completed.workspace_id);
+        if let Some(handle) = self
+            .hook_handles
+            .lock()
+            .await
+            .remove(&completed.workspace_id)
+        {
+            handle.abort();
+        }
         self.apis.lock().await.remove(&completed.workspace_id);
+        self.mutation_locks
+            .lock()
+            .await
+            .remove(&completed.workspace_id);
         Ok(completed)
     }
 
@@ -1194,12 +1272,22 @@ impl WorkspaceServerApi {
         let Some(api) = self.api_for_workspace(workspace_id).await? else {
             return Ok(None);
         };
-        tokio::spawn(run_orchestrator_turn_end_hook(api.clone()));
+        let mut routers = self.routers.lock().await;
+        if let Some(router) = routers.get(workspace_id).cloned() {
+            return Ok(Some(router));
+        }
+        let Some(workspace) = self.store.get_workspace(workspace_id).await? else {
+            return Ok(None);
+        };
+        if workspace.state == "active" {
+            let hook = tokio::spawn(run_orchestrator_turn_end_hook(api.clone()));
+            self.hook_handles
+                .lock()
+                .await
+                .insert(workspace_id.to_string(), hook.abort_handle());
+        }
         let router = build_inner_router(api);
-        self.routers
-            .lock()
-            .await
-            .insert(workspace_id.to_string(), router.clone());
+        routers.insert(workspace_id.to_string(), router.clone());
         Ok(Some(router))
     }
 
@@ -1324,6 +1412,8 @@ async fn start_server_workspace_deletion(
         Ok(None) => return forbidden_server_response("Workspace deletion requires its owner"),
         Err(error) => return server_error_response(error),
     };
+    let mutation_lock = api.mutation_lock(&workspace_id).await;
+    let _mutation_guard = mutation_lock.lock().await;
     let existing = match api
         .store
         .workspace_deletion_operation(&actor_account_id, &request.operation_id)
@@ -1351,24 +1441,13 @@ async fn start_server_workspace_deletion(
             Ok(reservation) => reservation,
             Err(error) => return server_error_response(error),
         };
-    let operation =
-        if reservation.replay && reservation.operation.state == WorkspaceDeletionState::Succeeded {
-            reservation.operation
-        } else {
-            match api.execute_workspace_deletion(&request.operation_id).await {
-                Ok(operation) => operation,
-                Err(error) => {
-                    let _ = api.store.update_workspace_deletion_operation(
-                        &request.operation_id,
-                        WorkspaceDeletionState::Failed,
-                        &reservation.operation.child_operation_ids,
-                        &[],
-                        Some("workspace_deletion_execution_failed"),
-                    );
-                    return server_error_response(error);
-                }
-            }
-        };
+    if let Some(handle) = api.hook_handles.lock().await.remove(&workspace_id) {
+        handle.abort();
+    }
+    let operation = reservation.operation;
+    if operation.state != WorkspaceDeletionState::Succeeded {
+        api.schedule_workspace_deletion(request.operation_id).await;
+    }
     let status = if operation.state == WorkspaceDeletionState::Succeeded {
         StatusCode::OK
     } else {
@@ -1393,17 +1472,6 @@ async fn get_server_workspace_deletion(
         .store
         .workspace_deletion_operation(&actor_account_id, &operation_id)
     {
-        Ok(Some(operation))
-            if matches!(
-                operation.state,
-                WorkspaceDeletionState::Queued | WorkspaceDeletionState::Running
-            ) =>
-        {
-            match api.execute_workspace_deletion(&operation_id).await {
-                Ok(operation) => Json(operation).into_response(),
-                Err(error) => server_error_response(error),
-            }
-        }
         Ok(Some(operation)) => Json(operation).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -1730,6 +1798,15 @@ async fn dispatch_workspace_request(
 ) -> Response {
     let path = request.uri().path().to_owned();
     let workspace_id = scoped_workspace_id(&path);
+    let _mutation_guard = if let Some(workspace_id) = workspace_id
+        && !matches!(
+            *request.method(),
+            Method::GET | Method::HEAD | Method::OPTIONS
+        ) {
+        Some(api.mutation_lock(workspace_id).await.lock_owned().await)
+    } else {
+        None
+    };
     if let Some(workspace_id) = workspace_id
         && (path.starts_with("/api/w/") || path.starts_with("/api/runtime/v1/workspaces/"))
         && let Err(response) =
@@ -1835,6 +1912,7 @@ pub async fn build_workspace_server_router(
     });
     let api = WorkspaceServerApi::new(template, store);
     api.preload().await?;
+    api.recover_workspace_deletions().await?;
     let catalog = Router::new()
         .route(
             "/api/workspaces",
@@ -17006,6 +17084,40 @@ mod tests {
         MemoryStagingRecord, ObjectiveRecord, ObjectiveResourceRecord, ObjectiveTicketLinkRecord,
         SqliteWorkspaceStore, UserRecord, WorkspaceRecord, WorkspaceRuntimeBinding,
     };
+
+    #[tokio::test]
+    async fn workspace_mutation_gate_serializes_deletion_with_active_mutations() {
+        let locks = Arc::new(AsyncMutex::new(HashMap::new()));
+        let active_mutation = workspace_mutation_lock(&locks, "workspace-a").await;
+        let deletion = workspace_mutation_lock(&locks, "workspace-a").await;
+        assert!(Arc::ptr_eq(&active_mutation, &deletion));
+
+        let active_guard = active_mutation.lock_owned().await;
+        let (acquired_tx, mut acquired_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let _deletion_guard = deletion.lock_owned().await;
+            let _ = acquired_tx.send(());
+        });
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            acquired_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        drop(active_guard);
+        acquired_rx.await.expect("deletion acquires after mutation");
+        waiter.await.expect("waiter joins");
+    }
+
+    #[test]
+    fn workspace_deletion_execution_is_server_owned_and_polling_is_read_only() {
+        let source = include_str!("server.rs");
+        let start = handler_source(source, "start_server_workspace_deletion");
+        assert!(start.contains("schedule_workspace_deletion"));
+        assert!(!start.contains("execute_workspace_deletion(&request"));
+        let poll = handler_source(source, "get_server_workspace_deletion");
+        assert!(!poll.contains("execute_workspace_deletion"));
+        assert!(source.contains("api.recover_workspace_deletions().await?"));
+    }
 
     fn handler_source<'a>(source: &'a str, name: &str) -> &'a str {
         let start = source
