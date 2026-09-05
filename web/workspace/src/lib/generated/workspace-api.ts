@@ -91,7 +91,6 @@ export type WorkspaceDeletionPreflightResponse = {
    */
   expected_revision: string;
   can_delete: boolean;
-  force_delete_dirty_workdirs_available: boolean;
   resources: WorkspaceDeletionResourceCounts;
   blockers: Array<WorkspaceDeletionBlocker>;
 };
@@ -100,7 +99,6 @@ export type WorkspaceDeletionRequest = {
   operation_id: string;
   expected_revision: string;
   confirmation: string;
-  force_delete_dirty_workdirs: boolean;
 };
 
 export type WorkspaceDeletionOperationResponse = {
@@ -108,7 +106,6 @@ export type WorkspaceDeletionOperationResponse = {
   workspace_id: string;
   display_name: string;
   state: WorkspaceDeletionState;
-  force_delete_dirty_workdirs: boolean;
   resources: WorkspaceDeletionResourceCounts;
   child_operation_ids: Array<string>;
   blockers: Array<WorkspaceDeletionBlocker>;

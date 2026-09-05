@@ -12,7 +12,6 @@ use crate::store::{SqliteWorkspaceStore, WorkspaceRecord};
 use crate::{Error, Result};
 
 const MAX_OPERATION_ID_BYTES: usize = 128;
-const CONFIRMATION_PREFIX: &str = "delete ";
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceDeletionReservation {
@@ -39,8 +38,6 @@ pub trait WorkspaceDeletionStore: Send + Sync {
         actor_account_id: &str,
         operation_id: &str,
     ) -> Result<Option<WorkspaceDeletionOperationResponse>>;
-
-    fn release_workspace_assignments_for_deletion(&self, workspace_id: &str) -> Result<u64>;
 
     fn latest_worker_removal_operation_id(
         &self,
@@ -74,11 +71,11 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
             let workspace = owner_workspace(conn, actor_account_id, workspace_id)?;
             let resources = resource_counts(conn, workspace_id)?;
             let accessible: u64 = conn.query_row(
-                "SELECT COUNT(*) FROM workspaces WHERE owner_account_id = ?1 AND state = 'active'",
+                "SELECT COUNT(*) FROM workspaces WHERE owner_account_id = ?1",
                 params![actor_account_id],
                 |row| row.get(0),
             )?;
-            let mut blockers = Vec::new();
+            let mut blockers = workspace_database_blockers(conn, workspace_id)?;
             if accessible <= 1 {
                 blockers.push(WorkspaceDeletionBlocker {
                     kind: WorkspaceDeletionBlockerKind::LastAccessibleWorkspace,
@@ -92,7 +89,6 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 display_name: workspace.display_name,
                 expected_revision: workspace.updated_at,
                 can_delete: blockers.is_empty(),
-                force_delete_dirty_workdirs_available: true,
                 resources,
                 blockers,
             })
@@ -126,8 +122,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
             }
 
             let workspace = owner_workspace(tx, actor_account_id, workspace_id)?;
-            let expected_confirmation = format!("{CONFIRMATION_PREFIX}{}", workspace.display_name);
-            if request.confirmation != expected_confirmation {
+            if request.confirmation != workspace.display_name {
                 return Err(Error::InvalidInput(
                     "confirmation must exactly match the displayed Workspace name".to_string(),
                 ));
@@ -138,7 +133,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 ));
             }
             let accessible: u64 = tx.query_row(
-                "SELECT COUNT(*) FROM workspaces WHERE owner_account_id = ?1 AND state = 'active'",
+                "SELECT COUNT(*) FROM workspaces WHERE owner_account_id = ?1",
                 params![actor_account_id],
                 |row| row.get(0),
             )?;
@@ -146,6 +141,11 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 return Err(Error::WorkspaceConfigConflict(
                     "last_accessible_workspace: create or retain another accessible Workspace first"
                         .to_string(),
+                ));
+            }
+            if !workspace_database_blockers(tx, workspace_id)?.is_empty() {
+                return Err(Error::WorkspaceConfigConflict(
+                    "Workspace deletion preflight changed; reload current blockers".to_string(),
                 ));
             }
 
@@ -156,10 +156,10 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 "INSERT INTO workspace_deletion_operations (
                     operation_id, request_fingerprint, workspace_id, workspace_display_name,
                     workspace_revision, owner_account_id, actor_account_id,
-                    force_delete_dirty_workdirs, state, resource_counts_json,
+                    state, resource_counts_json,
                     child_operation_ids_json, blockers_json, failure_category,
                     created_at, updated_at, completed_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, '[]', '[]', NULL, ?10, ?10, NULL)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', ?8, '[]', '[]', NULL, ?9, ?9, NULL)",
                 params![
                     request.operation_id,
                     fingerprint,
@@ -168,7 +168,6 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                     request.expected_revision,
                     workspace.owner_account_id,
                     actor_account_id,
-                    request.force_delete_dirty_workdirs as i64,
                     serde_json::to_string(&resources).map_err(|error| Error::Store(error.to_string()))?,
                     now,
                 ],
@@ -207,17 +206,6 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 ));
             }
             Ok(Some(operation.response))
-        })
-    }
-
-    fn release_workspace_assignments_for_deletion(&self, workspace_id: &str) -> Result<u64> {
-        self.with_conn(|conn| {
-            let changed = conn.execute(
-                "DELETE FROM ticket_current_worker_assignments WHERE workspace_id = ?1",
-                params![workspace_id],
-            )?;
-            u64::try_from(changed)
-                .map_err(|_| Error::Store("assignment deletion count overflow".to_string()))
         })
     }
 
@@ -373,30 +361,28 @@ fn read_operation(
 ) -> Result<Option<StoredOperation>> {
     conn.query_row(
         "SELECT request_fingerprint, actor_account_id, workspace_id, workspace_display_name,
-                state, force_delete_dirty_workdirs, resource_counts_json,
-                child_operation_ids_json, blockers_json, failure_category,
-                created_at, updated_at, completed_at
+                state, resource_counts_json, child_operation_ids_json,
+                blockers_json, failure_category, created_at, updated_at, completed_at
          FROM workspace_deletion_operations WHERE operation_id = ?1",
         params![operation_id],
         |row| {
             let state: String = row.get(4)?;
-            let resource_counts_json: String = row.get(6)?;
-            let child_operation_ids_json: String = row.get(7)?;
-            let blockers_json: String = row.get(8)?;
+            let resource_counts_json: String = row.get(5)?;
+            let child_operation_ids_json: String = row.get(6)?;
+            let blockers_json: String = row.get(7)?;
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 state,
-                row.get::<_, bool>(5)?,
                 resource_counts_json,
                 child_operation_ids_json,
                 blockers_json,
-                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, String>(9)?,
                 row.get::<_, String>(10)?,
-                row.get::<_, String>(11)?,
-                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(11)?,
             ))
         },
     )
@@ -408,7 +394,6 @@ fn read_operation(
             workspace_id,
             display_name,
             state,
-            force,
             resources,
             children,
             blockers,
@@ -425,7 +410,6 @@ fn read_operation(
                     workspace_id,
                     display_name,
                     state: parse_deletion_state(&state)?,
-                    force_delete_dirty_workdirs: force,
                     resources: serde_json::from_str(&resources)
                         .map_err(|error| Error::Store(error.to_string()))?,
                     child_operation_ids: serde_json::from_str(&children)
@@ -474,6 +458,98 @@ fn owner_workspace(
     Ok(workspace)
 }
 
+fn workspace_database_blockers(
+    conn: &rusqlite::Connection,
+    workspace_id: &str,
+) -> Result<Vec<WorkspaceDeletionBlocker>> {
+    let mut blockers = Vec::new();
+    for (sql, kind, resource_kind, message) in [
+        (
+            "SELECT workdir_id FROM worker_workdir_links WHERE workspace_id = ?1 AND unlinked_at IS NULL",
+            WorkspaceDeletionBlockerKind::WorkdirRemovalBlocked,
+            "workdir",
+            "Release this active Worker–Workdir attachment before deleting the Workspace.",
+        ),
+        (
+            "SELECT workdir_id FROM worker_workdir_attachment_reservations WHERE workspace_id = ?1",
+            WorkspaceDeletionBlockerKind::WorkdirRemovalBlocked,
+            "workdir",
+            "Wait for or cancel this pending Workdir attachment reservation.",
+        ),
+        (
+            "SELECT display_name FROM worker_registry WHERE workspace_id = ?1 AND retention_state = 'pinned'",
+            WorkspaceDeletionBlockerKind::RetentionHold,
+            "worker",
+            "Remove this Worker retention pin before deleting the Workspace.",
+        ),
+        (
+            "SELECT workdir_id FROM workdir_registry WHERE workspace_id = ?1 AND COALESCE(cleanliness, '') != 'clean'",
+            WorkspaceDeletionBlockerKind::DirtyWorkdir,
+            "workdir",
+            "Clean this Workdir and refresh unknown cleanliness before deleting the Workspace.",
+        ),
+    ] {
+        for resource_key in query_resource_keys(conn, sql, workspace_id)? {
+            blockers.push(WorkspaceDeletionBlocker {
+                kind,
+                resource_kind: Some(resource_kind.to_string()),
+                resource_key: Some(resource_key),
+                message: message.to_string(),
+            });
+        }
+    }
+
+    for (sql, kind, resource_kind, message) in [
+        (
+            "SELECT COUNT(*) FROM ticket_current_worker_assignments WHERE workspace_id = ?1",
+            WorkspaceDeletionBlockerKind::WorkerRemovalBlocked,
+            "ticket",
+            "Remove current Ticket assignments before deleting the Workspace.",
+        ),
+        (
+            "SELECT COUNT(*) FROM worker_removal_operations WHERE workspace_id = ?1 AND state IN ('planned', 'blocked', 'executing', 'failed', 'stale')",
+            WorkspaceDeletionBlockerKind::CleanupUnavailable,
+            "worker",
+            "Resolve pending or failed Worker removal operations first.",
+        ),
+        (
+            "SELECT COUNT(*) FROM workdir_removal_operations WHERE workspace_id = ?1 AND state IN ('pending', 'failed')",
+            WorkspaceDeletionBlockerKind::CleanupUnavailable,
+            "workdir",
+            "Resolve pending or failed Workdir removal operations first.",
+        ),
+        (
+            "SELECT COUNT(*) FROM workdir_create_operations WHERE workspace_id = ?1 AND state = 'pending'",
+            WorkspaceDeletionBlockerKind::CleanupUnavailable,
+            "workdir",
+            "Wait for pending Workdir creation operations to finish.",
+        ),
+    ] {
+        let count: u64 = conn.query_row(sql, params![workspace_id], |row| row.get(0))?;
+        if count != 0 {
+            blockers.push(WorkspaceDeletionBlocker {
+                kind,
+                resource_kind: Some(resource_kind.to_string()),
+                resource_key: None,
+                message: format!("{message} ({count})"),
+            });
+        }
+    }
+    Ok(blockers)
+}
+
+fn query_resource_keys(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    workspace_id: &str,
+) -> Result<Vec<String>> {
+    let mut statement = conn.prepare(sql)?;
+    statement
+        .query_map(params![workspace_id], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 fn resource_counts(
     conn: &rusqlite::Connection,
     workspace_id: &str,
@@ -515,8 +591,8 @@ fn request_fingerprint(
     request: &WorkspaceDeletionRequest,
 ) -> String {
     let canonical = format!(
-        "workspace-delete-v1\0{actor_account_id}\0{workspace_id}\0{}\0{}\0{}",
-        request.expected_revision, request.confirmation, request.force_delete_dirty_workdirs
+        "workspace-delete-v1\0{actor_account_id}\0{workspace_id}\0{}\0{}",
+        request.expected_revision, request.confirmation
     );
     encode_hex(&Sha256::digest(canonical.as_bytes()))
 }
@@ -590,8 +666,7 @@ mod tests {
         let request = WorkspaceDeletionRequest {
             operation_id: "delete-workspace-a".to_string(),
             expected_revision: preflight.expected_revision,
-            confirmation: "delete Alpha".to_string(),
-            force_delete_dirty_workdirs: false,
+            confirmation: "Alpha".to_string(),
         };
         let first = store
             .reserve_workspace_deletion(&owner, &workspace_id, &request)
@@ -644,18 +719,51 @@ mod tests {
         let mut request = WorkspaceDeletionRequest {
             operation_id: "delete-alpha-guarded".to_string(),
             expected_revision: "stale".to_string(),
-            confirmation: "delete Alpha".to_string(),
-            force_delete_dirty_workdirs: false,
+            confirmation: "Alpha".to_string(),
         };
         assert!(matches!(
             store.reserve_workspace_deletion(&owner, &workspace_id, &request),
             Err(Error::WorkspaceConfigConflict(_))
         ));
         request.expected_revision = preflight.expected_revision;
-        request.confirmation = "Alpha".to_string();
+        request.confirmation = "delete Alpha".to_string();
         assert!(matches!(
             store.reserve_workspace_deletion(&owner, &workspace_id, &request),
             Err(Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn pinned_worker_blocks_preflight_before_operation_reservation() {
+        let (store, owner, workspace_id) = setup();
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO worker_registry (
+                        workspace_id, runtime_id, worker_id, display_name,
+                        created_at, updated_at, retention_state
+                     ) VALUES (?1, 'runtime-a', 'worker-a', 'Pinned worker', '1', '1', 'pinned')",
+                    params![workspace_id],
+                )?;
+                Ok(())
+            })
+            .expect("worker");
+        let preflight = store
+            .workspace_deletion_preflight(&owner, &workspace_id)
+            .expect("preflight");
+        assert!(!preflight.can_delete);
+        assert!(preflight.blockers.iter().any(|blocker| {
+            blocker.kind == WorkspaceDeletionBlockerKind::RetentionHold
+                && blocker.resource_key.as_deref() == Some("Pinned worker")
+        }));
+        let request = WorkspaceDeletionRequest {
+            operation_id: "delete-pinned".to_string(),
+            expected_revision: preflight.expected_revision,
+            confirmation: "Alpha".to_string(),
+        };
+        assert!(matches!(
+            store.reserve_workspace_deletion(&owner, &workspace_id, &request),
+            Err(Error::WorkspaceConfigConflict(_))
         ));
     }
 
@@ -675,8 +783,7 @@ mod tests {
                         &WorkspaceDeletionRequest {
                             operation_id: "delete-beta".to_string(),
                             expected_revision: preflight.expected_revision,
-                            confirmation: "delete Beta".to_string(),
-                            force_delete_dirty_workdirs: false,
+                            confirmation: "Beta".to_string(),
                         },
                     )
                     .expect("reserve")

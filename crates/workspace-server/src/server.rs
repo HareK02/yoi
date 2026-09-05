@@ -90,11 +90,11 @@ use workspace_api::{
     WorkingDirectoryRemovalDisposition, WorkingDirectoryRemovalRequest,
     WorkingDirectoryRemovalResponse, WorkingDirectoryRepositoryOption,
     WorkspaceCatalogListResponse, WorkspaceCreateResponse, WorkspaceDeletionBlocker,
-    WorkspaceDeletionBlockerKind, WorkspaceDeletionOperationResponse, WorkspaceDeletionRequest,
-    WorkspaceDeletionState, WorkspaceExtensionPointState, WorkspaceExtensionPoints,
-    WorkspaceMetadataMutationResponse, WorkspaceMetadataSettingsResponse,
-    WorkspacePermissionSummary, WorkspaceRepositoryRecord, WorkspaceResponse,
-    WorkspaceRuntimeDetail, WorkspaceRuntimeResource, WorkspaceSummary,
+    WorkspaceDeletionBlockerKind, WorkspaceDeletionOperationResponse,
+    WorkspaceDeletionPreflightResponse, WorkspaceDeletionRequest, WorkspaceDeletionState,
+    WorkspaceExtensionPointState, WorkspaceExtensionPoints, WorkspaceMetadataMutationResponse,
+    WorkspaceMetadataSettingsResponse, WorkspacePermissionSummary, WorkspaceRepositoryRecord,
+    WorkspaceResponse, WorkspaceRuntimeDetail, WorkspaceRuntimeResource, WorkspaceSummary,
     WorkspaceWorkerDiscoveryItem, WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
 };
 
@@ -746,8 +746,7 @@ impl WorkspaceWorkerRemoveExecutor {
             ));
         }
 
-        self.execute_target_removal(&runtime, &target, reason, false)
-            .await
+        self.execute_target_removal(&runtime, &target, reason).await
     }
 
     async fn execute_target_removal(
@@ -755,7 +754,6 @@ impl WorkspaceWorkerRemoveExecutor {
         runtime: &RuntimeRegistry,
         target: &RuntimeWorkerRef,
         reason: &str,
-        allow_internal: bool,
     ) -> std::result::Result<worker::WorkspaceResponse, String> {
         let remove_lock = {
             let mut locks = self
@@ -857,7 +855,7 @@ impl WorkspaceWorkerRemoveExecutor {
                 ));
             }
         };
-        if worker.singleton_key.is_some() && !allow_internal {
+        if worker.singleton_key.is_some() {
             return Ok(worker_remove_error_response(
                 StatusCode::CONFLICT,
                 "internal_worker_forbidden",
@@ -1009,6 +1007,7 @@ pub struct WorkspaceServerApi {
     store: Arc<dyn ControlPlaneStore>,
     catalog: WorkspaceCatalogService,
     routers: Arc<AsyncMutex<HashMap<String, Router>>>,
+    apis: Arc<AsyncMutex<HashMap<String, WorkspaceApi>>>,
 }
 
 impl WorkspaceServerApi {
@@ -1018,7 +1017,69 @@ impl WorkspaceServerApi {
             catalog: WorkspaceCatalogService::new(store.clone()),
             store,
             routers: Arc::new(AsyncMutex::new(HashMap::new())),
+            apis: Arc::new(AsyncMutex::new(HashMap::new())),
         }
+    }
+
+    async fn api_for_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceApi>> {
+        let mut apis = self.apis.lock().await;
+        if let Some(api) = apis.get(workspace_id).cloned() {
+            return Ok(Some(api));
+        }
+        let Some(workspace) = self.store.get_workspace(workspace_id).await? else {
+            return Ok(None);
+        };
+        let repositories = self.store.list_repositories(workspace_id)?;
+        let config = self
+            .template
+            .for_catalog_workspace(&workspace, repositories)?;
+        let api = WorkspaceApi::new(config, self.store.clone()).await?;
+        apis.insert(workspace_id.to_string(), api.clone());
+        Ok(Some(api))
+    }
+
+    async fn workspace_deletion_preflight(
+        &self,
+        actor_account_id: &str,
+        workspace_id: &str,
+    ) -> Result<WorkspaceDeletionPreflightResponse> {
+        let mut preflight = self
+            .store
+            .workspace_deletion_preflight(actor_account_id, workspace_id)?;
+        let Some(api) = self.api_for_workspace(workspace_id).await? else {
+            return Err(Error::InvalidInput("Workspace does not exist".to_string()));
+        };
+        for registry_worker in self.store.list_worker_registry(workspace_id, 10_000)? {
+            let worker_key = registry_worker.display_name;
+            match api.runtime.worker(&registry_worker.worker) {
+                Ok(worker) if worker.state == "stopped" && worker.singleton_key.is_none() => {}
+                Ok(worker) => preflight.blockers.push(WorkspaceDeletionBlocker {
+                    kind: if worker.singleton_key.is_some() {
+                        WorkspaceDeletionBlockerKind::RetentionHold
+                    } else {
+                        WorkspaceDeletionBlockerKind::WorkerRemovalBlocked
+                    },
+                    resource_kind: Some("worker".to_string()),
+                    resource_key: Some(worker_key),
+                    message: if worker.singleton_key.is_some() {
+                        "Internal or singleton Workers must be released by their owning service first."
+                            .to_string()
+                    } else {
+                        "Stop running, restoring, or otherwise active Workers before deleting the Workspace."
+                            .to_string()
+                    },
+                }),
+                Err(_) => preflight.blockers.push(WorkspaceDeletionBlocker {
+                    kind: WorkspaceDeletionBlockerKind::CleanupUnavailable,
+                    resource_kind: Some("worker".to_string()),
+                    resource_key: Some(worker_key),
+                    message: "Worker state is unavailable; retry after Runtime state is healthy."
+                        .to_string(),
+                }),
+            }
+        }
+        preflight.can_delete = preflight.blockers.is_empty();
+        Ok(preflight)
     }
 
     async fn execute_workspace_deletion(
@@ -1032,18 +1093,10 @@ impl WorkspaceServerApi {
             &[],
             None,
         )?;
-        let workspace = self
-            .store
-            .get_workspace(&operation.workspace_id)
+        let api = self
+            .api_for_workspace(&operation.workspace_id)
             .await?
             .ok_or_else(|| Error::InvalidInput("Workspace no longer exists".to_string()))?;
-        let repositories = self.store.list_repositories(&operation.workspace_id)?;
-        let config = self
-            .template
-            .for_catalog_workspace(&workspace, repositories)?;
-        let api = WorkspaceApi::new(config, self.store.clone()).await?;
-        self.store
-            .release_workspace_assignments_for_deletion(&operation.workspace_id)?;
 
         let mut child_operation_ids = Vec::new();
         let mut blockers = Vec::new();
@@ -1053,22 +1106,8 @@ impl WorkspaceServerApi {
         {
             let worker_key = worker.display_name.clone();
             let target = worker.worker;
-            let lifecycle = WorkerLifecycleRequest {
-                reason: Some("Workspace deletion".to_string()),
-                ticket_assignment: None,
-            };
-            let _ = api.runtime.cancel_worker(&target, lifecycle.clone());
-            if api.runtime.stop_worker(&target, lifecycle).is_err() {
-                blockers.push(WorkspaceDeletionBlocker {
-                    kind: WorkspaceDeletionBlockerKind::WorkerRemovalBlocked,
-                    resource_kind: Some("worker".to_string()),
-                    resource_key: Some(worker_key.clone()),
-                    message: "Worker stop did not reach a retryable terminal state.".to_string(),
-                });
-                continue;
-            }
             let response = WorkspaceWorkerRemoveExecutor::new(&api)
-                .execute_target_removal(api.runtime.as_ref(), &target, "Workspace deletion", true)
+                .execute_target_removal(api.runtime.as_ref(), &target, "Workspace deletion")
                 .await
                 .map_err(Error::Store)?;
             if let Some(child_operation_id) = self.store.latest_worker_removal_operation_id(
@@ -1097,7 +1136,6 @@ impl WorkspaceServerApi {
                     &api,
                     &workdir.workdir_id,
                     operation_id,
-                    operation.force_delete_dirty_workdirs,
                 ) {
                     Ok(child) => {
                         child_operation_ids.push(child.operation_id.clone());
@@ -1115,7 +1153,7 @@ impl WorkspaceServerApi {
                                 resource_kind: Some("workdir".to_string()),
                                 resource_key: Some(workdir.workdir_id),
                                 message: if dirty {
-                                    "Workdir is dirty or its cleanliness is unknown. Enable force deletion only after reviewing the impact."
+                                    "Workdir is dirty or its cleanliness is unknown. Clean it and refresh status before retrying deletion."
                                         .to_string()
                                 } else {
                                     "Workdir removal did not complete; retry the Workspace deletion operation."
@@ -1145,25 +1183,23 @@ impl WorkspaceServerApi {
         }
         let completed = self.store.finalize_workspace_deletion(operation_id)?;
         self.routers.lock().await.remove(&completed.workspace_id);
+        self.apis.lock().await.remove(&completed.workspace_id);
         Ok(completed)
     }
 
     async fn router_for_workspace(&self, workspace_id: &str) -> Result<Option<Router>> {
-        let mut routers = self.routers.lock().await;
-        if let Some(router) = routers.get(workspace_id) {
-            return Ok(Some(router.clone()));
+        if let Some(router) = self.routers.lock().await.get(workspace_id).cloned() {
+            return Ok(Some(router));
         }
-        let Some(workspace) = self.store.get_workspace(workspace_id).await? else {
+        let Some(api) = self.api_for_workspace(workspace_id).await? else {
             return Ok(None);
         };
-        let repositories = self.store.list_repositories(workspace_id)?;
-        let config = self
-            .template
-            .for_catalog_workspace(&workspace, repositories)?;
-        let api = WorkspaceApi::new(config, self.store.clone()).await?;
         tokio::spawn(run_orchestrator_turn_end_hook(api.clone()));
         let router = build_inner_router(api);
-        routers.insert(workspace_id.to_string(), router.clone());
+        self.routers
+            .lock()
+            .await
+            .insert(workspace_id.to_string(), router.clone());
         Ok(Some(router))
     }
 
@@ -1269,8 +1305,8 @@ async fn preflight_server_workspace_deletion(
         Err(error) => return server_error_response(error),
     };
     match api
-        .store
         .workspace_deletion_preflight(&actor_account_id, &workspace_id)
+        .await
     {
         Ok(preflight) => Json(preflight).into_response(),
         Err(error) => server_error_response(error),
@@ -1288,6 +1324,25 @@ async fn start_server_workspace_deletion(
         Ok(None) => return forbidden_server_response("Workspace deletion requires its owner"),
         Err(error) => return server_error_response(error),
     };
+    let existing = match api
+        .store
+        .workspace_deletion_operation(&actor_account_id, &request.operation_id)
+    {
+        Ok(existing) => existing,
+        Err(error) => return server_error_response(error),
+    };
+    if existing.is_none() {
+        let preflight = match api
+            .workspace_deletion_preflight(&actor_account_id, &workspace_id)
+            .await
+        {
+            Ok(preflight) => preflight,
+            Err(error) => return server_error_response(error),
+        };
+        if !preflight.can_delete {
+            return (StatusCode::CONFLICT, Json(preflight)).into_response();
+        }
+    }
     let reservation =
         match api
             .store
@@ -10520,27 +10575,7 @@ fn execute_reserved_workdir_removal(
     operation: WorkdirRemovalOperation,
     recovery: bool,
 ) -> Result<WorkdirRemovalOperation> {
-    execute_reserved_workdir_removal_with_provider(
-        api,
-        operation,
-        recovery,
-        api.runtime.as_ref(),
-        false,
-    )
-}
-
-fn execute_reserved_workdir_removal_for_workspace_deletion(
-    api: &WorkspaceApi,
-    operation: WorkdirRemovalOperation,
-    force_dirty: bool,
-) -> Result<WorkdirRemovalOperation> {
-    execute_reserved_workdir_removal_with_provider(
-        api,
-        operation,
-        false,
-        api.runtime.as_ref(),
-        force_dirty,
-    )
+    execute_reserved_workdir_removal_with_provider(api, operation, recovery, api.runtime.as_ref())
 }
 
 fn execute_reserved_workdir_removal_with_provider(
@@ -10548,7 +10583,6 @@ fn execute_reserved_workdir_removal_with_provider(
     operation: WorkdirRemovalOperation,
     recovery: bool,
     provider: &dyn WorkdirRemovalRuntimeProvider,
-    force_dirty: bool,
 ) -> Result<WorkdirRemovalOperation> {
     if operation.state == WorkdirRemovalOperationState::Completed {
         return Ok(operation);
@@ -10623,9 +10657,8 @@ fn execute_reserved_workdir_removal_with_provider(
             true,
         );
     };
-    if !force_dirty
-        && (status.summary.cleanliness.as_deref() != Some("clean")
-            || status.summary.status != WorkingDirectoryStatusKind::Active)
+    if status.summary.cleanliness.as_deref() != Some("clean")
+        || status.summary.status != WorkingDirectoryStatusKind::Active
     {
         return api.config_store.complete_workdir_removal_retained(
             &operation,
@@ -10723,7 +10756,6 @@ fn execute_workdir_removal_for_workspace_deletion(
     api: &WorkspaceApi,
     working_directory_id: &str,
     parent_operation_id: &str,
-    force_dirty: bool,
 ) -> Result<WorkdirRemovalOperation> {
     let source_actor = format!("workspace-deletion:{parent_operation_id}");
     let reason = "Workspace deletion";
@@ -10750,7 +10782,7 @@ fn execute_workdir_removal_for_workspace_deletion(
         api.config_store
             .reserve_workdir_removal_operation(&intent)?
     };
-    execute_reserved_workdir_removal_for_workspace_deletion(api, operation, force_dirty)
+    execute_reserved_workdir_removal(api, operation, false)
 }
 
 fn recover_workdir_removals(api: &WorkspaceApi) -> Result<()> {
@@ -24371,7 +24403,6 @@ mod tests {
             clean_operation.clone(),
             false,
             &clean_provider,
-            false,
         )
         .unwrap();
         assert_eq!(
@@ -24384,7 +24415,6 @@ mod tests {
             removed.clone(),
             false,
             &clean_provider,
-            false,
         )
         .unwrap();
         assert_eq!(replay, removed);
@@ -24409,7 +24439,6 @@ mod tests {
             missing_operation,
             false,
             &missing_provider,
-            false,
         )
         .unwrap();
         assert_eq!(
@@ -24436,7 +24465,6 @@ mod tests {
             unknown_operation,
             false,
             &unknown_provider,
-            false,
         )
         .unwrap();
         assert_eq!(unknown.state, WorkdirRemovalOperationState::Failed);
@@ -24458,33 +24486,10 @@ mod tests {
             dirty_operation,
             false,
             &dirty_provider,
-            false,
         )
         .unwrap();
         assert_eq!(dirty.disposition, Some(WorkdirRemovalDisposition::Retained));
         assert_eq!(dirty_provider.cleanup_calls(), 0);
-
-        let (forced_operation, mut forced_summary) =
-            reserve_removal_fixture(&api, "provider-dirty-forced");
-        forced_summary.cleanliness = Some("dirty".to_string());
-        let forced_provider = FakeWorkdirRemovalProvider::new(
-            workdir_removal_result(
-                WorkerOperationState::Accepted,
-                Some(forced_summary),
-                Vec::new(),
-            ),
-            workdir_removal_result(WorkerOperationState::Accepted, None, Vec::new()),
-        );
-        let forced = execute_reserved_workdir_removal_with_provider(
-            &api,
-            forced_operation,
-            false,
-            &forced_provider,
-            true,
-        )
-        .unwrap();
-        assert_eq!(forced.disposition, Some(WorkdirRemovalDisposition::Removed));
-        assert_eq!(forced_provider.cleanup_calls(), 1);
 
         let (unsupported_operation, unsupported_summary) =
             reserve_removal_fixture(&api, "provider-unsupported");
@@ -24509,7 +24514,6 @@ mod tests {
             unsupported_operation,
             false,
             &unsupported_provider,
-            false,
         )
         .unwrap();
         assert_eq!(unsupported.state, WorkdirRemovalOperationState::Failed);
@@ -24564,7 +24568,6 @@ mod tests {
                     operation,
                     true,
                     provider.as_ref(),
-                    false,
                 )
             }));
         }

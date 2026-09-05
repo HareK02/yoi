@@ -117,7 +117,6 @@ Deno.test("Workspace deletion DTOs fail closed and preserve durable operation st
     display_name: "Alpha",
     expected_revision: "2026-01-01T00:00:00Z",
     can_delete: true,
-    force_delete_dirty_workdirs_available: true,
     resources: {
       workers: 2,
       workdirs: 1,
@@ -137,7 +136,6 @@ Deno.test("Workspace deletion DTOs fail closed and preserve durable operation st
     workspace_id: "workspace-a",
     display_name: "Alpha",
     state: "blocked",
-    force_delete_dirty_workdirs: false,
     resources: preflight.resources,
     child_operation_ids: ["worker-remove:arcadia/7"],
     blockers: [{
@@ -185,8 +183,7 @@ Deno.test("Workspace settings exposes owner-gated typed destructive confirmation
       "permissions.delete_workspace",
       "preflightWorkspaceDeletion",
       "startWorkspaceDeletion",
-      "delete ${",
-      "force_delete_dirty_workdirs",
+      "deletionConfirmation",
       "disposeWorkspaceMultiplexer(workspaceId)",
     ]
   ) {

@@ -32,7 +32,6 @@
   let deletionLoading = $state(false);
   let deletionSubmitting = $state(false);
   let deletionConfirmation = $state('');
-  let forceDeleteDirtyWorkdirs = $state(false);
   let deletionPreflight = $state<WorkspaceDeletionPreflightResponse | null>(null);
   let deletionOperation = $state<WorkspaceDeletionOperationResponse | null>(null);
   let deletionOperationId = $state('');
@@ -95,7 +94,6 @@
     deletionOperation = null;
     deletionOperationId = crypto.randomUUID();
     deletionConfirmation = '';
-    forceDeleteDirtyWorkdirs = false;
     try {
       deletionPreflight = await preflightWorkspaceDeletion(workspaceId);
     } catch (err) {
@@ -114,7 +112,6 @@
         operation_id: deletionOperationId,
         expected_revision: deletionPreflight.expected_revision,
         confirmation: deletionConfirmation,
-        force_delete_dirty_workdirs: forceDeleteDirtyWorkdirs,
       });
       deletionOperation = operation;
       while (operation.state === 'queued' || operation.state === 'running') {
@@ -207,15 +204,9 @@
           <p class="status-message error">{blocker.message}</p>
         {/each}
         <label>
-          <span>Type <strong>delete {deletionPreflight.display_name}</strong> to confirm</span>
+          <span>Type <strong>{deletionPreflight.display_name}</strong> to confirm</span>
           <input bind:value={deletionConfirmation} autocomplete="off" />
         </label>
-        {#if deletionPreflight.force_delete_dirty_workdirs_available}
-          <label class="force-delete-option">
-            <input type="checkbox" bind:checked={forceDeleteDirtyWorkdirs} disabled={deletionOperation !== null} />
-            <span>Force-delete dirty Workdirs after reviewing the impact</span>
-          </label>
-        {/if}
       {/if}
       {#if deletionOperation}
         <p class="status-message">Deletion state: {deletionOperation.state}</p>
@@ -230,7 +221,7 @@
           class="danger-button"
           type="button"
           onclick={() => void deleteWorkspace()}
-          disabled={deletionSubmitting || !deletionPreflight?.can_delete || deletionConfirmation !== `delete ${deletionPreflight?.display_name ?? ''}`}
+          disabled={deletionSubmitting || !deletionPreflight?.can_delete || deletionConfirmation !== (deletionPreflight?.display_name ?? '')}
         >{deletionSubmitting ? 'Deleting…' : 'Delete Workspace'}</button>
       </div>
     </div>
@@ -244,6 +235,5 @@
   .modal-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: var(--space-4); background: rgb(0 0 0 / 0.55); }
   .deletion-dialog { width: min(34rem, 100%); max-height: calc(100vh - 2rem); overflow: auto; padding: var(--space-5); background: var(--color-surface, white); border: 1px solid var(--color-border); }
   .deletion-dialog label { display: grid; gap: var(--space-2); margin-block: var(--space-4); }
-  .force-delete-option { grid-template-columns: auto 1fr !important; align-items: start; }
   .dialog-actions { display: flex; justify-content: flex-end; gap: var(--space-2); margin-top: var(--space-5); }
 </style>

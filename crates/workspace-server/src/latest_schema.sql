@@ -948,7 +948,6 @@ CREATE TABLE workspace_deletion_operations (
     workspace_revision TEXT NOT NULL,
     owner_account_id TEXT NOT NULL,
     actor_account_id TEXT NOT NULL,
-    force_delete_dirty_workdirs INTEGER NOT NULL CHECK(force_delete_dirty_workdirs IN (0, 1)),
     state TEXT NOT NULL CHECK(state IN ('queued', 'running', 'blocked', 'failed', 'succeeded')),
     resource_counts_json TEXT NOT NULL,
     child_operation_ids_json TEXT NOT NULL,

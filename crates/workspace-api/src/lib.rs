@@ -673,7 +673,6 @@ pub struct WorkspaceDeletionPreflightResponse {
     /// Opaque persisted Workspace metadata revision used as a CAS fence.
     pub expected_revision: String,
     pub can_delete: bool,
-    pub force_delete_dirty_workdirs_available: bool,
     pub resources: WorkspaceDeletionResourceCounts,
     pub blockers: Vec<WorkspaceDeletionBlocker>,
 }
@@ -686,8 +685,6 @@ pub struct WorkspaceDeletionRequest {
     pub operation_id: String,
     pub expected_revision: String,
     pub confirmation: String,
-    #[serde(default)]
-    pub force_delete_dirty_workdirs: bool,
 }
 
 /// Durable deletion operation projection used by request responses and polling.
@@ -699,7 +696,6 @@ pub struct WorkspaceDeletionOperationResponse {
     pub workspace_id: String,
     pub display_name: String,
     pub state: WorkspaceDeletionState,
-    pub force_delete_dirty_workdirs: bool,
     pub resources: WorkspaceDeletionResourceCounts,
     pub child_operation_ids: Vec<String>,
     pub blockers: Vec<WorkspaceDeletionBlocker>,
@@ -3262,7 +3258,6 @@ mod tests {
             display_name: "Test".to_string(),
             expected_revision: "revision-7".to_string(),
             can_delete: true,
-            force_delete_dirty_workdirs_available: true,
             resources: WorkspaceDeletionResourceCounts {
                 workers: 2,
                 workdirs: 1,
@@ -3288,8 +3283,7 @@ mod tests {
             serde_json::from_value::<WorkspaceDeletionRequest>(serde_json::json!({
                 "operation_id": "delete-test",
                 "expected_revision": "revision-7",
-                "confirmation": "delete Test",
-                "force_delete_dirty_workdirs": false,
+                "confirmation": "Test",
                 "workspace_id": "caller-controlled"
             }))
             .is_err()

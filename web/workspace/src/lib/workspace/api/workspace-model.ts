@@ -665,7 +665,6 @@ export function parseWorkspaceDeletionPreflightResponse(
     "display_name",
     "expected_revision",
     "can_delete",
-    "force_delete_dirty_workdirs_available",
     "resources",
     "blockers",
   ], "Workspace deletion preflight");
@@ -685,10 +684,6 @@ export function parseWorkspaceDeletionPreflightResponse(
     can_delete: boolean(
       item.can_delete,
       "Workspace deletion preflight.can_delete",
-    ),
-    force_delete_dirty_workdirs_available: boolean(
-      item.force_delete_dirty_workdirs_available,
-      "Workspace deletion preflight.force_delete_dirty_workdirs_available",
     ),
     resources: deletionResourceCounts(
       item.resources,
@@ -713,7 +708,6 @@ export function parseWorkspaceDeletionOperationResponse(
     "workspace_id",
     "display_name",
     "state",
-    "force_delete_dirty_workdirs",
     "resources",
     "child_operation_ids",
     "blockers",
@@ -736,10 +730,6 @@ export function parseWorkspaceDeletionOperationResponse(
       "Workspace deletion operation.display_name",
     ),
     state: deletionState(item.state, "Workspace deletion operation.state"),
-    force_delete_dirty_workdirs: boolean(
-      item.force_delete_dirty_workdirs,
-      "Workspace deletion operation.force_delete_dirty_workdirs",
-    ),
     resources: deletionResourceCounts(
       item.resources,
       "Workspace deletion operation.resources",
