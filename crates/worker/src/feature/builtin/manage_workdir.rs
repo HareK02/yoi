@@ -5,6 +5,8 @@
 //! endpoints, credentials, materializer handles, and operation sessions stay
 //! behind [`WorkspaceClient`].
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
@@ -12,7 +14,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use workdir::http::{WorkdirSessionOperation, WorkdirSessionOperationResult};
-use workdir::workspace::{WorkspaceWorkdirSessionFence, WorkspaceWorkdirSessionOperationRequest};
+use workdir::workspace::WorkspaceWorkdirSessionOperationRequest;
 use workdir::{
     CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
     EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
@@ -52,16 +54,48 @@ const LIST_DESCRIPTION: &str = "List persistent Workdirs in the current Workspac
 const CREATE_DESCRIPTION: &str = "Materialize a persistent Workdir on a selected Runtime from a Workspace repository and optional selector. This does not change this Worker's attachment; use WorkdirAttach explicitly after creation.";
 const ATTACH_DESCRIPTION: &str = "Attach this Worker to one existing Workdir. The Backend enforces one active Workdir per Worker and one active Worker per Workdir, then opens an ephemeral operation session.";
 const DETACH_DESCRIPTION: &str = "Detach this Worker from its active Workdir and release Workdir occupancy. Any ephemeral operation session is closed.";
+pub(crate) type BeforeWorkdirRelease =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> + Send + Sync>;
+pub(crate) type AfterWorkdirAttach = Arc<dyn Fn() + Send + Sync>;
+
 const DELETE_DESCRIPTION: &str = "Request removal of one persistent Workdir by id through durable Backend Workspace authority. The input includes only the Workdir id and a bounded reason. The result reports removed, retained, or attention_required without exposing operation-table or provider internals.";
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ManageWorkdirFeature {
     client: Arc<dyn WorkspaceClient>,
+    before_workdir_release: Option<BeforeWorkdirRelease>,
+    after_workdir_attach: Option<AfterWorkdirAttach>,
+}
+
+impl std::fmt::Debug for ManageWorkdirFeature {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManageWorkdirFeature")
+            .field("client_kind", &self.client.kind())
+            .field("release_guard", &self.before_workdir_release.is_some())
+            .finish()
+    }
 }
 
 impl ManageWorkdirFeature {
     pub fn new(client: Arc<dyn WorkspaceClient>) -> Self {
-        Self { client }
+        Self {
+            client,
+            before_workdir_release: None,
+            after_workdir_attach: None,
+        }
+    }
+
+    pub(crate) fn with_child_lifecycle(
+        client: Arc<dyn WorkspaceClient>,
+        before_workdir_release: BeforeWorkdirRelease,
+        after_workdir_attach: AfterWorkdirAttach,
+    ) -> Self {
+        Self {
+            client,
+            before_workdir_release: Some(before_workdir_release),
+            after_workdir_attach: Some(after_workdir_attach),
+        }
     }
 }
 
@@ -81,7 +115,10 @@ impl FeatureModule for ManageWorkdirFeature {
     }
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
-        let backend = WorkspaceHttpWorkdirBackend::new(self.client.clone());
+        let backend = WorkspaceHttpWorkdirBackend::new(self.client.clone()).with_child_lifecycle(
+            self.before_workdir_release.clone(),
+            self.after_workdir_attach.clone(),
+        );
         for (name, definition) in [
             (
                 LIST_TOOL,
@@ -142,9 +179,21 @@ impl FeatureModule for ManageWorkdirFeature {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct WorkspaceHttpWorkdirBackend {
     client: Arc<dyn WorkspaceClient>,
+    before_workdir_release: Option<BeforeWorkdirRelease>,
+    after_workdir_attach: Option<AfterWorkdirAttach>,
+}
+
+impl std::fmt::Debug for WorkspaceHttpWorkdirBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkspaceHttpWorkdirBackend")
+            .field("client_kind", &self.client.kind())
+            .field("release_guard", &self.before_workdir_release.is_some())
+            .finish()
+    }
 }
 
 /// Worker-local Workdir handle whose operation authority remains in the Workspace Backend.
@@ -156,8 +205,6 @@ struct WorkspaceHttpWorkdirBackend {
 pub struct WorkspaceAttachedWorkdirSession {
     client: Arc<dyn WorkspaceClient>,
     workdir: Workdir,
-    expected_session_fence: Option<String>,
-    delegations: Vec<workdir::WorkdirDelegationRequest>,
 }
 
 impl WorkspaceAttachedWorkdirSession {
@@ -165,8 +212,6 @@ impl WorkspaceAttachedWorkdirSession {
         Arc::new(Self {
             client,
             workdir: Workdir::new("workspace-attachment"),
-            expected_session_fence: None,
-            delegations: Vec::new(),
         })
     }
 
@@ -183,16 +228,13 @@ impl WorkspaceAttachedWorkdirSession {
                 "/api/w/{}/workers/self/workdir-session/operations",
                 encode_path_segment(workspace_id)
             ),
-            serde_json::to_string(&WorkspaceWorkdirSessionOperationRequest {
-                expected_session_fence: self.expected_session_fence.clone(),
-                delegations: self.delegations.clone(),
-                operation,
-            })
-            .map_err(|error| {
-                WorkdirError::Transport(format!(
-                    "failed to encode Workspace Workdir operation: {error}"
-                ))
-            })?,
+            serde_json::to_string(&WorkspaceWorkdirSessionOperationRequest { operation }).map_err(
+                |error| {
+                    WorkdirError::Transport(format!(
+                        "failed to encode Workspace Workdir operation: {error}"
+                    ))
+                },
+            )?,
         );
         let response = self
             .client
@@ -239,59 +281,6 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
 
     fn capabilities(&self) -> WorkdirSessionCapabilities {
         WorkdirSessionCapabilities::ALL
-    }
-
-    fn transports_delegation_context(&self) -> bool {
-        true
-    }
-
-    async fn capture_delegation_source(
-        &self,
-        request: &workdir::WorkdirDelegationRequest,
-    ) -> Result<WorkdirSessionHandle, WorkdirError> {
-        let expected_session_fence = if let Some(fence) = &self.expected_session_fence {
-            fence.clone()
-        } else {
-            let workspace_id = self.client.workspace_id().ok_or_else(|| {
-                WorkdirError::Unavailable("Workspace identity is unavailable".to_string())
-            })?;
-            let response = self
-                .client
-                .execute(WorkspaceRequest {
-                    method: WorkspaceRequestMethod::Get,
-                    path: format!(
-                        "/api/w/{}/workers/self/workdir-session/fence",
-                        encode_path_segment(workspace_id)
-                    ),
-                    body: None,
-                })
-                .map_err(|error| {
-                    WorkdirError::Unavailable(format!(
-                        "failed to capture Workdir attachment fence: {error}"
-                    ))
-                })?;
-            let fence: WorkspaceWorkdirSessionFence = serde_json::from_str(&response.body)
-                .map_err(|error| {
-                    WorkdirError::Unavailable(format!(
-                        "invalid Workdir attachment fence response: {error}"
-                    ))
-                })?;
-            fence.value
-        };
-        let mut delegations = self.delegations.clone();
-        delegations.push(request.clone());
-        let candidate = Arc::new(Self {
-            client: self.client.clone(),
-            workdir: self.workdir.clone(),
-            expected_session_fence: Some(expected_session_fence),
-            delegations,
-        });
-        candidate
-            .stat(StatRequest {
-                path: workdir::WorkdirPath::new("").expect("empty Workdir path is valid"),
-            })
-            .await?;
-        Ok(candidate)
     }
 
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
@@ -387,7 +376,21 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
 
 impl WorkspaceHttpWorkdirBackend {
     fn new(client: Arc<dyn WorkspaceClient>) -> Self {
-        Self { client }
+        Self {
+            client,
+            before_workdir_release: None,
+            after_workdir_attach: None,
+        }
+    }
+
+    fn with_child_lifecycle(
+        mut self,
+        before_workdir_release: Option<BeforeWorkdirRelease>,
+        after_workdir_attach: Option<AfterWorkdirAttach>,
+    ) -> Self {
+        self.before_workdir_release = before_workdir_release;
+        self.after_workdir_attach = after_workdir_attach;
+        self
     }
 
     fn workspace_id(&self) -> Result<&str, ToolError> {
@@ -565,11 +568,26 @@ impl Tool for WorkspaceHttpWorkdirTool {
                 parse_input::<WorkdirCreateInput>(input_json)?,
                 ctx.call_id.to_string(),
             ),
-            WorkdirOperation::Attach => self
-                .backend
-                .attach(parse_input::<WorkdirAttachInput>(input_json)?),
+            WorkdirOperation::Attach => {
+                let result = self
+                    .backend
+                    .attach(parse_input::<WorkdirAttachInput>(input_json)?);
+                if result.is_ok()
+                    && let Some(after_attach) = &self.backend.after_workdir_attach
+                {
+                    after_attach();
+                }
+                result
+            }
             WorkdirOperation::Detach => {
                 let _input = parse_input::<WorkdirDetachInput>(input_json)?;
+                if let Some(before_release) = &self.backend.before_workdir_release {
+                    before_release().await.map_err(|error| {
+                        ToolError::ExecutionFailed(format!(
+                            "stop Internal SubWorkers before Workdir detach: {error}"
+                        ))
+                    })?;
+                }
                 self.backend.detach()
             }
             WorkdirOperation::Delete => self
@@ -765,6 +783,7 @@ struct WorkdirDeleteInput {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::feature::{FeatureModule, FeatureRegistryBuilder};
@@ -1155,6 +1174,7 @@ mod tests {
                 command: "true".to_string(),
                 timeout_secs: 120,
                 output_limit: 1024,
+                cwd: None,
                 spill_dir: Some("/worker-local/bash-output".into()),
                 tool_call_id: Some("call-1".to_string()),
             })
@@ -1176,83 +1196,6 @@ mod tests {
                 .unwrap()
                 .contains("/worker-local/bash-output")
         );
-    }
-
-    #[tokio::test]
-    async fn delegated_attached_session_carries_captured_fence_on_operations() {
-        let client = Arc::new(RecordingWorkspaceClient::new(vec![
-            response(json!({"value": "attachment-fence"})),
-            response(json!({
-                "operation": "stat",
-                "result": {"path": "", "kind": "directory", "size": 0}
-            })),
-            response(json!({
-                "operation": "stat",
-                "result": {"path": "visible.txt", "kind": "file", "size": 8}
-            })),
-        ]));
-        let parent = workdir::delegation_capable_session(WorkspaceAttachedWorkdirSession::handle(
-            client.clone(),
-        ));
-        let delegation = parent
-            .delegate(workdir::WorkdirDelegationRequest {
-                rules: vec![workdir::WorkdirDelegationRule {
-                    target: workdir::WorkdirPath::new("").unwrap(),
-                    permission: workdir::WorkdirDelegationPermission::Read,
-                    recursive: false,
-                }],
-                cwd: workdir::WorkdirPath::new("").unwrap(),
-            })
-            .await
-            .unwrap();
-        delegation
-            .scoped_session
-            .stat(StatRequest {
-                path: workdir::WorkdirPath::new("visible.txt").unwrap(),
-            })
-            .await
-            .unwrap();
-
-        let requests = client.requests();
-        assert_eq!(requests.len(), 3);
-        assert_eq!(
-            requests[0].path,
-            "/api/w/workspace%2Ftest/workers/self/workdir-session/fence"
-        );
-        let body: serde_json::Value =
-            serde_json::from_str(requests[2].body.as_deref().unwrap()).unwrap();
-        assert_eq!(body["expected_session_fence"], "attachment-fence");
-        assert_eq!(body["operation"]["operation"], "stat");
-        assert_eq!(body["delegations"][0]["rules"][0]["target"], "");
-    }
-
-    #[tokio::test]
-    async fn attached_provider_rejection_happens_before_delegation_is_returned() {
-        let client = Arc::new(RecordingWorkspaceClient::new(vec![
-            response(json!({"value": "attachment-fence"})),
-            response(json!({"error": "provider rejected delegated write target"})),
-        ]));
-        let parent = workdir::delegation_capable_session(WorkspaceAttachedWorkdirSession::handle(
-            client.clone(),
-        ));
-        let result = parent
-            .delegate(workdir::WorkdirDelegationRequest {
-                rules: vec![workdir::WorkdirDelegationRule {
-                    target: workdir::WorkdirPath::new("linked-target").unwrap(),
-                    permission: workdir::WorkdirDelegationPermission::Write,
-                    recursive: true,
-                }],
-                cwd: workdir::WorkdirPath::new("linked-target").unwrap(),
-            })
-            .await;
-
-        assert!(result.is_err(), "provider rejection must fail before lease");
-        let requests = client.requests();
-        assert_eq!(requests.len(), 2);
-        let validation: serde_json::Value =
-            serde_json::from_str(requests[1].body.as_deref().unwrap()).unwrap();
-        assert_eq!(validation["operation"]["operation"], "stat");
-        assert_eq!(validation["delegations"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1298,73 +1241,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nested_attached_session_preserves_full_delegation_chain() {
+    async fn scoped_broker_operations_carry_no_child_context() {
         let client = Arc::new(RecordingWorkspaceClient::new(vec![
-            response(json!({"value": "attachment-fence"})),
             response(json!({
                 "operation": "stat",
-                "result": {"path": "", "kind": "directory", "size": 0}
+                "result": {"path": "visible.txt", "kind": "file", "size": 8}
             })),
             response(json!({
                 "operation": "stat",
-                "result": {"path": "nested", "kind": "directory", "size": 0}
-            })),
-            response(json!({
-                "operation": "stat",
-                "result": {"path": "nested/file", "kind": "file", "size": 1}
+                "result": {"path": "visible.txt", "kind": "file", "size": 8}
             })),
         ]));
-        let parent = workdir::delegation_capable_session(WorkspaceAttachedWorkdirSession::handle(
+        let broker = workdir::WorkdirToolBroker::new(WorkspaceAttachedWorkdirSession::handle(
             client.clone(),
         ));
-        let outer = parent
-            .delegate(workdir::WorkdirDelegationRequest {
-                rules: vec![workdir::WorkdirDelegationRule {
+        let scoped = broker
+            .scope(workdir::WorkdirToolScope {
+                rules: vec![workdir::WorkdirToolScopeRule {
                     target: workdir::WorkdirPath::new("").unwrap(),
-                    permission: workdir::WorkdirDelegationPermission::Read,
+                    permission: workdir::WorkdirToolScopePermission::Read,
                     recursive: true,
                 }],
                 cwd: workdir::WorkdirPath::new("").unwrap(),
+                command: false,
             })
             .await
             .unwrap();
-        let nested = outer
-            .scoped_session
-            .delegate(workdir::WorkdirDelegationRequest {
-                rules: vec![workdir::WorkdirDelegationRule {
-                    target: workdir::WorkdirPath::new("nested").unwrap(),
-                    permission: workdir::WorkdirDelegationPermission::Read,
-                    recursive: true,
-                }],
-                cwd: workdir::WorkdirPath::new("nested").unwrap(),
-            })
-            .await
-            .unwrap();
-        nested
-            .scoped_session
+        scoped
             .stat(StatRequest {
-                path: workdir::WorkdirPath::new("file").unwrap(),
+                path: workdir::WorkdirPath::new("visible.txt").unwrap(),
             })
             .await
             .unwrap();
 
         let requests = client.requests();
-        assert_eq!(requests.len(), 4);
-        let outer_validation: serde_json::Value =
-            serde_json::from_str(requests[1].body.as_deref().unwrap()).unwrap();
-        let nested_validation: serde_json::Value =
-            serde_json::from_str(requests[2].body.as_deref().unwrap()).unwrap();
-        assert_eq!(outer_validation["delegations"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            nested_validation["delegations"].as_array().unwrap().len(),
-            2
-        );
-        let body: serde_json::Value =
-            serde_json::from_str(requests[3].body.as_deref().unwrap()).unwrap();
-        assert_eq!(body["delegations"].as_array().unwrap().len(), 2);
-        assert_eq!(body["delegations"][0]["rules"][0]["target"], "");
-        assert_eq!(body["delegations"][1]["rules"][0]["target"], "nested");
-        assert_eq!(body["operation"]["request"]["path"], "file");
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert_eq!(
+                request.path,
+                "/api/w/workspace%2Ftest/workers/self/workdir-session/operations"
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            assert!(body.get("delegations").is_none());
+            assert!(body.get("child").is_none());
+            assert!(body.get("expected_session_fence").is_none());
+        }
     }
 
     #[test]
@@ -1415,5 +1337,87 @@ mod tests {
         assert!(matches!(error, ToolError::InvalidArgument(_)));
         assert!(client.requests().is_empty());
         assert!(parse_input::<WorkdirListInput>(r#"{"path":"/tmp"}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn detach_stops_internal_subworkers_before_backend_release() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
+            "workspace_id": "workspace/test",
+            "workdir_id": "wd-attached",
+            "attached": false
+        }))]));
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let cleanup_calls_for_guard = cleanup_calls.clone();
+        let before_release: BeforeWorkdirRelease = Arc::new(move || {
+            let cleanup_calls = cleanup_calls_for_guard.clone();
+            Box::pin(async move {
+                cleanup_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        let tool = WorkspaceHttpWorkdirTool {
+            backend: WorkspaceHttpWorkdirBackend::new(client.clone())
+                .with_child_lifecycle(Some(before_release), None),
+            operation: WorkdirOperation::Detach,
+        };
+
+        tool.execute("{}", ToolExecutionContext::default())
+            .await
+            .unwrap();
+
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(client.requests().len(), 1);
+        assert_eq!(
+            client.requests()[0].path,
+            "/api/w/workspace%2Ftest/workers/self/workdir-attachment"
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_does_not_release_backend_when_child_cleanup_fails() {
+        let client = Arc::new(RecordingWorkspaceClient::new(Vec::new()));
+        let before_release: BeforeWorkdirRelease =
+            Arc::new(|| Box::pin(async { Err(std::io::Error::other("child cleanup failed")) }));
+        let tool = WorkspaceHttpWorkdirTool {
+            backend: WorkspaceHttpWorkdirBackend::new(client.clone())
+                .with_child_lifecycle(Some(before_release), None),
+            operation: WorkdirOperation::Detach,
+        };
+
+        let error = tool
+            .execute("{}", ToolExecutionContext::default())
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("stop Internal SubWorkers"));
+        assert!(client.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn successful_attach_reopens_internal_subworker_admission() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
+            "workspace_id": "workspace/test",
+            "workdir_id": "wd-attached",
+            "attached": true
+        }))]));
+        let reopen_calls = Arc::new(AtomicUsize::new(0));
+        let reopen_calls_for_hook = reopen_calls.clone();
+        let after_attach: AfterWorkdirAttach = Arc::new(move || {
+            reopen_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+        });
+        let tool = WorkspaceHttpWorkdirTool {
+            backend: WorkspaceHttpWorkdirBackend::new(client)
+                .with_child_lifecycle(None, Some(after_attach)),
+            operation: WorkdirOperation::Attach,
+        };
+
+        tool.execute(
+            r#"{"workdir_id":"wd-attached"}"#,
+            ToolExecutionContext::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reopen_calls.load(Ordering::SeqCst), 1);
     }
 }

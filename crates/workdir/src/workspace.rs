@@ -104,15 +104,5 @@ mod tests {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceWorkdirSessionOperationRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_session_fence: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub delegations: Vec<crate::WorkdirDelegationRequest>,
     pub operation: crate::http::WorkdirSessionOperation,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkspaceWorkdirSessionFence {
-    pub value: String,
 }
