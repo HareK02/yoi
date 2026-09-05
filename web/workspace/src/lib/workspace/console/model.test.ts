@@ -2247,7 +2247,7 @@ Deno.test("overview hides thinking and aggregates uninterrupted tool activity", 
   assertEquals(overview[4].body, "edited +2/-1");
 });
 
-Deno.test("overview hides in-flight thinking and keeps tool failures visible", () => {
+Deno.test("overview keeps tool failure counts without marking the activity as an error", () => {
   const overview = projectOverviewLines([
     {
       ...consoleLine("thinking-in-flight", "in_flight"),
@@ -2269,7 +2269,7 @@ Deno.test("overview hides in-flight thinking and keeps tool failures visible", (
   assertEquals(overview.length, 1);
   assertEquals(overview[0].kind, "activity");
   assertEquals(overview[0].body, "1 file read\n1 failed");
-  assertEquals(overview[0].error, true);
+  assertEquals(overview[0].error, false);
 });
 
 Deno.test("RunEnd appends TUI-compatible request and token stats", () => {

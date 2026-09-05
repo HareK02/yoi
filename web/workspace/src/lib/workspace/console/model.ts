@@ -442,7 +442,7 @@ function overviewToolActivityLine(group: ConsoleLine[]): ConsoleLine {
     body: [primary.join("・"), ...changes].filter(Boolean).join("\n"),
     source: "event",
     streaming: active,
-    error: failedCount > 0,
+    error: false,
   };
 }
 
