@@ -55,11 +55,12 @@ Workspace Server schema migration v26 removes the legacy `flow_instances`, `flow
 
 ## Worker boundary
 
-Flow invocation uses the normal Submit/Run segment vector rather than a Worker-create field:
+Flow invocation uses the normal Submit segment vector rather than a Worker-create field:
 
 ```json
 {
-  "method": "run",
+  "method": "submit",
+  "submission_request_id": "018f4f15-5c41-7d3a-8a72-2e755bc71681",
   "input": [
     { "kind": "flow", "selector": "builtin:coder-review" },
     { "kind": "text", "content": "Ticket 00001... implementation" }
@@ -69,7 +70,7 @@ Flow invocation uses the normal Submit/Run segment vector rather than a Worker-c
 
 Runtime accepts exactly one Flow segment only when the resolved Profile enables `feature.flow` and a Workspace client is available. The Worker asks Workspace authority only for an immutable source snapshot, creates the instance locally, replaces the Flow segment with the entered state's instructions, and commits that runtime state atomically with the remaining Submit segments before LLM execution. A Worker with an active Flow rejects the duplicate input without changing its local state or events.
 
-The generic model-facing `WorkerSpawn` accepts `initial_submit: Vec<Segment>` and routes them unchanged through the shared Workspace spawn request into Runtime `CreateWorkerRequest.initial_input`. It does not have a parallel `initial_text` or a role-specific `SpawnCoder` wrapper. Backend derives the flat content projection from the canonical segment vector, validates Flow shape before spawn, and includes the segment vector in lifecycle idempotency fingerprints. Runtime does not commit Worker creation or report spawn success merely because the initial Run method entered the Worker's in-memory channel: Runtime assigns the Submit an opaque id, the Worker commits that id as an extension on the same `UserInput` entry as any initial `FlowRuntimeState`, and the execution backend must return a matching typed input-commit acknowledgement. Restoring the same Worker never replays spawn initial segments.
+The generic model-facing `WorkerSpawn` accepts `initial_submit: Vec<Segment>` and routes them unchanged through the shared Workspace spawn request into Runtime `CreateWorkerRequest.initial_input`. It does not have a parallel `initial_text` or a role-specific `SpawnCoder` wrapper. Backend derives the flat content projection from the canonical segment vector, validates Flow shape before spawn, and includes the segment vector in lifecycle idempotency fingerprints. Runtime does not commit Worker creation or report spawn success merely because the initial Submit request entered the Worker's in-memory channel: Runtime assigns the Submit an opaque id, the Worker commits that id as an extension on the same `UserInput` entry as any initial `FlowRuntimeState`, and the execution backend must return a matching typed input-commit acknowledgement. Restoring the same Worker never replays spawn initial segments.
 
 When an Orchestrator supplies `ticket_id` to generic `WorkerSpawn`, the Worker tool derives the assignment operation id from the durable tool-call id rather than accepting lifecycle authority from model input. The shared Workspace worker-create route projects that request into a Coder Ticket-role intent and atomically applies the existing queued-Ticket assignment operation only after Runtime has returned the input-commit acknowledgement. A spawn or pre-commit input failure therefore leaves the Ticket queued and unassigned.
 
