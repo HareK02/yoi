@@ -491,19 +491,17 @@ impl Tool for SubWorkerSpawnTool {
         .await
         .map_err(|error| ToolError::ExecutionFailed(format!("build Internal Worker: {error}")))?;
         child.bind_workdir_session(Some(workdir_delegation.scoped_session.clone()));
-        if !transports_delegation_context {
-            child
-                .add_scope_rules([ScopeRule {
-                    target: child_bash_output_dir.clone(),
-                    permission: manifest::Permission::Read,
-                    recursive: true,
-                }])
-                .map_err(|error| {
-                    ToolError::ExecutionFailed(format!(
-                        "grant Internal Worker Bash output scope: {error}"
-                    ))
-                })?;
-        }
+        child
+            .add_scope_rules([ScopeRule {
+                target: child_bash_output_dir.clone(),
+                permission: manifest::Permission::Read,
+                recursive: true,
+            }])
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!(
+                    "grant Internal Worker Bash output scope: {error}"
+                ))
+            })?;
         let child_scope = child.scope().clone();
         let child_registry = SpawnedWorkerRegistry::new_internal(input.name.clone(), child_scope);
         register_worker_tools(
@@ -1489,12 +1487,6 @@ enabled = false
         );
         let child_bash_output_dir = bash_output_dir.join("sub-workers").join("remote-child");
         assert!(child_bash_output_dir.is_dir());
-        assert!(
-            record
-                .scope_delegated
-                .iter()
-                .all(|rule| rule.target != child_bash_output_dir)
-        );
         for required in ["Read", "Write", "Edit", "Glob", "Grep", "Bash"] {
             assert!(
                 record.installed_tools.iter().any(|name| name == required),
