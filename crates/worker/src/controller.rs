@@ -320,25 +320,6 @@ fn stage_oldest_passive_notification<St: Store + Clone>(
         })
 }
 
-fn prepare_restored_auto_notification<St: Store + Clone>(
-    pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
-    notify_buffer: &NotifyBuffer,
-) -> Option<PendingRun> {
-    let notification = pending_submissions.prepare_oldest_auto_notification()?;
-    let extension = pending_submissions.notification_activation_extension();
-    let notification_request_id = notification.notification_request_id.clone();
-    notify_buffer.push_durable_notify(
-        notification.message,
-        true,
-        notification.provenance,
-        extension,
-    );
-    Some(PendingRun::RunForNotification {
-        invoke_kind: protocol::InvokeKind::Notify,
-        notification_request_id: Some(notification_request_id),
-    })
-}
-
 fn prepare_pending_run<St: Store + Clone>(
     pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
     notify_buffer: &NotifyBuffer,
@@ -1435,7 +1416,16 @@ async fn controller_loop<C, St>(
     );
     let pending_submissions = worker.pending_submission_handle();
     stage_oldest_passive_notification(&pending_submissions, &notify_buffer);
-    let mut pending = prepare_restored_auto_notification(&pending_submissions, &notify_buffer);
+    let mut pending = match prepare_pending_run(&pending_submissions, &notify_buffer, None) {
+        Ok(pending) => pending,
+        Err(error) => {
+            let _ = working_event_tx.send(Event::Error {
+                code: ErrorCode::Internal,
+                message: error.to_string(),
+            });
+            None
+        }
+    };
 
     loop {
         // Top-of-iteration: if an event handler staged a run, fire it
@@ -2663,13 +2653,62 @@ mod tests {
         assert!(snapshot.head_id.is_some());
         let notify_buffer = NotifyBuffer::new();
         assert!(matches!(
-            prepare_restored_auto_notification(&pending, &notify_buffer),
+            prepare_pending_run(&pending, &notify_buffer, None).unwrap(),
             Some(PendingRun::RunForNotification {
                 notification_request_id: Some(_),
                 ..
             })
         ));
         assert!(notify_buffer.has_auto_run_pending());
+    }
+
+    #[test]
+    fn restored_mixed_activations_preserve_global_fifo_order() {
+        let temp = TempDir::new().unwrap();
+        let pending =
+            crate::worker::PendingSubmissionHandle::for_test(&temp.path().join("submit-first"));
+        pending
+            .accept(
+                "submit-first".into(),
+                vec![protocol::Segment::Text {
+                    content: "queued submit".into(),
+                }],
+                false,
+            )
+            .unwrap();
+        pending
+            .accept_notification("notify-second".into(), "newer notification".into(), true)
+            .unwrap();
+        let notify_buffer = NotifyBuffer::new();
+
+        assert!(matches!(
+            prepare_pending_run(&pending, &notify_buffer, None).unwrap(),
+            Some(PendingRun::Submit(_))
+        ));
+
+        let pending =
+            crate::worker::PendingSubmissionHandle::for_test(&temp.path().join("notify-first"));
+        pending
+            .accept_notification("notify-first".into(), "older notification".into(), true)
+            .unwrap();
+        pending
+            .accept(
+                "submit-second".into(),
+                vec![protocol::Segment::Text {
+                    content: "newer submit".into(),
+                }],
+                false,
+            )
+            .unwrap();
+        let notify_buffer = NotifyBuffer::new();
+
+        assert!(matches!(
+            prepare_pending_run(&pending, &notify_buffer, None).unwrap(),
+            Some(PendingRun::RunForNotification {
+                notification_request_id: Some(request_id),
+                ..
+            }) if request_id == "notify-first"
+        ));
     }
 
     #[test]

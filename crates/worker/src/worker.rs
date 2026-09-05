@@ -1657,27 +1657,6 @@ where
         Some(notification)
     }
 
-    pub(crate) fn prepare_oldest_auto_notification(&self) -> Option<PendingNotification> {
-        let mut state = self
-            .state
-            .lock()
-            .expect("pending activation state poisoned");
-        if state.activating.is_some() || state.activating_notification.is_some() {
-            return None;
-        }
-        let index = state
-            .pending_notifications
-            .iter()
-            .position(|notification| notification.auto_run)?;
-        let notification = state
-            .pending_notifications
-            .remove(index)
-            .expect("located auto-run notification must exist");
-        state.activating_notification = Some(notification.clone());
-        state.revision = state.revision.saturating_add(1);
-        Some(notification)
-    }
-
     pub(crate) fn prepare_next_activation(
         &self,
         fence: Option<(u64, &str)>,
