@@ -1578,7 +1578,7 @@ impl WorkspaceApi {
                     updated_at: config.workspace_created_at.clone(),
                     revoked_at: None,
                 },
-                false,
+                true,
             )
             .await?;
         let embedded_audience = format!("embedded:{}", config.workspace_id);
@@ -1604,14 +1604,22 @@ impl WorkspaceApi {
                 "failed to initialize embedded Worker backend: {err}"
             ))
         })?;
-        Self::new_with_execution_backend_and_broker(
+        let runtime_binding_store = store.clone();
+        let runtime_binding_workspace_id = config.workspace_id.clone();
+        let api = Self::new_with_execution_backend_and_broker(
             config,
             store,
             Arc::new(execution_backend),
             resource_broker,
             Some(worker_remove_dispatcher),
         )
-        .await
+        .await?;
+        api.runtime.set_runtime_binding_gate(move |runtime_id| {
+            runtime_binding_store
+                .workspace_runtime_binding_is_active(&runtime_binding_workspace_id, runtime_id)
+                .unwrap_or(false)
+        });
+        Ok(api)
     }
 
     #[cfg(test)]

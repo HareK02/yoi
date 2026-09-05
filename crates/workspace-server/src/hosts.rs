@@ -1126,20 +1126,45 @@ pub enum RuntimeRegistryUnregisterResult {
     },
 }
 
+type RuntimeBindingGate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 #[derive(Clone)]
 pub struct RuntimeRegistry {
     runtimes: Arc<RwLock<Vec<Arc<dyn WorkspaceWorkerRuntime>>>>,
+    runtime_binding_gate: Arc<RwLock<Option<RuntimeBindingGate>>>,
 }
 
 impl RuntimeRegistry {
     pub fn new(runtimes: Vec<Arc<dyn WorkspaceWorkerRuntime>>) -> Self {
         Self {
             runtimes: Arc::new(RwLock::new(runtimes)),
+            runtime_binding_gate: Arc::new(RwLock::new(None)),
         }
     }
 
     pub fn for_workspace(embedded_runtime: EmbeddedWorkerRuntime) -> Self {
         Self::new(vec![Arc::new(embedded_runtime)])
+    }
+
+    pub fn set_runtime_binding_gate<F>(&self, gate: F)
+    where
+        F: Fn(&str) -> bool + Send + Sync + 'static,
+    {
+        *self
+            .runtime_binding_gate
+            .write()
+            .expect("runtime binding gate lock poisoned") = Some(Arc::new(gate));
+    }
+
+    fn runtime_binding_is_active(&self, runtime_id: &str) -> bool {
+        if runtime_id == EMBEDDED_RUNTIME_ID {
+            return true;
+        }
+        self.runtime_binding_gate
+            .read()
+            .expect("runtime binding gate lock poisoned")
+            .as_ref()
+            .is_none_or(|gate| gate(runtime_id))
     }
 
     pub fn register<R>(&self, runtime: R)
@@ -1795,13 +1820,19 @@ impl RuntimeRegistry {
         self.runtimes
             .read()
             .expect("runtime registry lock poisoned")
-            .clone()
+            .iter()
+            .filter(|runtime| self.runtime_binding_is_active(runtime.runtime_id()))
+            .cloned()
+            .collect()
     }
 
     fn runtime(
         &self,
         runtime_id: &str,
     ) -> Result<Arc<dyn WorkspaceWorkerRuntime>, RuntimeRegistryError> {
+        if !self.runtime_binding_is_active(runtime_id) {
+            return Err(RuntimeRegistryError::UnknownRuntime(runtime_id.to_string()));
+        }
         self.runtimes
             .read()
             .expect("runtime registry lock poisoned")
@@ -5163,6 +5194,34 @@ mod tests {
         assert_eq!(from_runtime_a.worker.runtime_id, "runtime-a");
         assert_eq!(from_runtime_a.host_id, "host-a");
         assert_eq!(from_runtime_a.label, "worker from runtime a");
+    }
+
+    #[test]
+    fn registry_gate_rejects_cached_runtime_immediately_after_binding_revocation() {
+        let registry = RuntimeRegistry::new(vec![Arc::new(FixtureRuntime::with_worker(
+            "runtime-a",
+            "host-a",
+            "worker-a",
+            "worker from runtime a",
+        ))]);
+        let active = Arc::new(Mutex::new(true));
+        let gate_state = active.clone();
+        registry.set_runtime_binding_gate(move |_| {
+            *gate_state.lock().expect("gate state lock poisoned")
+        });
+        assert_eq!(registry.list_runtimes(10).items.len(), 1);
+        assert!(
+            registry
+                .worker(&RuntimeWorkerRef::new("runtime-a", "worker-a"))
+                .is_ok()
+        );
+
+        *active.lock().expect("gate state lock poisoned") = false;
+        assert!(registry.list_runtimes(10).items.is_empty());
+        assert!(matches!(
+            registry.worker(&RuntimeWorkerRef::new("runtime-a", "worker-a")),
+            Err(RuntimeRegistryError::UnknownRuntime(runtime_id)) if runtime_id == "runtime-a"
+        ));
     }
 
     #[test]

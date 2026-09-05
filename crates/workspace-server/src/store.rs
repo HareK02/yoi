@@ -544,6 +544,11 @@ pub trait ControlPlaneStore: Send + Sync {
         &self,
         record: &WorkspaceBootstrapRecord,
     ) -> Result<WorkspaceBootstrapResult>;
+    fn workspace_runtime_binding_is_active(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Result<bool>;
     async fn get_workspace_runtime_binding(
         &self,
         workspace_id: &str,
@@ -1833,6 +1838,17 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 replayed: false,
             })
         })
+    }
+
+    fn workspace_runtime_binding_is_active(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Result<bool> {
+        Ok(
+            SqliteWorkspaceStore::get_workspace_runtime_binding(self, workspace_id, runtime_id)?
+                .is_some_and(|binding| binding.revoked_at.is_none()),
+        )
     }
 
     async fn get_workspace_runtime_binding(
@@ -6967,12 +6983,20 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
         prepare_schema_v50(&path, Some("workspace-a"));
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE trusted_runtime_records SET revoked_at = '2' WHERE runtime_id = 'shared'",
+                [],
+            )
+            .unwrap();
 
         let store = SqliteWorkspaceStore::open(&path).unwrap();
         let binding = store
             .get_workspace_runtime_binding("workspace-a", "shared")
             .unwrap()
             .unwrap();
+        assert_eq!(binding.revoked_at.as_deref(), Some("2"));
         assert!(binding.public_key.is_some());
         assert!(
             binding
@@ -6988,6 +7012,24 @@ mod tests {
                     |row| row.get(0),
                 )?;
                 assert_eq!(jti_workspace, "workspace-a");
+                let workspace_foreign_keys: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_foreign_key_list('workspace_runtime_bindings') WHERE \"table\" = 'workspaces' AND \"from\" = 'workspace_id'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(workspace_foreign_keys, 1);
+                let unique_indexes: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_index_list('workspace_runtime_bindings') WHERE \"unique\" = 1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(unique_indexes >= 2);
+                let lookup_index: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_workspace_runtime_bindings_workspace'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(lookup_index, 1);
                 let violations: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM pragma_foreign_key_check",
                     [],
@@ -7033,7 +7075,9 @@ mod tests {
 
     #[test]
     fn runtime_binding_identity_and_trust_uniqueness_are_workspace_scoped() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
         store
             .with_conn(|conn| {
                 conn.execute_batch(
@@ -7096,6 +7140,89 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+        assert!(
+            store
+                .revoke_workspace_runtime_binding("workspace-a", "shared", "2")
+                .unwrap()
+        );
+        drop(store);
+
+        let reopened = SqliteWorkspaceStore::open(&path).unwrap();
+        assert!(
+            reopened
+                .list_workspace_runtime_bindings("workspace-a", false)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .list_workspace_runtime_bindings("workspace-b", false)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            reopened
+                .get_workspace_runtime_binding("workspace-a", "shared")
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn embedded_runtime_binding_can_explicitly_rotate_restart_identity() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO accounts(account_id, kind, handle, display_name, created_at, updated_at)
+                    VALUES ('owner', 'user', 'owner', 'Owner', '1', '1');
+                    INSERT INTO workspaces(workspace_id, owner_account_id, display_name, state, created_at, updated_at)
+                    VALUES ('workspace-a', 'owner', 'Workspace A', 'active', '1', '1');
+                    "#,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let first =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate("embedded-first").unwrap();
+        let second =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate("embedded-second").unwrap();
+        let binding = |public_key: String| WorkspaceRuntimeBinding {
+            workspace_id: "workspace-a".to_string(),
+            runtime_id: crate::hosts::EMBEDDED_RUNTIME_ID.to_string(),
+            display_name: "Embedded Runtime".to_string(),
+            base_url: "in-process://embedded".to_string(),
+            public_key: Some(public_key),
+            public_key_fingerprint: None,
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+            revoked_at: None,
+        };
+        store
+            .upsert_workspace_runtime_binding(binding(first.public_key.clone()), false)
+            .unwrap();
+        assert!(matches!(
+            store.upsert_workspace_runtime_binding(binding(second.public_key.clone()), false),
+            Err(Error::RuntimeBindingConflict(_))
+        ));
+        assert_eq!(
+            store
+                .upsert_workspace_runtime_binding(binding(second.public_key.clone()), true)
+                .unwrap(),
+            WorkspaceRuntimeBindingUpsert::Replaced
+        );
+        let persisted = store
+            .get_workspace_runtime_binding("workspace-a", crate::hosts::EMBEDDED_RUNTIME_ID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.public_key.as_deref(),
+            Some(second.public_key.as_str())
         );
     }
 
