@@ -219,7 +219,7 @@
       {/if}
     </section>
 
-    {#if data.workspace.permissions.manage_runtimes}
+    {#if data.workspace.permissions.manage_runtimes && !runtime.management.built_in}
       <section class="runtime-detail-section" aria-labelledby="runtime-trust-heading">
         <h2 id="runtime-trust-heading">Workspace trust</h2>
 

@@ -440,7 +440,7 @@ CREATE TABLE workspace_runtime_bindings (
     base_url TEXT NOT NULL,
     public_key TEXT NOT NULL,
     public_key_fingerprint TEXT NOT NULL,
-    binding_revision INTEGER NOT NULL CHECK (binding_revision > 0),
+    binding_revision INTEGER NOT NULL DEFAULT 1 CHECK (binding_revision > 0),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     revoked_at TEXT,

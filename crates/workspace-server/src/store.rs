@@ -6470,6 +6470,17 @@ fn verify_workspace_runtime_binding_schema(conn: &Connection) -> Result<()> {
             "workspace_runtime_bindings schema does not match schema-52".to_string(),
         ));
     }
+    let revision_default = conn.query_row(
+        "SELECT dflt_value FROM pragma_table_info('workspace_runtime_bindings') WHERE name = 'binding_revision'",
+        [],
+        |row| row.get::<_, Option<String>>(0),
+    )?;
+    if revision_default.as_deref() != Some("1") {
+        return Err(Error::Store(
+            "workspace_runtime_bindings binding_revision default does not match schema-52"
+                .to_string(),
+        ));
+    }
     let sql = conn.query_row(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'workspace_runtime_bindings'",
         [],
