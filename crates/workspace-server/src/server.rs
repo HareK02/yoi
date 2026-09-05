@@ -9251,7 +9251,7 @@ async fn scoped_capture_worker_observation_session(
         return Err(ApiError::from(Error::UnknownWorker { worker: target }));
     }
 
-    let mut connection = connect_workspace_worker_protocol(&api, &target).await?;
+    let mut connection = connect_workspace_worker_protocol(&api, &target, None).await?;
     let event = tokio::time::timeout(std::time::Duration::from_secs(10), connection.events.recv())
         .await
         .map_err(|_| {
@@ -13955,6 +13955,7 @@ pub(crate) struct WorkspaceWorkerProtocolConnection {
 pub(crate) async fn connect_workspace_worker_protocol(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
+    input_source: Option<&protocol::AuthenticatedInputSource>,
 ) -> Result<WorkspaceWorkerProtocolConnection> {
     let source = match api.observation_proxy.source(worker) {
         Ok(source) => source,
@@ -13971,15 +13972,39 @@ pub(crate) async fn connect_workspace_worker_protocol(
         }
     };
     match source {
-        RuntimeObservationSource::RemoteWs(config) => connect_remote_worker_protocol(config).await,
+        RuntimeObservationSource::RemoteWs(config) => {
+            connect_remote_worker_protocol(config, input_source).await
+        }
         RuntimeObservationSource::Embedded(source) => {
             connect_embedded_worker_protocol(source).await
         }
     }
 }
 
+fn insert_authenticated_input_source_header(
+    headers: &mut HeaderMap,
+    input_source: Option<&protocol::AuthenticatedInputSource>,
+) -> Result<()> {
+    let Some(input_source) = input_source else {
+        return Ok(());
+    };
+    let protocol::AuthenticatedInputSource::Account { account_id } = input_source else {
+        return Err(Error::Config(
+            "remote Worker protocol transport supports only Account input source".into(),
+        ));
+    };
+    headers.insert(
+        protocol::AUTHENTICATED_ACCOUNT_ID_HEADER,
+        account_id.parse().map_err(|error| {
+            Error::Config(format!("invalid authenticated Account identity: {error}"))
+        })?,
+    );
+    Ok(())
+}
+
 async fn connect_remote_worker_protocol(
     config: RuntimeObservationSourceConfig,
+    input_source: Option<&protocol::AuthenticatedInputSource>,
 ) -> Result<WorkspaceWorkerProtocolConnection> {
     let mut request = config
         .endpoint
@@ -13994,6 +14019,7 @@ async fn connect_remote_worker_protocol(
             })?,
         );
     }
+    insert_authenticated_input_source_header(request.headers_mut(), input_source)?;
     let (socket, _) =
         connect_async(request)
             .await
@@ -14116,6 +14142,16 @@ async fn remote_worker_protocol_ws_session(
                 return;
             }
         }
+    }
+    if let Err(error) =
+        insert_authenticated_input_source_header(request.headers_mut(), Some(&input_source))
+    {
+        let mut socket = socket;
+        let event = protocol_error_event(format!(
+            "failed to build authenticated Account identity header: {error}"
+        ));
+        let _ = send_protocol_event(&mut socket, &event).await;
+        return;
     }
 
     let (upstream, _) = match connect_async(request).await {
@@ -16676,6 +16712,25 @@ mod tests {
             } if account_id == "account-1"
         ));
         assert!(authorize_browser_worker_method(method, &source).is_err());
+    }
+
+    #[test]
+    fn remote_worker_protocol_header_preserves_authenticated_account_source() {
+        let mut headers = HeaderMap::new();
+        insert_authenticated_input_source_header(
+            &mut headers,
+            Some(&protocol::AuthenticatedInputSource::Account {
+                account_id: "account-1".into(),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            headers
+                .get(protocol::AUTHENTICATED_ACCOUNT_ID_HEADER)
+                .unwrap(),
+            "account-1"
+        );
     }
 
     #[test]

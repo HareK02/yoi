@@ -32,6 +32,13 @@ fn is_false(value: &bool) -> bool {
 // Method (Client → Worker via Unix Socket)
 // ---------------------------------------------------------------------------
 
+/// Trusted Server → Runtime transport header carrying the authenticated
+/// browser Account identity for one Worker protocol connection.
+///
+/// Runtime accepts this only after its normal HTTP authentication succeeds;
+/// serialized [`Method`] payloads cannot set authenticated source identity.
+pub const AUTHENTICATED_ACCOUNT_ID_HEADER: &str = "x-yoi-authenticated-account-id";
+
 /// Trusted source identity attached by an authenticated transport boundary.
 ///
 /// Public clients cannot select this value directly. Runtime/Backend adapters

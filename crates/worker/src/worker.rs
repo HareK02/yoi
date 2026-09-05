@@ -1290,10 +1290,31 @@ where
         pending: &PendingSubmission,
     ) -> Result<(), PendingSubmissionError> {
         let session_id = self.writer.state.location().session_id;
+        let mut pinned = Vec::new();
         for reference in submission_uploaded_file_refs(&pending.input) {
-            self.writer
-                .store
-                .pin_uploaded_file(session_id, reference, &pending.submission_id)?;
+            if pinned.iter().any(|existing: &protocol::UploadedFileRef| {
+                existing.artifact_id == reference.artifact_id
+            }) {
+                continue;
+            }
+            if let Err(pin_error) =
+                self.writer
+                    .store
+                    .pin_uploaded_file(session_id, reference, &pending.submission_id)
+            {
+                let mut rollback_error = None;
+                for acquired in pinned.iter().rev() {
+                    if let Err(error) = self.writer.store.release_uploaded_file_pin(
+                        session_id,
+                        &acquired.artifact_id,
+                        &pending.submission_id,
+                    ) {
+                        rollback_error.get_or_insert(error);
+                    }
+                }
+                return Err(rollback_error.unwrap_or(pin_error).into());
+            }
+            pinned.push(reference.clone());
         }
         Ok(())
     }
@@ -1303,14 +1324,28 @@ where
         pending: &PendingSubmission,
     ) -> Result<(), PendingSubmissionError> {
         let session_id = self.writer.state.location().session_id;
+        let mut released = Vec::new();
+        let mut first_error = None;
         for reference in submission_uploaded_file_refs(&pending.input) {
-            self.writer.store.release_uploaded_file_pin(
+            if released
+                .iter()
+                .any(|artifact_id: &String| artifact_id == &reference.artifact_id)
+            {
+                continue;
+            }
+            if let Err(error) = self.writer.store.release_uploaded_file_pin(
                 session_id,
                 &reference.artifact_id,
                 &pending.submission_id,
-            )?;
+            ) {
+                first_error.get_or_insert(error);
+            }
+            released.push(reference.artifact_id.clone());
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
     }
 
     #[cfg(test)]
@@ -9666,6 +9701,76 @@ mod build_summary_prompt_tests {
         let state = handle.state.lock().unwrap();
         assert_eq!(state.pending[0].provenance, account_a);
         assert_eq!(state.pending[1].provenance, account_b);
+    }
+
+    #[test]
+    fn rejected_submission_rolls_back_uploaded_file_pins_acquired_before_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        let session_id = handle.writer.state.session_id();
+        let limits = session_store::UploadedFileLimits {
+            max_file_bytes: 1024,
+            max_session_bytes: 2048,
+        };
+        let first = handle
+            .writer
+            .store
+            .write_uploaded_file(session_id, "first.txt", "text/plain", b"first", limits)
+            .unwrap();
+        let second = handle
+            .writer
+            .store
+            .write_uploaded_file(session_id, "second.txt", "text/plain", b"second", limits)
+            .unwrap();
+        handle
+            .writer
+            .store
+            .pin_uploaded_file(session_id, &second, "other-submission")
+            .unwrap();
+
+        assert!(
+            handle
+                .accept(
+                    "request-partial-pin".into(),
+                    vec![
+                        Segment::UploadedFile {
+                            file: first.clone(),
+                        },
+                        Segment::UploadedFile {
+                            file: second.clone(),
+                        },
+                    ],
+                    false,
+                )
+                .is_err()
+        );
+        assert!(handle.snapshot().submissions.is_empty());
+        assert!(
+            handle
+                .writer
+                .store
+                .delete_uploaded_file(session_id, &first.artifact_id)
+                .unwrap()
+        );
+        assert!(matches!(
+            handle
+                .writer
+                .store
+                .delete_uploaded_file(session_id, &second.artifact_id),
+            Err(StoreError::ArtifactAlreadyCommitted)
+        ));
+        handle
+            .writer
+            .store
+            .release_uploaded_file_pin(session_id, &second.artifact_id, "other-submission")
+            .unwrap();
+        assert!(
+            handle
+                .writer
+                .store
+                .delete_uploaded_file(session_id, &second.artifact_id)
+                .unwrap()
+        );
     }
 
     #[test]

@@ -91,7 +91,13 @@ pub(crate) async fn serve_workspace_subscription(
                                 runtime_id: Some(runtime_id),
                             } => {
                                 let worker = RuntimeWorkerRef::new(&runtime_id, worker_id.as_str());
-                                match connect_workspace_worker_protocol(&api, &worker).await {
+                                match connect_workspace_worker_protocol(
+                                    &api,
+                                    &worker,
+                                    Some(&input_source),
+                                )
+                                .await
+                                {
                                     Ok(connection) => {
                                         let methods = connection.methods.clone();
                                         let task = tokio::spawn(run_worker_protocol(
