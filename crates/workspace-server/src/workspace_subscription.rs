@@ -11,7 +11,9 @@ use tokio::sync::mpsc;
 use worker_runtime::identity::RuntimeWorkerRef;
 
 use crate::runtime_subscription::{BrokerSubscriptionEvent, RuntimeSubscriptionBroker};
-use crate::server::{WorkspaceApi, connect_workspace_worker_protocol};
+use crate::server::{
+    WorkspaceApi, authorize_browser_worker_method, connect_workspace_worker_protocol,
+};
 use crate::store::WorkspaceResourceKind;
 
 const OUTBOUND_CAPACITY: usize = 256;
@@ -21,7 +23,11 @@ struct ActiveSubscription {
     methods: Option<mpsc::Sender<protocol::Method>>,
 }
 
-pub(crate) async fn serve_workspace_subscription(api: WorkspaceApi, socket: WebSocket) {
+pub(crate) async fn serve_workspace_subscription(
+    api: WorkspaceApi,
+    socket: WebSocket,
+    input_source: protocol::AuthenticatedInputSource,
+) {
     let broker = api.runtime_subscription_broker().clone();
     let (mut socket_sender, mut socket_receiver) = socket.split();
     let (control_outbound, mut control_receiver) = mpsc::channel::<WsMessage>(OUTBOUND_CAPACITY);
@@ -153,7 +159,12 @@ pub(crate) async fn serve_workspace_subscription(api: WorkspaceApi, socket: WebS
                         else {
                             break;
                         };
-                        if methods.send(message.method).await.is_err() {
+                        let Ok(method) =
+                            authorize_browser_worker_method(message.method, &input_source)
+                        else {
+                            break;
+                        };
+                        if methods.send(method).await.is_err() {
                             break;
                         }
                     }

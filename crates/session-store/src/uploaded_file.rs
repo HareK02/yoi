@@ -24,6 +24,12 @@ pub const DEFAULT_MAX_FILES_PER_SUBMISSION: usize = 8;
 pub const DEFAULT_MAX_SESSION_UPLOADED_FILES: u64 = 256;
 const MAX_FILE_NAME_CHARS: usize = 255;
 const MAX_MEDIA_TYPE_BYTES: usize = 127;
+fn validate_pending_owner_id(owner_id: &str) -> Result<()> {
+    if owner_id.is_empty() || owner_id.len() > 256 {
+        return Err(StoreError::ArtifactIntegrityMismatch);
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UploadedFileLimits {
@@ -58,6 +64,8 @@ struct StoredUploadedFile {
     sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_entry_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_owner_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     upload_context: Option<UploadedFileUploadContext>,
     content_base64: String,
@@ -291,6 +299,7 @@ pub(crate) fn write_uploaded_file(
         byte_len,
         sha256: sha256.clone(),
         source_entry_id: None,
+        pending_owner_id: None,
         upload_context: context.cloned(),
         content_base64: BASE64.encode(content),
     };
@@ -376,6 +385,72 @@ pub(crate) fn clear_uploaded_file_binding(
     Ok(())
 }
 
+pub(crate) fn pin_uploaded_file(
+    dir: &Path,
+    reference: &UploadedFileRef,
+    owner_id: &str,
+) -> Result<()> {
+    validate_pending_owner_id(owner_id)?;
+    if reference.source_entry_id.is_some() {
+        return Err(StoreError::ArtifactAlreadyCommitted);
+    }
+    let aggregate_lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(dir.join(".aggregate.lock"))?;
+    FileExt::lock_exclusive(&aggregate_lock)?;
+    let path = record_path(dir, &reference.artifact_id)?;
+    let mut stored: StoredUploadedFile = serde_json::from_slice(&fs::read(&path)?)?;
+    if stored.file_name != reference.file_name
+        || stored.media_type != reference.media_type
+        || stored.created_at_ms != reference.created_at_ms
+        || stored.byte_len != reference.byte_len
+        || stored.sha256 != reference.sha256
+    {
+        return Err(StoreError::ArtifactIntegrityMismatch);
+    }
+    if stored.source_entry_id.is_some() {
+        return Err(StoreError::ArtifactAlreadyCommitted);
+    }
+    if let Some(existing_owner) = stored.pending_owner_id.as_deref() {
+        return if existing_owner == owner_id {
+            Ok(())
+        } else {
+            Err(StoreError::ArtifactAlreadyCommitted)
+        };
+    }
+    stored.pending_owner_id = Some(owner_id.to_owned());
+    let temp = dir.join(format!(".{}.file.pin.tmp", reference.artifact_id));
+    fs::write(&temp, serde_json::to_vec(&stored)?)?;
+    fs::rename(temp, path)?;
+    Ok(())
+}
+
+pub(crate) fn release_uploaded_file_pin(
+    dir: &Path,
+    artifact_id: &str,
+    owner_id: &str,
+) -> Result<()> {
+    validate_pending_owner_id(owner_id)?;
+    let aggregate_lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(dir.join(".aggregate.lock"))?;
+    FileExt::lock_exclusive(&aggregate_lock)?;
+    let path = record_path(dir, artifact_id)?;
+    let mut stored: StoredUploadedFile = serde_json::from_slice(&fs::read(&path)?)?;
+    if stored.source_entry_id.is_some() || stored.pending_owner_id.as_deref() != Some(owner_id) {
+        return Err(StoreError::ArtifactIntegrityMismatch);
+    }
+    stored.pending_owner_id = None;
+    let temp = dir.join(format!(".{artifact_id}.file.unpin.tmp"));
+    fs::write(&temp, serde_json::to_vec(&stored)?)?;
+    fs::rename(temp, path)?;
+    Ok(())
+}
+
 pub(crate) fn bind_uploaded_file(
     dir: &Path,
     reference: &UploadedFileRef,
@@ -405,6 +480,7 @@ pub(crate) fn bind_uploaded_file(
         return Err(StoreError::ArtifactAlreadyCommitted);
     }
     stored.source_entry_id = Some(source_entry_id.to_owned());
+    stored.pending_owner_id = None;
     let temp = dir.join(format!(".{}.file.bind.tmp", reference.artifact_id));
     fs::write(&temp, serde_json::to_vec(&stored)?)?;
     fs::rename(&temp, path)?;
@@ -455,7 +531,7 @@ pub(crate) fn copy_committed_uploaded_files(source_dir: &Path, target_dir: &Path
         }
         let bytes = fs::read(&path)?;
         let stored: StoredUploadedFile = serde_json::from_slice(&bytes)?;
-        if stored.source_entry_id.is_none() {
+        if stored.source_entry_id.is_none() && stored.pending_owner_id.is_none() {
             continue;
         }
         let target = target_dir.join(name);
@@ -499,7 +575,7 @@ pub(crate) fn delete_uncommitted_uploaded_files(dir: &Path) -> Result<u64> {
             continue;
         }
         let stored: StoredUploadedFile = serde_json::from_slice(&fs::read(&path)?)?;
-        if stored.source_entry_id.is_none() {
+        if stored.source_entry_id.is_none() && stored.pending_owner_id.is_none() {
             fs::remove_file(path)?;
             removed = removed
                 .checked_add(1)
@@ -523,7 +599,7 @@ pub(crate) fn delete_uploaded_file(dir: &Path, artifact_id: &str) -> Result<bool
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     };
-    if stored.source_entry_id.is_some() {
+    if stored.source_entry_id.is_some() || stored.pending_owner_id.is_some() {
         return Err(StoreError::ArtifactAlreadyCommitted);
     }
     match fs::remove_file(path) {

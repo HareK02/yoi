@@ -178,14 +178,21 @@ impl WorkerInterceptor {
     /// matches worker-history order.
     fn commit_system_items_with_extensions(
         &self,
-        items: &[(SystemItem, Vec<session_store::SessionExtension>)],
+        items: &[(
+            SystemItem,
+            Vec<session_store::SessionExtension>,
+            Option<session_store::LoggedSessionHistoryOrigin>,
+        )],
     ) -> Result<(), session_store::StoreError> {
         let Some(writer) = self.log_writer.as_ref() else {
             return Ok(());
         };
-        for (item, extensions) in items {
-            let entry =
-                writer.commit_system_item_with_extensions(item.clone(), extensions.clone())?;
+        for (item, extensions, history_provenance) in items {
+            let entry = writer.commit_system_item_with_extensions(
+                item.clone(),
+                extensions.clone(),
+                history_provenance.clone(),
+            )?;
             self.pending_committed_history
                 .lock()
                 .expect("pending committed history poisoned")
@@ -199,7 +206,7 @@ impl WorkerInterceptor {
             &items
                 .iter()
                 .cloned()
-                .map(|item| (item, Vec::new()))
+                .map(|item| (item, Vec::new(), None))
                 .collect::<Vec<_>>(),
         )
     }
@@ -341,8 +348,11 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
             projection_digest: projection.catalog_digest.clone(),
             logical_name: "internal.notify_wrapper".to_string(),
         };
-        let mut system_items: Vec<(SystemItem, Vec<session_store::SessionExtension>)> =
-            Vec::with_capacity(drained.len());
+        let mut system_items: Vec<(
+            SystemItem,
+            Vec<session_store::SessionExtension>,
+            Option<session_store::LoggedSessionHistoryOrigin>,
+        )> = Vec::with_capacity(drained.len());
         let mut items: Vec<Item> = Vec::with_capacity(drained.len());
         for entry in &drained {
             let system_item = match build_system_item_with_provenance(
@@ -360,7 +370,7 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
                 }
             };
             items.push(system_item.to_history_item());
-            system_items.push((system_item, entry.extensions()));
+            system_items.push((system_item, entry.extensions(), entry.history_provenance()));
         }
         if let Err(error) = self.commit_system_items_with_extensions(&system_items) {
             self.pending_notifies.requeue_front(drained);

@@ -4987,7 +4987,7 @@ mod tests {
                     "missing test context",
                 );
             };
-            let submission_id = input.submission_id.clone();
+            let submission_request_id = input.submission_request_id.clone();
             let content = input.content;
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -5004,11 +5004,13 @@ mod tests {
                     status: protocol::WorkerStatus::Idle,
                 });
             });
-            if let Some(submission_id) = submission_id {
-                worker_runtime::execution::WorkerExecutionResult::accepted_input_committed(
+            if let Some(submission_request_id) = submission_request_id {
+                worker_runtime::execution::WorkerExecutionResult::accepted_submission(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
                     WorkerExecutionRunState::Busy,
-                    submission_id,
+                    submission_request_id,
+                    uuid::Uuid::now_v7().to_string(),
+                    protocol::SubmissionDisposition::Started,
                 )
             } else {
                 worker_runtime::execution::WorkerExecutionResult::accepted(

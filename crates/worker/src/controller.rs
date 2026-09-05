@@ -229,6 +229,43 @@ enum PendingRun {
     Resume,
 }
 
+fn stage_pending_notification<St: Store + Clone>(
+    pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
+    notify_buffer: &NotifyBuffer,
+    source_namespace: &str,
+    notification_request_id: &str,
+) -> bool {
+    let Some(notification) =
+        pending_submissions.prepare_notification(source_namespace, notification_request_id)
+    else {
+        return false;
+    };
+    let extension = pending_submissions.notification_activation_extension();
+    notify_buffer.push_durable_notify(
+        notification.message,
+        notification.auto_run,
+        notification.provenance,
+        extension,
+    );
+    true
+}
+
+fn stage_oldest_passive_notification<St: Store + Clone>(
+    pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
+    notify_buffer: &NotifyBuffer,
+) -> bool {
+    pending_submissions
+        .next_passive_notification_identity()
+        .is_some_and(|(source_namespace, request_id)| {
+            stage_pending_notification(
+                pending_submissions,
+                notify_buffer,
+                &source_namespace,
+                &request_id,
+            )
+        })
+}
+
 fn prepare_pending_run<St: Store + Clone>(
     pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
     notify_buffer: &NotifyBuffer,
@@ -241,7 +278,12 @@ fn prepare_pending_run<St: Store + Clone>(
         Some(crate::worker::PendingActivation::Notification(notification)) => {
             let extension = pending_submissions.notification_activation_extension();
             let notification_request_id = notification.notification_request_id.clone();
-            notify_buffer.push_durable_notify(notification.message, extension);
+            notify_buffer.push_durable_notify(
+                notification.message,
+                notification.auto_run,
+                notification.provenance,
+                extension,
+            );
             Some(PendingRun::RunForNotification {
                 invoke_kind: protocol::InvokeKind::Notify,
                 notification_request_id: Some(notification_request_id),
@@ -1314,6 +1356,7 @@ async fn controller_loop<C, St>(
     );
     let mut pending: Option<PendingRun> = None;
     let pending_submissions = worker.pending_submission_handle();
+    stage_oldest_passive_notification(&pending_submissions, &notify_buffer);
 
     loop {
         // Top-of-iteration: if an event handler staged a run, fire it
@@ -1347,6 +1390,8 @@ async fn controller_loop<C, St>(
                 } => notification_request_id.clone(),
                 _ => None,
             };
+            let passive_notification_request_id =
+                pending_submissions.activating_passive_notification_id();
             let (mut new_status, shutdown, may_drain_pending) = match run {
                 PendingRun::Submit(submission) => {
                     let (input_commit_tx, input_commit_rx) = oneshot::channel();
@@ -1356,6 +1401,7 @@ async fn controller_loop<C, St>(
                         worker.run_with_input_extensions_and_commit_hook(
                             submission.input,
                             vec![extension],
+                            submission.provenance,
                             move || {
                                 let _ = input_commit_tx.send(());
                             },
@@ -1415,8 +1461,11 @@ async fn controller_loop<C, St>(
                     .await
                 }
             };
-            if let Some(notification_request_id) = notification_request_id {
+            if let Some(notification_request_id) =
+                notification_request_id.or(passive_notification_request_id)
+            {
                 pending_submissions.finish_notification_activation(&notification_request_id);
+                stage_oldest_passive_notification(&pending_submissions, &notify_buffer);
             }
 
             if !shutdown && may_drain_pending && new_status == WorkerStatus::Idle {
@@ -1470,13 +1519,47 @@ async fn controller_loop<C, St>(
             Method::Submit {
                 submission_request_id,
                 input,
-            }
-            | Method::SubmitTracked {
-                submission_request_id,
-                input,
             } => {
                 let request_id = submission_request_id.clone();
-                match pending_submissions.accept(submission_request_id, input, true) {
+                match pending_submissions.accept_from_source(
+                    submission_request_id,
+                    input,
+                    pending_submissions.direct_client_namespace(),
+                    session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
+                    true,
+                ) {
+                    Ok(acceptance) => {
+                        if let Some(activation) = acceptance.activation {
+                            pending = Some(PendingRun::Submit(activation));
+                        } else {
+                            let _ = working_event_tx.send(Event::SubmissionAccepted {
+                                submission_request_id: acceptance.submission_request_id,
+                                submission_id: acceptance.submission_id,
+                                disposition: acceptance.disposition,
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        let _ = working_event_tx.send(Event::SubmissionRejected {
+                            submission_request_id: request_id,
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
+            Method::SubmitTracked {
+                submission_request_id,
+                input,
+                source,
+            } => {
+                let request_id = submission_request_id.clone();
+                match pending_submissions.accept_from_source(
+                    submission_request_id,
+                    input,
+                    source.namespace(),
+                    crate::worker::authenticated_input_provenance(&source),
+                    true,
+                ) {
                     Ok(acceptance) => {
                         if let Some(activation) = acceptance.activation {
                             pending = Some(PendingRun::Submit(activation));
@@ -1502,31 +1585,85 @@ async fn controller_loop<C, St>(
                 message,
                 auto_run,
             } => {
-                if auto_run {
-                    match pending_submissions.accept_notification(notification_request_id, message)
-                    {
-                        Ok(true) => {
-                            match prepare_pending_run(&pending_submissions, &notify_buffer, None) {
-                                Ok(Some(next)) => pending = Some(next),
-                                Ok(None) => {}
-                                Err(error) => {
-                                    let _ = working_event_tx.send(Event::Error {
-                                        code: ErrorCode::Internal,
-                                        message: error.to_string(),
-                                    });
-                                }
+                let request_id = notification_request_id.clone();
+                let source_namespace = pending_submissions.direct_client_namespace();
+                match pending_submissions.accept_notification_from_source(
+                    notification_request_id,
+                    message,
+                    source_namespace.clone(),
+                    session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
+                    auto_run,
+                ) {
+                    Ok(_) if auto_run => {
+                        match prepare_pending_run(&pending_submissions, &notify_buffer, None) {
+                            Ok(Some(next)) => pending = Some(next),
+                            Ok(None) => {}
+                            Err(error) => {
+                                let _ = working_event_tx.send(Event::Error {
+                                    code: ErrorCode::Internal,
+                                    message: error.to_string(),
+                                });
                             }
                         }
-                        Ok(false) => {}
-                        Err(error) => {
-                            let _ = working_event_tx.send(Event::Error {
-                                code: ErrorCode::InvalidRequest,
-                                message: error.to_string(),
-                            });
+                    }
+                    Ok(_) => {
+                        stage_pending_notification(
+                            &pending_submissions,
+                            &notify_buffer,
+                            &source_namespace,
+                            &request_id,
+                        );
+                    }
+                    Err(error) => {
+                        let _ = working_event_tx.send(Event::Error {
+                            code: ErrorCode::InvalidRequest,
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
+
+            Method::NotifyTracked {
+                notification_request_id,
+                message,
+                auto_run,
+                source,
+            } => {
+                let request_id = notification_request_id.clone();
+                let source_namespace = source.namespace();
+                match pending_submissions.accept_notification_from_source(
+                    notification_request_id,
+                    message,
+                    source_namespace.clone(),
+                    crate::worker::authenticated_input_provenance(&source),
+                    auto_run,
+                ) {
+                    Ok(_) if auto_run => {
+                        match prepare_pending_run(&pending_submissions, &notify_buffer, None) {
+                            Ok(Some(next)) => pending = Some(next),
+                            Ok(None) => {}
+                            Err(error) => {
+                                let _ = working_event_tx.send(Event::Error {
+                                    code: ErrorCode::Internal,
+                                    message: error.to_string(),
+                                });
+                            }
                         }
                     }
-                } else {
-                    worker.push_notify(message, false);
+                    Ok(_) => {
+                        stage_pending_notification(
+                            &pending_submissions,
+                            &notify_buffer,
+                            &source_namespace,
+                            &request_id,
+                        );
+                    }
+                    Err(error) => {
+                        let _ = working_event_tx.send(Event::Error {
+                            code: ErrorCode::InvalidRequest,
+                            message: error.to_string(),
+                        });
+                    }
                 }
             }
 
@@ -2070,13 +2207,46 @@ where
                     Some(Method::Submit {
                         submission_request_id,
                         input,
-                    }
-                    | Method::SubmitTracked {
-                        submission_request_id,
-                        input,
                     }) => {
                         let request_id = submission_request_id.clone();
-                        match pending_submissions.accept(submission_request_id, input, false) {
+                        match pending_submissions.accept_from_source(
+                            submission_request_id,
+                            input,
+                            pending_submissions.direct_client_namespace(),
+                            session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
+                            false,
+                        ) {
+                            Ok(acceptance) => {
+                                let _ = working_event_tx.send(Event::SubmissionAccepted {
+                                    submission_request_id: acceptance.submission_request_id,
+                                    submission_id: acceptance.submission_id,
+                                    disposition: acceptance.disposition,
+                                });
+                                let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
+                                    pending: pending_submissions.snapshot(),
+                                });
+                            }
+                            Err(error) => {
+                                let _ = working_event_tx.send(Event::SubmissionRejected {
+                                    submission_request_id: request_id,
+                                    message: error.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    Some(Method::SubmitTracked {
+                        submission_request_id,
+                        input,
+                        source,
+                    }) => {
+                        let request_id = submission_request_id.clone();
+                        match pending_submissions.accept_from_source(
+                            submission_request_id,
+                            input,
+                            source.namespace(),
+                            crate::worker::authenticated_input_provenance(&source),
+                            false,
+                        ) {
                             Ok(acceptance) => {
                                 let _ = working_event_tx.send(Event::SubmissionAccepted {
                                     submission_request_id: acceptance.submission_request_id,
@@ -2147,23 +2317,69 @@ where
                         message,
                         auto_run,
                     }) => {
-                        if auto_run {
-                            if let Err(error) = pending_submissions.accept_notification(
-                                notification_request_id,
-                                message,
-                            ) {
+                        let request_id = notification_request_id.clone();
+                        let source_namespace = pending_submissions.direct_client_namespace();
+                        match pending_submissions.accept_notification_from_source(
+                            notification_request_id,
+                            message,
+                            source_namespace.clone(),
+                            session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
+                            auto_run,
+                        ) {
+                            Ok(_) if !auto_run => {
+                                stage_pending_notification(
+                                    &pending_submissions,
+                                    notify_buffer,
+                                    &source_namespace,
+                                    &request_id,
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
                                 let _ = working_event_tx.send(Event::Error {
                                     code: ErrorCode::InvalidRequest,
                                     message: error.to_string(),
                                 });
-                            } else {
-                                let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
-                                    pending: pending_submissions.snapshot(),
+                            }
+                        }
+                        let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
+                            pending: pending_submissions.snapshot(),
+                        });
+                    }
+                    Some(Method::NotifyTracked {
+                        notification_request_id,
+                        message,
+                        auto_run,
+                        source,
+                    }) => {
+                        let request_id = notification_request_id.clone();
+                        let source_namespace = source.namespace();
+                        match pending_submissions.accept_notification_from_source(
+                            notification_request_id,
+                            message,
+                            source_namespace.clone(),
+                            crate::worker::authenticated_input_provenance(&source),
+                            auto_run,
+                        ) {
+                            Ok(_) if !auto_run => {
+                                stage_pending_notification(
+                                    &pending_submissions,
+                                    notify_buffer,
+                                    &source_namespace,
+                                    &request_id,
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                let _ = working_event_tx.send(Event::Error {
+                                    code: ErrorCode::InvalidRequest,
+                                    message: error.to_string(),
                                 });
                             }
-                        } else {
-                            notify_buffer.push_notify(message, false);
                         }
+                        let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
+                            pending: pending_submissions.snapshot(),
+                        });
                     }
                     Some(Method::ListCompletions { .. }) => {}
                     Some(Method::ListWorkers | Method::RestoreWorker { .. } | Method::RegisterPeer { .. }) => {

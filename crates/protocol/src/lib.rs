@@ -32,6 +32,38 @@ fn is_false(value: &bool) -> bool {
 // Method (Client → Worker via Unix Socket)
 // ---------------------------------------------------------------------------
 
+/// Trusted source identity attached by an authenticated transport boundary.
+///
+/// Public clients cannot select this value directly. Runtime/Backend adapters
+/// stamp it before forwarding an accepted Submit or Notify to a Worker.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuthenticatedInputSource {
+    Account {
+        account_id: String,
+    },
+    Worker {
+        runtime_id: String,
+        worker_id: String,
+    },
+    Backend {
+        operation_id: String,
+    },
+}
+
+impl AuthenticatedInputSource {
+    pub fn namespace(&self) -> String {
+        match self {
+            Self::Account { account_id } => format!("account:{account_id}"),
+            Self::Worker {
+                runtime_id,
+                worker_id,
+            } => format!("worker:{runtime_id}:{worker_id}"),
+            Self::Backend { operation_id } => format!("backend:{operation_id}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
@@ -45,13 +77,13 @@ pub enum Method {
         submission_request_id: String,
         input: Vec<Segment>,
     },
-    /// Runtime-internal Submit with the same request identity contract. This
-    /// variant is not serializable on the public Client → Worker protocol.
-    #[serde(skip)]
+    /// Authenticated transport form of Submit. Trusted adapters replace
+    /// public Submit before forwarding it to the Worker.
     #[cfg_attr(feature = "typescript", ts(skip))]
     SubmitTracked {
         submission_request_id: String,
         input: Vec<Segment>,
+        source: AuthenticatedInputSource,
     },
     /// Human-readable text injected into the target Worker's LLM context
     /// as a non-blocking system message. `auto_run` controls whether an
@@ -64,6 +96,15 @@ pub enum Method {
         message: String,
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         auto_run: bool,
+    },
+    /// Authenticated transport form of Notify.
+    #[cfg_attr(feature = "typescript", ts(skip))]
+    NotifyTracked {
+        notification_request_id: String,
+        message: String,
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        auto_run: bool,
+        source: AuthenticatedInputSource,
     },
     /// Typed lifecycle report from a child Worker to its direct parent.
     WorkerEvent(WorkerEvent),
@@ -1497,15 +1538,26 @@ mod tests {
     }
 
     #[test]
-    fn runtime_tracked_submit_is_not_public_protocol_json() {
+    fn authenticated_submit_round_trips_trusted_source() {
         let method = Method::SubmitTracked {
             input: vec![Segment::text("private")],
             submission_request_id: "request-1".to_string(),
+            source: AuthenticatedInputSource::Account {
+                account_id: "account-1".into(),
+            },
         };
-        assert!(serde_json::to_string(&method).is_err());
+        let json = serde_json::to_string(&method).unwrap();
+        let decoded = serde_json::from_str::<Method>(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            Method::SubmitTracked {
+                source: AuthenticatedInputSource::Account { account_id },
+                ..
+            } if account_id == "account-1"
+        ));
         assert!(
             serde_json::from_str::<Method>(
-                r#"{"method":"submit_tracked","input":[],"submission_id":"forged"}"#,
+                r#"{"method":"submit_tracked","input":[],"submission_request_id":"forged"}"#,
             )
             .is_err()
         );

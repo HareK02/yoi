@@ -1804,15 +1804,18 @@ async fn notify_while_idle_with_auto_run_false_waits_for_explicit_run() {
     let client_for_assert = client.clone();
     let worker = make_worker(client).await;
     let handle = spawn_controller(worker).await;
+    let notification_request_id = protocol::new_submission_request_id();
 
-    handle
-        .send(Method::Notify {
-            notification_request_id: protocol::new_submission_request_id(),
-            message: "progress snapshot".into(),
-            auto_run: false,
-        })
-        .await
-        .unwrap();
+    for _ in 0..2 {
+        handle
+            .send(Method::Notify {
+                notification_request_id: notification_request_id.clone(),
+                message: "progress snapshot".into(),
+                auto_run: false,
+            })
+            .await
+            .unwrap();
+    }
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(handle.shared_state.get_status(), WorkerStatus::Idle);
@@ -2047,6 +2050,66 @@ async fn notify_while_running_does_not_emit_already_running_error() {
     // and has dedicated coverage in
     // `notify_while_idle_auto_starts_turn_and_injects_system_message`.
     wait_for_status(&handle, WorkerStatus::Idle).await;
+}
+
+#[tokio::test]
+async fn weak_notify_while_running_is_deduped_and_survives_until_next_submit() {
+    let client = MockClient::sequential(vec![
+        MockResponse::Hang(Vec::new()),
+        MockResponse::Complete(simple_text_events()),
+    ]);
+    let client_for_assert = client.clone();
+    let worker = make_worker(client).await;
+    let handle = spawn_controller(worker).await;
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "first",
+        ))
+        .await
+        .unwrap();
+    wait_for_status(&handle, WorkerStatus::Running).await;
+
+    let notification_request_id = protocol::new_submission_request_id();
+    for _ in 0..2 {
+        handle
+            .send(Method::Notify {
+                notification_request_id: notification_request_id.clone(),
+                message: "durable weak notice".into(),
+                auto_run: false,
+            })
+            .await
+            .unwrap();
+    }
+    handle.send(Method::Cancel).await.unwrap();
+    wait_for_status(&handle, WorkerStatus::Idle).await;
+
+    let mut rx = handle.subscribe();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "second",
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if matches!(rx.recv().await, Ok(Event::TurnEnd { .. })) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("second submit completes");
+
+    let requests = client_for_assert.captured_requests();
+    let notice_count = requests[1]
+        .items
+        .iter()
+        .filter_map(|item| item.as_text())
+        .filter(|text| text.contains("durable weak notice"))
+        .count();
+    assert_eq!(notice_count, 1);
 }
 
 #[tokio::test]

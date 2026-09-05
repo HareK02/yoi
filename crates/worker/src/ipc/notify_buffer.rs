@@ -25,7 +25,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use protocol::WorkerEvent;
-use session_store::{SessionExtension, SystemItem};
+use session_store::{LoggedSessionHistoryOrigin, SessionExtension, SystemItem};
 use tracing::warn;
 
 use crate::prompt::catalog::{CatalogError, PromptCatalog};
@@ -45,6 +45,7 @@ pub enum PendingNotify {
         message: String,
         auto_run: bool,
         extensions: Vec<SessionExtension>,
+        history_provenance: Option<LoggedSessionHistoryOrigin>,
     },
     WorkerEvent {
         event: WorkerEvent,
@@ -56,6 +57,15 @@ impl PendingNotify {
         match self {
             PendingNotify::Notify { extensions, .. } => extensions.clone(),
             PendingNotify::WorkerEvent { .. } => Vec::new(),
+        }
+    }
+
+    pub(crate) fn history_provenance(&self) -> Option<LoggedSessionHistoryOrigin> {
+        match self {
+            PendingNotify::Notify {
+                history_provenance, ..
+            } => history_provenance.clone(),
+            PendingNotify::WorkerEvent { .. } => None,
         }
     }
 }
@@ -81,14 +91,22 @@ impl NotifyBuffer {
             message,
             auto_run,
             extensions: Vec::new(),
+            history_provenance: None,
         });
     }
 
-    pub fn push_durable_notify(&self, message: String, extension: SessionExtension) {
+    pub fn push_durable_notify(
+        &self,
+        message: String,
+        auto_run: bool,
+        history_provenance: LoggedSessionHistoryOrigin,
+        extension: SessionExtension,
+    ) {
         self.push_entry(PendingNotify::Notify {
             message,
-            auto_run: true,
+            auto_run,
             extensions: vec![extension],
+            history_provenance: Some(history_provenance),
         });
     }
 
@@ -230,6 +248,7 @@ mod tests {
             message: "hello".into(),
             auto_run: false,
             extensions: Vec::new(),
+            history_provenance: None,
         };
         let catalog = PromptCatalog::builtins_only().unwrap();
         let item = build_system_item(&entry, &catalog).unwrap();

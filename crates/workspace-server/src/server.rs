@@ -8537,13 +8537,15 @@ async fn scoped_list_runtimes(
 
 async fn scoped_workspace_protocol_ws(
     State(api): State<WorkspaceApi>,
+    Extension(actor): Extension<RequestActor>,
     AxumPath(workspace_id): AxumPath<String>,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> std::result::Result<Response, Response> {
     validate_workspace_scope(&api, &workspace_id).map_err(|error| error.into_response())?;
+    let input_source = authenticated_browser_input_source(&actor);
     Ok(ws
         .on_upgrade(move |socket| {
-            crate::workspace_subscription::serve_workspace_subscription(api, socket)
+            crate::workspace_subscription::serve_workspace_subscription(api, socket, input_source)
         })
         .into_response())
 }
@@ -11458,6 +11460,7 @@ async fn scoped_cancel_runtime_worker(
 async fn scoped_worker_protocol_ws(
     ws: WebSocketUpgrade,
     State(api): State<WorkspaceApi>,
+    Extension(actor): Extension<RequestActor>,
     AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
 ) -> Response {
     if let Err(err) = validate_workspace_scope(&api, &path.workspace_id) {
@@ -11465,6 +11468,7 @@ async fn scoped_worker_protocol_ws(
     }
     worker_protocol_ws(
         State(api),
+        Extension(actor),
         AxumPath((path.worker.runtime_id, path.worker.worker_id)),
         ws,
     )
@@ -13877,8 +13881,45 @@ async fn cancel_runtime_worker(
     Ok(Json(result))
 }
 
+fn authenticated_browser_input_source(actor: &RequestActor) -> protocol::AuthenticatedInputSource {
+    protocol::AuthenticatedInputSource::Account {
+        account_id: actor.account_id.clone(),
+    }
+}
+
+pub(crate) fn authorize_browser_worker_method(
+    method: protocol::Method,
+    source: &protocol::AuthenticatedInputSource,
+) -> std::result::Result<protocol::Method, &'static str> {
+    match method {
+        protocol::Method::Submit {
+            submission_request_id,
+            input,
+        } => Ok(protocol::Method::SubmitTracked {
+            submission_request_id,
+            input,
+            source: source.clone(),
+        }),
+        protocol::Method::Notify {
+            notification_request_id,
+            message,
+            auto_run,
+        } => Ok(protocol::Method::NotifyTracked {
+            notification_request_id,
+            message,
+            auto_run,
+            source: source.clone(),
+        }),
+        protocol::Method::SubmitTracked { .. } | protocol::Method::NotifyTracked { .. } => {
+            Err("authenticated Worker input source is server-owned")
+        }
+        other => Ok(other),
+    }
+}
+
 async fn worker_protocol_ws(
     State(api): State<WorkspaceApi>,
+    Extension(actor): Extension<RequestActor>,
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
@@ -13902,7 +13943,8 @@ async fn worker_protocol_ws(
                 .into_response();
         }
     };
-    ws.on_upgrade(move |socket| worker_protocol_ws_session(source, socket))
+    let input_source = authenticated_browser_input_source(&actor);
+    ws.on_upgrade(move |socket| worker_protocol_ws_session(source, socket, input_source))
 }
 
 pub(crate) struct WorkspaceWorkerProtocolConnection {
@@ -14029,13 +14071,17 @@ async fn connect_embedded_worker_protocol(
     Ok(WorkspaceWorkerProtocolConnection { methods, events })
 }
 
-async fn worker_protocol_ws_session(source: RuntimeObservationSource, socket: WebSocket) {
+async fn worker_protocol_ws_session(
+    source: RuntimeObservationSource,
+    socket: WebSocket,
+    input_source: protocol::AuthenticatedInputSource,
+) {
     match source {
         RuntimeObservationSource::RemoteWs(config) => {
-            remote_worker_protocol_ws_session(config, socket).await;
+            remote_worker_protocol_ws_session(config, socket, input_source).await;
         }
         RuntimeObservationSource::Embedded(source) => {
-            embedded_worker_protocol_ws_session(source, socket).await;
+            embedded_worker_protocol_ws_session(source, socket, input_source).await;
         }
     }
 }
@@ -14043,6 +14089,7 @@ async fn worker_protocol_ws_session(source: RuntimeObservationSource, socket: We
 async fn remote_worker_protocol_ws_session(
     config: RuntimeObservationSourceConfig,
     socket: WebSocket,
+    input_source: protocol::AuthenticatedInputSource,
 ) {
     let mut request = match config.endpoint.clone().into_client_request() {
         Ok(request) => request,
@@ -14091,14 +14138,33 @@ async fn remote_worker_protocol_ws_session(
             inbound = client_stream.next() => {
                 match inbound {
                     Some(Ok(WsMessage::Text(text))) => {
-                        if upstream_sink.send(TungsteniteMessage::Text(text.to_string().into())).await.is_err() {
+                        let method = match protocol::stream::decode_method(text.as_ref()) {
+                            Ok(method) => match authorize_browser_worker_method(method, &input_source) {
+                                Ok(method) => method,
+                                Err(message) => {
+                                    if let Ok(event) = protocol::stream::encode_event(&protocol_error_event(message)) {
+                                        let _ = client_sink.send(WsMessage::Text(event.into())).await;
+                                    }
+                                    break;
+                                }
+                            },
+                            Err(error) => {
+                                if let Ok(event) = protocol::stream::encode_event(&protocol_error_event(error.to_string())) {
+                                    let _ = client_sink.send(WsMessage::Text(event.into())).await;
+                                }
+                                break;
+                            }
+                        };
+                        let Ok(method) = protocol::stream::encode_method(&method) else { break };
+                        if upstream_sink.send(TungsteniteMessage::Text(method.into())).await.is_err() {
                             break;
                         }
                     }
-                    Some(Ok(WsMessage::Binary(binary))) => {
-                        if upstream_sink.send(TungsteniteMessage::Binary(binary.to_vec().into())).await.is_err() {
-                            break;
+                    Some(Ok(WsMessage::Binary(_))) => {
+                        if let Ok(event) = protocol::stream::encode_event(&protocol_error_event("binary Worker methods are not accepted")) {
+                            let _ = client_sink.send(WsMessage::Text(event.into())).await;
                         }
+                        break;
                     }
                     Some(Ok(WsMessage::Close(_))) | None => {
                         let _ = upstream_sink.send(TungsteniteMessage::Close(None)).await;
@@ -14154,6 +14220,7 @@ async fn remote_worker_protocol_ws_session(
 async fn embedded_worker_protocol_ws_session(
     source: crate::observation::EmbeddedRuntimeObservationSource,
     mut socket: WebSocket,
+    input_source: protocol::AuthenticatedInputSource,
 ) {
     let mut upstream = match RuntimeObservationClient::connect(&RuntimeObservationSource::Embedded(
         source.clone(),
@@ -14173,24 +14240,32 @@ async fn embedded_worker_protocol_ws_session(
             inbound = socket.next() => {
                 match inbound {
                     Some(Ok(WsMessage::Text(text))) => match decode_method(&text) {
-                        Ok(method) => match source.runtime.send_protocol_method(&source.worker_ref, method) {
-                            Ok(events) => {
-                                for event in events {
+                        Ok(method) => match authorize_browser_worker_method(method, &input_source) {
+                            Ok(method) => match source.runtime.send_protocol_method(&source.worker_ref, method) {
+                                Ok(events) => {
+                                    for event in events {
+                                        if !send_protocol_event(&mut socket, &event).await {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    let event = protocol_error_event(error.to_string());
                                     if !send_protocol_event(&mut socket, &event).await {
                                         return;
                                     }
                                 }
-                            }
-                            Err(error) => {
-                                let event = protocol_error_event(error.to_string());
-                                if !send_protocol_event(&mut socket, &event).await {
-                                    return;
-                                }
+                            },
+                            Err(message) => {
+                                let event = protocol_error_event(message);
+                                let _ = send_protocol_event(&mut socket, &event).await;
+                                return;
                             }
                         },
                         Err(error) => {
-                            let event =
-                                protocol_error_event(format!("malformed protocol method frame: {error}"));
+                            let event = protocol_error_event(format!(
+                                "malformed protocol method frame: {error}"
+                            ));
                             if !send_protocol_event(&mut socket, &event).await {
                                 return;
                             }
@@ -16581,6 +16656,29 @@ mod tests {
     }
 
     #[test]
+    fn browser_worker_methods_receive_server_owned_account_source() {
+        let source = protocol::AuthenticatedInputSource::Account {
+            account_id: "account-1".into(),
+        };
+        let method = authorize_browser_worker_method(
+            protocol::Method::Submit {
+                submission_request_id: "request-1".into(),
+                input: vec![protocol::Segment::text("hello")],
+            },
+            &source,
+        )
+        .unwrap();
+        assert!(matches!(
+            method,
+            protocol::Method::SubmitTracked {
+                source: protocol::AuthenticatedInputSource::Account { ref account_id },
+                ..
+            } if account_id == "account-1"
+        ));
+        assert!(authorize_browser_worker_method(method, &source).is_err());
+    }
+
+    #[test]
     fn merge_request_http_paths_observe_refs_through_runtime_provider_authority() {
         let source = include_str!("server.rs");
         for handler in [
@@ -18825,7 +18923,7 @@ mod tests {
                 .get(handle.worker_ref())
                 .cloned()
                 .expect("execution context");
-            let submission_id = input.submission_id.clone();
+            let submission_request_id = input.submission_request_id.clone();
             let content = input.content.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -18833,11 +18931,13 @@ mod tests {
                     text: format!("server companion echoed: {content}"),
                 });
             });
-            if let Some(submission_id) = submission_id {
-                worker_runtime::execution::WorkerExecutionResult::accepted_input_committed(
+            if let Some(submission_request_id) = submission_request_id {
+                worker_runtime::execution::WorkerExecutionResult::accepted_submission(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
                     worker_runtime::execution::WorkerExecutionRunState::Idle,
-                    submission_id,
+                    submission_request_id,
+                    uuid::Uuid::now_v7().to_string(),
+                    protocol::SubmissionDisposition::Started,
                 )
             } else {
                 worker_runtime::execution::WorkerExecutionResult::accepted(
@@ -27223,6 +27323,16 @@ mod tests {
         (runtime, worker_ref, endpoint)
     }
 
+    fn test_browser_request_actor() -> RequestActor {
+        RequestActor {
+            user_id: "test-user".into(),
+            account_id: format!("account-{TEST_WORKSPACE_ID}"),
+            handle: "test".into(),
+            display_name: "Test".into(),
+            auth_method: ActorAuthMethod::BrowserSession,
+        }
+    }
+
     async fn spawn_workspace_proxy(
         source: RuntimeObservationSourceConfig,
     ) -> (String, tempfile::TempDir) {
@@ -27241,11 +27351,8 @@ mod tests {
         .unwrap();
         let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let app_addr = app_listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(app_listener, build_inner_router(api))
-                .await
-                .unwrap()
-        });
+        let app = build_inner_router(api).layer(Extension(test_browser_request_actor()));
+        tokio::spawn(async move { axum::serve(app_listener, app).await.unwrap() });
         (
             format!("ws://{app_addr}/api/runtimes/{runtime_id}/workers/{worker_id}/protocol/ws"),
             dir,
@@ -27257,7 +27364,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let app = build_inner_router(test_api(dir.path()).await);
+        let app = build_inner_router(test_api(dir.path()).await)
+            .layer(Extension(test_browser_request_actor()));
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -27305,7 +27413,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let app = build_inner_router(api);
+        let app = build_inner_router(api).layer(Extension(test_browser_request_actor()));
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });

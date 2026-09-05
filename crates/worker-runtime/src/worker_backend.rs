@@ -1522,6 +1522,7 @@ fn method_starts_turn(method: &Method) -> bool {
         Method::Submit { .. }
             | Method::SubmitTracked { .. }
             | Method::Notify { auto_run: true, .. }
+            | Method::NotifyTracked { auto_run: true, .. }
             | Method::Resume
             | Method::Compact
     )
@@ -1549,6 +1550,7 @@ fn accepted_run_state_for_method(method: &Method) -> WorkerExecutionRunState {
         Method::Submit { .. }
         | Method::SubmitTracked { .. }
         | Method::Notify { auto_run: true, .. }
+        | Method::NotifyTracked { auto_run: true, .. }
         | Method::Resume
         | Method::Compact => WorkerExecutionRunState::Busy,
         Method::Shutdown => WorkerExecutionRunState::Stopped,
@@ -1946,6 +1948,9 @@ where
                         input: input.segments.unwrap_or_else(|| {
                             vec![Segment::text(input.content.trim().to_string())]
                         }),
+                        source: protocol::AuthenticatedInputSource::Backend {
+                            operation_id: submission_id.clone(),
+                        },
                     },
                     Some(submission_id),
                 )
@@ -1966,6 +1971,7 @@ where
             Method::Submit { .. }
             | Method::SubmitTracked { .. }
             | Method::Notify { .. }
+            | Method::NotifyTracked { .. }
             | Method::Compact => WorkerExecutionRunState::Busy,
             _ => WorkerExecutionRunState::Idle,
         };
