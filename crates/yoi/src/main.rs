@@ -363,10 +363,7 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             &workspace_root,
         )?;
         let mode = if target.kind() == client::TargetKind::Backend {
-            LaunchMode::Workers {
-                runtime_id: None,
-                include_stopped: false,
-            }
+            LaunchMode::BackendSpawn
         } else {
             LaunchMode::Spawn {
                 worker_name: None,
@@ -822,10 +819,7 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
                     .to_string(),
             ));
         }
-        LaunchMode::Workers {
-            runtime_id: None,
-            include_stopped: false,
-        }
+        LaunchMode::BackendSpawn
     };
 
     Ok(Mode::Tui {
@@ -1720,7 +1714,7 @@ Target selection:
   Ticket, Objective, Worker catalog, PID, socket, or subprocess authority.
 
 Connection-aware commands:
-  yoi                         Standalone: new Console. Backend: Worker picker.
+  yoi                         Standalone: new Console. Backend: create and attach to a new Worker.
   yoi resume                  Standalone Worker picker or stopped Backend Worker picker.
   yoi workers                 Backend Workspace Worker picker.
   yoi panel                   Backend Workspace dashboard.
@@ -2112,6 +2106,46 @@ backend = "shared"
                 assert_eq!(runtime_id.as_deref(), Some("r"));
             }
             _ => panic!("expected Workers mode"),
+        }
+    }
+
+    #[test]
+    fn parse_default_backend_creates_a_worker_before_attach() {
+        let resolver = DefaultBackendCliConnectionResolver {
+            backend_url: "http://default-backend.example",
+        };
+
+        match parse_args_slice_with_connection_resolver(&[], &resolver).unwrap() {
+            Mode::Tui {
+                target,
+                mode: LaunchMode::BackendSpawn,
+                ..
+            } => assert_eq!(target.kind(), TargetKind::Backend),
+            other => panic!("expected BackendSpawn mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_bare_backend_creates_a_worker_before_attach() {
+        match parse_args_from([
+            "--backend",
+            "http://127.0.0.1:8787",
+            "--workspace-id",
+            "workspace-a",
+        ])
+        .unwrap()
+        {
+            Mode::Tui {
+                target,
+                mode: LaunchMode::BackendSpawn,
+                ..
+            } => {
+                assert_eq!(target.kind(), TargetKind::Backend);
+                let launch = target.launch_backend_worker().unwrap();
+                assert_eq!(launch.target.base_url, "http://127.0.0.1:8787");
+                assert_eq!(launch.target.workspace_id.as_deref(), Some("workspace-a"));
+            }
+            other => panic!("expected BackendSpawn mode, got {other:?}"),
         }
     }
 

@@ -2,7 +2,7 @@ use std::{fmt, path::PathBuf};
 
 use crate::{
     BackendApiClient, BackendApiClientError, BackendOrigin, BackendRuntimeListTarget,
-    BackendRuntimeTarget,
+    BackendRuntimeTarget, BackendWorkerLaunchTarget,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +124,11 @@ pub struct Dashboard {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendWorkerLaunch {
+    pub target: BackendWorkerLaunchTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerList {
     pub backend_target: BackendRuntimeListTarget,
     pub include_stopped: bool,
@@ -197,6 +202,13 @@ pub trait Target: fmt::Debug + Send + Sync {
 
     fn dashboard(&self) -> Result<Dashboard, TargetError> {
         Err(TargetError::unsupported("Worker dashboard", self.kind()))
+    }
+
+    fn launch_backend_worker(&self) -> Result<BackendWorkerLaunch, TargetError> {
+        Err(TargetError::unsupported(
+            "Backend Worker launch",
+            self.kind(),
+        ))
     }
 
     fn list_workers(&self, _request: WorkerListRequest) -> Result<WorkerList, TargetError> {
@@ -296,6 +308,15 @@ impl Target for BackendTarget {
         Ok(Dashboard {
             base_url,
             workspace_id,
+        })
+    }
+
+    fn launch_backend_worker(&self) -> Result<BackendWorkerLaunch, TargetError> {
+        Ok(BackendWorkerLaunch {
+            target: BackendWorkerLaunchTarget::new(
+                self.base_url.clone(),
+                self.workspace_id.clone(),
+            ),
         })
     }
 
