@@ -56,6 +56,7 @@ const ATTACH_DESCRIPTION: &str = "Attach this Worker to one existing Workdir. Th
 const DETACH_DESCRIPTION: &str = "Detach this Worker from its active Workdir and release Workdir occupancy. Any ephemeral operation session is closed.";
 pub(crate) type BeforeWorkdirRelease =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> + Send + Sync>;
+pub(crate) type AfterWorkdirAttach = Arc<dyn Fn() + Send + Sync>;
 
 const DELETE_DESCRIPTION: &str = "Request removal of one persistent Workdir by id through durable Backend Workspace authority. The input includes only the Workdir id and a bounded reason. The result reports removed, retained, or attention_required without exposing operation-table or provider internals.";
 
@@ -63,6 +64,7 @@ const DELETE_DESCRIPTION: &str = "Request removal of one persistent Workdir by i
 pub struct ManageWorkdirFeature {
     client: Arc<dyn WorkspaceClient>,
     before_workdir_release: Option<BeforeWorkdirRelease>,
+    after_workdir_attach: Option<AfterWorkdirAttach>,
 }
 
 impl std::fmt::Debug for ManageWorkdirFeature {
@@ -80,16 +82,19 @@ impl ManageWorkdirFeature {
         Self {
             client,
             before_workdir_release: None,
+            after_workdir_attach: None,
         }
     }
 
-    pub(crate) fn with_before_workdir_release(
+    pub(crate) fn with_child_lifecycle(
         client: Arc<dyn WorkspaceClient>,
         before_workdir_release: BeforeWorkdirRelease,
+        after_workdir_attach: AfterWorkdirAttach,
     ) -> Self {
         Self {
             client,
             before_workdir_release: Some(before_workdir_release),
+            after_workdir_attach: Some(after_workdir_attach),
         }
     }
 }
@@ -110,8 +115,10 @@ impl FeatureModule for ManageWorkdirFeature {
     }
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
-        let backend = WorkspaceHttpWorkdirBackend::new(self.client.clone())
-            .with_before_workdir_release(self.before_workdir_release.clone());
+        let backend = WorkspaceHttpWorkdirBackend::new(self.client.clone()).with_child_lifecycle(
+            self.before_workdir_release.clone(),
+            self.after_workdir_attach.clone(),
+        );
         for (name, definition) in [
             (
                 LIST_TOOL,
@@ -176,6 +183,7 @@ impl FeatureModule for ManageWorkdirFeature {
 struct WorkspaceHttpWorkdirBackend {
     client: Arc<dyn WorkspaceClient>,
     before_workdir_release: Option<BeforeWorkdirRelease>,
+    after_workdir_attach: Option<AfterWorkdirAttach>,
 }
 
 impl std::fmt::Debug for WorkspaceHttpWorkdirBackend {
@@ -371,14 +379,17 @@ impl WorkspaceHttpWorkdirBackend {
         Self {
             client,
             before_workdir_release: None,
+            after_workdir_attach: None,
         }
     }
 
-    fn with_before_workdir_release(
+    fn with_child_lifecycle(
         mut self,
         before_workdir_release: Option<BeforeWorkdirRelease>,
+        after_workdir_attach: Option<AfterWorkdirAttach>,
     ) -> Self {
         self.before_workdir_release = before_workdir_release;
+        self.after_workdir_attach = after_workdir_attach;
         self
     }
 
@@ -557,9 +568,17 @@ impl Tool for WorkspaceHttpWorkdirTool {
                 parse_input::<WorkdirCreateInput>(input_json)?,
                 ctx.call_id.to_string(),
             ),
-            WorkdirOperation::Attach => self
-                .backend
-                .attach(parse_input::<WorkdirAttachInput>(input_json)?),
+            WorkdirOperation::Attach => {
+                let result = self
+                    .backend
+                    .attach(parse_input::<WorkdirAttachInput>(input_json)?);
+                if result.is_ok()
+                    && let Some(after_attach) = &self.backend.after_workdir_attach
+                {
+                    after_attach();
+                }
+                result
+            }
             WorkdirOperation::Detach => {
                 let _input = parse_input::<WorkdirDetachInput>(input_json)?;
                 if let Some(before_release) = &self.backend.before_workdir_release {
@@ -1338,7 +1357,7 @@ mod tests {
         });
         let tool = WorkspaceHttpWorkdirTool {
             backend: WorkspaceHttpWorkdirBackend::new(client.clone())
-                .with_before_workdir_release(Some(before_release)),
+                .with_child_lifecycle(Some(before_release), None),
             operation: WorkdirOperation::Detach,
         };
 
@@ -1361,7 +1380,7 @@ mod tests {
             Arc::new(|| Box::pin(async { Err(std::io::Error::other("child cleanup failed")) }));
         let tool = WorkspaceHttpWorkdirTool {
             backend: WorkspaceHttpWorkdirBackend::new(client.clone())
-                .with_before_workdir_release(Some(before_release)),
+                .with_child_lifecycle(Some(before_release), None),
             operation: WorkdirOperation::Detach,
         };
 
@@ -1372,5 +1391,33 @@ mod tests {
 
         assert!(error.to_string().contains("stop Internal SubWorkers"));
         assert!(client.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn successful_attach_reopens_internal_subworker_admission() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
+            "workspace_id": "workspace/test",
+            "workdir_id": "wd-attached",
+            "attached": true
+        }))]));
+        let reopen_calls = Arc::new(AtomicUsize::new(0));
+        let reopen_calls_for_hook = reopen_calls.clone();
+        let after_attach: AfterWorkdirAttach = Arc::new(move || {
+            reopen_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+        });
+        let tool = WorkspaceHttpWorkdirTool {
+            backend: WorkspaceHttpWorkdirBackend::new(client)
+                .with_child_lifecycle(None, Some(after_attach)),
+            operation: WorkdirOperation::Attach,
+        };
+
+        tool.execute(
+            r#"{"workdir_id":"wd-attached"}"#,
+            ToolExecutionContext::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reopen_calls.load(Ordering::SeqCst), 1);
     }
 }

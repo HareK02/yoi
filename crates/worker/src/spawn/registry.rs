@@ -72,6 +72,7 @@ pub(crate) struct InternalSpawnedWorkerRecord {
     #[cfg(test)]
     pub installed_tools: Arc<[String]>,
     pub session: InternalWorkerSessionHandle,
+    pub child_registry: Arc<SpawnedWorkerRegistry>,
     change_tracker: Option<tools::Tracker>,
     started_at: Instant,
     stop_lock: Arc<tokio::sync::Mutex<()>>,
@@ -89,6 +90,7 @@ impl InternalSpawnedWorkerRecord {
         workdir_tool_scope: WorkdirScopeLease,
         #[cfg(test)] installed_tools: Vec<String>,
         session: InternalWorkerSessionHandle,
+        child_registry: Arc<SpawnedWorkerRegistry>,
         change_tracker: Option<tools::Tracker>,
     ) -> Self {
         Self {
@@ -98,6 +100,7 @@ impl InternalSpawnedWorkerRecord {
             #[cfg(test)]
             installed_tools: installed_tools.into(),
             session,
+            child_registry,
             change_tracker,
             started_at: Instant::now(),
             stop_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -235,18 +238,39 @@ pub(crate) struct InternalSpawnReservation {
 }
 
 impl InternalSpawnReservation {
-    pub(crate) fn commit(mut self, record: InternalSpawnedWorkerRecord) -> io::Result<()> {
+    pub(crate) fn commit(
+        mut self,
+        record: InternalSpawnedWorkerRecord,
+    ) -> Result<(), (io::Error, InternalSpawnedWorkerRecord)> {
         if record.worker_name != self.worker_name {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "internal SubWorker reservation name does not match record name",
+            return Err((
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "internal SubWorker reservation name does not match record name",
+                ),
+                record,
             ));
         }
-        self.registry
-            .internal_records
-            .lock()
-            .map_err(|_| io::Error::other("internal spawned-worker registry lock poisoned"))?
-            .push(record.clone());
+        let mut records = match self.registry.internal_records.lock() {
+            Ok(records) => records,
+            Err(_) => {
+                return Err((
+                    io::Error::other("internal spawned-worker registry lock poisoned"),
+                    record,
+                ));
+            }
+        };
+        if self.registry.internal_shutting_down.load(Ordering::Acquire) {
+            return Err((
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "internal SubWorker registry is shutting down",
+                ),
+                record,
+            ));
+        }
+        records.push(record.clone());
+        drop(records);
         self.registry.start_protocol_forwarding(record);
         self.committed = true;
         Ok(())
@@ -267,6 +291,7 @@ pub struct SpawnedWorkerRegistry {
     internal_records: std::sync::Mutex<Vec<InternalSpawnedWorkerRecord>>,
     service_records: std::sync::Mutex<Vec<InternalServiceWorkerRecord>>,
     internal_names: std::sync::Mutex<HashSet<String>>,
+    internal_shutting_down: AtomicBool,
     parent_scope: Option<SharedScope>,
     parent_protocol: Mutex<Option<(broadcast::Sender<Event>, String)>>,
 }
@@ -283,6 +308,7 @@ impl SpawnedWorkerRegistry {
             internal_records: std::sync::Mutex::new(Vec::new()),
             service_records: std::sync::Mutex::new(Vec::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
+            internal_shutting_down: AtomicBool::new(false),
             parent_scope: None,
             parent_protocol: Mutex::new(None),
         })
@@ -294,6 +320,7 @@ impl SpawnedWorkerRegistry {
             internal_records: std::sync::Mutex::new(Vec::new()),
             service_records: std::sync::Mutex::new(Vec::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
+            internal_shutting_down: AtomicBool::new(false),
             parent_scope: None,
             parent_protocol: Mutex::new(None),
         })
@@ -304,6 +331,7 @@ impl SpawnedWorkerRegistry {
             internal_records: std::sync::Mutex::new(Vec::new()),
             service_records: std::sync::Mutex::new(Vec::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
+            internal_shutting_down: AtomicBool::new(false),
             parent_scope: Some(parent_scope),
             parent_protocol: Mutex::new(None),
         })
@@ -383,6 +411,7 @@ impl SpawnedWorkerRegistry {
                 internal_records: std::sync::Mutex::new(Vec::new()),
                 service_records: std::sync::Mutex::new(Vec::new()),
                 internal_names: std::sync::Mutex::new(HashSet::new()),
+                internal_shutting_down: AtomicBool::new(false),
                 parent_scope,
                 parent_protocol: Mutex::new(None),
             }),
@@ -394,6 +423,12 @@ impl SpawnedWorkerRegistry {
         self: &Arc<Self>,
         worker_name: String,
     ) -> io::Result<InternalSpawnReservation> {
+        if self.internal_shutting_down.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "internal SubWorker registry is shutting down",
+            ));
+        }
         let mut names = self
             .internal_names
             .lock()
@@ -702,6 +737,7 @@ impl SpawnedWorkerRegistry {
         let Some(record) = self.get_internal(name) else {
             return Ok(false);
         };
+        Box::pin(record.child_registry.shutdown_internal()).await?;
         record
             .workdir_tool_scope
             .close()
@@ -711,13 +747,17 @@ impl SpawnedWorkerRegistry {
     }
 
     pub(crate) async fn shutdown_internal(&self) -> io::Result<()> {
-        let names = self
-            .internal_records
-            .lock()
-            .expect("internal Worker registry lock poisoned")
-            .iter()
-            .map(|record| record.worker_name.clone())
-            .collect::<Vec<_>>();
+        let names = {
+            let records = self
+                .internal_records
+                .lock()
+                .map_err(|_| io::Error::other("internal Worker registry lock poisoned"))?;
+            self.internal_shutting_down.store(true, Ordering::Release);
+            records
+                .iter()
+                .map(|record| record.worker_name.clone())
+                .collect::<Vec<_>>()
+        };
         let mut first_error = None;
         for name in names {
             if let Err(error) = self.remove_internal(&name).await {
@@ -725,6 +765,10 @@ impl SpawnedWorkerRegistry {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    pub(crate) fn reopen_internal(&self) {
+        self.internal_shutting_down.store(false, Ordering::Release);
     }
 
     /// Stop one direct Internal SubWorker and discard its registry/scope state.
@@ -753,6 +797,7 @@ impl SpawnedWorkerRegistry {
             .stop()
             .await
             .map_err(|error| io::Error::other(error.to_string()))?;
+        Box::pin(record.child_registry.shutdown_internal()).await?;
         record
             .workdir_tool_scope
             .close()
@@ -1021,6 +1066,7 @@ mod tests {
                 delegation,
                 Vec::new(),
                 session,
+                registry(),
                 None,
             ),
             sender,
@@ -1274,6 +1320,85 @@ mod tests {
         assert!(registry.list_internal().is_empty());
         assert!(registry.get_internal("first").is_none());
         assert!(registry.get_internal("second").is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_new_reservations_until_reopened() {
+        let registry = registry();
+        registry.shutdown_internal().await.unwrap();
+        assert!(registry.reserve_internal_name("late-child".into()).is_err());
+
+        registry.reopen_internal();
+        let reservation = registry.reserve_internal_name("late-child".into()).unwrap();
+        drop(reservation);
+    }
+
+    #[tokio::test]
+    async fn concurrent_commit_and_shutdown_leave_no_live_internal_worker() {
+        let registry = registry();
+        let reservation = registry
+            .reserve_internal_name("racing-child".into())
+            .unwrap();
+        let (record, _events) =
+            record("racing-child", InternalWorkerVisibility::ParentClient).await;
+        let scope = record.workdir_tool_scope.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let commit_barrier = barrier.clone();
+        let commit = tokio::task::spawn_blocking(move || {
+            commit_barrier.wait();
+            reservation.commit(record)
+        });
+        let shutdown_registry = registry.clone();
+        let shutdown = tokio::spawn(async move {
+            barrier.wait();
+            shutdown_registry.shutdown_internal().await
+        });
+
+        let commit = commit.await.unwrap();
+        shutdown.await.unwrap().unwrap();
+        if let Err((_error, record)) = commit {
+            record.session.stop().await.unwrap();
+            record.child_registry.shutdown_internal().await.unwrap();
+            record.workdir_tool_scope.close().await.unwrap();
+        }
+
+        assert!(registry.list_internal().is_empty());
+        assert!(!scope.is_active());
+    }
+
+    #[tokio::test]
+    async fn shutdown_fences_a_reservation_that_has_not_committed() {
+        let registry = registry();
+        let reservation = registry
+            .reserve_internal_name("racing-child".into())
+            .unwrap();
+        let (record, _events) =
+            record("racing-child", InternalWorkerVisibility::ParentClient).await;
+
+        registry.shutdown_internal().await.unwrap();
+        let (error, record) = reservation.commit(record).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        record.session.stop().await.unwrap();
+        record.child_registry.shutdown_internal().await.unwrap();
+        record.workdir_tool_scope.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_recursively_stops_grandchildren_before_parent_scope_release() {
+        let registry = registry();
+        let (child, _child_events) = record("child", InternalWorkerVisibility::ParentClient).await;
+        let child_registry = child.child_registry.clone();
+        let (grandchild, _grandchild_events) =
+            record("grandchild", InternalWorkerVisibility::ParentClient).await;
+        let grandchild_scope = grandchild.workdir_tool_scope.clone();
+        install_record(&child_registry, grandchild);
+        install_record(&registry, child);
+
+        registry.shutdown_internal().await.unwrap();
+
+        assert!(registry.list_internal().is_empty());
+        assert!(child_registry.list_internal().is_empty());
+        assert!(!grandchild_scope.is_active());
     }
 
     #[tokio::test]

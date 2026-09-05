@@ -600,15 +600,19 @@ impl Tool for SubWorkerSpawnTool {
                 ),
                 body.to_string(),
             );
-            let response = self
-                .workspace_context
-                .client()
-                .execute(request)
-                .map_err(|error| {
-                    ToolError::ExecutionFailed(format!("register review capability: {error}"))
-                })?;
+            let response = match self.workspace_context.client().execute(request) {
+                Ok(response) => response,
+                Err(error) => {
+                    let _ = session.stop().await;
+                    let _ = workdir_scope.close().await;
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "register review capability: {error}"
+                    )));
+                }
+            };
             if !response.is_success() {
                 let _ = session.stop().await;
+                let _ = workdir_scope.close().await;
                 return Err(ToolError::ExecutionFailed(format!(
                     "register review capability failed with status {}: {}",
                     response.status, response.body
@@ -623,10 +627,13 @@ impl Tool for SubWorkerSpawnTool {
             #[cfg(test)]
             installed_tools,
             session.clone(),
+            child_registry,
             child_change_tracker,
         );
-        if let Err(error) = name_reservation.commit(record) {
+        if let Err((error, record)) = name_reservation.commit(record) {
             let _ = session.stop().await;
+            let _ = record.child_registry.shutdown_internal().await;
+            let _ = record.workdir_tool_scope.close().await;
             return Err(ToolError::ExecutionFailed(format!(
                 "register Internal Worker session: {error}"
             )));

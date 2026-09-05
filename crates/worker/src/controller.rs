@@ -1101,14 +1101,16 @@ where
                 "manage Workdir tools require Backend Workspace API authority",
             ));
         }
-        let child_registry = spawned_registry.clone();
+        let shutdown_registry = spawned_registry.clone();
+        let reopen_registry = spawned_registry.clone();
         feature_registry.add_module(
-            crate::feature::builtin::manage_workdir::ManageWorkdirFeature::with_before_workdir_release(
+            crate::feature::builtin::manage_workdir::ManageWorkdirFeature::with_child_lifecycle(
                 workspace_client,
                 Arc::new(move || {
-                    let child_registry = child_registry.clone();
+                    let child_registry = shutdown_registry.clone();
                     Box::pin(async move { child_registry.shutdown_internal().await })
                 }),
+                Arc::new(move || reopen_registry.reopen_internal()),
             ),
         );
     }
