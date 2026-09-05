@@ -104,8 +104,8 @@ pub struct WorkspaceRuntimeBinding {
     pub runtime_id: String,
     pub display_name: String,
     pub base_url: String,
-    pub public_key: Option<String>,
-    pub public_key_fingerprint: Option<String>,
+    pub public_key: String,
+    pub public_key_fingerprint: String,
     pub created_at: String,
     pub updated_at: String,
     pub revoked_at: Option<String>,
@@ -544,11 +544,8 @@ pub trait ControlPlaneStore: Send + Sync {
         &self,
         record: &WorkspaceBootstrapRecord,
     ) -> Result<WorkspaceBootstrapResult>;
-    fn workspace_runtime_binding_is_active(
-        &self,
-        workspace_id: &str,
-        runtime_id: &str,
-    ) -> Result<bool>;
+    fn workspace_runtime_binding_matches(&self, expected: &WorkspaceRuntimeBinding)
+    -> Result<bool>;
     async fn get_workspace_runtime_binding(
         &self,
         workspace_id: &str,
@@ -1840,15 +1837,16 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
-    fn workspace_runtime_binding_is_active(
+    fn workspace_runtime_binding_matches(
         &self,
-        workspace_id: &str,
-        runtime_id: &str,
+        expected: &WorkspaceRuntimeBinding,
     ) -> Result<bool> {
-        Ok(
-            SqliteWorkspaceStore::get_workspace_runtime_binding(self, workspace_id, runtime_id)?
-                .is_some_and(|binding| binding.revoked_at.is_none()),
-        )
+        Ok(SqliteWorkspaceStore::get_workspace_runtime_binding(
+            self,
+            &expected.workspace_id,
+            &expected.runtime_id,
+        )?
+        .is_some_and(|binding| binding == *expected && binding.revoked_at.is_none()))
     }
 
     async fn get_workspace_runtime_binding(
@@ -5316,28 +5314,15 @@ pub fn normalize_runtime_public_key(public_key: &str) -> Result<(String, String)
 }
 
 fn normalize_workspace_runtime_binding_key(record: &mut WorkspaceRuntimeBinding) -> Result<()> {
-    match (&record.public_key, &record.public_key_fingerprint) {
-        (None, None) => Ok(()),
-        (Some(public_key), None) => {
-            let (canonical, fingerprint) = normalize_runtime_public_key(public_key)?;
-            record.public_key = Some(canonical);
-            record.public_key_fingerprint = Some(fingerprint);
-            Ok(())
-        }
-        (Some(public_key), Some(public_key_fingerprint)) => {
-            let (canonical, fingerprint) = normalize_runtime_public_key(public_key)?;
-            if public_key_fingerprint != &fingerprint {
-                return Err(Error::InvalidInput(
-                    "Runtime public key fingerprint does not match the public key".into(),
-                ));
-            }
-            record.public_key = Some(canonical);
-            Ok(())
-        }
-        (None, Some(_)) => Err(Error::InvalidInput(
-            "Runtime public key fingerprint requires a public key".into(),
-        )),
+    let (canonical, fingerprint) = normalize_runtime_public_key(&record.public_key)?;
+    if !record.public_key_fingerprint.is_empty() && record.public_key_fingerprint != fingerprint {
+        return Err(Error::InvalidInput(
+            "Runtime public key fingerprint does not match the public key".into(),
+        ));
     }
+    record.public_key = canonical;
+    record.public_key_fingerprint = fingerprint;
+    Ok(())
 }
 
 fn map_runtime_binding_write_error(err: rusqlite::Error) -> Error {
@@ -6034,6 +6019,19 @@ CREATE TABLE IF NOT EXISTS __yoi_schema_migrations (
 }
 
 fn migrate_workspace_runtime_bindings_v50_to_v51(conn: &Connection) -> Result<()> {
+    migrate_workspace_runtime_bindings_v50_to_v51_with_verifier(
+        conn,
+        verify_workspace_runtime_binding_schema,
+    )
+}
+
+fn migrate_workspace_runtime_bindings_v50_to_v51_with_verifier<F>(
+    conn: &Connection,
+    verify: F,
+) -> Result<()>
+where
+    F: FnOnce(&Connection) -> Result<()>,
+{
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
     let legacy_columns = table_columns(&tx, "trusted_runtime_records")?
         .into_iter()
@@ -6108,8 +6106,8 @@ fn migrate_workspace_runtime_bindings_v50_to_v51(conn: &Connection) -> Result<()
                 runtime_id,
                 display_name,
                 base_url,
-                public_key: Some(public_key),
-                public_key_fingerprint: Some(fingerprint),
+                public_key,
+                public_key_fingerprint: fingerprint,
                 created_at,
                 updated_at,
                 revoked_at,
@@ -6126,10 +6124,7 @@ fn migrate_workspace_runtime_bindings_v50_to_v51(conn: &Connection) -> Result<()
                 binding.workspace_id, binding.runtime_id
             )));
         }
-        let fingerprint = binding
-            .public_key_fingerprint
-            .clone()
-            .expect("normalized key");
+        let fingerprint = binding.public_key_fingerprint.clone();
         if !trust_keys.insert((binding.workspace_id.clone(), fingerprint.clone())) {
             return Err(Error::Store(format!(
                 "duplicate Runtime trust fingerprint `{fingerprint}` in Workspace `{}`",
@@ -6184,14 +6179,13 @@ fn migrate_workspace_runtime_bindings_v50_to_v51(conn: &Connection) -> Result<()
             runtime_id TEXT NOT NULL,
             display_name TEXT NOT NULL,
             base_url TEXT NOT NULL,
-            public_key TEXT,
-            public_key_fingerprint TEXT,
+            public_key TEXT NOT NULL,
+            public_key_fingerprint TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             revoked_at TEXT,
             PRIMARY KEY (workspace_id, runtime_id),
             UNIQUE (workspace_id, public_key_fingerprint),
-            CHECK ((public_key IS NULL) = (public_key_fingerprint IS NULL)),
             FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT
         );
         CREATE INDEX idx_workspace_runtime_bindings_workspace
@@ -6246,10 +6240,12 @@ fn migrate_workspace_runtime_bindings_v50_to_v51(conn: &Connection) -> Result<()
             "schema-{LATEST_SCHEMA_VERSION} migration produced {foreign_key_failures} foreign-key violation(s)"
         )));
     }
+    verify(&tx)?;
     tx.execute(
         "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
         params![LATEST_SCHEMA_VERSION, RUNTIME_BINDINGS_MIGRATION_NAME],
     )?;
+    verify_current_schema_history(&tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -6997,13 +6993,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(binding.revoked_at.as_deref(), Some("2"));
-        assert!(binding.public_key.is_some());
-        assert!(
-            binding
-                .public_key_fingerprint
-                .as_deref()
-                .is_some_and(|value| value.starts_with("sha256:"))
-        );
+        assert!(!binding.public_key.is_empty());
+        assert!(binding.public_key_fingerprint.starts_with("sha256:"));
         store
             .with_conn(|conn| {
                 let jti_workspace: String = conn.query_row(
@@ -7074,6 +7065,53 @@ mod tests {
     }
 
     #[test]
+    fn schema_v50_runtime_migration_rolls_back_when_final_verification_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        prepare_schema_v50(&path, Some("workspace-a"));
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+
+        let error = migrate_workspace_runtime_bindings_v50_to_v51_with_verifier(&conn, |_| {
+            Err(Error::Store(
+                "forced final verification failure".to_string(),
+            ))
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("forced final verification failure")
+        );
+        let version: i64 = conn
+            .query_row(
+                "SELECT MAX(version) FROM __yoi_schema_migrations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, PREVIOUS_SCHEMA_VERSION);
+        assert!(
+            !table_columns(&conn, "trusted_runtime_records")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            table_columns(&conn, "workspace_runtime_bindings")
+                .unwrap()
+                .is_empty()
+        );
+        let jti: String = conn
+            .query_row(
+                "SELECT jti FROM worker_mutation_source_proof_jtis WHERE runtime_id = 'shared'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(jti, "jti-1");
+    }
+
+    #[test]
     fn runtime_binding_identity_and_trust_uniqueness_are_workspace_scoped() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
@@ -7099,8 +7137,8 @@ mod tests {
             runtime_id: runtime_id.to_string(),
             display_name: runtime_id.to_string(),
             base_url: format!("https://{workspace_id}.runtime.test"),
-            public_key: Some(identity.public_key.clone()),
-            public_key_fingerprint: None,
+            public_key: identity.public_key.clone(),
+            public_key_fingerprint: String::new(),
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
             revoked_at: None,
@@ -7141,9 +7179,32 @@ mod tests {
                 .len(),
             1
         );
+        let expected_workspace_a = store
+            .get_workspace_runtime_binding("workspace-a", "shared")
+            .unwrap()
+            .unwrap();
         assert!(
             store
-                .revoke_workspace_runtime_binding("workspace-a", "shared", "2")
+                .workspace_runtime_binding_matches(&expected_workspace_a)
+                .unwrap()
+        );
+        let mut replaced_workspace_a = expected_workspace_a.clone();
+        replaced_workspace_a.base_url = "https://replacement.runtime.test".to_string();
+        replaced_workspace_a.updated_at = "2".to_string();
+        assert_eq!(
+            store
+                .upsert_workspace_runtime_binding(replaced_workspace_a, true)
+                .unwrap(),
+            WorkspaceRuntimeBindingUpsert::Replaced
+        );
+        assert!(
+            !store
+                .workspace_runtime_binding_matches(&expected_workspace_a)
+                .unwrap()
+        );
+        assert!(
+            store
+                .revoke_workspace_runtime_binding("workspace-a", "shared", "3")
                 .unwrap()
         );
         drop(store);
@@ -7197,8 +7258,8 @@ mod tests {
             runtime_id: crate::hosts::EMBEDDED_RUNTIME_ID.to_string(),
             display_name: "Embedded Runtime".to_string(),
             base_url: "in-process://embedded".to_string(),
-            public_key: Some(public_key),
-            public_key_fingerprint: None,
+            public_key,
+            public_key_fingerprint: String::new(),
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
             revoked_at: None,
@@ -7220,10 +7281,7 @@ mod tests {
             .get_workspace_runtime_binding("workspace-a", crate::hosts::EMBEDDED_RUNTIME_ID)
             .unwrap()
             .unwrap();
-        assert_eq!(
-            persisted.public_key.as_deref(),
-            Some(second.public_key.as_str())
-        );
+        assert_eq!(persisted.public_key, second.public_key);
     }
 
     #[test]

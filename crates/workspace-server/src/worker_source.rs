@@ -60,12 +60,9 @@ pub async fn verify_runtime_request_source_proof_with_store(
         .get_workspace_runtime_binding(workspace_id, &unverified.iss)
         .await
         .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?
-        .filter(|record| record.revoked_at.is_none() && record.public_key.is_some())
+        .filter(|record| record.revoked_at.is_none())
         .ok_or(WorkerMutationSourceProofError::RevokedRuntimeTrust)?;
-    let public_key = trusted
-        .public_key
-        .as_deref()
-        .ok_or(WorkerMutationSourceProofError::RevokedRuntimeTrust)?;
+    let public_key = trusted.public_key.as_str();
     let expected = RuntimeRequestSourceExpectation {
         identity_id: &unverified.iss,
         audience: audience.as_ref(),
@@ -209,12 +206,9 @@ async fn verify_worker_remove_source_with(
                 .get_workspace_runtime_binding(&config.workspace_id, &unverified.iss)
                 .await
                 .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?
-                .filter(|record| record.revoked_at.is_none() && record.public_key.is_some())
+                .filter(|record| record.revoked_at.is_none())
                 .ok_or(WorkerMutationSourceProofError::RevokedRuntimeTrust)?;
-            let public_key = trusted
-                .public_key
-                .as_deref()
-                .ok_or(WorkerMutationSourceProofError::RevokedRuntimeTrust)?;
+            let public_key = trusted.public_key.as_str();
             let expected = WorkerMutationSourceExpectation {
                 runtime_id: &unverified.iss,
                 audience: audience.as_ref(),

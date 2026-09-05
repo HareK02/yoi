@@ -322,8 +322,8 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
                     runtime_id: runtime_id.clone(),
                     display_name: display_name.unwrap_or_else(|| runtime_id.clone()),
                     base_url,
-                    public_key: Some(public_key),
-                    public_key_fingerprint: None,
+                    public_key,
+                    public_key_fingerprint: String::new(),
                     created_at: now.clone(),
                     updated_at: now,
                     revoked_at: None,
@@ -384,7 +384,7 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
                         runtime.workspace_id,
                         runtime.runtime_id,
                         runtime.base_url,
-                        runtime.public_key_fingerprint.as_deref().unwrap_or(""),
+                        runtime.public_key_fingerprint,
                         runtime.revoked_at.unwrap_or_default()
                     );
                 }
@@ -857,8 +857,8 @@ mod tests {
             runtime_id: "runtime-a".to_string(),
             display_name: "Runtime A".to_string(),
             base_url: "http://127.0.0.1:18080".to_string(),
-            public_key: Some(public_key),
-            public_key_fingerprint: None,
+            public_key,
+            public_key_fingerprint: String::new(),
             created_at: "2026-07-26T00:00:00Z".to_string(),
             updated_at: "2026-07-26T00:00:00Z".to_string(),
             revoked_at: None,

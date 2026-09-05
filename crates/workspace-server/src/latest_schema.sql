@@ -438,14 +438,13 @@ CREATE TABLE workspace_runtime_bindings (
     runtime_id TEXT NOT NULL,
     display_name TEXT NOT NULL,
     base_url TEXT NOT NULL,
-    public_key TEXT,
-    public_key_fingerprint TEXT,
+    public_key TEXT NOT NULL,
+    public_key_fingerprint TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     revoked_at TEXT,
     PRIMARY KEY (workspace_id, runtime_id),
     UNIQUE (workspace_id, public_key_fingerprint),
-    CHECK ((public_key IS NULL) = (public_key_fingerprint IS NULL)),
     FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT
 );
 CREATE TABLE typed_ticket_artifacts (
