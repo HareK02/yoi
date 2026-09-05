@@ -98,6 +98,34 @@ export class RuntimeTrustRequestError extends Error {
   }
 }
 
+export type RuntimeTrustRouteOperation = Readonly<{
+  runtimeId: string;
+  generation: number;
+}>;
+
+export class RuntimeTrustRouteFence {
+  #runtimeId: string | null = null;
+  #generation = 0;
+
+  enter(runtimeId: string): number {
+    if (this.#runtimeId !== runtimeId) {
+      this.#runtimeId = runtimeId;
+      this.#generation += 1;
+    }
+    return this.#generation;
+  }
+
+  capture(runtimeId: string): RuntimeTrustRouteOperation {
+    return { runtimeId, generation: this.enter(runtimeId) };
+  }
+
+  isCurrent(operation: RuntimeTrustRouteOperation, runtimeId: string): boolean {
+    return operation.runtimeId === runtimeId &&
+      operation.generation === this.#generation &&
+      this.#runtimeId === runtimeId;
+  }
+}
+
 function fail(path: string, message: string): never {
   throw new RuntimeManagementValidationError(`${path} ${message}`);
 }

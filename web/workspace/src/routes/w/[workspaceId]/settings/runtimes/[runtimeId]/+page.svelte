@@ -11,7 +11,9 @@
     revealRuntimeTrustKey,
     revokeRuntimeTrustKey,
     RuntimeTrustConflictError,
+    RuntimeTrustRouteFence,
     RuntimeTrustRequestError,
+    type RuntimeTrustRouteOperation,
   } from '$lib/workspace/api/runtime-management';
   import type { PageProps } from './$types';
 
@@ -30,6 +32,26 @@
   let replacementFingerprint = $state<string | null>(null);
   let replacementFingerprintError = $state<string | null>(null);
   let fingerprintGeneration = 0;
+  const routeFence = new RuntimeTrustRouteFence();
+  let routeGeneration = 0;
+
+  $effect(() => {
+    const nextGeneration = routeFence.enter(data.runtimeId);
+    if (nextGeneration === routeGeneration) return;
+    routeGeneration = nextGeneration;
+    fingerprintGeneration += 1;
+    showPublicKey = false;
+    revealedPublicKey = null;
+    publicKey = '';
+    fingerprintConfirmation = '';
+    revokeFingerprintConfirmation = '';
+    busyAction = null;
+    fieldError = null;
+    requestError = null;
+    successMessage = null;
+    replacementFingerprint = null;
+    replacementFingerprintError = null;
+  });
 
   $effect(() => {
     const key = publicKey.trim();
@@ -79,6 +101,10 @@
     await invalidateAll();
   }
 
+  function isCurrentRoute(operation: RuntimeTrustRouteOperation): boolean {
+    return routeFence.isCurrent(operation, data.runtimeId);
+  }
+
   async function saveTrustKey(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     if (busyAction !== null || !data.runtimeDetail) return;
@@ -123,9 +149,11 @@
       expected_revision: trust.revision ?? null,
     };
 
+    const operation = routeFence.capture(data.runtimeId);
     busyAction = 'save';
     try {
-      await putRuntimeTrustKey(data.workspaceId, data.runtimeId, request);
+      await putRuntimeTrustKey(data.workspaceId, operation.runtimeId, request);
+      if (!isCurrentRoute(operation)) return;
       publicKey = '';
       fingerprintConfirmation = '';
       revokeFingerprintConfirmation = '';
@@ -138,6 +166,7 @@
         : 'Workspace trust was reactivated.';
       await reloadAuthority();
     } catch (error) {
+      if (!isCurrentRoute(operation)) return;
       fingerprintConfirmation = '';
       if (error instanceof RuntimeTrustConflictError) {
         requestError = `${error.message} Authoritative Runtime trust has been reloaded.`;
@@ -148,7 +177,7 @@
         requestError = error instanceof Error ? error.message : 'Runtime trust update failed.';
       }
     } finally {
-      busyAction = null;
+      if (isCurrentRoute(operation)) busyAction = null;
     }
   }
 
@@ -170,6 +199,7 @@
     fieldError = null;
     requestError = null;
     successMessage = null;
+    const operation = routeFence.capture(data.runtimeId);
     busyAction = 'revoke';
     const request: RevokeRuntimeTrustKeyRequest = {
       expected_revision: trust.revision,
@@ -178,11 +208,12 @@
     try {
       await revokeRuntimeTrustKey(
         data.workspaceId,
-        data.runtimeId,
+        operation.runtimeId,
         request,
         trust.fingerprint,
         revokeFingerprintConfirmation,
       );
+      if (!isCurrentRoute(operation)) return;
       publicKey = '';
       fingerprintConfirmation = '';
       revokeFingerprintConfirmation = '';
@@ -191,6 +222,7 @@
       successMessage = 'Workspace trust was revoked.';
       await reloadAuthority();
     } catch (error) {
+      if (!isCurrentRoute(operation)) return;
       if (error instanceof RuntimeTrustConflictError) {
         requestError = `${error.message} Authoritative Runtime trust has been reloaded.`;
         await reloadAuthority();
@@ -198,7 +230,7 @@
         requestError = error instanceof Error ? error.message : 'Runtime trust revoke failed.';
       }
     } finally {
-      busyAction = null;
+      if (isCurrentRoute(operation)) busyAction = null;
     }
   }
 
@@ -209,35 +241,42 @@
       return;
     }
     if (busyAction !== null) return;
+    const operation = routeFence.capture(data.runtimeId);
     busyAction = 'reveal';
     requestError = null;
     successMessage = null;
     try {
-      const response = await revealRuntimeTrustKey(data.workspaceId, data.runtimeId);
+      const response = await revealRuntimeTrustKey(data.workspaceId, operation.runtimeId);
+      if (!isCurrentRoute(operation)) return;
       revealedPublicKey = response.public_key;
       showPublicKey = true;
     } catch (error) {
+      if (!isCurrentRoute(operation)) return;
       requestError = error instanceof Error ? error.message : 'Public key reveal failed.';
     } finally {
-      busyAction = null;
+      if (isCurrentRoute(operation)) busyAction = null;
     }
   }
 
   async function copyPublicKey(): Promise<void> {
     if (busyAction !== null) return;
+    const operation = routeFence.capture(data.runtimeId);
     busyAction = 'copy';
     requestError = null;
     successMessage = null;
     try {
-      const response = await revealRuntimeTrustKey(data.workspaceId, data.runtimeId);
+      const response = await revealRuntimeTrustKey(data.workspaceId, operation.runtimeId);
+      if (!isCurrentRoute(operation)) return;
       await navigator.clipboard.writeText(response.public_key);
+      if (!isCurrentRoute(operation)) return;
       successMessage = 'Public key copied.';
     } catch (error) {
+      if (!isCurrentRoute(operation)) return;
       requestError = error instanceof Error
         ? error.message
         : 'The browser could not copy the public key.';
     } finally {
-      busyAction = null;
+      if (isCurrentRoute(operation)) busyAction = null;
     }
   }
 </script>

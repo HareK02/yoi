@@ -11,6 +11,7 @@ import {
   putRuntimeTrustKey,
   revokeRuntimeTrustKey,
   RuntimeTrustConflictError,
+  RuntimeTrustRouteFence,
 } from "../src/lib/workspace/api/runtime-management.ts";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -205,6 +206,27 @@ Deno.test("mismatched revoke fingerprint never sends a request", async () => {
   }
   assert(rejected, "mismatched fingerprint should be rejected locally");
   assert(requests === 0, "mismatched fingerprint sent a revoke request");
+});
+
+Deno.test("Runtime route fence rejects a delayed reveal from the prior Runtime", async () => {
+  const fence = new RuntimeTrustRouteFence();
+  fence.enter("runtime-a");
+  const operation = fence.capture("runtime-a");
+  let renderedKey: string | null = null;
+  let resolveReveal!: (key: string) => void;
+  const delayedReveal = new Promise<string>((resolve) => {
+    resolveReveal = resolve;
+  }).then((key) => {
+    if (fence.isCurrent(operation, "runtime-b")) renderedKey = key;
+  });
+
+  fence.enter("runtime-b");
+  resolveReveal("runtime-a-public-key");
+  await delayedReveal;
+  assert(
+    renderedKey === null,
+    "Runtime A key rendered after navigating to Runtime B",
+  );
 });
 
 Deno.test("Runtime public key preview matches the Server fingerprint contract", async () => {

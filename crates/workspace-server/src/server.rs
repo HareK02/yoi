@@ -14684,7 +14684,7 @@ async fn workspace_runtime_resources_response(
     let runtimes = api.runtime.list_runtimes(limit);
     let bindings = api
         .store
-        .list_workspace_runtime_bindings(workspace_id, false)
+        .list_workspace_runtime_bindings(workspace_id, true)
         .await?;
     let mut items = runtimes
         .items
@@ -22674,6 +22674,20 @@ mod tests {
             .unwrap();
         assert_eq!(binding.binding_revision, 3);
         assert!(binding.revoked_at.is_some());
+        let listed = workspace_runtime_resources_response(&api, TEST_WORKSPACE_ID)
+            .await
+            .unwrap();
+        let listed_runtime = listed
+            .items
+            .iter()
+            .find(|resource| resource.runtime.runtime_id == "runtime-a")
+            .expect("revoked binding must remain listed");
+        assert!(listed_runtime.management.config_managed);
+        let detail = workspace_runtime_detail(&api, TEST_WORKSPACE_ID, "runtime-a")
+            .await
+            .unwrap();
+        assert_eq!(detail.trust_key.status, RuntimeTrustKeyStatus::Revoked);
+        assert!(detail.runtime.management.config_managed);
         assert!(
             !api.runtime_binding_expectations
                 .read()
