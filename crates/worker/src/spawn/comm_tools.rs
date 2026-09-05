@@ -72,6 +72,7 @@ mod tests {
     fn snapshot(entries: Vec<serde_json::Value>) -> Event {
         Event::Snapshot {
             session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: entries
                     .into_iter()
                     .enumerate()

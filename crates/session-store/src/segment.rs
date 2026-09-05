@@ -287,6 +287,7 @@ pub fn append_system_item(
         LogEntry::AnnotatedSystemItem {
             ts: segment_log::now_millis(),
             entry,
+            extensions: Vec::new(),
         },
     )
 }

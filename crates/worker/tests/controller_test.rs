@@ -617,7 +617,13 @@ async fn feature_flags_default_to_core_tool_surface_only() {
     let worker = make_worker(client).await;
     let handle = spawn_controller(worker).await;
 
-    handle.send(Method::run_text("Hello")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "Hello",
+        ))
+        .await
+        .unwrap();
     wait_for_status(&handle, WorkerStatus::Idle).await;
 
     let request = wait_for_captured_request(&client_for_assert).await;
@@ -672,7 +678,13 @@ permission = "write"
     let worker = make_worker_with_pwd_and_manifest(client, manifest).await.0;
     let handle = spawn_controller(worker).await;
 
-    handle.send(Method::run_text("Hello")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "Hello",
+        ))
+        .await
+        .unwrap();
     wait_for_status(&handle, WorkerStatus::Idle).await;
 
     let request = wait_for_captured_request(&client_for_assert).await;
@@ -758,7 +770,13 @@ permission = "write"
         let worker = make_worker_with_pwd_and_manifest(client, &manifest).await.0;
         let handle = spawn_controller(worker).await;
 
-        handle.send(Method::run_text("Hello")).await.unwrap();
+        handle
+            .send(Method::submit_text(
+                protocol::new_submission_request_id(),
+                "Hello",
+            ))
+            .await
+            .unwrap();
         wait_for_status(&handle, WorkerStatus::Idle).await;
 
         let request = wait_for_captured_request(&client_for_assert).await;
@@ -826,7 +844,13 @@ async fn builtin_orchestrator_exposes_worker_remove_and_workdir_delete() {
     .await;
     let handle = spawn_controller(worker).await;
 
-    handle.send(Method::run_text("Hello")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "Hello",
+        ))
+        .await
+        .unwrap();
     wait_for_status(&handle, WorkerStatus::Idle).await;
     let request = wait_for_captured_request(&client_for_assert).await;
     let installed = request_tool_names(&request);
@@ -875,7 +899,13 @@ permission = "write"
     .0;
     let handle = spawn_controller(worker).await;
 
-    handle.send(Method::run_text("Hello")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "Hello",
+        ))
+        .await
+        .unwrap();
     wait_for_status(&handle, WorkerStatus::Idle).await;
 
     let request = wait_for_captured_request(&client_for_assert).await;
@@ -928,7 +958,13 @@ permission = "write"
     )
     .await;
     let handle = spawn_controller(worker).await;
-    handle.send(Method::run_text("Hello")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "Hello",
+        ))
+        .await
+        .unwrap();
     wait_for_status(&handle, WorkerStatus::Idle).await;
     let request = wait_for_captured_request(&client_for_assert).await;
     let names = request_tool_names(&request);
@@ -975,7 +1011,13 @@ async fn run_end_returns_to_idle_without_busy_status() {
     let handle = spawn_controller(worker).await;
     let mut rx = handle.subscribe();
 
-    handle.send(Method::run_text("Hello")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "Hello",
+        ))
+        .await
+        .unwrap();
 
     let mut saw_run_end = false;
     let mut saw_idle_status = false;
@@ -1017,7 +1059,13 @@ async fn provider_stream_error_records_run_errored() {
     let handle = spawn_controller(worker).await;
     let mut rx = handle.subscribe();
 
-    handle.send(Method::run_text("ping")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "ping",
+        ))
+        .await
+        .unwrap();
 
     assert!(
         drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
@@ -1066,7 +1114,10 @@ async fn snapshot_includes_user_input_for_in_flight_turn() {
     let mut events = handle.subscribe();
 
     handle
-        .send(Method::run_text("hello in-flight"))
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "hello in-flight",
+        ))
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -1131,7 +1182,13 @@ async fn attach_snapshot_includes_current_status() {
     let worker = make_worker(client).await;
     let handle = spawn_controller(worker).await;
 
-    handle.send(Method::run_text("Hello")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "Hello",
+        ))
+        .await
+        .unwrap();
     wait_for_status(&handle, WorkerStatus::Running).await;
 
     let stream = tokio::net::UnixStream::connect(handle.runtime_dir.socket_path())
@@ -1169,7 +1226,13 @@ async fn run_updates_shared_state_to_idle_after_completion() {
     let worker = make_worker(client).await;
     let handle = spawn_controller(worker).await;
 
-    handle.send(Method::run_text("Hello")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "Hello",
+        ))
+        .await
+        .unwrap();
 
     // Wait for the run to complete
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1183,7 +1246,13 @@ async fn run_populates_history() {
     let worker = make_worker(client).await;
     let handle = spawn_controller(worker).await;
 
-    handle.send(Method::run_text("Hello")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "Hello",
+        ))
+        .await
+        .unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -1201,7 +1270,13 @@ async fn events_are_broadcast() {
     let handle = spawn_controller(worker).await;
     let mut rx = handle.subscribe();
 
-    handle.send(Method::run_text("Hello")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "Hello",
+        ))
+        .await
+        .unwrap();
 
     let mut saw_turn_start = false;
     let mut saw_text_delta = false;
@@ -1236,10 +1311,8 @@ async fn events_are_broadcast() {
 }
 
 #[tokio::test]
-async fn double_run_returns_error() {
-    // Keep the first turn in-flight until the test drops the handle. A
-    // finite stream can finish before the second Method reaches the
-    // controller in the full test suite, making this assertion racy.
+async fn submit_while_running_is_durably_queued() {
+    // Keep the first turn in-flight until the second Submit is accepted.
     let events = vec![
         LlmEvent::text_block_start(0),
         LlmEvent::text_delta(0, "slow..."),
@@ -1249,35 +1322,67 @@ async fn double_run_returns_error() {
     let handle = spawn_controller(worker).await;
     let mut rx = handle.subscribe();
 
-    // Send first run and wait until the controller has entered Running.
-    handle.send(Method::run_text("first")).await.unwrap();
+    handle
+        .send(Method::submit_text("request-first", "first"))
+        .await
+        .unwrap();
     wait_for_status(&handle, WorkerStatus::Running).await;
+    handle
+        .send(Method::submit_text("request-second", "second"))
+        .await
+        .unwrap();
 
-    // Now the second run must be rejected by drive_turn's live Method arm.
-    handle.send(Method::run_text("second")).await.unwrap();
-
-    // Look for the error event
-    let mut saw_already_running = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        tokio::select! {
-            event = rx.recv() => {
-                match event {
-                    Ok(Event::Error { code, .. }) => {
-                        if code == worker::ErrorCode::AlreadyRunning {
-                            saw_already_running = true;
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                    _ => {}
-                }
+    let mut accepted = None;
+    let mut pending_snapshot = None;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
+            Ok(Ok(Event::SubmissionAccepted {
+                submission_request_id,
+                disposition,
+                ..
+            })) if submission_request_id == "request-second" => accepted = Some(disposition),
+            Ok(Ok(Event::PendingSubmissionsChanged { pending }))
+                if pending.submissions.len() == 1 =>
+            {
+                pending_snapshot = Some(pending)
             }
-            _ = tokio::time::sleep_until(deadline) => break,
+            Ok(Ok(Event::Error { code, message })) if code == worker::ErrorCode::AlreadyRunning => {
+                panic!("Submit was busy-rejected: {message}")
+            }
+            _ => {}
+        }
+        if accepted.is_some() && pending_snapshot.is_some() {
+            break;
         }
     }
 
-    assert!(saw_already_running, "should see already_running error");
+    assert_eq!(accepted, Some(protocol::SubmissionDisposition::Queued));
+    let pending_snapshot = pending_snapshot.expect("pending snapshot");
+    assert_eq!(pending_snapshot.submissions.len(), 1);
+    handle.send(Method::Pause).await.unwrap();
+    wait_for_status(&handle, WorkerStatus::Paused).await;
+    handle
+        .send(Method::ContinuePending {
+            expected_revision: pending_snapshot.revision,
+            expected_head_id: pending_snapshot.head_id.expect("pending head"),
+        })
+        .await
+        .unwrap();
+    let rejection = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if let Ok(Event::Error { code, message }) = rx.recv().await
+                && code == worker::ErrorCode::InvalidRequest
+                && message.contains("requires an idle Worker")
+            {
+                break message;
+            }
+        }
+    })
+    .await
+    .expect("paused ContinuePending rejection");
+    assert!(rejection.contains("Resume or Cancel"));
+    assert_eq!(handle.shared_state.get_status(), WorkerStatus::Paused);
 }
 
 #[tokio::test]
@@ -1365,7 +1470,8 @@ async fn run_with_paste_segment_inlines_content_and_emits_typed_user_message() {
         protocol::Segment::text(" thanks"),
     ];
     handle
-        .send(Method::Run {
+        .send(Method::Submit {
+            submission_request_id: protocol::new_submission_request_id(),
             input: segments.clone(),
         })
         .await
@@ -1437,7 +1543,13 @@ async fn run_with_resolvable_file_ref_attaches_system_message_after_user() {
             path: "notes.md".into(),
         },
     ];
-    handle.send(Method::Run { input: segments }).await.unwrap();
+    handle
+        .send(Method::Submit {
+            submission_request_id: protocol::new_submission_request_id(),
+            input: segments,
+        })
+        .await
+        .unwrap();
 
     // Wait for the turn to complete.
     let mut rx = handle.subscribe();
@@ -1485,7 +1597,8 @@ async fn run_with_file_ref_uses_manifest_file_upload_limit() {
     let handle = spawn_controller(worker).await;
 
     handle
-        .send(Method::Run {
+        .send(Method::Submit {
+            submission_request_id: protocol::new_submission_request_id(),
             input: vec![protocol::Segment::FileRef {
                 path: "long.txt".into(),
             }],
@@ -1538,7 +1651,13 @@ async fn run_with_unresolved_segment_emits_alert_and_placeholder() {
             path: "src/lib.rs".into(),
         },
     ];
-    handle.send(Method::Run { input: segments }).await.unwrap();
+    handle
+        .send(Method::Submit {
+            submission_request_id: protocol::new_submission_request_id(),
+            input: segments,
+        })
+        .await
+        .unwrap();
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     let mut saw_alert_for_file_ref = false;
@@ -1586,6 +1705,7 @@ async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
 
     handle
         .send(Method::Notify {
+            notification_request_id: protocol::new_submission_request_id(),
             message: "turn finished".into(),
             auto_run: true,
         })
@@ -1625,6 +1745,19 @@ async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
     assert!(
         saw_notify_in_mirror,
         "Method::Notify should commit a SystemItem::Notification entry; mirror = {entries:?}"
+    );
+    let queue_checkpoint_is_atomic = entries.iter().any(|entry| match entry {
+        LogEntry::AnnotatedSystemItem { extensions, .. } => extensions.iter().any(|extension| {
+            extension.domain == "worker.pending_activations.v1"
+                && extension.payload["pending_notifications"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty)
+        }),
+        _ => false,
+    });
+    assert!(
+        queue_checkpoint_is_atomic,
+        "notification history and queue claim must share one log entry"
     );
 
     // Exactly one request was made; it must contain the formatted
@@ -1671,14 +1804,18 @@ async fn notify_while_idle_with_auto_run_false_waits_for_explicit_run() {
     let client_for_assert = client.clone();
     let worker = make_worker(client).await;
     let handle = spawn_controller(worker).await;
+    let notification_request_id = protocol::new_submission_request_id();
 
-    handle
-        .send(Method::Notify {
-            message: "progress snapshot".into(),
-            auto_run: false,
-        })
-        .await
-        .unwrap();
+    for _ in 0..2 {
+        handle
+            .send(Method::Notify {
+                notification_request_id: notification_request_id.clone(),
+                message: "progress snapshot".into(),
+                auto_run: false,
+            })
+            .await
+            .unwrap();
+    }
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(handle.shared_state.get_status(), WorkerStatus::Idle);
@@ -1687,7 +1824,13 @@ async fn notify_while_idle_with_auto_run_false_waits_for_explicit_run() {
         "weak Notify must not stage RunForNotification while idle"
     );
 
-    handle.send(Method::run_text("continue")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "continue",
+        ))
+        .await
+        .unwrap();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         if !client_for_assert.captured_requests().is_empty() {
@@ -1867,9 +2010,16 @@ async fn notify_while_running_does_not_emit_already_running_error() {
     let handle = spawn_controller(worker).await;
     let mut rx = handle.subscribe();
 
-    handle.send(Method::run_text("start")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "start",
+        ))
+        .await
+        .unwrap();
     handle
         .send(Method::Notify {
+            notification_request_id: protocol::new_submission_request_id(),
             message: "ping".into(),
             auto_run: true,
         })
@@ -1900,6 +2050,66 @@ async fn notify_while_running_does_not_emit_already_running_error() {
     // and has dedicated coverage in
     // `notify_while_idle_auto_starts_turn_and_injects_system_message`.
     wait_for_status(&handle, WorkerStatus::Idle).await;
+}
+
+#[tokio::test]
+async fn weak_notify_while_running_is_deduped_and_survives_until_next_submit() {
+    let client = MockClient::sequential(vec![
+        MockResponse::Hang(Vec::new()),
+        MockResponse::Complete(simple_text_events()),
+    ]);
+    let client_for_assert = client.clone();
+    let worker = make_worker(client).await;
+    let handle = spawn_controller(worker).await;
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "first",
+        ))
+        .await
+        .unwrap();
+    wait_for_status(&handle, WorkerStatus::Running).await;
+
+    let notification_request_id = protocol::new_submission_request_id();
+    for _ in 0..2 {
+        handle
+            .send(Method::Notify {
+                notification_request_id: notification_request_id.clone(),
+                message: "durable weak notice".into(),
+                auto_run: false,
+            })
+            .await
+            .unwrap();
+    }
+    handle.send(Method::Cancel).await.unwrap();
+    wait_for_status(&handle, WorkerStatus::Idle).await;
+
+    let mut rx = handle.subscribe();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "second",
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if matches!(rx.recv().await, Ok(Event::TurnEnd { .. })) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("second submit completes");
+
+    let requests = client_for_assert.captured_requests();
+    let notice_count = requests[1]
+        .items
+        .iter()
+        .filter_map(|item| item.as_text())
+        .filter(|text| text.contains("durable weak notice"))
+        .count();
+    assert_eq!(notice_count, 1);
 }
 
 #[tokio::test]
@@ -1936,7 +2146,13 @@ async fn socket_run_receives_events() {
     let mut writer = JsonLineWriter::new(writer);
 
     // Send run method via socket
-    writer.write(&Method::run_text("Hello")).await.unwrap();
+    writer
+        .write(&Method::submit_text(
+            protocol::new_submission_request_id(),
+            "Hello",
+        ))
+        .await
+        .unwrap();
 
     // Collect events
     let mut saw_turn_start = false;
@@ -2243,7 +2459,13 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
     let handle = spawn_controller(worker).await;
     let mut rx = handle.subscribe();
 
-    handle.send(Method::run_text("hello")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "hello",
+        ))
+        .await
+        .unwrap();
 
     // Wait for the partial text_delta to confirm the first stream is
     // live before we pause.
@@ -2332,7 +2554,7 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
     assert!(!has_tool_call, "no orphan tool_call in history");
 }
 
-/// Paused with an orphan `tool_use` in history + a fresh `Method::Run`
+/// Paused with an orphan `tool_use` in history + a fresh `Method::Submit`
 /// must produce a wire-valid next LLM request: the orphan is closed
 /// with a synthetic `tool_result`, a system note is inserted, and the
 /// new user input is appended.
@@ -2369,7 +2591,13 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
     let handle = spawn_controller(worker).await;
     let mut rx = handle.subscribe();
 
-    handle.send(Method::run_text("first")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "first",
+        ))
+        .await
+        .unwrap();
 
     // Wait for ToolCallDone — the ToolCall is committed to history
     // right before the Engine enters tool execution and pends.
@@ -2400,7 +2628,13 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
     // `last_run_interrupted` and runs its interrupt-prep step, which
     // closes the orphan + injects a system note before the fresh user
     // message.
-    handle.send(Method::run_text("new request")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "new request",
+        ))
+        .await
+        .unwrap();
     assert!(
         drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
             e,
@@ -2531,7 +2765,13 @@ async fn paused_cancel_abandons_resume_and_next_input_is_fresh_run() {
     let handle = spawn_controller(worker).await;
     let mut rx = handle.subscribe();
 
-    handle.send(Method::run_text("first")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "first",
+        ))
+        .await
+        .unwrap();
     assert!(
         drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
             e,
@@ -2599,7 +2839,10 @@ async fn paused_cancel_abandons_resume_and_next_input_is_fresh_run() {
     );
 
     handle
-        .send(Method::run_text("fresh request"))
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "fresh request",
+        ))
         .await
         .unwrap();
     assert!(
@@ -2688,7 +2931,13 @@ async fn empty_turn_cancel_rolls_back_submit_entries_and_emits_signal() {
     let handle = spawn_controller(worker).await;
     let mut rx = handle.subscribe();
 
-    handle.send(Method::run_text("rollback me")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "rollback me",
+        ))
+        .await
+        .unwrap();
     wait_for_status(&handle, WorkerStatus::Running).await;
     handle.send(Method::Cancel).await.unwrap();
 
@@ -2721,7 +2970,10 @@ async fn empty_turn_pause_rolls_back_and_snapshot_does_not_restore_input() {
     let mut rx = handle.subscribe();
 
     handle
-        .send(Method::run_text("pause rollback"))
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "pause rollback",
+        ))
         .await
         .unwrap();
     wait_for_status(&handle, WorkerStatus::Running).await;
@@ -2755,7 +3007,13 @@ async fn empty_turn_rollback_removes_only_the_most_recent_turn() {
     let handle = spawn_controller(worker).await;
     let mut rx = handle.subscribe();
 
-    handle.send(Method::run_text("first kept")).await.unwrap();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "first kept",
+        ))
+        .await
+        .unwrap();
     assert!(
         drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
             e,
@@ -2769,7 +3027,10 @@ async fn empty_turn_rollback_removes_only_the_most_recent_turn() {
     wait_for_status(&handle, WorkerStatus::Idle).await;
 
     handle
-        .send(Method::run_text("second rolled back"))
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "second rolled back",
+        ))
         .await
         .unwrap();
     wait_for_status(&handle, WorkerStatus::Running).await;
@@ -2816,7 +3077,10 @@ async fn pause_after_assistant_token_does_not_rollback() {
     let mut rx = handle.subscribe();
 
     handle
-        .send(Method::run_text("keep this turn"))
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "keep this turn",
+        ))
         .await
         .unwrap();
     assert!(

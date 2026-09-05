@@ -538,7 +538,7 @@ fn initial_worker_input(segments: &[Segment]) -> Option<EmbeddedWorkerInput> {
     Some(EmbeddedWorkerInput {
         kind: EmbeddedWorkerInputKind::User,
         content: Segment::flatten_to_text(segments),
-        submission_id: None,
+        submission_request_id: None,
         segments: Some(segments.to_vec()),
     })
 }
@@ -2706,7 +2706,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 WorkerInputKind::RegisterPeer => EmbeddedWorkerInputKind::RegisterPeer,
             },
             content: request.content,
-            submission_id: None,
+            submission_request_id: None,
             segments: request.segments,
         };
         match self.runtime.send_input(&worker_ref, input) {
@@ -3934,7 +3934,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 WorkerInputKind::RegisterPeer => EmbeddedWorkerInputKind::RegisterPeer,
             },
             content: request.content,
-            submission_id: None,
+            submission_request_id: None,
             segments: request.segments,
         };
         match self.post_json::<_, RuntimeHttpWorkerInputResponse>(
@@ -5195,7 +5195,7 @@ mod tests {
                     "missing test context",
                 );
             };
-            let submission_id = input.submission_id.clone();
+            let submission_request_id = input.submission_request_id.clone();
             let content = input.content;
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -5212,11 +5212,13 @@ mod tests {
                     status: protocol::WorkerStatus::Idle,
                 });
             });
-            if let Some(submission_id) = submission_id {
-                worker_runtime::execution::WorkerExecutionResult::accepted_input_committed(
+            if let Some(submission_request_id) = submission_request_id {
+                worker_runtime::execution::WorkerExecutionResult::accepted_submission(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
                     WorkerExecutionRunState::Busy,
-                    submission_id,
+                    submission_request_id,
+                    uuid::Uuid::now_v7().to_string(),
+                    protocol::SubmissionDisposition::Started,
                 )
             } else {
                 worker_runtime::execution::WorkerExecutionResult::accepted(

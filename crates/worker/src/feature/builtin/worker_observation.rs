@@ -803,7 +803,10 @@ mod tests {
                 .collect();
             Ok(WorkerSessionCapture {
                 segment_id: "segment".to_string(),
-                session: protocol::SessionSnapshot { entries },
+                session: protocol::SessionSnapshot {
+                    pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                    entries,
+                },
             })
         }
     }

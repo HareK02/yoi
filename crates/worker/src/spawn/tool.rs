@@ -58,7 +58,7 @@ struct SubWorkerSpawnInput {
     /// a host path and grants no authority. When omitted, the Workdir root is used.
     #[serde(default)]
     cwd: Option<String>,
-    /// First message sent to the spawned SubWorker via `Method::Run`.
+    /// First message sent to the spawned SubWorker via `Method::Submit`.
     task: String,
     /// Allow rules delegated to the spawned SubWorker. Must be a subset of the
     /// spawner's explicit delegation authority; direct tool scope alone is not
@@ -219,33 +219,50 @@ fn parse_spawn_profile_selector(raw: Option<&str>) -> Result<SpawnProfileSelecto
 
 #[derive(Clone)]
 pub(crate) enum ParentNotificationTarget {
-    Controller(mpsc::WeakSender<Method>),
-    Buffer(crate::ipc::notify_buffer::NotifyBuffer),
+    Controller {
+        sender: mpsc::WeakSender<Method>,
+        fallback: Arc<dyn Fn(Method) + Send + Sync>,
+    },
+    Durable(Arc<dyn Fn(Method) + Send + Sync>),
 }
 
 impl ParentNotificationTarget {
-    fn notify(&self, message: String, auto_run: bool) {
+    pub(crate) fn with_controller_fallback(
+        sender: mpsc::WeakSender<Method>,
+        fallback: ParentNotificationTarget,
+    ) -> Self {
+        let ParentNotificationTarget::Durable(fallback) = fallback else {
+            unreachable!("controller fallback must use durable pending authority");
+        };
+        Self::Controller { sender, fallback }
+    }
+
+    pub(crate) fn notify(&self, child_session_id: String, message: String, auto_run: bool) {
+        let method = Method::NotifyTracked {
+            notification_request_id: protocol::new_submission_request_id(),
+            message,
+            auto_run,
+            source: protocol::AuthenticatedInputSource::SubWorker {
+                session_id: child_session_id,
+            },
+        };
         match self {
-            Self::Controller(parent_method_tx) => {
-                let Some(parent_method_tx) = parent_method_tx.upgrade() else {
-                    tracing::warn!(
-                        "parent Worker controller closed before Internal SubWorker completion notification"
-                    );
+            Self::Controller { sender, fallback } => {
+                let Some(parent_method_tx) = sender.upgrade() else {
+                    fallback(method);
                     return;
                 };
+                let fallback = fallback.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = parent_method_tx
-                        .send(Method::Notify { message, auto_run })
-                        .await
-                    {
+                    if let Err(error) = parent_method_tx.send(method).await {
                         tracing::warn!(
-                            %error,
-                            "failed to notify parent Worker about Internal SubWorker completion"
+                            "failed to notify parent Controller; using durable pending authority"
                         );
+                        fallback(error.0);
                     }
                 });
             }
-            Self::Buffer(parent_notifies) => parent_notifies.push_notify(message, auto_run),
+            Self::Durable(notify) => notify(method),
         }
     }
 }
@@ -550,7 +567,7 @@ impl Tool for SubWorkerSpawnTool {
                 let message = format!(
                     "SubWorker `{child_name}` turn ended with status {status:?}. Inspect its committed session with worker-observation tools before making completion decisions."
                 );
-                parent_notifications.notify(message, true);
+                parent_notifications.notify(child_name.clone(), message, true);
             })),
         )
         .await;
@@ -1134,12 +1151,41 @@ enabled = false
     #[tokio::test]
     async fn parent_controller_notification_target_does_not_keep_channel_open() {
         let (parent_method_tx, mut parent_method_rx) = mpsc::channel(1);
-        let target = ParentNotificationTarget::Controller(parent_method_tx.downgrade());
+        let captured = Arc::new(std::sync::Mutex::new(false));
+        let captured_for_fallback = captured.clone();
+        let target = ParentNotificationTarget::with_controller_fallback(
+            parent_method_tx.downgrade(),
+            ParentNotificationTarget::Durable(Arc::new(move |_| {
+                *captured_for_fallback.lock().unwrap() = true;
+            })),
+        );
 
         drop(parent_method_tx);
 
         assert!(parent_method_rx.recv().await.is_none());
-        target.notify("late completion".to_string(), true);
+        target.notify("child-session".into(), "late completion".to_string(), true);
+        assert!(*captured.lock().unwrap());
+    }
+
+    #[test]
+    fn durable_parent_notification_target_preserves_child_source() {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let captured_for_target = captured.clone();
+        let target = ParentNotificationTarget::Durable(Arc::new(move |method| {
+            *captured_for_target.lock().unwrap() = Some(method);
+        }));
+
+        target.notify("child-session".into(), "completed".into(), true);
+
+        assert!(matches!(
+            captured.lock().unwrap().take(),
+            Some(Method::NotifyTracked {
+                message,
+                auto_run: true,
+                source: protocol::AuthenticatedInputSource::SubWorker { session_id },
+                ..
+            }) if session_id == "child-session" && message == "completed"
+        ));
     }
 
     #[tokio::test]
@@ -1185,7 +1231,10 @@ enabled = false
         let tool = SubWorkerSpawnTool::new(
             "parent".into(),
             workspace_context,
-            ParentNotificationTarget::Controller(parent_method_tx.downgrade()),
+            ParentNotificationTarget::with_controller_fallback(
+                parent_method_tx.downgrade(),
+                ParentNotificationTarget::Durable(Arc::new(|_| {})),
+            ),
             runtime.path().to_path_buf(),
             bash_output_dir.clone(),
             workspace_root.clone(),
@@ -1282,10 +1331,13 @@ enabled = false
             .expect("parent method channel remains open");
         assert!(matches!(
             completion,
-            Method::Notify {
+            Method::NotifyTracked {
                 message,
                 auto_run: true,
-            } if message.contains("SubWorker `reviewer-child` turn ended with status Idle")
+                source: protocol::AuthenticatedInputSource::SubWorker { session_id },
+                ..
+            } if session_id == "reviewer-child"
+                && message.contains("SubWorker `reviewer-child` turn ended with status Idle")
         ));
         assert!(!runtime.path().join("reviewer-child/sock").exists());
 
@@ -1434,7 +1486,10 @@ enabled = false
         let tool = SubWorkerSpawnTool::new(
             "parent".into(),
             workspace_context,
-            ParentNotificationTarget::Controller(parent_method_tx.downgrade()),
+            ParentNotificationTarget::with_controller_fallback(
+                parent_method_tx.downgrade(),
+                ParentNotificationTarget::Durable(Arc::new(|_| {})),
+            ),
             runtime.path().to_path_buf(),
             bash_output_dir.clone(),
             workspace_root.clone(),

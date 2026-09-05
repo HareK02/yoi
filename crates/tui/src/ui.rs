@@ -1880,7 +1880,7 @@ fn actionbar_left_item(app: &App, now: Instant) -> Option<(String, Style)> {
     }
     if app.queued_input_count() > 0 {
         return Some((
-            "Alt-q edit queued  Alt-c clear queued".to_string(),
+            "Alt-n notify  Alt-q continue  Alt-d cancel queued  Alt-c clear queued".to_string(),
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -2136,8 +2136,24 @@ mod tests {
     use super::*;
     use crate::app::{ActionbarNoticeLevel, ActionbarNoticeSource, App};
     use crate::block::{ToolCallBlock, ToolCallState};
-    use protocol::WorkerStatus;
+    use protocol::Event;
     use std::time::{Duration, Instant};
+
+    fn set_pending_submission(app: &mut App, id: &str) {
+        app.handle_worker_event(Event::PendingSubmissionsChanged {
+            pending: protocol::PendingSubmissionsSnapshot {
+                revision: 1,
+                notification_count: 0,
+                head_id: Some(id.into()),
+                submissions: vec![protocol::PendingSubmissionSummary {
+                    submission_id: id.into(),
+                    accepted_at_ms: 1,
+                    segment_count: 1,
+                    byte_len: 1,
+                }],
+            },
+        });
+    }
 
     #[test]
     fn run_status_line_matches_console_metrics_and_spinner_frame() {
@@ -2251,15 +2267,11 @@ mod tests {
     #[test]
     fn queue_status_text_includes_count_and_preview() {
         let mut app = App::new("test".into());
-        app.set_worker_status(WorkerStatus::Running);
-        for c in "queued preview".chars() {
-            app.insert_char(c);
-        }
-        assert!(app.submit_input().is_none());
+        set_pending_submission(&mut app, "submission-1");
 
         assert_eq!(
             queue_status_text(&app),
-            Some("queued: 1 — queued preview".to_string())
+            Some("queued: 1 — submission-1".to_string())
         );
     }
 
@@ -2289,14 +2301,10 @@ mod tests {
             Some("Worker keeps running. Press Ctrl-C again to exit TUI.".into())
         );
 
-        app.set_worker_status(WorkerStatus::Running);
-        for c in "queued turn".chars() {
-            app.insert_char(c);
-        }
-        assert!(app.submit_input().is_none());
+        set_pending_submission(&mut app, "submission-1");
         assert_eq!(
             actionbar_left_item(&app, now).map(|(text, _)| text),
-            Some("Alt-q edit queued  Alt-c clear queued".into())
+            Some("Alt-n notify  Alt-q continue  Alt-d cancel queued  Alt-c clear queued".into())
         );
 
         app.enter_command_mode();

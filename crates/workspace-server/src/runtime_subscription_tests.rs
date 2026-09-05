@@ -32,11 +32,13 @@ impl WorkerExecutionBackend for TestExecutionBackend {
         _handle: &WorkerExecutionHandle,
         input: worker_runtime::interaction::WorkerInput,
     ) -> WorkerExecutionResult {
-        if let Some(submission_id) = input.submission_id {
-            WorkerExecutionResult::accepted_input_committed(
+        if let Some(submission_request_id) = input.submission_request_id {
+            WorkerExecutionResult::accepted_submission(
                 WorkerExecutionOperation::Input,
                 WorkerExecutionRunState::Busy,
-                submission_id,
+                submission_request_id,
+                uuid::Uuid::now_v7().to_string(),
+                protocol::SubmissionDisposition::Started,
             )
         } else {
             WorkerExecutionResult::accepted(

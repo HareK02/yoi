@@ -1240,10 +1240,12 @@ async fn worker_protocol_ws(
     auth: Option<Extension<RuntimeAuthContext>>,
     Path(worker_id): Path<String>,
     Query(query): Query<RuntimeWorkerEventsWsQuery>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, RuntimeHttpRestError> {
     let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
     let scope = auth_workspace_scope(&state, auth.as_ref())?;
+    let input_source = authenticated_protocol_input_source(&headers)?;
     match scope.as_ref() {
         Some(scope) => state
             .runtime
@@ -1254,9 +1256,80 @@ async fn worker_protocol_ws(
     .map_err(RuntimeHttpRestError::runtime)?;
     Ok(ws
         .on_upgrade(move |socket| {
-            worker_protocol_ws_session(state.runtime, scope, worker_ref, query, socket)
+            worker_protocol_ws_session(
+                state.runtime,
+                scope,
+                worker_ref,
+                query,
+                input_source,
+                socket,
+            )
         })
         .into_response())
+}
+
+#[cfg(feature = "ws-server")]
+fn authenticated_protocol_input_source(
+    headers: &HeaderMap,
+) -> Result<Option<protocol::AuthenticatedInputSource>, RuntimeHttpRestError> {
+    let Some(value) = headers.get(protocol::AUTHENTICATED_ACCOUNT_ID_HEADER) else {
+        return Ok(None);
+    };
+    let account_id = value.to_str().map_err(|_| {
+        RuntimeHttpRestError::new(
+            StatusCode::BAD_REQUEST,
+            "authenticated_input_source_invalid",
+            "authenticated Worker input source is invalid",
+        )
+    })?;
+    if account_id.trim().is_empty() || account_id.len() > 128 {
+        return Err(RuntimeHttpRestError::new(
+            StatusCode::BAD_REQUEST,
+            "authenticated_input_source_invalid",
+            "authenticated Worker input source is invalid",
+        ));
+    }
+    Ok(Some(protocol::AuthenticatedInputSource::Account {
+        account_id: account_id.to_owned(),
+    }))
+}
+
+#[cfg(feature = "ws-server")]
+fn authorize_runtime_protocol_method(
+    method: protocol::Method,
+    transport_source: Option<&protocol::AuthenticatedInputSource>,
+) -> protocol::Method {
+    match method {
+        protocol::Method::SubmitTracked {
+            submission_request_id,
+            input,
+            ..
+        } => protocol::Method::SubmitTracked {
+            source: transport_source.cloned().unwrap_or_else(|| {
+                protocol::AuthenticatedInputSource::Backend {
+                    operation_id: submission_request_id.clone(),
+                }
+            }),
+            submission_request_id,
+            input,
+        },
+        protocol::Method::NotifyTracked {
+            notification_request_id,
+            message,
+            auto_run,
+            ..
+        } => protocol::Method::NotifyTracked {
+            source: transport_source.cloned().unwrap_or_else(|| {
+                protocol::AuthenticatedInputSource::Backend {
+                    operation_id: notification_request_id.clone(),
+                }
+            }),
+            notification_request_id,
+            message,
+            auto_run,
+        },
+        other => other,
+    }
 }
 
 #[cfg(feature = "ws-server")]
@@ -1265,6 +1338,7 @@ async fn worker_protocol_ws_session(
     scope: Option<RuntimeWorkspaceScope>,
     worker_ref: WorkerRef,
     query: RuntimeWorkerEventsWsQuery,
+    input_source: Option<protocol::AuthenticatedInputSource>,
     mut socket: WebSocket,
 ) {
     let mut cursor = match query.cursor.as_deref() {
@@ -1347,6 +1421,8 @@ async fn worker_protocol_ws_session(
                 match inbound {
                     Some(Ok(WsMessage::Text(text))) => match decode_method(&text) {
                         Ok(method) => {
+                            let method =
+                                authorize_runtime_protocol_method(method, input_source.as_ref());
                             let result = match scope.as_ref() {
                                 Some(scope) => {
                                     runtime.send_protocol_method_scoped(scope, &worker_ref, method)
@@ -2220,6 +2296,63 @@ mod tests {
     }
 
     #[test]
+    fn runtime_protocol_replaces_serialized_tracked_source() {
+        let wire = serde_json::to_string(&protocol::Method::SubmitTracked {
+            submission_request_id: "request-1".into(),
+            input: vec![protocol::Segment::text("hello")],
+            source: protocol::AuthenticatedInputSource::Account {
+                account_id: "forged".into(),
+            },
+        })
+        .unwrap();
+        let decoded: protocol::Method = serde_json::from_str(&wire).unwrap();
+        assert!(matches!(
+            decoded,
+            protocol::Method::SubmitTracked {
+                source: protocol::AuthenticatedInputSource::UntrustedWire,
+                ..
+            }
+        ));
+        assert!(matches!(
+            authorize_runtime_protocol_method(decoded, None),
+            protocol::Method::SubmitTracked {
+                source: protocol::AuthenticatedInputSource::Backend { operation_id },
+                ..
+            } if operation_id == "request-1"
+        ));
+    }
+
+    #[test]
+    fn runtime_protocol_uses_transport_authenticated_account_source() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            protocol::AUTHENTICATED_ACCOUNT_ID_HEADER,
+            "account-1".parse().unwrap(),
+        );
+        let source = authenticated_protocol_input_source(&headers)
+            .unwrap()
+            .expect("account source header must resolve");
+        let wire = serde_json::to_string(&protocol::Method::NotifyTracked {
+            notification_request_id: "notification-1".into(),
+            message: "hello".into(),
+            auto_run: true,
+            source: protocol::AuthenticatedInputSource::Account {
+                account_id: "forged".into(),
+            },
+        })
+        .unwrap();
+        let decoded: protocol::Method = serde_json::from_str(&wire).unwrap();
+
+        assert!(matches!(
+            authorize_runtime_protocol_method(decoded, Some(&source)),
+            protocol::Method::NotifyTracked {
+                source: protocol::AuthenticatedInputSource::Account { account_id },
+                ..
+            } if account_id == "account-1"
+        ));
+    }
+
+    #[test]
     fn attachment_routes_require_worker_input_permission() {
         assert_eq!(
             required_runtime_permission(&Method::POST, "/v1/workers/7/attachments"),
@@ -2870,11 +3003,13 @@ mod tests {
             _handle: &WorkerExecutionHandle,
             input: WorkerInput,
         ) -> WorkerExecutionResult {
-            if let Some(submission_id) = input.submission_id {
-                WorkerExecutionResult::accepted_input_committed(
+            if let Some(submission_id) = input.submission_request_id {
+                WorkerExecutionResult::accepted_submission(
                     WorkerExecutionOperation::Input,
                     WorkerExecutionRunState::Idle,
+                    submission_id.clone(),
                     submission_id,
+                    protocol::SubmissionDisposition::Started,
                 )
             } else {
                 WorkerExecutionResult::accepted(
@@ -3194,11 +3329,13 @@ mod ws_tests {
             _handle: &WorkerExecutionHandle,
             input: WorkerInput,
         ) -> WorkerExecutionResult {
-            if let Some(submission_id) = input.submission_id {
-                WorkerExecutionResult::accepted_input_committed(
+            if let Some(submission_id) = input.submission_request_id {
+                WorkerExecutionResult::accepted_submission(
                     WorkerExecutionOperation::Input,
                     WorkerExecutionRunState::Idle,
+                    submission_id.clone(),
                     submission_id,
+                    protocol::SubmissionDisposition::Started,
                 )
             } else {
                 WorkerExecutionResult::accepted(

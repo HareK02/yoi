@@ -286,7 +286,7 @@ User triggers a Ticket action in yoi panel
   -> client Ticket role launcher reads .yoi/workspace.toml [ticket] settings
   -> launcher selects the role Profile
   -> launcher spawns the role Worker
-  -> launcher sends Method::Run with Text segments
+  -> launcher sends Method::Submit with Text segments
   -> launcher waits for run-acceptance evidence
   -> Dashboard reports success/failure
 ```

@@ -99,7 +99,10 @@ async fn in_process_host_runs_text_and_read_tool_then_shuts_down() {
     let mut protocol_client = host.connect();
 
     protocol_client
-        .send(&Method::run_text("read the probe"))
+        .send(&Method::submit_text(
+            protocol::new_submission_request_id(),
+            "read the probe",
+        ))
         .await
         .expect("submit input");
 
@@ -336,11 +339,15 @@ async fn standalone_restore_preserves_history_tasks_notifications_and_cwd_scope(
     let worker_id = host.worker_id();
     let mut protocol_client = host.connect();
     protocol_client
-        .send(&Method::run_text("first request"))
+        .send(&Method::submit_text(
+            protocol::new_submission_request_id(),
+            "first request",
+        ))
         .await?;
     wait_for_run_end(&mut protocol_client).await?;
     protocol_client
         .send(&Method::Notify {
+            notification_request_id: protocol::new_submission_request_id(),
             message: "persisted notification".to_string(),
             auto_run: true,
         })
@@ -394,7 +401,10 @@ async fn standalone_restore_preserves_history_tasks_notifications_and_cwd_scope(
     assert!(snapshot.contains("persisted notification"), "{snapshot}");
 
     protocol_client
-        .send(&Method::run_text("continue after restore"))
+        .send(&Method::submit_text(
+            protocol::new_submission_request_id(),
+            "continue after restore",
+        ))
         .await?;
     wait_for_run_end(&mut protocol_client).await?;
     let request = second_inspection
