@@ -53,6 +53,10 @@ use workdir::workspace::{
 };
 use workdir::{CommandHandle, WorkdirSessionHandle};
 use worker::feature::builtin::{WorkerObservationSubject, WorkerObservationSubjectRef};
+use worker_runtime::http_server::{
+    RUNTIME_HTTP_PROTOCOL_MAX_VERSION, RUNTIME_HTTP_PROTOCOL_MIN_VERSION,
+    RUNTIME_HTTP_PROTOCOL_VERSION,
+};
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 use workspace_api::{
@@ -72,7 +76,8 @@ use workspace_api::{
     PasskeyRegistrationOptionsResponse, ProfileSettingsResponse, PutRepositorySshHostTrustRequest,
     RepositoryAccessProjection, RepositoryDetailResponse, RepositoryListResponse,
     RepositoryLogResponse, RepositorySshCredential, RepositorySshHostTrust, RequestActor,
-    RotateRepositorySshCredentialRequest, RuntimeConnectionTestResponse, RuntimeManagementSummary,
+    RotateRepositorySshCredentialRequest, RuntimeConnectionTestFailureKind,
+    RuntimeConnectionTestResponse, RuntimeConnectionTestStatus, RuntimeManagementSummary,
     TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
     UpdateWorkspaceMetadataRequest, WhoamiResponse, WorkerLaunchOptionsResponse,
     WorkerLaunchProfileCandidate, WorkerLaunchRuntimeOption, WorkerLaunchWorkerSummary,
@@ -106,14 +111,14 @@ use crate::config_source::ConfigCommitRequest;
 use crate::hosts::{
     ConfigBundleCheckResult, ConfigBundleSyncResult, DiagnosticSeverity, EMBEDDED_RUNTIME_ID,
     EmbeddedWorkerRuntime, HostSummary, RemoteRuntimeConfig, RemoteWorkerRuntime,
-    RuntimeDiagnostic, RuntimeRegistry, RuntimeRegistryError, RuntimeRegistryUnregisterResult,
-    TicketWorkerRole, WorkerCapabilitySummary, WorkerCompletionsRequest, WorkerCompletionsResult,
-    WorkerControlOperation, WorkerCreateBinding, WorkerImplementationSummary, WorkerInputKind,
-    WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest, WorkerLifecycleResult,
-    WorkerOperationState, WorkerRestoreResult, WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent,
-    WorkerSpawnRequest, WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest, WorkerSummary,
-    WorkerTicketAssignmentRequest, WorkerWorkspaceSummary, worker_spawn_create_fingerprint,
-    workspace_worker_summary,
+    RuntimeDiagnostic, RuntimePingFailureKind, RuntimeRegistry, RuntimeRegistryError,
+    RuntimeRegistryUnregisterResult, TicketWorkerRole, WorkerCapabilitySummary,
+    WorkerCompletionsRequest, WorkerCompletionsResult, WorkerControlOperation, WorkerCreateBinding,
+    WorkerImplementationSummary, WorkerInputKind, WorkerInputRequest, WorkerInputResult,
+    WorkerLifecycleRequest, WorkerLifecycleResult, WorkerOperationState, WorkerRestoreResult,
+    WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult,
+    WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerTicketAssignmentRequest,
+    WorkerWorkspaceSummary, worker_spawn_create_fingerprint, workspace_worker_summary,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
@@ -148,7 +153,7 @@ use crate::store::{
     RepositoryRecord, TicketAssignmentPrincipal, TicketAssignmentRole, TicketCoderAssignmentRecord,
     TicketRoleAssignmentRecord, UserRecord, WorkdirCreateOperationRecord, WorkdirRegistryRecord,
     WorkerControlGrantRecord, WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord,
-    WorkspaceResourceKind, WorkspaceRuntimeBinding,
+    WorkspaceResourceKind,
 };
 use crate::workdir_removal::{
     WorkdirRemovalAttemptOwner, WorkdirRemovalDisposition, WorkdirRemovalOperation,
@@ -163,11 +168,7 @@ use worker_runtime::catalog::{
     WorkingDirectoryRepository, WorkingDirectoryRequest, WorkspaceApiRef,
 };
 use worker_runtime::config_bundle::ConfigBundle;
-use worker_runtime::http_server::{
-    MAX_WORKER_FILE_UPLOAD_BYTES, RuntimeHttpConfigBundleAvailabilityResponse,
-    RuntimeHttpConfigBundlesResponse, RuntimeHttpSummaryResponse, RuntimeHttpWorkerResponse,
-    RuntimeHttpWorkersResponse,
-};
+use worker_runtime::http_server::MAX_WORKER_FILE_UPLOAD_BYTES;
 use worker_runtime::identity::{RuntimeWorkerRef, WorkerId};
 
 const EMBEDDED_WORKER_RUNTIME_ID: &str = "embedded-worker-runtime";
@@ -12513,13 +12514,37 @@ async fn test_runtime_connection(
     State(api): State<WorkspaceApi>,
     AxumPath(runtime_id): AxumPath<String>,
 ) -> ApiResult<Json<RuntimeConnectionTestResponse>> {
-    let binding = api
-        .store
-        .get_workspace_runtime_binding(&api.config.workspace_id, &runtime_id)
+    let runtime_id = runtime_id.trim().to_string();
+    if runtime_id.is_empty() {
+        return Err(Error::InvalidRuntimeIdentifier {
+            kind: "runtime".to_string(),
+            value: runtime_id,
+        }
+        .into());
+    }
+    api.store
+        .get_workspace_runtime_binding(api.workspace_id(), &runtime_id)
         .await?
         .filter(|binding| binding.revoked_at.is_none())
         .ok_or_else(|| Error::UnknownRuntime(runtime_id.clone()))?;
-    Ok(Json(test_remote_runtime_binding(&api, &binding).await))
+
+    let checked_at = Utc::now().to_rfc3339();
+    let runtime = api.runtime.clone();
+    let ping_runtime_id = runtime_id.clone();
+    let ping = tokio::task::spawn_blocking(move || runtime.ping(&ping_runtime_id))
+        .await
+        .map_err(|_| Error::RuntimeOperationFailed {
+            runtime_id: runtime_id.clone(),
+            code: "runtime_connection_test_unavailable".to_string(),
+            message: "Runtime connection test could not be completed".to_string(),
+        })?;
+
+    Ok(Json(runtime_connection_test_response(
+        api.workspace_id(),
+        &runtime_id,
+        checked_at,
+        ping,
+    )))
 }
 
 async fn get_worker_launch_options(
@@ -14520,413 +14545,109 @@ fn remote_runtime_config_from_binding(
     Ok(remote)
 }
 
-async fn test_remote_runtime_binding(
-    api: &WorkspaceApi,
-    remote: &WorkspaceRuntimeBinding,
-) -> RuntimeConnectionTestResponse {
-    let checked_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => {
-            return remote_runtime_test_failed(
-                api,
-                remote,
-                checked_at,
-                "remote_runtime_test_client_unavailable",
-                "Remote Runtime test client could not be initialized.",
-            );
-        }
-    };
-
-    let mut observation = RuntimeCompatibilityObservation::default();
-    let summary_url = match remote_probe_url(remote, "/v1/runtime") {
-        Ok(url) => url,
-        Err(diagnostic) => {
-            return remote_runtime_test_failed(
-                api,
-                remote,
-                checked_at,
-                diagnostic.code,
-                diagnostic.message,
-            );
-        }
-    };
-
-    let summary_payload =
-        match probe_remote_json(&client, summary_url, "runtime.summary", "Runtime summary").await {
-            Ok(payload) => payload,
-            Err(diagnostic) => {
-                return remote_runtime_test_failed(
-                    api,
-                    remote,
-                    checked_at,
-                    diagnostic.code,
-                    diagnostic.message,
-                );
-            }
-        };
-    let protocol_version = summary_payload
-        .get("protocol_version")
-        .and_then(|value| value.as_str())
-        .map(ToOwned::to_owned);
-    let summary = match serde_json::from_value::<RuntimeHttpSummaryResponse>(summary_payload) {
-        Ok(summary) => summary,
-        Err(_) => {
-            return remote_runtime_test_failed(
-                api,
-                remote,
-                checked_at,
-                "remote_runtime_malformed_summary",
-                "Remote Runtime summary responded, but the payload was not recognized.",
-            );
-        }
-    };
-    observation.available(
-        "runtime.summary",
-        "Connected: /v1/runtime responded with a recognized worker-runtime summary.",
-    );
-
-    let workers_url = match remote_probe_url(remote, "/v1/workers") {
-        Ok(url) => url,
-        Err(diagnostic) => {
-            observation.incompatible("workers.list", diagnostic);
-            String::new()
-        }
-    };
-    let workers = if workers_url.is_empty() {
-        None
-    } else {
-        match probe_remote_json(&client, workers_url, "workers.list", "Worker list").await {
-            Ok(payload) => match serde_json::from_value::<RuntimeHttpWorkersResponse>(payload) {
-                Ok(workers) => {
-                    observation.available(
-                        "workers.list",
-                        "Verified: /v1/workers responded with a recognized worker list.",
-                    );
-                    Some(workers)
-                }
-                Err(_) => {
-                    observation.incompatible(
-                        "workers.list",
-                        settings_diagnostic(
-                            "remote_runtime_workers_malformed",
-                            DiagnosticSeverity::Error,
-                            "Remote Runtime worker list responded, but the payload was not recognized.",
-                        ),
-                    );
-                    None
-                }
-            },
-            Err(diagnostic) => {
-                observation.incompatible("workers.list", diagnostic);
-                None
-            }
-        }
-    };
-
-    if let Some(worker) = workers.as_ref().and_then(|workers| workers.workers.first()) {
-        let path = format!(
-            "/v1/workers/{}",
-            encode_path_segment(&worker.worker_id.to_string())
-        );
-        match remote_probe_url(remote, &path) {
-            Ok(url) => match probe_remote_json(&client, url, "workers.detail", "Worker detail").await {
-                Ok(payload) => match serde_json::from_value::<RuntimeHttpWorkerResponse>(payload) {
-                    Ok(_) => observation.available(
-                        "workers.detail",
-                        "Verified: worker detail responded for an existing worker reported by the remote Runtime.",
-                    ),
-                    Err(_) => observation.incompatible(
-                        "workers.detail",
-                        settings_diagnostic(
-                            "remote_runtime_worker_detail_malformed",
-                            DiagnosticSeverity::Error,
-                            "Remote Runtime worker detail responded, but the payload was not recognized.",
-                        ),
-                    ),
-                },
-                Err(diagnostic) => observation.incompatible("workers.detail", diagnostic),
-            },
-            Err(diagnostic) => observation.incompatible("workers.detail", diagnostic),
-        }
-    } else {
-        observation.unknown(
-            "workers.detail",
-            "No connection problem found. Worker detail was not checked because the remote Runtime reported no workers during the lightweight probe.",
-        );
-    }
-
-    observation.available(
-        "workers.events_ws.construct",
-        "Verified: worker event websocket URL can be constructed from the configured HTTP(S) Runtime endpoint. The lightweight test does not open a websocket stream.",
-    );
-
-    let bundles_url = match remote_probe_url(remote, "/v1/config-bundles") {
-        Ok(url) => url,
-        Err(diagnostic) => {
-            observation.incompatible("config_bundles.list", diagnostic);
-            String::new()
-        }
-    };
-    let bundles = if bundles_url.is_empty() {
-        None
-    } else {
-        match probe_remote_json(
-            &client,
-            bundles_url,
-            "config_bundles.list",
-            "Config-bundle list",
-        )
-        .await
-        {
-            Ok(payload) => {
-                match serde_json::from_value::<RuntimeHttpConfigBundlesResponse>(payload) {
-                    Ok(bundles) => {
-                        observation.available(
-                            "config_bundles.list",
-                            "Verified: /v1/config-bundles responded with a recognized config-bundle list.",
-                        );
-                        Some(bundles)
-                    }
-                    Err(_) => {
-                        observation.incompatible(
-                        "config_bundles.list",
-                        settings_diagnostic(
-                            "remote_runtime_config_bundles_malformed",
-                            DiagnosticSeverity::Error,
-                            "Remote Runtime config-bundle list responded, but the payload was not recognized.",
-                        ),
-                    );
-                        None
-                    }
-                }
-            }
-            Err(diagnostic) => {
-                observation.incompatible("config_bundles.list", diagnostic);
-                None
-            }
-        }
-    };
-
-    if let Some(bundle) = bundles.as_ref().and_then(|bundles| bundles.bundles.first()) {
-        let path = format!(
-            "/v1/config-bundles/{}/availability?digest={}",
-            encode_path_segment(&bundle.id),
-            encode_path_segment(&bundle.digest)
-        );
-        match remote_probe_url(remote, &path) {
-            Ok(url) => match probe_remote_json(
-                &client,
-                url,
-                "config_bundles.availability",
-                "Config-bundle availability",
-            )
-            .await
-            {
-                Ok(payload) => {
-                    match serde_json::from_value::<RuntimeHttpConfigBundleAvailabilityResponse>(payload)
-                    {
-                        Ok(_) => observation.available(
-                            "config_bundles.availability",
-                            "Verified: config-bundle availability was confirmed for an advertised bundle.",
-                        ),
-                        Err(_) => observation.incompatible(
-                            "config_bundles.availability",
-                            settings_diagnostic(
-                                "remote_runtime_config_bundle_availability_malformed",
-                                DiagnosticSeverity::Error,
-                                "Remote Runtime config-bundle availability responded, but the payload was not recognized.",
-                            ),
-                        ),
-                    }
-                }
-                Err(diagnostic) => {
-                    observation.incompatible("config_bundles.availability", diagnostic)
-                }
-            },
-            Err(diagnostic) => observation.incompatible("config_bundles.availability", diagnostic),
-        }
-    } else {
-        observation.unknown(
-            "config_bundles.availability",
-            "No connection problem found. Config-bundle availability was not checked because the remote Runtime advertised no bundles during the lightweight probe.",
-        );
-    }
-
-    if summary.runtime.worker_creation_available {
-        observation.available(
-            "workers.spawn",
-            "Verified: /v1/runtime reports worker creation is enabled by a Runtime execution backend. The lightweight test does not create a worker.",
-        );
-    } else {
-        observation.incompatible(
-            "workers.spawn",
-            settings_diagnostic(
-                "remote_runtime_worker_creation_unavailable",
-                DiagnosticSeverity::Error,
-                "Connected to the Runtime, but worker creation is unavailable because this Runtime process has no execution backend attached.",
-            ),
-        );
-    }
-    observation.unknown(
-        "workers.input_dispatch",
-        "No connection problem found. Worker input dispatch was not checked because this lightweight test does not send model-visible input as a side effect.",
-    );
-    observation.unknown(
-        "config_bundles.sync",
-        "No connection problem found. Config-bundle sync was not checked because this lightweight test does not upload bundles as a side effect.",
-    );
-
-    RuntimeConnectionTestResponse {
-        workspace_id: api.config.workspace_id.clone(),
-        runtime_id: remote.runtime_id.clone(),
-        checked_at,
-        state: observation.state().to_string(),
-        protocol_version,
-        compatibility_basis: "Connected to /v1/runtime and verified non-side-effecting worker-runtime HTTP endpoints. No incompatible operation was found; warning items below are unproven optional or side-effecting checks, not connection failures.".to_string(),
-        capabilities: observation.capabilities,
-        health_result: format!(
-            "connected=true; runtime_status={:?}; available={}; incompatible={}; warnings={}",
-            summary.runtime.status,
-            observation.available_count,
-            observation.incompatible_count,
-            observation.unknown_count
-        ),
-        diagnostics: observation
-            .diagnostics
-            .into_iter()
-            .map(Into::into)
-            .collect(),
-    }
-}
-
-fn remote_runtime_test_failed(
-    api: &WorkspaceApi,
-    remote: &WorkspaceRuntimeBinding,
+fn runtime_connection_test_response(
+    workspace_id: &str,
+    runtime_id: &str,
     checked_at: String,
-    code: impl Into<String>,
-    message: impl Into<String>,
+    ping: std::result::Result<
+        worker_runtime::http_server::RuntimeHttpPingResponse,
+        crate::hosts::RuntimePingFailure,
+    >,
+) -> RuntimeConnectionTestResponse {
+    match ping {
+        Ok(ping) if ping.runtime_id != runtime_id => runtime_connection_test_failure(
+            workspace_id,
+            runtime_id,
+            checked_at,
+            RuntimeConnectionTestFailureKind::RuntimeIdentityMismatch,
+            None,
+            RuntimeDiagnostic::new(
+                "runtime_ping_identity_mismatch",
+                "error",
+                "Runtime ping identity does not match the registered Runtime",
+            ),
+        ),
+        Ok(ping)
+            if !(RUNTIME_HTTP_PROTOCOL_MIN_VERSION..=RUNTIME_HTTP_PROTOCOL_MAX_VERSION)
+                .contains(&ping.protocol_version) =>
+        {
+            let code = if ping.protocol_version > RUNTIME_HTTP_PROTOCOL_MAX_VERSION {
+                "runtime_ping_protocol_newer"
+            } else {
+                "runtime_ping_protocol_older"
+            };
+            runtime_connection_test_failure(
+                workspace_id,
+                runtime_id,
+                checked_at,
+                RuntimeConnectionTestFailureKind::ProtocolVersionMismatch,
+                Some(ping.protocol_version),
+                RuntimeDiagnostic::new(
+                    code,
+                    "error",
+                    "Runtime protocol version is incompatible with this Server",
+                ),
+            )
+        }
+        Ok(ping) => RuntimeConnectionTestResponse {
+            workspace_id: workspace_id.to_string(),
+            runtime_id: runtime_id.to_string(),
+            checked_at,
+            status: RuntimeConnectionTestStatus::Compatible,
+            failure_kind: None,
+            expected_protocol_version: RUNTIME_HTTP_PROTOCOL_VERSION,
+            actual_protocol_version: Some(ping.protocol_version),
+            diagnostics: Vec::new(),
+        },
+        Err(failure) => runtime_connection_test_failure(
+            workspace_id,
+            runtime_id,
+            checked_at,
+            match failure.kind {
+                RuntimePingFailureKind::Authentication => {
+                    RuntimeConnectionTestFailureKind::Authentication
+                }
+                RuntimePingFailureKind::Authorization => {
+                    RuntimeConnectionTestFailureKind::Authorization
+                }
+                RuntimePingFailureKind::NetworkUnreachable => {
+                    RuntimeConnectionTestFailureKind::NetworkUnreachable
+                }
+                RuntimePingFailureKind::Timeout => RuntimeConnectionTestFailureKind::Timeout,
+                RuntimePingFailureKind::TlsOrTransport => {
+                    RuntimeConnectionTestFailureKind::TlsOrTransport
+                }
+                RuntimePingFailureKind::MalformedResponse => {
+                    RuntimeConnectionTestFailureKind::MalformedResponse
+                }
+                RuntimePingFailureKind::Configuration | RuntimePingFailureKind::Unsupported => {
+                    RuntimeConnectionTestFailureKind::Configuration
+                }
+            },
+            None,
+            failure.diagnostic,
+        ),
+    }
+}
+
+fn runtime_connection_test_failure(
+    workspace_id: &str,
+    runtime_id: &str,
+    checked_at: String,
+    failure_kind: RuntimeConnectionTestFailureKind,
+    actual_protocol_version: Option<u32>,
+    diagnostic: RuntimeDiagnostic,
 ) -> RuntimeConnectionTestResponse {
     RuntimeConnectionTestResponse {
-        workspace_id: api.config.workspace_id.clone(),
-        runtime_id: remote.runtime_id.clone(),
+        workspace_id: workspace_id.to_string(),
+        runtime_id: runtime_id.to_string(),
         checked_at,
-        state: "failed".to_string(),
-        protocol_version: None,
-        compatibility_basis: "worker-runtime lightweight HTTP compatibility probes".to_string(),
-        capabilities: Vec::new(),
-        health_result: "failed".to_string(),
-        diagnostics: vec![settings_diagnostic(code, DiagnosticSeverity::Error, message).into()],
+        status: RuntimeConnectionTestStatus::Failed,
+        failure_kind: Some(failure_kind),
+        expected_protocol_version: RUNTIME_HTTP_PROTOCOL_VERSION,
+        actual_protocol_version,
+        diagnostics: vec![diagnostic.into()],
     }
-}
-
-#[derive(Default)]
-struct RuntimeCompatibilityObservation {
-    capabilities: Vec<String>,
-    diagnostics: Vec<RuntimeDiagnostic>,
-    available_count: usize,
-    incompatible_count: usize,
-    unknown_count: usize,
-}
-
-impl RuntimeCompatibilityObservation {
-    fn available(&mut self, operation: &str, message: impl Into<String>) {
-        self.available_count += 1;
-        self.capabilities.push(format!("{operation}:available"));
-        self.diagnostics.push(settings_diagnostic(
-            format!("{operation}.available"),
-            DiagnosticSeverity::Info,
-            message,
-        ));
-    }
-
-    fn unknown(&mut self, operation: &str, message: impl Into<String>) {
-        self.unknown_count += 1;
-        self.capabilities.push(format!("{operation}:unknown"));
-        self.diagnostics.push(settings_diagnostic(
-            format!("{operation}.unknown"),
-            DiagnosticSeverity::Warning,
-            message,
-        ));
-    }
-
-    fn incompatible(&mut self, operation: &str, diagnostic: RuntimeDiagnostic) {
-        self.incompatible_count += 1;
-        self.capabilities.push(format!("{operation}:incompatible"));
-        self.diagnostics.push(diagnostic);
-    }
-
-    fn state(&self) -> &'static str {
-        if self.incompatible_count > 0 {
-            "incompatible"
-        } else {
-            "compatible"
-        }
-    }
-}
-
-fn remote_probe_url(
-    remote: &WorkspaceRuntimeBinding,
-    path: &str,
-) -> std::result::Result<String, RuntimeDiagnostic> {
-    let endpoint = remote.base_url.trim();
-    if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
-        return Err(settings_diagnostic(
-            "remote_runtime_endpoint_invalid",
-            DiagnosticSeverity::Error,
-            "Configured remote Runtime endpoint is not an absolute HTTP(S) URL.",
-        ));
-    }
-    Ok(format!("{}{}", endpoint.trim_end_matches('/'), path))
-}
-
-async fn probe_remote_json(
-    client: &reqwest::Client,
-    url: String,
-    operation: &'static str,
-    label: &'static str,
-) -> std::result::Result<serde_json::Value, RuntimeDiagnostic> {
-    let response = client.get(url).send().await.map_err(|error| {
-        let (code, message) = if error.is_timeout() {
-            (
-                format!("{operation}.timeout"),
-                format!("Remote Runtime probe for {label} timed out."),
-            )
-        } else if error.is_connect() {
-            (
-                format!("{operation}.connect_failed"),
-                format!("Remote Runtime probe for {label} could not connect."),
-            )
-        } else {
-            (
-                format!("{operation}.request_failed"),
-                format!("Remote Runtime probe for {label} failed before a response was received."),
-            )
-        };
-        settings_diagnostic(code, DiagnosticSeverity::Error, message)
-    })?;
-
-    if !response.status().is_success() {
-        return Err(settings_diagnostic(
-            format!("{operation}.http_status"),
-            DiagnosticSeverity::Error,
-            format!(
-                "Remote Runtime probe for {label} returned HTTP status {}.",
-                response.status().as_u16()
-            ),
-        ));
-    }
-
-    response.json::<serde_json::Value>().await.map_err(|_| {
-        settings_diagnostic(
-            format!("{operation}.malformed_json"),
-            DiagnosticSeverity::Error,
-            format!("Remote Runtime probe for {label} returned an unrecognized JSON payload."),
-        )
-    })
 }
 
 fn worker_launch_options_response(api: &WorkspaceApi) -> ApiResult<WorkerLaunchOptionsResponse> {
@@ -24314,6 +24035,90 @@ mod tests {
         axum::serve(listener, proxy).await
     }
 
+    async fn runtime_ping_stub(
+        status: StatusCode,
+        body: serde_json::Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        async fn ping(
+            State((status, body)): State<(StatusCode, serde_json::Value)>,
+            headers: HeaderMap,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            assert_eq!(
+                headers
+                    .get(worker_runtime::http_server::RUNTIME_WORKSPACE_SCOPE_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some(TEST_WORKSPACE_ID)
+            );
+            assert!(
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.starts_with("Bearer "))
+            );
+            (status, Json(body))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ping stub");
+        let base_url = format!("http://{}", listener.local_addr().expect("ping stub addr"));
+        let app = Router::new()
+            .route("/v1/ping", axum::routing::get(ping))
+            .with_state((status, body));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve ping stub");
+        });
+        (base_url, server)
+    }
+
+    async fn test_app_with_remote_runtime(
+        workspace_root: impl Into<PathBuf>,
+        runtime_id: &str,
+        endpoint: String,
+    ) -> Router {
+        let api = test_api(workspace_root).await;
+        api.store
+            .upsert_workspace_runtime_binding_record(
+                WorkspaceRuntimeBinding {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    runtime_id: runtime_id.to_string(),
+                    display_name: "Probe Runtime".to_string(),
+                    base_url: endpoint.clone(),
+                    public_key: RuntimeIdentityMaterial::generate(runtime_id)
+                        .unwrap()
+                        .public_key,
+                    public_key_fingerprint: String::new(),
+                    created_at: "1".to_string(),
+                    updated_at: "1".to_string(),
+                    revoked_at: None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        api.runtime.register_or_replace(
+            RemoteWorkerRuntime::new(
+                RemoteRuntimeConfig {
+                    runtime_id: runtime_id.to_string(),
+                    workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
+                    display_name: "Probe Runtime".to_string(),
+                    base_url: endpoint,
+                    bearer_token: Some("test-connection-token".to_string()),
+                    auth: None,
+                    cached_worker_creation_available: true,
+                    cached_os: "linux".to_string(),
+                    cached_arch: "x86_64".to_string(),
+                    cached_status: "active".to_string(),
+                    timeout: std::time::Duration::from_secs(2),
+                },
+                TEST_WORKSPACE_ID.to_string(),
+                "http://127.0.0.1:1".to_string(),
+            )
+            .unwrap(),
+        );
+        build_inner_router(api)
+    }
+
     async fn test_app(workspace_root: impl Into<PathBuf>) -> Router {
         build_inner_router(test_api(workspace_root).await)
     }
@@ -25599,140 +25404,141 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn runtime_connection_test_reports_compatible_with_unknown_warnings_without_endpoint_leak()
-     {
-        let (runtime, _worker_ref) = runtime_with_worker();
-        let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let runtime_addr = runtime_listener.local_addr().unwrap();
-        tokio::spawn({
-            let runtime = runtime.clone();
-            async move {
-                serve_runtime_http_with_injected_test_auth(runtime, runtime_listener)
-                    .await
-                    .unwrap()
-            }
-        });
-
+    async fn run_runtime_connection_test(
+        body: serde_json::Value,
+        status: StatusCode,
+    ) -> serde_json::Value {
+        let (endpoint, _server) = runtime_ping_stub(status, body).await;
         let dir = tempfile::tempdir().unwrap();
-        let endpoint = format!("http://{runtime_addr}");
-        let api = test_api(dir.path()).await;
-        api.store
-            .upsert_workspace_runtime_binding_record(
-                WorkspaceRuntimeBinding {
-                    workspace_id: TEST_WORKSPACE_ID.to_string(),
-                    runtime_id: "probe-runtime".to_string(),
-                    display_name: "Probe Runtime".to_string(),
-                    base_url: endpoint.clone(),
-                    public_key: RuntimeIdentityMaterial::generate("probe-runtime")
-                        .unwrap()
-                        .public_key,
-                    public_key_fingerprint: String::new(),
-                    created_at: "2026-01-01T00:00:00Z".to_string(),
-                    updated_at: "2026-01-01T00:00:00Z".to_string(),
-                    revoked_at: None,
-                },
-                false,
-            )
-            .await
-            .unwrap();
-        let app = build_inner_router(api);
-
-        let response = post_json(
+        let app = test_app_with_remote_runtime(dir.path(), "probe-runtime", endpoint).await;
+        post_json(
             app,
             &format!("/api/w/{TEST_WORKSPACE_ID}/runtimes/probe-runtime/connection-tests"),
             serde_json::json!({}),
         )
-        .await;
-        assert_eq!(response["state"], "compatible");
-        let capabilities = response["capabilities"].as_array().unwrap();
-        assert!(
-            capabilities
-                .iter()
-                .any(|value| value == "runtime.summary:available")
-        );
-        assert!(
-            capabilities
-                .iter()
-                .any(|value| value == "workers.list:available")
-        );
-        assert!(
-            capabilities
-                .iter()
-                .any(|value| value == "workers.spawn:available")
-        );
-        assert!(
-            response["diagnostics"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|diagnostic| { diagnostic["code"] == "workers.spawn.available" })
-        );
-        let projected = serde_json::to_string(&response).unwrap();
-        assert!(!projected.contains(&endpoint));
-        assert!(!projected.contains(&runtime_addr.to_string()));
-        assert_eq!(response["protocol_version"], serde_json::Value::Null);
+        .await
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn runtime_connection_test_marks_missing_execution_backend_incompatible() {
-        let runtime =
-            worker_runtime::Runtime::with_options(worker_runtime::RuntimeOptions::default());
-        let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let runtime_addr = runtime_listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            serve_runtime_http_with_injected_test_auth(runtime, runtime_listener)
-                .await
-                .unwrap()
-        });
-
-        let dir = tempfile::tempdir().unwrap();
-        let endpoint = format!("http://{runtime_addr}");
-        let api = test_api(dir.path()).await;
-        api.store
-            .upsert_workspace_runtime_binding_record(
-                WorkspaceRuntimeBinding {
-                    workspace_id: TEST_WORKSPACE_ID.to_string(),
-                    runtime_id: "control-only-runtime".to_string(),
-                    display_name: "Control-only Runtime".to_string(),
-                    base_url: endpoint,
-                    public_key: RuntimeIdentityMaterial::generate("control-only-runtime")
-                        .unwrap()
-                        .public_key,
-                    public_key_fingerprint: String::new(),
-                    created_at: "2026-01-01T00:00:00Z".to_string(),
-                    updated_at: "2026-01-01T00:00:00Z".to_string(),
-                    revoked_at: None,
-                },
-                false,
-            )
-            .await
-            .unwrap();
-        let app = build_inner_router(api);
-
-        let response = post_json(
-            app,
-            &format!("/api/w/{TEST_WORKSPACE_ID}/runtimes/control-only-runtime/connection-tests"),
-            serde_json::json!({}),
+    async fn runtime_connection_test_reports_exact_compatible_protocol() {
+        let response = run_runtime_connection_test(
+            serde_json::json!({
+                "runtime_id": "probe-runtime",
+                "protocol_version": RUNTIME_HTTP_PROTOCOL_VERSION,
+            }),
+            StatusCode::OK,
         )
         .await;
-        assert_eq!(response["state"], "incompatible");
-        assert!(
-            response["capabilities"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| { value == "workers.spawn:incompatible" })
+
+        assert_eq!(response["status"], "compatible");
+        assert_eq!(response["failure_kind"], serde_json::Value::Null);
+        assert_eq!(
+            response["expected_protocol_version"],
+            RUNTIME_HTTP_PROTOCOL_VERSION
         );
-        assert!(
-            response["diagnostics"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|diagnostic| {
-                    diagnostic["code"] == "remote_runtime_worker_creation_unavailable"
-                })
+        assert_eq!(
+            response["actual_protocol_version"],
+            RUNTIME_HTTP_PROTOCOL_VERSION
         );
+        assert_eq!(response["diagnostics"], serde_json::json!([]));
+        let projected = serde_json::to_string(&response).unwrap();
+        assert!(!projected.contains("Bearer"));
+        assert!(!projected.contains("public_key"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_connection_test_rejects_newer_protocol() {
+        let newer = RUNTIME_HTTP_PROTOCOL_MAX_VERSION + 1;
+        let response = run_runtime_connection_test(
+            serde_json::json!({
+                "runtime_id": "probe-runtime",
+                "protocol_version": newer,
+            }),
+            StatusCode::OK,
+        )
+        .await;
+
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["failure_kind"], "protocol_version_mismatch");
+        assert_eq!(response["actual_protocol_version"], newer);
+        assert_eq!(
+            response["diagnostics"][0]["code"],
+            "runtime_ping_protocol_newer"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_connection_test_rejects_older_protocol() {
+        let older = RUNTIME_HTTP_PROTOCOL_MIN_VERSION.saturating_sub(1);
+        let response = run_runtime_connection_test(
+            serde_json::json!({
+                "runtime_id": "probe-runtime",
+                "protocol_version": older,
+            }),
+            StatusCode::OK,
+        )
+        .await;
+
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["failure_kind"], "protocol_version_mismatch");
+        assert_eq!(response["actual_protocol_version"], older);
+        assert_eq!(
+            response["diagnostics"][0]["code"],
+            "runtime_ping_protocol_older"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_connection_test_classifies_authentication_failure() {
+        let response = run_runtime_connection_test(
+            serde_json::json!({"error": "credential details must not escape"}),
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["failure_kind"], "authentication");
+        assert_eq!(response["actual_protocol_version"], serde_json::Value::Null);
+        let projected = serde_json::to_string(&response).unwrap();
+        assert!(!projected.contains("credential details"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_connection_test_rejects_malformed_ping_response() {
+        let response = run_runtime_connection_test(
+            serde_json::json!({
+                "runtime_id": "probe-runtime",
+                "protocol_version": "not-a-number",
+                "unexpected": true,
+            }),
+            StatusCode::OK,
+        )
+        .await;
+
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["failure_kind"], "malformed_response");
+        assert_eq!(
+            response["diagnostics"][0]["code"],
+            "runtime_ping_malformed_response"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_connection_test_rejects_runtime_identity_mismatch() {
+        let response = run_runtime_connection_test(
+            serde_json::json!({
+                "runtime_id": "different-runtime",
+                "protocol_version": RUNTIME_HTTP_PROTOCOL_VERSION,
+            }),
+            StatusCode::OK,
+        )
+        .await;
+
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["failure_kind"], "runtime_identity_mismatch");
+        assert_eq!(response["actual_protocol_version"], serde_json::Value::Null);
+        let projected = serde_json::to_string(&response).unwrap();
+        assert!(!projected.contains("different-runtime"));
     }
 
     #[tokio::test]

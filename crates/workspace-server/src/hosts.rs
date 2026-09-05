@@ -9,7 +9,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    error::Error as _,
     future::Future,
+    io::Read as _,
     path::PathBuf,
     pin::Pin,
     sync::{Arc, RwLock},
@@ -38,13 +40,15 @@ use worker_runtime::error::RuntimeError as EmbeddedRuntimeError;
 use worker_runtime::execution::WorkerExecutionRunState;
 use worker_runtime::fs_store::FsRuntimeStoreOptions;
 use worker_runtime::http_server::{
+    RUNTIME_PING_PERMISSION, RUNTIME_WORKSPACE_SCOPE_HEADER,
     RuntimeHttpConfigBundleAvailabilityResponse, RuntimeHttpConfigBundleSyncRequest,
-    RuntimeHttpErrorResponse, RuntimeHttpRepositoryAccessResponse, RuntimeHttpSummaryResponse,
-    RuntimeHttpUploadedFileDeleteResponse, RuntimeHttpUploadedFileResponse,
-    RuntimeHttpWorkerCompletionsRequest, RuntimeHttpWorkerCompletionsResponse,
-    RuntimeHttpWorkerDeleteResponse, RuntimeHttpWorkerInputResponse,
-    RuntimeHttpWorkerLifecycleRequest, RuntimeHttpWorkerLifecycleResponse,
-    RuntimeHttpWorkerResponse, RuntimeHttpWorkerWorkspaceApiRequest, RuntimeHttpWorkersResponse,
+    RuntimeHttpErrorResponse, RuntimeHttpPingResponse, RuntimeHttpRepositoryAccessResponse,
+    RuntimeHttpSummaryResponse, RuntimeHttpUploadedFileDeleteResponse,
+    RuntimeHttpUploadedFileResponse, RuntimeHttpWorkerCompletionsRequest,
+    RuntimeHttpWorkerCompletionsResponse, RuntimeHttpWorkerDeleteResponse,
+    RuntimeHttpWorkerInputResponse, RuntimeHttpWorkerLifecycleRequest,
+    RuntimeHttpWorkerLifecycleResponse, RuntimeHttpWorkerResponse,
+    RuntimeHttpWorkerWorkspaceApiRequest, RuntimeHttpWorkersResponse,
     RuntimeHttpWorkingDirectoriesResponse, RuntimeHttpWorkingDirectoryResponse,
     RuntimeHttpWorkspacePromptProjectionRequest, RuntimeHttpWorkspacePromptProjectionResponse,
 };
@@ -64,6 +68,7 @@ pub const EMBEDDED_RUNTIME_ID: &str = "embedded-worker-runtime";
 const EMBEDDED_HOST_KIND: &str = "embedded-worker-runtime-host";
 const REMOTE_HOST_KIND: &str = "remote-worker-runtime-host";
 const MAX_DIAGNOSTICS: usize = 16;
+const MAX_RUNTIME_PING_RESPONSE_BYTES: usize = 8 * 1024;
 const MAX_HOST_SCAN: usize = 256;
 const MAX_IDENTIFIER_LEN: usize = 120;
 const ID_DIGEST_HEX_LEN: usize = 16;
@@ -760,10 +765,49 @@ fn default_worker_input_kind() -> WorkerInputKind {
     WorkerInputKind::User
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimePingFailureKind {
+    Authentication,
+    Authorization,
+    NetworkUnreachable,
+    Timeout,
+    TlsOrTransport,
+    MalformedResponse,
+    Configuration,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePingFailure {
+    pub kind: RuntimePingFailureKind,
+    pub diagnostic: RuntimeDiagnostic,
+}
+
+impl RuntimePingFailure {
+    fn new(
+        kind: RuntimePingFailureKind,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            diagnostic: diagnostic(code, DiagnosticSeverity::Error, message.into()),
+        }
+    }
+}
+
 pub trait WorkspaceWorkerRuntime: Send + Sync {
     fn runtime_id(&self) -> &str;
 
     fn runtime_summary(&self, limit: usize) -> RuntimeSummary;
+
+    fn ping(&self) -> Result<RuntimeHttpPingResponse, RuntimePingFailure> {
+        Err(RuntimePingFailure::new(
+            RuntimePingFailureKind::Unsupported,
+            "runtime_ping_unsupported",
+            "Runtime connection testing is unavailable for this Runtime provider",
+        ))
+    }
 
     fn list_hosts(&self, limit: usize) -> RuntimeList<HostSummary>;
 
@@ -1809,6 +1853,17 @@ impl RuntimeRegistry {
             .ok_or_else(|| RuntimeRegistryError::UnknownWorker {
                 worker: worker.clone(),
             })
+    }
+
+    pub fn ping(&self, runtime_id: &str) -> Result<RuntimeHttpPingResponse, RuntimePingFailure> {
+        let runtime = self.runtime(runtime_id).map_err(|_| {
+            RuntimePingFailure::new(
+                RuntimePingFailureKind::Configuration,
+                "runtime_ping_registration_unavailable",
+                "Registered Runtime binding is unavailable",
+            )
+        })?;
+        runtime.ping()
     }
 
     fn runtimes_snapshot(&self) -> Vec<Arc<dyn WorkspaceWorkerRuntime>> {
@@ -2927,6 +2982,49 @@ pub struct RemoteWorkerRuntime {
     async_http: AsyncHttpClient,
 }
 
+fn remote_runtime_ping_transport_failure(error: reqwest::Error) -> RuntimePingFailure {
+    if error.is_timeout() {
+        return RuntimePingFailure::new(
+            RuntimePingFailureKind::Timeout,
+            "runtime_ping_timeout",
+            "Runtime ping timed out",
+        );
+    }
+    let mut source = error.source();
+    let mut tls_error = false;
+    while let Some(current) = source {
+        let message = current.to_string().to_ascii_lowercase();
+        if message.contains("tls")
+            || message.contains("certificate")
+            || message.contains("unknownissuer")
+            || message.contains("handshake")
+        {
+            tls_error = true;
+            break;
+        }
+        source = current.source();
+    }
+    if tls_error {
+        return RuntimePingFailure::new(
+            RuntimePingFailureKind::TlsOrTransport,
+            "runtime_ping_tls_failed",
+            "Runtime TLS connection failed",
+        );
+    }
+    if error.is_connect() {
+        return RuntimePingFailure::new(
+            RuntimePingFailureKind::NetworkUnreachable,
+            "runtime_ping_network_unreachable",
+            "Runtime could not be reached",
+        );
+    }
+    RuntimePingFailure::new(
+        RuntimePingFailureKind::TlsOrTransport,
+        "runtime_ping_transport_failed",
+        "Runtime ping transport failed",
+    )
+}
+
 fn all_remote_runtime_permissions() -> Vec<String> {
     [
         "workers:list",
@@ -3075,14 +3173,18 @@ impl RemoteWorkerRuntime {
         self.send_json(path, self.http.delete(self.endpoint(path)))
     }
 
-    fn runtime_capability_token(&self, path: &str) -> Option<String> {
+    fn runtime_capability_token_with_permissions(
+        &self,
+        path: &str,
+        permissions: Vec<String>,
+    ) -> Option<String> {
         let auth = self.auth.as_ref()?;
         let signer = CapabilityTokenSigner::new(&auth.server_id, &auth.server_private_key);
         let claims = capability_claims(
             &auth.server_id,
             &self.runtime_id,
             &self.workspace_id,
-            all_remote_runtime_permissions(),
+            permissions,
             300,
         )
         .map_err(|error| {
@@ -3103,6 +3205,82 @@ impl RemoteWorkerRuntime {
                 error
             })
             .ok()
+    }
+
+    fn runtime_capability_token(&self, path: &str) -> Option<String> {
+        self.runtime_capability_token_with_permissions(path, all_remote_runtime_permissions())
+    }
+
+    fn ping_http(&self) -> Result<RuntimeHttpPingResponse, RuntimePingFailure> {
+        const PATH: &str = "/v1/ping";
+        let workspace_id = self.workspace_id.clone();
+        let bearer_token = self.bearer_token.clone();
+        let capability_token = self.runtime_capability_token_with_permissions(
+            PATH,
+            vec![RUNTIME_PING_PERMISSION.to_string()],
+        );
+        let request = self
+            .http
+            .get(self.endpoint(PATH))
+            .header(RUNTIME_WORKSPACE_SCOPE_HEADER, &workspace_id);
+        run_blocking_http(move || {
+            let request = match capability_token.as_deref().or(bearer_token.as_deref()) {
+                Some(token) => request.header(AUTHORIZATION, format!("Bearer {token}")),
+                None => request,
+            };
+            let response = request
+                .send()
+                .map_err(remote_runtime_ping_transport_failure)?;
+            match response.status() {
+                StatusCode::UNAUTHORIZED => {
+                    return Err(RuntimePingFailure::new(
+                        RuntimePingFailureKind::Authentication,
+                        "runtime_ping_authentication_failed",
+                        "Runtime rejected the connection-test credential",
+                    ));
+                }
+                StatusCode::FORBIDDEN => {
+                    return Err(RuntimePingFailure::new(
+                        RuntimePingFailureKind::Authorization,
+                        "runtime_ping_authorization_failed",
+                        "Runtime rejected the connection-test scope or permission",
+                    ));
+                }
+                status if !status.is_success() => {
+                    return Err(RuntimePingFailure::new(
+                        RuntimePingFailureKind::TlsOrTransport,
+                        "runtime_ping_http_failed",
+                        "Runtime ping returned an unsuccessful HTTP response",
+                    ));
+                }
+                _ => {}
+            }
+            let mut body = Vec::new();
+            response
+                .take((MAX_RUNTIME_PING_RESPONSE_BYTES + 1) as u64)
+                .read_to_end(&mut body)
+                .map_err(|_| {
+                    RuntimePingFailure::new(
+                        RuntimePingFailureKind::TlsOrTransport,
+                        "runtime_ping_response_read_failed",
+                        "Runtime ping response could not be read",
+                    )
+                })?;
+            if body.len() > MAX_RUNTIME_PING_RESPONSE_BYTES {
+                return Err(RuntimePingFailure::new(
+                    RuntimePingFailureKind::MalformedResponse,
+                    "runtime_ping_response_too_large",
+                    "Runtime ping response exceeded the allowed size",
+                ));
+            }
+            serde_json::from_slice::<RuntimeHttpPingResponse>(&body).map_err(|_| {
+                RuntimePingFailure::new(
+                    RuntimePingFailureKind::MalformedResponse,
+                    "runtime_ping_malformed_response",
+                    "Runtime ping returned an unrecognized response",
+                )
+            })
+        })
     }
 
     fn send_json<T>(&self, path: &str, request: RequestBuilder) -> Result<T, RuntimeDiagnostic>
@@ -3290,6 +3468,10 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 diagnostics: vec![diagnostic],
             },
         }
+    }
+
+    fn ping(&self) -> Result<RuntimeHttpPingResponse, RuntimePingFailure> {
+        self.ping_http()
     }
 
     fn list_hosts(&self, limit: usize) -> RuntimeList<HostSummary> {
@@ -4588,7 +4770,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -5789,6 +5971,30 @@ mod tests {
         .unwrap();
 
         assert_eq!(runtime.runtime_id(), "remote:async-init");
+    }
+
+    #[test]
+    fn remote_runtime_ping_classifies_unreachable_without_endpoint_leak() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let runtime = RemoteWorkerRuntime::new(
+            RemoteRuntimeConfig::new(
+                "remote:unreachable",
+                "Remote Unreachable",
+                endpoint.clone(),
+                Some("secret-token".to_string()),
+            ),
+            "workspace-test".to_string(),
+            "http://127.0.0.1:8787".to_string(),
+        )
+        .unwrap();
+
+        let failure = runtime.ping().unwrap_err();
+        assert_eq!(failure.kind, RuntimePingFailureKind::NetworkUnreachable);
+        assert_eq!(failure.diagnostic.code, "runtime_ping_network_unreachable");
+        assert!(!failure.diagnostic.message.contains(&endpoint));
+        assert!(!format!("{failure:?}").contains("secret-token"));
     }
 
     #[test]

@@ -1205,16 +1205,39 @@ pub struct CreateRemoteRuntimeRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeConnectionTestStatus {
+    Compatible,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeConnectionTestFailureKind {
+    Authentication,
+    Authorization,
+    NetworkUnreachable,
+    Timeout,
+    TlsOrTransport,
+    MalformedResponse,
+    ProtocolVersionMismatch,
+    RuntimeIdentityMismatch,
+    Configuration,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConnectionTestResponse {
     pub workspace_id: String,
     pub runtime_id: String,
     pub checked_at: String,
-    pub state: String,
-    pub protocol_version: Option<String>,
-    pub compatibility_basis: String,
-    #[serde(default)]
-    pub capabilities: Vec<String>,
-    pub health_result: String,
+    pub status: RuntimeConnectionTestStatus,
+    pub failure_kind: Option<RuntimeConnectionTestFailureKind>,
+    pub expected_protocol_version: u32,
+    pub actual_protocol_version: Option<u32>,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -2371,6 +2394,9 @@ pub fn catalog_typescript() -> String {
         RepositoryListResponse::decl(&config),
         RepositoryDetailResponse::decl(&config),
         RepositoryLogResponse::decl(&config),
+        RuntimeConnectionTestStatus::decl(&config),
+        RuntimeConnectionTestFailureKind::decl(&config),
+        RuntimeConnectionTestResponse::decl(&config),
     ]
     .map(|declaration| format!("export {declaration}"));
 
@@ -3060,6 +3086,27 @@ mod tests {
         assert!(serde_json::from_value::<RepositoryListResponse>(stale).is_err());
     }
 
+    #[test]
+    fn runtime_connection_test_response_is_closed_and_typed() {
+        let compatible = serde_json::json!({
+            "workspace_id": "workspace-test",
+            "runtime_id": "runtime-test",
+            "checked_at": "2026-09-01T12:00:00Z",
+            "status": "compatible",
+            "failure_kind": null,
+            "expected_protocol_version": 1,
+            "actual_protocol_version": 1,
+            "diagnostics": []
+        });
+        let parsed: RuntimeConnectionTestResponse =
+            serde_json::from_value(compatible.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), compatible);
+
+        let mut unknown = compatible;
+        unknown["capabilities"] = serde_json::json!(["shell"]);
+        assert!(serde_json::from_value::<RuntimeConnectionTestResponse>(unknown).is_err());
+    }
+
     #[cfg(feature = "typescript")]
     #[test]
     fn generated_catalog_typescript_keeps_public_wrappers_and_nullability() {
@@ -3080,6 +3127,9 @@ mod tests {
         assert!(output.contains(
             "export type WorkspaceProfileSourceProvenance = \"project_profile_source_tree\""
         ));
+        assert!(output.contains("export type RuntimeConnectionTestResponse ="));
+        assert!(output.contains("status: RuntimeConnectionTestStatus"));
+        assert!(output.contains("failure_kind: RuntimeConnectionTestFailureKind | null"));
         assert!(!output.contains("repository_key: string, display_name"));
     }
 
