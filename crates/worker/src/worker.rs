@@ -1765,6 +1765,11 @@ impl WorkerSession {
     }
 }
 
+#[async_trait::async_trait]
+pub(crate) trait SystemPromptContributionSource: Send + Sync {
+    async fn load(&self) -> Option<String>;
+}
+
 /// An independent agent execution unit.
 ///
 /// Holds a [`Engine`] directly and persists session state via
@@ -1908,8 +1913,8 @@ pub struct Worker<C: LlmClient, St: Store> {
     prompts: Arc<ArcSwap<PromptCatalog>>,
     /// Test/internal policy gate for installed resident prompt contributions.
     inject_resident_summary: bool,
-    /// Materialized resident prompt context installed by an enabled Feature.
-    feature_resident_summary: Option<String>,
+    /// Deferred resident prompt source installed by an enabled Feature.
+    feature_resident_summary_source: Option<Arc<dyn SystemPromptContributionSource>>,
     /// Complete system prompt replacement installed by an enabled Feature.
     feature_system_prompt_override: Option<String>,
     /// Typed user submissions in submit order. K-th entry corresponds to
@@ -2145,7 +2150,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             runtime_ticket_role: None,
             prompts,
             inject_resident_summary: true,
-            feature_resident_summary: None,
+            feature_resident_summary_source: None,
             feature_system_prompt_override: None,
             user_segments: Vec::new(),
             sink: SegmentLogSink::new(),
@@ -2191,10 +2196,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
 
     pub(crate) fn install_system_prompt_contribution(
         &mut self,
-        resident_summary: Option<String>,
+        resident_summary_source: Option<Arc<dyn SystemPromptContributionSource>>,
         system_prompt_override: Option<String>,
     ) {
-        self.feature_resident_summary = resident_summary;
+        self.feature_resident_summary_source = resident_summary_source;
         self.feature_system_prompt_override = system_prompt_override;
     }
 
@@ -3206,10 +3211,14 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 }
             }
         }
-        let resident_summary = self
-            .inject_resident_summary
-            .then(|| self.feature_resident_summary.clone())
-            .flatten();
+        let resident_summary = if self.inject_resident_summary {
+            match &self.feature_resident_summary_source {
+                Some(source) => source.load().await,
+                None => None,
+            }
+        } else {
+            None
+        };
         let worker_language = worker_language(&self.manifest.engine);
         let scope_snapshot = self.scope.snapshot();
         let cwd_for_prompt = self
@@ -5394,7 +5403,7 @@ where
             runtime_ticket_role: None,
             prompts: common.prompts,
             inject_resident_summary: true,
-            feature_resident_summary: None,
+            feature_resident_summary_source: None,
             feature_system_prompt_override: None,
             user_segments: Vec::new(),
             sink: SegmentLogSink::new(),
@@ -5478,7 +5487,7 @@ where
             runtime_ticket_role: None,
             prompts: common.prompts,
             inject_resident_summary: true,
-            feature_resident_summary: None,
+            feature_resident_summary_source: None,
             feature_system_prompt_override: None,
             user_segments: Vec::new(),
             sink: SegmentLogSink::new(),
@@ -5596,7 +5605,7 @@ where
             runtime_ticket_role: None,
             prompts: common.prompts,
             inject_resident_summary: true,
-            feature_resident_summary: None,
+            feature_resident_summary_source: None,
             feature_system_prompt_override: None,
             user_segments: Vec::new(),
             sink: SegmentLogSink::new(),
@@ -5971,7 +5980,7 @@ where
             runtime_ticket_role: None,
             prompts: common.prompts,
             inject_resident_summary: true,
-            feature_resident_summary: None,
+            feature_resident_summary_source: None,
             feature_system_prompt_override: None,
             user_segments: state.user_segments,
             // Seed the mirror with the entries we just replayed so a
@@ -7344,6 +7353,32 @@ permission = "read"
 #[cfg(test)]
 mod build_summary_prompt_tests {
     use super::*;
+
+    struct TestSystemPromptContributionSource {
+        value: Option<String>,
+        load_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SystemPromptContributionSource for TestSystemPromptContributionSource {
+        async fn load(&self) -> Option<String> {
+            self.load_count.fetch_add(1, Ordering::SeqCst);
+            self.value.clone()
+        }
+    }
+
+    fn test_system_prompt_contribution_source(
+        value: Option<String>,
+    ) -> (Arc<dyn SystemPromptContributionSource>, Arc<AtomicUsize>) {
+        let load_count = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(TestSystemPromptContributionSource {
+                value,
+                load_count: Arc::clone(&load_count),
+            }),
+            load_count,
+        )
+    }
 
     fn test_summary_input(items: &[Item]) -> String {
         build_summary_input(
@@ -8802,6 +8837,32 @@ mod build_summary_prompt_tests {
     }
 
     #[tokio::test]
+    async fn worker_without_initial_system_prompt_does_not_load_feature_contribution() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store,
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone()),
+            Scope::writable(&cwd).unwrap(),
+        )
+        .await
+        .unwrap();
+        let (source, load_count) =
+            test_system_prompt_contribution_source(Some("# Durable Memory".to_string()));
+        worker.install_system_prompt_contribution(Some(source), None);
+
+        worker.ensure_system_prompt_materialized().await.unwrap();
+
+        assert_eq!(load_count.load(Ordering::SeqCst), 0);
+        assert!(worker.history().is_empty());
+    }
+
+    #[tokio::test]
     async fn memory_consolidation_prompt_uses_bound_workspace_language() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("workspace");
@@ -8899,16 +8960,17 @@ mod build_summary_prompt_tests {
         .await
         .unwrap();
         worker.set_resident_memory_injection(gates.summary);
-        let resident_summary = if memory_config
+        let resident_summary_source = if memory_config
             .as_ref()
             .is_some_and(|cfg| cfg.profile.resident.inject_summary)
             && gates.summary
         {
-            summary_doc.and_then(summary_content_for_backend)
+            let summary = summary_doc.and_then(summary_content_for_backend);
+            Some(test_system_prompt_contribution_source(summary).0)
         } else {
             None
         };
-        worker.install_system_prompt_contribution(resident_summary, None);
+        worker.install_system_prompt_contribution(resident_summary_source, None);
         let template = SystemPromptTemplate::parse(
             "default",
             crate::prompt::source::PromptCatalogSource::builtins_only(),

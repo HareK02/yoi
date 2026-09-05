@@ -101,7 +101,6 @@ fn main_config_contract_with_schema(
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
-#[ts(export)]
 pub struct WorkspaceConfigState {
     pub snapshot: ConfigTreeSnapshot,
     pub contract: ToolchainContract,
@@ -118,7 +117,6 @@ pub struct EvaluatedConfigCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
-#[ts(export)]
 pub struct ConfigCommitRequest {
     #[ts(type = "number")]
     pub base_revision: u64,

@@ -567,7 +567,7 @@ Deno.test("Worker Console composer keeps a compact bounded chip editor", async (
   );
   assert(
     consolePage.includes("<ComposerInput") &&
-      consolePage.includes('<div class="composer-input-shell">') &&
+      consolePage.includes('class="composer-input-shell"') &&
       !consolePage.includes("handleComposerShellClick") &&
       consolePage.includes("bind:this={composerInputElement}") &&
       consolePage.includes("onchange={handleComposerChange}") &&
@@ -616,7 +616,7 @@ Deno.test("Worker Console paste chips preserve typed draft and target authority"
       consolePage.includes("if (!composerEditable) return") &&
       composerInput.includes('chip.setAttribute("aria-label", label)') &&
       composerInput.includes("preserveExactText = false") &&
-      consolePage.includes("buildComposerSegmentsRequest(value.segments, {") &&
+      consolePage.includes("const command = buildComposerSegmentsRequest(") &&
       consolePage.includes("preserveExactText: value.textPastes.length > 0") &&
       consolePage.includes("composerDrafts.set(activeComposerTargetKey") &&
       consolePage.includes("switchComposerTarget(target)") &&

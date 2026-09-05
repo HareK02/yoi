@@ -1020,11 +1020,10 @@ where
         worker.manifest(),
         worker.workspace_client_handle(),
         worker.prompts().load_full(),
-    )
-    .await?;
+    )?;
     let memory_prompt_contribution = memory_install_plan.as_ref().map(|plan| {
         (
-            plan.resident_summary.clone(),
+            plan.resident_summary_source.clone(),
             plan.system_prompt_override.clone(),
         )
     });
