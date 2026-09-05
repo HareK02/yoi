@@ -14533,7 +14533,7 @@ fn validate_public_runtime_id(runtime_id: &str) -> ApiResult<()> {
 
 #[cfg(test)]
 fn remote_runtime_config_from_binding(
-    binding: &WorkspaceRuntimeBinding,
+    binding: &crate::store::WorkspaceRuntimeBinding,
 ) -> std::result::Result<RemoteRuntimeConfig, RuntimeDiagnostic> {
     let remote = RemoteRuntimeConfig::new(
         binding.runtime_id.clone(),
