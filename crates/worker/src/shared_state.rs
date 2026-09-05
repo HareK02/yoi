@@ -1,6 +1,6 @@
 use std::sync::{
     OnceLock, RwLock,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 
 use protocol::{
@@ -23,7 +23,6 @@ pub struct WorkerSharedState {
     pub manifest_toml: String,
     pub greeting: protocol::Greeting,
     state: RwLock<WorkerStateSnapshot>,
-    last_command_id: AtomicU64,
     /// Worker-from-the-inside view of the filesystem. Set once in
     /// `WorkerController::start` after the local WorkdirSession provider is
     /// materialised, and read from the IPC server layer to answer
@@ -56,7 +55,6 @@ impl WorkerSharedState {
             manifest_toml,
             greeting,
             state: RwLock::new(WorkerStateSnapshot::initial(execution_generation)),
-            last_command_id: AtomicU64::new(0),
             fs_view: OnceLock::new(),
             flow_transition_enabled: AtomicBool::new(false),
         }
@@ -91,26 +89,27 @@ impl WorkerSharedState {
             snapshot.revision = snapshot.revision.saturating_add(1);
             snapshot.state = state;
         }
-        snapshot.last_command_id = self.last_command_id.load(Ordering::Acquire);
         snapshot.clone()
     }
 
     pub fn accept_command_id(&self, command_id: u64) -> bool {
-        self.last_command_id
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (command_id > current).then_some(command_id)
-            })
-            .is_ok()
+        let mut snapshot = self
+            .state
+            .write()
+            .expect("worker state lock poisoned; refusing command admission");
+        if command_id <= snapshot.last_command_id {
+            return false;
+        }
+        snapshot.last_command_id = command_id;
+        snapshot.revision = snapshot.revision.saturating_add(1);
+        true
     }
 
     pub fn snapshot(&self) -> WorkerStateSnapshot {
-        let mut snapshot = self
-            .state
+        self.state
             .read()
             .expect("worker state lock poisoned; refusing an inferred fallback state")
-            .clone();
-        snapshot.last_command_id = self.last_command_id.load(Ordering::Acquire);
-        snapshot
+            .clone()
     }
 
     /// Runtime catalog projection. This must not be used as live command
@@ -188,6 +187,23 @@ mod tests {
         assert_eq!(snapshot.revision, 2);
         assert_eq!(snapshot.state, paused);
         assert_eq!(state.catalog_status(), WorkerStatus::Paused);
+    }
+
+    #[test]
+    fn accepted_command_id_advances_the_snapshot_revision_atomically() {
+        let state = test_state();
+        assert!(state.accept_command_id(9));
+        assert_eq!(
+            state.snapshot(),
+            WorkerStateSnapshot {
+                execution_generation: 7,
+                revision: 1,
+                last_command_id: 9,
+                state: WorkerState::Idle,
+            }
+        );
+        assert!(!state.accept_command_id(9));
+        assert_eq!(state.snapshot().revision, 1);
     }
 
     #[test]

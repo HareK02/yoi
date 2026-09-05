@@ -218,6 +218,66 @@ Deno.test("console routing projects live errors but not completion replies", () 
   );
 });
 
+Deno.test("Worker state events and acknowledgements apply monotonically", () => {
+  const projector = createConsoleProjector();
+  const running: WorkerStateSnapshot = {
+    execution_generation: 4,
+    revision: 3,
+    last_command_id: 2,
+    state: { kind: "busy", state: { kind: "run", state: "running" } },
+  };
+  const paused: WorkerStateSnapshot = {
+    ...running,
+    revision: 4,
+    last_command_id: 3,
+    state: { kind: "busy", state: { kind: "run", state: "paused" } },
+  };
+  let projection = projector.append([
+    {
+      eventId: "running",
+      event: { event: "worker_state", data: { snapshot: running } },
+    },
+    {
+      eventId: "stale",
+      event: {
+        event: "worker_state",
+        data: { snapshot: { ...running, revision: 2, state: { kind: "idle" } } },
+      },
+    },
+    {
+      eventId: "pause-ack",
+      event: {
+        event: "command_acknowledged",
+        data: {
+          acknowledgement: {
+            command_id: 3,
+            command: "pause",
+            disposition: "accepted",
+            state: paused,
+          },
+        },
+      },
+    },
+  ]);
+  assertEquals(projection.workerState, paused);
+  assertEquals(projection.status, "paused");
+
+  projection = projector.append([{
+    eventId: "conflict",
+    event: {
+      event: "worker_state",
+      data: { snapshot: { ...paused, state: { kind: "idle" } } },
+    },
+  }]);
+  assertEquals(projection.workerState, paused);
+  assert(
+    projection.lines.some((line) =>
+      line.eventId === "conflict:worker-state-conflict" && line.error
+    ),
+    "conflicting equal-version snapshots must fail closed",
+  );
+});
+
 Deno.test("snapshot replaces a live error with one durable run_errored row", () => {
   const projector = createConsoleProjector();
   let projection = projector.append([

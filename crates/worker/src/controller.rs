@@ -3708,7 +3708,7 @@ mod tests {
                 WorkerCommandEnvelope {
                     command_id: 1,
                     expected_execution_generation: 9,
-                    expected_worker_state_revision: 0,
+                    expected_worker_state_revision: 1,
                 },
                 &shared,
             ),
@@ -3719,7 +3719,7 @@ mod tests {
                 WorkerCommandEnvelope {
                     command_id: 2,
                     expected_execution_generation: 9,
-                    expected_worker_state_revision: 0,
+                    expected_worker_state_revision: 1,
                 },
                 &shared,
             )

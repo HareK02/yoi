@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::time::Duration;
 
@@ -38,7 +38,9 @@ use crate::working_directory::{
     WorkingDirectoryBinding, WorkingDirectoryDiagnostic, WorkingDirectoryMaterializer,
 };
 use async_trait::async_trait;
-use protocol::{Event, Method, Segment, WorkerCommandEnvelope, WorkerStatus};
+#[cfg(test)]
+use protocol::WorkerStatus;
+use protocol::{Event, Method, Segment, WorkerCommandEnvelope};
 
 static NEXT_INTERNAL_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1197,7 +1199,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
 struct RuntimeWorkerExecution {
     handle: WorkerHandle,
     shutdown: Arc<tokio::sync::Mutex<Option<worker::ShutdownReceiver>>>,
-    busy: Arc<AtomicBool>,
     worker_state: Arc<RwLock<protocol::WorkerStateSnapshot>>,
     workspace_client: Option<Arc<dyn WorkspaceClient>>,
 }
@@ -1296,7 +1297,6 @@ where
     ) -> Result<
         (
             WorkerHandle,
-            Arc<AtomicBool>,
             Arc<RwLock<protocol::WorkerStateSnapshot>>,
             Option<Arc<dyn WorkspaceClient>>,
         ),
@@ -1323,7 +1323,6 @@ where
             .map(|execution| {
                 (
                     execution.handle.clone(),
-                    execution.busy.clone(),
                     execution.worker_state.clone(),
                     execution.workspace_client.clone(),
                 )
@@ -1434,48 +1433,31 @@ where
         working_directory: Option<WorkingDirectoryBinding>,
         workspace_client: Option<Arc<dyn WorkspaceClient>>,
     ) -> WorkerExecutionSpawnResult {
-        let busy = Arc::new(AtomicBool::new(false));
         let worker_state = Arc::new(RwLock::new(handle.shared_state.snapshot()));
         #[cfg(feature = "ws-server")]
         {
             let streams = subscribe_worker_protocol_session(&handle);
             let mut events = streams.events;
             let mut entry_events = streams.log_entries;
-            let bridge_busy = busy.clone();
             let bridge_worker_state = worker_state.clone();
             if let Err(message) = self.spawn_on_adapter_runtime(async move {
                 loop {
                     tokio::select! {
                         event = events.recv() => {
                             match event {
-                                Ok(event) => {
-                                    let next_state = match &event {
-                                        Event::WorkerState { snapshot }
-                                        | Event::Snapshot { state: snapshot, .. } => {
-                                            Some(snapshot.clone())
+                                Ok(mut event) => {
+                                    match apply_protocol_worker_state(&bridge_worker_state, &mut event) {
+                                        Ok(true) => {
+                                            let _ = bridge_context.publish_protocol_event(event);
                                         }
-                                        Event::CommandAcknowledged { acknowledgement } => {
-                                            Some(acknowledgement.state.clone())
+                                        Ok(false) => {}
+                                        Err(message) => {
+                                            let _ = bridge_context.publish_protocol_event(Event::Error {
+                                                code: protocol::ErrorCode::Internal,
+                                                message: format!("worker state stream rejected: {message}"),
+                                            });
+                                            break;
                                         }
-                                        _ => None,
-                                    };
-                                    let next_busy = next_state
-                                        .as_ref()
-                                        .map(worker_state_is_executing)
-                                        .or_else(|| matches!(event, Event::Shutdown).then_some(false));
-                                    let _ = bridge_context.publish_protocol_event(event);
-                                    if let Some(next_state) = next_state {
-                                        if let Ok(mut current) = bridge_worker_state.write() {
-                                            if next_state.execution_generation > current.execution_generation
-                                                || (next_state.execution_generation == current.execution_generation
-                                                    && next_state.revision >= current.revision)
-                                            {
-                                                *current = next_state;
-                                            }
-                                        }
-                                    }
-                                    if let Some(next_busy) = next_busy {
-                                        bridge_busy.store(next_busy, Ordering::SeqCst);
                                     }
                                 }
                                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -1520,7 +1502,6 @@ where
             RuntimeWorkerExecution {
                 handle,
                 shutdown,
-                busy,
                 worker_state,
                 workspace_client,
             },
@@ -1543,32 +1524,28 @@ impl<F> Drop for WorkerRuntimeExecutionBackend<F> {
     }
 }
 
-fn worker_state_is_executing(snapshot: &protocol::WorkerStateSnapshot) -> bool {
-    matches!(
-        snapshot.state,
-        protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
-            protocol::WorkerRunState::Running
-                | protocol::WorkerRunState::Pausing
-                | protocol::WorkerRunState::Cancelling
-        )) | protocol::WorkerState::Busy(protocol::WorkerBusyState::Maintenance(_))
-    )
-}
-
-fn method_starts_turn(method: &Method) -> bool {
-    matches!(
-        method,
-        Method::Submit { .. }
-            | Method::SubmitTracked { .. }
-            | Method::Notify { auto_run: true, .. }
-            | Method::NotifyTracked { auto_run: true, .. }
-            | Method::Resume { .. }
-    )
-}
-
-fn method_can_start_turn_from_status(method: &Method, status: WorkerStatus) -> bool {
-    match method {
-        Method::Resume { .. } => matches!(status, WorkerStatus::Idle | WorkerStatus::Paused),
-        _ => status == WorkerStatus::Idle,
+fn apply_protocol_worker_state(
+    current: &Arc<RwLock<protocol::WorkerStateSnapshot>>,
+    event: &mut Event,
+) -> Result<bool, String> {
+    let (incoming, replace_stale) = match event {
+        Event::WorkerState { snapshot } => (snapshot, false),
+        Event::Snapshot { state, .. } => (state, true),
+        Event::CommandAcknowledged { acknowledgement } => (&mut acknowledgement.state, true),
+        _ => return Ok(true),
+    };
+    let mut current = current
+        .write()
+        .map_err(|_| "worker state projection lock is poisoned".to_string())?;
+    match protocol::apply_worker_state_snapshot(&mut current, incoming) {
+        Ok(protocol::WorkerStateSnapshotApply::Applied)
+        | Ok(protocol::WorkerStateSnapshotApply::Duplicate) => Ok(true),
+        Ok(protocol::WorkerStateSnapshotApply::Stale) if replace_stale => {
+            *incoming = current.clone();
+            Ok(true)
+        }
+        Ok(protocol::WorkerStateSnapshotApply::Stale) => Ok(false),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -1897,7 +1874,7 @@ where
         handle: &WorkerExecutionHandle,
         input: WorkerInput,
     ) -> WorkerExecutionResult {
-        let (worker, busy, worker_state, _workspace_client) = match self.get_execution(handle) {
+        let (worker, worker_state, _workspace_client) = match self.get_execution(handle) {
             Ok(execution) => execution,
             Err(mut result) => {
                 result.operation = WorkerExecutionOperation::Input;
@@ -1906,15 +1883,10 @@ where
         };
 
         if input.kind == WorkerInputKind::Notify {
-            let status = worker.shared_state.catalog_status();
-            let claimed_here = status == WorkerStatus::Idle
-                && busy
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok();
             let notification_request_id = input
                 .submission_request_id
                 .unwrap_or_else(protocol::new_submission_request_id);
-            let result = self.send_method(
+            return self.send_method(
                 WorkerExecutionOperation::Input,
                 worker,
                 Method::NotifyTracked {
@@ -1926,11 +1898,6 @@ where
                     },
                 },
             );
-            if claimed_here && result.outcome != crate::execution::WorkerExecutionOutcome::Accepted
-            {
-                busy.store(false, Ordering::SeqCst);
-            }
-            return result;
         }
 
         if input.kind == WorkerInputKind::Compact {
@@ -1947,26 +1914,12 @@ where
             );
         }
 
-        let is_user_submit = input.kind == WorkerInputKind::User;
-        let status = worker.shared_state.catalog_status();
-        let claimed_here = status == WorkerStatus::Idle
-            && busy
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok();
-        if !is_user_submit && !claimed_here {
-            return WorkerExecutionResult::busy(
-                WorkerExecutionOperation::Input,
-                "Worker is already running",
-            );
-        }
-
         let (method, submission_request_id) = match input.kind {
             WorkerInputKind::User => {
                 let Some(submission_id) = input
                     .submission_request_id
                     .filter(|submission_id| !submission_id.trim().is_empty())
                 else {
-                    busy.store(false, Ordering::SeqCst);
                     return WorkerExecutionResult::rejected(
                         WorkerExecutionOperation::Input,
                         "Runtime user input is missing its internal submission id",
@@ -1986,7 +1939,7 @@ where
                 )
             }
             WorkerInputKind::Notify => {
-                unreachable!("Notify input is dispatched before the turn-start busy guard")
+                unreachable!("Notify input is dispatched before ordinary input mapping")
             }
             WorkerInputKind::Compact => unreachable!("compact input is dispatched above"),
             WorkerInputKind::ListRewindTargets => (Method::ListRewindTargets, None),
@@ -1999,7 +1952,7 @@ where
         };
         let waits_for_submission_acceptance = submission_request_id.is_some();
 
-        let result = if waits_for_submission_acceptance {
+        if waits_for_submission_acceptance {
             self.send_submit_and_wait_for_acceptance(
                 WorkerExecutionOperation::Input,
                 worker,
@@ -2008,11 +1961,7 @@ where
             )
         } else {
             self.send_method(WorkerExecutionOperation::Input, worker, method)
-        };
-        if claimed_here && result.outcome != crate::execution::WorkerExecutionOutcome::Accepted {
-            busy.store(false, Ordering::SeqCst);
         }
-        result
     }
 
     fn upload_file(
@@ -2023,7 +1972,7 @@ where
         content: &[u8],
         context: Option<&session_store::UploadedFileUploadContext>,
     ) -> Result<protocol::UploadedFileRef, WorkerExecutionResult> {
-        let (worker, _, _, _) = self.get_execution(handle).map_err(|mut result| {
+        let (worker, _, _) = self.get_execution(handle).map_err(|mut result| {
             result.operation = WorkerExecutionOperation::UploadFile;
             result
         })?;
@@ -2046,7 +1995,7 @@ where
         handle: &WorkerExecutionHandle,
         artifact_id: &str,
     ) -> WorkerExecutionResult {
-        let (worker, _, _, _) = match self.get_execution(handle) {
+        let (worker, _, _) = match self.get_execution(handle) {
             Ok(execution) => execution,
             Err(mut result) => {
                 result.operation = WorkerExecutionOperation::DeleteUploadedFile;
@@ -2067,7 +2016,7 @@ where
         handle: &WorkerExecutionHandle,
         method: Method,
     ) -> WorkerExecutionResult {
-        let (worker, busy, _worker_state, _workspace_client) = match self.get_execution(handle) {
+        let (worker, _worker_state, _workspace_client) = match self.get_execution(handle) {
             Ok(execution) => execution,
             Err(mut result) => {
                 result.operation = WorkerExecutionOperation::ProtocolMethod;
@@ -2075,44 +2024,7 @@ where
             }
         };
 
-        if let Some(auto_run) = match &method {
-            Method::Notify { auto_run, .. } | Method::NotifyTracked { auto_run, .. } => {
-                Some(*auto_run)
-            }
-            _ => None,
-        } {
-            let status = worker.shared_state.catalog_status();
-            let claimed_here = status == WorkerStatus::Idle
-                && auto_run
-                && busy
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok();
-            let result = self.send_method(WorkerExecutionOperation::ProtocolMethod, worker, method);
-            if claimed_here && result.outcome != crate::execution::WorkerExecutionOutcome::Accepted
-            {
-                busy.store(false, Ordering::SeqCst);
-            }
-            return result;
-        }
-
-        let starts_turn = method_starts_turn(&method);
-        if starts_turn
-            && (!method_can_start_turn_from_status(&method, worker.shared_state.catalog_status())
-                || busy
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_err())
-        {
-            return WorkerExecutionResult::busy(
-                WorkerExecutionOperation::ProtocolMethod,
-                "Worker is already running; runtime adapter v0 does not queue protocol methods",
-            );
-        }
-
-        let result = self.send_method(WorkerExecutionOperation::ProtocolMethod, worker, method);
-        if starts_turn && result.outcome != crate::execution::WorkerExecutionOutcome::Accepted {
-            busy.store(false, Ordering::SeqCst);
-        }
-        result
+        self.send_method(WorkerExecutionOperation::ProtocolMethod, worker, method)
     }
 
     fn stop_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
@@ -2193,7 +2105,7 @@ where
     }
 
     fn cancel_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
-        let (worker, _busy, worker_state, _workspace_client) = match self.get_execution(handle) {
+        let (worker, worker_state, _workspace_client) = match self.get_execution(handle) {
             Ok(execution) => execution,
             Err(mut result) => {
                 result.operation = WorkerExecutionOperation::Cancel;
@@ -2295,6 +2207,56 @@ mod tests {
             .unwrap()
             .clone();
         WorkerCommandEnvelope::for_snapshot(state.last_command_id.saturating_add(1), &state)
+    }
+
+    #[test]
+    fn protocol_bridge_applies_state_and_acknowledgement_monotonically() {
+        let running = protocol::WorkerStateSnapshot {
+            execution_generation: 4,
+            revision: 3,
+            state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                protocol::WorkerRunState::Running,
+            )),
+            last_command_id: 2,
+        };
+        let current = Arc::new(RwLock::new(running.clone()));
+        let mut stale = Event::WorkerState {
+            snapshot: protocol::WorkerStateSnapshot {
+                revision: 2,
+                state: protocol::WorkerState::Idle,
+                ..running.clone()
+            },
+        };
+        assert!(!apply_protocol_worker_state(&current, &mut stale).unwrap());
+        assert_eq!(*current.read().unwrap(), running);
+
+        let paused = protocol::WorkerStateSnapshot {
+            revision: 4,
+            state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                protocol::WorkerRunState::Paused,
+            )),
+            last_command_id: 3,
+            ..running.clone()
+        };
+        let mut acknowledgement = Event::CommandAcknowledged {
+            acknowledgement: protocol::WorkerCommandAcknowledgement {
+                command_id: 3,
+                command: protocol::WorkerCommandKind::Pause,
+                disposition: protocol::WorkerCommandDisposition::Accepted,
+                state: paused.clone(),
+            },
+        };
+        assert!(apply_protocol_worker_state(&current, &mut acknowledgement).unwrap());
+        assert_eq!(*current.read().unwrap(), paused);
+
+        let mut conflict = Event::WorkerState {
+            snapshot: protocol::WorkerStateSnapshot {
+                state: protocol::WorkerState::Idle,
+                ..paused.clone()
+            },
+        };
+        assert!(apply_protocol_worker_state(&current, &mut conflict).is_err());
+        assert_eq!(*current.read().unwrap(), paused);
     }
 
     #[test]
@@ -2441,44 +2403,6 @@ mod tests {
         );
         assert_eq!(after_restore_kind, "runtime-owned-workspace-client");
         assert_eq!(after_restore_workspace_id.as_deref(), Some("workspace-a"));
-    }
-
-    #[test]
-    fn compact_is_maintenance_not_a_turn_start() {
-        assert!(!method_starts_turn(&Method::Compact {
-            command: test_command(),
-        }));
-        assert!(method_starts_turn(&Method::Resume {
-            command: test_command(),
-        }));
-    }
-
-    #[test]
-    fn resume_turn_claim_accepts_paused_and_idle_but_not_running_status() {
-        assert!(method_can_start_turn_from_status(
-            &Method::Resume {
-                command: test_command()
-            },
-            WorkerStatus::Paused
-        ));
-        assert!(method_can_start_turn_from_status(
-            &Method::Resume {
-                command: test_command()
-            },
-            WorkerStatus::Idle
-        ));
-        assert!(!method_can_start_turn_from_status(
-            &Method::Resume {
-                command: test_command()
-            },
-            WorkerStatus::Running
-        ));
-        assert!(!method_can_start_turn_from_status(
-            &Method::Compact {
-                command: test_command()
-            },
-            WorkerStatus::Paused
-        ));
     }
 
     #[derive(Clone)]
@@ -2681,11 +2605,38 @@ mod tests {
             .collect()
     }
 
+    fn wait_for_adapter_command(
+        backend: &WorkerRuntimeExecutionBackend<MockFactory>,
+        worker_ref: &WorkerRef,
+        expected_command_id: u64,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let observed = {
+                let workers = backend.workers.lock().unwrap();
+                workers
+                    .get(worker_ref)
+                    .expect("live Worker execution")
+                    .worker_state
+                    .read()
+                    .unwrap()
+                    .last_command_id
+            };
+            if observed >= expected_command_id {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for adapter command {expected_command_id}; last observed={observed}",
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn wait_for_adapter_state(
         backend: &WorkerRuntimeExecutionBackend<MockFactory>,
         worker_ref: &WorkerRef,
         expected_status: WorkerStatus,
-        expected_busy: bool,
     ) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -2693,21 +2644,16 @@ mod tests {
                 let workers = backend.workers.lock().unwrap();
                 let execution = workers.get(worker_ref).expect("live Worker execution");
                 let projected = execution.worker_state.read().unwrap().catalog_status();
-                (
-                    execution.handle.shared_state.catalog_status(),
-                    projected,
-                    execution.busy.load(Ordering::SeqCst),
-                )
+                (execution.handle.shared_state.catalog_status(), projected)
             };
-            if observed == (expected_status, expected_status, expected_busy) {
+            if observed == (expected_status, expected_status) {
                 return;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "timed out waiting for adapter state {expected_status:?}, busy={expected_busy}; last observed controller={:?}, projected={:?}, busy={}",
+                "timed out waiting for adapter state {expected_status:?}; last observed controller={:?}, projected={:?}",
                 observed.0,
                 observed.1,
-                observed.2,
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -3694,22 +3640,18 @@ mod tests {
         runtime
             .send_input(&detail.worker_ref, WorkerInput::user("pause and resume"))
             .expect("start initial turn");
-        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Running, true);
+        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Running);
 
-        let running_resume = runtime
+        let running_resume = adapter_command(&backend, &detail.worker_ref);
+        runtime
             .send_protocol_method(
                 &detail.worker_ref,
                 Method::Resume {
-                    command: adapter_command(&backend, &detail.worker_ref),
+                    command: running_resume,
                 },
             )
-            .expect_err("Resume while Running must be rejected");
-        assert!(
-            running_resume
-                .to_string()
-                .contains("does not queue protocol methods"),
-            "unexpected Running Resume error: {running_resume}"
-        );
+            .expect("running Resume is forwarded for controller admission");
+        wait_for_adapter_command(&backend, &detail.worker_ref, running_resume.command_id);
 
         runtime
             .send_protocol_method(
@@ -3719,7 +3661,7 @@ mod tests {
                 },
             )
             .expect("pause initial turn");
-        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Paused, false);
+        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Paused);
 
         runtime
             .send_protocol_method(
@@ -3729,22 +3671,18 @@ mod tests {
                 },
             )
             .expect("resume paused turn");
-        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Running, true);
+        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Running);
 
-        let duplicate_resume = runtime
+        let duplicate_resume = adapter_command(&backend, &detail.worker_ref);
+        runtime
             .send_protocol_method(
                 &detail.worker_ref,
                 Method::Resume {
-                    command: adapter_command(&backend, &detail.worker_ref),
+                    command: duplicate_resume,
                 },
             )
-            .expect_err("duplicate Resume must be rejected");
-        assert!(
-            duplicate_resume
-                .to_string()
-                .contains("does not queue protocol methods"),
-            "unexpected duplicate Resume error: {duplicate_resume}"
-        );
+            .expect("duplicate Resume is forwarded for controller admission");
+        wait_for_adapter_command(&backend, &detail.worker_ref, duplicate_resume.command_id);
 
         runtime
             .send_protocol_method(
@@ -3754,7 +3692,7 @@ mod tests {
                 },
             )
             .expect("pause resumed turn");
-        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Paused, false);
+        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Paused);
         runtime
             .send_protocol_method(
                 &detail.worker_ref,
@@ -3763,18 +3701,20 @@ mod tests {
                 },
             )
             .expect("resume paused turn a second time");
-        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Idle, false);
+        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Idle);
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
 
+        let idle_resume = adapter_command(&backend, &detail.worker_ref);
         runtime
             .send_protocol_method(
                 &detail.worker_ref,
                 Method::Resume {
-                    command: adapter_command(&backend, &detail.worker_ref),
+                    command: idle_resume,
                 },
             )
             .expect("Idle Resume preserves controller NotPaused semantics");
-        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Idle, false);
+        wait_for_adapter_command(&backend, &detail.worker_ref, idle_resume.command_id);
+        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Idle);
         let events = runtime
             .read_worker_observation_events(&detail.worker_ref, WorkerObservationCursor::zero())
             .expect("read protocol events");

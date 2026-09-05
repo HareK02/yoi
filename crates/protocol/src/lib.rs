@@ -203,6 +203,53 @@ impl WorkerStateSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerStateSnapshotApply {
+    Applied,
+    Duplicate,
+    Stale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerStateSnapshotConflict {
+    pub execution_generation: u64,
+    pub revision: u64,
+}
+
+impl std::fmt::Display for WorkerStateSnapshotConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "conflicting worker state snapshots at generation {} revision {}",
+            self.execution_generation, self.revision
+        )
+    }
+}
+
+impl std::error::Error for WorkerStateSnapshotConflict {}
+
+pub fn apply_worker_state_snapshot(
+    current: &mut WorkerStateSnapshot,
+    incoming: &WorkerStateSnapshot,
+) -> Result<WorkerStateSnapshotApply, WorkerStateSnapshotConflict> {
+    use std::cmp::Ordering;
+
+    let ordering = (incoming.execution_generation, incoming.revision)
+        .cmp(&(current.execution_generation, current.revision));
+    match ordering {
+        Ordering::Greater => {
+            *current = incoming.clone();
+            Ok(WorkerStateSnapshotApply::Applied)
+        }
+        Ordering::Less => Ok(WorkerStateSnapshotApply::Stale),
+        Ordering::Equal if incoming == current => Ok(WorkerStateSnapshotApply::Duplicate),
+        Ordering::Equal => Err(WorkerStateSnapshotConflict {
+            execution_generation: incoming.execution_generation,
+            revision: incoming.revision,
+        }),
+    }
+}
+
 impl From<WorkerStatus> for WorkerStateSnapshot {
     fn from(status: WorkerStatus) -> Self {
         let state = match status {
@@ -1573,6 +1620,58 @@ pub enum Permission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_state_snapshot_apply_is_monotonic_and_detects_conflicts() {
+        let mut current = WorkerStateSnapshot::initial(4);
+        let mut newer = current.clone();
+        newer.revision = 1;
+        newer.state = WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running));
+
+        assert_eq!(
+            apply_worker_state_snapshot(&mut current, &newer),
+            Ok(WorkerStateSnapshotApply::Applied)
+        );
+        assert_eq!(
+            apply_worker_state_snapshot(&mut current, &newer),
+            Ok(WorkerStateSnapshotApply::Duplicate)
+        );
+
+        let stale_revision = WorkerStateSnapshot::initial(4);
+        assert_eq!(
+            apply_worker_state_snapshot(&mut current, &stale_revision),
+            Ok(WorkerStateSnapshotApply::Stale)
+        );
+        let stale_generation = WorkerStateSnapshot {
+            execution_generation: 3,
+            revision: u64::MAX,
+            ..newer.clone()
+        };
+        assert_eq!(
+            apply_worker_state_snapshot(&mut current, &stale_generation),
+            Ok(WorkerStateSnapshotApply::Stale)
+        );
+
+        let conflicting = WorkerStateSnapshot {
+            state: WorkerState::Idle,
+            ..newer.clone()
+        };
+        assert_eq!(
+            apply_worker_state_snapshot(&mut current, &conflicting),
+            Err(WorkerStateSnapshotConflict {
+                execution_generation: 4,
+                revision: 1,
+            })
+        );
+        assert_eq!(current, newer);
+
+        let next_generation = WorkerStateSnapshot::initial(5);
+        assert_eq!(
+            apply_worker_state_snapshot(&mut current, &next_generation),
+            Ok(WorkerStateSnapshotApply::Applied)
+        );
+        assert_eq!(current, next_generation);
+    }
 
     #[test]
     fn method_submit_json_roundtrip_and_run_is_rejected() {
