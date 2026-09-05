@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Instant;
 
@@ -23,7 +23,7 @@ use protocol::{Event, InternalWorkerKind, InternalWorkerRef, InternalWorkerSnaps
 use session_store::{
     LoggedItem, WorkerMetadataStore, WorkerReclaimedChild, WorkerSpawnedChild, WorkerStoreError,
 };
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 use tracing::warn;
 use workdir::WorkdirScopeLease;
 
@@ -238,39 +238,56 @@ pub(crate) struct InternalSpawnReservation {
 }
 
 impl InternalSpawnReservation {
-    pub(crate) fn commit(
-        mut self,
-        record: InternalSpawnedWorkerRecord,
-    ) -> Result<(), (io::Error, InternalSpawnedWorkerRecord)> {
-        if record.worker_name != self.worker_name {
-            return Err((
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "internal SubWorker reservation name does not match record name",
-                ),
-                record,
-            ));
-        }
-        let mut records = match self.registry.internal_records.lock() {
-            Ok(records) => records,
-            Err(_) => {
-                return Err((
-                    io::Error::other("internal spawned-worker registry lock poisoned"),
-                    record,
-                ));
+    pub(crate) async fn commit(mut self, record: InternalSpawnedWorkerRecord) -> io::Result<()> {
+        let rejection = if record.worker_name != self.worker_name {
+            Some(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "internal SubWorker reservation name does not match record name",
+            ))
+        } else {
+            match self.registry.internal_records.lock() {
+                Ok(mut records) => {
+                    if self.registry.internal_shutting_down.load(Ordering::Acquire) {
+                        Some(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "internal SubWorker registry is shutting down",
+                        ))
+                    } else {
+                        records.push(record.clone());
+                        None
+                    }
+                }
+                Err(_) => Some(io::Error::other(
+                    "internal spawned-worker registry lock poisoned",
+                )),
             }
         };
-        if self.registry.internal_shutting_down.load(Ordering::Acquire) {
-            return Err((
-                io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "internal SubWorker registry is shutting down",
-                ),
-                record,
-            ));
+        if let Some(error) = rejection {
+            let mut cleanup_failures = Vec::new();
+            if let Err(cleanup) = record.session.stop().await {
+                cleanup_failures.push(format!("stop rejected Internal SubWorker: {cleanup}"));
+            }
+            if let Err(cleanup) = Box::pin(record.child_registry.shutdown_internal()).await {
+                cleanup_failures.push(format!(
+                    "stop rejected Internal SubWorker descendants: {cleanup}"
+                ));
+            }
+            if let Err(cleanup) = record.workdir_tool_scope.close().await {
+                cleanup_failures.push(format!(
+                    "close rejected Internal SubWorker Workdir tools: {cleanup}"
+                ));
+            }
+            if cleanup_failures.is_empty() {
+                return Err(error);
+            }
+            self.registry
+                .internal_spawn_cleanup_failed
+                .store(true, Ordering::Release);
+            return Err(io::Error::other(format!(
+                "{error}; {}",
+                cleanup_failures.join("; ")
+            )));
         }
-        records.push(record.clone());
-        drop(records);
         self.registry.start_protocol_forwarding(record);
         self.committed = true;
         Ok(())
@@ -284,6 +301,10 @@ impl Drop for InternalSpawnReservation {
                 names.remove(&self.worker_name);
             }
         }
+        self.registry
+            .pending_internal_spawns
+            .fetch_sub(1, Ordering::AcqRel);
+        self.registry.pending_internal_notify.notify_waiters();
     }
 }
 
@@ -292,6 +313,9 @@ pub struct SpawnedWorkerRegistry {
     service_records: std::sync::Mutex<Vec<InternalServiceWorkerRecord>>,
     internal_names: std::sync::Mutex<HashSet<String>>,
     internal_shutting_down: AtomicBool,
+    pending_internal_spawns: AtomicUsize,
+    pending_internal_notify: Notify,
+    internal_spawn_cleanup_failed: AtomicBool,
     parent_scope: Option<SharedScope>,
     parent_protocol: Mutex<Option<(broadcast::Sender<Event>, String)>>,
 }
@@ -309,6 +333,9 @@ impl SpawnedWorkerRegistry {
             service_records: std::sync::Mutex::new(Vec::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
             internal_shutting_down: AtomicBool::new(false),
+            pending_internal_spawns: AtomicUsize::new(0),
+            pending_internal_notify: Notify::new(),
+            internal_spawn_cleanup_failed: AtomicBool::new(false),
             parent_scope: None,
             parent_protocol: Mutex::new(None),
         })
@@ -321,6 +348,9 @@ impl SpawnedWorkerRegistry {
             service_records: std::sync::Mutex::new(Vec::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
             internal_shutting_down: AtomicBool::new(false),
+            pending_internal_spawns: AtomicUsize::new(0),
+            pending_internal_notify: Notify::new(),
+            internal_spawn_cleanup_failed: AtomicBool::new(false),
             parent_scope: None,
             parent_protocol: Mutex::new(None),
         })
@@ -332,6 +362,9 @@ impl SpawnedWorkerRegistry {
             service_records: std::sync::Mutex::new(Vec::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
             internal_shutting_down: AtomicBool::new(false),
+            pending_internal_spawns: AtomicUsize::new(0),
+            pending_internal_notify: Notify::new(),
+            internal_spawn_cleanup_failed: AtomicBool::new(false),
             parent_scope: Some(parent_scope),
             parent_protocol: Mutex::new(None),
         })
@@ -412,6 +445,9 @@ impl SpawnedWorkerRegistry {
                 service_records: std::sync::Mutex::new(Vec::new()),
                 internal_names: std::sync::Mutex::new(HashSet::new()),
                 internal_shutting_down: AtomicBool::new(false),
+                pending_internal_spawns: AtomicUsize::new(0),
+                pending_internal_notify: Notify::new(),
+                internal_spawn_cleanup_failed: AtomicBool::new(false),
                 parent_scope,
                 parent_protocol: Mutex::new(None),
             }),
@@ -423,6 +459,10 @@ impl SpawnedWorkerRegistry {
         self: &Arc<Self>,
         worker_name: String,
     ) -> io::Result<InternalSpawnReservation> {
+        let records = self
+            .internal_records
+            .lock()
+            .map_err(|_| io::Error::other("internal Worker registry lock poisoned"))?;
         if self.internal_shutting_down.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -439,7 +479,9 @@ impl SpawnedWorkerRegistry {
                 format!("spawned worker `{worker_name}` is already registered"),
             ));
         }
+        self.pending_internal_spawns.fetch_add(1, Ordering::AcqRel);
         drop(names);
+        drop(records);
         Ok(InternalSpawnReservation {
             registry: Arc::clone(self),
             worker_name,
@@ -758,17 +800,31 @@ impl SpawnedWorkerRegistry {
                 .map(|record| record.worker_name.clone())
                 .collect::<Vec<_>>()
         };
+        loop {
+            let notified = self.pending_internal_notify.notified();
+            if self.pending_internal_spawns.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            notified.await;
+        }
         let mut first_error = None;
         for name in names {
             if let Err(error) = self.remove_internal(&name).await {
                 first_error.get_or_insert(error);
             }
         }
+        if first_error.is_none() && self.internal_spawn_cleanup_failed.load(Ordering::Acquire) {
+            first_error = Some(io::Error::other(
+                "an in-flight Internal SubWorker failed cleanup during shutdown",
+            ));
+        }
         first_error.map_or(Ok(()), Err)
     }
 
     pub(crate) fn reopen_internal(&self) {
         self.internal_shutting_down.store(false, Ordering::Release);
+        self.internal_spawn_cleanup_failed
+            .store(false, Ordering::Release);
     }
 
     /// Stop one direct Internal SubWorker and discard its registry/scope state.
@@ -1342,24 +1398,22 @@ mod tests {
         let (record, _events) =
             record("racing-child", InternalWorkerVisibility::ParentClient).await;
         let scope = record.workdir_tool_scope.clone();
-        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let commit_barrier = barrier.clone();
-        let commit = tokio::task::spawn_blocking(move || {
-            commit_barrier.wait();
-            reservation.commit(record)
+        let commit = tokio::spawn(async move {
+            commit_barrier.wait().await;
+            reservation.commit(record).await
         });
         let shutdown_registry = registry.clone();
         let shutdown = tokio::spawn(async move {
-            barrier.wait();
+            barrier.wait().await;
             shutdown_registry.shutdown_internal().await
         });
 
         let commit = commit.await.unwrap();
         shutdown.await.unwrap().unwrap();
-        if let Err((_error, record)) = commit {
-            record.session.stop().await.unwrap();
-            record.child_registry.shutdown_internal().await.unwrap();
-            record.workdir_tool_scope.close().await.unwrap();
+        if let Err(error) = commit {
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         }
 
         assert!(registry.list_internal().is_empty());
@@ -1375,12 +1429,54 @@ mod tests {
         let (record, _events) =
             record("racing-child", InternalWorkerVisibility::ParentClient).await;
 
-        registry.shutdown_internal().await.unwrap();
-        let (error, record) = reservation.commit(record).unwrap_err();
+        let mut shutdown = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.shutdown_internal().await })
+        };
+        while !registry.internal_shutting_down.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown must wait for the pending spawn to roll back"
+        );
+        let error = reservation.commit(record).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-        record.session.stop().await.unwrap();
-        record.child_registry.shutdown_internal().await.unwrap();
-        record.workdir_tool_scope.close().await.unwrap();
+        shutdown.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_spawn_cleanup_failure_keeps_shutdown_failed_closed() {
+        let registry = registry();
+        let reservation = registry
+            .reserve_internal_name("cleanup-failure".into())
+            .unwrap();
+        let (record, _events) =
+            record("cleanup-failure", InternalWorkerVisibility::ParentClient).await;
+        record.session.force_stop_failure();
+        let shutdown = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.shutdown_internal().await })
+        };
+        while !registry.internal_shutting_down.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        let error = reservation.commit(record).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("stop rejected Internal SubWorker")
+        );
+        let shutdown_error = shutdown.await.unwrap().unwrap_err();
+        assert!(
+            shutdown_error
+                .to_string()
+                .contains("failed cleanup during shutdown")
+        );
+        assert!(registry.internal_shutting_down.load(Ordering::Acquire));
     }
 
     #[tokio::test]

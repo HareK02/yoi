@@ -75,6 +75,7 @@ impl WorkdirToolBroker {
             owned_commands: Arc::new(Mutex::new(HashSet::new())),
             pending_command_events: Arc::new(Mutex::new(HashMap::new())),
             starting_tool_calls: Arc::new(Mutex::new(HashSet::new())),
+            forwarded_starts: Arc::new(Mutex::new(HashSet::new())),
             forwarded_terminals: Arc::new(Mutex::new(HashSet::new())),
             command_events,
             closes_source: true,
@@ -314,6 +315,7 @@ struct ScopedWorkdirSession {
     owned_commands: Arc<Mutex<HashSet<String>>>,
     pending_command_events: Arc<Mutex<HashMap<String, Vec<CommandEvent>>>>,
     starting_tool_calls: Arc<Mutex<HashSet<String>>>,
+    forwarded_starts: Arc<Mutex<HashSet<String>>>,
     forwarded_terminals: Arc<Mutex<HashSet<String>>>,
     command_events: broadcast::Sender<CommandEvent>,
     closes_source: bool,
@@ -675,6 +677,7 @@ impl ScopedWorkdirSession {
         let owned_commands = Arc::new(Mutex::new(HashSet::new()));
         let pending_command_events = Arc::new(Mutex::new(HashMap::new()));
         let starting_tool_calls = Arc::new(Mutex::new(HashSet::new()));
+        let forwarded_starts = Arc::new(Mutex::new(HashSet::new()));
         let forwarded_terminals = Arc::new(Mutex::new(HashSet::new()));
         let (command_events, _) = broadcast::channel(64);
         let event_forwarder = forward_owned_command_events(
@@ -682,6 +685,7 @@ impl ScopedWorkdirSession {
             owned_commands.clone(),
             pending_command_events.clone(),
             starting_tool_calls.clone(),
+            forwarded_starts.clone(),
             forwarded_terminals.clone(),
             command_events.clone(),
         )
@@ -699,6 +703,7 @@ impl ScopedWorkdirSession {
             owned_commands,
             pending_command_events,
             starting_tool_calls,
+            forwarded_starts,
             forwarded_terminals,
             command_events,
             closes_source: false,
@@ -862,6 +867,7 @@ impl WorkdirSession for ScopedWorkdirSession {
         {
             publish_owned_command_event(
                 &self.command_events,
+                &self.forwarded_starts,
                 &self.forwarded_terminals,
                 CommandEvent::Started {
                     command_id: handle.0.clone(),
@@ -871,7 +877,12 @@ impl WorkdirSession for ScopedWorkdirSession {
             );
         }
         for event in pending {
-            publish_owned_command_event(&self.command_events, &self.forwarded_terminals, event);
+            publish_owned_command_event(
+                &self.command_events,
+                &self.forwarded_starts,
+                &self.forwarded_terminals,
+                event,
+            );
         }
         Ok(handle)
     }
@@ -1033,6 +1044,7 @@ fn forward_owned_command_events(
     owned_commands: Arc<Mutex<HashSet<String>>>,
     pending_command_events: Arc<Mutex<HashMap<String, Vec<CommandEvent>>>>,
     starting_tool_calls: Arc<Mutex<HashSet<String>>>,
+    forwarded_starts: Arc<Mutex<HashSet<String>>>,
     forwarded_terminals: Arc<Mutex<HashSet<String>>>,
     sender: broadcast::Sender<CommandEvent>,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -1082,7 +1094,7 @@ fn forward_owned_command_events(
             }
             drop(pending);
             drop(owned);
-            publish_owned_command_event(&sender, &forwarded_terminals, event);
+            publish_owned_command_event(&sender, &forwarded_starts, &forwarded_terminals, event);
         }
     }))
 }
@@ -1097,6 +1109,7 @@ fn command_event_id(event: &CommandEvent) -> &str {
 
 fn publish_owned_command_event(
     sender: &broadcast::Sender<CommandEvent>,
+    forwarded_starts: &Mutex<HashSet<String>>,
     forwarded_terminals: &Mutex<HashSet<String>>,
     event: CommandEvent,
 ) {
@@ -1106,11 +1119,16 @@ fn publish_owned_command_event(
         .expect("forwarded terminal command mutex poisoned");
     match &event {
         CommandEvent::Terminal { .. } if !terminals.insert(command_id.to_string()) => return,
-        CommandEvent::Started { .. } | CommandEvent::Output { .. }
-            if terminals.contains(command_id) =>
+        CommandEvent::Started { .. } if terminals.contains(command_id) => return,
+        CommandEvent::Started { .. }
+            if !forwarded_starts
+                .lock()
+                .expect("forwarded command start mutex poisoned")
+                .insert(command_id.to_string()) =>
         {
             return;
         }
+        CommandEvent::Output { .. } if terminals.contains(command_id) => return,
         _ => {}
     }
     drop(terminals);
@@ -1657,8 +1675,16 @@ mod tests {
         }
         assert_eq!(kinds.first(), Some(&"started"));
         assert_eq!(kinds.last(), Some(&"terminal"));
+        assert_eq!(kinds.iter().filter(|kind| **kind == "started").count(), 1);
         assert!(kinds.contains(&"output"));
         assert!(streamed.contains("fast-output"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), events.recv())
+                .await
+                .is_err(),
+            "no provider event may follow the terminal event"
+        );
+        assert!(child.command_snapshot().is_empty());
         child.close().await.unwrap();
     }
 

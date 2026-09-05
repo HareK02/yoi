@@ -630,10 +630,7 @@ impl Tool for SubWorkerSpawnTool {
             child_registry,
             child_change_tracker,
         );
-        if let Err((error, record)) = name_reservation.commit(record) {
-            let _ = session.stop().await;
-            let _ = record.child_registry.shutdown_internal().await;
-            let _ = record.workdir_tool_scope.close().await;
+        if let Err(error) = name_reservation.commit(record).await {
             return Err(ToolError::ExecutionFailed(format!(
                 "register Internal Worker session: {error}"
             )));
