@@ -779,10 +779,10 @@ async fn probe_socket(socket_path: &Path) -> LiveInfo {
             loop {
                 match tokio::time::timeout(PROBE_TIMEOUT, reader.next::<Event>()).await {
                     Ok(Ok(Some(Event::Snapshot {
-                        status: snapshot_status,
+                        state: snapshot_state,
                         ..
                     }))) => {
-                        status = Some(snapshot_status);
+                        status = Some(snapshot_state.catalog_status());
                         break;
                     }
                     Ok(Ok(Some(Event::Alert(_)))) => continue,
@@ -1507,7 +1507,7 @@ mod tests {
                         context_window: 0,
                         context_tokens: 0,
                     },
-                    status: WorkerStatus::Idle,
+                    state: WorkerStatus::Idle.into(),
                     in_flight: Default::default(),
                     internal_workers: Vec::new(),
                 })
@@ -1543,7 +1543,7 @@ mod tests {
                         context_window: 0,
                         context_tokens: 0,
                     },
-                    status: WorkerStatus::Idle,
+                    state: WorkerStatus::Idle.into(),
                     in_flight: Default::default(),
                     internal_workers: Vec::new(),
                 })
@@ -1638,7 +1638,7 @@ mod tests {
                         context_window: 0,
                         context_tokens: 0,
                     },
-                    status: WorkerStatus::Idle,
+                    state: WorkerStatus::Idle.into(),
                     in_flight: Default::default(),
                     internal_workers: Vec::new(),
                 })
@@ -1665,7 +1665,7 @@ mod tests {
                         context_window: 0,
                         context_tokens: 0,
                     },
-                    status: WorkerStatus::Idle,
+                    state: WorkerStatus::Idle.into(),
                     in_flight: Default::default(),
                     internal_workers: Vec::new(),
                 })
@@ -1773,7 +1773,7 @@ mod tests {
                         context_window: 0,
                         context_tokens: 0,
                     },
-                    status: WorkerStatus::Paused,
+                    state: WorkerStatus::Paused.into(),
                     in_flight: Default::default(),
                     internal_workers: Vec::new(),
                 })
@@ -1827,7 +1827,7 @@ mod tests {
                                 context_window: 0,
                                 context_tokens: 0,
                             },
-                            status: WorkerStatus::Idle,
+                            state: WorkerStatus::Idle.into(),
                             in_flight: Default::default(),
                             internal_workers: Vec::new(),
                         })

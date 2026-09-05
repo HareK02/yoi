@@ -101,8 +101,8 @@ mod tests {
         ));
 
         peer.send(
-            encode_event(&Event::Status {
-                status: WorkerStatus::Idle,
+            encode_event(&Event::WorkerState {
+                snapshot: WorkerStatus::Idle.into(),
             })
             .expect("encode event"),
         )
@@ -110,9 +110,7 @@ mod tests {
         .expect("send event");
         assert!(matches!(
             client.next_event().await,
-            Ok(Some(Event::Status {
-                status: WorkerStatus::Idle
-            }))
+            Ok(Some(Event::WorkerState { .. }))
         ));
     }
 }

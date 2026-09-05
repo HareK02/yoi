@@ -197,7 +197,6 @@ pub fn default_base() -> Result<PathBuf, io::Error> {
 mod tests {
     use super::*;
     use crate::shared_state::WorkerSharedState;
-    use protocol::WorkerStatus;
 
     fn test_state() -> WorkerSharedState {
         WorkerSharedState::new(
@@ -247,7 +246,9 @@ mod tests {
         let rt = RuntimeDir::create(tmp.path(), "my-worker").await.unwrap();
         let state = test_state();
 
-        state.set_status(WorkerStatus::Running);
+        state.transition(protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+            protocol::WorkerRunState::Running,
+        )));
         rt.write_status(&state).await.unwrap();
 
         let content = std::fs::read_to_string(rt.path().join("status.json")).unwrap();

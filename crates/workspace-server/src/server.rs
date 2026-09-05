@@ -18559,7 +18559,6 @@ mod tests {
                     request.worker_ref,
                     self.backend_id(),
                 ),
-                run_state: worker_runtime::execution::WorkerExecutionRunState::Idle,
                 working_directory,
             }
         }
@@ -18575,7 +18574,6 @@ mod tests {
                 .push((handle.worker_ref().clone(), method));
             worker_runtime::execution::WorkerExecutionResult::accepted(
                 worker_runtime::execution::WorkerExecutionOperation::ProtocolMethod,
-                worker_runtime::execution::WorkerExecutionRunState::Idle,
             )
         }
 
@@ -18585,7 +18583,6 @@ mod tests {
         ) -> worker_runtime::execution::WorkerExecutionResult {
             worker_runtime::execution::WorkerExecutionResult::accepted(
                 worker_runtime::execution::WorkerExecutionOperation::Stop,
-                worker_runtime::execution::WorkerExecutionRunState::Stopped,
             )
         }
 
@@ -18595,7 +18592,6 @@ mod tests {
         ) -> worker_runtime::execution::WorkerExecutionResult {
             worker_runtime::execution::WorkerExecutionResult::accepted(
                 worker_runtime::execution::WorkerExecutionOperation::Cancel,
-                worker_runtime::execution::WorkerExecutionRunState::Stopped,
             )
         }
 
@@ -18632,16 +18628,16 @@ mod tests {
             if let Some(submission_request_id) = submission_request_id {
                 worker_runtime::execution::WorkerExecutionResult::accepted_submission(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
-                    worker_runtime::execution::WorkerExecutionRunState::Idle,
                     submission_request_id,
                     uuid::Uuid::now_v7().to_string(),
                     protocol::SubmissionDisposition::Started,
                 )
+                .with_worker_state(protocol::WorkerStateSnapshot::initial(1))
             } else {
                 worker_runtime::execution::WorkerExecutionResult::accepted(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
-                    worker_runtime::execution::WorkerExecutionRunState::Idle,
                 )
+                .with_worker_state(protocol::WorkerStateSnapshot::initial(1))
             }
         }
     }
@@ -27497,7 +27493,13 @@ mod tests {
             protocol::subscription::SubscriptionFramePayload::WorkerProtocol(
                 protocol::subscription::SubscriptionWorkerProtocolMethod {
                     subscription_id: second_protocol_subscription_id,
-                    method: protocol::Method::Resume,
+                    method: protocol::Method::Resume {
+                        command: protocol::WorkerCommandEnvelope {
+                            command_id: 1,
+                            expected_execution_generation: 1,
+                            expected_worker_state_revision: 0,
+                        },
+                    },
                 },
             ),
         );
@@ -27514,7 +27516,7 @@ mod tests {
                     .iter()
                     .any(|(worker_ref, method)| {
                         worker_ref.worker_id.to_string() == worker_id
-                            && matches!(method, protocol::Method::Resume)
+                            && matches!(method, protocol::Method::Resume { .. })
                     })
                 {
                     break;
@@ -27527,7 +27529,7 @@ mod tests {
         let protocol_methods = execution_backend.protocol_methods();
         assert!(protocol_methods.iter().any(|(worker_ref, method)| {
             worker_ref.worker_id.to_string() == worker_id
-                && matches!(method, protocol::Method::Resume)
+                && matches!(method, protocol::Method::Resume { .. })
         }));
         server.abort();
     }

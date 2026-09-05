@@ -10,6 +10,37 @@ export type CompletionKind = "file";
 
 export type WorkerStatus = "idle" | "running" | "paused" | "stopped";
 
+export type WorkerCommandEnvelope = {
+/**
+ * Caller-owned sequence. A controller accepts command ids in strictly
+ * increasing order for one execution generation.
+ */
+command_id: number, expected_execution_generation: number, expected_worker_state_revision: number, };
+
+export type WorkerCommandKind = "resume" | "cancel" | "pause" | "compact" | "shutdown";
+
+export type WorkerCommandDisposition = "accepted" | "stale_execution_generation" | "stale_worker_state_revision" | "stale_command_id" | "invalid_state";
+
+export type WorkerCommandAcknowledgement = { command_id: number, command: WorkerCommandKind, disposition: WorkerCommandDisposition,
+/**
+ * The complete authoritative state observed after command admission.
+ */
+state: WorkerStateSnapshot, };
+
+export type WorkerRunState = "running" | "pausing" | "paused" | "cancelling";
+
+export type WorkerMaintenanceState = "compacting";
+
+export type WorkerBusyState = { "kind": "run", "state": WorkerRunState } | { "kind": "maintenance", "state": WorkerMaintenanceState };
+
+export type WorkerState = { "kind": "idle" } | { "kind": "busy", "state": WorkerBusyState };
+
+export type WorkerStateSnapshot = { execution_generation: number, revision: number,
+/**
+ * Highest lifecycle command id observed by this controller generation.
+ */
+last_command_id: number, state: WorkerState, };
+
 export type TurnResult = "finished" | "paused";
 
 export type InvokeKind = "user_send" | "notify" | "worker_event" | "system_reminder" | "wakeup";
@@ -231,7 +262,7 @@ export type SubscriptionFramePayload = { "frame": "request", "message": Subscrip
 
 export type SubscriptionFrame = { protocol_version: number, } & ({ "frame": "request", "message": SubscriptionRequest } | { "frame": "response", "message": SubscriptionResponse } | { "frame": "event", "message": SubscriptionEvent } | { "frame": "worker_protocol", "message": SubscriptionWorkerProtocolMethod });
 
-export type Method = { "method": "submit", "params": { submission_request_id: string, input: Array<Segment>, } } | { "method": "notify", "params": { notification_request_id: string, message: string, auto_run?: boolean, } } | { "method": "worker_event", "params": WorkerEvent } | { "method": "list_pending_submissions" } | { "method": "cancel_pending_submission", "params": { submission_id: string, expected_revision: number, } } | { "method": "clear_pending_submissions", "params": { expected_revision: number, } } | { "method": "continue_pending", "params": { expected_revision: number, expected_head_id: string, } } | { "method": "resume" } | { "method": "cancel" } | { "method": "pause" } | { "method": "compact" } | { "method": "list_rewind_targets" } | { "method": "rewind_to", "params": { target: RewindTargetId, expected_head_entries: number, } } | { "method": "shutdown" } | { "method": "list_completions", "params": { kind: CompletionKind, prefix: string, } } | { "method": "list_workers" } | { "method": "restore_worker", "params": { name: string, } } | { "method": "register_peer", "params": { name: string, } };
+export type Method = { "method": "submit", "params": { submission_request_id: string, input: Array<Segment>, } } | { "method": "notify", "params": { notification_request_id: string, message: string, auto_run?: boolean, } } | { "method": "worker_event", "params": WorkerEvent } | { "method": "list_pending_submissions" } | { "method": "cancel_pending_submission", "params": { submission_id: string, expected_revision: number, } } | { "method": "clear_pending_submissions", "params": { expected_revision: number, } } | { "method": "continue_pending", "params": { expected_revision: number, expected_head_id: string, } } | { "method": "resume", "params": { command: WorkerCommandEnvelope, } } | { "method": "cancel", "params": { command: WorkerCommandEnvelope, } } | { "method": "pause", "params": { command: WorkerCommandEnvelope, } } | { "method": "compact", "params": { command: WorkerCommandEnvelope, } } | { "method": "list_rewind_targets" } | { "method": "rewind_to", "params": { target: RewindTargetId, expected_head_entries: number, } } | { "method": "shutdown", "params": { command: WorkerCommandEnvelope, } } | { "method": "list_completions", "params": { kind: CompletionKind, prefix: string, } } | { "method": "list_workers" } | { "method": "restore_worker", "params": { name: string, } } | { "method": "register_peer", "params": { name: string, } };
 
 export type Event = { "event": "submission_accepted", "data": { submission_request_id: string, submission_id: string, disposition: SubmissionDisposition, } } | { "event": "submission_rejected", "data": { submission_request_id: string, message: string, } } | { "event": "pending_submissions_changed", "data": { pending: PendingSubmissionsSnapshot, } } | { "event": "user_message", "data": { segments: Array<Segment>, } } | { "event": "system_item", "data": { item: unknown, } } | { "event": "invoke_start", "data": { kind: InvokeKind, } } | { "event": "turn_start", "data": { turn: number, } } | { "event": "turn_end", "data": { turn: number, result: TurnResult, } } | { "event": "llm_call_start", "data": { llm_call: number, } } | { "event": "llm_call_end", "data": { llm_call: number, } } | { "event": "llm_retry", "data": { llm_call: number,
 /**
@@ -247,7 +278,12 @@ summary: string,
  * Full tool output. Absent when the tool chose to return
  * summary-only, or when the result was pruned.
  */
-output?: string | null, disposition?: ToolResultDisposition | null, is_error: boolean, } } | { "event": "usage", "data": { input_tokens: number | null, output_tokens: number | null, cache_read_input_tokens?: number | null, } } | { "event": "run_end", "data": { result: RunResult, } } | { "event": "error", "data": { code: ErrorCode, message: string, } } | { "event": "snapshot", "data": { session: SessionSnapshot, greeting: Greeting, status: WorkerStatus,
+output?: string | null, disposition?: ToolResultDisposition | null, is_error: boolean, } } | { "event": "usage", "data": { input_tokens: number | null, output_tokens: number | null, cache_read_input_tokens?: number | null, } } | { "event": "run_end", "data": { result: RunResult, } } | { "event": "error", "data": { code: ErrorCode, message: string, } } | { "event": "snapshot", "data": { session: SessionSnapshot, greeting: Greeting,
+/**
+ * Full revisioned live execution state. `Stopped` remains Runtime
+ * catalog authority and is deliberately not represented here.
+ */
+state: WorkerStateSnapshot,
 /**
  * Unfinished model output that has already streamed in the current
  * run but is not yet represented by committed snapshot entries.
@@ -257,4 +293,4 @@ in_flight?: InFlightSnapshot,
  * Parent-owned Internal Worker sessions visible to this client.
  * Service-private Internal Workers are deliberately excluded.
  */
-internal_workers?: Array<InternalWorkerSnapshot>, } } | { "event": "internal_worker", "data": { worker: InternalWorkerRef, revision: number, event: Event, } } | { "event": "internal_worker_removed", "data": { worker: InternalWorkerRef, revision: number, } } | { "event": "segment_rotated", "data": { session: SessionSnapshot, } } | { "event": "status", "data": { status: WorkerStatus, } } | { "event": "command", "data": { event: CommandEvent, } } | { "event": "completions", "data": { kind: CompletionKind, entries: Array<CompletionEntry>, } } | { "event": "rewind_targets", "data": { head_entries: number, targets: Array<RewindTarget>, } } | { "event": "rewind_applied", "data": { session: SessionSnapshot, input: Array<Segment>, summary: RewindSummary, } } | { "event": "workers_listed", "data": { workers: unknown, } } | { "event": "worker_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compact_start", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_done", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_failed", "data": { lifecycle: CompactionLifecycle, } } | { "event": "shutdown" };
+internal_workers?: Array<InternalWorkerSnapshot>, } } | { "event": "internal_worker", "data": { worker: InternalWorkerRef, revision: number, event: Event, } } | { "event": "internal_worker_removed", "data": { worker: InternalWorkerRef, revision: number, } } | { "event": "segment_rotated", "data": { session: SessionSnapshot, } } | { "event": "worker_state", "data": { snapshot: WorkerStateSnapshot, } } | { "event": "command_acknowledged", "data": { acknowledgement: WorkerCommandAcknowledgement, } } | { "event": "command", "data": { event: CommandEvent, } } | { "event": "completions", "data": { kind: CompletionKind, entries: Array<CompletionEntry>, } } | { "event": "rewind_targets", "data": { head_entries: number, targets: Array<RewindTarget>, } } | { "event": "rewind_applied", "data": { session: SessionSnapshot, input: Array<Segment>, summary: RewindSummary, } } | { "event": "workers_listed", "data": { workers: unknown, } } | { "event": "worker_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compact_start", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_done", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_failed", "data": { lifecycle: CompactionLifecycle, } } | { "event": "shutdown" };

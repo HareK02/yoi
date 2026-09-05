@@ -97,7 +97,7 @@ mod tests {
                 context_window: 200_000,
                 context_tokens: 0,
             },
-            status: WorkerStatus::Idle,
+            state: WorkerStatus::Idle.into(),
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         }
@@ -137,10 +137,16 @@ mod tests {
             ],
         );
 
-        connect_and_send(&socket, &Method::Shutdown).await.unwrap();
+        let method = Method::Shutdown {
+            command: protocol::WorkerCommandEnvelope::for_snapshot(
+                1,
+                &protocol::WorkerStateSnapshot::initial(1),
+            ),
+        };
+        connect_and_send(&socket, &method).await.unwrap();
 
         let method = received.await.unwrap().expect("expected method");
-        assert!(matches!(method, Method::Shutdown));
+        assert!(matches!(method, Method::Shutdown { .. }));
     }
 
     #[tokio::test]

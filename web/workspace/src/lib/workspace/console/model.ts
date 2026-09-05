@@ -10,6 +10,8 @@ import type {
   InternalWorkerRef,
   InternalWorkerSnapshot,
   Segment,
+  WorkerStateSnapshot,
+  WorkerStatus,
 } from "$lib/generated/protocol";
 import { stringify as stringifyYaml } from "yaml";
 import { workspaceRoute } from "$lib/workspace/api/http";
@@ -169,6 +171,7 @@ export type ConsoleProjection = {
   tasks: ConsoleTask[];
   taskNextId: number;
   status: string | null;
+  workerState: WorkerStateSnapshot | null;
   usage: string | null;
   runActivity: RunActivityStats;
   cwd: string | null;
@@ -251,12 +254,22 @@ export function isConsoleProjectionEvent(event: ProtocolEvent): boolean {
   return event.event !== "completions";
 }
 
+function workerStatusFromState(snapshot: WorkerStateSnapshot): WorkerStatus {
+  if (snapshot.state.kind === "idle") return "idle";
+  if (
+    snapshot.state.state.kind === "run" &&
+    snapshot.state.state.state === "paused"
+  ) return "paused";
+  return "running";
+}
+
 export function emptyConsoleProjection(): ConsoleProjection {
   return {
     lines: [],
     tasks: [],
     taskNextId: 1,
     status: null,
+    workerState: null,
     usage: null,
     runActivity: emptyRunActivityStats(),
     cwd: null,
@@ -793,6 +806,7 @@ export function applyProtocolEvent(
     tasks: [...projection.tasks],
     taskNextId: projection.taskNextId,
     status: projection.status,
+    workerState: projection.workerState,
     usage: projection.usage,
     runActivity: applyRunActivityEvent(
       projection.runActivity,
@@ -903,7 +917,8 @@ export function applyProtocolEvent(
       );
       break;
     case "snapshot": {
-      next.status = event.data.status;
+      next.workerState = event.data.state;
+      next.status = workerStatusFromState(event.data.state);
       next.cwd = event.data.greeting.cwd;
       const snapshot = snapshotProjectionFromSession(
         envelope.eventId,
@@ -1000,8 +1015,13 @@ export function applyProtocolEvent(
       if (existingIndex >= 0) next.internalWorkers.splice(existingIndex, 1);
       break;
     }
-    case "status":
-      next.status = event.data.status;
+    case "worker_state":
+      next.workerState = event.data.snapshot;
+      next.status = workerStatusFromState(event.data.snapshot);
+      break;
+    case "command_acknowledged":
+      next.workerState = event.data.acknowledgement.state;
+      next.status = workerStatusFromState(event.data.acknowledgement.state);
       break;
     case "command":
       applyCommandEvent(next, envelope.eventId, event.data.event);
@@ -1939,6 +1959,7 @@ function snapshotProjectionFromSession(
     tasks: [],
     taskNextId: 1,
     status: null,
+    workerState: null,
     usage: null,
     runActivity: emptyRunActivityStats(),
     cwd,

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use protocol::{
     AlertLevel, AlertSource, CompletionEntry, CompletionKind, ErrorCode, Event, InFlightBlock,
     InFlightSnapshot, InFlightToolCallState, InternalWorkerRef, InternalWorkerSnapshot, Method,
-    RewindTarget, RunResult, Segment, WorkerStatus,
+    RewindTarget, RunResult, Segment, WorkerCommandEnvelope, WorkerStateSnapshot, WorkerStatus,
 };
 
 use crate::block::{
@@ -225,8 +225,10 @@ pub struct WorkerViewTab {
 pub struct App {
     pub worker_name: String,
     pub connected: bool,
-    /// Last controller status reported by the Worker. Drives the status line
-    /// and Ctrl-key routing; do not infer this solely from replayed history.
+    /// Latest authoritative revisioned live execution state.
+    pub worker_state: WorkerStateSnapshot,
+    next_command_id: u64,
+    /// Derived Runtime-catalog compatibility projection used by existing UI.
     pub worker_status: WorkerStatus,
     /// True while the Worker is in `WorkerStatus::Running`.
     pub running: bool,
@@ -337,6 +339,8 @@ impl App {
         Self {
             worker_name,
             connected: false,
+            worker_state: WorkerStateSnapshot::initial(1),
+            next_command_id: 1,
             worker_status: WorkerStatus::Idle,
             running: false,
             paused: false,
@@ -745,7 +749,8 @@ impl App {
             if self.paused {
                 self.input_history.cancel_browse();
                 self.input.clear();
-                return Some(Method::Resume);
+                let command = self.next_command_envelope();
+                return Some(Method::Resume { command });
             }
             return None;
         }
@@ -1114,6 +1119,15 @@ impl App {
         }
     }
 
+    pub fn next_command_envelope(&mut self) -> WorkerCommandEnvelope {
+        let command_id = self
+            .next_command_id
+            .max(self.worker_state.last_command_id.saturating_add(1));
+        let command = WorkerCommandEnvelope::for_snapshot(command_id, &self.worker_state);
+        self.next_command_id = command_id.saturating_add(1);
+        command
+    }
+
     pub fn handle_worker_event(&mut self, event: Event) -> Option<Method> {
         if self.rewind_refresh_fence && event_is_stale_after_rewind(&event) {
             return None;
@@ -1443,7 +1457,7 @@ impl App {
             Event::Snapshot {
                 session,
                 greeting,
-                status,
+                state,
                 in_flight,
                 internal_workers,
             } => {
@@ -1451,7 +1465,8 @@ impl App {
                 self.pending_submissions = session.pending_submissions.clone();
                 self.restore_snapshot(&session, greeting, in_flight);
                 self.replace_internal_worker_snapshots(internal_workers);
-                self.set_worker_status(status);
+                self.worker_state = state.clone();
+                self.set_worker_status(state.catalog_status());
             }
             Event::InternalWorker {
                 worker,
@@ -1461,9 +1476,14 @@ impl App {
             Event::InternalWorkerRemoved { worker, revision } => {
                 self.remove_internal_worker(worker, revision)
             }
-            Event::Status { status } => {
+            Event::WorkerState { snapshot } => {
                 self.rewind_refresh_fence = false;
-                self.set_worker_status(status);
+                self.worker_state = snapshot.clone();
+                self.set_worker_status(snapshot.catalog_status());
+            }
+            Event::CommandAcknowledged { acknowledgement } => {
+                self.worker_state = acknowledgement.state.clone();
+                self.set_worker_status(acknowledgement.state.catalog_status());
             }
             // Command telemetry is an operational Web Console surface. The
             // TUI continues to render the final Bash ToolResult from history.
@@ -2026,12 +2046,18 @@ impl App {
             self.input_mode = CommandInputMode::Composer;
             self.command_completion_selected = None;
         }
-        if let Some(Method::ListRewindTargets) = result.method.as_ref() {
+        let mut method = result.method;
+        if let Some(Method::Compact { .. }) = method {
+            method = Some(Method::Compact {
+                command: self.next_command_envelope(),
+            });
+        }
+        if let Some(Method::ListRewindTargets) = method.as_ref() {
             self.completion = None;
             self.rewind_picker = None;
             self.rewind_request_pending = true;
         }
-        result.method
+        method
     }
 
     fn push_command_diagnostic(&mut self, message: impl Into<String>) {
@@ -2761,8 +2787,8 @@ mod rewind_refresh_tests {
         });
         assert!(!blocks_contain(&app, "stale tail after rewind"));
 
-        app.handle_worker_event(Event::Status {
-            status: WorkerStatus::Idle,
+        app.handle_worker_event(Event::WorkerState {
+            snapshot: WorkerStatus::Idle.into(),
         });
         app.handle_worker_event(Event::TextDelta {
             text: "new live tail after status".into(),
@@ -3478,7 +3504,7 @@ mod completion_flow_tests {
         let mut app = App::new("test".into());
         app.set_worker_status(WorkerStatus::Paused);
 
-        assert!(matches!(app.submit_input(), Some(Method::Resume)));
+        assert!(matches!(app.submit_input(), Some(Method::Resume { .. })));
         assert_eq!(app.queued_input_count(), 0);
     }
 
@@ -3533,7 +3559,7 @@ mod completion_flow_tests {
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             session: public_session(vec![session_start_value]),
-            status: WorkerStatus::Running,
+            state: WorkerStatus::Running.into(),
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });
@@ -3551,8 +3577,8 @@ mod completion_flow_tests {
             code: ErrorCode::ProviderError,
             message: "provider unavailable".into(),
         });
-        app.handle_worker_event(Event::Status {
-            status: WorkerStatus::Idle,
+        app.handle_worker_event(Event::WorkerState {
+            snapshot: WorkerStatus::Idle.into(),
         });
 
         let live_errors = app
@@ -3577,7 +3603,7 @@ mod completion_flow_tests {
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             session: public_session(vec![serde_json::to_value(run_errored).unwrap()]),
-            status: WorkerStatus::Idle,
+            state: WorkerStatus::Idle.into(),
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });
@@ -3641,7 +3667,7 @@ mod completion_flow_tests {
                 pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
-            status: WorkerStatus::Running,
+            state: WorkerStatus::Running.into(),
             in_flight: InFlightSnapshot {
                 blocks: vec![
                     InFlightBlock::Thinking {
@@ -3968,7 +3994,7 @@ mod completion_flow_tests {
                 pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
-            status: WorkerStatus::Idle,
+            state: WorkerStatus::Idle.into(),
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });
@@ -4020,7 +4046,7 @@ mod completion_flow_tests {
                 pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
-            status: WorkerStatus::Idle,
+            state: WorkerStatus::Idle.into(),
             in_flight: Default::default(),
             internal_workers: vec![InternalWorkerSnapshot {
                 worker: InternalWorkerRef {
@@ -4194,7 +4220,7 @@ mod completion_flow_tests {
                 entries: Vec::new(),
             },
             greeting,
-            status: WorkerStatus::Idle,
+            state: WorkerStatus::Idle.into(),
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });
@@ -4393,7 +4419,7 @@ mod completion_flow_tests {
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             session: public_session(assistant_item_entries),
-            status: WorkerStatus::Running,
+            state: WorkerStatus::Running.into(),
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });

@@ -1,7 +1,12 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{
+    OnceLock, RwLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
-use protocol::WorkerStatus;
+use protocol::{
+    WorkerBusyState, WorkerMaintenanceState, WorkerRunState, WorkerState, WorkerStateSnapshot,
+    WorkerStatus,
+};
 use serde_json::json;
 use session_store::SegmentId;
 
@@ -9,20 +14,16 @@ use crate::fs_view::WorkerFsView;
 
 /// Shared state between WorkerController and runtime directory.
 ///
-/// Controller updates this in-memory; RuntimeDir writes the status
-/// snapshot to disk. Wrapped in `Arc` for sharing.
-///
-/// History and typed user-segment mirrors used to live here so the
-/// IPC layer could answer `Method::GetHistory`. Those reads now go
-/// directly through the session-log sink (`Event::Snapshot` +
-/// live events), so this struct holds only status, identity,
-/// greeting, and filesystem completion lookup hubs.
+/// `WorkerStateSnapshot` is the sole live execution-state authority. Runtime
+/// catalog status remains a separate lifecycle projection because `Stopped`
+/// describes the execution handle rather than a live controller state.
 pub struct WorkerSharedState {
     pub worker_name: String,
     pub segment_id: SegmentId,
     pub manifest_toml: String,
     pub greeting: protocol::Greeting,
-    pub status: RwLock<WorkerStatus>,
+    state: RwLock<WorkerStateSnapshot>,
+    last_command_id: AtomicU64,
     /// Worker-from-the-inside view of the filesystem. Set once in
     /// `WorkerController::start` after the local WorkdirSession provider is
     /// materialised, and read from the IPC server layer to answer
@@ -39,12 +40,23 @@ impl WorkerSharedState {
         manifest_toml: String,
         greeting: protocol::Greeting,
     ) -> Self {
+        Self::new_with_generation(worker_name, segment_id, manifest_toml, greeting, 1)
+    }
+
+    pub fn new_with_generation(
+        worker_name: String,
+        segment_id: SegmentId,
+        manifest_toml: String,
+        greeting: protocol::Greeting,
+        execution_generation: u64,
+    ) -> Self {
         Self {
             worker_name,
             segment_id,
             manifest_toml,
             greeting,
-            status: RwLock::new(WorkerStatus::Idle),
+            state: RwLock::new(WorkerStateSnapshot::initial(execution_generation)),
+            last_command_id: AtomicU64::new(0),
             fs_view: OnceLock::new(),
             flow_transition_enabled: AtomicBool::new(false),
         }
@@ -70,21 +82,57 @@ impl WorkerSharedState {
         self.flow_transition_enabled.load(Ordering::Acquire)
     }
 
-    pub fn set_status(&self, status: WorkerStatus) {
-        if let Ok(mut s) = self.status.write() {
-            *s = status;
+    pub fn transition(&self, state: WorkerState) -> WorkerStateSnapshot {
+        let mut snapshot = self
+            .state
+            .write()
+            .expect("worker state lock poisoned; refusing an inferred fallback state");
+        if snapshot.state != state {
+            snapshot.revision = snapshot.revision.saturating_add(1);
+            snapshot.state = state;
+        }
+        snapshot.last_command_id = self.last_command_id.load(Ordering::Acquire);
+        snapshot.clone()
+    }
+
+    pub fn accept_command_id(&self, command_id: u64) -> bool {
+        self.last_command_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (command_id > current).then_some(command_id)
+            })
+            .is_ok()
+    }
+
+    pub fn snapshot(&self) -> WorkerStateSnapshot {
+        let mut snapshot = self
+            .state
+            .read()
+            .expect("worker state lock poisoned; refusing an inferred fallback state")
+            .clone();
+        snapshot.last_command_id = self.last_command_id.load(Ordering::Acquire);
+        snapshot
+    }
+
+    /// Runtime catalog projection. This must not be used as live command
+    /// admission authority.
+    pub fn catalog_status(&self) -> WorkerStatus {
+        match self.snapshot().state {
+            WorkerState::Idle => WorkerStatus::Idle,
+            WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Paused)) => WorkerStatus::Paused,
+            WorkerState::Busy(WorkerBusyState::Run(_))
+            | WorkerState::Busy(WorkerBusyState::Maintenance(WorkerMaintenanceState::Compacting)) => {
+                WorkerStatus::Running
+            }
         }
     }
 
-    pub fn get_status(&self) -> WorkerStatus {
-        self.status.read().map(|s| *s).unwrap_or(WorkerStatus::Idle)
-    }
-
-    /// Serialize status as JSON.
+    /// Serialize the runtime-directory lifecycle projection as JSON while
+    /// retaining the full state snapshot for diagnostics and reconnects.
     pub fn status_json(&self) -> String {
-        let status = self.get_status();
+        let snapshot = self.snapshot();
         json!({
-            "state": status,
+            "state": self.catalog_status(),
+            "worker_state": snapshot,
             "segment_id": self.segment_id.to_string(),
             "worker_name": self.worker_name,
         })
@@ -97,11 +145,12 @@ mod tests {
     use super::*;
 
     fn test_state() -> WorkerSharedState {
-        WorkerSharedState::new(
+        WorkerSharedState::new_with_generation(
             "test-worker".into(),
             session_store::new_segment_id(),
             "[engine]\nname = \"test-worker\"".into(),
             test_greeting(),
+            7,
         )
     }
 
@@ -119,36 +168,40 @@ mod tests {
     }
 
     #[test]
-    fn initial_status_is_idle() {
+    fn initial_snapshot_is_idle() {
         let state = test_state();
-        assert_eq!(state.get_status(), WorkerStatus::Idle);
+        assert_eq!(state.snapshot(), WorkerStateSnapshot::initial(7));
+        assert_eq!(state.catalog_status(), WorkerStatus::Idle);
     }
 
     #[test]
-    fn set_and_get_status() {
+    fn transitions_increment_revision_only_when_state_changes() {
         let state = test_state();
-        state.set_status(WorkerStatus::Running);
-        assert_eq!(state.get_status(), WorkerStatus::Running);
-        state.set_status(WorkerStatus::Paused);
-        assert_eq!(state.get_status(), WorkerStatus::Paused);
+        let running = WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running));
+        let snapshot = state.transition(running.clone());
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(snapshot.state, running);
+        assert_eq!(state.transition(running).revision, 1);
+
+        let paused = WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Paused));
+        let snapshot = state.transition(paused.clone());
+        assert_eq!(snapshot.revision, 2);
+        assert_eq!(snapshot.state, paused);
+        assert_eq!(state.catalog_status(), WorkerStatus::Paused);
     }
 
     #[test]
-    fn status_json_contains_fields() {
+    fn status_json_contains_full_snapshot_and_catalog_projection() {
         let state = test_state();
-        let json = state.status_json();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["state"], "idle");
+        state.transition(WorkerState::Busy(WorkerBusyState::Maintenance(
+            WorkerMaintenanceState::Compacting,
+        )));
+        let parsed: serde_json::Value = serde_json::from_str(&state.status_json()).unwrap();
+        assert_eq!(parsed["state"], "running");
+        assert_eq!(parsed["worker_state"]["execution_generation"], 7);
+        assert_eq!(parsed["worker_state"]["revision"], 1);
+        assert_eq!(parsed["worker_state"]["state"]["kind"], "busy");
         assert_eq!(parsed["worker_name"], "test-worker");
         assert!(parsed["segment_id"].is_string());
-    }
-
-    #[test]
-    fn status_json_reflects_changes() {
-        let state = test_state();
-        state.set_status(WorkerStatus::Running);
-        let json = state.status_json();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["state"], "running");
     }
 }

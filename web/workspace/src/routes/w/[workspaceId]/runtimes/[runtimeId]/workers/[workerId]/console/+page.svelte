@@ -541,9 +541,42 @@
         }
     }
 
+    let nextWorkerCommandId = 1;
+
+    function lifecycleMethod(
+        command: "pause" | "cancel" | "resume" | "compact",
+    ): ProtocolMethod | null {
+        const state = consoleProjection.workerState;
+        if (!state) {
+            sendError = "Worker state snapshot is not available; reconnect before sending control.";
+            return null;
+        }
+        const commandId = Math.max(
+            nextWorkerCommandId,
+            state.last_command_id + 1,
+        );
+        nextWorkerCommandId = commandId + 1;
+        const envelope = {
+            command_id: commandId,
+            expected_execution_generation: state.execution_generation,
+            expected_worker_state_revision: state.revision,
+        };
+        switch (command) {
+            case "pause":
+                return { method: "pause", params: { command: envelope } };
+            case "cancel":
+                return { method: "cancel", params: { command: envelope } };
+            case "resume":
+                return { method: "resume", params: { command: envelope } };
+            case "compact":
+                return { method: "compact", params: { command: envelope } };
+        }
+    }
+
     function sendWorkerControl(command: "pause" | "cancel" | "resume") {
         const label = command[0].toUpperCase() + command.slice(1);
-        sendControl({ method: command }, label);
+        const method = lifecycleMethod(command);
+        if (method) sendControl(method, label);
     }
 
     function isEditableTarget(target: EventTarget | null): boolean {
@@ -627,8 +660,11 @@
                         auto_run: true,
                     },
                 };
-            case "compact":
-                return { method: "compact" };
+            case "compact": {
+                const method = lifecycleMethod("compact");
+                if (!method) throw new Error("Worker state snapshot is not available");
+                return method;
+            }
             case "list_rewind_targets":
                 return { method: "list_rewind_targets" };
             case "register_peer":
@@ -691,7 +727,7 @@
 
     function handleComposerSubmit() {
         if (workerRunning) {
-            sendControl({ method: "cancel" }, "Stop");
+            sendWorkerControl("cancel");
             return;
         }
         void submitDraft(composerInputElement?.snapshot() ?? draft);
@@ -894,8 +930,26 @@
     ): string | null {
         switch (event.event) {
             case "snapshot":
-            case "status":
-                return event.data.status;
+                return event.data.state.state.kind === "idle"
+                    ? "idle"
+                    : event.data.state.state.state.kind === "run" &&
+                        event.data.state.state.state.state === "paused"
+                      ? "paused"
+                      : "running";
+            case "worker_state":
+                return event.data.snapshot.state.kind === "idle"
+                    ? "idle"
+                    : event.data.snapshot.state.state.kind === "run" &&
+                        event.data.snapshot.state.state.state === "paused"
+                      ? "paused"
+                      : "running";
+            case "command_acknowledged":
+                return event.data.acknowledgement.state.state.kind === "idle"
+                    ? "idle"
+                    : event.data.acknowledgement.state.state.state.kind === "run" &&
+                        event.data.acknowledgement.state.state.state.state === "paused"
+                      ? "paused"
+                      : "running";
             case "shutdown":
                 return "shutdown";
             default:
@@ -1620,7 +1674,10 @@
                 type="button"
                 class="secondary-button"
                 disabled={protocolState !== "open"}
-                onclick={() => sendControl({ method: "compact" }, "Compact")}
+                onclick={() => {
+                    const method = lifecycleMethod("compact");
+                    if (method) sendControl(method, "Compact");
+                }}
             >
                 Compact
             </button>

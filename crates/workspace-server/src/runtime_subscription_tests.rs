@@ -6,7 +6,7 @@ use worker_runtime::catalog::{
 };
 use worker_runtime::execution::{
     WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation, WorkerExecutionResult,
-    WorkerExecutionRunState, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
+    WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
 };
 use worker_runtime::identity::WorkerId;
 use worker_runtime::profile_archive::{ProfileSourceArchiveRef, ProfileSourceGraphSummary};
@@ -22,7 +22,6 @@ impl WorkerExecutionBackend for TestExecutionBackend {
     fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
         WorkerExecutionSpawnResult::connected(
             WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
-            WorkerExecutionRunState::Idle,
             None,
         )
     }
@@ -35,24 +34,17 @@ impl WorkerExecutionBackend for TestExecutionBackend {
         if let Some(submission_request_id) = input.submission_request_id {
             WorkerExecutionResult::accepted_submission(
                 WorkerExecutionOperation::Input,
-                WorkerExecutionRunState::Busy,
                 submission_request_id,
                 uuid::Uuid::now_v7().to_string(),
                 protocol::SubmissionDisposition::Started,
             )
         } else {
-            WorkerExecutionResult::accepted(
-                WorkerExecutionOperation::Input,
-                WorkerExecutionRunState::Busy,
-            )
+            WorkerExecutionResult::accepted(WorkerExecutionOperation::Input)
         }
     }
 
     fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
-        WorkerExecutionResult::accepted(
-            WorkerExecutionOperation::Stop,
-            WorkerExecutionRunState::Stopped,
-        )
+        WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop)
     }
 }
 
@@ -199,8 +191,8 @@ async fn equal_downstream_selectors_share_one_upstream_subscription() {
     runtime
         .observe_worker_event(
             &worker.worker_ref,
-            protocol::Event::Status {
-                status: protocol::WorkerStatus::Running,
+            protocol::Event::WorkerState {
+                snapshot: protocol::WorkerStatus::Running.into(),
             },
         )
         .unwrap();
@@ -339,8 +331,8 @@ async fn embedded_runtime_uses_in_process_subscription_source() {
     runtime
         .observe_worker_event(
             &worker.worker_ref,
-            protocol::Event::Status {
-                status: protocol::WorkerStatus::Running,
+            protocol::Event::WorkerState {
+                snapshot: protocol::WorkerStatus::Running.into(),
             },
         )
         .unwrap();

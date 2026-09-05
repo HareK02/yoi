@@ -1,4 +1,4 @@
-import type { Event } from "$lib/generated/protocol";
+import type { Event, WorkerStateSnapshot, WorkerStatus } from "$lib/generated/protocol";
 import {
   type ConsoleEventInput,
   type ConsoleLine,
@@ -18,6 +18,23 @@ import {
 declare const Deno: {
   test(name: string, fn: () => void): void;
 };
+
+function workerState(status: WorkerStatus): WorkerStateSnapshot {
+  return {
+    execution_generation: 1,
+    revision: status === "idle" ? 0 : 1,
+    last_command_id: 0,
+    state: status === "idle"
+      ? { kind: "idle" }
+      : {
+        kind: "busy",
+        state: {
+          kind: "run",
+          state: status === "paused" ? "paused" : "running",
+        },
+      },
+  };
+}
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) {
@@ -131,7 +148,7 @@ function snapshotEvent(cwd: string, entries: unknown[] = []): Event {
         context_window: 100,
         context_tokens: 20,
       },
-      status: "idle",
+      state: workerState("idle"),
       in_flight: { blocks: [] },
     },
   };
@@ -213,7 +230,7 @@ Deno.test("snapshot replaces a live error with one durable run_errored row", () 
     },
     {
       eventId: "idle-after-error",
-      event: { event: "status", data: { status: "idle" } } satisfies Event,
+      event: { event: "worker_state", data: { snapshot: workerState("idle") } } satisfies Event,
     },
   ]);
 
@@ -653,7 +670,7 @@ Deno.test("projectConsole streams distinct Bash stdout and stderr through termin
 Deno.test("snapshot restores bounded in-flight Bash command output", () => {
   const snapshot = snapshotEvent("/repo");
   if (snapshot.event !== "snapshot") throw new Error("snapshot fixture expected");
-  snapshot.data.status = "running";
+  snapshot.data.state = workerState("running");
   snapshot.data.in_flight = {
     blocks: [{
       kind: "tool_call",
@@ -1403,7 +1420,7 @@ Deno.test("projectConsole hides lifecycle events and renders system items", () =
   const projection = projectConsole([
     {
       eventId: "30",
-      event: { event: "status", data: { status: "running" } } satisfies Event,
+      event: { event: "worker_state", data: { snapshot: workerState("running") } } satisfies Event,
     },
     {
       eventId: "31",
@@ -1527,7 +1544,7 @@ Deno.test("projectConsole renders snapshot entries and in-flight output", () => 
             context_window: 100,
             context_tokens: 20,
           },
-          status: "running",
+          state: workerState("running"),
           in_flight: {
             blocks: [
               { kind: "text", text: "partial" },
@@ -1578,7 +1595,7 @@ Deno.test("projectConsole restores system items from snapshot entries", () => {
           context_window: 100,
           context_tokens: 20,
         },
-        status: "idle",
+        state: workerState("idle"),
       },
     } satisfies Event,
   }]);
@@ -1922,7 +1939,7 @@ Deno.test("console Worker views expose only direct Internal Workers", () => {
               kind: "sub_worker",
             },
             revision: 1,
-            event: { event: "status", data: { status: "running" } },
+            event: { event: "worker_state", data: { snapshot: workerState("running") } },
           },
         },
       },
@@ -1941,7 +1958,7 @@ Deno.test("console Worker views expose only direct Internal Workers", () => {
           kind: "sub_worker",
         },
         revision: 1,
-        event: { event: "status", data: { status: "idle" } },
+        event: { event: "worker_state", data: { snapshot: workerState("idle") } },
       },
     },
   }]);
@@ -2033,7 +2050,7 @@ Deno.test("parent snapshot authoritatively replaces Internal Worker projections"
           kind: "sub_worker",
         },
         revision: 1,
-        event: { event: "status", data: { status: "running" } },
+        event: { event: "worker_state", data: { snapshot: workerState("running") } },
       },
     },
   }]);

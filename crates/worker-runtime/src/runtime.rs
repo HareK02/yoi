@@ -13,8 +13,8 @@ use crate::error::RuntimeError;
 use crate::execution::WorkerExecutionRestoreRequest;
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionBackendRef, WorkerExecutionHandle,
-    WorkerExecutionOperation, WorkerExecutionResult, WorkerExecutionRunState,
-    WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
+    WorkerExecutionOperation, WorkerExecutionResult, WorkerExecutionSpawnRequest,
+    WorkerExecutionSpawnResult,
 };
 #[cfg(feature = "fs-store")]
 use crate::fs_store::{
@@ -725,12 +725,11 @@ impl Runtime {
         };
 
         let spawn_result = backend.spawn_worker(spawn_request);
-        let (handle, run_state, working_directory) = match spawn_result {
+        let (handle, working_directory) = match spawn_result {
             WorkerExecutionSpawnResult::Connected {
                 handle,
-                run_state,
                 working_directory,
-            } => (handle, run_state, working_directory),
+            } => (handle, working_directory),
             WorkerExecutionSpawnResult::Rejected(result)
             | WorkerExecutionSpawnResult::Errored(result) => {
                 self.rollback_failed_create(&worker_ref)?;
@@ -785,11 +784,10 @@ impl Runtime {
                     result,
                 });
             }
-            let initial_run_state = dispatch_result.run_state;
             let detail = self.commit_created_worker(
                 &worker_ref,
                 handle,
-                initial_run_state,
+                WorkerStatus::Running,
                 working_directory,
                 dispatch_result,
             )?;
@@ -799,9 +797,9 @@ impl Runtime {
             self.commit_created_worker(
                 &worker_ref,
                 handle,
-                run_state,
+                WorkerStatus::Idle,
                 working_directory,
-                WorkerExecutionResult::accepted(WorkerExecutionOperation::Spawn, run_state),
+                WorkerExecutionResult::accepted(WorkerExecutionOperation::Spawn),
             )
         }
     }
@@ -1086,13 +1084,12 @@ impl Runtime {
         match backend.restore_worker(request) {
             WorkerExecutionSpawnResult::Connected {
                 handle,
-                run_state,
                 working_directory,
             } => {
                 self.commit_restored_worker_execution(
                     worker_ref,
                     handle,
-                    run_state,
+                    WorkerStatus::Idle,
                     working_directory,
                 )?;
                 self.worker_detail(worker_ref)
@@ -1222,7 +1219,19 @@ impl Runtime {
         let mut state = self.lock()?;
         state.ensure_running()?;
         let worker = state.worker_mut(worker_ref)?;
-        worker.status = worker_status_from_run_state(dispatch_result.run_state);
+        if let Some(snapshot) = dispatch_result.worker_state.as_ref() {
+            worker.status = match snapshot.catalog_status() {
+                protocol::WorkerStatus::Idle => WorkerStatus::Idle,
+                protocol::WorkerStatus::Running => WorkerStatus::Running,
+                protocol::WorkerStatus::Paused => WorkerStatus::Paused,
+                protocol::WorkerStatus::Stopped => WorkerStatus::Stopped,
+            };
+        } else if matches!(
+            submission.as_ref().map(|ack| ack.disposition),
+            Some(protocol::SubmissionDisposition::Started)
+        ) {
+            worker.status = WorkerStatus::Running;
+        }
         let status = worker.status;
         #[cfg(feature = "ws-server")]
         if let Some(payload) = input_protocol_event(&input) {
@@ -1431,7 +1440,7 @@ impl Runtime {
             let entries = self.worker_completions(worker_ref, kind, &prefix)?;
             return Ok(vec![Event::Completions { kind, entries }]);
         }
-        if matches!(&method, Method::Shutdown) {
+        if matches!(&method, Method::Shutdown { .. }) {
             self.stop_worker(worker_ref, Some("worker protocol shutdown".to_string()))?;
             return Ok(Vec::new());
         }
@@ -1481,7 +1490,7 @@ impl Runtime {
         &self,
         worker_ref: &WorkerRef,
         handle: WorkerExecutionHandle,
-        run_state: WorkerExecutionRunState,
+        status: WorkerStatus,
         working_directory: Option<CatalogWorkingDirectoryStatus>,
         _result: WorkerExecutionResult,
     ) -> Result<WorkerDetail, RuntimeError> {
@@ -1490,7 +1499,7 @@ impl Runtime {
             let worker = state.worker_mut(worker_ref)?;
             worker.execution_handle = Some(handle);
             worker.execution_bound = true;
-            worker.status = worker_status_from_run_state(run_state);
+            worker.status = status;
             worker.restore_intent = restore_intent_for_status(worker.status);
             worker.working_directory = working_directory;
             worker.detail()
@@ -1518,16 +1527,28 @@ impl Runtime {
         worker_ref: &WorkerRef,
         result: WorkerExecutionResult,
     ) -> Result<(), RuntimeError> {
-        let mut state = self.lock()?;
-        if result.is_accepted() {
-            let status = worker_status_from_run_state(result.run_state);
-            let worker = state.worker_mut(worker_ref)?;
-            worker.status = status;
-            worker.restore_intent = restore_intent_for_status(status);
-            state.publish_worker_upsert(worker_ref.worker_id)?;
-            state.persist_runtime_snapshot()?;
-            state.persist_worker(&worker_ref.worker_id)?;
+        // Accepted dispatch without a state snapshot is transport evidence only;
+        // the revisioned protocol stream remains live authority. Test/detached
+        // backends may return an exact full snapshot as their acknowledgement.
+        if !result.is_accepted() {
+            return Ok(());
         }
+        let Some(snapshot) = result.worker_state else {
+            return Ok(());
+        };
+        let status = match snapshot.catalog_status() {
+            protocol::WorkerStatus::Idle => WorkerStatus::Idle,
+            protocol::WorkerStatus::Running => WorkerStatus::Running,
+            protocol::WorkerStatus::Paused => WorkerStatus::Paused,
+            protocol::WorkerStatus::Stopped => WorkerStatus::Stopped,
+        };
+        let mut state = self.lock()?;
+        let worker = state.worker_mut(worker_ref)?;
+        worker.status = status;
+        worker.restore_intent = restore_intent_for_status(status);
+        state.publish_worker_upsert(worker_ref.worker_id)?;
+        state.persist_runtime_snapshot()?;
+        state.persist_worker(&worker_ref.worker_id)?;
         Ok(())
     }
 
@@ -1730,7 +1751,7 @@ impl Runtime {
                 context_window: 0,
                 context_tokens: 0,
             },
-            status: protocol::WorkerStatus::Idle,
+            state: protocol::WorkerStateSnapshot::initial(1),
             in_flight: protocol::InFlightSnapshot {
                 blocks: Vec::new(),
                 commands: Vec::new(),
@@ -1968,12 +1989,11 @@ impl Runtime {
             match backend.restore_worker(request) {
                 WorkerExecutionSpawnResult::Connected {
                     handle,
-                    run_state,
                     working_directory,
                 } => self.commit_restored_worker_execution(
                     &candidate.worker_ref,
                     handle,
-                    run_state,
+                    WorkerStatus::Idle,
                     working_directory,
                 )?,
                 WorkerExecutionSpawnResult::Rejected(result)
@@ -1990,7 +2010,7 @@ impl Runtime {
         &self,
         worker_ref: &WorkerRef,
         handle: WorkerExecutionHandle,
-        run_state: WorkerExecutionRunState,
+        status: WorkerStatus,
         working_directory: Option<CatalogWorkingDirectoryStatus>,
     ) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
@@ -1999,7 +2019,7 @@ impl Runtime {
             let worker = state.worker_mut(worker_ref)?;
             worker.execution_handle = Some(handle);
             worker.execution_bound = true;
-            worker.status = worker_status_from_run_state(run_state);
+            worker.status = status;
             worker.restore_intent = restore_intent_for_status(worker.status);
             worker.working_directory = working_directory;
         }
@@ -2867,7 +2887,7 @@ impl RuntimeState {
     ) {
         match event {
             protocol::Event::Snapshot {
-                status,
+                state,
                 internal_workers,
                 ..
             } => {
@@ -2875,7 +2895,7 @@ impl RuntimeState {
                 statuses.insert(
                     worker.session_id.clone(),
                     InternalWorkerActivity {
-                        status: *status,
+                        status: state.catalog_status(),
                         parent_session_id: worker.parent_session_id.clone(),
                     },
                 );
@@ -2888,26 +2908,17 @@ impl RuntimeState {
                 event,
                 ..
             } => Self::project_internal_worker_event(statuses, nested_worker, event),
-            protocol::Event::Status { status } => {
-                statuses.insert(
-                    worker.session_id.clone(),
-                    InternalWorkerActivity {
-                        status: *status,
-                        parent_session_id: worker.parent_session_id.clone(),
+            protocol::Event::WorkerState { snapshot }
+            | protocol::Event::CommandAcknowledged {
+                acknowledgement:
+                    protocol::WorkerCommandAcknowledgement {
+                        state: snapshot, ..
                     },
-                );
-            }
-            protocol::Event::RunEnd { result } => {
-                let status = match result {
-                    protocol::RunResult::Paused => protocol::WorkerStatus::Paused,
-                    protocol::RunResult::Finished
-                    | protocol::RunResult::LimitReached
-                    | protocol::RunResult::RolledBack => protocol::WorkerStatus::Idle,
-                };
+            } => {
                 statuses.insert(
                     worker.session_id.clone(),
                     InternalWorkerActivity {
-                        status,
+                        status: snapshot.catalog_status(),
                         parent_session_id: worker.parent_session_id.clone(),
                     },
                 );
@@ -2963,28 +2974,21 @@ impl RuntimeState {
             return false;
         };
         let next_status = match event {
-            protocol::Event::Status {
-                status: protocol::WorkerStatus::Running,
-            } => Some(WorkerStatus::Running),
-            protocol::Event::Status {
-                status: protocol::WorkerStatus::Idle,
-            } => Some(WorkerStatus::Idle),
-            protocol::Event::Status {
-                status: protocol::WorkerStatus::Paused,
-            } => Some(WorkerStatus::Paused),
-            protocol::Event::Snapshot { status, .. } => match status {
-                protocol::WorkerStatus::Running => Some(WorkerStatus::Running),
-                protocol::WorkerStatus::Idle => Some(WorkerStatus::Idle),
-                protocol::WorkerStatus::Paused => Some(WorkerStatus::Paused),
-                protocol::WorkerStatus::Stopped => Some(WorkerStatus::Stopped),
-            },
-            protocol::Event::RunEnd { result } => match result {
-                protocol::RunResult::Finished | protocol::RunResult::RolledBack => {
-                    Some(WorkerStatus::Idle)
-                }
-                protocol::RunResult::Paused => Some(WorkerStatus::Paused),
-                protocol::RunResult::LimitReached => Some(WorkerStatus::Idle),
-            },
+            protocol::Event::WorkerState { snapshot }
+            | protocol::Event::Snapshot {
+                state: snapshot, ..
+            }
+            | protocol::Event::CommandAcknowledged {
+                acknowledgement:
+                    protocol::WorkerCommandAcknowledgement {
+                        state: snapshot, ..
+                    },
+            } => Some(match snapshot.catalog_status() {
+                protocol::WorkerStatus::Idle => WorkerStatus::Idle,
+                protocol::WorkerStatus::Running => WorkerStatus::Running,
+                protocol::WorkerStatus::Paused => WorkerStatus::Paused,
+                protocol::WorkerStatus::Stopped => WorkerStatus::Stopped,
+            }),
             _ => None,
         };
         if let Some(next_status) = next_status {
@@ -3078,16 +3082,6 @@ fn restore_intent_for_status(status: WorkerStatus) -> WorkerRestoreIntent {
         WorkerRestoreIntent::Automatic
     } else {
         WorkerRestoreIntent::Explicit
-    }
-}
-
-fn worker_status_from_run_state(run_state: WorkerExecutionRunState) -> WorkerStatus {
-    match run_state {
-        WorkerExecutionRunState::Idle => WorkerStatus::Idle,
-        WorkerExecutionRunState::Busy => WorkerStatus::Running,
-        WorkerExecutionRunState::Stopped
-        | WorkerExecutionRunState::Rejected
-        | WorkerExecutionRunState::Errored => WorkerStatus::Stopped,
     }
 }
 
@@ -3304,7 +3298,7 @@ mod tests {
     };
     use crate::execution::{
         WorkerExecutionBackend, WorkerExecutionContext, WorkerExecutionHandle,
-        WorkerExecutionRestoreRequest, WorkerExecutionRunState,
+        WorkerExecutionRestoreRequest,
     };
     use crate::working_directory::WorkingDirectoryDiagnostic;
     use async_trait::async_trait;
@@ -3312,6 +3306,14 @@ mod tests {
     #[cfg(feature = "fs-store")]
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+
+    fn test_command() -> protocol::WorkerCommandEnvelope {
+        protocol::WorkerCommandEnvelope {
+            command_id: 1,
+            expected_execution_generation: 1,
+            expected_worker_state_revision: 0,
+        }
+    }
 
     #[test]
     fn repository_resource_failures_keep_typed_credential_diagnostics() {
@@ -3359,7 +3361,9 @@ mod tests {
         protocol::Event::InternalWorker {
             worker,
             revision: 1,
-            event: Box::new(protocol::Event::Status { status }),
+            event: Box::new(protocol::Event::WorkerState {
+                snapshot: status.into(),
+            }),
         }
     }
 
@@ -3452,7 +3456,7 @@ mod tests {
                 context_window: 0,
                 context_tokens: 0,
             },
-            status: protocol::WorkerStatus::Idle,
+            state: protocol::WorkerStatus::Idle.into(),
             in_flight: protocol::InFlightSnapshot::default(),
             internal_workers: Vec::new(),
         };
@@ -3967,7 +3971,6 @@ mod tests {
                 .insert(request.worker_ref.worker_id.clone(), request.context);
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
-                run_state: WorkerExecutionRunState::Idle,
                 working_directory: request
                     .working_directory
                     .as_ref()
@@ -3997,7 +4000,6 @@ mod tests {
                 .insert(request.worker_ref.worker_id.clone(), request.context);
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
-                run_state: WorkerExecutionRunState::Idle,
                 working_directory: request
                     .working_directory
                     .as_ref()
@@ -4020,7 +4022,6 @@ mod tests {
                 .unwrap_or_else(|| {
                     WorkerExecutionResult::accepted_submission(
                         WorkerExecutionOperation::Input,
-                        WorkerExecutionRunState::Idle,
                         "request-test",
                         "test-submission",
                         protocol::SubmissionDisposition::Started,
@@ -4038,17 +4039,11 @@ mod tests {
         }
 
         fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
-            WorkerExecutionResult::accepted(
-                WorkerExecutionOperation::Stop,
-                WorkerExecutionRunState::Stopped,
-            )
+            WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop)
         }
 
         fn cancel_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
-            WorkerExecutionResult::accepted(
-                WorkerExecutionOperation::Cancel,
-                WorkerExecutionRunState::Stopped,
-            )
+            WorkerExecutionResult::accepted(WorkerExecutionOperation::Cancel)
         }
 
         #[cfg(feature = "ws-server")]
@@ -4374,7 +4369,9 @@ mod tests {
             .send_protocol_method_scoped(
                 &scope("workspace-a", "server-a"),
                 &workspace_b.worker_ref,
-                Method::Shutdown,
+                Method::Shutdown {
+                    command: test_command(),
+                },
             )
             .unwrap_err();
         assert!(matches!(
@@ -4722,11 +4719,10 @@ mod tests {
     }
 
     #[test]
-    fn create_worker_uses_committed_input_ack_run_state() {
+    fn create_worker_uses_started_submission_ack_for_initial_running_status() {
         let (runtime, backend) = runtime_and_backend();
         backend.set_dispatch_result(WorkerExecutionResult::accepted_submission(
             WorkerExecutionOperation::Input,
-            WorkerExecutionRunState::Idle,
             "request-test",
             "test-submission",
             protocol::SubmissionDisposition::Started,
@@ -4736,7 +4732,7 @@ mod tests {
 
         let detail = runtime.create_worker(request).unwrap();
 
-        assert_eq!(detail.status, WorkerStatus::Idle);
+        assert_eq!(detail.status, WorkerStatus::Running);
     }
 
     #[test]
@@ -4745,7 +4741,6 @@ mod tests {
         backend.preserve_commit_ack_submission_id();
         backend.set_dispatch_result(WorkerExecutionResult::accepted_submission(
             WorkerExecutionOperation::Input,
-            WorkerExecutionRunState::Busy,
             "request-test",
             "forged-submission",
             protocol::SubmissionDisposition::Started,
@@ -4770,7 +4765,6 @@ mod tests {
         let (runtime, backend) = runtime_and_backend();
         backend.set_dispatch_result(WorkerExecutionResult::accepted(
             WorkerExecutionOperation::Input,
-            WorkerExecutionRunState::Busy,
         ));
         let mut request = task_request("missing initial input commit ack");
         request.initial_input = Some(WorkerInput::user("start the ticket"));
@@ -4898,7 +4892,7 @@ mod tests {
                     context_window: 128,
                     context_tokens: 64,
                 },
-                status: protocol::WorkerStatus::Running,
+                state: protocol::WorkerStatus::Running.into(),
                 in_flight: protocol::InFlightSnapshot {
                     blocks: Vec::new(),
                     commands: Vec::new(),
@@ -4914,13 +4908,13 @@ mod tests {
             protocol::Event::Snapshot {
                 session,
                 greeting,
-                status,
+                state,
                 ..
             } => {
                 assert_eq!(session.entries.len(), 1);
                 assert_eq!(session.entries[0].entry_id, "restored-log-entry");
                 assert_eq!(greeting.worker_name, "live-worker");
-                assert_eq!(status, protocol::WorkerStatus::Running);
+                assert_eq!(state.catalog_status(), protocol::WorkerStatus::Running);
             }
             other => panic!("expected snapshot, got {other:?}"),
         }
@@ -4936,7 +4930,6 @@ mod tests {
         fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
-                run_state: WorkerExecutionRunState::Idle,
                 working_directory: request
                     .working_directory
                     .as_ref()
@@ -4951,7 +4944,6 @@ mod tests {
         ) -> WorkerExecutionResult {
             WorkerExecutionResult::accepted_submission(
                 WorkerExecutionOperation::Input,
-                WorkerExecutionRunState::Idle,
                 "request-test",
                 input
                     .submission_request_id
@@ -4993,7 +4985,12 @@ mod tests {
             .unwrap();
 
         runtime
-            .send_protocol_method(&detail.worker_ref, Method::Shutdown)
+            .send_protocol_method(
+                &detail.worker_ref,
+                Method::Shutdown {
+                    command: test_command(),
+                },
+            )
             .unwrap();
 
         assert_eq!(
@@ -5009,7 +5006,12 @@ mod tests {
             .create_worker(task_request("restore explicitly"))
             .unwrap();
         runtime
-            .send_protocol_method(&detail.worker_ref, Method::Shutdown)
+            .send_protocol_method(
+                &detail.worker_ref,
+                Method::Shutdown {
+                    command: test_command(),
+                },
+            )
             .unwrap();
 
         assert!(matches!(
@@ -5027,7 +5029,7 @@ mod tests {
         assert_eq!(*backend.run_generations.lock().unwrap(), vec![1, 2]);
         assert_eq!(
             runtime.worker_detail(&detail.worker_ref).unwrap().status,
-            WorkerStatus::Idle
+            WorkerStatus::Running
         );
     }
 

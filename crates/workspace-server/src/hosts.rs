@@ -36,8 +36,6 @@ use worker_runtime::config_bundle::{
     ConfigBundleMetadata, ConfigBundleProvenance, ConfigProfileDescriptor,
 };
 use worker_runtime::error::RuntimeError as EmbeddedRuntimeError;
-#[cfg(test)]
-use worker_runtime::execution::WorkerExecutionRunState;
 use worker_runtime::fs_store::FsRuntimeStoreOptions;
 use worker_runtime::http_server::{
     RUNTIME_PING_PERMISSION, RUNTIME_WORKSPACE_SCOPE_HEADER,
@@ -5170,7 +5168,6 @@ mod tests {
                     request.worker_ref,
                     self.backend_id(),
                 ),
-                run_state: WorkerExecutionRunState::Idle,
                 working_directory: request
                     .working_directory
                     .as_ref()
@@ -5199,8 +5196,8 @@ mod tests {
             let content = input.content;
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(10));
-                let _ = context.publish_protocol_event(protocol::Event::Status {
-                    status: protocol::WorkerStatus::Running,
+                let _ = context.publish_protocol_event(protocol::Event::WorkerState {
+                    snapshot: protocol::WorkerStatus::Running.into(),
                 });
                 let _ = context.publish_protocol_event(protocol::Event::TextDone {
                     text: format!("echo: {content}"),
@@ -5208,14 +5205,13 @@ mod tests {
                 let _ = context.publish_protocol_event(protocol::Event::RunEnd {
                     result: protocol::RunResult::Finished,
                 });
-                let _ = context.publish_protocol_event(protocol::Event::Status {
-                    status: protocol::WorkerStatus::Idle,
+                let _ = context.publish_protocol_event(protocol::Event::WorkerState {
+                    snapshot: protocol::WorkerStatus::Idle.into(),
                 });
             });
             if let Some(submission_request_id) = submission_request_id {
                 worker_runtime::execution::WorkerExecutionResult::accepted_submission(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
-                    WorkerExecutionRunState::Busy,
                     submission_request_id,
                     uuid::Uuid::now_v7().to_string(),
                     protocol::SubmissionDisposition::Started,
@@ -5223,7 +5219,6 @@ mod tests {
             } else {
                 worker_runtime::execution::WorkerExecutionResult::accepted(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
-                    WorkerExecutionRunState::Busy,
                 )
             }
         }
