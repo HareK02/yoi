@@ -367,13 +367,18 @@ function authConfig(value: unknown, path: string): WorkspaceAuthConfig {
 
 function permissions(value: unknown, path: string): WorkspacePermissionSummary {
   const item = object(value, path);
-  exactKeys(item, ["manage_repositories", "manage_secrets"], path);
+  exactKeys(
+    item,
+    ["manage_repositories", "manage_secrets", "manage_runtimes"],
+    path,
+  );
   return {
     manage_repositories: boolean(
       item.manage_repositories,
       `${path}.manage_repositories`,
     ),
     manage_secrets: boolean(item.manage_secrets, `${path}.manage_secrets`),
+    manage_runtimes: boolean(item.manage_runtimes, `${path}.manage_runtimes`),
   };
 }
 

@@ -440,6 +440,7 @@ CREATE TABLE workspace_runtime_bindings (
     base_url TEXT NOT NULL,
     public_key TEXT NOT NULL,
     public_key_fingerprint TEXT NOT NULL,
+    binding_revision INTEGER NOT NULL DEFAULT 1 CHECK (binding_revision > 0),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     revoked_at TEXT,
@@ -447,6 +448,22 @@ CREATE TABLE workspace_runtime_bindings (
     UNIQUE (workspace_id, public_key_fingerprint),
     FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT
 );
+CREATE TABLE workspace_runtime_binding_audit (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    actor_account_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('created', 'replaced', 'reactivated', 'revoked')),
+    old_fingerprint TEXT,
+    new_fingerprint TEXT,
+    binding_revision INTEGER NOT NULL CHECK (binding_revision > 0),
+    at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, runtime_id, binding_revision),
+    FOREIGN KEY(workspace_id, runtime_id)
+        REFERENCES workspace_runtime_bindings(workspace_id, runtime_id) ON DELETE RESTRICT,
+    FOREIGN KEY(actor_account_id) REFERENCES accounts(account_id) ON DELETE RESTRICT
+);
+CREATE INDEX idx_workspace_runtime_binding_audit_recent
+    ON workspace_runtime_binding_audit(workspace_id, runtime_id, binding_revision DESC);
 CREATE TABLE typed_ticket_artifacts (
     workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, relative_path TEXT NOT NULL, content BLOB NOT NULL,
     PRIMARY KEY (workspace_id, ticket_id, relative_path),

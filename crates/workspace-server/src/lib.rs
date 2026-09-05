@@ -120,6 +120,15 @@ pub enum Error {
     WorkspaceConfigConflict(String),
     #[error("Runtime binding conflict: {0}")]
     RuntimeBindingConflict(String),
+    #[error("Runtime binding revision conflict: expected {expected:?}, current {actual:?}")]
+    RuntimeBindingRevisionConflict {
+        expected: Option<u64>,
+        actual: Option<u64>,
+    },
+    #[error("Runtime public key fingerprint is already bound in this Workspace: {fingerprint}")]
+    RuntimeBindingFingerprintConflict { fingerprint: String },
+    #[error("Runtime binding was not found for {runtime_id}")]
+    RuntimeBindingNotFound { runtime_id: String },
     #[error("Repository conflict: {0}")]
     RepositoryConflict(String),
     #[error("Registry inconsistency: {0}")]

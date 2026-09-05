@@ -705,6 +705,7 @@ impl WorkerController {
             runtime_base.to_path_buf(),
             spawned_registry.clone(),
             Some(method_tx.downgrade()),
+            None,
         )
         .await?;
         if let Some(session) = fs_for_view.as_ref() {
@@ -1116,6 +1117,7 @@ pub(crate) async fn register_worker_tools<C, St>(
     runtime_base: PathBuf,
     spawned_registry: Arc<SpawnedWorkerRegistry>,
     parent_method_tx: Option<mpsc::WeakSender<Method>>,
+    inherited_workdir_tool_broker: Option<workdir::WorkdirToolBroker>,
 ) -> std::io::Result<Option<workdir::WorkdirSessionHandle>>
 where
     C: LlmClient + Clone + 'static,
@@ -1124,21 +1126,26 @@ where
     // Worker-immutable snapshots taken before the mutable worker borrow
     // below so the worker borrow doesn't conflict with reads on `worker`.
     let feature_config = worker.manifest().feature.clone();
+    let mut workdir_tool_broker = inherited_workdir_tool_broker;
     if feature_config.manage_workdir.enabled && worker.workdir_session().is_none() {
         let workspace_client = worker.workspace_client_handle();
-        worker.bind_workdir_session(Some(workdir::delegation_capable_session(
+        let broker = workdir::WorkdirToolBroker::new(
             crate::feature::builtin::manage_workdir::WorkspaceAttachedWorkdirSession::handle(
                 workspace_client,
             ),
-        )));
-    }
-    if feature_config.sub_worker.enabled
+        );
+        worker.bind_workdir_session(Some(broker.tool_session()));
+        workdir_tool_broker = Some(broker);
+    } else if workdir_tool_broker.is_none()
         && let Some(existing) = worker.workdir_session().cloned()
-        && !existing.is_delegation_capable()
     {
-        worker.bind_workdir_session(Some(workdir::delegation_capable_session(existing)));
+        let broker = workdir::WorkdirToolBroker::new(existing);
+        worker.bind_workdir_session(Some(broker.tool_session()));
+        workdir_tool_broker = Some(broker);
     }
-    let worker_workdir = worker.workdir_session().cloned();
+    let worker_workdir = workdir_tool_broker
+        .as_ref()
+        .map(workdir::WorkdirToolBroker::tool_session);
     let local_filesystem = worker.local_working_directory().cloned();
     let local_workspace_root = local_filesystem.as_ref().map(|local| local.root.clone());
     let task_feature = worker.task_feature();
@@ -1305,8 +1312,17 @@ where
                 "manage Workdir tools require Backend Workspace API authority",
             ));
         }
+        let shutdown_registry = spawned_registry.clone();
+        let reopen_registry = spawned_registry.clone();
         feature_registry.add_module(
-            crate::feature::builtin::manage_workdir::manage_workdir_feature(workspace_client),
+            crate::feature::builtin::manage_workdir::ManageWorkdirFeature::with_child_lifecycle(
+                workspace_client,
+                Arc::new(move || {
+                    let child_registry = shutdown_registry.clone();
+                    Box::pin(async move { child_registry.shutdown_internal().await })
+                }),
+                Arc::new(move || reopen_registry.reopen_internal()),
+            ),
         );
     }
     if feature_config.workspace_worker_discovery.enabled {
@@ -1368,7 +1384,6 @@ where
     }
 
     let host_worker_observation_provider = worker.worker_observation_provider();
-    let source_workdir_session = worker.workdir_session().cloned();
     {
         let workspace_client = worker.workspace_client_handle();
         let engine = worker.engine_mut();
@@ -1410,7 +1425,7 @@ where
                 runtime_base.clone(),
                 bash_output_dir.clone(),
                 spawner_workspace_root,
-                source_workdir_session,
+                workdir_tool_broker,
                 spawned_registry.clone(),
                 spawner_manifest,
                 prompts,
@@ -2292,7 +2307,16 @@ async fn controller_loop<C, St>(
     // Memory/Workdir teardown so they cannot observe a partially closed Worker.
     worker.stop_feature_runtime("controller shutdown").await;
 
-    if let Some(session) = worker.workdir_session()
+    let child_cleanup_succeeded = match spawned_registry.shutdown_internal().await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "Internal SubWorker cleanup failed before Workdir shutdown");
+            false
+        }
+    };
+
+    if child_cleanup_succeeded
+        && let Some(session) = worker.workdir_session()
         && let Err(error) = session.close().await
     {
         tracing::warn!(%error, "Workdir session close failed");
@@ -3701,5 +3725,22 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn controller_shutdown_orders_child_cleanup_before_workdir_close() {
+        let source = include_str!("controller.rs");
+        let shutdown_start = source
+            .rfind("worker.stop_feature_runtime(\"controller shutdown\")")
+            .expect("controller shutdown block");
+        let shutdown = &source[shutdown_start..];
+        let children = shutdown
+            .find("spawned_registry.shutdown_internal().await")
+            .expect("Internal SubWorker cleanup");
+        let workdir = shutdown
+            .find("session.close().await")
+            .expect("parent Workdir close");
+        assert!(children < workdir);
+        assert!(shutdown.contains("if child_cleanup_succeeded"));
     }
 }

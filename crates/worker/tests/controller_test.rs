@@ -346,6 +346,7 @@ async fn shutdown_closes_bound_workdir_session() {
             command: "sleep 30".to_owned(),
             timeout_secs: 60,
             output_limit: 1024,
+            cwd: None,
             spill_dir: None,
             tool_call_id: None,
         })
@@ -395,6 +396,7 @@ async fn controller_projects_workdir_command_events_and_snapshot_state() {
             command: "printf ready; sleep 0.3; printf done".to_owned(),
             timeout_secs: 5,
             output_limit: 1024,
+            cwd: None,
             spill_dir: None,
             tool_call_id: Some("tool-command-1".into()),
         })
@@ -508,6 +510,7 @@ async fn controller_refreshes_command_snapshot_after_high_output_provider_lag() 
                 .to_owned(),
             timeout_secs: 10,
             output_limit: 1024,
+            cwd: None,
             spill_dir: None,
             tool_call_id: Some("tool-high-output".into()),
         })
@@ -589,6 +592,7 @@ async fn controller_startup_failure_closes_bound_workdir_session() {
                 command: "printf unreachable".to_owned(),
                 timeout_secs: 5,
                 output_limit: 1024,
+                cwd: None,
                 spill_dir: None,
                 tool_call_id: None,
             })

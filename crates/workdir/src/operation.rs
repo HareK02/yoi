@@ -11,6 +11,10 @@ pub struct CommandRequest {
     pub command: String,
     pub timeout_secs: u64,
     pub output_limit: usize,
+    /// Workdir-relative command directory. Providers validate it against the
+    /// active session before process start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<fs_operation::FsPath>,
     /// Provider-local directory where complete output is retained when the
     /// inline result exceeds `output_limit`.
     pub spill_dir: Option<PathBuf>,

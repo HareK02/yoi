@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use manifest::{Permission, Scope, ScopeConfig, ScopeRule, SharedScope};
+use manifest::{Scope, SharedScope};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::sync::{Mutex, broadcast, watch};
@@ -28,10 +28,8 @@ use crate::{
     CommandEvent, CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest,
     CommandSnapshot, CommandStatus, CommandStream, CommandStreamSlice, EditRequest, EditResult,
     GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult, ReadRequest,
-    ReadResult, StatRequest, StatResult, Workdir, WorkdirDelegationPermission,
-    WorkdirDelegationRequest, WorkdirError, WorkdirPath, WorkdirSession,
-    WorkdirSessionCapabilities, WorkdirSessionCapability, WorkdirSessionHandle, WriteRequest,
-    WriteResult,
+    ReadResult, StatRequest, StatResult, Workdir, WorkdirError, WorkdirPath, WorkdirSession,
+    WorkdirSessionCapabilities, WorkdirSessionCapability, WriteRequest, WriteResult,
 };
 #[cfg(test)]
 use crate::{EntryKind, WriteOutcome};
@@ -558,69 +556,6 @@ impl WorkdirSession for LocalWorkdirSession {
         self.inner.capabilities
     }
 
-    async fn capture_delegation_source(
-        &self,
-        request: &WorkdirDelegationRequest,
-    ) -> Result<WorkdirSessionHandle, WorkdirError> {
-        let host_rules = request
-            .rules
-            .iter()
-            .map(|rule| ScopeRule {
-                target: self.inner.root.join(rule.target.as_str()),
-                permission: match rule.permission {
-                    WorkdirDelegationPermission::Read => Permission::Read,
-                    WorkdirDelegationPermission::Write => Permission::Write,
-                },
-                recursive: rule.recursive,
-            })
-            .collect::<Vec<_>>();
-        for (logical, host) in request.rules.iter().zip(&host_rules) {
-            if logical.permission == WorkdirDelegationPermission::Write {
-                let resolved = Scope::resolved_target(host)
-                    .map_err(|error| WorkdirError::Denied(error.to_string()))?;
-                if resolved != host.target {
-                    return Err(WorkdirError::Denied(format!(
-                        "write delegation target `{}` traverses a symlink",
-                        logical.target
-                    )));
-                }
-            }
-        }
-        let parent_scope = self.inner.scope.snapshot();
-        for rule in &host_rules {
-            if !parent_scope
-                .allows_rule(rule)
-                .map_err(|error| WorkdirError::Denied(error.to_string()))?
-            {
-                return Err(WorkdirError::Denied(format!(
-                    "delegated provider scope `{}` exceeds the parent session",
-                    rule.target.display()
-                )));
-            }
-        }
-        let child_scope = Scope::from_config(&ScopeConfig {
-            allow: host_rules,
-            deny: Vec::new(),
-        })
-        .map_err(|error| WorkdirError::Denied(error.to_string()))?;
-        let child_cwd = self.inner.root.join(request.cwd.as_str());
-        if !child_scope.is_readable(&child_cwd)
-            || !std::fs::metadata(&child_cwd).is_ok_and(|metadata| metadata.is_dir())
-        {
-            return Err(WorkdirError::Denied(format!(
-                "delegated cwd `{}` is not a readable Workdir directory",
-                request.cwd
-            )));
-        }
-        Ok(Arc::new(LocalWorkdirSession::materialized_bound(
-            self.inner.workdir.clone(),
-            self.inner.root.clone(),
-            self.inner.root.clone(),
-            SharedScope::new(child_scope),
-            self.inner.capabilities,
-        )))
-    }
-
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Read)?;
         let logical = request.path.clone();
@@ -694,9 +629,20 @@ impl WorkdirSession for LocalWorkdirSession {
         {
             return Err(WorkdirError::OutOfScope(spill_dir.to_path_buf()));
         }
+        let cwd = if let Some(logical_cwd) = request.cwd.as_ref() {
+            let cwd = self.resolve(logical_cwd);
+            let scope = self.inner.scope.snapshot();
+            if !scope.is_readable(&cwd)
+                || !std::fs::metadata(&cwd).is_ok_and(|metadata| metadata.is_dir())
+            {
+                return Err(WorkdirError::OutOfScope(cwd));
+            }
+            cwd
+        } else {
+            self.inner.cwd.clone()
+        };
         let id = self.inner.next_command_id.fetch_add(1, Ordering::Relaxed);
         let handle = CommandHandle(format!("command-{id}"));
-        let cwd = self.inner.cwd.clone();
         let (completion_tx, completion) = watch::channel(false);
         let command_id = handle.0.clone();
         let telemetry = self.inner.command_telemetry.clone();
@@ -1516,6 +1462,7 @@ mod tests {
                 command: "sleep 30".to_owned(),
                 timeout_secs: 60,
                 output_limit: 1024,
+                cwd: None,
                 spill_dir: None,
                 tool_call_id: None,
             },
@@ -2043,6 +1990,7 @@ mod tests {
                 command: "pwd && printf provider-command".into(),
                 timeout_secs: 5,
                 output_limit: 4096,
+                cwd: None,
                 spill_dir: None,
                 tool_call_id: None,
             },
@@ -2141,6 +2089,7 @@ mod tests {
                 command: "printf hidden".into(),
                 timeout_secs: 5,
                 output_limit: 1,
+                cwd: None,
                 spill_dir: Some(spill.path().to_path_buf()),
                 tool_call_id: None,
             },
@@ -2178,6 +2127,7 @@ mod tests {
                 command: "i=0; while [ $i -lt 200 ]; do printf 'line-%03d\\n' \"$i\"; i=$((i+1)); done; printf 'FINAL-NEEDLE\\n'".into(),
                 timeout_secs: 5,
                 output_limit: 64,
+                cwd: None,
                 spill_dir: Some(spill.path().to_path_buf()),
                 tool_call_id: None,
             },
@@ -2224,6 +2174,7 @@ mod tests {
                 command: "printf 'aéz'".into(),
                 timeout_secs: 5,
                 output_limit: 1024,
+                cwd: None,
                 spill_dir: None,
                 tool_call_id: None,
             },
@@ -2449,6 +2400,7 @@ mod tests {
                 command: "printf ready; printf warning >&2; sleep 0.2; printf done".into(),
                 timeout_secs: 5,
                 output_limit: 1024,
+                cwd: None,
                 spill_dir: None,
                 tool_call_id: Some("tool-7".into()),
             },
@@ -2553,6 +2505,7 @@ mod tests {
                 command: "sleep 30".into(),
                 timeout_secs: 1,
                 output_limit: 1024,
+                cwd: None,
                 spill_dir: None,
                 tool_call_id: None,
             },
@@ -2623,6 +2576,7 @@ mod tests {
                 command: "sleep 30".into(),
                 timeout_secs: 60,
                 output_limit: 1024,
+                cwd: None,
                 spill_dir: None,
                 tool_call_id: None,
             },
