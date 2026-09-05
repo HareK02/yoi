@@ -655,6 +655,9 @@ Deno.test("workspace Runtime inventory lives under Settings admin routes", async
       import.meta.url,
     ),
   );
+  const runtimeConnectionApi = await Deno.readTextFile(
+    new URL("../api/runtime-connection.ts", import.meta.url),
+  );
   const workdirsPage = await Deno.readTextFile(
     new URL(
       "./../../../routes/w/[workspaceId]/settings/runtimes/[runtimeId]/workdirs/+page.svelte",
@@ -678,9 +681,11 @@ Deno.test("workspace Runtime inventory lives under Settings admin routes", async
     runtimesPage.includes("Add remote Runtime") &&
       runtimesPage.includes("Open workdirs") &&
       runtimesPage.includes("settings-runtime-table") &&
-      runtimesPage.includes(
-        "/runtimes/${encodeURIComponent(runtime.runtime_id)}/connection-tests",
-      ) &&
+      runtimesPage.includes("testRuntimeConnection") &&
+      runtimesPage.includes("data.workspaceId") &&
+      runtimesPage.includes("runtime.runtime_id") &&
+      runtimeConnectionApi.includes("/runtimes/${") &&
+      runtimeConnectionApi.includes("}/connection-tests") &&
       runtimesPage.includes(
         "/settings/runtimes/${encodeURIComponent(runtime.runtime_id)}/workdirs",
       ),

@@ -220,3 +220,27 @@ export type RepositoryLogResponse = {
   items: Array<GitCommitSummary>;
   diagnostics: Array<Diagnostic>;
 };
+
+export type RuntimeConnectionTestStatus = "compatible" | "failed";
+
+export type RuntimeConnectionTestFailureKind =
+  | "authentication"
+  | "authorization"
+  | "network_unreachable"
+  | "timeout"
+  | "tls_or_transport"
+  | "malformed_response"
+  | "protocol_version_mismatch"
+  | "runtime_identity_mismatch"
+  | "configuration";
+
+export type RuntimeConnectionTestResponse = {
+  workspace_id: string;
+  runtime_id: string;
+  checked_at: string;
+  status: RuntimeConnectionTestStatus;
+  failure_kind: RuntimeConnectionTestFailureKind | null;
+  expected_protocol_version: number;
+  actual_protocol_version: number | null;
+  diagnostics: Array<Diagnostic>;
+};
