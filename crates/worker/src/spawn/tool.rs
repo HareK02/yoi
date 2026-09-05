@@ -380,14 +380,21 @@ impl Tool for SubWorkerSpawnTool {
                     child_bash_output_dir.display()
                 ))
             })?;
-        workdir_rules.push(WorkdirDelegationRule {
-            target: WorkdirPath::new_scoped(child_bash_output_dir.to_string_lossy())
-                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?,
-            permission: WorkdirDelegationPermission::Read,
-            recursive: true,
-        });
         let source_workdir_session =
             require_active_workdir_session(self.source_workdir_session.as_ref())?;
+        let transports_delegation_context = source_workdir_session.transports_delegation_context();
+        // Provider-transported sessions resolve every delegation rule in the
+        // receiving Workdir namespace. The Bash spill directory instead belongs
+        // to this Worker host, so forwarding it would widen the request with a
+        // foreign absolute path and fail the provider's existing scope check.
+        if !transports_delegation_context {
+            workdir_rules.push(WorkdirDelegationRule {
+                target: WorkdirPath::new_scoped(child_bash_output_dir.to_string_lossy())
+                    .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?,
+                permission: WorkdirDelegationPermission::Read,
+                recursive: true,
+            });
+        }
         let delegation_request = workdir_delegation_request(input.cwd.as_deref(), workdir_rules)?;
         let workdir_delegation = source_workdir_session
             .delegate(delegation_request)
@@ -1012,10 +1019,12 @@ mod tests {
     use super::*;
     use manifest::{DelegationScope, Permission, Scope, SharedScope};
     use std::pin::Pin;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use crate::WorkspaceId;
+    use crate::feature::builtin::manage_workdir::WorkspaceAttachedWorkdirSession;
     use agen::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
     use agen::llm_client::{ClientError, LlmClient, Request};
     use async_trait::async_trait;
@@ -1238,6 +1247,15 @@ enabled = false
         let record = registry
             .get_internal("reviewer-child")
             .expect("Internal reviewer registry record");
+        let child_bash_output_dir = bash_output_dir.join("sub-workers").join("reviewer-child");
+        record
+            .workdir_delegation
+            .scoped_session
+            .stat(workdir::StatRequest {
+                path: WorkdirPath::new_scoped(child_bash_output_dir.to_string_lossy()).unwrap(),
+            })
+            .await
+            .expect("local child retains read scope for its Bash output directory");
         for required in ["Read", "Write", "Edit", "Glob", "Grep", "Bash"] {
             assert!(
                 record.installed_tools.iter().any(|name| name == required),
@@ -1384,6 +1402,130 @@ enabled = false
         assert!(spawner_scope.snapshot().is_writable(&workspace_root));
     }
 
+    #[tokio::test]
+    async fn remote_subworker_spawn_keeps_worker_host_output_path_out_of_workdir_scope() {
+        let runtime = TempDir::new().unwrap();
+        let workspace_root = runtime.path().join("worker-host/project");
+        let bash_output_dir = runtime.path().join("worker-host/bash-output");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&bash_output_dir).unwrap();
+
+        let mut manifest = parent_manifest(&workspace_root, None);
+        manifest
+            .scope
+            .allow
+            .push(abs_rule(&bash_output_dir, Permission::Read));
+        manifest.delegation_scope = ScopeConfig {
+            allow: vec![abs_rule(&workspace_root, Permission::Write)],
+            deny: Vec::new(),
+        };
+        let spawner_scope = SharedScope::new(Scope::from_config(&manifest.scope).unwrap());
+        let registry = SpawnedWorkerRegistry::new_internal("parent".into(), spawner_scope.clone());
+        let workspace_context = crate::worker::WorkerWorkspaceContext::with_client(
+            Some(WorkspaceId::new("workspace-test").unwrap()),
+            Arc::new(AvailableWorkspaceClient),
+        );
+        let remote_client = Arc::new(StrictRemoteWorkdirWorkspaceClient::default());
+        let source_workdir_session = workdir::delegation_capable_session(
+            WorkspaceAttachedWorkdirSession::handle(remote_client.clone()),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (parent_method_tx, _parent_method_rx) = mpsc::channel(8);
+        let tool = SubWorkerSpawnTool::new(
+            "parent".into(),
+            workspace_context,
+            ParentNotificationTarget::Controller(parent_method_tx.downgrade()),
+            runtime.path().to_path_buf(),
+            bash_output_dir.clone(),
+            workspace_root.clone(),
+            Some(source_workdir_session),
+            registry.clone(),
+            manifest,
+            PromptCatalogSource::builtins_only(),
+            AvailableProfiles::discover(&workspace_root),
+        )
+        .with_internal_client(Box::new(ScriptedInternalClient {
+            calls: calls.clone(),
+            parent_scope: spawner_scope,
+            delegated_path: workspace_root.clone(),
+            observed_parent_write_revoked: Arc::new(AtomicBool::new(false)),
+            observed_instruction_override: Arc::new(AtomicBool::new(false)),
+            fail_requests: Arc::new(AtomicBool::new(false)),
+        }));
+
+        tool.execute(
+            &serde_json::json!({
+                "name": "remote-child",
+                "profile": "inherit",
+                "instruction": "role.reviewer",
+                "task": "inspect the remote Workdir",
+                "scope": [{
+                    "target": ".",
+                    "permission": "write",
+                    "recursive": true
+                }]
+            })
+            .to_string(),
+            agen::tool::ToolExecutionContext::direct(),
+        )
+        .await
+        .expect("remote Workdir delegation must not receive Worker-host paths");
+
+        let record = registry
+            .get_internal("remote-child")
+            .expect("remote Internal Worker registry record");
+        assert_eq!(
+            record.session.wait_until_idle().await,
+            crate::internal_worker::InternalWorkerSessionStatus::Idle
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            remote_client
+                .foreign_scope_rejections
+                .load(Ordering::SeqCst),
+            0
+        );
+        let child_bash_output_dir = bash_output_dir.join("sub-workers").join("remote-child");
+        assert!(child_bash_output_dir.is_dir());
+        for required in ["Read", "Write", "Edit", "Glob", "Grep", "Bash"] {
+            assert!(
+                record.installed_tools.iter().any(|name| name == required),
+                "remote write-scoped child is missing {required}: {:?}",
+                record.installed_tools
+            );
+        }
+
+        let remote_requests = remote_client.requests();
+        let operate_requests = remote_requests
+            .iter()
+            .filter(|request| request.body.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operate_requests.len(),
+            1,
+            "remote requests: {remote_requests:?}"
+        );
+        let operation_body: serde_json::Value = serde_json::from_str(
+            operate_requests[0]
+                .body
+                .as_deref()
+                .expect("remote operation body"),
+        )
+        .unwrap();
+        let rules = operation_body["delegations"][0]["rules"]
+            .as_array()
+            .expect("delegation rules");
+        assert_eq!(rules.len(), 1, "remote operation body: {operation_body}");
+        assert_eq!(rules[0]["target"], "");
+        assert!(
+            !operation_body.to_string().contains(
+                child_bash_output_dir
+                    .to_str()
+                    .expect("UTF-8 test output directory")
+            )
+        );
+    }
+
     #[test]
     fn spawn_worker_input_schema_includes_optional_cwd() {
         let schema = serde_json::to_value(schemars::schema_for!(SubWorkerSpawnInput)).unwrap();
@@ -1515,6 +1657,97 @@ enabled = false
             _request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
             Err(WorkspaceClientError::Unavailable("not invoked".into()))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct StrictRemoteWorkdirWorkspaceClient {
+        requests: Mutex<Vec<WorkspaceRequest>>,
+        foreign_scope_rejections: AtomicUsize,
+    }
+
+    impl StrictRemoteWorkdirWorkspaceClient {
+        fn requests(&self) -> Vec<WorkspaceRequest> {
+            self.requests
+                .lock()
+                .expect("remote Workdir request lock")
+                .clone()
+        }
+    }
+
+    impl WorkspaceClient for StrictRemoteWorkdirWorkspaceClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace-test")
+        }
+
+        fn kind(&self) -> &str {
+            "strict-remote-workdir-test"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: WorkspaceRequest,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            self.requests
+                .lock()
+                .expect("remote Workdir request lock")
+                .push(request.clone());
+            if request.path.ends_with("/fence") {
+                return Ok(WorkspaceResponse {
+                    status: 200,
+                    body: serde_json::json!({ "value": "remote-fence-1" }).to_string(),
+                });
+            }
+
+            let body: serde_json::Value = serde_json::from_str(
+                request
+                    .body
+                    .as_deref()
+                    .ok_or_else(|| WorkspaceClientError::Request("missing request body".into()))?,
+            )
+            .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
+            let has_foreign_scope = body
+                .get("delegations")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .flat_map(|delegation| {
+                    delegation
+                        .get("rules")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                })
+                .filter_map(|rule| rule.get("target").and_then(serde_json::Value::as_str))
+                .any(|target| Path::new(target).is_absolute());
+            if has_foreign_scope {
+                self.foreign_scope_rejections.fetch_add(1, Ordering::SeqCst);
+                return Ok(WorkspaceResponse {
+                    status: 403,
+                    body: serde_json::json!({
+                        "code": "out_of_scope",
+                        "message": "Worker-host path is outside the remote Workdir namespace"
+                    })
+                    .to_string(),
+                });
+            }
+
+            Ok(WorkspaceResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "operation": "stat",
+                    "result": {
+                        "path": "",
+                        "kind": "directory",
+                        "size": 0
+                    }
+                })
+                .to_string(),
+            })
         }
     }
 
