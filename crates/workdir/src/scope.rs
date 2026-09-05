@@ -106,6 +106,7 @@ pub struct WorkdirScopeLease {
     broker: WorkdirToolBroker,
     pub capabilities: WorkdirSessionCapabilities,
     validity: Arc<SessionValidity>,
+    cleanup_pending: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for WorkdirScopeLease {
@@ -134,12 +135,74 @@ impl WorkdirScopeLease {
         self.broker.scope(request).await
     }
 
+    pub async fn close(&self) -> Result<(), WorkdirError> {
+        self.validity.active.store(false, Ordering::Release);
+        let command_ids = self
+            .broker
+            .authority
+            .owned_commands
+            .lock()
+            .expect("scoped command set mutex poisoned")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for command_id in command_ids {
+            let handle = CommandHandle(command_id.clone());
+            let cancel = self
+                .broker
+                .authority
+                .source
+                .cancel_command(handle.clone())
+                .await;
+            let terminal = self
+                .broker
+                .authority
+                .source
+                .command_output(CommandOutputRequest {
+                    handle,
+                    cursor: 0,
+                    limit: 1,
+                    wait: true,
+                })
+                .await;
+            match (cancel, terminal) {
+                (_, Ok(_))
+                | (Ok(()), Err(WorkdirError::UnknownCommand(_)))
+                | (Err(WorkdirError::UnknownCommand(_)), Err(WorkdirError::UnknownCommand(_))) => {
+                    self.broker
+                        .authority
+                        .owned_commands
+                        .lock()
+                        .expect("scoped command set mutex poisoned")
+                        .remove(&command_id);
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        tokio::task::yield_now().await;
+        self.finish_release();
+        Ok(())
+    }
+
     pub fn is_active(&self) -> bool {
         self.validity.is_active()
     }
 
-    pub fn release(&self) {
+    /// Revoke a scope whose owner has already terminalized every tool call.
+    /// Use [`Self::close`] when commands may still be live.
+    pub fn revoke(&self) {
+        self.finish_release();
+    }
+
+    fn finish_release(&self) {
         self.validity.active.store(false, Ordering::Release);
+        self.cleanup_pending.store(false, Ordering::Release);
         if let Some(forwarder) = &self.broker.event_forwarder
             && let Some(handle) = forwarder
                 .lock()
@@ -161,7 +224,7 @@ impl std::ops::Deref for WorkdirScopeLease {
 
 impl Drop for WorkdirScopeLease {
     fn drop(&mut self) {
-        self.release();
+        self.finish_release();
     }
 }
 
@@ -195,6 +258,7 @@ impl SessionValidity {
 #[derive(Clone, Debug)]
 struct ActiveWriteLease {
     validity: Weak<SessionValidity>,
+    cleanup_pending: Weak<AtomicBool>,
     rules: Vec<WorkdirToolScopeRule>,
 }
 
@@ -471,22 +535,52 @@ impl ScopedWorkdirSession {
         self.ensure_scope_targets_do_not_traverse_symlinks(&request.rules)
             .await?;
         let validity = SessionValidity::child(self.validity.clone());
+        let cleanup_pending = Arc::new(AtomicBool::new(true));
         let id = self.next_lease_id.fetch_add(1, Ordering::Relaxed);
         if request
             .rules
             .iter()
             .any(|rule| rule.permission == WorkdirToolScopePermission::Write)
         {
-            self.child_write_leases
+            let mut leases = self
+                .child_write_leases
                 .lock()
-                .expect("Workdir tool scope lease mutex poisoned")
-                .insert(
-                    id,
-                    ActiveWriteLease {
-                        validity: Arc::downgrade(&validity),
-                        rules: request.rules.clone(),
-                    },
-                );
+                .expect("Workdir tool scope lease mutex poisoned");
+            leases.retain(|_, lease| {
+                lease
+                    .validity
+                    .upgrade()
+                    .is_some_and(|validity| validity.is_active())
+                    || lease
+                        .cleanup_pending
+                        .upgrade()
+                        .is_some_and(|pending| pending.load(Ordering::Acquire))
+            });
+            let requested_write_rules = request
+                .rules
+                .iter()
+                .filter(|rule| rule.permission == WorkdirToolScopePermission::Write);
+            for requested in requested_write_rules {
+                if leases.values().any(|lease| {
+                    lease
+                        .rules
+                        .iter()
+                        .any(|active| rules_overlap(active, requested))
+                }) {
+                    return Err(WorkdirError::Denied(format!(
+                        "scoped write path `{}` overlaps an active child scope",
+                        requested.target
+                    )));
+                }
+            }
+            leases.insert(
+                id,
+                ActiveWriteLease {
+                    validity: Arc::downgrade(&validity),
+                    cleanup_pending: Arc::downgrade(&cleanup_pending),
+                    rules: request.rules.clone(),
+                },
+            );
         }
         let owned_commands = Arc::new(Mutex::new(HashSet::new()));
         let (command_events, _) = broadcast::channel(64);
@@ -517,6 +611,7 @@ impl ScopedWorkdirSession {
             broker,
             capabilities,
             validity,
+            cleanup_pending,
         })
     }
 }
@@ -785,6 +880,13 @@ fn unix_timestamp_ms() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
+}
+
+fn rules_overlap(left: &WorkdirToolScopeRule, right: &WorkdirToolScopeRule) -> bool {
+    left.permission == WorkdirToolScopePermission::Write
+        && right.permission == WorkdirToolScopePermission::Write
+        && (rule_allows_path(left, &right.target, WorkdirToolScopePermission::Write)
+            || rule_allows_path(right, &left.target, WorkdirToolScopePermission::Write))
 }
 
 fn rule_allows_path(
@@ -1231,7 +1333,7 @@ mod tests {
         ));
         parent.write(write("other/file", "parent")).await.unwrap();
         child.write(write("file", "child")).await.unwrap();
-        child.release();
+        child.close().await.unwrap();
         assert!(matches!(
             child
                 .start_command(CommandRequest {
@@ -1253,6 +1355,79 @@ mod tests {
             child.read(read("file")).await,
             Err(WorkdirError::SessionClosed)
         ));
+    }
+
+    #[tokio::test]
+    async fn sibling_write_scopes_must_not_overlap() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("shared/one")).unwrap();
+        fs::create_dir_all(root.path().join("other")).unwrap();
+        let parent = session(root.path());
+        let first = parent
+            .scope(request("shared", WorkdirToolScopePermission::Write))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            parent
+                .scope(request("shared/one", WorkdirToolScopePermission::Write))
+                .await,
+            Err(WorkdirError::Denied(_))
+        ));
+        let other = parent
+            .scope(request("other", WorkdirToolScopePermission::Write))
+            .await
+            .unwrap();
+        other.close().await.unwrap();
+        first.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_scope_cancels_and_terminalizes_owned_commands() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("work")).unwrap();
+        let parent = session(root.path());
+        let child = parent
+            .scope(request("work", WorkdirToolScopePermission::Write))
+            .await
+            .unwrap();
+        let mut events = child.subscribe_command_events().unwrap();
+        let handle = child
+            .start_command(CommandRequest {
+                command: "sleep 30; printf leaked > marker".into(),
+                timeout_secs: 60,
+                output_limit: 1024,
+                cwd: None,
+                spill_dir: None,
+                tool_call_id: Some("owned-command".into()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            CommandEvent::Started { .. }
+        ));
+
+        child.close().await.unwrap();
+
+        assert!(matches!(
+            parent.command_status(handle).await,
+            Ok(CommandStatus::Cancelled | CommandStatus::Completed | CommandStatus::Failed)
+                | Err(WorkdirError::UnknownCommand(_))
+        ));
+        assert!(!root.path().join("work/marker").exists());
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let CommandEvent::Terminal { .. } = events.recv().await.unwrap() {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            terminal.is_ok(),
+            "scope close must publish terminal command telemetry"
+        );
     }
 
     #[tokio::test]
@@ -1286,7 +1461,7 @@ mod tests {
                 .is_err()
         );
 
-        child.release();
+        child.close().await.unwrap();
         assert!(matches!(
             nested.read(read("a")).await,
             Err(WorkdirError::SessionClosed)
@@ -1332,8 +1507,8 @@ mod tests {
         ));
         nested.write(write("nested", "allowed")).await.unwrap();
 
-        nested.release();
-        child.release();
+        nested.close().await.unwrap();
+        child.close().await.unwrap();
     }
 
     #[tokio::test]

@@ -690,7 +690,7 @@ impl SpawnedWorkerRegistry {
         if !record.claim_scope_reclaim() {
             return Ok(false);
         }
-        record.workdir_tool_scope.release();
+        record.workdir_tool_scope.revoke();
         let result = if let Some(parent_scope) = &self.parent_scope {
             parent_scope
                 .update(|current| current.with_removed_deny_rules(delegated_write_rules(record)))
@@ -729,6 +729,11 @@ impl SpawnedWorkerRegistry {
         record
             .session
             .stop()
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        record
+            .workdir_tool_scope
+            .close()
             .await
             .map_err(|error| io::Error::other(error.to_string()))?;
         let summary = record.stop_summary();
