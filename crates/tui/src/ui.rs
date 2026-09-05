@@ -1880,7 +1880,7 @@ fn actionbar_left_item(app: &App, now: Instant) -> Option<(String, Style)> {
     }
     if app.queued_input_count() > 0 {
         return Some((
-            "Alt-q continue queued  Alt-c clear queued".to_string(),
+            "Alt-n notify  Alt-q continue  Alt-d cancel queued  Alt-c clear queued".to_string(),
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -2144,6 +2144,7 @@ mod tests {
             pending: protocol::PendingSubmissionsSnapshot {
                 revision: 1,
                 notification_count: 0,
+                head_id: Some(id.into()),
                 submissions: vec![protocol::PendingSubmissionSummary {
                     submission_id: id.into(),
                     accepted_at_ms: 1,
@@ -2303,7 +2304,7 @@ mod tests {
         set_pending_submission(&mut app, "submission-1");
         assert_eq!(
             actionbar_left_item(&app, now).map(|(text, _)| text),
-            Some("Alt-q continue queued  Alt-c clear queued".into())
+            Some("Alt-n notify  Alt-q continue  Alt-d cancel queued  Alt-c clear queued".into())
         );
 
         app.enter_command_mode();

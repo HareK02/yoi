@@ -232,8 +232,9 @@ enum PendingRun {
 fn prepare_pending_run<St: Store + Clone>(
     pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
     notify_buffer: &NotifyBuffer,
+    fence: Option<(u64, &str)>,
 ) -> Result<Option<PendingRun>, crate::worker::PendingSubmissionError> {
-    Ok(match pending_submissions.prepare_next_activation()? {
+    Ok(match pending_submissions.prepare_next_activation(fence)? {
         Some(crate::worker::PendingActivation::Submission(submission)) => {
             Some(PendingRun::Submit(submission))
         }
@@ -1420,7 +1421,7 @@ async fn controller_loop<C, St>(
             }
 
             if !shutdown && may_drain_pending && new_status == WorkerStatus::Idle {
-                match prepare_pending_run(&pending_submissions, &notify_buffer) {
+                match prepare_pending_run(&pending_submissions, &notify_buffer, None) {
                     Ok(Some(next)) => {
                         pending = Some(next);
                         new_status = WorkerStatus::Running;
@@ -1505,17 +1506,18 @@ async fn controller_loop<C, St>(
                 if auto_run {
                     match pending_submissions.accept_notification(notification_request_id, message)
                     {
-                        Ok(true) => match prepare_pending_run(&pending_submissions, &notify_buffer)
-                        {
-                            Ok(Some(next)) => pending = Some(next),
-                            Ok(None) => {}
-                            Err(error) => {
-                                let _ = working_event_tx.send(Event::Error {
-                                    code: ErrorCode::Internal,
-                                    message: error.to_string(),
-                                });
+                        Ok(true) => {
+                            match prepare_pending_run(&pending_submissions, &notify_buffer, None) {
+                                Ok(Some(next)) => pending = Some(next),
+                                Ok(None) => {}
+                                Err(error) => {
+                                    let _ = working_event_tx.send(Event::Error {
+                                        code: ErrorCode::Internal,
+                                        message: error.to_string(),
+                                    });
+                                }
                             }
-                        },
+                        }
                         Ok(false) => {}
                         Err(error) => {
                             let _ = working_event_tx.send(Event::Error {
@@ -1534,8 +1536,24 @@ async fn controller_loop<C, St>(
                     pending: pending_submissions.snapshot(),
                 });
             }
-            Method::CancelPendingSubmission { submission_id } => {
-                match pending_submissions.cancel(&submission_id) {
+            Method::CancelPendingSubmission {
+                submission_id,
+                expected_revision,
+            } => match pending_submissions.cancel(&submission_id, expected_revision) {
+                Ok(pending_snapshot) => {
+                    let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
+                        pending: pending_snapshot,
+                    });
+                }
+                Err(error) => {
+                    let _ = working_event_tx.send(Event::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: error.to_string(),
+                    });
+                }
+            },
+            Method::ClearPendingSubmissions { expected_revision } => {
+                match pending_submissions.clear(expected_revision) {
                     Ok(pending_snapshot) => {
                         let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
                             pending: pending_snapshot,
@@ -1549,21 +1567,22 @@ async fn controller_loop<C, St>(
                     }
                 }
             }
-            Method::ClearPendingSubmissions => match pending_submissions.clear() {
-                Ok(pending_snapshot) => {
-                    let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
-                        pending: pending_snapshot,
-                    });
-                }
-                Err(error) => {
+            Method::ContinuePending {
+                expected_revision,
+                expected_head_id,
+            } => {
+                if shared_state.get_status() != WorkerStatus::Idle {
                     let _ = working_event_tx.send(Event::Error {
-                        code: ErrorCode::Internal,
-                        message: error.to_string(),
+                        code: ErrorCode::InvalidRequest,
+                        message: "ContinuePending requires an idle Worker; Resume or Cancel a paused run first".into(),
                     });
+                    continue;
                 }
-            },
-            Method::ContinuePending => {
-                match prepare_pending_run(&pending_submissions, &notify_buffer) {
+                match prepare_pending_run(
+                    &pending_submissions,
+                    &notify_buffer,
+                    Some((expected_revision, &expected_head_id)),
+                ) {
                     Ok(Some(next)) => pending = Some(next),
                     Ok(None) => {
                         let _ = working_event_tx.send(Event::Error {
@@ -2077,7 +2096,7 @@ where
                             }
                         }
                     }
-                    Some(Method::Resume | Method::ContinuePending) => {
+                    Some(Method::Resume | Method::ContinuePending { .. }) => {
                         let _ = working_event_tx.send(Event::Error {
                             code: ErrorCode::AlreadyRunning,
                             message: "Worker is already executing a turn".into(),
@@ -2088,8 +2107,11 @@ where
                             pending: pending_submissions.snapshot(),
                         });
                     }
-                    Some(Method::CancelPendingSubmission { submission_id }) => {
-                        match pending_submissions.cancel(&submission_id) {
+                    Some(Method::CancelPendingSubmission {
+                        submission_id,
+                        expected_revision,
+                    }) => {
+                        match pending_submissions.cancel(&submission_id, expected_revision) {
                             Ok(pending) => {
                                 let _ = working_event_tx.send(Event::PendingSubmissionsChanged { pending });
                             }
@@ -2101,14 +2123,14 @@ where
                             }
                         }
                     }
-                    Some(Method::ClearPendingSubmissions) => {
-                        match pending_submissions.clear() {
+                    Some(Method::ClearPendingSubmissions { expected_revision }) => {
+                        match pending_submissions.clear(expected_revision) {
                             Ok(pending) => {
                                 let _ = working_event_tx.send(Event::PendingSubmissionsChanged { pending });
                             }
                             Err(error) => {
                                 let _ = working_event_tx.send(Event::Error {
-                                    code: ErrorCode::Internal,
+                                    code: ErrorCode::InvalidRequest,
                                     message: error.to_string(),
                                 });
                             }

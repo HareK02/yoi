@@ -754,6 +754,28 @@ impl App {
         Some(self.method_for_run(segments))
     }
 
+    pub fn submit_notify_input(&mut self) -> Option<Method> {
+        let segments = self.input.submit_segments();
+        if segments_are_blank(&segments) {
+            return None;
+        }
+        if segments
+            .iter()
+            .any(|segment| matches!(segment, Segment::UploadedFile { .. }))
+        {
+            self.push_error("Notify accepts text only; remove attachments or queue a Submit.");
+            return None;
+        }
+        let message = Segment::flatten_to_text(&segments);
+        self.record_input_history(segments);
+        self.input.clear();
+        Some(Method::Notify {
+            notification_request_id: protocol::new_submission_request_id(),
+            message,
+            auto_run: true,
+        })
+    }
+
     pub fn restore_unsent_run(&mut self, method: &Method) {
         let Method::Submit { input, .. } = method else {
             return;
@@ -887,6 +909,26 @@ impl App {
             .is_some_and(|notice| notice.is_expired(now))
         {
             self.actionbar_notice = None;
+        }
+    }
+
+    pub fn continue_pending_method(&self) -> Option<Method> {
+        Some(Method::ContinuePending {
+            expected_revision: self.pending_submissions.revision,
+            expected_head_id: self.pending_submissions.head_id.clone()?,
+        })
+    }
+
+    pub fn clear_pending_method(&self) -> Method {
+        Method::ClearPendingSubmissions {
+            expected_revision: self.pending_submissions.revision,
+        }
+    }
+
+    pub fn cancel_pending_method(&self, submission_id: String) -> Method {
+        Method::CancelPendingSubmission {
+            submission_id,
+            expected_revision: self.pending_submissions.revision,
         }
     }
 
@@ -3410,6 +3452,7 @@ mod completion_flow_tests {
             pending: protocol::PendingSubmissionsSnapshot {
                 revision: 3,
                 notification_count: 0,
+                head_id: Some("submission-1".into()),
                 submissions: vec![protocol::PendingSubmissionSummary {
                     submission_id: "submission-1".into(),
                     accepted_at_ms: 7,

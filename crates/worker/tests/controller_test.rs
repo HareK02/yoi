@@ -1322,7 +1322,7 @@ async fn submit_while_running_is_durably_queued() {
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     let mut accepted = None;
-    let mut pending_count = None;
+    let mut pending_snapshot = None;
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
             Ok(Ok(Event::SubmissionAccepted {
@@ -1333,21 +1333,44 @@ async fn submit_while_running_is_durably_queued() {
             Ok(Ok(Event::PendingSubmissionsChanged { pending }))
                 if pending.submissions.len() == 1 =>
             {
-                pending_count = Some(1)
+                pending_snapshot = Some(pending)
             }
             Ok(Ok(Event::Error { code, message })) if code == worker::ErrorCode::AlreadyRunning => {
                 panic!("Submit was busy-rejected: {message}")
             }
             _ => {}
         }
-        if accepted.is_some() && pending_count.is_some() {
+        if accepted.is_some() && pending_snapshot.is_some() {
             break;
         }
     }
 
     assert_eq!(accepted, Some(protocol::SubmissionDisposition::Queued));
-    assert_eq!(pending_count, Some(1));
+    let pending_snapshot = pending_snapshot.expect("pending snapshot");
+    assert_eq!(pending_snapshot.submissions.len(), 1);
     handle.send(Method::Pause).await.unwrap();
+    wait_for_status(&handle, WorkerStatus::Paused).await;
+    handle
+        .send(Method::ContinuePending {
+            expected_revision: pending_snapshot.revision,
+            expected_head_id: pending_snapshot.head_id.expect("pending head"),
+        })
+        .await
+        .unwrap();
+    let rejection = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if let Ok(Event::Error { code, message }) = rx.recv().await
+                && code == worker::ErrorCode::InvalidRequest
+                && message.contains("requires an idle Worker")
+            {
+                break message;
+            }
+        }
+    })
+    .await
+    .expect("paused ContinuePending rejection");
+    assert!(rejection.contains("Resume or Cancel"));
+    assert_eq!(handle.shared_state.get_status(), WorkerStatus::Paused);
 }
 
 #[tokio::test]

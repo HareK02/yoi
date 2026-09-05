@@ -130,9 +130,20 @@ pub(crate) struct PendingActivationState {
 
 impl PendingActivationState {
     pub(crate) fn snapshot(&self) -> protocol::PendingSubmissionsSnapshot {
+        let head_id = match (self.pending.front(), self.pending_notifications.front()) {
+            (Some(submission), Some(notification))
+                if notification.activation_sequence < submission.activation_sequence =>
+            {
+                Some(notification.notification_request_id.clone())
+            }
+            (Some(submission), _) => Some(submission.submission_id.clone()),
+            (None, Some(notification)) => Some(notification.notification_request_id.clone()),
+            (None, None) => None,
+        };
         protocol::PendingSubmissionsSnapshot {
             revision: self.revision,
             notification_count: u32::try_from(self.pending_notifications.len()).unwrap_or(u32::MAX),
+            head_id,
             submissions: self
                 .pending
                 .iter()
@@ -1125,6 +1136,13 @@ pub(crate) enum PendingSubmissionError {
     ByteLimit,
     #[error("pending submission artifact references exceed {MAX_PENDING_ARTIFACT_REFS}")]
     ArtifactLimit,
+    #[error("pending queue revision conflict: expected {expected}, current {current}")]
+    RevisionConflict { expected: u64, current: u64 },
+    #[error("pending queue head conflict: expected {expected}, current {current:?}")]
+    HeadConflict {
+        expected: String,
+        current: Option<String>,
+    },
     #[error("pending submission not found: {0}")]
     NotFound(String),
     #[error("pending submission state persistence failed: {0}")]
@@ -1141,6 +1159,29 @@ impl<St> PendingSubmissionHandle<St>
 where
     St: Store + Clone,
 {
+    fn validate_fence(
+        state: &PendingActivationState,
+        expected_revision: u64,
+        expected_head_id: Option<&str>,
+    ) -> Result<(), PendingSubmissionError> {
+        if state.revision != expected_revision {
+            return Err(PendingSubmissionError::RevisionConflict {
+                expected: expected_revision,
+                current: state.revision,
+            });
+        }
+        if let Some(expected) = expected_head_id {
+            let current = state.snapshot().head_id;
+            if current.as_deref() != Some(expected) {
+                return Err(PendingSubmissionError::HeadConflict {
+                    expected: expected.to_owned(),
+                    current,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn persist_locked(&self, state: &PendingActivationState) -> Result<(), PendingSubmissionError> {
         self.writer.append_entry_locked(LogEntry::Extension {
             ts: segment_log::now_millis(),
@@ -1354,6 +1395,7 @@ where
 
     pub(crate) fn prepare_next_activation(
         &self,
+        fence: Option<(u64, &str)>,
     ) -> Result<Option<PendingActivation>, PendingSubmissionError> {
         let _append_guard = self
             .writer
@@ -1365,6 +1407,9 @@ where
             .state
             .lock()
             .expect("pending activation state poisoned");
+        if let Some((expected_revision, expected_head_id)) = fence {
+            Self::validate_fence(&state, expected_revision, Some(expected_head_id))?;
+        }
         if state.activating.is_some() || state.activating_notification.is_some() {
             return Ok(None);
         }
@@ -1495,6 +1540,7 @@ where
     pub(crate) fn cancel(
         &self,
         submission_id: &str,
+        expected_revision: u64,
     ) -> Result<protocol::PendingSubmissionsSnapshot, PendingSubmissionError> {
         let _append_guard = self
             .writer
@@ -1506,6 +1552,7 @@ where
             .state
             .lock()
             .expect("pending activation state poisoned");
+        Self::validate_fence(&state, expected_revision, None)?;
         let original = state.clone();
         let Some(index) = state
             .pending
@@ -1525,6 +1572,7 @@ where
 
     pub(crate) fn clear(
         &self,
+        expected_revision: u64,
     ) -> Result<protocol::PendingSubmissionsSnapshot, PendingSubmissionError> {
         let _append_guard = self
             .writer
@@ -1536,6 +1584,7 @@ where
             .state
             .lock()
             .expect("pending activation state poisoned");
+        Self::validate_fence(&state, expected_revision, None)?;
         let original = state.clone();
         state.pending.clear();
         state.pending_notifications.clear();
@@ -9189,10 +9238,23 @@ mod build_summary_prompt_tests {
         assert_eq!(restored.pending.len(), 1);
         assert_eq!(restored.pending[0].submission_id, accepted.submission_id);
 
-        let snapshot = handle.cancel(&accepted.submission_id).unwrap();
+        let fence = handle.snapshot();
+        assert!(matches!(
+            handle.cancel(&accepted.submission_id, fence.revision.saturating_sub(1)),
+            Err(PendingSubmissionError::RevisionConflict { .. })
+        ));
+        assert!(matches!(
+            handle.prepare_next_activation(Some((fence.revision, "wrong-head"))),
+            Err(PendingSubmissionError::HeadConflict { .. })
+        ));
+        assert_eq!(handle.snapshot(), fence);
+
+        let snapshot = handle
+            .cancel(&accepted.submission_id, handle.snapshot().revision)
+            .unwrap();
         assert!(snapshot.submissions.is_empty());
         assert!(matches!(
-            handle.cancel(&accepted.submission_id),
+            handle.cancel(&accepted.submission_id, handle.snapshot().revision),
             Err(PendingSubmissionError::NotFound(_))
         ));
 
@@ -9210,7 +9272,7 @@ mod build_summary_prompt_tests {
             Err(PendingSubmissionError::CountLimit)
         ));
         assert_eq!(handle.snapshot().submissions.len(), MAX_PENDING_SUBMISSIONS);
-        let cleared = handle.clear().unwrap();
+        let cleared = handle.clear(handle.snapshot().revision).unwrap();
         assert!(cleared.submissions.is_empty());
         assert_eq!(cleared.notification_count, 0);
     }
@@ -9237,7 +9299,7 @@ mod build_summary_prompt_tests {
             .accept("request-1".into(), vec![Segment::text("submit")], false)
             .unwrap();
 
-        let first = handle.prepare_next_activation().unwrap().unwrap();
+        let first = handle.prepare_next_activation(None).unwrap().unwrap();
         assert!(matches!(
             first,
             PendingActivation::Notification(PendingNotification { ref message, .. })
@@ -9249,7 +9311,7 @@ mod build_summary_prompt_tests {
         assert!(committed_state.pending_notifications.is_empty());
         assert!(committed_state.activating_notification.is_none());
         handle.finish_notification_activation("notification-1");
-        let second = handle.prepare_next_activation().unwrap().unwrap();
+        let second = handle.prepare_next_activation(None).unwrap().unwrap();
         assert!(matches!(second, PendingActivation::Submission(_)));
     }
 

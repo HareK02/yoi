@@ -161,6 +161,7 @@
     let pendingSubmissions = $state<PendingSubmissionsSnapshot>({
         revision: 0,
         notification_count: 0,
+        head_id: null,
         submissions: [],
     });
     let pendingSubmissionItems = $derived(pendingSubmissions.submissions ?? []);
@@ -574,16 +575,6 @@
     ): ProtocolMethod {
         switch (request.kind) {
             case "user":
-                if (workerRunning) {
-                    return {
-                        method: "notify",
-                        params: {
-                            notification_request_id: crypto.randomUUID(),
-                            message: request.content,
-                            auto_run: true,
-                        },
-                    };
-                }
                 return {
                     method: "submit",
                     params: {
@@ -670,6 +661,14 @@
             return;
         }
         void submitDraft(composerInputElement?.snapshot() ?? draft);
+    }
+
+    function handleQueueSubmit() {
+        void submitDraft(composerInputElement?.snapshot() ?? draft);
+    }
+
+    function handleNotifySubmit() {
+        void submitDraft(composerInputElement?.snapshot() ?? draft, "notify");
     }
 
     function attachmentPath(): string {
@@ -771,7 +770,15 @@
         if (event.dataTransfer?.files) addAttachmentFiles(event.dataTransfer.files);
     }
 
-    async function submitDraft(value: ComposerDraftSnapshot) {
+    async function submitDraft(
+        value: ComposerDraftSnapshot,
+        delivery: "submit" | "notify" = "submit",
+    ) {
+        if (delivery === "notify" && attachments.length > 0) {
+            composerNotice = null;
+            sendError = "Notify accepts text only; remove attachments or queue a Submit.";
+            return;
+        }
         const incompleteAttachment = attachments.find((attachment) =>
             attachment.state !== "uploaded" || !attachment.reference
         );
@@ -805,10 +812,19 @@
             return;
         }
 
+        let request: WorkerConsoleInputRequest = command.request;
+        if (delivery === "notify") {
+            if (request.kind !== "user") {
+                composerNotice = null;
+                sendError = "Notify accepts ordinary text, not a Composer command.";
+                return;
+            }
+            request = { kind: "notify", content: request.content };
+        }
         sending = true;
         sendError = null;
         try {
-            const method = composerRequestToProtocolMethod(command.request);
+            const method = composerRequestToProtocolMethod(request);
             sendProtocolMethod(method);
             composerInputElement?.recordHistory(value);
             composerInputElement?.clear();
@@ -1772,7 +1788,10 @@
                                 sendControl(
                                     {
                                         method: "cancel_pending_submission",
-                                        params: { submission_id: submission.submission_id },
+                                        params: {
+                                            submission_id: submission.submission_id,
+                                            expected_revision: pendingSubmissions.revision,
+                                        },
                                     },
                                     "Pending submission cancellation",
                                 )}
@@ -1782,10 +1801,16 @@
             </ol>
             <button
                 type="button"
-                disabled={workerRunning}
+                disabled={workerRunning || pendingSubmissions.head_id === null}
                 onclick={() =>
                     sendControl(
-                        { method: "continue_pending" },
+                        {
+                            method: "continue_pending",
+                            params: {
+                                expected_revision: pendingSubmissions.revision,
+                                expected_head_id: pendingSubmissions.head_id ?? "",
+                            },
+                        },
                         "Pending activation continue",
                     )}
             >Continue next</button>
@@ -1793,7 +1818,10 @@
                 type="button"
                 onclick={() =>
                     sendControl(
-                        { method: "clear_pending_submissions" },
+                        {
+                            method: "clear_pending_submissions",
+                            params: { expected_revision: pendingSubmissions.revision },
+                        },
                         "Pending submissions clear",
                     )}
             >Clear all</button>
@@ -1932,6 +1960,18 @@
             </div>
         </div>
         <div class="composer-actions">
+            {#if workerRunning}
+                <button
+                    type="button"
+                    disabled={sending || !inputReady}
+                    onclick={handleQueueSubmit}
+                >Queue Submit</button>
+                <button
+                    type="button"
+                    disabled={sending || !inputReady}
+                    onclick={handleNotifySubmit}
+                >Notify</button>
+            {/if}
             {#if composerNotice}
                 <span class="composer-notice">{composerNotice}</span>
             {/if}

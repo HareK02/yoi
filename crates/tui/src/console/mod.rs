@@ -1151,12 +1151,26 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             Some(None)
         }
         KeyCode::Char(c)
+            if c.eq_ignore_ascii_case(&'d') && alt && !ctrl && !app.is_command_mode() =>
+        {
+            Some(
+                app.next_queued_input_preview()
+                    .map(str::to_owned)
+                    .map(|submission_id| app.cancel_pending_method(submission_id)),
+            )
+        }
+        KeyCode::Char(c)
+            if c.eq_ignore_ascii_case(&'n') && alt && !ctrl && !app.is_command_mode() =>
+        {
+            Some(app.submit_notify_input())
+        }
+        KeyCode::Char(c)
             if c.eq_ignore_ascii_case(&'q') && alt && !ctrl && !app.is_command_mode() =>
         {
-            Some(Some(Method::ContinuePending))
+            Some(app.continue_pending_method())
         }
         KeyCode::Char(c) if c.eq_ignore_ascii_case(&'c') && alt && !ctrl => {
-            Some(Some(Method::ClearPendingSubmissions))
+            Some(Some(app.clear_pending_method()))
         }
         KeyCode::Char('c') if ctrl => Some(handle_pause_or_quit(app)),
         KeyCode::Char('x') if ctrl => Some(handle_cancel_or_shutdown(app)),
@@ -1977,12 +1991,36 @@ mod tests {
     }
 
     #[test]
+    fn running_alt_n_sends_explicit_notify_without_implicit_submit_conversion() {
+        let mut app = App::new("test".into());
+        app.set_worker_status(WorkerStatus::Running);
+        for character in "progress".chars() {
+            app.insert_char(character);
+        }
+
+        let method = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT),
+        );
+        assert!(matches!(
+            method,
+            Some(Method::Notify {
+                ref message,
+                auto_run: true,
+                ..
+            }) if message == "progress"
+        ));
+        assert_eq!(input_text(&app), "");
+    }
+
+    #[test]
     fn pending_queue_shortcuts_send_worker_operations() {
         let mut app = App::new("test".into());
         app.handle_worker_event(Event::PendingSubmissionsChanged {
             pending: protocol::PendingSubmissionsSnapshot {
                 revision: 2,
                 notification_count: 0,
+                head_id: Some("submission-1".into()),
                 submissions: vec![protocol::PendingSubmissionSummary {
                     submission_id: "submission-1".into(),
                     accepted_at_ms: 1,
@@ -1996,14 +2034,37 @@ mod tests {
             &mut app,
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT),
         );
-        assert!(matches!(continue_next, Some(Method::ContinuePending)));
+        assert!(matches!(
+            continue_next,
+            Some(Method::ContinuePending {
+                expected_revision: 2,
+                ref expected_head_id,
+            }) if expected_head_id == "submission-1"
+        ));
         assert_eq!(app.queued_input_count(), 1);
+
+        let cancel = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT),
+        );
+        assert!(matches!(
+            cancel,
+            Some(Method::CancelPendingSubmission {
+                expected_revision: 2,
+                ref submission_id,
+            }) if submission_id == "submission-1"
+        ));
 
         let clear = handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT),
         );
-        assert!(matches!(clear, Some(Method::ClearPendingSubmissions)));
+        assert!(matches!(
+            clear,
+            Some(Method::ClearPendingSubmissions {
+                expected_revision: 2
+            })
+        ));
         assert_eq!(app.queued_input_count(), 1);
     }
 
@@ -2014,6 +2075,7 @@ mod tests {
             pending: protocol::PendingSubmissionsSnapshot {
                 revision: 2,
                 notification_count: 0,
+                head_id: Some("submission-1".into()),
                 submissions: vec![protocol::PendingSubmissionSummary {
                     submission_id: "submission-1".into(),
                     accepted_at_ms: 1,

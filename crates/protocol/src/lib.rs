@@ -73,12 +73,18 @@ pub enum Method {
     /// are immutable and therefore cannot be cancelled here.
     CancelPendingSubmission {
         submission_id: String,
+        expected_revision: u64,
     },
     /// Remove every queued submission while preserving the active run.
-    ClearPendingSubmissions,
+    ClearPendingSubmissions {
+        expected_revision: u64,
+    },
     /// Activate the next queued submission while the Worker is idle. This is an
     /// explicit recovery operation and never resumes a paused run implicitly.
-    ContinuePending,
+    ContinuePending {
+        expected_revision: u64,
+        expected_head_id: String,
+    },
     Resume,
     Cancel,
     /// Stop the in-flight turn and transition to `Paused`.
@@ -554,6 +560,8 @@ pub struct PendingSubmissionsSnapshot {
     pub revision: u64,
     #[serde(default)]
     pub notification_count: u32,
+    #[serde(default)]
+    pub head_id: Option<String>,
     #[serde(default)]
     pub submissions: Vec<PendingSubmissionSummary>,
 }
