@@ -147,12 +147,18 @@ mod tests {
 
         let mut client = Client::new(Socket::connect(&socket_path).await.unwrap());
         client
-            .send(&Method::run_text("hello"))
+            .send(&Method::submit_text(
+                protocol::new_submission_request_id(),
+                "hello",
+            ))
             .await
             .expect("send method");
 
         let received = server.await.unwrap().expect("method message");
-        assert!(matches!(decode_method(&received), Ok(Method::Run { .. })));
+        assert!(matches!(
+            decode_method(&received),
+            Ok(Method::Submit { .. })
+        ));
     }
 
     #[tokio::test]

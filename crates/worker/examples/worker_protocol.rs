@@ -101,7 +101,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Send a run method
     handle
-        .send(Method::run_text("What is the capital of France?"))
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "What is the capital of France?",
+        ))
         .await?;
 
     // Wait for completion

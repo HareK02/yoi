@@ -630,7 +630,10 @@ async fn controller_compact_method_emits_start_and_done() {
     let mut rx = handle.subscribe();
 
     handle
-        .send(Method::run_text("seed history"))
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "seed history",
+        ))
         .await
         .expect("send run");
     loop {

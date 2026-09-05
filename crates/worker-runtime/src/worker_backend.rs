@@ -39,7 +39,7 @@ use crate::working_directory::{
 };
 use async_trait::async_trait;
 use protocol::{ErrorCode, Event, Method, Segment, WorkerStatus};
-use session_store::{CombinedStore, LogEntry, WorkerAggregateStore, WorkerSessionStore};
+use session_store::{CombinedStore, WorkerAggregateStore, WorkerSessionStore};
 #[cfg(test)]
 use session_store::{FsStore, FsWorkerStore};
 use tokio::runtime::Runtime;
@@ -57,11 +57,10 @@ use worker::feature::builtin::{
 #[cfg(feature = "ws-server")]
 use worker::ipc::protocol_session::{live_log_entry_event, subscribe_worker_protocol_session};
 use worker::{
-    PreparedWorker, PromptCatalogSource, SegmentLogSink, WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN,
-    Worker, WorkerBootstrap, WorkerBootstrapError, WorkerBootstrapLayout,
-    WorkerControllerTransport, WorkerError, WorkerFilesystemAuthority, WorkerHandle,
-    WorkerSharedState, WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
-    bash_output_dir_for_worker_id,
+    PreparedWorker, PromptCatalogSource, SegmentLogSink, Worker, WorkerBootstrap,
+    WorkerBootstrapError, WorkerBootstrapLayout, WorkerControllerTransport, WorkerError,
+    WorkerFilesystemAuthority, WorkerHandle, WorkerSharedState, WorkerWorkspaceContext,
+    WorkspaceClient, WorkspaceId, bash_output_dir_for_worker_id,
 };
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
@@ -69,17 +68,6 @@ const RUNTIME_TASK_TIMEOUT: Duration = Duration::from_secs(10);
 // Keep this below the adapter task timeout so a failed acknowledgement task
 // returns a typed execution error instead of leaving the outer waiter to time out.
 const USER_INPUT_COMMIT_TIMEOUT: Duration = Duration::from_secs(9);
-
-fn user_input_has_submission(entry: &LogEntry, submission_id: &str) -> bool {
-    let extensions = match entry {
-        LogEntry::AnnotatedUserInput { extensions, .. } => extensions,
-        _ => return false,
-    };
-    extensions.iter().any(|extension| {
-        extension.domain == WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN
-            && extension.payload["submission_id"].as_str() == Some(submission_id)
-    })
-}
 
 pub struct RuntimeWorkerController {
     pub handle: WorkerHandle,
@@ -1342,126 +1330,75 @@ where
         .unwrap_or_else(|message| WorkerExecutionResult::errored(operation, message))
     }
 
-    fn send_user_input_and_wait_for_commit(
+    fn send_submit_and_wait_for_acceptance(
         &self,
         operation: WorkerExecutionOperation,
         worker: WorkerHandle,
         method: Method,
-        submission_id: String,
+        submission_request_id: String,
         accepted_run_state: WorkerExecutionRunState,
     ) -> WorkerExecutionResult {
-        let acknowledged_submission_id = submission_id.clone();
+        let request_id = submission_request_id.clone();
         self.run_on_adapter_runtime(async move {
-            // Subscribe before enqueueing the input so the acknowledgement cannot
-            // race with a fast Worker commit. The opaque submission id is stored in
-            // the same UserInput entry as the transformed Flow input and its state.
-            let (_, mut committed_entries) = worker.sink.subscribe_with_snapshot();
-            let committed_probe = worker.clone();
+            // Subscribe before enqueueing so a fast durable acceptance cannot
+            // race the Runtime acknowledgement.
             let mut events = worker.subscribe();
             worker
                 .send(method)
                 .await
                 .map_err(|err| format!("failed to send Worker method: {err}"))?;
 
-            let timeout_probe = committed_probe.clone();
-            let timeout_submission_id = submission_id.clone();
-            let acknowledgement = tokio::time::timeout(USER_INPUT_COMMIT_TIMEOUT, async move {
-                let input_was_committed = || {
-                    committed_probe
-                        .committed_entries()
-                        .iter()
-                        .any(|entry| user_input_has_submission(entry, &submission_id))
-                };
+            tokio::time::timeout(USER_INPUT_COMMIT_TIMEOUT, async move {
                 loop {
-                    tokio::select! {
-                        entry = committed_entries.recv() => {
-                            match entry {
-                                Ok(entry) if user_input_has_submission(&entry, &submission_id) => {
-                                    return Ok(());
-                                }
-                                Ok(_) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                    if input_was_committed() {
-                                        return Ok(());
-                                    }
-                                    return Err(format!(
-                                        "worker input commit acknowledgement lagged by {skipped} entry event(s)"
-                                    ));
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                    if input_was_committed() {
-                                        return Ok(());
-                                    }
-                                    return Err(
-                                        "worker entry stream closed before user input was committed"
-                                            .to_string(),
-                                    );
-                                }
-                            }
+                    match events.recv().await {
+                        Ok(Event::SubmissionAccepted {
+                            submission_request_id,
+                            submission_id,
+                            disposition,
+                        }) if submission_request_id == request_id => {
+                            return Ok((submission_id, disposition));
                         }
-                        event = events.recv() => {
-                            match event {
-                                Ok(Event::Error { message, .. }) => {
-                                    if input_was_committed() {
-                                        return Ok(());
-                                    }
-                                    return Err(format!(
-                                        "worker rejected user input before session commit: {message}"
-                                    ));
-                                }
-                                Ok(Event::Shutdown) => {
-                                    if input_was_committed() {
-                                        return Ok(());
-                                    }
-                                    return Err(
-                                        "worker shut down before user input was committed".to_string()
-                                    );
-                                }
-                                Ok(_) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                    if input_was_committed() {
-                                        return Ok(());
-                                    }
-                                    return Err(format!(
-                                        "worker input commit acknowledgement lagged by {skipped} protocol event(s)"
-                                    ));
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                    if input_was_committed() {
-                                        return Ok(());
-                                    }
-                                    return Err(
-                                        "worker event stream closed before user input was committed"
-                                            .to_string(),
-                                    );
-                                }
-                            }
+                        Ok(Event::SubmissionRejected {
+                            submission_request_id,
+                            message,
+                        }) if submission_request_id == request_id => {
+                            return Err(format!("worker rejected Submit: {message}"));
+                        }
+                        Ok(Event::Error { message, .. }) => {
+                            return Err(format!(
+                                "worker rejected Submit before durable acceptance: {message}"
+                            ));
+                        }
+                        Ok(Event::Shutdown) => {
+                            return Err(
+                                "worker shut down before Submit was durably accepted".to_string()
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            return Err(format!(
+                                "worker Submit acknowledgement lagged by {skipped} protocol event(s)"
+                            ));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            return Err(
+                                "worker event stream closed before Submit was durably accepted"
+                                    .to_string(),
+                            );
                         }
                     }
                 }
             })
-            .await;
-
-            match acknowledgement {
-                Ok(result) => result,
-                Err(_) => {
-                    if timeout_probe
-                        .committed_entries()
-                        .iter()
-                        .any(|entry| user_input_has_submission(entry, &timeout_submission_id))
-                    {
-                        Ok(())
-                    } else {
-                        Err("timed out waiting for worker user input commit".to_string())
-                    }
-                }
-            }
+            .await
+            .map_err(|_| "timed out waiting for durable Worker Submit acceptance".to_string())?
         })
-        .map(|_| {
-            WorkerExecutionResult::accepted_input_committed(
+        .map(|(submission_id, disposition)| {
+            WorkerExecutionResult::accepted_submission(
                 operation,
                 accepted_run_state,
-                acknowledged_submission_id,
+                submission_request_id,
+                submission_id,
+                disposition,
             )
         })
         .unwrap_or_else(|message| WorkerExecutionResult::errored(operation, message))
@@ -1582,8 +1519,8 @@ impl<F> Drop for WorkerRuntimeExecutionBackend<F> {
 fn method_starts_turn(method: &Method) -> bool {
     matches!(
         method,
-        Method::Run { .. }
-            | Method::RunTracked { .. }
+        Method::Submit { .. }
+            | Method::SubmitTracked { .. }
             | Method::Notify { auto_run: true, .. }
             | Method::Resume
             | Method::Compact
@@ -1609,8 +1546,8 @@ fn accepted_notify_run_state(status: WorkerStatus, auto_run: bool) -> WorkerExec
 
 fn accepted_run_state_for_method(method: &Method) -> WorkerExecutionRunState {
     match method {
-        Method::Run { .. }
-        | Method::RunTracked { .. }
+        Method::Submit { .. }
+        | Method::SubmitTracked { .. }
         | Method::Notify { auto_run: true, .. }
         | Method::Resume
         | Method::Compact => WorkerExecutionRunState::Busy,
@@ -1963,6 +1900,9 @@ where
                 WorkerExecutionOperation::Input,
                 worker,
                 Method::Notify {
+                    notification_request_id: input
+                        .submission_request_id
+                        .unwrap_or_else(protocol::new_submission_request_id),
                     message: input.content,
                     auto_run: true,
                 },
@@ -1975,21 +1915,23 @@ where
             return result;
         }
 
-        if worker.shared_state.get_status() != WorkerStatus::Idle
-            || busy
+        let is_user_submit = input.kind == WorkerInputKind::User;
+        let status = worker.shared_state.get_status();
+        let claimed_here = status == WorkerStatus::Idle
+            && busy
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-        {
+                .is_ok();
+        if !is_user_submit && !claimed_here {
             return WorkerExecutionResult::busy(
                 WorkerExecutionOperation::Input,
-                "Worker is already running; runtime adapter v0 does not queue input",
+                "Worker is already running",
             );
         }
 
-        let (method, submission_id) = match input.kind {
+        let (method, submission_request_id) = match input.kind {
             WorkerInputKind::User => {
                 let Some(submission_id) = input
-                    .submission_id
+                    .submission_request_id
                     .filter(|submission_id| !submission_id.trim().is_empty())
                 else {
                     busy.store(false, Ordering::SeqCst);
@@ -1999,11 +1941,11 @@ where
                     );
                 };
                 (
-                    Method::RunTracked {
+                    Method::SubmitTracked {
+                        submission_request_id: submission_id.clone(),
                         input: input.segments.unwrap_or_else(|| {
                             vec![Segment::text(input.content.trim().to_string())]
                         }),
-                        submission_id: submission_id.clone(),
                     },
                     Some(submission_id),
                 )
@@ -2021,21 +1963,21 @@ where
             ),
         };
         let accepted_run_state = match method {
-            Method::Run { .. }
-            | Method::RunTracked { .. }
+            Method::Submit { .. }
+            | Method::SubmitTracked { .. }
             | Method::Notify { .. }
             | Method::Compact => WorkerExecutionRunState::Busy,
             _ => WorkerExecutionRunState::Idle,
         };
         let accepted_is_idle = accepted_run_state == WorkerExecutionRunState::Idle;
-        let waits_for_user_input_commit = submission_id.is_some();
+        let waits_for_submission_acceptance = submission_request_id.is_some();
 
-        let result = if waits_for_user_input_commit {
-            self.send_user_input_and_wait_for_commit(
+        let result = if waits_for_submission_acceptance {
+            self.send_submit_and_wait_for_acceptance(
                 WorkerExecutionOperation::Input,
                 worker,
                 method,
-                submission_id.expect("tracked Run has submission id"),
+                submission_request_id.expect("Submit must have a submission request id"),
                 accepted_run_state,
             )
         } else {
@@ -2046,7 +1988,9 @@ where
                 accepted_run_state,
             )
         };
-        if accepted_is_idle || result.outcome != crate::execution::WorkerExecutionOutcome::Accepted
+        if accepted_is_idle
+            || (claimed_here
+                && result.outcome != crate::execution::WorkerExecutionOutcome::Accepted)
         {
             busy.store(false, Ordering::SeqCst);
         }
@@ -3401,6 +3345,60 @@ mod tests {
     }
 
     #[test]
+    fn running_worker_accepts_a_second_submit_as_queued() {
+        let client = MockClient::sequential(vec![MockResponse::Hang(vec![])]);
+        let runtime_base = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let factory = MockFactory {
+            client,
+            runtime_base: runtime_base.path().to_path_buf(),
+            cwd: cwd.path().to_path_buf(),
+            store_dir: store.path().join("sessions"),
+            worker_metadata_dir: store.path().join("workers"),
+            observed_cwds: Arc::new(Mutex::new(Vec::new())),
+            observed_workspace_clients: Arc::new(Mutex::new(Vec::new())),
+        };
+        let backend = Arc::new(WorkerRuntimeExecutionBackend::new(factory).unwrap());
+        let runtime =
+            EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), backend).unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let detail = runtime
+            .create_worker(create_request("queued-submit"))
+            .unwrap();
+
+        let mut first_input = WorkerInput::user("first");
+        first_input.submission_request_id = Some("request-first".into());
+        let first = runtime
+            .send_input(&detail.worker_ref, first_input.clone())
+            .unwrap();
+        assert_eq!(
+            first.submission.as_ref().map(|ack| ack.disposition),
+            Some(protocol::SubmissionDisposition::Started)
+        );
+        let retry = runtime.send_input(&detail.worker_ref, first_input).unwrap();
+        assert_eq!(retry.submission, first.submission);
+        let mut conflicting_retry = WorkerInput::user("different");
+        conflicting_retry.submission_request_id = Some("request-first".into());
+        assert!(
+            runtime
+                .send_input(&detail.worker_ref, conflicting_retry)
+                .is_err(),
+            "same request id with a different payload must fail"
+        );
+
+        let mut second_input = WorkerInput::user("second");
+        second_input.submission_request_id = Some("request-second".into());
+        let second = runtime
+            .send_input(&detail.worker_ref, second_input)
+            .unwrap();
+        assert_eq!(
+            second.submission.as_ref().map(|ack| ack.disposition),
+            Some(protocol::SubmissionDisposition::Queued)
+        );
+    }
+
+    #[test]
     fn create_with_initial_input_returns_after_session_commit() {
         let client = MockClient::new(simple_text_events());
         let runtime_base = tempfile::tempdir().unwrap();
@@ -3449,8 +3447,10 @@ mod tests {
                 };
                 extensions
                     .iter()
-                    .find(|extension| extension.domain == WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN)
-                    .and_then(|extension| extension.payload["submission_id"].as_str())
+                    .find(|extension| extension.domain == "worker.pending_activations.v1")
+                    .and_then(|extension| {
+                        extension.payload["receipts"][0]["submission_id"].as_str()
+                    })
             })
             .expect("committed input submission id");
         uuid::Uuid::parse_str(submission_id).expect("opaque submission id is a UUID");

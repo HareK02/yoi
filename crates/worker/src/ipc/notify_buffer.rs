@@ -25,7 +25,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use protocol::WorkerEvent;
-use session_store::SystemItem;
+use session_store::{SessionExtension, SystemItem};
 use tracing::warn;
 
 use crate::prompt::catalog::{CatalogError, PromptCatalog};
@@ -41,8 +41,23 @@ const CAPACITY: usize = 128;
 /// is available.
 #[derive(Debug, Clone)]
 pub enum PendingNotify {
-    Notify { message: String, auto_run: bool },
-    WorkerEvent { event: WorkerEvent },
+    Notify {
+        message: String,
+        auto_run: bool,
+        extensions: Vec<SessionExtension>,
+    },
+    WorkerEvent {
+        event: WorkerEvent,
+    },
+}
+
+impl PendingNotify {
+    pub(crate) fn extensions(&self) -> Vec<SessionExtension> {
+        match self {
+            PendingNotify::Notify { extensions, .. } => extensions.clone(),
+            PendingNotify::WorkerEvent { .. } => Vec::new(),
+        }
+    }
 }
 
 /// Shared, mutex-guarded buffer of pending entries.
@@ -62,7 +77,19 @@ impl NotifyBuffer {
     /// oldest entry is dropped and a `tracing::warn` is emitted — the
     /// caller should never hit this in normal operation.
     pub fn push_notify(&self, message: String, auto_run: bool) {
-        self.push_entry(PendingNotify::Notify { message, auto_run });
+        self.push_entry(PendingNotify::Notify {
+            message,
+            auto_run,
+            extensions: Vec::new(),
+        });
+    }
+
+    pub fn push_durable_notify(&self, message: String, extension: SessionExtension) {
+        self.push_entry(PendingNotify::Notify {
+            message,
+            auto_run: true,
+            extensions: vec![extension],
+        });
     }
 
     /// Push a typed worker-event entry onto the queue.
@@ -202,6 +229,7 @@ mod tests {
         let entry = PendingNotify::Notify {
             message: "hello".into(),
             auto_run: false,
+            extensions: Vec::new(),
         };
         let catalog = PromptCatalog::builtins_only().unwrap();
         let item = build_system_item(&entry, &catalog).unwrap();

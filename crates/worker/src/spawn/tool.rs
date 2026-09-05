@@ -58,7 +58,7 @@ struct SubWorkerSpawnInput {
     /// a host path and grants no authority. When omitted, the Workdir root is used.
     #[serde(default)]
     cwd: Option<String>,
-    /// First message sent to the spawned SubWorker via `Method::Run`.
+    /// First message sent to the spawned SubWorker via `Method::Submit`.
     task: String,
     /// Allow rules delegated to the spawned SubWorker. Must be a subset of the
     /// spawner's explicit delegation authority; direct tool scope alone is not
@@ -235,7 +235,11 @@ impl ParentNotificationTarget {
                 };
                 tokio::spawn(async move {
                     if let Err(error) = parent_method_tx
-                        .send(Method::Notify { message, auto_run })
+                        .send(Method::Notify {
+                            notification_request_id: protocol::new_submission_request_id(),
+                            message,
+                            auto_run,
+                        })
                         .await
                     {
                         tracing::warn!(
@@ -1267,6 +1271,7 @@ enabled = false
             Method::Notify {
                 message,
                 auto_run: true,
+                ..
             } if message.contains("SubWorker `reviewer-child` turn ended with status Idle")
         ));
         assert!(!runtime.path().join("reviewer-child/sock").exists());

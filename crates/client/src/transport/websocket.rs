@@ -114,7 +114,7 @@ mod tests {
             assert!(matches!(
                 message,
                 Message::Text(ref text)
-                    if matches!(decode_method(text), Ok(Method::Run { .. }))
+                    if matches!(decode_method(text), Ok(Method::Submit { .. }))
             ));
             let event = encode_event(&Event::Status {
                 status: WorkerStatus::Idle,
@@ -126,7 +126,10 @@ mod tests {
         let request = format!("ws://{address}").into_client_request().unwrap();
         let mut client = Client::new(Socket::connect(request).await.unwrap());
         client
-            .send(&Method::run_text("hello"))
+            .send(&Method::submit_text(
+                protocol::new_submission_request_id(),
+                "hello",
+            ))
             .await
             .expect("send method");
         assert!(matches!(

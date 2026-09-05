@@ -533,7 +533,7 @@ fn initial_worker_input(segments: &[Segment]) -> Option<EmbeddedWorkerInput> {
     Some(EmbeddedWorkerInput {
         kind: EmbeddedWorkerInputKind::User,
         content: Segment::flatten_to_text(segments),
-        submission_id: None,
+        submission_request_id: None,
         segments: Some(segments.to_vec()),
     })
 }
@@ -2625,7 +2625,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 WorkerInputKind::RegisterPeer => EmbeddedWorkerInputKind::RegisterPeer,
             },
             content: request.content,
-            submission_id: None,
+            submission_request_id: None,
             segments: request.segments,
         };
         match self.runtime.send_input(&worker_ref, input) {
@@ -3726,7 +3726,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 WorkerInputKind::RegisterPeer => EmbeddedWorkerInputKind::RegisterPeer,
             },
             content: request.content,
-            submission_id: None,
+            submission_request_id: None,
             segments: request.segments,
         };
         match self.post_json::<_, RuntimeHttpWorkerInputResponse>(

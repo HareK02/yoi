@@ -291,6 +291,7 @@ mod tests {
                     prompt_provenance: None,
                 },
             ),
+            extensions: Vec::new(),
         }
     }
 

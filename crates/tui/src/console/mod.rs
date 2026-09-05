@@ -270,8 +270,8 @@ impl<T: Socket> ConsoleConnection<T> {
     async fn send(&mut self, method: &Method) -> Result<(), Box<dyn std::error::Error>> {
         let mut prepared = method.clone();
         let carries_attachments =
-            matches!(prepared, Method::Run { .. }) && !self.pending_attachments.is_empty();
-        if let Method::Run { input } = &mut prepared {
+            matches!(prepared, Method::Submit { .. }) && !self.pending_attachments.is_empty();
+        if let Method::Submit { input, .. } = &mut prepared {
             input.extend(
                 self.pending_attachments
                     .iter()
@@ -569,6 +569,7 @@ async fn run_e2e_rewind_fixture(
     app.connected = true;
     app.handle_worker_event(Event::Snapshot {
         session: protocol::SessionSnapshot {
+            pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
             entries: Vec::new(),
         },
         status: WorkerStatus::Idle,
@@ -697,6 +698,7 @@ async fn run_e2e_rewind_fixture(
             if submitted_at.elapsed() >= apply_delay {
                 app.handle_worker_event(Event::RewindApplied {
                     session: protocol::SessionSnapshot {
+                        pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                         entries: Vec::new(),
                     },
                     input: vec![Segment::text("rewind-live-refresh")],
@@ -916,7 +918,7 @@ async fn run_loop<T: Socket>(
 }
 
 fn attachment_command_path(method: &Method) -> Option<PathBuf> {
-    let Method::Run { input } = method else {
+    let Method::Submit { input, .. } = method else {
         return None;
     };
     let [Segment::Text { content }] = input.as_slice() else {
@@ -927,7 +929,7 @@ fn attachment_command_path(method: &Method) -> Option<PathBuf> {
 }
 
 fn is_clear_attachments_command(method: &Method) -> bool {
-    let Method::Run { input } = method else {
+    let Method::Submit { input, .. } = method else {
         return false;
     };
     matches!(
@@ -941,7 +943,7 @@ async fn send_console_method<T: Socket>(
     client: &mut ConsoleConnection<T>,
     method: &Method,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if matches!(method, Method::Run { .. }) && client.has_active_uploads() {
+    if matches!(method, Method::Submit { .. }) && client.has_active_uploads() {
         app.restore_unsent_run(method);
         app.flash_actionbar_notice(
             "Attachment upload is still in progress; wait or use /clear-attachments.",
@@ -953,7 +955,7 @@ async fn send_console_method<T: Socket>(
     }
 
     let sends_attachments =
-        matches!(method, Method::Run { .. }) && !client.pending_attachments.is_empty();
+        matches!(method, Method::Submit { .. }) && !client.pending_attachments.is_empty();
     if let Err(error) = client.send(method).await {
         if sends_attachments {
             app.restore_unsent_run(method);
@@ -1151,15 +1153,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
         KeyCode::Char(c)
             if c.eq_ignore_ascii_case(&'q') && alt && !ctrl && !app.is_command_mode() =>
         {
-            if app.restore_next_queued_input_to_composer() {
-                Some(app.refresh_completion())
-            } else {
-                Some(None)
-            }
+            Some(Some(Method::ContinuePending))
         }
         KeyCode::Char(c) if c.eq_ignore_ascii_case(&'c') && alt && !ctrl => {
-            app.clear_queued_inputs();
-            Some(None)
+            Some(Some(Method::ClearPendingSubmissions))
         }
         KeyCode::Char('c') if ctrl => Some(handle_pause_or_quit(app)),
         KeyCode::Char('x') if ctrl => Some(handle_cancel_or_shutdown(app)),
@@ -1427,7 +1424,6 @@ fn handle_cancel_or_shutdown(app: &mut App) -> Option<Method> {
         WorkerStatus::Running | WorkerStatus::Paused
     ) {
         app.shutdown_confirm = None;
-        app.clear_queued_inputs();
         return Some(Method::Cancel);
     }
     if let Some(pressed_at) = app.shutdown_confirm
@@ -1450,7 +1446,6 @@ fn handle_cancel_or_shutdown(app: &mut App) -> Option<Method> {
 /// Idle / Paused → 2-tap to quit the TUI (the Worker keeps running).
 fn handle_pause_or_quit(app: &mut App) -> Option<Method> {
     if app.worker_status == WorkerStatus::Running {
-        app.clear_queued_inputs();
         return Some(Method::Pause);
     }
     if let Some(t) = app.quit_confirm
@@ -1476,8 +1471,8 @@ mod tests {
     use crate::text_selection::{HistoryViewport, SelectionRow};
     use async_trait::async_trait;
     use protocol::{
-        Event, RewindTarget, RewindTargetId, RunResult, Segment, UploadedFileAvailability,
-        UploadedFileRef, WorkerStatus,
+        Event, RewindTarget, RewindTargetId, Segment, UploadedFileAvailability, UploadedFileRef,
+        WorkerStatus,
     };
 
     #[test]
@@ -1490,7 +1485,8 @@ mod tests {
 
     #[test]
     fn client_local_attachment_commands_are_typed_and_do_not_send_the_path() {
-        let attach = Method::Run {
+        let attach = Method::Submit {
+            submission_request_id: protocol::new_submission_request_id(),
             input: vec![Segment::text("/attach /tmp/report.md")],
         };
         assert_eq!(
@@ -1499,7 +1495,8 @@ mod tests {
         );
         assert!(!is_clear_attachments_command(&attach));
 
-        let clear = Method::Run {
+        let clear = Method::Submit {
+            submission_request_id: protocol::new_submission_request_id(),
             input: vec![Segment::text("/clear-attachments")],
         };
         assert!(is_clear_attachments_command(&clear));
@@ -1605,7 +1602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_attachment_send_failure_restores_draft_without_exiting_console() {
+    async fn running_attachment_submit_failure_restores_draft_without_exiting_console() {
         let file = UploadedFileRef {
             artifact_id: "artifact-queued".into(),
             file_name: "queued.txt".into(),
@@ -1631,13 +1628,10 @@ mod tests {
         let mut app = App::new("worker".into());
         app.set_worker_status(WorkerStatus::Running);
         app.input.insert_str("queued inspect");
-        assert!(app.submit_input().is_none());
-
         let method = app
-            .handle_worker_event(Event::RunEnd {
-                result: RunResult::Finished,
-            })
-            .expect("queued run must be released");
+            .submit_input()
+            .expect("running Submit is sent immediately");
+
         send_console_method(&mut app, &mut connection, &method)
             .await
             .unwrap();
@@ -1960,7 +1954,7 @@ mod tests {
     }
 
     #[test]
-    fn running_enter_queues_instead_of_sending_run() {
+    fn running_enter_sends_submit_to_worker() {
         let mut app = App::new("agent".to_string());
         app.set_worker_status(WorkerStatus::Running);
         for c in "queued".chars() {
@@ -1973,102 +1967,80 @@ mod tests {
             );
         }
 
-        assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).is_none());
+        assert!(matches!(
+            handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Method::Submit { .. })
+        ));
 
-        assert_eq!(app.queued_input_count(), 1);
-        assert_eq!(app.next_queued_input_preview(), Some("queued"));
+        assert_eq!(app.queued_input_count(), 0);
         assert_eq!(input_text(&app), "");
     }
 
     #[test]
-    fn queued_input_keybindings_restore_and_clear() {
-        let mut app = App::new("agent".to_string());
-        app.set_worker_status(WorkerStatus::Running);
-        for c in "edit queued".chars() {
-            assert!(
-                handle_key(
-                    &mut app,
-                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
-                )
-                .is_none()
-            );
-        }
-        assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).is_none());
+    fn pending_queue_shortcuts_send_worker_operations() {
+        let mut app = App::new("test".into());
+        app.handle_worker_event(Event::PendingSubmissionsChanged {
+            pending: protocol::PendingSubmissionsSnapshot {
+                revision: 2,
+                notification_count: 0,
+                submissions: vec![protocol::PendingSubmissionSummary {
+                    submission_id: "submission-1".into(),
+                    accepted_at_ms: 1,
+                    segment_count: 1,
+                    byte_len: 6,
+                }],
+            },
+        });
 
-        assert!(
-            handle_key(
-                &mut app,
-                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT)
-            )
-            .is_none()
+        let continue_next = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT),
         );
-        assert_eq!(app.queued_input_count(), 0);
-        assert_eq!(input_text(&app), "edit queued");
-
-        app.input.clear();
-        for c in "clear queued".chars() {
-            assert!(
-                handle_key(
-                    &mut app,
-                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
-                )
-                .is_none()
-            );
-        }
-        assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).is_none());
+        assert!(matches!(continue_next, Some(Method::ContinuePending)));
         assert_eq!(app.queued_input_count(), 1);
 
-        assert!(
-            handle_key(
-                &mut app,
-                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT)
-            )
-            .is_none()
+        let clear = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT),
         );
-        assert_eq!(app.queued_input_count(), 0);
+        assert!(matches!(clear, Some(Method::ClearPendingSubmissions)));
+        assert_eq!(app.queued_input_count(), 1);
     }
 
     #[test]
-    fn pause_and_cancel_clear_queued_input() {
-        let mut app = App::new("agent".to_string());
+    fn pause_and_cancel_preserve_authoritative_pending_queue() {
+        let mut app = App::new("test".into());
+        app.handle_worker_event(Event::PendingSubmissionsChanged {
+            pending: protocol::PendingSubmissionsSnapshot {
+                revision: 2,
+                notification_count: 0,
+                submissions: vec![protocol::PendingSubmissionSummary {
+                    submission_id: "submission-1".into(),
+                    accepted_at_ms: 1,
+                    segment_count: 1,
+                    byte_len: 6,
+                }],
+            },
+        });
         app.set_worker_status(WorkerStatus::Running);
-        for c in "queued".chars() {
-            assert!(
-                handle_key(
-                    &mut app,
-                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
-                )
-                .is_none()
-            );
-        }
-        assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).is_none());
+        assert!(matches!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            ),
+            Some(Method::Pause)
+        ));
         assert_eq!(app.queued_input_count(), 1);
 
-        let pause = handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-        );
-        assert!(matches!(pause, Some(Method::Pause)));
-        assert_eq!(app.queued_input_count(), 0);
-
-        for c in "queued again".chars() {
-            assert!(
-                handle_key(
-                    &mut app,
-                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
-                )
-                .is_none()
-            );
-        }
-        assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).is_none());
+        app.set_worker_status(WorkerStatus::Running);
+        assert!(matches!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            ),
+            Some(Method::Cancel)
+        ));
         assert_eq!(app.queued_input_count(), 1);
-
-        let cancel = handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
-        );
-        assert!(matches!(cancel, Some(Method::Cancel)));
-        assert_eq!(app.queued_input_count(), 0);
     }
 
     #[test]
@@ -2535,13 +2507,19 @@ mod tests {
         let mut app = App::new("agent".to_string());
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
-            session: protocol::SessionSnapshot { entries: vec![] },
+            session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                entries: vec![],
+            },
             status: WorkerStatus::Idle,
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });
         app.handle_worker_event(Event::RewindApplied {
-            session: protocol::SessionSnapshot { entries: vec![] },
+            session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                entries: vec![],
+            },
             input: vec![Segment::Text {
                 content: "retry this".into(),
             }],
@@ -2562,7 +2540,10 @@ mod tests {
         let mut app = App::new("agent".to_string());
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
-            session: protocol::SessionSnapshot { entries: vec![] },
+            session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                entries: vec![],
+            },
             status: WorkerStatus::Idle,
             in_flight: Default::default(),
             internal_workers: Vec::new(),
@@ -2570,7 +2551,10 @@ mod tests {
         type_keys(&mut app, "draft");
 
         app.handle_worker_event(Event::RewindApplied {
-            session: protocol::SessionSnapshot { entries: vec![] },
+            session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                entries: vec![],
+            },
             input: vec![Segment::Text {
                 content: "retry this".into(),
             }],
@@ -2918,12 +2902,12 @@ mod tests {
         type_keys(&mut app, "first");
         assert!(matches!(
             handle_key(&mut app, key(KeyCode::Enter)),
-            Some(Method::Run { .. })
+            Some(Method::Submit { .. })
         ));
         type_keys(&mut app, "second");
         assert!(matches!(
             handle_key(&mut app, key(KeyCode::Enter)),
-            Some(Method::Run { .. })
+            Some(Method::Submit { .. })
         ));
 
         assert_eq!(input_text(&app), "");
@@ -2954,7 +2938,7 @@ mod tests {
         type_keys(&mut app, "sent");
         assert!(matches!(
             handle_key(&mut app, key(KeyCode::Enter)),
-            Some(Method::Run { .. })
+            Some(Method::Submit { .. })
         ));
         type_keys(&mut app, "draft\nbody");
         app.move_cursor_start();

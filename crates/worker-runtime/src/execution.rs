@@ -41,14 +41,12 @@ pub enum WorkerExecutionOperation {
     Cancel,
 }
 
-/// Evidence that a user input reached the durable Worker session boundary.
-///
-/// This is intentionally distinct from accepting a method on the Worker's
-/// in-memory channel. For Flow submissions, the committed UserInput entry also
-/// carries the initial Flow runtime-state extension.
+/// Evidence that a Submit request reached the durable Worker session boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkerInputCommitAck {
+pub struct WorkerSubmissionAck {
+    pub submission_request_id: String,
     pub submission_id: String,
+    pub disposition: protocol::SubmissionDisposition,
 }
 
 /// Typed execution result class. Results are transient operation outcomes and
@@ -61,7 +59,7 @@ pub struct WorkerExecutionResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_commit: Option<WorkerInputCommitAck>,
+    pub submission: Option<WorkerSubmissionAck>,
 }
 
 /// Backend result class for a Worker execution operation.
@@ -85,22 +83,26 @@ impl WorkerExecutionResult {
             outcome: WorkerExecutionOutcome::Accepted,
             run_state,
             message: None,
-            input_commit: None,
+            submission: None,
         }
     }
 
-    pub fn accepted_input_committed(
+    pub fn accepted_submission(
         operation: WorkerExecutionOperation,
         run_state: WorkerExecutionRunState,
+        submission_request_id: impl Into<String>,
         submission_id: impl Into<String>,
+        disposition: protocol::SubmissionDisposition,
     ) -> Self {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Accepted,
             run_state,
             message: None,
-            input_commit: Some(WorkerInputCommitAck {
+            submission: Some(WorkerSubmissionAck {
+                submission_request_id: submission_request_id.into(),
                 submission_id: submission_id.into(),
+                disposition,
             }),
         }
     }
@@ -111,7 +113,7 @@ impl WorkerExecutionResult {
             outcome: WorkerExecutionOutcome::Busy,
             run_state: WorkerExecutionRunState::Busy,
             message: Some(message.into()),
-            input_commit: None,
+            submission: None,
         }
     }
 
@@ -121,7 +123,7 @@ impl WorkerExecutionResult {
             outcome: WorkerExecutionOutcome::Rejected,
             run_state: WorkerExecutionRunState::Stopped,
             message: Some(message.into()),
-            input_commit: None,
+            submission: None,
         }
     }
 
@@ -131,7 +133,7 @@ impl WorkerExecutionResult {
             outcome: WorkerExecutionOutcome::Errored,
             run_state: WorkerExecutionRunState::Errored,
             message: Some(message.into()),
-            input_commit: None,
+            submission: None,
         }
     }
 
@@ -141,7 +143,7 @@ impl WorkerExecutionResult {
             outcome: WorkerExecutionOutcome::Unsupported,
             run_state: WorkerExecutionRunState::Stopped,
             message: Some(message.into()),
-            input_commit: None,
+            submission: None,
         }
     }
 
@@ -618,14 +620,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn input_commit_ack_survives_json_round_trip() {
-        let result = WorkerExecutionResult::accepted_input_committed(
+    fn submission_ack_survives_json_round_trip() {
+        let result = WorkerExecutionResult::accepted_submission(
             WorkerExecutionOperation::Input,
             WorkerExecutionRunState::Busy,
+            "request-1",
             "submission-1",
+            protocol::SubmissionDisposition::Started,
         );
 
         let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"submission_request_id\":\"request-1\""));
         assert!(json.contains("\"submission_id\":\"submission-1\""));
         assert_eq!(
             serde_json::from_str::<WorkerExecutionResult>(&json).unwrap(),

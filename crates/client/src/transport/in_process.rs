@@ -89,12 +89,15 @@ mod tests {
         let mut client = Client::new(socket);
 
         client
-            .send(&Method::run_text("hello"))
+            .send(&Method::submit_text(
+                protocol::new_submission_request_id(),
+                "hello",
+            ))
             .await
             .expect("send method");
         assert!(matches!(
             peer.next().await.as_deref().map(decode_method),
-            Some(Ok(Method::Run { .. }))
+            Some(Ok(Method::Submit { .. }))
         ));
 
         peer.send(

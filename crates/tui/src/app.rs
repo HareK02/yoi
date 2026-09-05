@@ -102,23 +102,6 @@ struct RollbackSubmitState {
     turn_before: usize,
 }
 
-#[derive(Clone)]
-pub struct QueuedInput {
-    segments: Vec<Segment>,
-    preview: String,
-}
-
-impl QueuedInput {
-    fn new(segments: Vec<Segment>) -> Self {
-        let preview = Segment::flatten_to_text(&segments);
-        Self { segments, preview }
-    }
-
-    pub fn preview(&self) -> &str {
-        &self.preview
-    }
-}
-
 struct ComposerInputHistory {
     entries: VecDeque<Vec<Segment>>,
     browse: Option<ComposerInputHistoryBrowse>,
@@ -272,7 +255,7 @@ pub struct App {
     /// Current transient actionbar notice. Notices are local UI state only:
     /// they are never appended to transcript/session history or LLM context.
     actionbar_notice: Option<ActionbarNotice>,
-    /// Normal composer input that is submitted as `Method::Run`.
+    /// Normal composer input that is submitted as `Method::Submit`.
     pub input: InputBuffer,
     /// Separate command-line input. It is never submitted as a user message.
     pub command_input: InputBuffer,
@@ -333,9 +316,8 @@ pub struct App {
     /// Top entry index of the task pane's visible window. Clamped on
     /// render so it never points past the end of the list.
     pub task_pane_scroll: usize,
-    /// TUI-local FIFO of user inputs submitted while the Worker is already running.
-    /// Entries have not been sent to the Worker yet, so they remain editable/cancellable locally.
-    queued_inputs: VecDeque<QueuedInput>,
+    /// Authoritative WorkerSession FIFO summary received from snapshot/live events.
+    pending_submissions: protocol::PendingSubmissionsSnapshot,
     /// TUI-local readline-style composer input history. This is intentionally
     /// client-side only: recalled entries are plain drafts until submitted again.
     input_history: ComposerInputHistory,
@@ -395,7 +377,7 @@ impl App {
             text_selection: TextSelectionState::default(),
             task_pane_open: false,
             task_pane_scroll: 0,
-            queued_inputs: VecDeque::new(),
+            pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
             input_history: ComposerInputHistory::new(),
             input_history_store: None,
             pending_submit_rollback: None,
@@ -768,18 +750,12 @@ impl App {
             return None;
         }
         self.record_input_history(segments.clone());
-        if self.running {
-            self.queued_inputs.push_back(QueuedInput::new(segments));
-            self.input.clear();
-            self.completion = None;
-            return None;
-        }
         self.input.clear();
         Some(self.method_for_run(segments))
     }
 
     pub fn restore_unsent_run(&mut self, method: &Method) {
-        let Method::Run { input } = method else {
+        let Method::Submit { input, .. } = method else {
             return;
         };
         self.pending_submit_rollback = None;
@@ -787,8 +763,9 @@ impl App {
             self.input.replace_with_segments(input);
             self.completion = None;
         } else {
-            self.queued_inputs
-                .push_front(QueuedInput::new(input.clone()));
+            self.push_error(
+                "Submit transport failed; current Composer was preserved and the unsent input was not queued.",
+            );
         }
     }
 
@@ -804,7 +781,10 @@ impl App {
             block_start: self.blocks.len(),
             turn_before: self.turn_index,
         });
-        Method::Run { input: segments }
+        Method::Submit {
+            submission_request_id: protocol::new_submission_request_id(),
+            input: segments,
+        }
     }
 
     fn record_input_history(&mut self, segments: Vec<Segment>) {
@@ -825,7 +805,7 @@ impl App {
     }
 
     pub fn queued_input_count(&self) -> usize {
-        self.queued_inputs.len()
+        self.pending_submissions.submissions.len()
     }
 
     #[cfg(test)]
@@ -911,35 +891,10 @@ impl App {
     }
 
     pub fn next_queued_input_preview(&self) -> Option<&str> {
-        self.queued_inputs.front().map(QueuedInput::preview)
-    }
-
-    pub fn clear_queued_inputs(&mut self) -> usize {
-        let cleared = self.queued_inputs.len();
-        self.queued_inputs.clear();
-        cleared
-    }
-
-    pub fn restore_next_queued_input_to_composer(&mut self) -> bool {
-        if self.queued_inputs.is_empty() {
-            return false;
-        }
-        if !self.input.is_empty() {
-            self.push_error("Composer is not empty; clear it before editing queued input.");
-            return false;
-        }
-        let Some(queued) = self.queued_inputs.pop_front() else {
-            return false;
-        };
-        self.input_history.cancel_browse();
-        self.input.replace_with_segments(&queued.segments);
-        self.completion = None;
-        true
-    }
-
-    fn pop_next_queued_run(&mut self) -> Option<Method> {
-        let queued = self.queued_inputs.pop_front()?;
-        Some(self.method_for_run(queued.segments))
+        self.pending_submissions
+            .submissions
+            .first()
+            .map(|submission| submission.submission_id.as_str())
     }
 
     pub fn clear_actionbar_notice(&mut self) {
@@ -1123,6 +1078,11 @@ impl App {
         }
 
         match event {
+            Event::SubmissionAccepted { .. } => {}
+            Event::SubmissionRejected { message, .. } => self.push_error(message),
+            Event::PendingSubmissionsChanged { pending } => {
+                self.pending_submissions = pending;
+            }
             Event::UserMessage { segments } => {
                 self.turn_index += 1;
                 self.blocks.push(Block::TurnHeader {
@@ -1372,9 +1332,6 @@ impl App {
                             WorkerStatus::Idle
                         }
                     });
-                    if matches!(result, RunResult::Finished | RunResult::LimitReached) {
-                        return self.pop_next_queued_run();
-                    }
                 }
             }
             Event::CompactStart { .. } => {
@@ -1449,6 +1406,7 @@ impl App {
                 internal_workers,
             } => {
                 self.rewind_refresh_fence = false;
+                self.pending_submissions = session.pending_submissions.clone();
                 self.restore_snapshot(&session, greeting, in_flight);
                 self.replace_internal_worker_snapshots(internal_workers);
                 self.set_worker_status(status);
@@ -2681,7 +2639,10 @@ mod rewind_refresh_tests {
         });
 
         app.handle_worker_event(Event::RewindApplied {
-            session: protocol::SessionSnapshot { entries: vec![] },
+            session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                entries: vec![],
+            },
             input: vec![Segment::text("selected rewind input")],
             summary: summary(3),
         });
@@ -2700,7 +2661,10 @@ mod rewind_refresh_tests {
         });
 
         app.handle_worker_event(Event::RewindApplied {
-            session: protocol::SessionSnapshot { entries: vec![] },
+            session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                entries: vec![],
+            },
             input: vec![Segment::text("rewound input")],
             summary: summary(1),
         });
@@ -2743,7 +2707,10 @@ mod rewind_refresh_tests {
         });
 
         app.handle_worker_event(Event::RewindApplied {
-            session: protocol::SessionSnapshot { entries: vec![] },
+            session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                entries: vec![],
+            },
             input: vec![Segment::text("rewound input")],
             summary: summary(2),
         });
@@ -2877,7 +2844,7 @@ mod composer_history_persistence_tests {
                 path: "src/lib.rs".into(),
             },
         ]);
-        assert!(matches!(app.submit_input(), Some(Method::Run { .. })));
+        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
 
         let mut reloaded = App::new_with_input_history_store("test".into(), store);
         assert!(reloaded.browse_input_history_older());
@@ -2958,7 +2925,7 @@ mod composer_history_persistence_tests {
             app.insert_char(c);
         }
         match app.submit_input() {
-            Some(Method::Run { input }) => input,
+            Some(Method::Submit { input, .. }) => input,
             other => panic!("expected Run, got {other:?}"),
         }
     }
@@ -3424,72 +3391,43 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn running_submit_is_queued_locally_and_clears_composer() {
+    fn running_submit_is_sent_to_the_worker_and_not_queued_locally() {
         let mut app = App::new("test".into());
         app.set_worker_status(WorkerStatus::Running);
         insert_text(&mut app, "queued turn");
 
-        assert!(app.submit_input().is_none());
+        let method = app.submit_input();
 
-        assert_eq!(app.queued_input_count(), 1);
-        assert_eq!(app.next_queued_input_preview(), Some("queued turn"));
+        assert!(matches!(method, Some(Method::Submit { .. })));
+        assert_eq!(app.queued_input_count(), 0);
         assert_eq!(input_text(&app), "");
     }
 
     #[test]
-    fn finished_run_auto_sends_next_queued_input() {
+    fn pending_submission_projection_is_worker_authoritative() {
         let mut app = App::new("test".into());
-        app.set_worker_status(WorkerStatus::Running);
-        insert_text(&mut app, "next turn");
-        assert!(app.submit_input().is_none());
-
-        let method = app.handle_worker_event(Event::RunEnd {
-            result: RunResult::Finished,
+        app.handle_worker_event(Event::PendingSubmissionsChanged {
+            pending: protocol::PendingSubmissionsSnapshot {
+                revision: 3,
+                notification_count: 0,
+                submissions: vec![protocol::PendingSubmissionSummary {
+                    submission_id: "submission-1".into(),
+                    accepted_at_ms: 7,
+                    segment_count: 2,
+                    byte_len: 42,
+                }],
+            },
         });
 
-        match method {
-            Some(Method::Run { input }) => {
-                assert_eq!(Segment::flatten_to_text(&input), "next turn");
-            }
-            other => panic!("expected queued Run, got {other:?}"),
-        }
-        assert_eq!(app.queued_input_count(), 0);
-    }
-
-    #[test]
-    fn limit_reached_run_auto_sends_next_queued_input() {
-        let mut app = App::new("test".into());
-        app.set_worker_status(WorkerStatus::Running);
-        insert_text(&mut app, "next after limit");
-        assert!(app.submit_input().is_none());
-
-        let method = app.handle_worker_event(Event::RunEnd {
-            result: RunResult::LimitReached,
-        });
-
-        match method {
-            Some(Method::Run { input }) => {
-                assert_eq!(Segment::flatten_to_text(&input), "next after limit");
-            }
-            other => panic!("expected queued Run, got {other:?}"),
-        }
-        assert_eq!(app.queued_input_count(), 0);
-    }
-
-    #[test]
-    fn paused_and_rolled_back_run_do_not_auto_send_queue() {
-        for result in [RunResult::Paused, RunResult::RolledBack] {
-            let mut app = App::new("test".into());
-            app.set_worker_status(WorkerStatus::Running);
-            insert_text(&mut app, "held turn");
-            assert!(app.submit_input().is_none());
-
-            let method = app.handle_worker_event(Event::RunEnd { result });
-
-            assert!(method.is_none());
-            assert_eq!(app.queued_input_count(), 1);
-            assert_eq!(app.next_queued_input_preview(), Some("held turn"));
-        }
+        assert_eq!(app.queued_input_count(), 1);
+        assert_eq!(app.next_queued_input_preview(), Some("submission-1"));
+        assert!(
+            app.handle_worker_event(Event::RunEnd {
+                result: RunResult::Finished,
+            })
+            .is_none()
+        );
+        assert_eq!(app.queued_input_count(), 1);
     }
 
     #[test]
@@ -3498,24 +3436,6 @@ mod completion_flow_tests {
         app.set_worker_status(WorkerStatus::Paused);
 
         assert!(matches!(app.submit_input(), Some(Method::Resume)));
-        assert_eq!(app.queued_input_count(), 0);
-    }
-
-    #[test]
-    fn queued_input_can_be_restored_to_composer_or_cleared() {
-        let mut app = App::new("test".into());
-        app.set_worker_status(WorkerStatus::Running);
-        insert_text(&mut app, "edit me");
-        assert!(app.submit_input().is_none());
-
-        assert!(app.restore_next_queued_input_to_composer());
-        assert_eq!(app.queued_input_count(), 0);
-        assert_eq!(input_text(&app), "edit me");
-
-        app.input.clear();
-        insert_text(&mut app, "clear me");
-        assert!(app.submit_input().is_none());
-        assert_eq!(app.clear_queued_inputs(), 1);
         assert_eq!(app.queued_input_count(), 0);
     }
 
@@ -3530,7 +3450,7 @@ mod completion_flow_tests {
             app.insert_char(c);
         }
         match app.submit_input() {
-            Some(Method::Run { input }) => input,
+            Some(Method::Submit { input, .. }) => input,
             other => panic!("expected Run, got {other:?}"),
         }
     }
@@ -3675,6 +3595,7 @@ mod completion_flow_tests {
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
             status: WorkerStatus::Running,
@@ -3783,6 +3704,7 @@ mod completion_flow_tests {
             revision,
             status: WorkerStatus::Idle,
             session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
             in_flight: protocol::InFlightSnapshot::default(),
@@ -4000,6 +3922,7 @@ mod completion_flow_tests {
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
             status: WorkerStatus::Idle,
@@ -4051,6 +3974,7 @@ mod completion_flow_tests {
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
             status: WorkerStatus::Idle,
@@ -4064,6 +3988,7 @@ mod completion_flow_tests {
                 },
                 revision: 4,
                 session: protocol::SessionSnapshot {
+                    pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                     entries: Vec::new(),
                 },
                 status: WorkerStatus::Running,
@@ -4222,6 +4147,7 @@ mod completion_flow_tests {
 
         app.handle_worker_event(Event::Snapshot {
             session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
             greeting,
@@ -4437,23 +4363,23 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn input_history_records_queued_inputs_and_suppresses_consecutive_duplicates() {
+    fn input_history_records_running_submits_and_suppresses_consecutive_duplicates() {
         let mut app = App::new("test".into());
         app.running = true;
 
         for c in "repeat".chars() {
             app.insert_char(c);
         }
-        assert!(app.submit_input().is_none());
+        assert!(app.submit_input().is_some());
         assert_eq!(app.input_history_len(), 1);
-        assert_eq!(app.queued_input_count(), 1);
+        assert_eq!(app.queued_input_count(), 0);
 
         for c in "repeat".chars() {
             app.insert_char(c);
         }
-        assert!(app.submit_input().is_none());
+        assert!(app.submit_input().is_some());
         assert_eq!(app.input_history_len(), 1);
-        assert_eq!(app.queued_input_count(), 2);
+        assert_eq!(app.queued_input_count(), 0);
 
         app.insert_char(' ');
         assert!(app.submit_input().is_none());
@@ -4481,7 +4407,7 @@ mod completion_flow_tests {
             },
         ];
         app.input.replace_with_segments(&original);
-        assert!(matches!(app.submit_input(), Some(Method::Run { .. })));
+        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
 
         assert!(app.browse_input_history_older());
         assert_eq!(app.input.submit_segments(), original);
@@ -4493,7 +4419,7 @@ mod completion_flow_tests {
         for c in "sent".chars() {
             app.insert_char(c);
         }
-        assert!(matches!(app.submit_input(), Some(Method::Run { .. })));
+        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
 
         for c in "draft".chars() {
             app.insert_char(c);
@@ -4511,7 +4437,7 @@ mod completion_flow_tests {
         for c in "sent".chars() {
             app.insert_char(c);
         }
-        assert!(matches!(app.submit_input(), Some(Method::Run { .. })));
+        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
 
         assert!(app.browse_input_history_older());
         assert!(app.input_history_is_browsing());
@@ -4528,17 +4454,19 @@ mod completion_flow_tests {
         for c in "first".chars() {
             app.insert_char(c);
         }
-        assert!(matches!(app.submit_input(), Some(Method::Run { .. })));
+        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
         for c in "second".chars() {
             app.insert_char(c);
         }
-        assert!(matches!(app.submit_input(), Some(Method::Run { .. })));
+        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
 
         assert!(app.browse_input_history_older());
         assert!(app.browse_input_history_older());
         let method = app.submit_input();
         match method {
-            Some(Method::Run { input }) => assert_eq!(Segment::flatten_to_text(&input), "first"),
+            Some(Method::Submit { input, .. }) => {
+                assert_eq!(Segment::flatten_to_text(&input), "first")
+            }
             other => panic!("expected recalled run, got {other:?}"),
         }
         assert_eq!(app.input_history_len(), 3);

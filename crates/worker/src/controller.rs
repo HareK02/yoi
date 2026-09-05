@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use agen::EngineError;
 use agen::llm_client::client::LlmClient;
 use session_store::WorkerMetadataStore;
-use session_store::{LogEntry, SessionExtension, Store};
+use session_store::{LogEntry, Store};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::discovery::WorkerDiscovery;
@@ -23,16 +23,12 @@ use crate::shutdown_after_idle::{
 };
 use crate::spawn::registry::SpawnedWorkerRegistry;
 use crate::spawn::tool::sub_worker_spawn_tool;
-use crate::worker::{
-    SystemItemCommitter, WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN, Worker, WorkerError,
-    WorkerRunResult,
-};
+use crate::worker::{SystemItemCommitter, Worker, WorkerError, WorkerRunResult};
 use protocol::{
     AlertLevel, AlertSource, CommandEvent as ProtocolCommandEvent,
     CommandSnapshot as ProtocolCommandSnapshot, CommandStatus as ProtocolCommandStatus,
     CommandStream as ProtocolCommandStream, CommandStreamSlice as ProtocolCommandStreamSlice,
-    ErrorCode, Event, Method, RewindTargetId, RunResult, Segment, TurnResult, UploadedFileRef,
-    WorkerStatus,
+    ErrorCode, Event, Method, RewindTargetId, RunResult, TurnResult, UploadedFileRef, WorkerStatus,
 };
 use workdir::{
     CommandEvent as WorkdirCommandEvent, CommandSnapshot as WorkdirCommandSnapshot,
@@ -58,6 +54,7 @@ pub struct WorkerHandle {
     spawned_registry: Arc<SpawnedWorkerRegistry>,
     artifact_store: Arc<dyn Store>,
     session_id: session_store::SessionId,
+    pending_activations: Arc<std::sync::Mutex<crate::worker::PendingActivationState>>,
 }
 
 impl WorkerHandle {
@@ -131,8 +128,15 @@ impl WorkerHandle {
             let in_flight = snapshot_from_guard(&in_flight_guard);
             (entries, entry_rx, in_flight)
         };
+        let mut session =
+            session_store::public_snapshot::project_current_session_snapshot(&entries);
+        session.pending_submissions = self
+            .pending_activations
+            .lock()
+            .expect("pending activation state poisoned")
+            .snapshot();
         let event = Event::Snapshot {
-            session: session_store::public_snapshot::project_current_session_snapshot(&entries),
+            session,
             greeting: self.shared_state.greeting.clone(),
             status: self.shared_state.get_status(),
             in_flight,
@@ -213,21 +217,41 @@ async fn finish_controller_run<C, St>(
 /// `Worker::*` entry point — `RunForNotification` carries none because
 /// `worker.run_for_notification()` drains the NotifyBuffer on its own.
 enum PendingRun {
-    Run(Vec<Segment>),
-    RunTracked {
-        input: Vec<Segment>,
-        extension: SessionExtension,
-    },
+    Submit(crate::worker::PendingSubmission),
     /// Self-initiated turn kicked from the notify buffer. The carried
     /// `InvokeKind` is the trigger that flipped the Worker from IDLE
     /// (Notify or WorkerEvent) and is recorded by the Invoke marker
     /// committed at the start of `worker.run_for_notification`.
-    RunForNotification(protocol::InvokeKind),
+    RunForNotification {
+        invoke_kind: protocol::InvokeKind,
+        notification_request_id: Option<String>,
+    },
     Resume,
 }
 
+fn prepare_pending_run<St: Store + Clone>(
+    pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
+    notify_buffer: &NotifyBuffer,
+) -> Result<Option<PendingRun>, crate::worker::PendingSubmissionError> {
+    Ok(match pending_submissions.prepare_next_activation()? {
+        Some(crate::worker::PendingActivation::Submission(submission)) => {
+            Some(PendingRun::Submit(submission))
+        }
+        Some(crate::worker::PendingActivation::Notification(notification)) => {
+            let extension = pending_submissions.notification_activation_extension();
+            let notification_request_id = notification.notification_request_id.clone();
+            notify_buffer.push_durable_notify(notification.message, extension);
+            Some(PendingRun::RunForNotification {
+                invoke_kind: protocol::InvokeKind::Notify,
+                notification_request_id: Some(notification_request_id),
+            })
+        }
+        None => None,
+    })
+}
+
 impl PendingRun {
-    /// Whether this turn was kicked off by the parent (via `Method::Run`
+    /// Whether this turn was kicked off by the parent (via `Method::Submit`
     /// or `Method::Resume`). Used by [`drive_turn`] to gate upward
     /// `WorkerEvent::TurnEnded` / `WorkerEvent::Errored` reports so the parent
     /// only sees completion signals for work it actually delegated.
@@ -235,14 +259,10 @@ impl PendingRun {
     /// notify buffer (Notify / inbound WorkerEvent) and stays silent.
     fn is_parent_originated(&self) -> bool {
         match self {
-            PendingRun::Run(_) | PendingRun::RunTracked { .. } | PendingRun::Resume => true,
-            PendingRun::RunForNotification(_) => false,
+            PendingRun::Submit(_) | PendingRun::Resume => true,
+            PendingRun::RunForNotification { .. } => false,
         }
     }
-}
-
-fn should_auto_run_notification(status: WorkerStatus, auto_run: bool) -> bool {
-    auto_run && status == WorkerStatus::Idle
 }
 
 // ---------------------------------------------------------------------------
@@ -552,6 +572,7 @@ impl WorkerController {
 
         let artifact_store: Arc<dyn Store> = Arc::new(worker.store().clone());
         let session_id = worker.session_id();
+        let pending_activations = worker.pending_activation_state();
         let handle = WorkerHandle {
             method_tx,
             working_event_tx: working_event_tx.clone(),
@@ -563,6 +584,7 @@ impl WorkerController {
             spawned_registry: spawned_registry.clone(),
             artifact_store,
             session_id,
+            pending_activations,
         };
 
         let socket_server = match transport {
@@ -1291,6 +1313,7 @@ async fn controller_loop<C, St>(
         spawned_registry.clone(),
     );
     let mut pending: Option<PendingRun> = None;
+    let pending_submissions = worker.pending_submission_handle();
 
     loop {
         // Top-of-iteration: if an event handler staged a run, fire it
@@ -1307,8 +1330,8 @@ async fn controller_loop<C, St>(
             // interrupted/error turn from being carried into the next snapshot.
             worker.clear_in_flight_events();
             let parent_originated = run.is_parent_originated();
-            let user_input_run = matches!(&run, PendingRun::Run(_) | PendingRun::RunTracked { .. });
-            if !user_input_run {
+            let user_input_submit = matches!(&run, PendingRun::Submit(_));
+            if !user_input_submit {
                 set_controller_status(
                     &shared_state,
                     &runtime_dir,
@@ -1317,37 +1340,21 @@ async fn controller_loop<C, St>(
                 )
                 .await;
             }
-            let (mut new_status, shutdown) = match run {
-                PendingRun::Run(input) => {
+            let notification_request_id = match &run {
+                PendingRun::RunForNotification {
+                    notification_request_id,
+                    ..
+                } => notification_request_id.clone(),
+                _ => None,
+            };
+            let (mut new_status, shutdown, may_drain_pending) = match run {
+                PendingRun::Submit(submission) => {
                     let (input_commit_tx, input_commit_rx) = oneshot::channel();
+                    let committed_submission = submission.clone();
+                    let extension = pending_submissions.activation_extension();
                     drive_turn(
                         worker.run_with_input_extensions_and_commit_hook(
-                            input,
-                            Vec::new(),
-                            move || {
-                                let _ = input_commit_tx.send(());
-                            },
-                        ),
-                        &mut method_rx,
-                        &working_event_tx,
-                        &cancel_tx,
-                        &pause_tx,
-                        &shared_state,
-                        &runtime_dir,
-                        Some(input_commit_rx),
-                        &notify_buffer,
-                        self_parent_socket.as_ref(),
-                        &spawner_name,
-                        &spawned_registry,
-                        parent_originated,
-                    )
-                    .await
-                }
-                PendingRun::RunTracked { input, extension } => {
-                    let (input_commit_tx, input_commit_rx) = oneshot::channel();
-                    drive_turn(
-                        worker.run_with_input_extensions_and_commit_hook(
-                            input,
+                            submission.input,
                             vec![extension],
                             move || {
                                 let _ = input_commit_tx.send(());
@@ -1359,8 +1366,9 @@ async fn controller_loop<C, St>(
                         &pause_tx,
                         &shared_state,
                         &runtime_dir,
-                        Some(input_commit_rx),
+                        Some((input_commit_rx, committed_submission)),
                         &notify_buffer,
+                        &pending_submissions,
                         self_parent_socket.as_ref(),
                         &spawner_name,
                         &spawned_registry,
@@ -1368,9 +1376,9 @@ async fn controller_loop<C, St>(
                     )
                     .await
                 }
-                PendingRun::RunForNotification(kind) => {
+                PendingRun::RunForNotification { invoke_kind, .. } => {
                     drive_turn(
-                        worker.run_for_notification(kind),
+                        worker.run_for_notification(invoke_kind),
                         &mut method_rx,
                         &working_event_tx,
                         &cancel_tx,
@@ -1379,6 +1387,7 @@ async fn controller_loop<C, St>(
                         &runtime_dir,
                         None,
                         &notify_buffer,
+                        &pending_submissions,
                         self_parent_socket.as_ref(),
                         &spawner_name,
                         &spawned_registry,
@@ -1397,6 +1406,7 @@ async fn controller_loop<C, St>(
                         &runtime_dir,
                         None,
                         &notify_buffer,
+                        &pending_submissions,
                         self_parent_socket.as_ref(),
                         &spawner_name,
                         &spawned_registry,
@@ -1405,10 +1415,32 @@ async fn controller_loop<C, St>(
                     .await
                 }
             };
-            if !shutdown && new_status == WorkerStatus::Idle && notify_buffer.has_auto_run_pending()
-            {
-                pending = Some(PendingRun::RunForNotification(protocol::InvokeKind::Notify));
-                new_status = WorkerStatus::Running;
+            if let Some(notification_request_id) = notification_request_id {
+                pending_submissions.finish_notification_activation(&notification_request_id);
+            }
+
+            if !shutdown && may_drain_pending && new_status == WorkerStatus::Idle {
+                match prepare_pending_run(&pending_submissions, &notify_buffer) {
+                    Ok(Some(next)) => {
+                        pending = Some(next);
+                        new_status = WorkerStatus::Running;
+                    }
+                    Ok(None) => {
+                        if notify_buffer.has_auto_run_pending() {
+                            pending = Some(PendingRun::RunForNotification {
+                                invoke_kind: protocol::InvokeKind::Notify,
+                                notification_request_id: None,
+                            });
+                            new_status = WorkerStatus::Running;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = working_event_tx.send(Event::Error {
+                            code: ErrorCode::Internal,
+                            message: error.to_string(),
+                        });
+                    }
+                }
             }
             finish_controller_run(
                 &mut worker,
@@ -1435,61 +1467,118 @@ async fn controller_loop<C, St>(
         };
 
         match method {
-            Method::Run { input } => {
-                if shared_state.get_status() == WorkerStatus::Running {
-                    // Defensive: the inner select! inside drive_turn
-                    // already rejects `Run` while a turn is live, so
-                    // this branch is only reachable across a race window
-                    // around status flips.
-                    let _ = working_event_tx.send(Event::Error {
-                        code: ErrorCode::AlreadyRunning,
-                        message: "Worker is already executing a turn".into(),
-                    });
-                    continue;
-                }
-                // Stage the run without a speculative user-message echo.
-                // `Worker::run` validates the input, commits
-                // `LogEntry::AnnotatedUserInput`, and the session-log sink turns that
-                // committed entry into the live `Event::UserMessage`. That
-                // keeps every client ordered against `SegmentStart` replay and
-                // makes persisted history the single source of visible user
-                // input. Paused→Run cleanup (orphan tool_result closure +
-                // interrupt system note) is applied inside `Worker::run` itself
-                // when the worker's `last_run_interrupted` flag is set.
-                pending = Some(PendingRun::Run(input));
-            }
-
-            Method::RunTracked {
+            Method::Submit {
+                submission_request_id,
                 input,
-                submission_id,
-            } => {
-                // Runtime-correlated submissions retain their opaque id in the
-                // same durable UserInput record used for Flow state.
-                let extension = SessionExtension::new(
-                    WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN,
-                    serde_json::json!({ "submission_id": submission_id }),
-                );
-                pending = Some(PendingRun::RunTracked { input, extension });
             }
-
-            Method::Notify { message, auto_run } => {
-                // Client-side live echo is delivered as `Event::SystemItem`
-                // once the interceptor commits the corresponding
-                // `LogEntry::AnnotatedSystemItem` entry — drained out of the
-                // notify buffer + broadcast through the sink. No
-                // separate echo here.
-                worker.push_notify(message, auto_run);
-                // RUNNING: the in-flight turn drains the buffer at its next
-                // pending_history_appends; if an auto-run notification remains
-                // at turn end, the Controller stages a follow-up notification
-                // turn. Paused notifications remain queued until Resume/Run.
-                // IDLE: `auto_run` notifications stage RunForNotification;
-                // weak progress notices stay queued until an explicit run.
-                if should_auto_run_notification(shared_state.get_status(), auto_run) {
-                    pending = Some(PendingRun::RunForNotification(protocol::InvokeKind::Notify));
+            | Method::SubmitTracked {
+                submission_request_id,
+                input,
+            } => {
+                let request_id = submission_request_id.clone();
+                match pending_submissions.accept(submission_request_id, input, true) {
+                    Ok(acceptance) => {
+                        if let Some(activation) = acceptance.activation {
+                            pending = Some(PendingRun::Submit(activation));
+                        } else {
+                            let _ = working_event_tx.send(Event::SubmissionAccepted {
+                                submission_request_id: acceptance.submission_request_id,
+                                submission_id: acceptance.submission_id,
+                                disposition: acceptance.disposition,
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        let _ = working_event_tx.send(Event::SubmissionRejected {
+                            submission_request_id: request_id,
+                            message: error.to_string(),
+                        });
+                    }
                 }
             }
 
+            Method::Notify {
+                notification_request_id,
+                message,
+                auto_run,
+            } => {
+                if auto_run {
+                    match pending_submissions.accept_notification(notification_request_id, message)
+                    {
+                        Ok(true) => match prepare_pending_run(&pending_submissions, &notify_buffer)
+                        {
+                            Ok(Some(next)) => pending = Some(next),
+                            Ok(None) => {}
+                            Err(error) => {
+                                let _ = working_event_tx.send(Event::Error {
+                                    code: ErrorCode::Internal,
+                                    message: error.to_string(),
+                                });
+                            }
+                        },
+                        Ok(false) => {}
+                        Err(error) => {
+                            let _ = working_event_tx.send(Event::Error {
+                                code: ErrorCode::InvalidRequest,
+                                message: error.to_string(),
+                            });
+                        }
+                    }
+                } else {
+                    worker.push_notify(message, false);
+                }
+            }
+
+            Method::ListPendingSubmissions => {
+                let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
+                    pending: pending_submissions.snapshot(),
+                });
+            }
+            Method::CancelPendingSubmission { submission_id } => {
+                match pending_submissions.cancel(&submission_id) {
+                    Ok(pending_snapshot) => {
+                        let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
+                            pending: pending_snapshot,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = working_event_tx.send(Event::Error {
+                            code: ErrorCode::InvalidRequest,
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
+            Method::ClearPendingSubmissions => match pending_submissions.clear() {
+                Ok(pending_snapshot) => {
+                    let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
+                        pending: pending_snapshot,
+                    });
+                }
+                Err(error) => {
+                    let _ = working_event_tx.send(Event::Error {
+                        code: ErrorCode::Internal,
+                        message: error.to_string(),
+                    });
+                }
+            },
+            Method::ContinuePending => {
+                match prepare_pending_run(&pending_submissions, &notify_buffer) {
+                    Ok(Some(next)) => pending = Some(next),
+                    Ok(None) => {
+                        let _ = working_event_tx.send(Event::Error {
+                            code: ErrorCode::InvalidRequest,
+                            message: "pending activation queue is empty".into(),
+                        });
+                    }
+                    Err(error) => {
+                        let _ = working_event_tx.send(Event::Error {
+                            code: ErrorCode::Internal,
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
             Method::Resume => {
                 if shared_state.get_status() != WorkerStatus::Paused {
                     let _ = working_event_tx.send(Event::Error {
@@ -1703,9 +1792,10 @@ async fn controller_loop<C, St>(
                     // notification is not stranded. Matches the
                     // `Method::Notify` idle path.
                     if shared_state.get_status() == WorkerStatus::Idle {
-                        pending = Some(PendingRun::RunForNotification(
-                            protocol::InvokeKind::WorkerEvent,
-                        ));
+                        pending = Some(PendingRun::RunForNotification {
+                            invoke_kind: protocol::InvokeKind::WorkerEvent,
+                            notification_request_id: None,
+                        });
                     }
                 }
             }
@@ -1788,12 +1878,12 @@ async fn handle_inbound_worker_event(
 /// as `Errored` — only the worker-execution `Err` branch below fires.
 ///
 /// `parent_originated` further restricts both upward reports to turns
-/// the parent actually delegated (`Method::Run` / `Method::Resume`).
+/// the parent actually delegated (`Method::Submit` / `Method::Resume`).
 /// `Method::Notify` / inbound `WorkerEvent` auto-kicks complete silently
 /// so the parent's history does not get flooded with child-internal
 /// turn boundaries.
 #[allow(clippy::too_many_arguments)]
-async fn drive_turn<F>(
+async fn drive_turn<F, St>(
     worker_future: F,
     method_rx: &mut mpsc::Receiver<Method>,
     working_event_tx: &broadcast::Sender<Event>,
@@ -1801,15 +1891,17 @@ async fn drive_turn<F>(
     pause_tx: &mpsc::Sender<()>,
     shared_state: &Arc<WorkerSharedState>,
     runtime_dir: &RuntimeDir,
-    mut input_commit_rx: Option<oneshot::Receiver<()>>,
+    mut input_commit: Option<(oneshot::Receiver<()>, crate::worker::PendingSubmission)>,
     notify_buffer: &NotifyBuffer,
+    pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
     parent_socket: Option<&PathBuf>,
     self_name: &str,
     spawned_registry: &Arc<SpawnedWorkerRegistry>,
     parent_originated: bool,
-) -> (WorkerStatus, bool)
+) -> (WorkerStatus, bool, bool)
 where
     F: std::future::Future<Output = Result<WorkerRunResult, WorkerError>>,
+    St: Store + Clone,
 {
     tokio::pin!(worker_future);
     let mut shutdown_requested = false;
@@ -1822,13 +1914,25 @@ where
             // Running snapshot contract deterministic even for immediate clients.
             biased;
             committed = async {
-                input_commit_rx
+                input_commit
                     .as_mut()
+                    .map(|(receiver, _)| receiver)
                     .expect("input commit receiver guarded by select condition")
                     .await
-            }, if input_commit_rx.is_some() => {
-                input_commit_rx = None;
+            }, if input_commit.is_some() => {
+                let submission = input_commit.take().map(|(_, submission)| submission);
                 if committed.is_ok() {
+                    if let Some(submission) = submission {
+                        pending_submissions.finish_activation(&submission.submission_id);
+                        let _ = working_event_tx.send(Event::SubmissionAccepted {
+                            submission_request_id: submission.submission_request_id,
+                            submission_id: submission.submission_id,
+                            disposition: protocol::SubmissionDisposition::Started,
+                        });
+                        let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
+                            pending: pending_submissions.snapshot(),
+                        });
+                    }
                     set_controller_status(
                         shared_state,
                         runtime_dir,
@@ -1836,11 +1940,33 @@ where
                         WorkerStatus::Running,
                     )
                     .await;
+                } else if let Some(submission) = submission {
+                    pending_submissions.abort_activation(submission);
                 }
             }
             result = &mut worker_future => {
+                if let Some((mut receiver, submission)) = input_commit.take() {
+                    match receiver.try_recv() {
+                        Ok(()) => {
+                            pending_submissions.finish_activation(&submission.submission_id);
+                            let _ = working_event_tx.send(Event::SubmissionAccepted {
+                                submission_request_id: submission.submission_request_id,
+                                submission_id: submission.submission_id,
+                                disposition: protocol::SubmissionDisposition::Started,
+                            });
+                            let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
+                                pending: pending_submissions.snapshot(),
+                            });
+                        }
+                        Err(_) => pending_submissions.abort_activation(submission),
+                    }
+                }
                 return match result {
                     Ok(r) => {
+                        let may_drain_pending = matches!(
+                            &r,
+                            WorkerRunResult::Finished | WorkerRunResult::LimitReached
+                        );
                         let (status, run_result) = match r {
                             WorkerRunResult::Finished if pause_requested => {
                                 (WorkerStatus::Paused, RunResult::Paused)
@@ -1851,7 +1977,7 @@ where
                             WorkerRunResult::RolledBack => (WorkerStatus::Idle, RunResult::RolledBack),
                             WorkerRunResult::Interrupted { .. } if pause_requested => {
                                 let _ = working_event_tx.send(Event::RunEnd { result: RunResult::Paused });
-                                return (WorkerStatus::Paused, shutdown_requested);
+                                return (WorkerStatus::Paused, shutdown_requested, false);
                             }
                             WorkerRunResult::Interrupted { code, message } => {
                                 let _ = working_event_tx.send(Event::Error {
@@ -1867,7 +1993,7 @@ where
                                         },
                                     );
                                 }
-                                return (WorkerStatus::Idle, shutdown_requested);
+                                return (WorkerStatus::Idle, shutdown_requested, false);
                             }
                         };
                         let _ = working_event_tx.send(Event::RunEnd { result: run_result });
@@ -1879,7 +2005,7 @@ where
                                 },
                             );
                         }
-                        (status, shutdown_requested)
+                        (status, shutdown_requested, may_drain_pending)
                     }
                     Err(WorkerError::Engine(EngineError::Cancelled)) if pause_requested => {
                         // User-initiated Pause. Report the transition to
@@ -1888,7 +2014,7 @@ where
                         // that channel is reserved for worker runtime
                         // failures, not deliberate interruptions.
                         let _ = working_event_tx.send(Event::RunEnd { result: RunResult::Paused });
-                        (WorkerStatus::Paused, shutdown_requested)
+                        (WorkerStatus::Paused, shutdown_requested, false)
                     }
                     Err(e) => {
                         let code = worker_error_code(&e);
@@ -1906,11 +2032,11 @@ where
                                 },
                             );
                         }
-                        (WorkerStatus::Idle, shutdown_requested)
+                        (WorkerStatus::Idle, shutdown_requested, false)
                     }
                 };
             }
-            method = method_rx.recv() => {
+            method = method_rx.recv(), if input_commit.is_none() => {
                 match method {
                     Some(Method::Cancel) => {
                         let _ = cancel_tx.try_send(());
@@ -1923,11 +2049,70 @@ where
                         shutdown_requested = true;
                         let _ = cancel_tx.try_send(());
                     }
-                    Some(Method::Run { .. } | Method::RunTracked { .. } | Method::Resume) => {
+                    Some(Method::Submit {
+                        submission_request_id,
+                        input,
+                    }
+                    | Method::SubmitTracked {
+                        submission_request_id,
+                        input,
+                    }) => {
+                        let request_id = submission_request_id.clone();
+                        match pending_submissions.accept(submission_request_id, input, false) {
+                            Ok(acceptance) => {
+                                let _ = working_event_tx.send(Event::SubmissionAccepted {
+                                    submission_request_id: acceptance.submission_request_id,
+                                    submission_id: acceptance.submission_id,
+                                    disposition: acceptance.disposition,
+                                });
+                                let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
+                                    pending: pending_submissions.snapshot(),
+                                });
+                            }
+                            Err(error) => {
+                                let _ = working_event_tx.send(Event::SubmissionRejected {
+                                    submission_request_id: request_id,
+                                    message: error.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    Some(Method::Resume | Method::ContinuePending) => {
                         let _ = working_event_tx.send(Event::Error {
                             code: ErrorCode::AlreadyRunning,
                             message: "Worker is already executing a turn".into(),
                         });
+                    }
+                    Some(Method::ListPendingSubmissions) => {
+                        let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
+                            pending: pending_submissions.snapshot(),
+                        });
+                    }
+                    Some(Method::CancelPendingSubmission { submission_id }) => {
+                        match pending_submissions.cancel(&submission_id) {
+                            Ok(pending) => {
+                                let _ = working_event_tx.send(Event::PendingSubmissionsChanged { pending });
+                            }
+                            Err(error) => {
+                                let _ = working_event_tx.send(Event::Error {
+                                    code: ErrorCode::InvalidRequest,
+                                    message: error.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    Some(Method::ClearPendingSubmissions) => {
+                        match pending_submissions.clear() {
+                            Ok(pending) => {
+                                let _ = working_event_tx.send(Event::PendingSubmissionsChanged { pending });
+                            }
+                            Err(error) => {
+                                let _ = working_event_tx.send(Event::Error {
+                                    code: ErrorCode::Internal,
+                                    message: error.to_string(),
+                                });
+                            }
+                        }
                     }
                     Some(Method::Compact | Method::ListRewindTargets | Method::RewindTo { .. }) => {
                         let _ = working_event_tx.send(Event::Error {
@@ -1936,11 +2121,28 @@ where
                                 .into(),
                         });
                     }
-                    Some(Method::Notify { message, auto_run }) => {
-                        // Live echo arrives via `Event::SystemItem` once
-                        // the in-flight turn's next `pending_history_appends`
-                        // drains this entry through the interceptor.
-                        notify_buffer.push_notify(message, auto_run);
+                    Some(Method::Notify {
+                        notification_request_id,
+                        message,
+                        auto_run,
+                    }) => {
+                        if auto_run {
+                            if let Err(error) = pending_submissions.accept_notification(
+                                notification_request_id,
+                                message,
+                            ) {
+                                let _ = working_event_tx.send(Event::Error {
+                                    code: ErrorCode::InvalidRequest,
+                                    message: error.to_string(),
+                                });
+                            } else {
+                                let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
+                                    pending: pending_submissions.snapshot(),
+                                });
+                            }
+                        } else {
+                            notify_buffer.push_notify(message, false);
+                        }
                     }
                     Some(Method::ListCompletions { .. }) => {}
                     Some(Method::ListWorkers | Method::RestoreWorker { .. } | Method::RegisterPeer { .. }) => {
@@ -1969,7 +2171,7 @@ where
                     None => {
                         let _ = cancel_tx.try_send(());
                         shared_state.set_status(WorkerStatus::Idle);
-                        return (WorkerStatus::Idle, false);
+                        return (WorkerStatus::Idle, false, false);
                     }
                 }
             }
@@ -2134,19 +2336,14 @@ mod tests {
 
     #[test]
     fn pending_run_parent_origin_table() {
-        assert!(PendingRun::Run(Vec::new()).is_parent_originated());
         assert!(PendingRun::Resume.is_parent_originated());
         assert!(
-            !PendingRun::RunForNotification(protocol::InvokeKind::Notify).is_parent_originated()
+            !PendingRun::RunForNotification {
+                invoke_kind: protocol::InvokeKind::Notify,
+                notification_request_id: None,
+            }
+            .is_parent_originated()
         );
-    }
-
-    #[test]
-    fn notification_auto_run_gate_only_allows_idle_auto_run() {
-        assert!(should_auto_run_notification(WorkerStatus::Idle, true));
-        assert!(!should_auto_run_notification(WorkerStatus::Idle, false));
-        assert!(!should_auto_run_notification(WorkerStatus::Running, true));
-        assert!(!should_auto_run_notification(WorkerStatus::Paused, true));
     }
 
     struct DriveTurnEnv {
@@ -2161,6 +2358,7 @@ mod tests {
         _pause_rx: mpsc::Receiver<()>,
         shared_state: Arc<WorkerSharedState>,
         notify_buffer: NotifyBuffer,
+        pending_submissions: crate::worker::PendingSubmissionHandle<session_store::FsStore>,
         spawned_registry: Arc<SpawnedWorkerRegistry>,
         parent_socket_path: PathBuf,
         runtime_dir: Arc<RuntimeDir>,
@@ -2194,6 +2392,8 @@ mod tests {
             },
         ));
         let notify_buffer = NotifyBuffer::new();
+        let pending_submissions =
+            crate::worker::PendingSubmissionHandle::for_test(&temp.path().join("pending-sessions"));
         let spawned_registry = SpawnedWorkerRegistry::new(runtime_dir.clone());
         let parent_socket_path = temp.path().join("parent.sock");
 
@@ -2207,6 +2407,7 @@ mod tests {
             _pause_rx: pause_rx,
             shared_state,
             notify_buffer,
+            pending_submissions,
             spawned_registry,
             parent_socket_path,
             runtime_dir,
@@ -2225,6 +2426,7 @@ mod tests {
             writer
                 .write(&Event::Snapshot {
                     session: protocol::SessionSnapshot {
+                        pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                         entries: Vec::new(),
                     },
                     greeting: protocol::Greeting {
@@ -2259,7 +2461,7 @@ mod tests {
         let recv = tokio::spawn(recv_worker_event(listener, Duration::from_secs(2)));
 
         let worker_future = async { Ok::<_, WorkerError>(WorkerRunResult::Finished) };
-        let (status, shutdown) = drive_turn(
+        let (status, shutdown, _) = drive_turn(
             worker_future,
             &mut env.method_rx,
             &env.working_event_tx,
@@ -2269,6 +2471,7 @@ mod tests {
             &env.runtime_dir,
             None,
             &env.notify_buffer,
+            &env.pending_submissions,
             Some(&env.parent_socket_path),
             "child-worker",
             &env.spawned_registry,
@@ -2302,7 +2505,7 @@ mod tests {
             Ok::<_, WorkerError>(WorkerRunResult::Finished)
         };
         let started_at = std::time::Instant::now();
-        let (status, shutdown) = drive_turn(
+        let (status, shutdown, _) = drive_turn(
             worker_future,
             &mut env.method_rx,
             &env.working_event_tx,
@@ -2312,6 +2515,7 @@ mod tests {
             &env.runtime_dir,
             None,
             &env.notify_buffer,
+            &env.pending_submissions,
             None,
             "child-worker",
             &env.spawned_registry,
@@ -2332,7 +2536,7 @@ mod tests {
         let listener = UnixListener::bind(&env.parent_socket_path).expect("bind listener");
 
         let worker_future = async { Ok::<_, WorkerError>(WorkerRunResult::Finished) };
-        let (status, _) = drive_turn(
+        let (status, _, _) = drive_turn(
             worker_future,
             &mut env.method_rx,
             &env.working_event_tx,
@@ -2342,6 +2546,7 @@ mod tests {
             &env.runtime_dir,
             None,
             &env.notify_buffer,
+            &env.pending_submissions,
             Some(&env.parent_socket_path),
             "child-worker",
             &env.spawned_registry,
@@ -2370,7 +2575,7 @@ mod tests {
                 "boom from test".into(),
             )))
         };
-        let (status, _) = drive_turn(
+        let (status, _, _) = drive_turn(
             worker_future,
             &mut env.method_rx,
             &env.working_event_tx,
@@ -2380,6 +2585,7 @@ mod tests {
             &env.runtime_dir,
             None,
             &env.notify_buffer,
+            &env.pending_submissions,
             Some(&env.parent_socket_path),
             "child-worker",
             &env.spawned_registry,
@@ -2414,7 +2620,7 @@ mod tests {
                 "boom from notify".into(),
             )))
         };
-        let (status, _) = drive_turn(
+        let (status, _, _) = drive_turn(
             worker_future,
             &mut env.method_rx,
             &env.working_event_tx,
@@ -2424,6 +2630,7 @@ mod tests {
             &env.runtime_dir,
             None,
             &env.notify_buffer,
+            &env.pending_submissions,
             Some(&env.parent_socket_path),
             "child-worker",
             &env.spawned_registry,
@@ -2456,7 +2663,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             Ok::<_, WorkerError>(WorkerRunResult::Finished)
         };
-        let (status, shutdown) = drive_turn(
+        let (status, shutdown, _) = drive_turn(
             worker_future,
             &mut env.method_rx,
             &env.working_event_tx,
@@ -2466,6 +2673,7 @@ mod tests {
             &env.runtime_dir,
             None,
             &env.notify_buffer,
+            &env.pending_submissions,
             Some(&env.parent_socket_path),
             "parent",
             &env.spawned_registry,
@@ -2495,7 +2703,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             Ok::<_, WorkerError>(WorkerRunResult::Finished)
         };
-        let (status, shutdown) = drive_turn(
+        let (status, shutdown, _) = drive_turn(
             worker_future,
             &mut env.method_rx,
             &env.working_event_tx,
@@ -2505,6 +2713,7 @@ mod tests {
             &env.runtime_dir,
             None,
             &env.notify_buffer,
+            &env.pending_submissions,
             Some(&env.parent_socket_path),
             "parent",
             &env.spawned_registry,
@@ -2522,6 +2731,7 @@ mod tests {
         let mut env = make_env().await;
         env._method_tx
             .send(Method::Notify {
+                notification_request_id: protocol::new_submission_request_id(),
                 message: "continue".into(),
                 auto_run: true,
             })
@@ -2532,7 +2742,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             Ok::<_, WorkerError>(WorkerRunResult::Finished)
         };
-        let (status, shutdown) = drive_turn(
+        let (status, shutdown, _) = drive_turn(
             worker_future,
             &mut env.method_rx,
             &env.working_event_tx,
@@ -2542,6 +2752,7 @@ mod tests {
             &env.runtime_dir,
             None,
             &env.notify_buffer,
+            &env.pending_submissions,
             Some(&env.parent_socket_path),
             "parent",
             &env.spawned_registry,
@@ -2551,8 +2762,8 @@ mod tests {
 
         assert_eq!(status, WorkerStatus::Idle);
         assert!(!shutdown);
-        assert_eq!(env.notify_buffer.len(), 1);
-        assert!(env.notify_buffer.has_auto_run_pending());
+        assert_eq!(env.notify_buffer.len(), 0);
+        assert_eq!(env.pending_submissions.snapshot().notification_count, 1);
     }
 
     #[tokio::test]
@@ -2568,7 +2779,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             Ok::<_, WorkerError>(WorkerRunResult::Finished)
         };
-        let (status, shutdown) = drive_turn(
+        let (status, shutdown, _) = drive_turn(
             worker_future,
             &mut env.method_rx,
             &env.working_event_tx,
@@ -2578,6 +2789,7 @@ mod tests {
             &env.runtime_dir,
             None,
             &env.notify_buffer,
+            &env.pending_submissions,
             Some(&env.parent_socket_path),
             "child-worker",
             &env.spawned_registry,

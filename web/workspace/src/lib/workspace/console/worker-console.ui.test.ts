@@ -1059,3 +1059,25 @@ Deno.test("Web Console switches main and direct SubWorker views from the Tasks r
     "Worker view selection should expose only direct SubWorker session identities with main fallback",
   );
 });
+
+Deno.test("Web Console uses Notify while running and exposes durable pending controls", async () => {
+  const consolePage = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+
+  for (const token of [
+    'method: "submit"',
+    'method: "notify"',
+    "notification_request_id: crypto.randomUUID()",
+    "submission_request_id: crypto.randomUUID()",
+    'payload.event === "pending_submissions_changed"',
+    'method: "cancel_pending_submission"',
+    'method: "clear_pending_submissions"',
+    'method: "continue_pending"',
+  ]) {
+    assert(consolePage.includes(token), `missing durable pending control token: ${token}`);
+  }
+});

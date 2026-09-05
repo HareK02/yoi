@@ -748,8 +748,12 @@ impl Runtime {
             let state = self.lock()?;
             state.worker(&worker_ref)?.request.initial_input.clone()
         } {
-            let expected_submission_id = Uuid::now_v7().to_string();
-            initial_input.submission_id = Some(expected_submission_id.clone());
+            let expected_submission_id = initial_input
+                .submission_request_id
+                .clone()
+                .filter(|request_id| !request_id.trim().is_empty())
+                .unwrap_or_else(|| Uuid::now_v7().to_string());
+            initial_input.submission_request_id = Some(expected_submission_id.clone());
             let dispatch_result = backend.dispatch_input(&handle, initial_input.clone());
             if !dispatch_result.is_accepted() {
                 let _ = backend.stop_worker(&handle);
@@ -763,9 +767,9 @@ impl Runtime {
                 });
             }
             let has_commit_ack = dispatch_result
-                .input_commit
+                .submission
                 .as_ref()
-                .is_some_and(|ack| ack.submission_id == expected_submission_id);
+                .is_some_and(|ack| ack.submission_request_id == expected_submission_id);
             if !has_commit_ack {
                 let _ = backend.stop_worker(&handle);
                 self.rollback_failed_create(&worker_ref)?;
@@ -1146,13 +1150,18 @@ impl Runtime {
         mut input: WorkerInput,
     ) -> Result<WorkerInteractionAck, RuntimeError> {
         validate_worker_input(&input)?;
-        let expected_submission_id = if input.kind == WorkerInputKind::User {
-            let submission_id = Uuid::now_v7().to_string();
-            input.submission_id = Some(submission_id.clone());
-            Some(submission_id)
-        } else {
-            None
-        };
+        let expected_submission_id =
+            if matches!(input.kind, WorkerInputKind::User | WorkerInputKind::Notify) {
+                let submission_id = input
+                    .submission_request_id
+                    .clone()
+                    .filter(|request_id| !request_id.trim().is_empty())
+                    .unwrap_or_else(|| Uuid::now_v7().to_string());
+                input.submission_request_id = Some(submission_id.clone());
+                Some(submission_id)
+            } else {
+                None
+            };
         self.ensure_worker_execution(worker_ref)?;
         let (backend, handle) = {
             let state = self.lock()?;
@@ -1191,13 +1200,13 @@ impl Runtime {
         }
         if let Some(expected_submission_id) = expected_submission_id
             && dispatch_result
-                .input_commit
+                .submission
                 .as_ref()
-                .is_none_or(|ack| ack.submission_id != expected_submission_id)
+                .is_none_or(|ack| ack.submission_request_id != expected_submission_id)
         {
             let result = WorkerExecutionResult::rejected(
                 WorkerExecutionOperation::Input,
-                "execution backend did not acknowledge the committed Runtime submission id",
+                "execution backend did not acknowledge the committed Runtime submission request id",
             );
             self.record_execution_result(worker_ref, result.clone())?;
             return Err(RuntimeError::WorkerExecutionRejected {
@@ -1209,6 +1218,7 @@ impl Runtime {
             });
         }
 
+        let submission = dispatch_result.submission.clone();
         let mut state = self.lock()?;
         state.ensure_running()?;
         let worker = state.worker_mut(worker_ref)?;
@@ -1225,6 +1235,7 @@ impl Runtime {
         Ok(WorkerInteractionAck {
             worker_ref: worker_ref.clone(),
             status,
+            submission,
         })
     }
 
@@ -1706,6 +1717,7 @@ impl Runtime {
         }
         Ok(protocol::Event::Snapshot {
             session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
             greeting: protocol::Greeting {
@@ -3250,17 +3262,9 @@ fn validate_worker_input(input: &WorkerInput) -> Result<(), RuntimeError> {
 #[cfg(feature = "ws-server")]
 fn input_protocol_event(input: &WorkerInput) -> Option<protocol::Event> {
     match input.kind {
-        WorkerInputKind::User => Some(protocol::Event::UserMessage {
-            segments: input.segments.clone().unwrap_or_else(|| {
-                vec![protocol::Segment::Text {
-                    content: input.content.clone(),
-                }]
-            }),
-        }),
-        // The committed `SystemItem::Notification` is the sole agent-visible
-        // and Console-visible authority for Notify. A synthetic observation
-        // here would display the same notification twice.
-        WorkerInputKind::Notify => None,
+        // Submit is projected only after the Worker commits UserInput. Queued
+        // payloads must never become model- or client-visible history early.
+        WorkerInputKind::User | WorkerInputKind::Notify => None,
         WorkerInputKind::Compact
         | WorkerInputKind::ListRewindTargets
         | WorkerInputKind::RegisterPeer => Some(protocol::Event::SystemItem {
@@ -3435,6 +3439,7 @@ mod tests {
         );
         let snapshot = protocol::Event::Snapshot {
             session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
             greeting: protocol::Greeting {
@@ -3475,7 +3480,7 @@ mod tests {
         let input = WorkerInput {
             kind: WorkerInputKind::User,
             content: String::new(),
-            submission_id: None,
+            submission_request_id: None,
             segments: Some(vec![protocol::Segment::Flow {
                 selector: "builtin:coder-review".to_string(),
             }]),
@@ -3488,7 +3493,7 @@ mod tests {
         let input = WorkerInput {
             kind: WorkerInputKind::User,
             content: String::new(),
-            submission_id: None,
+            submission_request_id: None,
             segments: Some(Vec::new()),
         };
         assert!(matches!(
@@ -3503,7 +3508,7 @@ mod tests {
         request.initial_input = Some(WorkerInput {
             kind: WorkerInputKind::User,
             content: String::new(),
-            submission_id: None,
+            submission_request_id: None,
             segments: Some(vec![protocol::Segment::Flow {
                 selector: "builtin:coder-review".to_string(),
             }]),
@@ -4005,7 +4010,7 @@ mod tests {
             _handle: &WorkerExecutionHandle,
             input: WorkerInput,
         ) -> WorkerExecutionResult {
-            let submission_id = input.submission_id.clone();
+            let submission_id = input.submission_request_id.clone();
             self.dispatched_inputs.lock().unwrap().push(input);
             let mut result = self
                 .dispatch_result
@@ -4013,19 +4018,21 @@ mod tests {
                 .unwrap()
                 .clone()
                 .unwrap_or_else(|| {
-                    WorkerExecutionResult::accepted_input_committed(
+                    WorkerExecutionResult::accepted_submission(
                         WorkerExecutionOperation::Input,
                         WorkerExecutionRunState::Idle,
+                        "request-test",
                         "test-submission",
+                        protocol::SubmissionDisposition::Started,
                     )
                 });
             if !self
                 .preserve_commit_ack_submission_id
                 .load(Ordering::SeqCst)
                 && let (Some(ack), Some(submission_id)) =
-                    (result.input_commit.as_mut(), submission_id)
+                    (result.submission.as_mut(), submission_id)
             {
-                ack.submission_id = submission_id;
+                ack.submission_request_id = submission_id;
             }
             result
         }
@@ -4717,10 +4724,12 @@ mod tests {
     #[test]
     fn create_worker_uses_committed_input_ack_run_state() {
         let (runtime, backend) = runtime_and_backend();
-        backend.set_dispatch_result(WorkerExecutionResult::accepted_input_committed(
+        backend.set_dispatch_result(WorkerExecutionResult::accepted_submission(
             WorkerExecutionOperation::Input,
             WorkerExecutionRunState::Idle,
+            "request-test",
             "test-submission",
+            protocol::SubmissionDisposition::Started,
         ));
         let mut request = task_request("committed initial input is already idle");
         request.initial_input = Some(WorkerInput::user("start the ticket"));
@@ -4731,13 +4740,15 @@ mod tests {
     }
 
     #[test]
-    fn create_worker_rejects_mismatched_input_commit_acknowledgement() {
+    fn create_worker_rejects_mismatched_submission_acknowledgement() {
         let (runtime, backend) = runtime_and_backend();
         backend.preserve_commit_ack_submission_id();
-        backend.set_dispatch_result(WorkerExecutionResult::accepted_input_committed(
+        backend.set_dispatch_result(WorkerExecutionResult::accepted_submission(
             WorkerExecutionOperation::Input,
             WorkerExecutionRunState::Busy,
+            "request-test",
             "forged-submission",
+            protocol::SubmissionDisposition::Started,
         ));
         let mut request = task_request("mismatched initial input commit ack");
         request.initial_input = Some(WorkerInput::user("start the ticket"));
@@ -4866,6 +4877,7 @@ mod tests {
             &detail.worker_ref,
             protocol::Event::Snapshot {
                 session: protocol::SessionSnapshot {
+                    pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                     entries: vec![protocol::SessionSnapshotEntry {
                         entry_id: "restored-log-entry".to_owned(),
                         timestamp: 1,
@@ -4937,10 +4949,14 @@ mod tests {
             _handle: &WorkerExecutionHandle,
             input: WorkerInput,
         ) -> WorkerExecutionResult {
-            WorkerExecutionResult::accepted_input_committed(
+            WorkerExecutionResult::accepted_submission(
                 WorkerExecutionOperation::Input,
                 WorkerExecutionRunState::Idle,
-                input.submission_id.expect("Runtime submission id"),
+                "request-test",
+                input
+                    .submission_request_id
+                    .expect("Runtime submission request id"),
+                protocol::SubmissionDisposition::Started,
             )
         }
     }
@@ -5030,7 +5046,7 @@ mod tests {
         request.initial_input = Some(WorkerInput {
             kind: WorkerInputKind::User,
             content: String::new(),
-            submission_id: None,
+            submission_request_id: None,
             segments: Some(vec![
                 protocol::Segment::Flow {
                     selector: "builtin:coder-review".to_string(),
@@ -5068,7 +5084,7 @@ mod tests {
         let input = WorkerInput {
             kind: WorkerInputKind::User,
             content: String::new(),
-            submission_id: None,
+            submission_request_id: None,
             segments: Some(vec![protocol::Segment::Flow {
                 selector: "builtin:coder-review".to_string(),
             }]),
@@ -5083,11 +5099,11 @@ mod tests {
         assert_eq!(dispatched[0].kind, input.kind);
         assert_eq!(dispatched[0].content, input.content);
         assert_eq!(dispatched[0].segments, input.segments);
-        let submission_id = dispatched[0]
-            .submission_id
+        let submission_request_id = dispatched[0]
+            .submission_request_id
             .as_deref()
-            .expect("Runtime submission id");
-        Uuid::parse_str(submission_id).expect("submission id UUID");
+            .expect("Runtime submission request id");
+        Uuid::parse_str(submission_request_id).expect("submission request id UUID");
     }
 
     #[cfg(feature = "ws-server")]
@@ -5113,11 +5129,7 @@ mod tests {
         let observations = runtime
             .read_worker_observation_events(&detail.worker_ref, WorkerObservationCursor::zero())
             .unwrap();
-        assert_eq!(observations.len(), 1);
-        assert!(matches!(
-            observations[0].payload,
-            protocol::Event::UserMessage { .. }
-        ));
+        assert!(observations.is_empty());
 
         runtime
             .observe_worker_event(
@@ -5135,8 +5147,8 @@ mod tests {
         let observations = runtime
             .read_worker_observation_events(&detail.worker_ref, WorkerObservationCursor::zero())
             .unwrap();
-        assert_eq!(observations.len(), 2);
-        let protocol::Event::SystemItem { item } = &observations[1].payload else {
+        assert_eq!(observations.len(), 1);
+        let protocol::Event::SystemItem { item } = &observations[0].payload else {
             panic!("committed notification observation must be a system item");
         };
         assert_eq!(item["kind"], "notification");

@@ -2735,11 +2735,13 @@ mod tests {
             _handle: &WorkerExecutionHandle,
             input: WorkerInput,
         ) -> WorkerExecutionResult {
-            if let Some(submission_id) = input.submission_id {
-                WorkerExecutionResult::accepted_input_committed(
+            if let Some(submission_id) = input.submission_request_id {
+                WorkerExecutionResult::accepted_submission(
                     WorkerExecutionOperation::Input,
                     WorkerExecutionRunState::Idle,
+                    submission_id.clone(),
                     submission_id,
+                    protocol::SubmissionDisposition::Started,
                 )
             } else {
                 WorkerExecutionResult::accepted(
@@ -3059,11 +3061,13 @@ mod ws_tests {
             _handle: &WorkerExecutionHandle,
             input: WorkerInput,
         ) -> WorkerExecutionResult {
-            if let Some(submission_id) = input.submission_id {
-                WorkerExecutionResult::accepted_input_committed(
+            if let Some(submission_id) = input.submission_request_id {
+                WorkerExecutionResult::accepted_submission(
                     WorkerExecutionOperation::Input,
                     WorkerExecutionRunState::Idle,
+                    submission_id.clone(),
                     submission_id,
+                    protocol::SubmissionDisposition::Started,
                 )
             } else {
                 WorkerExecutionResult::accepted(
