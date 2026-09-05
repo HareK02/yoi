@@ -89,8 +89,10 @@ use workspace_api::{
     WorkingDirectoryListResponse as BrowserWorkingDirectoryListResponse,
     WorkingDirectoryRemovalDisposition, WorkingDirectoryRemovalRequest,
     WorkingDirectoryRemovalResponse, WorkingDirectoryRepositoryOption,
-    WorkspaceCatalogListResponse, WorkspaceCreateResponse, WorkspaceExtensionPointState,
-    WorkspaceExtensionPoints, WorkspaceMetadataMutationResponse, WorkspaceMetadataSettingsResponse,
+    WorkspaceCatalogListResponse, WorkspaceCreateResponse, WorkspaceDeletionBlocker,
+    WorkspaceDeletionBlockerKind, WorkspaceDeletionOperationResponse, WorkspaceDeletionRequest,
+    WorkspaceDeletionState, WorkspaceExtensionPointState, WorkspaceExtensionPoints,
+    WorkspaceMetadataMutationResponse, WorkspaceMetadataSettingsResponse,
     WorkspacePermissionSummary, WorkspaceRepositoryRecord, WorkspaceResponse,
     WorkspaceRuntimeDetail, WorkspaceRuntimeResource, WorkspaceSummary,
     WorkspaceWorkerDiscoveryItem, WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
@@ -744,6 +746,17 @@ impl WorkspaceWorkerRemoveExecutor {
             ));
         }
 
+        self.execute_target_removal(&runtime, &target, reason, false)
+            .await
+    }
+
+    async fn execute_target_removal(
+        &self,
+        runtime: &RuntimeRegistry,
+        target: &RuntimeWorkerRef,
+        reason: &str,
+        allow_internal: bool,
+    ) -> std::result::Result<worker::WorkspaceResponse, String> {
         let remove_lock = {
             let mut locks = self
                 .worker_remove_locks
@@ -830,7 +843,7 @@ impl WorkspaceWorkerRemoveExecutor {
                 ));
             }
             return self
-                .resume_worker_retention(&runtime, &target, prepared)
+                .resume_worker_retention(runtime, &target, prepared)
                 .await;
         }
 
@@ -844,7 +857,7 @@ impl WorkspaceWorkerRemoveExecutor {
                 ));
             }
         };
-        if worker.singleton_key.is_some() {
+        if worker.singleton_key.is_some() && !allow_internal {
             return Ok(worker_remove_error_response(
                 StatusCode::CONFLICT,
                 "internal_worker_forbidden",
@@ -1008,6 +1021,133 @@ impl WorkspaceServerApi {
         }
     }
 
+    async fn execute_workspace_deletion(
+        &self,
+        operation_id: &str,
+    ) -> Result<WorkspaceDeletionOperationResponse> {
+        let operation = self.store.update_workspace_deletion_operation(
+            operation_id,
+            WorkspaceDeletionState::Running,
+            &[],
+            &[],
+            None,
+        )?;
+        let workspace = self
+            .store
+            .get_workspace(&operation.workspace_id)
+            .await?
+            .ok_or_else(|| Error::InvalidInput("Workspace no longer exists".to_string()))?;
+        let repositories = self.store.list_repositories(&operation.workspace_id)?;
+        let config = self
+            .template
+            .for_catalog_workspace(&workspace, repositories)?;
+        let api = WorkspaceApi::new(config, self.store.clone()).await?;
+        self.store
+            .release_workspace_assignments_for_deletion(&operation.workspace_id)?;
+
+        let mut child_operation_ids = Vec::new();
+        let mut blockers = Vec::new();
+        for worker in self
+            .store
+            .list_worker_registry(&operation.workspace_id, 10_000)?
+        {
+            let worker_key = worker.display_name.clone();
+            let target = worker.worker;
+            let lifecycle = WorkerLifecycleRequest {
+                reason: Some("Workspace deletion".to_string()),
+                ticket_assignment: None,
+            };
+            let _ = api.runtime.cancel_worker(&target, lifecycle.clone());
+            if api.runtime.stop_worker(&target, lifecycle).is_err() {
+                blockers.push(WorkspaceDeletionBlocker {
+                    kind: WorkspaceDeletionBlockerKind::WorkerRemovalBlocked,
+                    resource_kind: Some("worker".to_string()),
+                    resource_key: Some(worker_key.clone()),
+                    message: "Worker stop did not reach a retryable terminal state.".to_string(),
+                });
+                continue;
+            }
+            let response = WorkspaceWorkerRemoveExecutor::new(&api)
+                .execute_target_removal(api.runtime.as_ref(), &target, "Workspace deletion", true)
+                .await
+                .map_err(Error::Store)?;
+            if let Some(child_operation_id) = self.store.latest_worker_removal_operation_id(
+                &operation.workspace_id,
+                &target.runtime_id,
+                &target.worker_id,
+            )? {
+                child_operation_ids.push(child_operation_id);
+            }
+            if response.status != 200 {
+                blockers.push(WorkspaceDeletionBlocker {
+                    kind: WorkspaceDeletionBlockerKind::WorkerRemovalBlocked,
+                    resource_kind: Some("worker".to_string()),
+                    resource_key: Some(worker_key.clone()),
+                    message: "Worker retention or removal policy blocked deletion.".to_string(),
+                });
+            }
+        }
+
+        if blockers.is_empty() {
+            for workdir in self
+                .store
+                .list_workdir_registry(&operation.workspace_id, 10_000)?
+            {
+                match execute_workdir_removal_for_workspace_deletion(
+                    &api,
+                    &workdir.workdir_id,
+                    operation_id,
+                    operation.force_delete_dirty_workdirs,
+                ) {
+                    Ok(child) => {
+                        child_operation_ids.push(child.operation_id.clone());
+                        if child.state != WorkdirRemovalOperationState::Completed
+                            || child.disposition != Some(WorkdirRemovalDisposition::Removed)
+                        {
+                            let dirty =
+                                child.failure_category.as_deref() == Some("dirty_or_unknown");
+                            blockers.push(WorkspaceDeletionBlocker {
+                                kind: if dirty {
+                                    WorkspaceDeletionBlockerKind::DirtyWorkdir
+                                } else {
+                                    WorkspaceDeletionBlockerKind::WorkdirRemovalBlocked
+                                },
+                                resource_kind: Some("workdir".to_string()),
+                                resource_key: Some(workdir.workdir_id),
+                                message: if dirty {
+                                    "Workdir is dirty or its cleanliness is unknown. Enable force deletion only after reviewing the impact."
+                                        .to_string()
+                                } else {
+                                    "Workdir removal did not complete; retry the Workspace deletion operation."
+                                        .to_string()
+                                },
+                            });
+                        }
+                    }
+                    Err(error) => blockers.push(WorkspaceDeletionBlocker {
+                        kind: WorkspaceDeletionBlockerKind::WorkdirRemovalBlocked,
+                        resource_kind: Some("workdir".to_string()),
+                        resource_key: Some(workdir.workdir_id),
+                        message: format!("Workdir removal failed: {error}"),
+                    }),
+                }
+            }
+        }
+
+        if !blockers.is_empty() {
+            return self.store.update_workspace_deletion_operation(
+                operation_id,
+                WorkspaceDeletionState::Blocked,
+                &child_operation_ids,
+                &blockers,
+                None,
+            );
+        }
+        let completed = self.store.finalize_workspace_deletion(operation_id)?;
+        self.routers.lock().await.remove(&completed.workspace_id);
+        Ok(completed)
+    }
+
     async fn router_for_workspace(&self, workspace_id: &str) -> Result<Option<Router>> {
         let mut routers = self.routers.lock().await;
         if let Some(router) = routers.get(workspace_id) {
@@ -1118,6 +1258,107 @@ async fn create_server_workspace(
     (status, Json(workspace_create_response(created))).into_response()
 }
 
+async fn preflight_server_workspace_deletion(
+    State(api): State<WorkspaceServerApi>,
+    AxumPath(workspace_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    let actor_account_id = match resolve_server_actor(&api, &headers).await {
+        Ok(Some(actor)) => actor.account_id,
+        Ok(None) => return forbidden_server_response("Workspace deletion requires its owner"),
+        Err(error) => return server_error_response(error),
+    };
+    match api
+        .store
+        .workspace_deletion_preflight(&actor_account_id, &workspace_id)
+    {
+        Ok(preflight) => Json(preflight).into_response(),
+        Err(error) => server_error_response(error),
+    }
+}
+
+async fn start_server_workspace_deletion(
+    State(api): State<WorkspaceServerApi>,
+    AxumPath(workspace_id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(request): Json<WorkspaceDeletionRequest>,
+) -> Response {
+    let actor_account_id = match resolve_server_actor(&api, &headers).await {
+        Ok(Some(actor)) => actor.account_id,
+        Ok(None) => return forbidden_server_response("Workspace deletion requires its owner"),
+        Err(error) => return server_error_response(error),
+    };
+    let reservation =
+        match api
+            .store
+            .reserve_workspace_deletion(&actor_account_id, &workspace_id, &request)
+        {
+            Ok(reservation) => reservation,
+            Err(error) => return server_error_response(error),
+        };
+    let operation =
+        if reservation.replay && reservation.operation.state == WorkspaceDeletionState::Succeeded {
+            reservation.operation
+        } else {
+            match api.execute_workspace_deletion(&request.operation_id).await {
+                Ok(operation) => operation,
+                Err(error) => {
+                    let _ = api.store.update_workspace_deletion_operation(
+                        &request.operation_id,
+                        WorkspaceDeletionState::Failed,
+                        &reservation.operation.child_operation_ids,
+                        &[],
+                        Some("workspace_deletion_execution_failed"),
+                    );
+                    return server_error_response(error);
+                }
+            }
+        };
+    let status = if operation.state == WorkspaceDeletionState::Succeeded {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    (status, Json(operation)).into_response()
+}
+
+async fn get_server_workspace_deletion(
+    State(api): State<WorkspaceServerApi>,
+    AxumPath(operation_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    let actor_account_id = match resolve_server_actor(&api, &headers).await {
+        Ok(Some(actor)) => actor.account_id,
+        Ok(None) => {
+            return forbidden_server_response("Workspace deletion status requires its owner");
+        }
+        Err(error) => return server_error_response(error),
+    };
+    match api
+        .store
+        .workspace_deletion_operation(&actor_account_id, &operation_id)
+    {
+        Ok(Some(operation))
+            if matches!(
+                operation.state,
+                WorkspaceDeletionState::Queued | WorkspaceDeletionState::Running
+            ) =>
+        {
+            match api.execute_workspace_deletion(&operation_id).await {
+                Ok(operation) => Json(operation).into_response(),
+                Err(error) => server_error_response(error),
+            }
+        }
+        Ok(Some(operation)) => Json(operation).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            "Workspace deletion operation not found",
+        )
+            .into_response(),
+        Err(error) => server_error_response(error),
+    }
+}
+
 fn workspace_summary(record: WorkspaceRecord) -> WorkspaceSummary {
     WorkspaceSummary {
         workspace_id: record.workspace_id,
@@ -1217,6 +1458,22 @@ async fn authorize_scoped_workspace_request(
         .await
         .map_err(|_| StatusCode::UNAUTHORIZED.into_response())?;
         request.extensions_mut().insert(source);
+        if !matches!(
+            *request.method(),
+            Method::GET | Method::HEAD | Method::OPTIONS
+        ) && !api
+            .store
+            .get_workspace(workspace_id)
+            .await
+            .map_err(server_error_response)?
+            .is_some_and(|workspace| workspace.state == "active")
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "Workspace is deleting and no longer accepts mutations",
+            )
+                .into_response());
+        }
         return Ok(());
     }
 
@@ -1243,6 +1500,20 @@ async fn authorize_scoped_workspace_request(
         }
     }
     request.extensions_mut().insert(actor);
+    if mutating
+        && !api
+            .store
+            .get_workspace(workspace_id)
+            .await
+            .map_err(server_error_response)?
+            .is_some_and(|workspace| workspace.state == "active")
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Workspace is deleting and no longer accepts mutations",
+        )
+            .into_response());
+    }
     Ok(())
 }
 
@@ -1297,6 +1568,23 @@ async fn authorize_workspace_api_request(
             return StatusCode::UNAUTHORIZED.into_response();
         };
         request.extensions_mut().insert(source);
+        if !matches!(
+            *request.method(),
+            Method::GET | Method::HEAD | Method::OPTIONS
+        ) && !api
+            .store
+            .get_workspace(&workspace_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|workspace| workspace.state == "active")
+        {
+            return (
+                StatusCode::CONFLICT,
+                "Workspace is deleting and no longer accepts mutations",
+            )
+                .into_response();
+        }
         return next.run(request).await;
     }
 
@@ -1330,6 +1618,21 @@ async fn authorize_workspace_api_request(
         }
     }
     request.extensions_mut().insert(actor);
+    if mutating
+        && !api
+            .store
+            .get_workspace(&workspace_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|workspace| workspace.state == "active")
+    {
+        return (
+            StatusCode::CONFLICT,
+            "Workspace is deleting and no longer accepts mutations",
+        )
+            .into_response();
+    }
     next.run(request).await
 }
 
@@ -1481,6 +1784,14 @@ pub async fn build_workspace_server_router(
         .route(
             "/api/workspaces",
             get(list_server_workspaces).post(create_server_workspace),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/deletion",
+            get(preflight_server_workspace_deletion).post(start_server_workspace_deletion),
+        )
+        .route(
+            "/api/workspace-deletions/{operation_id}",
+            get(get_server_workspace_deletion),
         )
         .fallback(dispatch_workspace_request)
         .with_state(api.clone());
@@ -10209,7 +10520,27 @@ fn execute_reserved_workdir_removal(
     operation: WorkdirRemovalOperation,
     recovery: bool,
 ) -> Result<WorkdirRemovalOperation> {
-    execute_reserved_workdir_removal_with_provider(api, operation, recovery, api.runtime.as_ref())
+    execute_reserved_workdir_removal_with_provider(
+        api,
+        operation,
+        recovery,
+        api.runtime.as_ref(),
+        false,
+    )
+}
+
+fn execute_reserved_workdir_removal_for_workspace_deletion(
+    api: &WorkspaceApi,
+    operation: WorkdirRemovalOperation,
+    force_dirty: bool,
+) -> Result<WorkdirRemovalOperation> {
+    execute_reserved_workdir_removal_with_provider(
+        api,
+        operation,
+        false,
+        api.runtime.as_ref(),
+        force_dirty,
+    )
 }
 
 fn execute_reserved_workdir_removal_with_provider(
@@ -10217,6 +10548,7 @@ fn execute_reserved_workdir_removal_with_provider(
     operation: WorkdirRemovalOperation,
     recovery: bool,
     provider: &dyn WorkdirRemovalRuntimeProvider,
+    force_dirty: bool,
 ) -> Result<WorkdirRemovalOperation> {
     if operation.state == WorkdirRemovalOperationState::Completed {
         return Ok(operation);
@@ -10291,8 +10623,9 @@ fn execute_reserved_workdir_removal_with_provider(
             true,
         );
     };
-    if status.summary.cleanliness.as_deref() != Some("clean")
-        || status.summary.status != WorkingDirectoryStatusKind::Active
+    if !force_dirty
+        && (status.summary.cleanliness.as_deref() != Some("clean")
+            || status.summary.status != WorkingDirectoryStatusKind::Active)
     {
         return api.config_store.complete_workdir_removal_retained(
             &operation,
@@ -10384,6 +10717,40 @@ fn execute_workdir_removal(
     };
     execute_reserved_workdir_removal(api, operation, false)
         .map(|operation| workdir_removal_response(&operation))
+}
+
+fn execute_workdir_removal_for_workspace_deletion(
+    api: &WorkspaceApi,
+    working_directory_id: &str,
+    parent_operation_id: &str,
+    force_dirty: bool,
+) -> Result<WorkdirRemovalOperation> {
+    let source_actor = format!("workspace-deletion:{parent_operation_id}");
+    let reason = "Workspace deletion";
+    let lock = workdir_removal_execution_lock(api, working_directory_id)?;
+    let _guard = lock
+        .lock()
+        .map_err(|_| Error::Store("Workdir removal lock was poisoned".to_string()))?;
+    let operation = if let Some(existing) =
+        api.config_store.find_workdir_removal_operation_by_intent(
+            api.workspace_id(),
+            working_directory_id,
+            &source_actor,
+            reason,
+        )? {
+        existing
+    } else {
+        let workdir = api
+            .config_store
+            .get_workdir_registry(api.workspace_id(), working_directory_id)?
+            .ok_or_else(|| {
+                Error::InvalidInput(format!("Unknown Workdir `{working_directory_id}`"))
+            })?;
+        let intent = workdir_removal_intent(&workdir, &source_actor, reason)?;
+        api.config_store
+            .reserve_workdir_removal_operation(&intent)?
+    };
+    execute_reserved_workdir_removal_for_workspace_deletion(api, operation, force_dirty)
 }
 
 fn recover_workdir_removals(api: &WorkspaceApi) -> Result<()> {
@@ -12380,6 +12747,7 @@ async fn get_workspace(
             manage_repositories: is_owner,
             manage_secrets: is_owner,
             manage_runtimes: is_owner,
+            delete_workspace: is_owner,
         },
         extension_points: WorkspaceExtensionPoints {
             store: "sqlite".to_string(),
@@ -24003,6 +24371,7 @@ mod tests {
             clean_operation.clone(),
             false,
             &clean_provider,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -24015,6 +24384,7 @@ mod tests {
             removed.clone(),
             false,
             &clean_provider,
+            false,
         )
         .unwrap();
         assert_eq!(replay, removed);
@@ -24039,6 +24409,7 @@ mod tests {
             missing_operation,
             false,
             &missing_provider,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -24065,6 +24436,7 @@ mod tests {
             unknown_operation,
             false,
             &unknown_provider,
+            false,
         )
         .unwrap();
         assert_eq!(unknown.state, WorkdirRemovalOperationState::Failed);
@@ -24086,10 +24458,33 @@ mod tests {
             dirty_operation,
             false,
             &dirty_provider,
+            false,
         )
         .unwrap();
         assert_eq!(dirty.disposition, Some(WorkdirRemovalDisposition::Retained));
         assert_eq!(dirty_provider.cleanup_calls(), 0);
+
+        let (forced_operation, mut forced_summary) =
+            reserve_removal_fixture(&api, "provider-dirty-forced");
+        forced_summary.cleanliness = Some("dirty".to_string());
+        let forced_provider = FakeWorkdirRemovalProvider::new(
+            workdir_removal_result(
+                WorkerOperationState::Accepted,
+                Some(forced_summary),
+                Vec::new(),
+            ),
+            workdir_removal_result(WorkerOperationState::Accepted, None, Vec::new()),
+        );
+        let forced = execute_reserved_workdir_removal_with_provider(
+            &api,
+            forced_operation,
+            false,
+            &forced_provider,
+            true,
+        )
+        .unwrap();
+        assert_eq!(forced.disposition, Some(WorkdirRemovalDisposition::Removed));
+        assert_eq!(forced_provider.cleanup_calls(), 1);
 
         let (unsupported_operation, unsupported_summary) =
             reserve_removal_fixture(&api, "provider-unsupported");
@@ -24114,6 +24509,7 @@ mod tests {
             unsupported_operation,
             false,
             &unsupported_provider,
+            false,
         )
         .unwrap();
         assert_eq!(unsupported.state, WorkdirRemovalOperationState::Failed);
@@ -24168,6 +24564,7 @@ mod tests {
                     operation,
                     true,
                     provider.as_ref(),
+                    false,
                 )
             }));
         }

@@ -540,6 +540,7 @@ pub struct WorkspacePermissionSummary {
     pub manage_repositories: bool,
     pub manage_secrets: bool,
     pub manage_runtimes: bool,
+    pub delete_workspace: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -604,6 +605,108 @@ pub struct UpdateWorkspaceMetadataRequest {
 pub struct WorkspaceMetadataMutationResponse {
     pub workspace: WorkspaceMetadataSettingsResponse,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Lifecycle state for one durable Workspace deletion operation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceDeletionState {
+    Queued,
+    Running,
+    Blocked,
+    Failed,
+    Succeeded,
+}
+
+/// Stable category explaining why Workspace deletion cannot currently advance.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceDeletionBlockerKind {
+    LastAccessibleWorkspace,
+    RevisionConflict,
+    DirtyWorkdir,
+    WorkerRemovalBlocked,
+    WorkdirRemovalBlocked,
+    RetentionHold,
+    CleanupUnavailable,
+}
+
+/// One bounded, user-actionable blocker returned by preflight or execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDeletionBlocker {
+    pub kind: WorkspaceDeletionBlockerKind,
+    pub resource_kind: Option<String>,
+    pub resource_key: Option<String>,
+    pub message: String,
+}
+
+/// Workspace-owned resources summarized before destructive confirmation.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDeletionResourceCounts {
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub workers: u64,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub workdirs: u64,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub repositories: u64,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub runtime_bindings: u64,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub secrets: u64,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub artifacts: u64,
+}
+
+/// Owner-only impact preview for deleting one Workspace.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDeletionPreflightResponse {
+    pub workspace_id: String,
+    pub display_name: String,
+    /// Opaque persisted Workspace metadata revision used as a CAS fence.
+    pub expected_revision: String,
+    pub can_delete: bool,
+    pub force_delete_dirty_workdirs_available: bool,
+    pub resources: WorkspaceDeletionResourceCounts,
+    pub blockers: Vec<WorkspaceDeletionBlocker>,
+}
+
+/// Idempotent request to start or resume Workspace deletion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDeletionRequest {
+    pub operation_id: String,
+    pub expected_revision: String,
+    pub confirmation: String,
+    #[serde(default)]
+    pub force_delete_dirty_workdirs: bool,
+}
+
+/// Durable deletion operation projection used by request responses and polling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDeletionOperationResponse {
+    pub operation_id: String,
+    pub workspace_id: String,
+    pub display_name: String,
+    pub state: WorkspaceDeletionState,
+    pub force_delete_dirty_workdirs: bool,
+    pub resources: WorkspaceDeletionResourceCounts,
+    pub child_operation_ids: Vec<String>,
+    pub blockers: Vec<WorkspaceDeletionBlocker>,
+    pub failure_category: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
 }
 
 /// Read-only Profile catalog projected from one active Workspace config revision.
@@ -2492,6 +2595,13 @@ pub fn catalog_typescript() -> String {
         WorkspaceCreateResponse::decl(&config),
         WorkspaceAuthConfig::decl(&config),
         WorkspacePermissionSummary::decl(&config),
+        WorkspaceDeletionState::decl(&config),
+        WorkspaceDeletionBlockerKind::decl(&config),
+        WorkspaceDeletionBlocker::decl(&config),
+        WorkspaceDeletionResourceCounts::decl(&config),
+        WorkspaceDeletionPreflightResponse::decl(&config),
+        WorkspaceDeletionRequest::decl(&config),
+        WorkspaceDeletionOperationResponse::decl(&config),
         DiagnosticSeverity::decl(&config),
         Diagnostic::decl(&config),
         WorkspaceExtensionPointState::decl(&config),
@@ -3146,6 +3256,47 @@ mod tests {
     }
 
     #[test]
+    fn workspace_deletion_wire_contract_is_closed_and_typed() {
+        let preflight = WorkspaceDeletionPreflightResponse {
+            workspace_id: "workspace-test".to_string(),
+            display_name: "Test".to_string(),
+            expected_revision: "revision-7".to_string(),
+            can_delete: true,
+            force_delete_dirty_workdirs_available: true,
+            resources: WorkspaceDeletionResourceCounts {
+                workers: 2,
+                workdirs: 1,
+                repositories: 1,
+                runtime_bindings: 1,
+                secrets: 0,
+                artifacts: 3,
+            },
+            blockers: Vec::new(),
+        };
+        let value = serde_json::to_value(&preflight).unwrap();
+        assert_eq!(
+            serde_json::from_value::<WorkspaceDeletionPreflightResponse>(value.clone()).unwrap(),
+            preflight
+        );
+        let mut stale = value.as_object().unwrap().clone();
+        stale.insert("revision".to_string(), serde_json::json!(7));
+        assert!(
+            serde_json::from_value::<WorkspaceDeletionPreflightResponse>(stale.into()).is_err()
+        );
+
+        assert!(
+            serde_json::from_value::<WorkspaceDeletionRequest>(serde_json::json!({
+                "operation_id": "delete-test",
+                "expected_revision": "revision-7",
+                "confirmation": "delete Test",
+                "force_delete_dirty_workdirs": false,
+                "workspace_id": "caller-controlled"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn workspace_and_repository_response_shapes_round_trip() {
         let workspace = serde_json::json!({
             "workspace_id": "workspace-test",
@@ -3161,7 +3312,8 @@ mod tests {
             "permissions": {
                 "manage_repositories": true,
                 "manage_secrets": true,
-                "manage_runtimes": true
+                "manage_runtimes": true,
+                "delete_workspace": true
             },
             "extension_points": {
                 "store": "sqlite",

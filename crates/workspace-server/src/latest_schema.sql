@@ -940,6 +940,29 @@ CREATE UNIQUE INDEX worker_workdir_links_active_worker_unique
             WHERE unlinked_at IS NULL;
 CREATE INDEX worker_workdir_links_workdir
             ON worker_workdir_links(workspace_id, workdir_id);
+CREATE TABLE workspace_deletion_operations (
+    operation_id TEXT PRIMARY KEY,
+    request_fingerprint TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    workspace_display_name TEXT NOT NULL,
+    workspace_revision TEXT NOT NULL,
+    owner_account_id TEXT NOT NULL,
+    actor_account_id TEXT NOT NULL,
+    force_delete_dirty_workdirs INTEGER NOT NULL CHECK(force_delete_dirty_workdirs IN (0, 1)),
+    state TEXT NOT NULL CHECK(state IN ('queued', 'running', 'blocked', 'failed', 'succeeded')),
+    resource_counts_json TEXT NOT NULL,
+    child_operation_ids_json TEXT NOT NULL,
+    blockers_json TEXT NOT NULL,
+    failure_category TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    FOREIGN KEY(owner_account_id) REFERENCES accounts(account_id) ON DELETE RESTRICT,
+    FOREIGN KEY(actor_account_id) REFERENCES accounts(account_id) ON DELETE RESTRICT
+);
+CREATE INDEX workspace_deletion_operations_workspace_recent
+    ON workspace_deletion_operations(workspace_id, created_at DESC);
+
 CREATE TRIGGER seed_worker_retention_policy_after_workspace_insert AFTER INSERT ON workspaces BEGIN
         INSERT INTO workspace_worker_retention_policy_revisions
           (workspace_id,policy_id,revision,session_disposition,metadata_disposition,archive_retention_kind,archive_retention_seconds,diagnostics_disposition,diagnostics_retention_seconds,created_at)

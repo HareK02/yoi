@@ -13,11 +13,12 @@ use uuid::Uuid;
 use worker_runtime::identity::{RuntimeWorkerRef, WorkerId};
 use workspace_api::{RepositoryObservedStatus, RepositorySource};
 
+use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
-const PREVIOUS_SCHEMA_VERSION: i64 = 51;
-const LATEST_SCHEMA_VERSION: i64 = 52;
-const RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
+const PREVIOUS_SCHEMA_VERSION: i64 = 52;
+const LATEST_SCHEMA_VERSION: i64 = 53;
+const WORKSPACE_DELETION_MIGRATION_NAME: &str = "durable Workspace deletion operations";
 
 const MIGRATIONS: &[Migration] = &[Migration {
     version: LATEST_SCHEMA_VERSION,
@@ -546,7 +547,7 @@ impl WorkspaceResourceKind {
 }
 
 #[async_trait]
-pub trait ControlPlaneStore: Send + Sync {
+pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     async fn schema_version(&self) -> Result<i64>;
     fn resource_key(
         &self,
@@ -1131,6 +1132,18 @@ impl SqliteWorkspaceStore {
             .lock()
             .map_err(|_| Error::Store("sqlite connection lock poisoned".to_string()))?;
         f(&mut conn)
+    }
+
+    pub(crate) fn with_transaction<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction()?;
+            let value = f(&tx)?;
+            tx.commit()?;
+            Ok(value)
+        })
     }
 
     pub(crate) fn get_workspace_memory_settings(
@@ -6406,43 +6419,80 @@ CREATE TABLE IF NOT EXISTS __yoi_schema_migrations (
     Ok(())
 }
 
-fn migrate_workspace_runtime_bindings_v51_to_v52(conn: &Connection) -> Result<()> {
+fn migrate_workspace_deletion_v52_to_v53(conn: &Connection) -> Result<()> {
     let current = current_schema_version(conn)?;
     if current != PREVIOUS_SCHEMA_VERSION {
         return Err(Error::Store(format!(
-            "expected schema version {PREVIOUS_SCHEMA_VERSION} before {RUNTIME_BINDINGS_MIGRATION_NAME} migration, found {current}"
+            "expected schema version {PREVIOUS_SCHEMA_VERSION} before {WORKSPACE_DELETION_MIGRATION_NAME} migration, found {current}"
         )));
     }
 
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
     tx.execute_batch(
         r#"
-        ALTER TABLE workspace_runtime_bindings
-            ADD COLUMN binding_revision INTEGER NOT NULL DEFAULT 1 CHECK (binding_revision > 0);
-        CREATE TABLE workspace_runtime_binding_audit (
+        CREATE TABLE workspace_deletion_operations (
+            operation_id TEXT PRIMARY KEY,
+            request_fingerprint TEXT NOT NULL,
             workspace_id TEXT NOT NULL,
-            runtime_id TEXT NOT NULL,
+            workspace_display_name TEXT NOT NULL,
+            workspace_revision TEXT NOT NULL,
+            owner_account_id TEXT NOT NULL,
             actor_account_id TEXT NOT NULL,
-            action TEXT NOT NULL CHECK (action IN ('created', 'replaced', 'reactivated', 'revoked')),
-            old_fingerprint TEXT,
-            new_fingerprint TEXT,
-            binding_revision INTEGER NOT NULL CHECK (binding_revision > 0),
-            at TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, runtime_id, binding_revision),
-            FOREIGN KEY(workspace_id, runtime_id)
-                REFERENCES workspace_runtime_bindings(workspace_id, runtime_id) ON DELETE RESTRICT,
+            force_delete_dirty_workdirs INTEGER NOT NULL CHECK(force_delete_dirty_workdirs IN (0, 1)),
+            state TEXT NOT NULL CHECK(state IN ('queued', 'running', 'blocked', 'failed', 'succeeded')),
+            resource_counts_json TEXT NOT NULL,
+            child_operation_ids_json TEXT NOT NULL,
+            blockers_json TEXT NOT NULL,
+            failure_category TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            FOREIGN KEY(owner_account_id) REFERENCES accounts(account_id) ON DELETE RESTRICT,
             FOREIGN KEY(actor_account_id) REFERENCES accounts(account_id) ON DELETE RESTRICT
         );
-        CREATE INDEX idx_workspace_runtime_binding_audit_recent
-            ON workspace_runtime_binding_audit(workspace_id, runtime_id, binding_revision DESC);
+        CREATE INDEX workspace_deletion_operations_workspace_recent
+            ON workspace_deletion_operations(workspace_id, created_at DESC);
         "#,
     )?;
-    verify_workspace_runtime_binding_schema(&tx)?;
+    verify_workspace_deletion_schema(&tx)?;
     tx.execute(
         "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![LATEST_SCHEMA_VERSION, RUNTIME_BINDINGS_MIGRATION_NAME],
+        params![LATEST_SCHEMA_VERSION, WORKSPACE_DELETION_MIGRATION_NAME],
     )?;
     tx.commit()?;
+    Ok(())
+}
+
+fn verify_workspace_deletion_schema(conn: &Connection) -> Result<()> {
+    let columns = table_columns(conn, "workspace_deletion_operations")?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let expected = [
+        "operation_id",
+        "request_fingerprint",
+        "workspace_id",
+        "workspace_display_name",
+        "workspace_revision",
+        "owner_account_id",
+        "actor_account_id",
+        "force_delete_dirty_workdirs",
+        "state",
+        "resource_counts_json",
+        "child_operation_ids_json",
+        "blockers_json",
+        "failure_category",
+        "created_at",
+        "updated_at",
+        "completed_at",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<BTreeSet<_>>();
+    if columns != expected {
+        return Err(Error::Store(
+            "workspace_deletion_operations schema does not match schema-53".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -7034,7 +7084,7 @@ fn verify_current_schema_history(conn: &Connection) -> Result<()> {
         ),
         (
             LATEST_SCHEMA_VERSION,
-            RUNTIME_BINDINGS_MIGRATION_NAME.to_string(),
+            WORKSPACE_DELETION_MIGRATION_NAME.to_string(),
         ),
     ];
     if rows != fresh && rows != upgraded {
@@ -7077,17 +7127,20 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                 params![baseline.version, baseline.name],
             )?;
             tx.commit()?;
-            verify_workspace_runtime_binding_schema(conn)
+            verify_workspace_runtime_binding_schema(conn)?;
+            verify_workspace_deletion_schema(conn)
         }
         PREVIOUS_SCHEMA_VERSION => {
             verify_previous_schema_history(conn)?;
-            migrate_workspace_runtime_bindings_v51_to_v52(conn)?;
+            migrate_workspace_deletion_v52_to_v53(conn)?;
             verify_current_schema_history(conn)?;
-            verify_workspace_runtime_binding_schema(conn)
+            verify_workspace_runtime_binding_schema(conn)?;
+            verify_workspace_deletion_schema(conn)
         }
         LATEST_SCHEMA_VERSION => {
             verify_current_schema_history(conn)?;
-            verify_workspace_runtime_binding_schema(conn)
+            verify_workspace_runtime_binding_schema(conn)?;
+            verify_workspace_deletion_schema(conn)
         }
         version if version > LATEST_SCHEMA_VERSION => Err(Error::Store(format!(
             "database schema version {version} is newer than this server supports ({LATEST_SCHEMA_VERSION}); refusing to serve with an older binary"
@@ -7156,7 +7209,7 @@ mod tests {
             .unwrap();
     }
 
-    fn prepare_schema_v51(path: &Path) {
+    fn prepare_schema_v52(path: &Path) {
         let conn = Connection::open(path).unwrap();
         configure_sqlite(&conn).unwrap();
         ticket::migrate_sqlite_ticket_schema(&conn).unwrap();
@@ -7164,56 +7217,27 @@ mod tests {
         create_latest_workspace_schema(&conn).unwrap();
         conn.execute_batch(
             r#"
-            DROP INDEX idx_workspace_runtime_binding_audit_recent;
-            DROP TABLE workspace_runtime_binding_audit;
-            ALTER TABLE workspace_runtime_bindings DROP COLUMN binding_revision;
+            DROP INDEX workspace_deletion_operations_workspace_recent;
+            DROP TABLE workspace_deletion_operations;
             DELETE FROM __yoi_schema_migrations;
             INSERT INTO __yoi_schema_migrations(version, name)
-            VALUES (51, 'workspace schema baseline');
-            INSERT INTO accounts(account_id, kind, handle, display_name, created_at, updated_at)
-            VALUES ('owner', 'user', 'owner', 'Owner', '1', '1');
-            INSERT INTO workspaces(
-                workspace_id, owner_account_id, display_name, state, created_at, updated_at
-            ) VALUES ('workspace-a', 'owner', 'Workspace A', 'active', '1', '1');
+            VALUES (52, 'workspace schema baseline');
             "#,
-        )
-        .unwrap();
-        let identity =
-            worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-a").unwrap();
-        let (_, fingerprint) = normalize_runtime_public_key(&identity.public_key).unwrap();
-        conn.execute(
-            r#"INSERT INTO workspace_runtime_bindings(
-                   workspace_id, runtime_id, display_name, base_url, public_key,
-                   public_key_fingerprint, created_at, updated_at, revoked_at
-               ) VALUES ('workspace-a', 'runtime-a', 'Runtime A', 'https://runtime.test',
-                         ?1, ?2, '1', '1', NULL)"#,
-            params![identity.public_key, fingerprint],
         )
         .unwrap();
     }
 
     #[test]
-    fn schema_v51_runtime_binding_migrates_with_revision_and_empty_audit() {
+    fn schema_v52_migrates_workspace_deletion_operations() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
-        prepare_schema_v51(&path);
+        prepare_schema_v52(&path);
 
         let store = SqliteWorkspaceStore::open(&path).unwrap();
-        let binding = store
-            .get_workspace_runtime_binding("workspace-a", "runtime-a")
-            .unwrap()
-            .unwrap();
-        assert_eq!(binding.binding_revision, 1);
-        assert!(
-            store
-                .list_workspace_runtime_binding_audit("workspace-a", "runtime-a", 50)
-                .unwrap()
-                .is_empty()
-        );
         store
             .with_conn(|conn| {
-                let version = current_schema_version(conn)?;
-                assert_eq!(version, LATEST_SCHEMA_VERSION);
+                assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
+                verify_workspace_deletion_schema(conn)?;
                 let violations: i64 =
                     conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
                         row.get(0)
@@ -7225,13 +7249,13 @@ mod tests {
     }
 
     #[test]
-    fn schema_v51_runtime_binding_migration_rolls_back_all_changes_on_failure() {
+    fn schema_v52_workspace_deletion_migration_rolls_back_on_failure() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
-        prepare_schema_v51(&path);
+        prepare_schema_v52(&path);
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
-            "CREATE TABLE workspace_runtime_binding_audit (unexpected TEXT NOT NULL);",
+            "CREATE TABLE workspace_deletion_operations (unexpected TEXT NOT NULL);",
         )
         .unwrap();
         drop(conn);
@@ -7242,12 +7266,11 @@ mod tests {
             .to_string();
         assert!(error.contains("already exists"), "{error}");
         let conn = Connection::open(&path).unwrap();
-        assert!(
-            !table_columns(&conn, "workspace_runtime_bindings")
-                .unwrap()
-                .contains(&"binding_revision".to_string())
+        assert_eq!(
+            table_columns(&conn, "workspace_deletion_operations").unwrap(),
+            vec!["unexpected".to_string()]
         );
-        assert_eq!(current_schema_version(&conn).unwrap(), 51);
+        assert_eq!(current_schema_version(&conn).unwrap(), 52);
     }
 
     #[test]
@@ -8536,13 +8559,13 @@ INSERT INTO worker_registry (
         let conn = Connection::open_in_memory().unwrap();
         configure_sqlite(&conn).unwrap();
         conn.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (53, 'future')",
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (54, 'future')",
             [],
         )
         .unwrap();
 
         let error = apply_migrations(&conn).unwrap_err().to_string();
-        assert!(error.contains("schema version 53 is newer"), "{error}");
+        assert!(error.contains("schema version 54 is newer"), "{error}");
         assert!(error.contains("refusing to serve"), "{error}");
     }
 

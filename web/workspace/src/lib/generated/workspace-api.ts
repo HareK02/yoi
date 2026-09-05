@@ -48,6 +48,74 @@ export type WorkspacePermissionSummary = {
   manage_repositories: boolean;
   manage_secrets: boolean;
   manage_runtimes: boolean;
+  delete_workspace: boolean;
+};
+
+export type WorkspaceDeletionState =
+  | "queued"
+  | "running"
+  | "blocked"
+  | "failed"
+  | "succeeded";
+
+export type WorkspaceDeletionBlockerKind =
+  | "last_accessible_workspace"
+  | "revision_conflict"
+  | "dirty_workdir"
+  | "worker_removal_blocked"
+  | "workdir_removal_blocked"
+  | "retention_hold"
+  | "cleanup_unavailable";
+
+export type WorkspaceDeletionBlocker = {
+  kind: WorkspaceDeletionBlockerKind;
+  resource_kind: string | null;
+  resource_key: string | null;
+  message: string;
+};
+
+export type WorkspaceDeletionResourceCounts = {
+  workers: number;
+  workdirs: number;
+  repositories: number;
+  runtime_bindings: number;
+  secrets: number;
+  artifacts: number;
+};
+
+export type WorkspaceDeletionPreflightResponse = {
+  workspace_id: string;
+  display_name: string;
+  /**
+   * Opaque persisted Workspace metadata revision used as a CAS fence.
+   */
+  expected_revision: string;
+  can_delete: boolean;
+  force_delete_dirty_workdirs_available: boolean;
+  resources: WorkspaceDeletionResourceCounts;
+  blockers: Array<WorkspaceDeletionBlocker>;
+};
+
+export type WorkspaceDeletionRequest = {
+  operation_id: string;
+  expected_revision: string;
+  confirmation: string;
+  force_delete_dirty_workdirs: boolean;
+};
+
+export type WorkspaceDeletionOperationResponse = {
+  operation_id: string;
+  workspace_id: string;
+  display_name: string;
+  state: WorkspaceDeletionState;
+  force_delete_dirty_workdirs: boolean;
+  resources: WorkspaceDeletionResourceCounts;
+  child_operation_ids: Array<string>;
+  blockers: Array<WorkspaceDeletionBlocker>;
+  failure_category: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
 };
 
 export type DiagnosticSeverity = "info" | "warning" | "error";

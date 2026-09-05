@@ -33,6 +33,7 @@ pub mod workdir_create_operations;
 mod workdir_removal;
 pub mod worker_source;
 pub mod workspace_catalog;
+mod workspace_deletion;
 mod workspace_subscription;
 
 pub use authority::{
