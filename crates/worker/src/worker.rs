@@ -1674,14 +1674,24 @@ where
         if let Some((expected_revision, expected_head_id)) = fence {
             Self::validate_fence(&state, expected_revision, Some(expected_head_id))?;
         }
-        if state.activating.is_some() || state.activating_notification.is_some() {
+        if state.activating.is_some()
+            || state
+                .activating_notification
+                .as_ref()
+                .is_some_and(|notification| notification.auto_run)
+        {
             return Ok(None);
         }
+        let has_staged_passive_notification = state.activating_notification.is_some();
         let submission_sequence = state.pending.front().map(|item| item.activation_sequence);
-        let notification_index = state
-            .pending_notifications
-            .iter()
-            .position(|item| item.auto_run);
+        let notification_index = if has_staged_passive_notification {
+            None
+        } else {
+            state
+                .pending_notifications
+                .iter()
+                .position(|item| item.auto_run)
+        };
         let notification_sequence = notification_index
             .and_then(|index| state.pending_notifications.get(index))
             .map(|item| item.activation_sequence);
@@ -1785,6 +1795,7 @@ where
             .lock()
             .expect("pending activation state poisoned");
         let mut committed = state.clone();
+        committed.activating = None;
         committed.activating_notification = None;
         committed.revision = committed.revision.saturating_add(1);
         pending_activation_extension(&committed)

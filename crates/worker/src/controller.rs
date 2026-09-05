@@ -325,8 +325,13 @@ fn prepare_pending_run<St: Store + Clone>(
     notify_buffer: &NotifyBuffer,
     fence: Option<(u64, &str)>,
 ) -> Result<Option<PendingRun>, crate::worker::PendingSubmissionError> {
+    let staged_passive_notification = pending_submissions.activating_passive_notification_id();
     Ok(match pending_submissions.prepare_next_activation(fence)? {
         Some(crate::worker::PendingActivation::Submission(submission)) => {
+            if staged_passive_notification.is_some() {
+                let extension = pending_submissions.notification_activation_extension();
+                debug_assert!(notify_buffer.replace_durable_notification_extension(extension));
+            }
             Some(PendingRun::Submit(submission))
         }
         Some(crate::worker::PendingActivation::Notification(notification)) => {
@@ -2708,6 +2713,34 @@ mod tests {
                 notification_request_id: Some(request_id),
                 ..
             }) if request_id == "notify-first"
+        ));
+
+        let pending =
+            crate::worker::PendingSubmissionHandle::for_test(&temp.path().join("passive-first"));
+        pending
+            .accept_notification("passive-first".into(), "passive notification".into(), false)
+            .unwrap();
+        pending
+            .accept(
+                "submit-after-passive".into(),
+                vec![protocol::Segment::Text {
+                    content: "queued after passive".into(),
+                }],
+                false,
+            )
+            .unwrap();
+        let snapshot = pending.snapshot();
+        let head_id = snapshot.head_id.clone().expect("queued Submit is the head");
+        let notify_buffer = NotifyBuffer::new();
+        assert!(stage_oldest_passive_notification(&pending, &notify_buffer));
+        assert!(matches!(
+            prepare_pending_run(
+                &pending,
+                &notify_buffer,
+                Some((snapshot.revision + 1, &head_id)),
+            )
+            .unwrap(),
+            Some(PendingRun::Submit(_))
         ));
     }
 

@@ -110,6 +110,25 @@ impl NotifyBuffer {
         });
     }
 
+    pub(crate) fn replace_durable_notification_extension(
+        &self,
+        extension: SessionExtension,
+    ) -> bool {
+        let mut queue = self.inner.lock().expect("notify buffer poisoned");
+        let Some(extensions) = queue.iter_mut().rev().find_map(|pending| match pending {
+            PendingNotify::Notify {
+                auto_run: false,
+                extensions,
+                ..
+            } if !extensions.is_empty() => Some(extensions),
+            _ => None,
+        }) else {
+            return false;
+        };
+        *extensions = vec![extension];
+        true
+    }
+
     /// Push a typed worker-event entry onto the queue.
     pub fn push_worker_event(&self, event: WorkerEvent) {
         self.push_entry(PendingNotify::WorkerEvent { event });
