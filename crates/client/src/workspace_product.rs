@@ -12,8 +12,10 @@ use workspace_api::{
     BrowserCreateWorkerResponse, BrowserWorkspaceOrchestratorResponse,
     CreateWorkspaceWorkerRequest, ListResponse, MemoryDocumentResponse, MemoryStagingListResponse,
     ObjectiveCreateRequest, ObjectiveDetail, ObjectiveEditRequest, ObjectiveLinkTicketRequest,
-    ObjectiveStateRequest, ObjectiveSummary, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
-    TICKET_RELATIONS_QUERY_PATH, WorkerLaunchOptionsResponse,
+    ObjectiveStateRequest, ObjectiveSummary, PutRuntimeTrustKeyRequest,
+    RevokeRuntimeTrustKeyRequest, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
+    TICKET_RELATIONS_QUERY_PATH, WorkerLaunchOptionsResponse, WorkspaceRuntimeDetail,
+    WorkspaceRuntimeResource,
 };
 
 use crate::{BackendApiClient, BackendWorkspaceClientError};
@@ -238,6 +240,43 @@ impl BackendWorkspaceProductClient {
                 encode_path_segment(ticket_id)
             ),
             None,
+        )
+    }
+
+    pub fn list_runtimes(
+        &self,
+    ) -> Result<ListResponse<WorkspaceRuntimeResource>, BackendWorkspaceClientError> {
+        self.get_json("/runtimes")
+    }
+
+    pub fn runtime_detail(
+        &self,
+        runtime_id: &str,
+    ) -> Result<WorkspaceRuntimeDetail, BackendWorkspaceClientError> {
+        self.get_json(&format!("/runtimes/{}", encode_path_segment(runtime_id)))
+    }
+
+    pub fn put_runtime_trust_key(
+        &self,
+        runtime_id: &str,
+        request: &PutRuntimeTrustKeyRequest,
+    ) -> Result<WorkspaceRuntimeDetail, BackendWorkspaceClientError> {
+        self.send_json(
+            Method::PUT,
+            &format!("/runtimes/{}/trust-key", encode_path_segment(runtime_id)),
+            Some(request),
+        )
+    }
+
+    pub fn revoke_runtime_trust_key(
+        &self,
+        runtime_id: &str,
+        request: &RevokeRuntimeTrustKeyRequest,
+    ) -> Result<WorkspaceRuntimeDetail, BackendWorkspaceClientError> {
+        self.send_json(
+            Method::DELETE,
+            &format!("/runtimes/{}/trust-key", encode_path_segment(runtime_id)),
+            Some(request),
         )
     }
 

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
@@ -74,11 +74,13 @@ use workspace_api::{
     PasskeyLoginCompleteRequest, PasskeyLoginOptionsRequest, PasskeyLoginOptionsResponse,
     PasskeyRegistrationCompleteRequest, PasskeyRegistrationOptionsRequest,
     PasskeyRegistrationOptionsResponse, ProfileSettingsResponse, PutRepositorySshHostTrustRequest,
-    RepositoryAccessProjection, RepositoryDetailResponse, RepositoryListResponse,
-    RepositoryLogResponse, RepositorySshCredential, RepositorySshHostTrust, RequestActor,
-    RotateRepositorySshCredentialRequest, RuntimeConnectionTestFailureKind,
-    RuntimeConnectionTestResponse, RuntimeConnectionTestStatus, RuntimeManagementSummary,
-    TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
+    PutRuntimeTrustKeyRequest, RepositoryAccessProjection, RepositoryDetailResponse,
+    RepositoryListResponse, RepositoryLogResponse, RepositorySshCredential, RepositorySshHostTrust,
+    RequestActor, RevokeRuntimeTrustKeyRequest, RotateRepositorySshCredentialRequest,
+    RuntimeConnectionTestFailureKind, RuntimeConnectionTestResponse, RuntimeConnectionTestStatus,
+    RuntimeManagementSummary, RuntimeTrustAuditAction, RuntimeTrustAuditEntry,
+    RuntimeTrustConflictKind, RuntimeTrustConflictResponse, RuntimeTrustKeyState,
+    RuntimeTrustKeyStatus, TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
     UpdateWorkspaceMetadataRequest, WhoamiResponse, WorkerLaunchOptionsResponse,
     WorkerLaunchProfileCandidate, WorkerLaunchRuntimeOption, WorkerLaunchWorkerSummary,
     WorkingDirectoryCreateRequest as BrowserWorkingDirectoryCreateRequest,
@@ -90,8 +92,8 @@ use workspace_api::{
     WorkspaceCatalogListResponse, WorkspaceCreateResponse, WorkspaceExtensionPointState,
     WorkspaceExtensionPoints, WorkspaceMetadataMutationResponse, WorkspaceMetadataSettingsResponse,
     WorkspacePermissionSummary, WorkspaceRepositoryRecord, WorkspaceResponse,
-    WorkspaceRuntimeResource, WorkspaceSummary, WorkspaceWorkerDiscoveryItem,
-    WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
+    WorkspaceRuntimeDetail, WorkspaceRuntimeResource, WorkspaceSummary,
+    WorkspaceWorkerDiscoveryItem, WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
 };
 
 use crate::auth::{
@@ -153,7 +155,7 @@ use crate::store::{
     RepositoryRecord, TicketAssignmentPrincipal, TicketAssignmentRole, TicketCoderAssignmentRecord,
     TicketRoleAssignmentRecord, UserRecord, WorkdirCreateOperationRecord, WorkdirRegistryRecord,
     WorkerControlGrantRecord, WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord,
-    WorkspaceResourceKind,
+    WorkspaceResourceKind, WorkspaceRuntimeBinding, WorkspaceRuntimeBindingAuditRecord,
 };
 use crate::workdir_removal::{
     WorkdirRemovalAttemptOwner, WorkdirRemovalDisposition, WorkdirRemovalOperation,
@@ -585,6 +587,7 @@ pub struct WorkspaceApi {
     prompt_projection_cache: crate::prompt_settings::WorkspacePromptProjectionCache,
     authority: SqliteWorkspaceAuthority,
     runtime: Arc<RuntimeRegistry>,
+    runtime_binding_expectations: Arc<RwLock<HashMap<(String, String), WorkspaceRuntimeBinding>>>,
     companion: Arc<CompanionConsole>,
     orchestrator_spawn_lock: Arc<std::sync::Mutex<()>>,
     orchestrator_attention_fingerprint: Arc<Mutex<Option<String>>>,
@@ -1575,6 +1578,7 @@ impl WorkspaceApi {
                     base_url: "in-process://embedded".to_owned(),
                     public_key: embedded_identity.public_key.clone(),
                     public_key_fingerprint: String::new(),
+                    binding_revision: 1,
                     created_at: config.workspace_created_at.clone(),
                     updated_at: config.workspace_created_at.clone(),
                     revoked_at: None,
@@ -1614,18 +1618,22 @@ impl WorkspaceApi {
                     .then(|| (source.runtime_id.clone(), source.base_url.clone()))
             })
             .collect::<HashMap<_, _>>();
-        let expected_runtime_bindings = Arc::new(
-            store
-                .list_workspace_runtime_bindings(&config.workspace_id, false)
-                .await?
-                .into_iter()
-                .filter(|binding| binding.runtime_id != EMBEDDED_RUNTIME_ID)
-                .filter(|binding| {
-                    configured_runtime_endpoints.get(&binding.runtime_id) == Some(&binding.base_url)
-                })
-                .map(|binding| (binding.runtime_id.clone(), binding))
-                .collect::<HashMap<_, _>>(),
-        );
+        let expected_runtime_bindings = store
+            .list_workspace_runtime_bindings(&config.workspace_id, false)
+            .await?
+            .into_iter()
+            .filter(|binding| binding.runtime_id != EMBEDDED_RUNTIME_ID)
+            .filter(|binding| {
+                configured_runtime_endpoints.get(&binding.runtime_id) == Some(&binding.base_url)
+            })
+            .map(|binding| {
+                (
+                    (binding.workspace_id.clone(), binding.runtime_id.clone()),
+                    binding,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let workspace_id = config.workspace_id.clone();
         let api = Self::new_with_execution_backend_and_broker(
             config,
             store,
@@ -1634,15 +1642,34 @@ impl WorkspaceApi {
             Some(worker_remove_dispatcher),
         )
         .await?;
+        *api.runtime_binding_expectations
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = expected_runtime_bindings;
+        let runtime_binding_expectations = Arc::clone(&api.runtime_binding_expectations);
         api.runtime.set_runtime_binding_gate(move |runtime_id| {
-            expected_runtime_bindings
-                .get(runtime_id)
+            runtime_binding_expectations
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&(workspace_id.clone(), runtime_id.to_string()))
                 .is_some_and(|expected| {
                     runtime_binding_store
                         .workspace_runtime_binding_matches(expected)
                         .unwrap_or(false)
                 })
         });
+        let active_expectations = api
+            .runtime_binding_expectations
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for source in &api.config.remote_runtime_sources {
+            if !active_expectations
+                .contains_key(&(api.config.workspace_id.clone(), source.runtime_id.clone()))
+            {
+                api.runtime_subscription_broker
+                    .unregister_runtime(&source.runtime_id);
+            }
+        }
+        drop(active_expectations);
         Ok(api)
     }
 
@@ -1748,6 +1775,7 @@ impl WorkspaceApi {
             config,
             store,
             runtime,
+            runtime_binding_expectations: Arc::new(RwLock::new(HashMap::new())),
             companion,
             orchestrator_spawn_lock: Arc::new(std::sync::Mutex::new(())),
             orchestrator_attention_fingerprint: Arc::new(Mutex::new(None)),
@@ -2648,7 +2676,11 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         )
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}",
-            delete(scoped_delete_remote_runtime),
+            get(scoped_get_runtime_detail).delete(scoped_delete_remote_runtime),
+        )
+        .route(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/trust-key",
+            put(scoped_put_runtime_trust_key).delete(scoped_revoke_runtime_trust_key),
         )
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/connection-tests",
@@ -10956,11 +10988,225 @@ async fn scoped_create_remote_runtime(
     create_remote_runtime(State(api), Json(request)).await
 }
 
+async fn scoped_get_runtime_detail(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimePath>,
+    Extension(actor): Extension<RequestActor>,
+) -> ApiResult<Json<WorkspaceRuntimeDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let workspace = api
+        .store
+        .get_workspace(&path.workspace_id)
+        .await?
+        .ok_or(Error::WorkspaceIdMismatch)?;
+    let is_owner = workspace.owner_account_id == actor.account_id;
+    Ok(Json(
+        workspace_runtime_detail(&api, &path.workspace_id, &path.runtime_id, is_owner).await?,
+    ))
+}
+
+async fn scoped_put_runtime_trust_key(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimePath>,
+    Extension(actor): Extension<RequestActor>,
+    Json(request): Json<PutRuntimeTrustKeyRequest>,
+) -> std::result::Result<Response, ApiError> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    require_workspace_owner(&api, &path.workspace_id, &actor, "Runtime trust changes").await?;
+    let actor_account_id = actor.account_id.clone();
+    if path.runtime_id == EMBEDDED_WORKER_RUNTIME_ID {
+        return Err(settings_bad_request(
+            "embedded_runtime_trust_managed_internally",
+            "the embedded Runtime trust key is managed by Server identity authority",
+        ));
+    }
+    if request.expected_revision == Some(0) {
+        return Err(settings_bad_request(
+            "invalid_runtime_binding_revision",
+            "expected_revision must be greater than zero when provided",
+        ));
+    }
+    if request.public_key.len() > 16 * 1024 {
+        return Err(settings_bad_request(
+            "runtime_public_key_too_large",
+            "public_key must be at most 16384 bytes",
+        ));
+    }
+    let existing = api
+        .store
+        .get_workspace_runtime_binding(&path.workspace_id, &path.runtime_id)
+        .await?;
+    let source = api
+        .config
+        .remote_runtime_sources
+        .iter()
+        .find(|source| {
+            source.runtime_id == path.runtime_id
+                && source.workspace_id.as_deref() == Some(path.workspace_id.as_str())
+        })
+        .cloned();
+    if let (Some(binding), Some(source)) = (&existing, &source)
+        && binding.base_url != source.base_url
+    {
+        return Err(settings_bad_request(
+            "runtime_endpoint_mismatch",
+            "the persisted Runtime endpoint no longer matches Server Runtime configuration; reconcile the endpoint before changing trust",
+        ));
+    }
+    let (display_name, base_url) = if let Some(binding) = &existing {
+        (binding.display_name.clone(), binding.base_url.clone())
+    } else if let Some(source) = &source {
+        (source.display_name.clone(), source.base_url.clone())
+    } else {
+        return Err(Error::UnknownRuntime(path.runtime_id.clone()).into());
+    };
+    let now = Utc::now().to_rfc3339();
+    let record = WorkspaceRuntimeBinding {
+        workspace_id: path.workspace_id.clone(),
+        runtime_id: path.runtime_id.clone(),
+        display_name,
+        base_url,
+        public_key: request.public_key,
+        public_key_fingerprint: String::new(),
+        binding_revision: 1,
+        created_at: existing
+            .as_ref()
+            .map_or_else(|| now.clone(), |binding| binding.created_at.clone()),
+        updated_at: now,
+        revoked_at: None,
+    };
+    let mutation = api
+        .store
+        .put_workspace_runtime_binding_key(record, request.expected_revision, &actor_account_id)
+        .await;
+    let (_, binding) = match mutation {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(response) = runtime_trust_conflict_response(&api, &path, &error).await {
+                return Ok(response);
+            }
+            return Err(error.into());
+        }
+    };
+    api.runtime_binding_expectations
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            (path.workspace_id.clone(), path.runtime_id.clone()),
+            binding,
+        );
+    if let Some(source) = source {
+        api.runtime_subscription_broker
+            .register_remote_runtime(source);
+    }
+    Ok(
+        Json(workspace_runtime_detail(&api, &path.workspace_id, &path.runtime_id, true).await?)
+            .into_response(),
+    )
+}
+
+async fn scoped_revoke_runtime_trust_key(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimePath>,
+    Extension(actor): Extension<RequestActor>,
+    Json(request): Json<RevokeRuntimeTrustKeyRequest>,
+) -> std::result::Result<Response, ApiError> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    require_workspace_owner(&api, &path.workspace_id, &actor, "Runtime trust changes").await?;
+    let actor_account_id = actor.account_id.clone();
+    if path.runtime_id == EMBEDDED_WORKER_RUNTIME_ID {
+        return Err(settings_bad_request(
+            "embedded_runtime_trust_managed_internally",
+            "the embedded Runtime trust key is managed by Server identity authority",
+        ));
+    }
+    if request.expected_revision == 0 {
+        return Err(settings_bad_request(
+            "invalid_runtime_binding_revision",
+            "expected_revision must be greater than zero",
+        ));
+    }
+    let now = Utc::now().to_rfc3339();
+    let mutation = api
+        .store
+        .revoke_workspace_runtime_binding_key(
+            &path.workspace_id,
+            &path.runtime_id,
+            request.expected_revision,
+            &actor_account_id,
+            &now,
+        )
+        .await;
+    let _ = match mutation {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(response) = runtime_trust_conflict_response(&api, &path, &error).await {
+                return Ok(response);
+            }
+            return Err(error.into());
+        }
+    };
+    api.runtime_binding_expectations
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(path.workspace_id.clone(), path.runtime_id.clone()));
+    api.runtime_subscription_broker
+        .unregister_runtime(&path.runtime_id);
+    Ok(
+        Json(workspace_runtime_detail(&api, &path.workspace_id, &path.runtime_id, true).await?)
+            .into_response(),
+    )
+}
+
+async fn runtime_trust_conflict_response(
+    api: &WorkspaceApi,
+    path: &ScopedRuntimePath,
+    error: &Error,
+) -> Option<Response> {
+    let kind = match error {
+        Error::RuntimeBindingRevisionConflict { .. } => RuntimeTrustConflictKind::StaleRevision,
+        Error::RuntimeBindingFingerprintConflict { .. } => {
+            RuntimeTrustConflictKind::FingerprintInUse
+        }
+        _ => return None,
+    };
+    let current = api
+        .store
+        .get_workspace_runtime_binding(&path.workspace_id, &path.runtime_id)
+        .await
+        .ok()
+        .flatten();
+    Some(
+        (
+            StatusCode::CONFLICT,
+            Json(RuntimeTrustConflictResponse {
+                error: kind,
+                message: match kind {
+                    RuntimeTrustConflictKind::StaleRevision => {
+                        "the Runtime trust binding changed; reload before retrying".to_string()
+                    }
+                    RuntimeTrustConflictKind::FingerprintInUse => {
+                        "the public key is already bound to another Runtime in this Workspace"
+                            .to_string()
+                    }
+                },
+                current_revision: current.as_ref().map(|binding| binding.binding_revision),
+                current_fingerprint: current
+                    .as_ref()
+                    .map(|binding| binding.public_key_fingerprint.clone()),
+            }),
+        )
+            .into_response(),
+    )
+}
+
 async fn scoped_delete_remote_runtime(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
+    Extension(actor): Extension<RequestActor>,
 ) -> ApiResult<StatusCode> {
     validate_workspace_scope(&api, &path.workspace_id)?;
+    require_workspace_owner(&api, &path.workspace_id, &actor, "Runtime removal").await?;
     delete_remote_runtime(State(api), AxumPath(path.runtime_id)).await
 }
 
@@ -12211,6 +12457,7 @@ async fn get_workspace(
         permissions: WorkspacePermissionSummary {
             manage_repositories: is_owner,
             manage_secrets: is_owner,
+            manage_runtimes: is_owner,
         },
         extension_points: WorkspaceExtensionPoints {
             store: "sqlite".to_string(),
@@ -12451,7 +12698,7 @@ async fn create_remote_runtime(
     }
     Err(settings_bad_request(
         "runtime_public_key_required",
-        "remote Runtime registration requires an authenticated public key; use `yoi-server trust-runtime add` until the Workspace Runtime key API is available",
+        "remote Runtime registration requires an authenticated public key; configure it from the Runtime detail page after the Runtime endpoint is registered",
     ))
 }
 
@@ -12469,8 +12716,13 @@ async fn delete_remote_runtime(
         .store
         .get_workspace_runtime_binding(&api.config.workspace_id, &runtime_id)
         .await?
-        .filter(|binding| binding.revoked_at.is_none())
         .ok_or_else(|| Error::UnknownRuntime(runtime_id.clone()))?;
+    if binding.revoked_at.is_none() {
+        return Err(Error::RuntimeBindingConflict(
+            "runtime trust is still active; revoke this Workspace's trust key with an expected revision before removing the inactive registration".to_string(),
+        )
+        .into());
+    }
     match api
         .runtime
         .unregister_if_idle(&runtime_id, api.config.max_records.min(200))
@@ -12498,14 +12750,6 @@ async fn delete_remote_runtime(
                 diagnostics,
             ));
         }
-    }
-    let now = Utc::now().to_rfc3339();
-    if !api
-        .store
-        .revoke_workspace_runtime_binding_record(&binding.workspace_id, &binding.runtime_id, &now)
-        .await?
-    {
-        return Err(Error::UnknownRuntime(runtime_id).into());
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -14488,6 +14732,133 @@ async fn workspace_runtime_resources_response(
     })
 }
 
+async fn workspace_runtime_detail(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    runtime_id: &str,
+    include_public_key: bool,
+) -> ApiResult<WorkspaceRuntimeDetail> {
+    let binding = api
+        .store
+        .get_workspace_runtime_binding(workspace_id, runtime_id)
+        .await?;
+    let mut resource = workspace_runtime_resources_response(api, workspace_id)
+        .await?
+        .items
+        .into_iter()
+        .find(|resource| resource.runtime.runtime_id == runtime_id);
+    if resource.is_none() {
+        resource = binding.as_ref().map(|binding| WorkspaceRuntimeResource {
+            runtime: workspace_api::RuntimeSummary {
+                runtime_id: binding.runtime_id.clone(),
+                label: binding.display_name.clone(),
+                kind: "remote_http".to_string(),
+                status: "unavailable".to_string(),
+                source: workspace_api::RuntimeSourceSummary {
+                    kind: workspace_api::RuntimeSourceKind::RemoteHttp,
+                    status: workspace_api::RuntimeSourceStatus::Reserved,
+                    identity_authority:
+                        workspace_api::RuntimeIdentityAuthority::ServerRuntimeConfiguration,
+                    note: "The Runtime trust binding is not active in the Runtime registry."
+                        .to_string(),
+                },
+                host_ids: Vec::new(),
+                worker_creation_available: false,
+                os: String::new(),
+                arch: String::new(),
+                diagnostics: Vec::new(),
+            },
+            management: RuntimeManagementSummary {
+                built_in: false,
+                config_managed: true,
+                removable: false,
+                endpoint_configured: !binding.base_url.trim().is_empty(),
+                token_ref_configured: false,
+            },
+        });
+    }
+    let mut resource = resource.ok_or_else(|| Error::UnknownRuntime(runtime_id.to_string()))?;
+    if let Some(binding) = &binding {
+        resource.management.config_managed = true;
+        resource.management.endpoint_configured = !binding.base_url.trim().is_empty();
+    }
+    let endpoint = binding
+        .as_ref()
+        .map(|binding| binding.base_url.clone())
+        .or_else(|| {
+            api.config
+                .remote_runtime_sources
+                .iter()
+                .find(|source| {
+                    source.runtime_id == runtime_id
+                        && source.workspace_id.as_deref() == Some(workspace_id)
+                })
+                .map(|source| source.base_url.clone())
+        });
+    let trust_key = binding.as_ref().map_or(
+        RuntimeTrustKeyState {
+            status: RuntimeTrustKeyStatus::Unconfigured,
+            public_key: None,
+            fingerprint: None,
+            revision: None,
+            created_at: None,
+            updated_at: None,
+            revoked_at: None,
+        },
+        |binding| RuntimeTrustKeyState {
+            status: if binding.revoked_at.is_some() {
+                RuntimeTrustKeyStatus::Revoked
+            } else {
+                RuntimeTrustKeyStatus::Active
+            },
+            public_key: include_public_key.then(|| binding.public_key.clone()),
+            fingerprint: Some(binding.public_key_fingerprint.clone()),
+            revision: Some(binding.binding_revision),
+            created_at: Some(binding.created_at.clone()),
+            updated_at: Some(binding.updated_at.clone()),
+            revoked_at: binding.revoked_at.clone(),
+        },
+    );
+    let recent_audit = api
+        .store
+        .list_workspace_runtime_binding_audit(workspace_id, runtime_id, 20)
+        .await?
+        .into_iter()
+        .map(project_runtime_trust_audit)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(WorkspaceRuntimeDetail {
+        workspace_id: workspace_id.to_string(),
+        runtime: resource,
+        endpoint,
+        trust_key,
+        recent_audit,
+    })
+}
+
+fn project_runtime_trust_audit(
+    record: WorkspaceRuntimeBindingAuditRecord,
+) -> Result<RuntimeTrustAuditEntry> {
+    let action = match record.action.as_str() {
+        "created" => RuntimeTrustAuditAction::Created,
+        "replaced" => RuntimeTrustAuditAction::Replaced,
+        "reactivated" => RuntimeTrustAuditAction::Reactivated,
+        "revoked" => RuntimeTrustAuditAction::Revoked,
+        other => {
+            return Err(Error::Store(format!(
+                "unsupported Runtime trust audit action {other}"
+            )));
+        }
+    };
+    Ok(RuntimeTrustAuditEntry {
+        action,
+        actor_account_id: record.actor_account_id,
+        old_fingerprint: record.old_fingerprint,
+        new_fingerprint: record.new_fingerprint,
+        revision: record.binding_revision,
+        at: record.at,
+    })
+}
+
 fn validate_runtime_connection_request(request: &CreateRemoteRuntimeRequest) -> ApiResult<()> {
     validate_public_runtime_id(request.runtime_id.trim())?;
     let endpoint = request.endpoint.trim();
@@ -16040,6 +16411,8 @@ impl IntoResponse for ApiError {
             | Error::WorkdirAttachmentConflict(_)
             | Error::WorkspaceConfigConflict(_)
             | Error::RuntimeBindingConflict(_)
+            | Error::RuntimeBindingRevisionConflict { .. }
+            | Error::RuntimeBindingFingerprintConflict { .. }
             | Error::RepositoryConflict(_) => StatusCode::CONFLICT,
             Error::WorkerSourceIdentity(_) | Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
             Error::InvalidRuntimeIdentifier { .. } | Error::ReservedWorkerName(_) => {
@@ -16068,6 +16441,7 @@ impl IntoResponse for ApiError {
             | Error::UnknownRuntime(_)
             | Error::UnknownWorker { .. }
             | Error::UnknownRepository(_)
+            | Error::RuntimeBindingNotFound { .. }
             | Error::WorkspaceIdMismatch => StatusCode::NOT_FOUND,
             Error::RuntimeOperationFailed { code, .. } if code == "skill_not_found" => {
                 StatusCode::NOT_FOUND
@@ -16573,6 +16947,7 @@ mod tests {
                     base_url: "https://runtime.test".to_owned(),
                     public_key: identity.public_key.clone(),
                     public_key_fingerprint: String::new(),
+                    binding_revision: 1,
                     created_at: "2026-01-01T00:00:00Z".to_owned(),
                     updated_at: "2026-01-01T00:00:00Z".to_owned(),
                     revoked_at: None,
@@ -22069,6 +22444,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_trust_management_is_owner_only_revisioned_and_redacted() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        let owner_account_id = format!("account-{TEST_WORKSPACE_ID}");
+        let owner = RequestActor {
+            user_id: "owner-user".to_string(),
+            account_id: owner_account_id.clone(),
+            handle: "owner".to_string(),
+            display_name: "Owner".to_string(),
+            auth_method: ActorAuthMethod::BrowserSession,
+        };
+        let non_owner = RequestActor {
+            user_id: "other-user".to_string(),
+            account_id: "other-account".to_string(),
+            handle: "other".to_string(),
+            display_name: "Other".to_string(),
+            auth_method: ActorAuthMethod::ApiToken,
+        };
+        let first = worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-a").unwrap();
+        let second = worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-a").unwrap();
+        let third = worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-a").unwrap();
+        let now = Utc::now().to_rfc3339();
+        api.store
+            .put_workspace_runtime_binding_key(
+                WorkspaceRuntimeBinding {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    runtime_id: "runtime-a".to_string(),
+                    display_name: "Runtime A".to_string(),
+                    base_url: "https://runtime.example".to_string(),
+                    public_key: first.public_key,
+                    public_key_fingerprint: String::new(),
+                    binding_revision: 1,
+                    created_at: now.clone(),
+                    updated_at: now,
+                    revoked_at: None,
+                },
+                None,
+                &owner_account_id,
+            )
+            .await
+            .unwrap();
+
+        let Json(owner_detail) = scoped_get_runtime_detail(
+            State(api.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                runtime_id: "runtime-a".to_string(),
+            }),
+            Extension(owner.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(owner_detail.trust_key.public_key.is_some());
+        assert_eq!(owner_detail.trust_key.revision, Some(1));
+        let Json(reader_detail) = scoped_get_runtime_detail(
+            State(api.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                runtime_id: "runtime-a".to_string(),
+            }),
+            Extension(non_owner.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(reader_detail.trust_key.public_key.is_none());
+        assert!(reader_detail.trust_key.fingerprint.is_some());
+
+        let response = scoped_put_runtime_trust_key(
+            State(api.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                runtime_id: "runtime-a".to_string(),
+            }),
+            Extension(owner.clone()),
+            Json(PutRuntimeTrustKeyRequest {
+                public_key: second.public_key,
+                expected_revision: Some(1),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let detail: WorkspaceRuntimeDetail = serde_json::from_slice(&body).unwrap();
+        assert_eq!(detail.trust_key.revision, Some(2));
+        assert_eq!(
+            detail.recent_audit[0].action,
+            RuntimeTrustAuditAction::Replaced
+        );
+
+        let stale = scoped_put_runtime_trust_key(
+            State(api.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                runtime_id: "runtime-a".to_string(),
+            }),
+            Extension(owner.clone()),
+            Json(PutRuntimeTrustKeyRequest {
+                public_key: third.public_key,
+                expected_revision: Some(1),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(stale.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let conflict: RuntimeTrustConflictResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(conflict.error, RuntimeTrustConflictKind::StaleRevision);
+        assert_eq!(conflict.current_revision, Some(2));
+
+        let denied = scoped_revoke_runtime_trust_key(
+            State(api.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                runtime_id: "runtime-a".to_string(),
+            }),
+            Extension(non_owner),
+            Json(RevokeRuntimeTrustKeyRequest {
+                expected_revision: 2,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.into_response().status(), StatusCode::FORBIDDEN);
+
+        let revoked = scoped_revoke_runtime_trust_key(
+            State(api.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                runtime_id: "runtime-a".to_string(),
+            }),
+            Extension(owner),
+            Json(RevokeRuntimeTrustKeyRequest {
+                expected_revision: 2,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(revoked.status(), StatusCode::OK);
+        let binding = api
+            .store
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, "runtime-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.binding_revision, 3);
+        assert!(binding.revoked_at.is_some());
+        assert!(
+            !api.runtime_binding_expectations
+                .read()
+                .unwrap()
+                .contains_key(&(TEST_WORKSPACE_ID.to_string(), "runtime-a".to_string()))
+        );
+    }
+
+    #[tokio::test]
     async fn repository_secret_management_is_owner_only() {
         let temp = tempfile::tempdir().unwrap();
         let api = test_api(temp.path()).await;
@@ -22113,6 +22648,16 @@ mod tests {
 
     async fn test_api(workspace_root: impl Into<PathBuf>) -> WorkspaceApi {
         test_api_with_recording_backend(workspace_root).await.0
+    }
+
+    fn test_owner_actor() -> RequestActor {
+        RequestActor {
+            user_id: "owner-user".to_string(),
+            account_id: format!("account-{TEST_WORKSPACE_ID}"),
+            handle: "owner".to_string(),
+            display_name: "Owner".to_string(),
+            auth_method: ActorAuthMethod::BrowserSession,
+        }
     }
 
     fn test_repository_id(api: &WorkspaceApi) -> String {
@@ -22602,6 +23147,7 @@ mod tests {
             base_url: "https://runtime.invalid".to_string(),
             public_key: identity.public_key.clone(),
             public_key_fingerprint: String::new(),
+            binding_revision: 1,
             created_at: "2026-08-11T00:00:00Z".to_string(),
             updated_at: "2026-08-11T00:00:00Z".to_string(),
             revoked_at: None,
@@ -24088,6 +24634,7 @@ mod tests {
                         .unwrap()
                         .public_key,
                     public_key_fingerprint: String::new(),
+                    binding_revision: 1,
                     created_at: "1".to_string(),
                     updated_at: "1".to_string(),
                     revoked_at: None,
@@ -25205,6 +25752,7 @@ mod tests {
             base_url: "https://runtime.example.invalid".to_string(),
             public_key: identity.public_key,
             public_key_fingerprint: String::new(),
+            binding_revision: 1,
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
             revoked_at: None,
@@ -25222,7 +25770,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let app = build_inner_router(api);
+        let app = build_inner_router(api.clone()).layer(Extension(test_owner_actor()));
         let runtimes_uri = format!("/api/w/{TEST_WORKSPACE_ID}/runtimes");
 
         let initial = get_json(app.clone(), &runtimes_uri).await;
@@ -25303,6 +25851,16 @@ mod tests {
             .expect("team runtime launch option");
         assert_eq!(team_runtime["working_directory_required"], true);
 
+        api.store
+            .revoke_workspace_runtime_binding_key(
+                TEST_WORKSPACE_ID,
+                "team-runtime",
+                1,
+                &format!("account-{TEST_WORKSPACE_ID}"),
+                &Utc::now().to_rfc3339(),
+            )
+            .await
+            .unwrap();
         let deleted = request_json(
             app.clone(),
             "DELETE",
@@ -25354,6 +25912,7 @@ mod tests {
                 .unwrap()
                 .public_key,
             public_key_fingerprint: String::new(),
+            binding_revision: 1,
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
             revoked_at: None,
@@ -25370,7 +25929,17 @@ mod tests {
             )
             .unwrap(),
         );
-        let app = build_inner_router(api);
+        api.store
+            .revoke_workspace_runtime_binding_key(
+                TEST_WORKSPACE_ID,
+                "busy-runtime",
+                1,
+                &format!("account-{TEST_WORKSPACE_ID}"),
+                &Utc::now().to_rfc3339(),
+            )
+            .await
+            .unwrap();
+        let app = build_inner_router(api).layer(Extension(test_owner_actor()));
         let workers = get_json(app.clone(), "/api/workers").await;
         assert!(
             workers["items"]

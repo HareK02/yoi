@@ -539,6 +539,7 @@ pub enum WorkspaceAuthConfig {
 pub struct WorkspacePermissionSummary {
     pub manage_repositories: bool,
     pub manage_secrets: bool,
+    pub manage_runtimes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1135,6 +1136,7 @@ pub struct ObjectiveLinkTicketRequest {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeSourceKind {
     EmbeddedWorkerRuntime,
@@ -1142,6 +1144,7 @@ pub enum RuntimeSourceKind {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeSourceStatus {
     Active,
@@ -1149,6 +1152,7 @@ pub enum RuntimeSourceStatus {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeIdentityAuthority {
     RuntimeRegistryProjection,
@@ -1156,6 +1160,8 @@ pub enum RuntimeIdentityAuthority {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeSourceSummary {
     pub kind: RuntimeSourceKind,
     pub status: RuntimeSourceStatus,
@@ -1164,6 +1170,7 @@ pub struct RuntimeSourceSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct RuntimeSummary {
     pub runtime_id: String,
     pub label: String,
@@ -1180,6 +1187,8 @@ pub struct RuntimeSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeManagementSummary {
     pub built_in: bool,
     pub config_managed: bool,
@@ -1189,10 +1198,117 @@ pub struct RuntimeManagementSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkspaceRuntimeResource {
     #[serde(flatten)]
     pub runtime: RuntimeSummary,
     pub management: RuntimeManagementSummary,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeTrustKeyStatus {
+    Unconfigured,
+    Active,
+    Revoked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeTrustKeyState {
+    pub status: RuntimeTrustKeyStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
+    pub revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeTrustAuditAction {
+    Created,
+    Replaced,
+    Reactivated,
+    Revoked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeTrustAuditEntry {
+    pub action: RuntimeTrustAuditAction,
+    pub actor_account_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_fingerprint: Option<String>,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub revision: u64,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRuntimeDetail {
+    pub workspace_id: String,
+    pub runtime: WorkspaceRuntimeResource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    pub trust_key: RuntimeTrustKeyState,
+    #[serde(default)]
+    pub recent_audit: Vec<RuntimeTrustAuditEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PutRuntimeTrustKeyRequest {
+    pub public_key: String,
+    #[serde(default)]
+    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
+    pub expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RevokeRuntimeTrustKeyRequest {
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub expected_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeTrustConflictKind {
+    StaleRevision,
+    FingerprintInUse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeTrustConflictResponse {
+    pub error: RuntimeTrustConflictKind,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub current_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2394,6 +2510,22 @@ pub fn catalog_typescript() -> String {
         RepositoryListResponse::decl(&config),
         RepositoryDetailResponse::decl(&config),
         RepositoryLogResponse::decl(&config),
+        RuntimeSourceKind::decl(&config),
+        RuntimeSourceStatus::decl(&config),
+        RuntimeIdentityAuthority::decl(&config),
+        RuntimeSourceSummary::decl(&config),
+        RuntimeSummary::decl(&config),
+        RuntimeManagementSummary::decl(&config),
+        WorkspaceRuntimeResource::decl(&config),
+        RuntimeTrustKeyStatus::decl(&config),
+        RuntimeTrustKeyState::decl(&config),
+        RuntimeTrustAuditAction::decl(&config),
+        RuntimeTrustAuditEntry::decl(&config),
+        WorkspaceRuntimeDetail::decl(&config),
+        PutRuntimeTrustKeyRequest::decl(&config),
+        RevokeRuntimeTrustKeyRequest::decl(&config),
+        RuntimeTrustConflictKind::decl(&config),
+        RuntimeTrustConflictResponse::decl(&config),
         RuntimeConnectionTestStatus::decl(&config),
         RuntimeConnectionTestFailureKind::decl(&config),
         RuntimeConnectionTestResponse::decl(&config),
@@ -3022,7 +3154,8 @@ mod tests {
             }},
             "permissions": {
                 "manage_repositories": true,
-                "manage_secrets": true
+                "manage_secrets": true,
+                "manage_runtimes": true
             },
             "extension_points": {
                 "store": "sqlite",
@@ -3084,6 +3217,75 @@ mod tests {
         });
 
         assert!(serde_json::from_value::<RepositoryListResponse>(stale).is_err());
+    }
+
+    #[test]
+    fn runtime_detail_and_trust_mutations_are_closed_and_typed() {
+        let detail = serde_json::json!({
+            "workspace_id": "workspace-test",
+            "runtime": {
+                "runtime_id": "runtime-test",
+                "label": "Runtime Test",
+                "kind": "remote_http",
+                "status": "active",
+                "source": {
+                    "kind": "remote_http",
+                    "status": "active",
+                    "identity_authority": "runtime_registry_projection",
+                    "note": "active"
+                },
+                "host_ids": [],
+                "worker_creation_available": true,
+                "os": "linux",
+                "arch": "x86_64",
+                "diagnostics": [],
+                "management": {
+                    "built_in": false,
+                    "config_managed": true,
+                    "removable": true,
+                    "endpoint_configured": true,
+                    "token_ref_configured": false
+                }
+            },
+            "endpoint": "https://runtime.example",
+            "trust_key": {
+                "status": "active",
+                "public_key": "ssh-ed25519 AAAA runtime-test",
+                "fingerprint": "SHA256:test",
+                "revision": 2,
+                "created_at": "2026-09-01T12:00:00Z",
+                "updated_at": "2026-09-01T13:00:00Z"
+            },
+            "recent_audit": [{
+                "action": "replaced",
+                "actor_account_id": "account-owner",
+                "old_fingerprint": "SHA256:old",
+                "new_fingerprint": "SHA256:test",
+                "revision": 2,
+                "at": "2026-09-01T13:00:00Z"
+            }]
+        });
+        let parsed: WorkspaceRuntimeDetail = serde_json::from_value(detail.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), detail);
+
+        let mut unknown = detail;
+        unknown["trust_key"]["private_key"] = serde_json::json!("forbidden");
+        assert!(serde_json::from_value::<WorkspaceRuntimeDetail>(unknown).is_err());
+        assert!(
+            serde_json::from_value::<PutRuntimeTrustKeyRequest>(serde_json::json!({
+                "public_key": "key",
+                "expected_revision": 1,
+                "replace": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<RevokeRuntimeTrustKeyRequest>(serde_json::json!({
+                "expected_revision": 1,
+                "delete_runtime": true
+            }))
+            .is_err()
+        );
     }
 
     #[test]

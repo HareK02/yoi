@@ -47,6 +47,7 @@ export type WorkspaceAuthConfig = {
 export type WorkspacePermissionSummary = {
   manage_repositories: boolean;
   manage_secrets: boolean;
+  manage_runtimes: boolean;
 };
 
 export type DiagnosticSeverity = "info" | "warning" | "error";
@@ -219,6 +220,107 @@ export type RepositoryLogResponse = {
   limit: number;
   items: Array<GitCommitSummary>;
   diagnostics: Array<Diagnostic>;
+};
+
+export type RuntimeSourceKind = "embedded_worker_runtime" | "remote_http";
+
+export type RuntimeSourceStatus = "active" | "reserved";
+
+export type RuntimeIdentityAuthority =
+  | "runtime_registry_projection"
+  | "server_runtime_configuration";
+
+export type RuntimeSourceSummary = {
+  kind: RuntimeSourceKind;
+  status: RuntimeSourceStatus;
+  identity_authority: RuntimeIdentityAuthority;
+  note: string;
+};
+
+export type RuntimeSummary = {
+  runtime_id: string;
+  label: string;
+  kind: string;
+  status: string;
+  source: RuntimeSourceSummary;
+  host_ids: Array<string>;
+  worker_creation_available: boolean;
+  os: string;
+  arch: string;
+  diagnostics: Array<Diagnostic>;
+};
+
+export type RuntimeManagementSummary = {
+  built_in: boolean;
+  config_managed: boolean;
+  removable: boolean;
+  endpoint_configured: boolean;
+  token_ref_configured: boolean;
+};
+
+export type WorkspaceRuntimeResource = {
+  management: RuntimeManagementSummary;
+  runtime_id: string;
+  label: string;
+  kind: string;
+  status: string;
+  source: RuntimeSourceSummary;
+  host_ids: Array<string>;
+  worker_creation_available: boolean;
+  os: string;
+  arch: string;
+  diagnostics: Array<Diagnostic>;
+};
+
+export type RuntimeTrustKeyStatus = "unconfigured" | "active" | "revoked";
+
+export type RuntimeTrustKeyState = {
+  status: RuntimeTrustKeyStatus;
+  public_key?: string | null;
+  fingerprint?: string | null;
+  revision?: number | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  revoked_at?: string | null;
+};
+
+export type RuntimeTrustAuditAction =
+  | "created"
+  | "replaced"
+  | "reactivated"
+  | "revoked";
+
+export type RuntimeTrustAuditEntry = {
+  action: RuntimeTrustAuditAction;
+  actor_account_id: string;
+  old_fingerprint?: string | null;
+  new_fingerprint?: string | null;
+  revision: number;
+  at: string;
+};
+
+export type WorkspaceRuntimeDetail = {
+  workspace_id: string;
+  runtime: WorkspaceRuntimeResource;
+  endpoint?: string | null;
+  trust_key: RuntimeTrustKeyState;
+  recent_audit: Array<RuntimeTrustAuditEntry>;
+};
+
+export type PutRuntimeTrustKeyRequest = {
+  public_key: string;
+  expected_revision: number | null;
+};
+
+export type RevokeRuntimeTrustKeyRequest = { expected_revision: number };
+
+export type RuntimeTrustConflictKind = "stale_revision" | "fingerprint_in_use";
+
+export type RuntimeTrustConflictResponse = {
+  error: RuntimeTrustConflictKind;
+  message: string;
+  current_revision?: number;
+  current_fingerprint?: string | null;
 };
 
 export type RuntimeConnectionTestStatus = "compatible" | "failed";
