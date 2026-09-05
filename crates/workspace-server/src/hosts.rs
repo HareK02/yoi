@@ -1382,12 +1382,7 @@ impl RuntimeRegistry {
         &self,
         projection: worker::WorkspacePromptProjection,
     ) -> Vec<RuntimeDiagnostic> {
-        let runtimes = self
-            .runtimes
-            .read()
-            .map(|runtimes| runtimes.clone())
-            .unwrap_or_default();
-        runtimes
+        self.runtimes_snapshot()
             .into_iter()
             .filter_map(|runtime| {
                 runtime
@@ -5198,18 +5193,23 @@ mod tests {
 
     #[test]
     fn registry_gate_rejects_cached_runtime_immediately_after_binding_revocation() {
-        let registry = RuntimeRegistry::new(vec![Arc::new(FixtureRuntime::with_worker(
-            "runtime-a",
-            "host-a",
-            "worker-a",
-            "worker from runtime a",
-        ))]);
+        let remote =
+            FixtureRuntime::with_worker("runtime-a", "host-a", "worker-a", "worker from runtime a");
+        let remote_observed = remote.observed_prompt_revisions.clone();
+        let embedded = FixtureRuntime::with_worker(
+            EMBEDDED_RUNTIME_ID,
+            "embedded-host",
+            "embedded-worker",
+            "embedded worker",
+        );
+        let embedded_observed = embedded.observed_prompt_revisions.clone();
+        let registry = RuntimeRegistry::new(vec![Arc::new(remote), Arc::new(embedded)]);
         let active = Arc::new(Mutex::new(true));
         let gate_state = active.clone();
         registry.set_runtime_binding_gate(move |_| {
             *gate_state.lock().expect("gate state lock poisoned")
         });
-        assert_eq!(registry.list_runtimes(10).items.len(), 1);
+        assert_eq!(registry.list_runtimes(10).items.len(), 2);
         assert!(
             registry
                 .worker(&RuntimeWorkerRef::new("runtime-a", "worker-a"))
@@ -5217,11 +5217,36 @@ mod tests {
         );
 
         *active.lock().expect("gate state lock poisoned") = false;
-        assert!(registry.list_runtimes(10).items.is_empty());
+        assert_eq!(registry.list_runtimes(10).items.len(), 1);
         assert!(matches!(
             registry.worker(&RuntimeWorkerRef::new("runtime-a", "worker-a")),
             Err(RuntimeRegistryError::UnknownRuntime(runtime_id)) if runtime_id == "runtime-a"
         ));
+
+        let catalog = worker::EffectivePromptCatalog::new(
+            std::collections::BTreeMap::from([(
+                "default".to_string(),
+                "workspace prompt".to_string(),
+            )]),
+            12,
+            "schema",
+            "toolchain",
+        )
+        .unwrap();
+        let projection = worker::WorkspacePromptProjection::new(
+            "workspace-a",
+            "source-12",
+            catalog.catalog_digest.clone(),
+            catalog,
+        )
+        .unwrap();
+        assert!(
+            registry
+                .observe_workspace_prompt_projection(projection)
+                .is_empty()
+        );
+        assert!(remote_observed.lock().unwrap().is_empty());
+        assert_eq!(*embedded_observed.lock().unwrap(), vec![12]);
     }
 
     #[test]
