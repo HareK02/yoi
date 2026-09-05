@@ -677,6 +677,41 @@ async function finishMutation(
   return detail;
 }
 
+export async function previewRuntimePublicKeyFingerprint(
+  publicKey: string,
+): Promise<string> {
+  const normalized = publicKey.trim();
+  const prefix = "yoi-ed25519-pub:v1:";
+  if (!normalized.startsWith(prefix)) {
+    throw new RuntimeTrustRequestError(
+      `Public key must start with ${prefix}`,
+    );
+  }
+  const encoded = normalized.slice(prefix.length);
+  if (!/^[A-Za-z0-9_-]+$/.test(encoded)) {
+    throw new RuntimeTrustRequestError("Public key encoding is invalid");
+  }
+  const padded = encoded.replaceAll("-", "+").replaceAll("_", "/") +
+    "=".repeat((4 - (encoded.length % 4)) % 4);
+  let decoded: string;
+  try {
+    decoded = atob(padded);
+  } catch {
+    throw new RuntimeTrustRequestError("Public key encoding is invalid");
+  }
+  if (decoded.length !== 32) {
+    throw new RuntimeTrustRequestError("Public key must contain 32 bytes");
+  }
+  const bytes = Uint8Array.from(
+    decoded,
+    (character) => character.charCodeAt(0),
+  );
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  const hex = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  return `sha256:${hex}`;
+}
+
 export async function putRuntimeTrustKey(
   workspaceId: string,
   runtimeId: string,

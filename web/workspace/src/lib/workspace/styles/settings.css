@@ -470,6 +470,30 @@
     color: var(--text-muted);
   }
 
+  .runtime-trust-comparison {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-3);
+    margin: 0;
+    padding: var(--space-3) 0;
+    border-block: 1px solid var(--line);
+  }
+
+  .runtime-trust-comparison div {
+    min-width: 0;
+  }
+
+  .runtime-trust-comparison dt {
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    font-weight: 700;
+  }
+
+  .runtime-trust-comparison dd {
+    margin: var(--space-1) 0 0;
+    overflow-wrap: anywhere;
+  }
+
   .runtime-trust-form .field-error,
   .runtime-detail-page .section-state.error {
     color: var(--danger);

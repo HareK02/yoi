@@ -6,6 +6,7 @@
     RuntimeTrustKeyStatus,
   } from '$lib/generated/workspace-api';
   import {
+    previewRuntimePublicKeyFingerprint,
     putRuntimeTrustKey,
     revokeRuntimeTrustKey,
     RuntimeTrustConflictError,
@@ -23,6 +24,29 @@
   let fieldError = $state<string | null>(null);
   let requestError = $state<string | null>(null);
   let successMessage = $state<string | null>(null);
+  let replacementFingerprint = $state<string | null>(null);
+  let replacementFingerprintError = $state<string | null>(null);
+  let fingerprintGeneration = 0;
+
+  $effect(() => {
+    const key = publicKey.trim();
+    const generation = ++fingerprintGeneration;
+    replacementFingerprint = null;
+    replacementFingerprintError = null;
+    if (!key) return;
+    void previewRuntimePublicKeyFingerprint(key).then(
+      (fingerprint) => {
+        if (generation === fingerprintGeneration) replacementFingerprint = fingerprint;
+      },
+      (error) => {
+        if (generation === fingerprintGeneration) {
+          replacementFingerprintError = error instanceof Error
+            ? error.message
+            : String(error);
+        }
+      },
+    );
+  });
 
   function trustAction(status: RuntimeTrustKeyStatus): TrustAction {
     if (status === 'unconfigured') return 'create';
@@ -67,6 +91,14 @@
     }
     if (utf8Bytes(key) > 16 * 1024) {
       fieldError = 'Public key must be at most 16 KiB of UTF-8 text.';
+      return;
+    }
+    if (replacementFingerprintError) {
+      fieldError = replacementFingerprintError;
+      return;
+    }
+    if (!replacementFingerprint) {
+      fieldError = 'Wait for the replacement fingerprint preview before saving.';
       return;
     }
 
@@ -249,8 +281,22 @@
             spellcheck="false"
             aria-describedby={fieldError ? 'runtime-public-key-error' : undefined}
             aria-invalid={fieldError ? 'true' : undefined}
-            placeholder="ssh-ed25519 …"
+            placeholder="yoi-ed25519-pub:v1:…"
           ></textarea>
+
+          <dl class="runtime-trust-comparison">
+            <div>
+              <dt>Current fingerprint</dt>
+              <dd><code>{trust.fingerprint ?? 'Not configured'}</code></dd>
+            </div>
+            <div>
+              <dt>Replacement fingerprint</dt>
+              <dd><code>{replacementFingerprint ?? 'Enter a valid public key'}</code></dd>
+            </div>
+          </dl>
+          {#if replacementFingerprintError}
+            <p class="field-error">{replacementFingerprintError}</p>
+          {/if}
 
           {#if currentAction !== 'create'}
             <label for="runtime-fingerprint-confirmation">Confirm current fingerprint</label>

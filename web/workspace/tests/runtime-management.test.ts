@@ -6,6 +6,7 @@ import {
   parseRuntimeTrustConflict,
   parseWorkspaceRuntimeDetail,
   parseWorkspaceRuntimeList,
+  previewRuntimePublicKeyFingerprint,
   putRuntimeTrustKey,
   RuntimeTrustConflictError,
 } from "../src/lib/workspace/api/runtime-management.ts";
@@ -177,6 +178,17 @@ Deno.test("Runtime detail rejects unbounded strings and incoherent trust state",
   assertThrows(
     () => parseWorkspaceRuntimeDetail(activeWithoutFingerprint),
     "must include fingerprint",
+  );
+});
+
+Deno.test("Runtime public key preview matches the Server fingerprint contract", async () => {
+  const fingerprint = await previewRuntimePublicKeyFingerprint(
+    "yoi-ed25519-pub:v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  );
+  assert(
+    fingerprint ===
+      "sha256:66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+    "fingerprint preview drifted from the Server SHA-256 contract",
   );
 });
 

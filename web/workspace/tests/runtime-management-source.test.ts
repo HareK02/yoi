@@ -85,6 +85,14 @@ Deno.test("Runtime detail keeps trust controls owner-only and conflict-safe", as
   const mutation = page.indexOf('id="runtime-public-key-input"');
   assert(ownerGate >= 0, "Runtime trust controls should use manage_runtimes");
   assert(
+    page.includes("Current fingerprint"),
+    "current fingerprint must be explicit",
+  );
+  assert(
+    page.includes("Replacement fingerprint"),
+    "replacement fingerprint must be previewed before confirmation",
+  );
+  assert(
     page.includes("!runtime.management.built_in"),
     "Runtime trust controls should be hidden for the built-in Runtime",
   );
