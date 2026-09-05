@@ -78,10 +78,11 @@ use workspace_api::{
     RequestActor, RevokeRuntimeTrustKeyRequest, RotateRepositorySshCredentialRequest,
     RuntimeConnectionTestFailureKind, RuntimeConnectionTestResponse, RuntimeConnectionTestStatus,
     RuntimeManagementSummary, RuntimeTrustAuditAction, RuntimeTrustAuditEntry,
-    RuntimeTrustConflictKind, RuntimeTrustConflictResponse, RuntimeTrustKeyState,
-    RuntimeTrustKeyStatus, TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
-    UpdateWorkspaceMetadataRequest, WhoamiResponse, WorkerLaunchOptionsResponse,
-    WorkerLaunchProfileCandidate, WorkerLaunchRuntimeOption, WorkerLaunchWorkerSummary,
+    RuntimeTrustConflictKind, RuntimeTrustConflictResponse, RuntimeTrustKeyRevealResponse,
+    RuntimeTrustKeyState, RuntimeTrustKeyStatus, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
+    TICKET_RELATIONS_QUERY_PATH, UpdateWorkspaceMetadataRequest, WhoamiResponse,
+    WorkerLaunchOptionsResponse, WorkerLaunchProfileCandidate, WorkerLaunchRuntimeOption,
+    WorkerLaunchWorkerSummary,
     WorkingDirectoryCreateRequest as BrowserWorkingDirectoryCreateRequest,
     WorkingDirectoryCreateResponse as BrowserWorkingDirectoryCreateResponse,
     WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
@@ -2672,7 +2673,9 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         )
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/trust-key",
-            put(scoped_put_runtime_trust_key).delete(scoped_revoke_runtime_trust_key),
+            get(scoped_reveal_runtime_trust_key)
+                .put(scoped_put_runtime_trust_key)
+                .delete(scoped_revoke_runtime_trust_key),
         )
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/connection-tests",
@@ -10884,18 +10887,42 @@ async fn scoped_create_remote_runtime(
 async fn scoped_get_runtime_detail(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
-    Extension(actor): Extension<RequestActor>,
 ) -> ApiResult<Json<WorkspaceRuntimeDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let workspace = api
-        .store
-        .get_workspace(&path.workspace_id)
-        .await?
-        .ok_or(Error::WorkspaceIdMismatch)?;
-    let is_owner = workspace.owner_account_id == actor.account_id;
     Ok(Json(
-        workspace_runtime_detail(&api, &path.workspace_id, &path.runtime_id, is_owner).await?,
+        workspace_runtime_detail(&api, &path.workspace_id, &path.runtime_id).await?,
     ))
+}
+
+async fn scoped_reveal_runtime_trust_key(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimePath>,
+    Extension(actor): Extension<RequestActor>,
+) -> ApiResult<Json<RuntimeTrustKeyRevealResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    require_workspace_owner(
+        &api,
+        &path.workspace_id,
+        &actor,
+        "Runtime public key reveal",
+    )
+    .await?;
+    if path.runtime_id == EMBEDDED_WORKER_RUNTIME_ID {
+        return Err(settings_bad_request(
+            "embedded_runtime_trust_managed_internally",
+            "the embedded Runtime trust key is managed by Server identity authority",
+        ));
+    }
+    let binding = api
+        .store
+        .get_workspace_runtime_binding(&path.workspace_id, &path.runtime_id)
+        .await?
+        .ok_or_else(|| Error::RuntimeBindingNotFound {
+            runtime_id: path.runtime_id.clone(),
+        })?;
+    Ok(Json(RuntimeTrustKeyRevealResponse {
+        public_key: binding.public_key,
+    }))
 }
 
 async fn scoped_put_runtime_trust_key(
@@ -10993,7 +11020,7 @@ async fn scoped_put_runtime_trust_key(
             .register_remote_runtime(source);
     }
     Ok(
-        Json(workspace_runtime_detail(&api, &path.workspace_id, &path.runtime_id, true).await?)
+        Json(workspace_runtime_detail(&api, &path.workspace_id, &path.runtime_id).await?)
             .into_response(),
     )
 }
@@ -11046,7 +11073,7 @@ async fn scoped_revoke_runtime_trust_key(
     api.runtime_subscription_broker
         .unregister_runtime(&path.runtime_id);
     Ok(
-        Json(workspace_runtime_detail(&api, &path.workspace_id, &path.runtime_id, true).await?)
+        Json(workspace_runtime_detail(&api, &path.workspace_id, &path.runtime_id).await?)
             .into_response(),
     )
 }
@@ -14738,7 +14765,6 @@ async fn workspace_runtime_detail(
     api: &WorkspaceApi,
     workspace_id: &str,
     runtime_id: &str,
-    include_public_key: bool,
 ) -> ApiResult<WorkspaceRuntimeDetail> {
     let binding = api
         .store
@@ -14800,7 +14826,6 @@ async fn workspace_runtime_detail(
     let trust_key = binding.as_ref().map_or(
         RuntimeTrustKeyState {
             status: RuntimeTrustKeyStatus::Unconfigured,
-            public_key: None,
             fingerprint: None,
             revision: None,
             created_at: None,
@@ -14813,7 +14838,6 @@ async fn workspace_runtime_detail(
             } else {
                 RuntimeTrustKeyStatus::Active
             },
-            public_key: include_public_key.then(|| binding.public_key.clone()),
             fingerprint: Some(binding.public_key_fingerprint.clone()),
             revision: Some(binding.binding_revision),
             created_at: Some(binding.created_at.clone()),
@@ -22529,7 +22553,18 @@ mod tests {
             .await
             .unwrap();
 
-        let Json(owner_detail) = scoped_get_runtime_detail(
+        let Json(detail) = scoped_get_runtime_detail(
+            State(api.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                runtime_id: "runtime-a".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(detail.trust_key.revision, Some(1));
+        assert!(detail.trust_key.fingerprint.is_some());
+        let Json(revealed) = scoped_reveal_runtime_trust_key(
             State(api.clone()),
             AxumPath(ScopedRuntimePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
@@ -22539,9 +22574,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(owner_detail.trust_key.public_key.is_some());
-        assert_eq!(owner_detail.trust_key.revision, Some(1));
-        let Json(reader_detail) = scoped_get_runtime_detail(
+        assert!(revealed.public_key.starts_with("yoi-ed25519-pub:v1:"));
+        let denied_reveal = scoped_reveal_runtime_trust_key(
             State(api.clone()),
             AxumPath(ScopedRuntimePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
@@ -22550,9 +22584,11 @@ mod tests {
             Extension(non_owner.clone()),
         )
         .await
-        .unwrap();
-        assert!(reader_detail.trust_key.public_key.is_none());
-        assert!(reader_detail.trust_key.fingerprint.is_some());
+        .unwrap_err();
+        assert_eq!(
+            denied_reveal.into_response().status(),
+            StatusCode::FORBIDDEN
+        );
 
         let response = scoped_put_runtime_trust_key(
             State(api.clone()),

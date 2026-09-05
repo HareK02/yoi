@@ -276,7 +276,6 @@ export type RuntimeTrustKeyStatus = "unconfigured" | "active" | "revoked";
 
 export type RuntimeTrustKeyState = {
   status: RuntimeTrustKeyStatus;
-  public_key?: string | null;
   fingerprint?: string | null;
   revision?: number | null;
   created_at?: string | null;
@@ -306,6 +305,8 @@ export type WorkspaceRuntimeDetail = {
   trust_key: RuntimeTrustKeyState;
   recent_audit: Array<RuntimeTrustAuditEntry>;
 };
+
+export type RuntimeTrustKeyRevealResponse = { public_key: string };
 
 export type PutRuntimeTrustKeyRequest = {
   public_key: string;

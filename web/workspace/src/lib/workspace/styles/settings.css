@@ -426,7 +426,8 @@
 
   .runtime-public-key,
   .runtime-trust-form textarea,
-  .runtime-trust-form input {
+  .runtime-trust-form input,
+  .runtime-revoke-row input {
     border: 1px solid var(--line);
     border-radius: 0.5rem;
     background: var(--bg-raised);
@@ -450,14 +451,16 @@
     max-width: 56rem;
   }
 
-  .runtime-trust-form label {
+  .runtime-trust-form label,
+  .runtime-revoke-row label {
     color: var(--text-muted);
     font-size: 0.78rem;
     font-weight: 700;
   }
 
   .runtime-trust-form textarea,
-  .runtime-trust-form input {
+  .runtime-trust-form input,
+  .runtime-revoke-row input {
     width: 100%;
     padding: 0.65rem 0.75rem;
   }
@@ -466,7 +469,8 @@
     resize: vertical;
   }
 
-  .runtime-trust-form small {
+  .runtime-trust-form small,
+  .runtime-revoke-row small {
     color: var(--text-muted);
   }
 

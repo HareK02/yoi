@@ -1220,8 +1220,6 @@ pub enum RuntimeTrustKeyStatus {
 pub struct RuntimeTrustKeyState {
     pub status: RuntimeTrustKeyStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub public_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
@@ -1270,6 +1268,13 @@ pub struct WorkspaceRuntimeDetail {
     pub trust_key: RuntimeTrustKeyState,
     #[serde(default)]
     pub recent_audit: Vec<RuntimeTrustAuditEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeTrustKeyRevealResponse {
+    pub public_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2522,6 +2527,7 @@ pub fn catalog_typescript() -> String {
         RuntimeTrustAuditAction::decl(&config),
         RuntimeTrustAuditEntry::decl(&config),
         WorkspaceRuntimeDetail::decl(&config),
+        RuntimeTrustKeyRevealResponse::decl(&config),
         PutRuntimeTrustKeyRequest::decl(&config),
         RevokeRuntimeTrustKeyRequest::decl(&config),
         RuntimeTrustConflictKind::decl(&config),
@@ -3250,7 +3256,6 @@ mod tests {
             "endpoint": "https://runtime.example",
             "trust_key": {
                 "status": "active",
-                "public_key": "ssh-ed25519 AAAA runtime-test",
                 "fingerprint": "SHA256:test",
                 "revision": 2,
                 "created_at": "2026-09-01T12:00:00Z",
@@ -3271,6 +3276,13 @@ mod tests {
         let mut unknown = detail;
         unknown["trust_key"]["private_key"] = serde_json::json!("forbidden");
         assert!(serde_json::from_value::<WorkspaceRuntimeDetail>(unknown).is_err());
+        assert!(
+            serde_json::from_value::<RuntimeTrustKeyRevealResponse>(serde_json::json!({
+                "public_key": "yoi-ed25519-pub:v1:key",
+                "private_key": "forbidden"
+            }))
+            .is_err()
+        );
         assert!(
             serde_json::from_value::<PutRuntimeTrustKeyRequest>(serde_json::json!({
                 "public_key": "key",

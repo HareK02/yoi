@@ -8,6 +8,7 @@
   import {
     previewRuntimePublicKeyFingerprint,
     putRuntimeTrustKey,
+    revealRuntimeTrustKey,
     revokeRuntimeTrustKey,
     RuntimeTrustConflictError,
     RuntimeTrustRequestError,
@@ -17,10 +18,12 @@
   type TrustAction = 'create' | 'replace' | 'reactivate';
 
   let { data }: PageProps = $props();
-  let revealPublicKey = $state(false);
+  let showPublicKey = $state(false);
+  let revealedPublicKey = $state<string | null>(null);
   let publicKey = $state('');
   let fingerprintConfirmation = $state('');
-  let busyAction = $state<'save' | 'revoke' | 'copy' | null>(null);
+  let revokeFingerprintConfirmation = $state('');
+  let busyAction = $state<'save' | 'revoke' | 'reveal' | 'copy' | null>(null);
   let fieldError = $state<string | null>(null);
   let requestError = $state<string | null>(null);
   let successMessage = $state<string | null>(null);
@@ -125,7 +128,9 @@
       await putRuntimeTrustKey(data.workspaceId, data.runtimeId, request);
       publicKey = '';
       fingerprintConfirmation = '';
-      revealPublicKey = false;
+      revokeFingerprintConfirmation = '';
+      showPublicKey = false;
+      revealedPublicKey = null;
       successMessage = action === 'create'
         ? 'Workspace trust was created.'
         : action === 'replace'
@@ -154,6 +159,13 @@
       requestError = 'Only active Workspace trust can be revoked.';
       return;
     }
+    if (
+      !trust.fingerprint ||
+      revokeFingerprintConfirmation.trim() !== trust.fingerprint
+    ) {
+      fieldError = 'Enter the current fingerprint exactly before revoking Workspace trust.';
+      return;
+    }
 
     fieldError = null;
     requestError = null;
@@ -164,10 +176,18 @@
     };
 
     try {
-      await revokeRuntimeTrustKey(data.workspaceId, data.runtimeId, request);
+      await revokeRuntimeTrustKey(
+        data.workspaceId,
+        data.runtimeId,
+        request,
+        trust.fingerprint,
+        revokeFingerprintConfirmation,
+      );
       publicKey = '';
       fingerprintConfirmation = '';
-      revealPublicKey = false;
+      revokeFingerprintConfirmation = '';
+      showPublicKey = false;
+      revealedPublicKey = null;
       successMessage = 'Workspace trust was revoked.';
       await reloadAuthority();
     } catch (error) {
@@ -182,16 +202,40 @@
     }
   }
 
+  async function togglePublicKeyReveal(): Promise<void> {
+    if (showPublicKey) {
+      showPublicKey = false;
+      revealedPublicKey = null;
+      return;
+    }
+    if (busyAction !== null) return;
+    busyAction = 'reveal';
+    requestError = null;
+    successMessage = null;
+    try {
+      const response = await revealRuntimeTrustKey(data.workspaceId, data.runtimeId);
+      revealedPublicKey = response.public_key;
+      showPublicKey = true;
+    } catch (error) {
+      requestError = error instanceof Error ? error.message : 'Public key reveal failed.';
+    } finally {
+      busyAction = null;
+    }
+  }
+
   async function copyPublicKey(): Promise<void> {
-    const key = data.runtimeDetail?.trust_key.public_key;
-    if (!key || busyAction !== null) return;
+    if (busyAction !== null) return;
     busyAction = 'copy';
     requestError = null;
+    successMessage = null;
     try {
-      await navigator.clipboard.writeText(key);
+      const response = await revealRuntimeTrustKey(data.workspaceId, data.runtimeId);
+      await navigator.clipboard.writeText(response.public_key);
       successMessage = 'Public key copied.';
-    } catch {
-      requestError = 'The browser could not copy the public key.';
+    } catch (error) {
+      requestError = error instanceof Error
+        ? error.message
+        : 'The browser could not copy the public key.';
     } finally {
       busyAction = null;
     }
@@ -255,20 +299,23 @@
       <section class="runtime-detail-section" aria-labelledby="runtime-trust-heading">
         <h2 id="runtime-trust-heading">Workspace trust</h2>
 
-        {#if trust.public_key}
+        {#if trust.status !== 'unconfigured'}
           <div class="runtime-public-key-actions">
-            <button type="button" class="secondary" onclick={() => revealPublicKey = !revealPublicKey}>
-              {revealPublicKey ? 'Hide public key' : 'Reveal public key'}
+            <button
+              type="button"
+              class="secondary"
+              disabled={busyAction !== null}
+              onclick={togglePublicKeyReveal}
+            >
+              {busyAction === 'reveal' ? 'Loading…' : showPublicKey ? 'Hide public key' : 'Reveal public key'}
             </button>
             <button type="button" class="secondary" disabled={busyAction !== null} onclick={copyPublicKey}>
               {busyAction === 'copy' ? 'Copying…' : 'Copy public key'}
             </button>
           </div>
-          {#if revealPublicKey}
-            <pre class="runtime-public-key"><code>{trust.public_key}</code></pre>
+          {#if showPublicKey && revealedPublicKey}
+            <pre class="runtime-public-key"><code>{revealedPublicKey}</code></pre>
           {/if}
-        {:else if trust.status !== 'unconfigured'}
-          <p class="section-state">The public key was not included in this authorized response.</p>
         {/if}
 
         <form class="runtime-trust-form" onsubmit={saveTrustKey}>
@@ -324,11 +371,25 @@
           <div>
             <strong>Revoke Workspace trust</strong>
             <p>Workspace trust only; this does not delete the Runtime process, Workers, or Workdirs.</p>
+            <label>
+              Confirm current fingerprint
+              <input
+                bind:value={revokeFingerprintConfirmation}
+                autocomplete="off"
+                spellcheck="false"
+                disabled={trust.status !== 'active' || busyAction !== null}
+              />
+              <small>Enter <code>{trust.fingerprint ?? 'the current fingerprint'}</code> exactly before revocation.</small>
+            </label>
           </div>
           <button
             type="button"
             class="danger"
-            disabled={busyAction !== null || trust.status !== 'active'}
+            disabled={
+              busyAction !== null ||
+              trust.status !== 'active' ||
+              revokeFingerprintConfirmation.trim() !== trust.fingerprint
+            }
             onclick={revokeTrust}
           >{busyAction === 'revoke' ? 'Revoking…' : 'Revoke trust'}</button>
         </div>

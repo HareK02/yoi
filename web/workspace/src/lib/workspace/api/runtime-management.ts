@@ -11,6 +11,7 @@ import type {
   RuntimeTrustAuditEntry,
   RuntimeTrustConflictKind,
   RuntimeTrustConflictResponse,
+  RuntimeTrustKeyRevealResponse,
   RuntimeTrustKeyState,
   RuntimeTrustKeyStatus,
   WorkspaceRuntimeDetail,
@@ -354,23 +355,11 @@ function trustKey(value: unknown, path: string): RuntimeTrustKeyState {
   exactKeys(
     item,
     ["status"],
-    [
-      "public_key",
-      "fingerprint",
-      "revision",
-      "created_at",
-      "updated_at",
-      "revoked_at",
-    ],
+    ["fingerprint", "revision", "created_at", "updated_at", "revoked_at"],
     path,
   );
   const result: RuntimeTrustKeyState = {
     status: enumValue(item.status, `${path}.status`, TRUST_STATUSES),
-    public_key: optionalNullableString(
-      item.public_key,
-      `${path}.public_key`,
-      LIMITS.publicKeyBytes,
-    ),
     fingerprint: optionalNullableString(
       item.fingerprint,
       `${path}.fingerprint`,
@@ -538,6 +527,25 @@ export function parseWorkspaceRuntimeDetail(
   };
 }
 
+export function parseRuntimeTrustKeyRevealResponse(
+  value: unknown,
+): RuntimeTrustKeyRevealResponse {
+  const response = object(value, "Runtime trust key reveal response");
+  exactKeys(
+    response,
+    ["public_key"],
+    [],
+    "Runtime trust key reveal response",
+  );
+  return {
+    public_key: boundedString(
+      response.public_key,
+      "Runtime trust key reveal response.public_key",
+      LIMITS.publicKeyBytes,
+    ),
+  };
+}
+
 export function parseRuntimeTrustConflict(
   value: unknown,
 ): RuntimeTrustConflictResponse {
@@ -677,6 +685,21 @@ async function finishMutation(
   return detail;
 }
 
+export async function revealRuntimeTrustKey(
+  workspaceId: string,
+  runtimeId: string,
+): Promise<RuntimeTrustKeyRevealResponse> {
+  const response = await fetch(
+    workspaceApiPath(
+      workspaceId,
+      `/runtimes/${encodeURIComponent(runtimeId)}/trust-key`,
+    ),
+  );
+  const payload = await readBoundedJson(response);
+  if (!response.ok) throw requestErrorFrom(payload, response.status);
+  return parseRuntimeTrustKeyRevealResponse(payload);
+}
+
 export async function previewRuntimePublicKeyFingerprint(
   publicKey: string,
 ): Promise<string> {
@@ -739,8 +762,15 @@ export async function revokeRuntimeTrustKey(
   workspaceId: string,
   runtimeId: string,
   request: RevokeRuntimeTrustKeyRequest,
+  currentFingerprint: string,
+  confirmation: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<WorkspaceRuntimeDetail> {
+  if (!currentFingerprint || confirmation.trim() !== currentFingerprint) {
+    throw new RuntimeTrustRequestError(
+      "Enter the current fingerprint exactly before revoking Workspace trust.",
+    );
+  }
   const response = await fetchImpl(
     workspaceApiPath(
       workspaceId,

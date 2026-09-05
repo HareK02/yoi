@@ -4,10 +4,12 @@ declare const Deno: {
 
 import {
   parseRuntimeTrustConflict,
+  parseRuntimeTrustKeyRevealResponse,
   parseWorkspaceRuntimeDetail,
   parseWorkspaceRuntimeList,
   previewRuntimePublicKeyFingerprint,
   putRuntimeTrustKey,
+  revokeRuntimeTrustKey,
   RuntimeTrustConflictError,
 } from "../src/lib/workspace/api/runtime-management.ts";
 
@@ -62,7 +64,6 @@ function detail() {
     endpoint: "https://runtime.example.test",
     trust_key: {
       status: "active",
-      public_key: "ssh-ed25519 AAAA-test",
       fingerprint: "SHA256:current",
       revision: 3,
       created_at: "2026-09-01T12:00:00Z",
@@ -162,10 +163,11 @@ Deno.test("Runtime validators reject unsafe revisions and bounded collection ove
 });
 
 Deno.test("Runtime detail rejects unbounded strings and incoherent trust state", () => {
-  const largeKey = structuredClone(detail());
-  largeKey.trust_key.public_key = "x".repeat(16 * 1024 + 1);
   assertThrows(
-    () => parseWorkspaceRuntimeDetail(largeKey),
+    () =>
+      parseRuntimeTrustKeyRevealResponse({
+        public_key: "x".repeat(16 * 1024 + 1),
+      }),
     "must be at most 16384 UTF-8 bytes",
   );
 
@@ -179,6 +181,30 @@ Deno.test("Runtime detail rejects unbounded strings and incoherent trust state",
     () => parseWorkspaceRuntimeDetail(activeWithoutFingerprint),
     "must include fingerprint",
   );
+});
+
+Deno.test("mismatched revoke fingerprint never sends a request", async () => {
+  let requests = 0;
+  const fetchImpl: typeof fetch = () => {
+    requests += 1;
+    return Promise.reject(new Error("request must not be sent"));
+  };
+  let rejected = false;
+  try {
+    await revokeRuntimeTrustKey(
+      "workspace-a",
+      "runtime-a",
+      { expected_revision: 3 },
+      "sha256:current",
+      "sha256:different",
+      fetchImpl,
+    );
+  } catch (error) {
+    rejected = error instanceof Error &&
+      error.message.includes("current fingerprint exactly");
+  }
+  assert(rejected, "mismatched fingerprint should be rejected locally");
+  assert(requests === 0, "mismatched fingerprint sent a revoke request");
 });
 
 Deno.test("Runtime public key preview matches the Server fingerprint contract", async () => {

@@ -110,6 +110,8 @@ Deno.test("Runtime detail keeps trust controls owner-only and conflict-safe", as
       "Revoke Workspace trust",
       "Workspace trust only; this does not delete the Runtime process, Workers, or Workdirs.",
       "RuntimeTrustConflictError",
+      "revealRuntimeTrustKey",
+      "revokeFingerprintConfirmation.trim() !== trust.fingerprint",
       "await reloadAuthority()",
       "busyAction !== null",
       "Workdirs",
