@@ -21,11 +21,14 @@ pub use backend_auth::{
     poll_device_login, start_device_login, wait_for_device_login,
 };
 pub use backend_runtime::{
-    BackendDiagnostic, BackendDiagnosticSeverity, BackendRuntimeClientError,
-    BackendRuntimeListResponse, BackendRuntimeListTarget, BackendRuntimeSummary,
-    BackendRuntimeTarget, BackendWorkerCapabilitySummary, BackendWorkerImplementationSummary,
-    BackendWorkerRestoreResponse, BackendWorkerRestoreResult, BackendWorkerSummary,
-    BackendWorkerWorkspaceSummary, BackendWorkingDirectorySummary, connect_backend_runtime,
+    BackendCreateWorkerRequest, BackendCreateWorkerResponse, BackendDiagnostic,
+    BackendDiagnosticSeverity, BackendRuntimeClientError, BackendRuntimeListResponse,
+    BackendRuntimeListTarget, BackendRuntimeSummary, BackendRuntimeTarget,
+    BackendWorkerCapabilitySummary, BackendWorkerImplementationSummary, BackendWorkerLaunchOptions,
+    BackendWorkerLaunchProfileCandidate, BackendWorkerLaunchRuntimeOption,
+    BackendWorkerLaunchTarget, BackendWorkerRestoreResponse, BackendWorkerRestoreResult,
+    BackendWorkerSummary, BackendWorkerWorkspaceSummary, BackendWorkingDirectorySummary,
+    connect_backend_runtime, create_backend_worker, get_backend_worker_launch_options,
     list_backend_stopped_workers, list_backend_workers, restore_backend_worker,
 };
 pub use backend_workspace::{
@@ -35,9 +38,9 @@ pub use backend_workspace::{
 };
 pub use client::{Client, ClientError};
 pub use target::{
-    BackendTarget, Dashboard, ResolvedTarget, StandaloneTarget, StandaloneWorkerListIntent,
-    StandaloneWorkerResumeIntent, Target, TargetError, TargetKind, WorkerConnection,
-    WorkerConnectionSelector, WorkerList, WorkerListRequest, WorkerSpawn,
+    BackendTarget, BackendWorkerLaunch, Dashboard, ResolvedTarget, StandaloneTarget,
+    StandaloneWorkerListIntent, StandaloneWorkerResumeIntent, Target, TargetError, TargetKind,
+    WorkerConnection, WorkerConnectionSelector, WorkerList, WorkerListRequest, WorkerSpawn,
 };
 pub use workspace_api::{
     CompanionCancelRequest, CompanionLifecycleState, CompanionMessageDisposition,

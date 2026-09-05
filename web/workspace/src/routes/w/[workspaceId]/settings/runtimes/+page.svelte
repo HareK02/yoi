@@ -1,19 +1,10 @@
 <script lang="ts">
   import { invalidateAll } from '$app/navigation';
+  import type { RuntimeConnectionTestResponse } from '$lib/generated/workspace-api';
+  import { testRuntimeConnection } from '$lib/workspace/api/runtime-connection';
   import { workspaceApiPath } from '$lib/workspace/api/http';
-  import type { Diagnostic, Runtime } from '$lib/workspace/sidebar/types';
+  import type { Runtime } from '$lib/workspace/sidebar/types';
   import type { PageProps } from './$types';
-
-  type ConnectionTest = {
-    runtime_id: string;
-    checked_at: string;
-    state: string;
-    protocol_version?: string | null;
-    compatibility_basis: string;
-    capabilities: string[];
-    health_result: string;
-    diagnostics: Diagnostic[];
-  };
 
   let { data }: PageProps = $props();
   let runtimeId = $state('');
@@ -22,10 +13,29 @@
   let showAddRuntime = $state(false);
   let busyRuntimeId = $state<string | null>(null);
   let requestError = $state<string | null>(null);
-  let testResults = $state<Record<string, ConnectionTest>>({});
+  let testResults = $state<Record<string, RuntimeConnectionTestResponse>>({});
 
   function runtimePlatform(runtime: Runtime): string {
     return runtime.os && runtime.arch ? `${runtime.os} / ${runtime.arch}` : 'Unknown';
+  }
+
+  function connectionTestSummary(result: RuntimeConnectionTestResponse): string {
+    if (result.status === 'compatible') {
+      return `Compatible · protocol v${result.actual_protocol_version}`;
+    }
+    switch (result.failure_kind) {
+      case 'authentication': return 'Authentication failed';
+      case 'authorization': return 'Permission or Workspace scope rejected';
+      case 'network_unreachable': return 'Runtime unreachable';
+      case 'timeout': return 'Connection timed out';
+      case 'tls_or_transport': return 'TLS or transport failed';
+      case 'malformed_response': return 'Runtime returned an invalid ping response';
+      case 'protocol_version_mismatch':
+        return `Incompatible protocol · expected v${result.expected_protocol_version}, received v${result.actual_protocol_version ?? 'unknown'}`;
+      case 'runtime_identity_mismatch': return 'Runtime identity mismatch';
+      case 'configuration': return 'Runtime connection test is not configured';
+      default: return 'Connection test failed';
+    }
   }
 
   function managementLabel(runtime: Runtime): string {
@@ -92,15 +102,7 @@
     requestError = null;
     busyRuntimeId = runtime.runtime_id;
     try {
-      const response = await fetch(
-        workspaceApiPath(
-          data.workspaceId,
-          `/runtimes/${encodeURIComponent(runtime.runtime_id)}/connection-tests`,
-        ),
-        { method: 'POST' },
-      );
-      if (!response.ok) throw new Error(await responseError(response));
-      const result = await response.json() as ConnectionTest;
+      const result = await testRuntimeConnection(data.workspaceId, runtime.runtime_id);
       testResults = { ...testResults, [runtime.runtime_id]: result };
     } catch (error) {
       requestError = error instanceof Error ? error.message : String(error);
@@ -229,10 +231,12 @@
                   {/if}
                   {#if testResults[runtime.runtime_id]}
                     {@const result = testResults[runtime.runtime_id]}
-                    <div class="settings-test-result">
-                      <strong>Connection test: {result.state}</strong>
-                      <span>{result.health_result}</span>
-                      <small>{result.compatibility_basis} · {result.checked_at}</small>
+                    <div class:failed={result.status === 'failed'} class="settings-test-result">
+                      <strong>Connection test: {connectionTestSummary(result)}</strong>
+                      {#if result.diagnostics[0]}
+                        <span>{result.diagnostics[0].message}</span>
+                      {/if}
+                      <small>Checked {new Date(result.checked_at).toLocaleString()}</small>
                     </div>
                   {/if}
                 </td>

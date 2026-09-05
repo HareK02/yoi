@@ -7,10 +7,15 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 pub use workspace_api::{
-    Diagnostic as BackendDiagnostic, DiagnosticSeverity as BackendDiagnosticSeverity,
-    ListResponse as BackendRuntimeListResponse, RuntimeSummary as BackendRuntimeSummary,
+    BrowserCreateWorkerResponse as BackendCreateWorkerResponse,
+    CreateWorkspaceWorkerRequest as BackendCreateWorkerRequest, Diagnostic as BackendDiagnostic,
+    DiagnosticSeverity as BackendDiagnosticSeverity, ListResponse as BackendRuntimeListResponse,
+    RuntimeSummary as BackendRuntimeSummary,
     WorkerCapabilitySummary as BackendWorkerCapabilitySummary,
     WorkerImplementationSummary as BackendWorkerImplementationSummary,
+    WorkerLaunchOptionsResponse as BackendWorkerLaunchOptions,
+    WorkerLaunchProfileCandidate as BackendWorkerLaunchProfileCandidate,
+    WorkerLaunchRuntimeOption as BackendWorkerLaunchRuntimeOption,
     WorkerRestoreResponse as BackendWorkerRestoreResponse,
     WorkerRestoreResult as BackendWorkerRestoreResult, WorkerSummary as BackendWorkerSummary,
     WorkerWorkspaceSummary as BackendWorkerWorkspaceSummary,
@@ -172,6 +177,47 @@ struct UploadedFileResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendWorkerLaunchTarget {
+    pub base_url: String,
+    pub workspace_id: Option<String>,
+}
+
+impl BackendWorkerLaunchTarget {
+    pub fn new(base_url: impl Into<String>, workspace_id: Option<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            workspace_id,
+        }
+    }
+
+    pub fn select_workspace(&mut self, workspace_id: impl Into<String>) {
+        self.workspace_id = Some(workspace_id.into());
+    }
+
+    pub fn workspace_id(&self) -> Option<&str> {
+        self.workspace_id.as_deref()
+    }
+
+    pub fn runtime_target(
+        &self,
+        runtime_id: impl Into<String>,
+        worker_id: impl Into<String>,
+    ) -> Result<BackendRuntimeTarget, BackendRuntimeClientError> {
+        let workspace_id = self.workspace_id.clone().ok_or_else(|| {
+            BackendRuntimeClientError::InvalidTarget(
+                "workspace_id is required before creating a Backend worker".to_string(),
+            )
+        })?;
+        Ok(BackendRuntimeTarget::new(
+            self.base_url.clone(),
+            workspace_id,
+            runtime_id,
+            worker_id,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendRuntimeListTarget {
     pub base_url: String,
     pub workspace_id: Option<String>,
@@ -253,6 +299,58 @@ impl From<reqwest::Error> for BackendRuntimeClientError {
     fn from(error: reqwest::Error) -> Self {
         Self::Http(error)
     }
+}
+
+pub async fn get_backend_worker_launch_options(
+    target: &BackendWorkerLaunchTarget,
+) -> Result<BackendWorkerLaunchOptions, BackendRuntimeClientError> {
+    validate_launch_target(target)?;
+    let api = BackendApiClient::from_stored_token(&target.base_url)?;
+    get_backend_worker_launch_options_with_client(target, &api).await
+}
+
+async fn get_backend_worker_launch_options_with_client(
+    target: &BackendWorkerLaunchTarget,
+    api: &BackendApiClient,
+) -> Result<BackendWorkerLaunchOptions, BackendRuntimeClientError> {
+    let path = backend_workspace_workers_launch_options_path(
+        target
+            .workspace_id
+            .as_deref()
+            .expect("validated Backend Workspace scope"),
+    );
+    let response = api.request(HttpMethod::GET, &path)?.send().await?;
+    let response = api.require_success(response).await?;
+    Ok(response.json::<BackendWorkerLaunchOptions>().await?)
+}
+
+pub async fn create_backend_worker(
+    target: &BackendWorkerLaunchTarget,
+    request: &BackendCreateWorkerRequest,
+) -> Result<BackendCreateWorkerResponse, BackendRuntimeClientError> {
+    validate_launch_target(target)?;
+    let api = BackendApiClient::from_stored_token(&target.base_url)?;
+    create_backend_worker_with_client(target, request, &api).await
+}
+
+async fn create_backend_worker_with_client(
+    target: &BackendWorkerLaunchTarget,
+    request: &BackendCreateWorkerRequest,
+    api: &BackendApiClient,
+) -> Result<BackendCreateWorkerResponse, BackendRuntimeClientError> {
+    let path = backend_workspace_workers_path(
+        target
+            .workspace_id
+            .as_deref()
+            .expect("validated Backend Workspace scope"),
+    );
+    let response = api
+        .request(HttpMethod::POST, &path)?
+        .json(request)
+        .send()
+        .await?;
+    let response = api.require_success(response).await?;
+    Ok(response.json::<BackendCreateWorkerResponse>().await?)
 }
 
 pub async fn list_backend_workers(
@@ -462,6 +560,30 @@ fn validate_target(target: &BackendRuntimeTarget) -> Result<(), BackendRuntimeCl
     Ok(())
 }
 
+fn validate_launch_target(
+    target: &BackendWorkerLaunchTarget,
+) -> Result<(), BackendRuntimeClientError> {
+    if target.base_url.trim().is_empty() {
+        return Err(BackendRuntimeClientError::InvalidTarget(
+            "Backend API base URL is required".to_string(),
+        ));
+    }
+    if !(target.base_url.starts_with("http://") || target.base_url.starts_with("https://")) {
+        return Err(BackendRuntimeClientError::InvalidTarget(
+            "Backend API base URL must start with http:// or https://".to_string(),
+        ));
+    }
+    match target.workspace_id.as_deref() {
+        Some("") => Err(BackendRuntimeClientError::InvalidTarget(
+            "workspace_id must not be empty".to_string(),
+        )),
+        None => Err(BackendRuntimeClientError::InvalidTarget(
+            "workspace selection is required before creating a Backend worker".to_string(),
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
 fn validate_list_target(
     target: &BackendRuntimeListTarget,
 ) -> Result<(), BackendRuntimeClientError> {
@@ -494,6 +616,17 @@ fn validate_list_target(
         ));
     }
     Ok(())
+}
+
+fn backend_workspace_workers_path(workspace_id: &str) -> String {
+    format!("/api/w/{}/workers", path_segment_encode(workspace_id))
+}
+
+fn backend_workspace_workers_launch_options_path(workspace_id: &str) -> String {
+    format!(
+        "{}/launch-options",
+        backend_workspace_workers_path(workspace_id)
+    )
 }
 
 fn backend_runtimes_path(workspace_id: &str) -> String {
@@ -580,6 +713,155 @@ fn percent_encode(input: &str, keep: impl Fn(u8) -> bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn serve_json_once(body: serde_json::Value) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let header_end = loop {
+                let mut buffer = [0_u8; 4096];
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "client closed before sending HTTP headers");
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(position) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let mut buffer = [0_u8; 4096];
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "client closed before sending HTTP body");
+                request.extend_from_slice(&buffer[..read]);
+            }
+
+            let body = serde_json::to_vec(&body).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (base_url, task)
+    }
+
+    #[tokio::test]
+    async fn launch_options_request_uses_workspace_path_and_bearer_auth() {
+        let (base_url, server) = serve_json_once(serde_json::json!({
+            "workspace_id": "team main",
+            "runtimes": [{
+                "runtime_id": "embedded",
+                "display_name": "Embedded",
+                "built_in": true,
+                "worker_creation_available": true,
+                "working_directory_required": false,
+                "status": "online",
+                "diagnostics": []
+            }],
+            "default_profile": "builtin:default",
+            "profiles": [{
+                "id": "builtin:default",
+                "label": "Default",
+                "description": ""
+            }],
+            "repositories": [],
+            "working_directories": [],
+            "diagnostics": []
+        }))
+        .await;
+        let target = BackendWorkerLaunchTarget::new(&base_url, Some("team main".to_string()));
+        let api = BackendApiClient::from_access_token_for_test(&base_url, "launch-secret").unwrap();
+
+        let response = get_backend_worker_launch_options_with_client(&target, &api)
+            .await
+            .unwrap();
+        assert_eq!(response.runtimes[0].runtime_id, "embedded");
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /api/w/team%20main/workers/launch-options HTTP/1.1\r\n"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer launch-secret\r\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_worker_posts_frontend_contract_to_workspace_path() {
+        let (base_url, server) = serve_json_once(serde_json::json!({
+            "workspace_id": "workspace-1",
+            "runtime_id": "embedded",
+            "worker_id": "worker-1",
+            "console_href": "/w/workspace-1/workers/embedded/worker-1",
+            "worker": {
+                "runtime_id": "embedded",
+                "worker_id": "worker-1",
+                "host_id": "host-1",
+                "display_name": "Coder one",
+                "label": "Coder one",
+                "profile": "builtin:coder",
+                "singleton_key": null,
+                "tags": [],
+                "workspace": {
+                    "visibility": "workspace",
+                    "identity": "workspace",
+                    "workspace_id": "workspace-1"
+                },
+                "state": "idle",
+                "last_seen_at": null,
+                "pinned": false,
+                "retention_state": "resident",
+                "implementation": {"kind": "embedded", "display_hint": "Embedded"},
+                "capabilities": {"can_stop": true, "can_spawn_followup": false},
+                "diagnostics": []
+            },
+            "diagnostics": []
+        }))
+        .await;
+        let target = BackendWorkerLaunchTarget::new(&base_url, Some("workspace-1".to_string()));
+        let api = BackendApiClient::from_access_token_for_test(&base_url, "create-secret").unwrap();
+        let create = BackendCreateWorkerRequest {
+            runtime_id: "embedded".to_string(),
+            display_name: "Coder one".to_string(),
+            profile: Some("builtin:coder".to_string()),
+            ticket_assignment: None,
+            initial_submit: Vec::new(),
+            working_directory: None,
+            control_operation_id: None,
+        };
+
+        let response = create_backend_worker_with_client(&target, &create, &api)
+            .await
+            .unwrap();
+        assert_eq!(response.worker_id, "worker-1");
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST /api/w/workspace-1/workers HTTP/1.1\r\n"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer create-secret\r\n")
+        );
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["runtime_id"], "embedded");
+        assert_eq!(body["display_name"], "Coder one");
+        assert_eq!(body["profile"], "builtin:coder");
+        assert_eq!(body["initial_submit"], serde_json::json!([]));
+        assert_eq!(body["working_directory"], serde_json::Value::Null);
+    }
 
     #[test]
     fn protocol_url_uses_backend_runtime_worker_identity() {

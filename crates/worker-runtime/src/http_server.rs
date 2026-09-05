@@ -66,6 +66,11 @@ use workdir::{
 };
 
 const DEFAULT_RUNTIME_HTTP_PORT: u16 = 38800;
+pub const RUNTIME_HTTP_PROTOCOL_MIN_VERSION: u32 = 1;
+pub const RUNTIME_HTTP_PROTOCOL_MAX_VERSION: u32 = 1;
+pub const RUNTIME_HTTP_PROTOCOL_VERSION: u32 = RUNTIME_HTTP_PROTOCOL_MAX_VERSION;
+pub const RUNTIME_PING_PERMISSION: &str = "runtime:ping";
+pub const RUNTIME_WORKSPACE_SCOPE_HEADER: &str = "x-yoi-workspace-id";
 
 fn default_runtime_http_bind_addr() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], DEFAULT_RUNTIME_HTTP_PORT))
@@ -187,6 +192,7 @@ fn runtime_http_router_with_optional_auth(
     };
 
     let router = Router::new()
+        .route("/v1/ping", get(get_runtime_ping))
         .route("/v1/runtime", get(get_runtime))
         .route(
             "/v1/config-bundles",
@@ -340,6 +346,14 @@ enum RuntimeHttpWorkerStatusFilter {
     Stopped,
 }
 
+/// `GET /v1/ping` response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeHttpPingResponse {
+    pub runtime_id: String,
+    pub protocol_version: u32,
+}
+
 /// `GET /v1/workers` response.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeHttpWorkersResponse {
@@ -460,6 +474,48 @@ struct RuntimeWorkerEventsWsQuery {
 }
 
 type RestResult<T> = Result<Json<T>, RuntimeHttpRestError>;
+
+async fn get_runtime_ping(
+    State(state): State<RuntimeHttpState>,
+    Extension(auth): Extension<RuntimeAuthContext>,
+    headers: HeaderMap,
+) -> RestResult<RuntimeHttpPingResponse> {
+    let requested_workspace_id = headers
+        .get(RUNTIME_WORKSPACE_SCOPE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            RuntimeHttpRestError::new(
+                StatusCode::FORBIDDEN,
+                "runtime_ping_workspace_scope_required",
+                "Runtime ping requires the target Workspace scope",
+            )
+        })?;
+    if requested_workspace_id != auth.workspace_id {
+        return Err(RuntimeHttpRestError::new(
+            StatusCode::FORBIDDEN,
+            "runtime_ping_workspace_scope_mismatch",
+            "Runtime ping Workspace scope does not match the authenticated capability",
+        ));
+    }
+    let runtime_id = state
+        .auth
+        .as_ref()
+        .map(|config| config.runtime_id.trim())
+        .filter(|runtime_id| !runtime_id.is_empty())
+        .ok_or_else(|| {
+            RuntimeHttpRestError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime_ping_identity_unavailable",
+                "Runtime ping identity is not configured",
+            )
+        })?;
+    Ok(Json(RuntimeHttpPingResponse {
+        runtime_id: runtime_id.to_string(),
+        protocol_version: RUNTIME_HTTP_PROTOCOL_VERSION,
+    }))
+}
 
 async fn get_runtime(
     State(state): State<RuntimeHttpState>,
@@ -1843,6 +1899,9 @@ fn auth_workspace_scope(
 }
 
 fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static str> {
+    if path == "/v1/ping" && *method == Method::GET {
+        return Some(RUNTIME_PING_PERMISSION);
+    }
     if path == "/v1/runtime" {
         return None;
     }
@@ -2159,6 +2218,82 @@ mod tests {
         GrepOutputMode, GrepRequest, LocalWorkdirSession, ReadRequest, StatRequest, Workdir,
         WorkdirPath, WorkdirSessionCapabilities,
     };
+
+    #[tokio::test]
+    async fn ping_requires_scoped_permission_and_returns_versioned_identity() {
+        let runtime = Runtime::new_memory();
+        let (auth, signer) = auth_config_and_signer();
+        let app = runtime_http_router_with_auth(runtime, None, auth);
+        let token =
+            token_for_workspace_with_permissions(&signer, "workspace-a", [RUNTIME_PING_PERMISSION]);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/ping")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(RUNTIME_WORKSPACE_SCOPE_HEADER, "workspace-a")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<RuntimeHttpPingResponse>(&body).unwrap(),
+            RuntimeHttpPingResponse {
+                runtime_id: "runtime-test".to_string(),
+                protocol_version: RUNTIME_HTTP_PROTOCOL_VERSION,
+            }
+        );
+
+        let wrong_scope_token =
+            token_for_workspace_with_permissions(&signer, "workspace-a", [RUNTIME_PING_PERMISSION]);
+        let wrong_scope_request = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/ping")
+            .header(header::AUTHORIZATION, format!("Bearer {wrong_scope_token}"))
+            .header(RUNTIME_WORKSPACE_SCOPE_HEADER, "workspace-b")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(wrong_scope_request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn ping_rejects_token_without_ping_permission() {
+        let runtime = Runtime::new_memory();
+        let (auth, signer) = auth_config_and_signer();
+        let app = runtime_http_router_with_auth(runtime, None, auth);
+        let missing_credential = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/ping")
+            .header(RUNTIME_WORKSPACE_SCOPE_HEADER, "workspace-a")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(missing_credential)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let token = token_for_workspace_with_permissions(&signer, "workspace-a", ["workers:read"]);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/ping")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(RUNTIME_WORKSPACE_SCOPE_HEADER, "workspace-a")
+            .body(Body::empty())
+            .unwrap();
+
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
 
     #[test]
     fn runtime_protocol_replaces_serialized_tracked_source() {

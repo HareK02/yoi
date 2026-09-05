@@ -1,5 +1,6 @@
 mod app;
 mod backend_dashboard;
+mod backend_spawn;
 mod backend_worker_picker;
 mod backend_workspace_picker;
 mod block;
@@ -51,6 +52,8 @@ pub enum LaunchMode {
     /// Restore one client-owned standalone Worker. The current cwd is the default scope;
     /// `include_all` opts into all standalone Workers under the same client data root.
     StandaloneResume { include_all: bool },
+    /// Create one Backend Worker and attach to it.
+    BackendSpawn,
     /// List Backend Workers and attach to the selected Worker.
     Workers {
         runtime_id: Option<String>,
@@ -161,6 +164,10 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
                 Err(error) => Err(Box::new(error) as Box<dyn std::error::Error>),
             }
         }
+        LaunchMode::BackendSpawn => match target.launch_backend_worker() {
+            Ok(launch) => backend_spawn::run(launch.target).await,
+            Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
+        },
         LaunchMode::Workers {
             runtime_id,
             include_stopped,

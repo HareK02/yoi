@@ -12,6 +12,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_width::UnicodeWidthStr;
 
 use crate::backend_workspace_picker::select_backend_workspace;
 use crate::console;
@@ -235,9 +236,10 @@ fn draw(frame: &mut Frame<'_>, state: &BackendWorkerPickerState) {
         layout[0],
     );
 
+    let column_widths = WorkerColumnWidths::from_workers(&state.workers);
     for (i, worker) in state.workers.iter().enumerate() {
         frame.render_widget(
-            Paragraph::new(row_line(worker, i == state.selected)),
+            Paragraph::new(row_line(worker, &column_widths, i == state.selected)),
             layout[i + 1],
         );
     }
@@ -272,7 +274,28 @@ fn picker_title(target: &BackendRuntimeListTarget) -> String {
     format!("backend workers   workspace: {workspace}   runtime: {runtime}")
 }
 
-fn row_line(worker: &BackendWorkerSummary, selected: bool) -> Line<'static> {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WorkerColumnWidths {
+    identity: usize,
+    name: usize,
+    state: usize,
+}
+
+impl WorkerColumnWidths {
+    fn from_workers(workers: &[BackendWorkerSummary]) -> Self {
+        workers.iter().fold(Self::default(), |widths, worker| Self {
+            identity: widths.identity.max(text_width(&short_worker_id(worker))),
+            name: widths.name.max(text_width(worker_name(worker))),
+            state: widths.state.max(text_width(&worker_state(worker))),
+        })
+    }
+}
+
+fn row_line(
+    worker: &BackendWorkerSummary,
+    widths: &WorkerColumnWidths,
+    selected: bool,
+) -> Line<'static> {
     let marker = if selected { "▶ " } else { "  " };
     let id_style = if selected {
         Style::default()
@@ -281,40 +304,56 @@ fn row_line(worker: &BackendWorkerSummary, selected: bool) -> Line<'static> {
     } else {
         Style::default().fg(Color::Cyan)
     };
-    let preview_style = if selected {
+    let name_style = if selected {
         Style::default().fg(Color::White)
     } else {
         Style::default().fg(Color::DarkGray)
     };
 
-    let label = if worker.label.is_empty() {
-        worker.worker_id.as_str()
-    } else {
-        worker.label.as_str()
-    };
-    let profile = worker.profile.as_deref().unwrap_or("-");
-
     Line::from(vec![
         Span::raw(marker),
-        Span::styled(short_worker_id(worker), id_style),
-        Span::raw("  "),
         Span::styled(
-            format!("[{}]", worker.state),
-            state_style(worker.state.as_str()),
+            pad_column(&short_worker_id(worker), widths.identity),
+            id_style,
         ),
         Span::raw("  "),
+        Span::styled(pad_column(worker_name(worker), widths.name), name_style),
+        Span::raw("  "),
         Span::styled(
-            format!("profile:{profile}"),
-            Style::default().fg(Color::DarkGray),
+            pad_column(&worker_state(worker), widths.state),
+            state_style(worker.state.as_str()),
         ),
         Span::raw("  "),
         Span::styled(
             working_directory_text(worker),
             Style::default().fg(Color::DarkGray),
         ),
-        Span::raw("  "),
-        Span::styled(label.to_string(), preview_style),
     ])
+}
+
+fn worker_name(worker: &BackendWorkerSummary) -> &str {
+    if !worker.label.is_empty() {
+        worker.label.as_str()
+    } else if !worker.display_name.is_empty() {
+        worker.display_name.as_str()
+    } else {
+        worker.worker_id.as_str()
+    }
+}
+
+fn worker_state(worker: &BackendWorkerSummary) -> String {
+    format!("[{}]", worker.state)
+}
+
+fn text_width(value: &str) -> usize {
+    UnicodeWidthStr::width(value)
+}
+
+fn pad_column(value: &str, width: usize) -> String {
+    format!(
+        "{value}{}",
+        " ".repeat(width.saturating_sub(text_width(value)))
+    )
 }
 
 fn state_style(state: &str) -> Style {
@@ -347,11 +386,7 @@ fn working_directory_text(worker: &BackendWorkerSummary) -> String {
     let Some(wd) = worker.working_directory.as_ref() else {
         return "wd:—".to_string();
     };
-    let cleanliness = wd.cleanliness.as_deref().unwrap_or("unknown");
-    format!(
-        "wd:{}:{} {} {}",
-        wd.repository_key, wd.working_directory_id, wd.status, cleanliness
-    )
+    format!("wd:{}・{}", wd.repository_key, wd.working_directory_id)
 }
 
 #[cfg(test)]
@@ -395,18 +430,90 @@ mod tests {
         }
     }
 
-    #[test]
-    fn worker_row_matches_inline_picker_shape() {
-        let row = row_line(&worker("runtime-a", "worker-b", Some("default")), true);
-        let text = row
+    fn row_text(worker: &BackendWorkerSummary, widths: &WorkerColumnWidths) -> String {
+        row_line(worker, widths, false)
             .spans
             .into_iter()
             .map(|span| span.content)
-            .collect::<String>();
-        assert!(text.starts_with("▶ W-1"));
-        assert!(text.contains("[running]"));
-        assert!(text.contains("profile:default"));
-        assert!(text.contains("wd:—"));
+            .collect()
+    }
+
+    fn display_column(text: &str, value: &str) -> usize {
+        let byte_offset = text.find(value).expect("value in rendered row");
+        text_width(&text[..byte_offset])
+    }
+
+    #[test]
+    fn worker_row_orders_and_simplifies_columns() {
+        let mut worker = worker("runtime-a", "worker-b", Some("builtin:coder"));
+        worker.resource_key = "W-90".to_string();
+        worker.display_name = "Coder".to_string();
+        worker.label = "Coder · T-585".to_string();
+        worker.state = "stopped".to_string();
+        worker.working_directory = Some(
+            serde_json::from_value(serde_json::json!({
+                "working_directory_id": "001a06a9f0202000000",
+                "repository_key": "main",
+                "materializer_kind": "local_git_worktree",
+                "status": "active",
+                "cleanliness": "clean"
+            }))
+            .unwrap(),
+        );
+        let widths = WorkerColumnWidths::from_workers(std::slice::from_ref(&worker));
+        let text = row_text(&worker, &widths);
+
+        assert_eq!(
+            text,
+            "  W-90  Coder · T-585  [stopped]  wd:main・001a06a9f0202000000"
+        );
+        assert!(!text.contains("profile:"));
+        assert!(!text.contains("active clean"));
+    }
+
+    #[test]
+    fn worker_rows_align_identity_name_state_and_workdir_columns() {
+        let mut short = worker("runtime-a", "worker-a", None);
+        short.resource_key = "W-2".to_string();
+        short.label = "Coder".to_string();
+        short.display_name = short.label.clone();
+        short.state = "idle".to_string();
+
+        let mut long = worker("runtime-a", "worker-b", None);
+        long.resource_key = "W-100".to_string();
+        long.label = "Longer worker · T-9".to_string();
+        long.display_name = long.label.clone();
+        long.state = "stopped".to_string();
+
+        for worker in [&mut short, &mut long] {
+            worker.working_directory = Some(
+                serde_json::from_value(serde_json::json!({
+                    "working_directory_id": "workdir-1",
+                    "repository_key": "main",
+                    "materializer_kind": "local_git_worktree",
+                    "status": "active"
+                }))
+                .unwrap(),
+            );
+        }
+
+        let workers = vec![short, long];
+        let widths = WorkerColumnWidths::from_workers(&workers);
+        let first = row_text(&workers[0], &widths);
+        let second = row_text(&workers[1], &widths);
+
+        assert_eq!(
+            display_column(&first, "Coder"),
+            display_column(&second, "Longer")
+        );
+        assert_eq!(
+            display_column(&first, "[idle]"),
+            display_column(&second, "[stopped]")
+        );
+        assert_eq!(
+            display_column(&first, "wd:main"),
+            display_column(&second, "wd:main")
+        );
     }
 
     #[test]
