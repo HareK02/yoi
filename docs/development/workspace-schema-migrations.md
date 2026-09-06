@@ -1,41 +1,59 @@
-# Workspace database schema baseline
+# Workspace schema migrations
 
-The Workspace Server owns one control-plane SQLite database. New databases are created directly from the current canonical schema; the repository does not retain an executable chain of historical Workspace schema migrations.
+Workspace schema authority belongs to `crates/workspace-server/src/store.rs`. The canonical
+schema, ordered migrations, migration-history validation, startup upgrade path, and explicit
+`yoi-server migrate` command must remain one contract.
 
-Domain components such as Ticket and Merge Request contribute their current tables to the same database, but they do not create a second Workspace authority.
+## Retained migration chain
 
-## Compatibility boundary
+Released or dogfooded schema migrations are retained and composed in version order. Adding a new
+schema version does not authorize deleting the preceding migration. A migration may be removed
+only as an explicit baseline-retirement operation after the supported installations that depend on
+it have been migrated or intentionally discarded.
 
-The Server accepts only the current canonical schema generation. Its `__yoi_schema_migrations` ledger must contain exactly one row naming that baseline. A database with an older, newer, or multi-generation Workspace migration history is rejected at startup.
+The current retained Workspace chain is:
 
-This is intentional while Yoi has only the dogfooding deployment. Schema changes may replace the baseline rather than adding permanent compatibility code. Existing dogfooding data must be migrated manually and atomically before starting the new binary.
+1. schema 50: `workspace schema baseline`
+2. schema 51: `workspace runtime bindings`
+3. schema 52: `workspace Runtime binding revision and audit`
+4. schema 53: `durable Workspace deletion operations`
 
-## Updating the dogfooding database
+A database may begin at any retained baseline. Its following history rows must be the exact prefix
+of the ordered migration chain from that baseline. This allows both a freshly created current
+database and a database upgraded across several releases while rejecting edited, reordered, or
+unknown histories.
 
-1. Stop every Server and Runtime process that can write the affected SQLite or Runtime stores.
-2. Record the current binary revision and schema generation.
-3. Take a SQLite-safe backup of `server.db` and a filesystem backup of any Runtime stores whose persisted contracts change.
-4. Apply the data and schema repair explicitly. Keep Workspace SQL data and Runtime filesystem data as separate authorities; changing one does not repair the other.
-5. Replace historical migration-ledger rows with the single marker expected by the current baseline.
-6. Validate before startup:
+## Runtime behavior
 
-   ```sql
-   PRAGMA foreign_key_check;
-   PRAGMA integrity_check;
-   ```
+`SqliteWorkspaceStore::open` computes all pending retained migrations and applies them in order.
+Each migration is transactional and restartable: if a later step fails, completed steps remain a
+valid canonical prefix and the next run resumes from that version.
 
-7. Start exactly one Server generation and verify the affected API contracts.
+`yoi-server migrate` invokes the same store migration path without starting the Server:
 
-There is no in-place down migration and no automatic upgrade from an old baseline. Rollback means restoring both the prior binary and the complete matching database and Runtime-store backups.
+```sh
+# Copy the DB into memory and validate the complete pending path without changing the source.
+yoi-server migrate --dry-run
 
-## Creating a new baseline
+# Preflight the complete path, then apply it to the source DB.
+yoi-server migrate
+```
 
-A baseline change must include:
+Use `--database <PATH>` for a non-default Server DB. Stop `yoi-server` before applying migrations
+and make an external backup before an operational upgrade.
 
-- canonical DDL that creates a fresh database directly at the new generation;
-- current-schema verification for Workspace, Ticket, and Merge Request tables;
-- tests proving a fresh database records only the canonical baseline marker;
-- an explicit, separately reviewed repair procedure for the current dogfooding data;
-- removal of obsolete migration functions, fixtures, commands, and documentation.
+## Development workflow
 
-Do not put temporary legacy interpretation into normal request or projection paths. If persisted Runtime data also changes identity or shape, repair that Runtime authority explicitly instead of teaching steady-state Workspace APIs to accept both contracts indefinitely.
+When changing the Workspace schema:
+
+1. increment `LATEST_SCHEMA_VERSION`;
+2. append one `Migration` entry with the new version, stable name, and apply function;
+3. preserve all migrations at or above `OLDEST_SCHEMA_VERSION`;
+4. update the canonical latest-schema creator for fresh databases;
+5. add a fixture at the oldest retained version and prove migration through every retained step;
+6. prove that `--dry-run` leaves the source DB unchanged;
+7. keep DDL validation and cross-schema foreign-key checks in the shared store preparation path.
+
+A deliberate baseline retirement must be a separately reviewed change. It must identify the oldest
+remaining version, provide an operational migration/discard plan for older databases, update tests
+and this document, and must not be inferred merely because a new migration was added.

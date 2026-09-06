@@ -20,6 +20,7 @@ enum Command {
     Serve(ServeOptions),
     Identity(Vec<String>),
     TrustRuntime(Vec<String>),
+    Migrate(MigrateOptions),
     Skills(SkillsCommand),
     Help,
 }
@@ -28,6 +29,13 @@ enum Command {
 struct ServeOptions {
     listen: Option<SocketAddr>,
     config: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct MigrateOptions {
+    database: Option<PathBuf>,
+    dry_run: bool,
+    help: bool,
 }
 
 #[derive(Debug)]
@@ -70,6 +78,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Serve(options) => run_serve(options).await,
         Command::Identity(args) => run_identity_command(args),
         Command::TrustRuntime(args) => run_trust_runtime_command(args),
+        Command::Migrate(options) => run_migrate(options),
         Command::Skills(command) => run_skills(command),
         Command::Help => Ok(()),
     }
@@ -84,6 +93,7 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
     match command.as_str() {
         "identity" => Ok(Command::Identity(rest.to_vec())),
         "trust-runtime" => Ok(Command::TrustRuntime(rest.to_vec())),
+        "migrate" => parse_migrate_options(rest).map(Command::Migrate),
         "skills" => parse_skills_command(rest),
         "serve" => {
             if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -509,6 +519,40 @@ fn load_skill_workspace_config(
     })
 }
 
+fn run_migrate(options: MigrateOptions) -> Result<(), Box<dyn std::error::Error>> {
+    if options.help {
+        print_migrate_help();
+        return Ok(());
+    }
+    let database_path = options
+        .database
+        .unwrap_or_else(ServerConfig::default_server_database_path);
+    let plan = if options.dry_run {
+        SqliteWorkspaceStore::migration_plan(&database_path)?
+    } else {
+        SqliteWorkspaceStore::migrate_database(&database_path)?
+    };
+
+    println!("server_db={}", database_path.display());
+    println!("current_schema_version={}", plan.current_schema_version);
+    println!("target_schema_version={}", plan.target_schema_version);
+    println!("migration_required={}", plan.migration_required());
+    for migration in &plan.migrations {
+        println!("migration={} {}", migration.version, migration.name);
+    }
+    println!(
+        "result={}",
+        if options.dry_run {
+            "dry-run-validated"
+        } else if plan.migration_required() {
+            "migrated"
+        } else {
+            "unchanged"
+        }
+    );
+    Ok(())
+}
+
 async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Error>> {
     let database_path = ServerConfig::default_server_database_path();
     if let Some(parent) = database_path.parent() {
@@ -683,6 +727,44 @@ fn parse_skill_workspace_options(args: &[String]) -> Result<SkillWorkspaceOption
     Ok(SkillWorkspaceOptions { workspace_id })
 }
 
+fn parse_migrate_options(args: &[String]) -> Result<MigrateOptions, CliError> {
+    let mut database = None;
+    let mut dry_run = false;
+    let mut help = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "--database" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| CliError("--database requires a path".to_string()))?;
+                database = Some(PathBuf::from(value));
+            }
+            _ if arg.starts_with("--database=") => {
+                database = Some(PathBuf::from(value_after_equals(arg, "--database")?));
+            }
+            "--dry-run" => dry_run = true,
+            "--help" | "-h" => help = true,
+            _ if arg.starts_with('-') => {
+                return Err(CliError(format!("unknown migrate option `{arg}`")));
+            }
+            _ => {
+                return Err(CliError(format!(
+                    "unexpected positional argument `{arg}`; use --database <PATH>"
+                )));
+            }
+        }
+        index += 1;
+    }
+    Ok(MigrateOptions {
+        database,
+        dry_run,
+        help,
+    })
+}
+
 fn parse_serve_options(args: &[String]) -> Result<ServeOptions, CliError> {
     let mut listen = None;
     let mut config = None;
@@ -745,7 +827,13 @@ fn parse_listen(value: &str) -> Result<SocketAddr, CliError> {
 
 fn print_help() {
     println!(
-        "yoi-server\n\nUsage:\n  yoi-server identity init --server-id <SERVER_ID> [--replace]\n  yoi-server identity show [--json]\n  yoi-server trust-runtime add --runtime-id <RUNTIME_ID> --workspace-id <WORKSPACE_ID> --base-url <URL> --public-key <KEY> [--display-name <NAME>] [--replace]\n  yoi-server trust-runtime list --workspace-id <WORKSPACE_ID> [--json] [--include-revoked]\n  yoi-server trust-runtime revoke --workspace-id <WORKSPACE_ID> --runtime-id <RUNTIME_ID>\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
+        "yoi-server\n\nUsage:\n  yoi-server identity init --server-id <SERVER_ID> [--replace]\n  yoi-server identity show [--json]\n  yoi-server trust-runtime add --runtime-id <RUNTIME_ID> --workspace-id <WORKSPACE_ID> --base-url <URL> --public-key <KEY> [--display-name <NAME>] [--replace]\n  yoi-server trust-runtime list --workspace-id <WORKSPACE_ID> [--json] [--include-revoked]\n  yoi-server trust-runtime revoke --workspace-id <WORKSPACE_ID> --runtime-id <RUNTIME_ID>\n  yoi-server migrate [--dry-run] [--database <PATH>]\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
+    );
+}
+
+fn print_migrate_help() {
+    println!(
+        "yoi-server migrate\n\nUsage:\n  yoi-server migrate [OPTIONS]\n\nDescription:\n  Validates and applies every retained Server DB schema migration in order. --dry-run copies the database into memory and runs the same migration path without changing the source database. Stop yoi-server before applying migrations.\n\nOptions:\n      --database <PATH>  Server DB path (default: canonical Yoi server DB)\n      --dry-run          Validate the complete migration without changing the source DB\n  -h, --help             Print help"
     );
 }
 
@@ -774,6 +862,28 @@ mod tests {
                 "unexpected error for {command}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn parse_migrate_uses_the_shared_schema_path() {
+        let command = parse_command(&[
+            "migrate".to_string(),
+            "--dry-run".to_string(),
+            "--database=/tmp/server.db".to_string(),
+        ])
+        .unwrap();
+        let Command::Migrate(options) = command else {
+            panic!("expected migrate command");
+        };
+        assert!(options.dry_run);
+        assert!(!options.help);
+        assert_eq!(options.database, Some(PathBuf::from("/tmp/server.db")));
+    }
+
+    #[test]
+    fn parse_migrate_rejects_unknown_options() {
+        let error = parse_command(&["migrate".to_string(), "--apply-all".to_string()]).unwrap_err();
+        assert_eq!(error.to_string(), "unknown migrate option `--apply-all`");
     }
 
     #[test]
