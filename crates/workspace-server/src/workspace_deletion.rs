@@ -1,7 +1,6 @@
 use chrono::Utc;
 use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
 use workspace_api::{
     WORKSPACE_DELETION_MAX_BLOCKER_MESSAGE_BYTES, WORKSPACE_DELETION_MAX_BLOCKERS,
     WORKSPACE_DELETION_MAX_CHILD_OPERATION_IDS, WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES,
@@ -13,6 +12,77 @@ use workspace_api::{
 
 use crate::store::{SqliteWorkspaceStore, WorkspaceRecord};
 use crate::{Error, Result};
+
+/// Explicit domain-owned purge inventory. The deletion operation tombstone is intentionally
+/// excluded so retries and audit remain available after the Workspace row is gone.
+const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
+    "artifacts",
+    "audit_events",
+    "flow_source_revisions",
+    "flow_sources",
+    "memory_staging_records",
+    "memory_staging_resolutions",
+    "merge_request_review_grants",
+    "merge_request_reviewer_child_sessions",
+    "merge_request_thread_events",
+    "merge_request_ticket_relations",
+    "merge_requests",
+    "objective_events",
+    "objective_resources",
+    "objective_ticket_links",
+    "objectives",
+    "repositories",
+    "repository_secret_audit_events",
+    "repository_secret_operations",
+    "repository_ssh_credential_revisions",
+    "repository_ssh_credentials",
+    "repository_ssh_host_trust_revisions",
+    "repository_ssh_host_trusts",
+    "server_secret_versions",
+    "ticket_assignment_operations",
+    "ticket_assignment_ticket_tombstones",
+    "ticket_assignment_worker_tombstones",
+    "ticket_current_worker_assignments",
+    "ticket_worker_assignment_events",
+    "ticket_worker_assignments",
+    "typed_ticket_artifacts",
+    "typed_ticket_event_attributes",
+    "typed_ticket_event_references",
+    "typed_ticket_events",
+    "typed_ticket_labels",
+    "typed_ticket_orchestration_plans",
+    "typed_ticket_raw_frontmatter",
+    "typed_ticket_relations",
+    "typed_ticket_risk_flags",
+    "typed_tickets",
+    "workdir_create_operations",
+    "workdir_registry",
+    "workdir_removal_operations",
+    "worker_control_grants",
+    "worker_create_reservations",
+    "worker_diagnostics_archives",
+    "worker_mutation_source_proof_jtis",
+    "worker_orphan_diagnostics",
+    "worker_registry",
+    "worker_removal_operations",
+    "worker_retention_audit_events",
+    "worker_session_archives",
+    "worker_tombstones",
+    "worker_workdir_attachment_reservations",
+    "worker_workdir_links",
+    "workspace_config_entries",
+    "workspace_config_tree_revisions",
+    "workspace_config_trees",
+    "workspace_create_operations",
+    "workspace_memory_documents",
+    "workspace_memory_settings",
+    "workspace_resource_key_counters",
+    "workspace_resource_keys",
+    "workspace_runtime_binding_audit",
+    "workspace_runtime_bindings",
+    "workspace_worker_retention_policies",
+    "workspace_worker_retention_policy_revisions",
+];
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceDeletionReservation {
@@ -53,6 +123,12 @@ pub trait WorkspaceDeletionStore: Send + Sync {
     ) -> Result<Option<WorkspaceDeletionOperationResponse>>;
 
     fn resumable_workspace_deletion_operation_ids(&self) -> Result<Vec<String>>;
+
+    fn append_workspace_deletion_child_operation(
+        &self,
+        operation_id: &str,
+        child_operation_id: &str,
+    ) -> Result<WorkspaceDeletionOperationResponse>;
 
     fn update_workspace_deletion_operation(
         &self,
@@ -276,6 +352,45 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
         })
     }
 
+    fn append_workspace_deletion_child_operation(
+        &self,
+        operation_id: &str,
+        child_operation_id: &str,
+    ) -> Result<WorkspaceDeletionOperationResponse> {
+        validate_operation_id(child_operation_id)?;
+        self.with_transaction(|tx| {
+            let operation = read_operation(tx, operation_id)?
+                .ok_or_else(|| Error::InvalidInput("Workspace deletion operation".to_string()))?
+                .response;
+            if !operation
+                .child_operation_ids
+                .iter()
+                .any(|existing| existing == child_operation_id)
+            {
+                let mut child_operation_ids = operation.child_operation_ids;
+                child_operation_ids.push(child_operation_id.to_string());
+                validate_operation_projection(&child_operation_ids, &operation.blockers)?;
+                let now = Utc::now().to_rfc3339();
+                tx.execute(
+                    "UPDATE workspace_deletion_operations
+                     SET child_operation_ids_json = ?2, updated_at = ?3
+                     WHERE operation_id = ?1",
+                    params![
+                        operation_id,
+                        serde_json::to_string(&child_operation_ids)
+                            .map_err(|error| Error::Store(error.to_string()))?,
+                        now,
+                    ],
+                )?;
+            }
+            Ok(read_operation(tx, operation_id)?
+                .ok_or_else(|| {
+                    Error::Store("Workspace deletion operation disappeared".to_string())
+                })?
+                .response)
+        })
+    }
+
     fn update_workspace_deletion_operation(
         &self,
         operation_id: &str,
@@ -332,31 +447,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
             }
             let workspace_id = operation.response.workspace_id.clone();
 
-            let mut scoped_tables = Vec::new();
-            let mut statement = tx.prepare(
-                "SELECT m.name
-                 FROM sqlite_master m
-                 WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'
-                 ORDER BY m.name",
-            )?;
-            let names = statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            drop(statement);
-            for table in names {
-                if table == "workspaces" || table == "workspace_deletion_operations" {
-                    continue;
-                }
-                let escaped = table.replace('"', "\"\"");
-                let mut info = tx.prepare(&format!("PRAGMA table_info(\"{escaped}\")"))?;
-                let columns = info
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .collect::<std::result::Result<BTreeSet<_>, _>>()?;
-                if columns.contains("workspace_id") {
-                    scoped_tables.push(escaped);
-                }
-            }
-            for table in scoped_tables {
+            for table in WORKSPACE_DELETION_PURGE_TABLES {
                 tx.execute(
                     &format!("DELETE FROM \"{table}\" WHERE workspace_id = ?1"),
                     params![workspace_id],
@@ -595,6 +686,12 @@ fn workspace_database_blockers(
             "Remove current Ticket assignments before deleting the Workspace.",
         ),
         (
+            "SELECT COUNT(*) FROM worker_create_reservations WHERE workspace_id = ?1 AND state = 'reserved'",
+            WorkspaceDeletionBlockerKind::CleanupUnavailable,
+            "worker",
+            "Wait for or cancel pending Worker creation reservations.",
+        ),
+        (
             "SELECT COUNT(*) FROM worker_removal_operations WHERE workspace_id = ?1 AND state IN ('planned', 'blocked', 'executing', 'failed', 'stale')",
             WorkspaceDeletionBlockerKind::CleanupUnavailable,
             "worker",
@@ -706,8 +803,8 @@ fn request_fingerprint(
     request: &WorkspaceDeletionRequest,
 ) -> String {
     let canonical = format!(
-        "workspace-delete-v1\0{actor_account_id}\0{workspace_id}\0{}\0{}",
-        request.expected_revision, request.confirmation
+        "workspace-delete-v1\0{actor_account_id}\0{workspace_id}\0{}\0{}\0{}",
+        request.operation_id, request.expected_revision, request.confirmation
     );
     encode_hex(&Sha256::digest(canonical.as_bytes()))
 }
@@ -748,6 +845,7 @@ fn parse_deletion_state(value: &str) -> Result<WorkspaceDeletionState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use tempfile::tempdir;
 
     fn setup() -> (SqliteWorkspaceStore, String, String) {
@@ -773,8 +871,55 @@ mod tests {
     }
 
     #[test]
+    fn explicit_purge_inventory_covers_every_workspace_scoped_table() {
+        let (store, _, _) = setup();
+        store
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                )?;
+                let tables = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(statement);
+                let mut scoped = BTreeSet::new();
+                for table in tables {
+                    let escaped = table.replace('"', "\"\"");
+                    let mut info = conn.prepare(&format!("PRAGMA table_info(\"{escaped}\")"))?;
+                    let columns = info
+                        .query_map([], |row| row.get::<_, String>(1))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    if columns.iter().any(|column| column == "workspace_id") {
+                        scoped.insert(table);
+                    }
+                }
+                let expected = WORKSPACE_DELETION_PURGE_TABLES
+                    .iter()
+                    .copied()
+                    .chain(["workspace_deletion_operations", "workspaces"])
+                    .map(str::to_string)
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(scoped, expected);
+                Ok(())
+            })
+            .expect("purge inventory");
+    }
+
+    #[test]
     fn deletion_is_idempotent_and_removes_workspace_scoped_rows() {
         let (store, owner, workspace_id) = setup();
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO worker_mutation_source_proof_jtis (
+                        workspace_id, runtime_id, jti, expires_at, consumed_at
+                     ) VALUES (?1, 'runtime-a', 'jti-a', 1, '1')",
+                    params![workspace_id],
+                )?;
+                Ok(())
+            })
+            .expect("non-FK scoped audit fixture");
         let preflight = store
             .workspace_deletion_preflight(&owner, &workspace_id)
             .expect("preflight");
@@ -807,6 +952,20 @@ mod tests {
             ),
             Err(Error::Store(_))
         ));
+        let with_child = store
+            .append_workspace_deletion_child_operation(&request.operation_id, "child-operation-1")
+            .expect("append child operation");
+        assert_eq!(
+            with_child.child_operation_ids,
+            vec!["child-operation-1".to_string()]
+        );
+        let duplicate = store
+            .append_workspace_deletion_child_operation(&request.operation_id, "child-operation-1")
+            .expect("append child operation replay");
+        assert_eq!(
+            duplicate.child_operation_ids,
+            with_child.child_operation_ids
+        );
         let completed = store
             .finalize_workspace_deletion(&request.operation_id)
             .expect("finalize");
@@ -832,6 +991,17 @@ mod tests {
             })
             .expect("read");
         assert_eq!(workspace_count, 0);
+        let proof_count: u64 = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM worker_mutation_source_proof_jtis WHERE workspace_id = ?1",
+                    params![workspace_id],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .expect("scoped audit read");
+        assert_eq!(proof_count, 0);
     }
 
     #[test]
@@ -862,12 +1032,79 @@ mod tests {
             store.reserve_workspace_deletion(&owner, &workspace_id, &request),
             Err(Error::WorkspaceConfigConflict(_))
         ));
+        let mut other_operation = request.clone();
+        other_operation.operation_id = "delete-alpha-other-operation".to_string();
+        assert_ne!(
+            request_fingerprint(&owner, &workspace_id, &request),
+            request_fingerprint(&owner, &workspace_id, &other_operation)
+        );
         request.expected_revision = preflight.expected_revision;
         request.confirmation = "delete Alpha".to_string();
         assert!(matches!(
             store.reserve_workspace_deletion(&owner, &workspace_id, &request),
             Err(Error::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn pending_worker_and_workdir_creation_block_reservation_without_orphans() {
+        let (store, owner, workspace_id) = setup();
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO worker_create_reservations (
+                        workspace_id, allocation_key, worker_id, runtime_id,
+                        create_fingerprint, state, created_at, updated_at
+                     ) VALUES (?1, 'allocation', 'worker-pending', 'runtime-a',
+                               'fingerprint', 'reserved', '1', '1')",
+                    params![workspace_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO workdir_create_operations (
+                        workspace_id, operation_id, request_fingerprint, repository_id,
+                        selector, requested_runtime_id, resolved_runtime_id, config_revision,
+                        config_projection_digest, working_directory_id, state, created_at, updated_at
+                     ) VALUES (
+                        ?1, 'workdir-create', 'fingerprint', 'repository-pending',
+                        'develop', 'runtime-a', 'runtime-a', 1,
+                        'projection', 'workdir-pending', 'pending', '1', '1'
+                     )",
+                    params![workspace_id],
+                )?;
+                Ok(())
+            })
+            .expect("pending creation fixtures");
+        let preflight = store
+            .workspace_deletion_preflight(&owner, &workspace_id)
+            .expect("preflight");
+        assert!(!preflight.can_delete);
+        assert!(
+            preflight
+                .blockers
+                .iter()
+                .any(|blocker| blocker.message.contains("Worker creation reservations"))
+        );
+        assert!(
+            preflight
+                .blockers
+                .iter()
+                .any(|blocker| blocker.message.contains("Workdir creation operations"))
+        );
+        let request = WorkspaceDeletionRequest {
+            operation_id: "delete-with-pending-creates".to_string(),
+            expected_revision: preflight.expected_revision,
+            confirmation: "Alpha".to_string(),
+        };
+        assert!(matches!(
+            store.reserve_workspace_deletion(&owner, &workspace_id, &request),
+            Err(Error::WorkspaceConfigConflict(_))
+        ));
+        assert!(
+            store
+                .workspace_deletion_operation_for_recovery(&request.operation_id)
+                .expect("operation lookup")
+                .is_none()
+        );
     }
 
     #[test]

@@ -1152,10 +1152,14 @@ impl WorkspaceServerApi {
         &self,
         operation_id: &str,
     ) -> Result<WorkspaceDeletionOperationResponse> {
+        let prior = self
+            .store
+            .workspace_deletion_operation_for_recovery(operation_id)?
+            .ok_or_else(|| Error::InvalidInput("Workspace deletion operation".to_string()))?;
         let operation = self.store.update_workspace_deletion_operation(
             operation_id,
             WorkspaceDeletionState::Running,
-            &[],
+            &prior.child_operation_ids,
             &[],
             None,
         )?;
@@ -1164,7 +1168,7 @@ impl WorkspaceServerApi {
             .await?
             .ok_or_else(|| Error::InvalidInput("Workspace no longer exists".to_string()))?;
 
-        let mut child_operation_ids = Vec::new();
+        let mut child_operation_ids = operation.child_operation_ids.clone();
         let mut blockers = Vec::new();
         for worker in self
             .store
@@ -1181,7 +1185,10 @@ impl WorkspaceServerApi {
                 &target.runtime_id,
                 &target.worker_id,
             )? {
-                child_operation_ids.push(child_operation_id);
+                child_operation_ids = self
+                    .store
+                    .append_workspace_deletion_child_operation(operation_id, &child_operation_id)?
+                    .child_operation_ids;
             }
             if response.status != 200 {
                 blockers.push(WorkspaceDeletionBlocker {
@@ -1204,7 +1211,13 @@ impl WorkspaceServerApi {
                     operation_id,
                 ) {
                     Ok(child) => {
-                        child_operation_ids.push(child.operation_id.clone());
+                        child_operation_ids = self
+                            .store
+                            .append_workspace_deletion_child_operation(
+                                operation_id,
+                                &child.operation_id,
+                            )?
+                            .child_operation_ids;
                         if child.state != WorkdirRemovalOperationState::Completed
                             || child.disposition != Some(WorkdirRemovalDisposition::Removed)
                         {
