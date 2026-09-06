@@ -110,13 +110,6 @@ pub trait WorkspaceDeletionStore: Send + Sync {
         operation_id: &str,
     ) -> Result<Option<WorkspaceDeletionOperationResponse>>;
 
-    fn latest_worker_removal_operation_id(
-        &self,
-        workspace_id: &str,
-        runtime_id: &str,
-        worker_id: &str,
-    ) -> Result<Option<String>>;
-
     fn workspace_deletion_operation_for_recovery(
         &self,
         operation_id: &str,
@@ -310,25 +303,6 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 ));
             }
             Ok(Some(operation.response))
-        })
-    }
-
-    fn latest_worker_removal_operation_id(
-        &self,
-        workspace_id: &str,
-        runtime_id: &str,
-        worker_id: &str,
-    ) -> Result<Option<String>> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                "SELECT operation_id FROM worker_removal_operations
-                 WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
-                 ORDER BY created_at DESC LIMIT 1",
-                params![workspace_id, runtime_id, worker_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(Into::into)
         })
     }
 
@@ -970,6 +944,10 @@ mod tests {
             .finalize_workspace_deletion(&request.operation_id)
             .expect("finalize");
         assert_eq!(completed.state, WorkspaceDeletionState::Succeeded);
+        assert_eq!(
+            completed.child_operation_ids,
+            vec!["child-operation-1".to_string()]
+        );
         let replayed = store
             .finalize_workspace_deletion(&request.operation_id)
             .expect("finalize replay");

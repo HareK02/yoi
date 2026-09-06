@@ -164,6 +164,7 @@ use crate::workdir_removal::{
     WorkdirRemovalOperationState, workdir_removal_intent,
 };
 use crate::workspace_catalog::{WorkspaceCatalogService, WorkspaceCreateRequest};
+use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 use worker_runtime::catalog::{
     ConfigBundleRef, ProfileSelector, RepositoryMaterializationContext, RepositoryRefObservation,
@@ -746,7 +747,8 @@ impl WorkspaceWorkerRemoveExecutor {
             ));
         }
 
-        self.execute_target_removal(&runtime, &target, reason).await
+        self.execute_target_removal(&runtime, &target, reason, None)
+            .await
     }
 
     async fn execute_target_removal(
@@ -754,6 +756,7 @@ impl WorkspaceWorkerRemoveExecutor {
         runtime: &RuntimeRegistry,
         target: &RuntimeWorkerRef,
         reason: &str,
+        parent_workspace_deletion_operation_id: Option<&str>,
     ) -> std::result::Result<worker::WorkspaceResponse, String> {
         let remove_lock = {
             let mut locks = self
@@ -802,6 +805,14 @@ impl WorkspaceWorkerRemoveExecutor {
             } else {
                 prepared
             };
+            if let Some(parent_operation_id) = parent_workspace_deletion_operation_id {
+                self.store
+                    .append_workspace_deletion_child_operation(
+                        parent_operation_id,
+                        &prepared.plan.operation_id,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
             if close_worker_workdir_sessions(&self.workdir_sessions, &target)
                 .await
                 .is_err()
@@ -898,6 +909,14 @@ impl WorkspaceWorkerRemoveExecutor {
             Err(error) => return Ok(worker_retention_error_response(error)),
         };
 
+        if let Some(parent_operation_id) = parent_workspace_deletion_operation_id {
+            self.store
+                .append_workspace_deletion_child_operation(
+                    parent_operation_id,
+                    &prepared.plan.operation_id,
+                )
+                .map_err(|error| error.to_string())?;
+        }
         if close_worker_workdir_sessions(&self.workdir_sessions, &target)
             .await
             .is_err()
@@ -1177,19 +1196,21 @@ impl WorkspaceServerApi {
             let worker_key = worker.display_name.clone();
             let target = worker.worker;
             let response = WorkspaceWorkerRemoveExecutor::new(&api)
-                .execute_target_removal(api.runtime.as_ref(), &target, "Workspace deletion")
+                .execute_target_removal(
+                    api.runtime.as_ref(),
+                    &target,
+                    "Workspace deletion",
+                    Some(operation_id),
+                )
                 .await
                 .map_err(Error::Store)?;
-            if let Some(child_operation_id) = self.store.latest_worker_removal_operation_id(
-                &operation.workspace_id,
-                &target.runtime_id,
-                &target.worker_id,
-            )? {
-                child_operation_ids = self
-                    .store
-                    .append_workspace_deletion_child_operation(operation_id, &child_operation_id)?
-                    .child_operation_ids;
-            }
+            child_operation_ids = self
+                .store
+                .workspace_deletion_operation_for_recovery(operation_id)?
+                .ok_or_else(|| {
+                    Error::Store("Workspace deletion operation disappeared".to_string())
+                })?
+                .child_operation_ids;
             if response.status != 200 {
                 blockers.push(WorkspaceDeletionBlocker {
                     kind: WorkspaceDeletionBlockerKind::WorkerRemovalBlocked,
@@ -10873,6 +10894,8 @@ fn execute_workdir_removal_for_workspace_deletion(
         api.config_store
             .reserve_workdir_removal_operation(&intent)?
     };
+    api.config_store
+        .append_workspace_deletion_child_operation(parent_operation_id, &operation.operation_id)?;
     execute_reserved_workdir_removal(api, operation, false)
 }
 
@@ -17130,6 +17153,34 @@ mod tests {
         let poll = handler_source(source, "get_server_workspace_deletion");
         assert!(!poll.contains("execute_workspace_deletion"));
         assert!(source.contains("api.recover_workspace_deletions().await?"));
+    }
+
+    #[test]
+    fn workspace_deletion_checkpoints_child_operations_before_external_cleanup() {
+        let source = include_str!("server.rs");
+        let worker_start = source
+            .find("async fn execute_target_removal")
+            .expect("Worker removal helper");
+        let worker_source = &source[worker_start..];
+        let checkpoint = worker_source
+            .find("append_workspace_deletion_child_operation")
+            .expect("Worker child checkpoint");
+        let cleanup = worker_source
+            .find("close_worker_workdir_sessions")
+            .expect("Worker cleanup side effect");
+        assert!(checkpoint < cleanup);
+
+        let workdir_start = source
+            .find("fn execute_workdir_removal_for_workspace_deletion")
+            .expect("Workdir removal helper");
+        let workdir_source = &source[workdir_start..];
+        let checkpoint = workdir_source
+            .find("append_workspace_deletion_child_operation")
+            .expect("Workdir child checkpoint");
+        let cleanup = workdir_source
+            .find("execute_reserved_workdir_removal")
+            .expect("Workdir cleanup side effect");
+        assert!(checkpoint < cleanup);
     }
 
     fn handler_source<'a>(source: &'a str, name: &str) -> &'a str {
