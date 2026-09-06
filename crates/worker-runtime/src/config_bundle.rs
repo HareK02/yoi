@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const CONFIG_BUNDLE_DIGEST_ALGORITHM: &str = "sha256";
+pub const WORKSPACE_CONFIG_ETAG_PREFIX: &str = "workspace-config:";
+
+pub fn workspace_config_etag(digest: &str) -> String {
+    format!("\"{WORKSPACE_CONFIG_ETAG_PREFIX}{digest}\"")
+}
 
 /// Backend-synced Profile/config bundle stored by a Runtime.
 ///

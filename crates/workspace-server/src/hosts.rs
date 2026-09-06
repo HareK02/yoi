@@ -1,5 +1,7 @@
 use crate::Error;
-use crate::resource_broker::{BackendResourceBroker, BackendResourceTarget};
+use crate::resource_broker::BackendResourceBroker;
+#[cfg(test)]
+use crate::resource_broker::BackendResourceTarget;
 use chrono::Utc;
 use protocol::Segment;
 use reqwest::blocking::{Client as BlockingHttpClient, RequestBuilder};
@@ -24,8 +26,8 @@ use workdir::{
 use worker_runtime::RuntimeWorkspaceScope;
 use worker_runtime::auth::{CapabilityTokenSigner, capability_claims};
 use worker_runtime::catalog::{
-    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, ProfileSourceArchiveHttpRef,
-    ProfileSourceArchiveSource, RepositoryRefObservation, RepositoryRefObservationRequest,
+    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, ProfileSourceArchiveSource,
+    RepositoryRefObservation, RepositoryRefObservationRequest,
     WorkerDetail as EmbeddedWorkerDetail, WorkerStatus as EmbeddedWorkerStatus,
     WorkingDirectoryClaim, WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest,
     WorkingDirectoryStatus, WorkingDirectorySummary, WorkspaceApiRef,
@@ -57,7 +59,7 @@ use worker_runtime::interaction::{
     WorkerInput as EmbeddedWorkerInput, WorkerInputKind as EmbeddedWorkerInputKind,
 };
 use worker_runtime::management::{RuntimeOptions as EmbeddedRuntimeOptions, RuntimeStatus};
-use worker_runtime::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveInput};
+use worker_runtime::profile_archive::ProfileSourceArchive;
 use worker_runtime::retention::{
     WorkerRetentionExecutionRequest, WorkerRetentionExecutionResult, WorkerRetentionInventory,
 };
@@ -1481,7 +1483,9 @@ impl RuntimeRegistry {
             _ => {}
         }
         let runtime = self.runtime(runtime_id)?;
-        if let Some(bundle) = request.resolved_config_bundle.clone() {
+        if runtime_id == EMBEDDED_RUNTIME_ID
+            && let Some(bundle) = request.resolved_config_bundle.clone()
+        {
             let sync = runtime.sync_config_bundle(bundle);
             if sync.state != WorkerOperationState::Accepted {
                 let message = sync
@@ -2972,7 +2976,6 @@ pub struct RemoteWorkerRuntime {
     runtime_id: String,
     display_name: String,
     base_url: String,
-    backend_base_url: String,
     workspace_id: String,
     bearer_token: Option<String>,
     auth: Option<RemoteRuntimeAuthConfig>,
@@ -3049,7 +3052,7 @@ impl RemoteWorkerRuntime {
     pub fn new(
         config: RemoteRuntimeConfig,
         workspace_id: String,
-        backend_base_url: String,
+        _backend_base_url: String,
     ) -> Result<Self, RuntimeRegistryError> {
         validate_backend_identifier("runtime_id", &config.runtime_id)?;
         let base_url = config.base_url.trim_end_matches('/').to_string();
@@ -3077,7 +3080,6 @@ impl RemoteWorkerRuntime {
             runtime_id: config.runtime_id,
             display_name: config.display_name,
             base_url,
-            backend_base_url: backend_base_url.trim_end_matches('/').to_string(),
             workspace_id,
             bearer_token: config.bearer_token,
             auth: config.auth,
@@ -3722,27 +3724,23 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             };
         }
         let profile = request.profile.clone();
-        let profile_source = match profile_source_archive_http_source(
-            &request,
-            &profile,
-            &self.workspace_id,
-            Some(self.runtime_id.as_str()),
-            &self.resource_broker,
-            &self.backend_base_url,
-        ) {
-            Ok(source) => source,
+        let profile_source_archive = match profile_source_archive_for_request(&request, &profile) {
+            Ok(archive) => archive,
             Err(error) => {
                 return WorkerSpawnResult {
                     state: WorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
                     diagnostics: vec![diagnostic(
-                        "remote_profile_source_archive_invalid",
+                        "remote_workspace_config_invalid",
                         DiagnosticSeverity::Error,
                         error,
                     )],
                 };
             }
+        };
+        let profile_source = ProfileSourceArchiveSource::WorkspaceConfig {
+            archive: profile_source_archive.reference,
         };
         let workspace_api = match required_worker_workspace_api(&request) {
             Ok(workspace_api) => workspace_api,
@@ -4088,7 +4086,7 @@ fn profile_source_archive_for_request(
     {
         return Ok(archive);
     }
-    builtin_profile_source_archive(profile)
+    crate::profile_settings::builtin_profile_source_archive(profile)
 }
 
 fn profile_source_archive_source(
@@ -4100,36 +4098,14 @@ fn profile_source_archive_source(
     })
 }
 
-fn profile_source_archive_http_source(
+#[cfg(test)]
+fn profile_source_archive_workspace_config_source(
     request: &WorkerSpawnRequest,
     profile: &ProfileSelector,
-    workspace_id: &str,
-    runtime_id: Option<&str>,
-    resource_broker: &BackendResourceBroker,
-    backend_base_url: &str,
 ) -> Result<ProfileSourceArchiveSource, String> {
     let archive = profile_source_archive_for_request(request, profile)?;
-    let target = runtime_id
-        .map(BackendResourceTarget::Runtime)
-        .unwrap_or(BackendResourceTarget::Workspace);
-    let _handle = resource_broker.issue_profile_source_archive_handle(
-        workspace_id.to_string(),
-        target,
-        archive.clone(),
-    );
-    let etag = format!("\"profile-source:{}\"", archive.reference.digest);
-    let url = format!(
-        "{}/api/w/{}/profile-source-archives/{}",
-        backend_base_url.trim_end_matches('/'),
-        workspace_id,
-        archive.reference.digest
-    );
-    Ok(ProfileSourceArchiveSource::Http {
-        location: ProfileSourceArchiveHttpRef {
-            url,
-            etag: Some(etag),
-            archive: archive.reference.clone(),
-        },
+    Ok(ProfileSourceArchiveSource::WorkspaceConfig {
+        archive: archive.reference,
     })
 }
 
@@ -4154,7 +4130,7 @@ fn builtin_profile_config_bundle(
             .unwrap_or_else(|| "default".to_string())
             .replace([':', '/', ' '], "-")
     );
-    let archive = builtin_profile_source_archive(profile)?;
+    let archive = crate::profile_settings::builtin_profile_source_archive(profile)?;
     let (profile_source_archive, profile_source_archive_handle) = match archive_transport {
         ProfileSourceArchiveTransport::Inline => (Some(archive), None),
         ProfileSourceArchiveTransport::BackendResourceHandle => {
@@ -4206,39 +4182,6 @@ fn embedded_profile_label(profile: &ProfileSelector) -> Option<String> {
             }
         }
     })
-}
-
-fn builtin_profile_source_archive(
-    profile: &ProfileSelector,
-) -> Result<ProfileSourceArchive, String> {
-    let selected_profile = match profile {
-        ProfileSelector::Builtin(name) => {
-            if name.starts_with("builtin:") {
-                name.clone()
-            } else {
-                format!("builtin:{name}")
-            }
-        }
-        ProfileSelector::Named(name) => {
-            return Err(format!(
-                "embedded runtime does not provide named Profile `{name}`"
-            ));
-        }
-    };
-    let catalog = manifest::builtin_profile_catalog_snapshot();
-    if !catalog.entrypoints.contains_key(&selected_profile) {
-        return Err(format!(
-            "embedded runtime does not provide Profile `{selected_profile}`"
-        ));
-    }
-
-    ProfileSourceArchive::build(ProfileSourceArchiveInput {
-        id: catalog.id.to_owned(),
-        sources: catalog.sources,
-        entrypoints: catalog.entrypoints,
-        imports: catalog.imports,
-    })
-    .map_err(|error| format!("failed to build built-in Profile source archive: {error}"))
 }
 
 const MEMORY_CONSOLIDATION_PROFILE: &str = "memory-consolidation";
@@ -4940,7 +4883,7 @@ mod tests {
     fn resolved_project_profile_archive_is_used_for_runtime_delivery() {
         let broker = BackendResourceBroker::default();
         let builtin_selector = ProfileSelector::Builtin("builtin:coder".to_string());
-        let archive = builtin_profile_source_archive(&builtin_selector)
+        let archive = crate::profile_settings::builtin_profile_source_archive(&builtin_selector)
             .expect("build stand-in project profile archive");
         let mut bundle = builtin_profile_config_bundle(
             &builtin_selector,
@@ -4962,30 +4905,17 @@ mod tests {
     }
 
     #[test]
-    fn remote_profile_source_archive_url_uses_workspace_id_not_host_id() {
-        let broker = BackendResourceBroker::default();
-        let runtime_id = "remote:test";
+    fn remote_profile_source_uses_workspace_config_archive_reference() {
         let request = embedded_spawn_request();
-        let source = profile_source_archive_http_source(
-            &request,
-            &ProfileSelector::Builtin("builtin:coder".to_string()),
-            "workspace-actual",
-            Some(runtime_id),
-            &broker,
-            "http://127.0.0.1:8787/",
-        )
-        .unwrap();
-        let ProfileSourceArchiveSource::Http { location } = source else {
-            panic!("remote profile source should be HTTP fetched");
-        };
-        assert!(
-            location.url.starts_with(
-                "http://127.0.0.1:8787/api/w/workspace-actual/profile-source-archives/"
-            ),
-            "{}",
-            location.url
+        let profile = ProfileSelector::Builtin("builtin:coder".to_string());
+        let expected = profile_source_archive_for_request(&request, &profile)
+            .unwrap()
+            .reference;
+        let source = profile_source_archive_workspace_config_source(&request, &profile).unwrap();
+        assert_eq!(
+            source,
+            ProfileSourceArchiveSource::WorkspaceConfig { archive: expected }
         );
-        assert!(!location.url.contains("remote-runtime"), "{}", location.url);
     }
 
     #[test]

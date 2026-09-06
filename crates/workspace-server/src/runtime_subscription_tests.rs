@@ -1,15 +1,12 @@
 use super::*;
 use protocol::subscription::{SubscriptionWorkerIds, SubscriptionWorkerState};
 use worker_runtime::Runtime;
-use worker_runtime::catalog::{
-    CreateWorkerRequest, ProfileSelector, ProfileSourceArchiveHttpRef, ProfileSourceArchiveSource,
-};
+use worker_runtime::catalog::{CreateWorkerRequest, ProfileSelector, ProfileSourceArchiveSource};
 use worker_runtime::execution::{
     WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation, WorkerExecutionResult,
     WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
 };
 use worker_runtime::identity::WorkerId;
-use worker_runtime::profile_archive::{ProfileSourceArchiveRef, ProfileSourceGraphSummary};
 
 #[derive(Debug)]
 struct TestExecutionBackend;
@@ -57,22 +54,11 @@ fn create_request(name: &str) -> CreateWorkerRequest {
         profile: ProfileSelector::Builtin("builtin:companion".to_string()),
         display_name: Some(name.to_string()),
         config_bundle: None,
-        profile_source: ProfileSourceArchiveSource::Http {
-            location: ProfileSourceArchiveHttpRef {
-                url: "http://127.0.0.1/profiles/test".to_string(),
-                etag: None,
-                archive: ProfileSourceArchiveRef {
-                    id: "test-profile-source".to_string(),
-                    digest: "test-digest".to_string(),
-                    size_bytes: 0,
-                    source_graph: ProfileSourceGraphSummary {
-                        source_count: 0,
-                        total_source_bytes: 0,
-                        entrypoints: std::collections::BTreeMap::new(),
-                        import_count: 0,
-                    },
-                },
-            },
+        profile_source: ProfileSourceArchiveSource::Embedded {
+            archive: crate::profile_settings::builtin_profile_source_archive(
+                &ProfileSelector::Builtin("builtin:default".to_string()),
+            )
+            .unwrap(),
         },
         initial_input: None,
         working_directory_request: None,

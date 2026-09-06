@@ -2694,22 +2694,22 @@ mod tests {
             create_fingerprint: "test-create".to_string(),
             profile,
             display_name: None,
-            profile_source: crate::catalog::ProfileSourceArchiveSource::Http {
-                location: crate::catalog::ProfileSourceArchiveHttpRef {
-                    url: "http://127.0.0.1/profile-source.tar".to_string(),
-                    etag: None,
-                    archive: crate::profile_archive::ProfileSourceArchiveRef {
+            profile_source: crate::catalog::ProfileSourceArchiveSource::Embedded {
+                archive: crate::profile_archive::ProfileSourceArchive::build(
+                    crate::profile_archive::ProfileSourceArchiveInput {
                         id: "test-profile-source".to_string(),
-                        digest: "test-digest".to_string(),
-                        size_bytes: 0,
-                        source_graph: crate::profile_archive::ProfileSourceGraphSummary {
-                            source_count: 0,
-                            total_source_bytes: 0,
-                            entrypoints: std::collections::BTreeMap::new(),
-                            import_count: 0,
-                        },
+                        entrypoints: std::collections::BTreeMap::from([(
+                            "builtin:coder".to_string(),
+                            "profiles/coder.dcdl".to_string(),
+                        )]),
+                        imports: std::collections::BTreeMap::new(),
+                        sources: std::collections::BTreeMap::from([(
+                            "profiles/coder.dcdl".to_string(),
+                            "{}".to_string(),
+                        )]),
                     },
-                },
+                )
+                .unwrap(),
             },
             config_bundle: Some(ConfigBundleRef {
                 id: bundle.metadata.id,
@@ -3312,22 +3312,22 @@ mod ws_tests {
             create_fingerprint: "test-create".to_string(),
             profile: ProfileSelector::Builtin("builtin:companion".to_string()),
             display_name: None,
-            profile_source: crate::catalog::ProfileSourceArchiveSource::Http {
-                location: crate::catalog::ProfileSourceArchiveHttpRef {
-                    url: "http://127.0.0.1/profile-source.tar".to_string(),
-                    etag: None,
-                    archive: crate::profile_archive::ProfileSourceArchiveRef {
+            profile_source: crate::catalog::ProfileSourceArchiveSource::Embedded {
+                archive: crate::profile_archive::ProfileSourceArchive::build(
+                    crate::profile_archive::ProfileSourceArchiveInput {
                         id: "test-profile-source".to_string(),
-                        digest: "test-digest".to_string(),
-                        size_bytes: 0,
-                        source_graph: crate::profile_archive::ProfileSourceGraphSummary {
-                            source_count: 0,
-                            total_source_bytes: 0,
-                            entrypoints: std::collections::BTreeMap::new(),
-                            import_count: 0,
-                        },
+                        entrypoints: std::collections::BTreeMap::from([(
+                            "builtin:coder".to_string(),
+                            "profiles/coder.dcdl".to_string(),
+                        )]),
+                        imports: std::collections::BTreeMap::new(),
+                        sources: std::collections::BTreeMap::from([(
+                            "profiles/coder.dcdl".to_string(),
+                            "{}".to_string(),
+                        )]),
                     },
-                },
+                )
+                .unwrap(),
             },
             config_bundle: Some(ConfigBundleRef {
                 id: bundle.metadata.id,

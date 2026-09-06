@@ -6,8 +6,6 @@ use crate::identity::WorkerId;
 use crate::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveRef, sha256_hex};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Mutex;
 
 pub const PROFILE_SOURCE_ARCHIVE_CONTENT_TYPE: &str =
     "application/vnd.yoi.profile-source-archive+tar";
@@ -262,23 +260,6 @@ impl BackendResourceClient for HttpBackendResourceClient {
                     message: format!("backend resource fetch failed with HTTP {status}: {err}"),
                 }),
             }
-        }
-    }
-}
-
-#[derive(Default, Debug)]
-pub struct ProfileSourceArchiveCache {
-    archives: Mutex<HashMap<String, ProfileSourceArchive>>,
-}
-
-impl ProfileSourceArchiveCache {
-    pub fn get(&self, digest: &str) -> Option<ProfileSourceArchive> {
-        self.archives.lock().ok()?.get(digest).cloned()
-    }
-
-    pub fn insert(&self, archive: ProfileSourceArchive) {
-        if let Ok(mut archives) = self.archives.lock() {
-            archives.insert(archive.reference.digest.clone(), archive);
         }
     }
 }

@@ -1,8 +1,9 @@
 use crate::catalog::{
-    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, RepositoryRefObservation,
-    RepositoryRefObservationRequest, WorkerDetail, WorkerLifecycleAck, WorkerRestoreIntent,
-    WorkerStatus, WorkerSummary, WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest,
-    WorkingDirectoryStatus as CatalogWorkingDirectoryStatus, WorkspaceApiRef,
+    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, ProfileSourceArchiveSource,
+    RepositoryRefObservation, RepositoryRefObservationRequest, WorkerDetail, WorkerLifecycleAck,
+    WorkerRestoreIntent, WorkerStatus, WorkerSummary, WorkingDirectoryRepositoryAccessRequest,
+    WorkingDirectoryRequest, WorkingDirectoryStatus as CatalogWorkingDirectoryStatus,
+    WorkspaceApiRef,
 };
 use crate::config_bundle::{
     ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary, validate_config_bundle,
@@ -14,7 +15,7 @@ use crate::execution::WorkerExecutionRestoreRequest;
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionBackendRef, WorkerExecutionHandle,
     WorkerExecutionOperation, WorkerExecutionResult, WorkerExecutionSpawnRequest,
-    WorkerExecutionSpawnResult,
+    WorkerExecutionSpawnResult, WorkspaceConfigFetchRequest, WorkspaceConfigFetchResult,
 };
 #[cfg(feature = "fs-store")]
 use crate::fs_store::{
@@ -643,11 +644,147 @@ impl Runtime {
         self.create_worker_with_workspace(request, Some(scope))
     }
 
+    fn existing_worker_for_create(
+        &self,
+        request: &CreateWorkerRequest,
+        scope: Option<&RuntimeWorkspaceScope>,
+    ) -> Result<Option<WorkerDetail>, RuntimeError> {
+        let mut state = self.lock()?;
+        state.ensure_running()?;
+        validate_create_worker_request(request)?;
+        validate_create_workspace_scope(request, scope.map(|scope| scope.workspace_id.as_str()))?;
+        if let Some(scope) = scope {
+            state.ensure_workspace_owner(scope, false)?;
+        }
+        let workspace_id = scope.map(|scope| scope.workspace_id.as_str());
+        if let Some(existing) = state.workers.get(&request.worker_id) {
+            if existing.workspace_id.as_deref() != workspace_id {
+                return Err(RuntimeError::InvalidRequest(format!(
+                    "worker {} already belongs to another Workspace scope",
+                    request.worker_id
+                )));
+            }
+            if existing.request.create_fingerprint != request.create_fingerprint {
+                return Err(RuntimeError::InvalidRequest(format!(
+                    "worker {} was already created with a different fingerprint",
+                    request.worker_id
+                )));
+            }
+            return Ok(Some(existing.detail()));
+        }
+        Ok(None)
+    }
+
+    fn refresh_workspace_config(&self, request: &CreateWorkerRequest) -> Result<(), RuntimeError> {
+        let ProfileSourceArchiveSource::WorkspaceConfig {
+            archive: expected_archive,
+        } = &request.profile_source
+        else {
+            return Ok(());
+        };
+        let expected = request.config_bundle.as_ref().ok_or_else(|| {
+            RuntimeError::InvalidRequest(
+                "Workspace Config profile source requires a config_bundle reference".to_string(),
+            )
+        })?;
+        let workspace_api = request.workspace_api.clone().ok_or_else(|| {
+            RuntimeError::InvalidRequest(
+                "Workspace Config profile source requires a Workspace API reference".to_string(),
+            )
+        })?;
+        let profile_key = match &request.profile {
+            ProfileSelector::Builtin(value) | ProfileSelector::Named(value) => value.clone(),
+        };
+        let cache_key = format!(
+            "{}\u{0}{}\u{0}{}",
+            workspace_api.base_url, workspace_api.workspace_id, profile_key
+        );
+        let fetch_gate = {
+            let mut state = self.lock()?;
+            state
+                .workspace_config_fetch_gates
+                .entry(cache_key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _fetch_guard = fetch_gate.lock().map_err(|_| RuntimeError::StatePoisoned)?;
+        let (backend, cached) = {
+            let state = self.lock()?;
+            let cached_reference = state
+                .workspace_config_latest
+                .get(&cache_key)
+                .unwrap_or(expected);
+            let cached = state
+                .config_bundles
+                .get(&cached_reference.id)
+                .filter(|bundle| bundle.metadata.digest == cached_reference.digest)
+                .map(|bundle| ConfigBundleRef {
+                    id: bundle.metadata.id.clone(),
+                    digest: bundle.metadata.digest.clone(),
+                });
+            (state.execution_backend.clone(), cached)
+        };
+        let backend = backend.ok_or_else(|| RuntimeError::ExecutionBackendUnavailable {
+            message: "Workspace Config refresh requires an execution backend".to_string(),
+        })?;
+        let fetched = backend
+            .fetch_workspace_config(WorkspaceConfigFetchRequest {
+                workspace_api,
+                profile: request.profile.clone(),
+                expected: expected.clone(),
+                cached: cached.clone(),
+            })
+            .map_err(|message| {
+                RuntimeError::InvalidRequest(format!(
+                    "failed to refresh latest Workspace Config: {message}"
+                ))
+            })?;
+        let resolved = match fetched {
+            WorkspaceConfigFetchResult::NotModified => cached.ok_or_else(|| {
+                RuntimeError::InvalidRequest(
+                    "latest Workspace Config returned not-modified without a cached bundle"
+                        .to_string(),
+                )
+            })?,
+            WorkspaceConfigFetchResult::Modified(bundle) => {
+                self.store_config_bundle(bundle)?.reference
+            }
+        };
+        if &resolved != expected {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "latest Workspace Config changed while Worker creation was being prepared: expected '{}@{}', got '{}@{}'",
+                expected.id, expected.digest, resolved.id, resolved.digest
+            )));
+        }
+        let mut state = self.lock()?;
+        let bundle = state.config_bundles.get(&resolved.id).ok_or_else(|| {
+            RuntimeError::InvalidRequest(
+                "latest Workspace Config was not available after refresh".to_string(),
+            )
+        })?;
+        let archive = bundle.profile_source_archive.as_ref().ok_or_else(|| {
+            RuntimeError::InvalidRequest(
+                "latest Workspace Config is missing its profile source archive".to_string(),
+            )
+        })?;
+        if &archive.reference != expected_archive {
+            return Err(RuntimeError::InvalidRequest(
+                "latest Workspace Config profile source archive reference mismatch".to_string(),
+            ));
+        }
+        state.workspace_config_latest.insert(cache_key, resolved);
+        Ok(())
+    }
+
     fn create_worker_with_workspace(
         &self,
         request: CreateWorkerRequest,
         scope: Option<&RuntimeWorkspaceScope>,
     ) -> Result<WorkerDetail, RuntimeError> {
+        if let Some(existing) = self.existing_worker_for_create(&request, scope)? {
+            return Ok(existing);
+        }
+        self.refresh_workspace_config(&request)?;
         let (backend, worker_ref, spawn_request) = {
             let mut state = self.lock()?;
             state.ensure_running()?;
@@ -2170,6 +2307,8 @@ struct RuntimeState {
     workers: BTreeMap<WorkerId, WorkerRecord>,
     workspace_owners: BTreeMap<String, String>,
     config_bundles: BTreeMap<String, ConfigBundle>,
+    workspace_config_latest: BTreeMap<String, ConfigBundleRef>,
+    workspace_config_fetch_gates: BTreeMap<String, Arc<Mutex<()>>>,
     diagnostics: Vec<RuntimeDiagnostic>,
     subscription_revision: u64,
     worker_subject_revisions: BTreeMap<WorkerId, u64>,
@@ -2198,6 +2337,8 @@ impl RuntimeState {
             workers: BTreeMap::new(),
             workspace_owners: BTreeMap::new(),
             config_bundles: BTreeMap::new(),
+            workspace_config_latest: BTreeMap::new(),
+            workspace_config_fetch_gates: BTreeMap::new(),
             diagnostics: Vec::new(),
             subscription_revision: 0,
             worker_subject_revisions: BTreeMap::new(),
@@ -2227,6 +2368,8 @@ impl RuntimeState {
             workers: BTreeMap::new(),
             workspace_owners: BTreeMap::new(),
             config_bundles: BTreeMap::new(),
+            workspace_config_latest: BTreeMap::new(),
+            workspace_config_fetch_gates: BTreeMap::new(),
             diagnostics: Vec::new(),
             subscription_revision: 0,
             worker_subject_revisions: BTreeMap::new(),
@@ -2286,6 +2429,8 @@ impl RuntimeState {
             next_diagnostic_id,
             workers,
             config_bundles: BTreeMap::new(),
+            workspace_config_latest: BTreeMap::new(),
+            workspace_config_fetch_gates: BTreeMap::new(),
             workspace_owners: persisted.workspace_owners,
             diagnostics,
             subscription_revision: 0,
@@ -3126,15 +3271,10 @@ fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), R
                 RuntimeError::InvalidRequest(format!("profile_source archive is invalid: {err}"))
             })?;
         }
-        crate::catalog::ProfileSourceArchiveSource::Http { location } => {
-            if location.url.trim().is_empty() {
+        crate::catalog::ProfileSourceArchiveSource::WorkspaceConfig { archive } => {
+            if archive.digest.trim().is_empty() {
                 return Err(RuntimeError::InvalidRequest(
-                    "profile_source.location.url must not be empty".to_string(),
-                ));
-            }
-            if location.archive.digest.trim().is_empty() {
-                return Err(RuntimeError::InvalidRequest(
-                    "profile_source.location.archive.digest must not be empty".to_string(),
+                    "profile_source.archive.digest must not be empty".to_string(),
                 ));
             }
         }
@@ -3494,6 +3634,21 @@ mod tests {
         assert!(validate_create_worker_request(&request).is_ok());
     }
 
+    fn test_profile_source_archive() -> crate::profile_archive::ProfileSourceArchive {
+        crate::profile_archive::ProfileSourceArchive::build(
+            crate::profile_archive::ProfileSourceArchiveInput {
+                id: "test-profile-source".to_string(),
+                entrypoints: BTreeMap::from([(
+                    "builtin:coder".to_string(),
+                    "profiles/coder.dcdl".to_string(),
+                )]),
+                imports: BTreeMap::new(),
+                sources: BTreeMap::from([("profiles/coder.dcdl".to_string(), "{}".to_string())]),
+            },
+        )
+        .unwrap()
+    }
+
     fn task_request(_objective: &str) -> CreateWorkerRequest {
         let profile = ProfileSelector::Builtin("builtin:coder".to_string());
         let bundle = test_bundle_for_profile(profile.clone());
@@ -3502,22 +3657,8 @@ mod tests {
             create_fingerprint: "test-create".to_string(),
             profile,
             display_name: None,
-            profile_source: crate::catalog::ProfileSourceArchiveSource::Http {
-                location: crate::catalog::ProfileSourceArchiveHttpRef {
-                    url: "http://127.0.0.1/profile-source.tar".to_string(),
-                    etag: None,
-                    archive: crate::profile_archive::ProfileSourceArchiveRef {
-                        id: "test-profile-source".to_string(),
-                        digest: "test-digest".to_string(),
-                        size_bytes: 0,
-                        source_graph: crate::profile_archive::ProfileSourceGraphSummary {
-                            source_count: 0,
-                            total_source_bytes: 0,
-                            entrypoints: BTreeMap::new(),
-                            import_count: 0,
-                        },
-                    },
-                },
+            profile_source: crate::catalog::ProfileSourceArchiveSource::Embedded {
+                archive: test_profile_source_archive(),
             },
             config_bundle: Some(ConfigBundleRef {
                 id: bundle.metadata.id,
@@ -3853,6 +3994,8 @@ mod tests {
         restore_count: Mutex<u64>,
         run_generations: Mutex<Vec<u64>>,
         config_bundles: Mutex<Vec<Option<ConfigBundle>>>,
+        workspace_config_fetches: Mutex<Vec<WorkspaceConfigFetchRequest>>,
+        workspace_config_results: Mutex<Vec<WorkspaceConfigFetchResult>>,
         contexts: Mutex<BTreeMap<WorkerId, WorkerExecutionContext>>,
         dispatched_inputs: Mutex<Vec<WorkerInput>>,
         repository_accesses: Mutex<Vec<WorkingDirectoryRepositoryAccessRequest>>,
@@ -3896,6 +4039,18 @@ mod tests {
     impl WorkerExecutionBackend for TestExecutionBackend {
         fn backend_id(&self) -> &str {
             "test-execution-backend"
+        }
+
+        fn fetch_workspace_config(
+            &self,
+            request: WorkspaceConfigFetchRequest,
+        ) -> Result<WorkspaceConfigFetchResult, String> {
+            self.workspace_config_fetches.lock().unwrap().push(request);
+            let mut results = self.workspace_config_results.lock().unwrap();
+            if results.is_empty() {
+                return Err("no Workspace Config fetch result configured".to_string());
+            }
+            Ok(results.remove(0))
         }
 
         fn create_working_directory(
@@ -4582,6 +4737,50 @@ mod tests {
         assert_eq!(
             backend.config_bundles.lock().unwrap().as_slice(),
             &[Some(bundle), None]
+        );
+    }
+
+    #[test]
+    fn remote_create_refreshes_workspace_config_and_revalidates_cached_etag() {
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime =
+            Runtime::with_execution_backend(RuntimeOptions::default(), backend.clone()).unwrap();
+        let mut bundle = test_bundle();
+        let archive = test_profile_source_archive();
+        bundle.profile_source_archive = Some(archive.clone());
+        bundle = bundle.with_computed_digest();
+        backend.workspace_config_results.lock().unwrap().extend([
+            WorkspaceConfigFetchResult::Modified(bundle.clone()),
+            WorkspaceConfigFetchResult::NotModified,
+        ]);
+        let archive = archive.reference;
+        let request = |objective: &str| {
+            let mut request = bundled_task_request(objective, &bundle);
+            request.profile_source = ProfileSourceArchiveSource::WorkspaceConfig {
+                archive: archive.clone(),
+            };
+            request.workspace_api = Some(WorkspaceApiRef {
+                workspace_id: "workspace-test".to_string(),
+                base_url: "https://workspace.example".to_string(),
+            });
+            request
+        };
+
+        let first = request("first refresh");
+        let second = request("cached refresh");
+        runtime.create_worker(first).unwrap();
+        runtime.create_worker(second.clone()).unwrap();
+        runtime.create_worker(second).unwrap();
+
+        let fetches = backend.workspace_config_fetches.lock().unwrap();
+        assert_eq!(fetches.len(), 2);
+        assert_eq!(fetches[0].cached, None);
+        assert_eq!(
+            fetches[1].cached,
+            Some(ConfigBundleRef {
+                id: bundle.metadata.id.clone(),
+                digest: bundle.metadata.digest.clone(),
+            })
         );
     }
 

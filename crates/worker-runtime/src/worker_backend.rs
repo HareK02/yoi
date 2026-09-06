@@ -19,18 +19,19 @@ use crate::auth::{
     RuntimeIdentityMaterial, RuntimeRequestSourceSigner, unix_now_seconds,
 };
 use crate::catalog::{
-    CreateWorkerRequest, ProfileSourceArchiveHttpRef, ProfileSourceArchiveSource,
-    RepositoryRefObservation, RepositoryRefObservationRequest,
-    WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest, WorkingDirectoryStatus,
+    CreateWorkerRequest, ProfileSourceArchiveSource, RepositoryRefObservation,
+    RepositoryRefObservationRequest, WorkingDirectoryRepositoryAccessRequest,
+    WorkingDirectoryRequest, WorkingDirectoryStatus,
 };
+use crate::config_bundle::{ConfigBundle, workspace_config_etag};
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation,
     WorkerExecutionRestoreRequest, WorkerExecutionResult, WorkerExecutionSpawnRequest,
-    WorkerExecutionSpawnResult,
+    WorkerExecutionSpawnResult, WorkspaceConfigFetchRequest, WorkspaceConfigFetchResult,
 };
 use crate::identity::WorkerRef;
 use crate::interaction::{WorkerInput, WorkerInputKind};
-use crate::resource::{BackendResourceClient, ProfileSourceArchiveCache};
+use crate::resource::BackendResourceClient;
 use crate::worker_source::{
     EmbeddedWorkerMutationDispatcher, RuntimeOwnedWorkspaceClient, RuntimeWorkerMutationForwarder,
 };
@@ -38,6 +39,8 @@ use crate::working_directory::{
     WorkingDirectoryBinding, WorkingDirectoryDiagnostic, WorkingDirectoryMaterializer,
 };
 use async_trait::async_trait;
+#[cfg(feature = "http-server")]
+use futures::StreamExt;
 #[cfg(test)]
 use protocol::WorkerStatus;
 use protocol::{Event, Method, Segment, WorkerCommandEnvelope};
@@ -86,6 +89,8 @@ use worker::{
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
 const RUNTIME_TASK_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKSPACE_CONFIG_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
+const MAX_WORKSPACE_CONFIG_RESPONSE_BYTES: usize = 72 * 1024 * 1024;
 // Keep this below the adapter task timeout so a failed acknowledgement task
 // returns a typed execution error instead of leaving the outer waiter to time out.
 const USER_INPUT_COMMIT_TIMEOUT: Duration = Duration::from_secs(9);
@@ -105,6 +110,13 @@ pub trait RuntimeWorkerFactory: Send + Sync + 'static {
         _projection: worker::WorkspacePromptProjection,
     ) -> Result<(), String> {
         Ok(())
+    }
+
+    async fn fetch_workspace_config(
+        &self,
+        _request: WorkspaceConfigFetchRequest,
+    ) -> Result<WorkspaceConfigFetchResult, String> {
+        Err("Runtime Worker factory does not support Workspace Config fetching".to_string())
     }
 
     async fn spawn_controller(
@@ -307,7 +319,6 @@ pub struct ProfileRuntimeWorkerFactory {
     profile_base_dir: PathBuf,
     worker_aggregate_root: Option<PathBuf>,
     resource_client: Option<Arc<dyn BackendResourceClient>>,
-    profile_archive_cache: Arc<ProfileSourceArchiveCache>,
     prompt_projection_cache: Arc<WorkspacePromptProjectionCache>,
     runtime_id: Option<String>,
     worker_mutation_identity: Option<RuntimeIdentityMaterial>,
@@ -324,7 +335,6 @@ impl ProfileRuntimeWorkerFactory {
             profile_base_dir,
             worker_aggregate_root: None,
             resource_client: None,
-            profile_archive_cache: Arc::new(ProfileSourceArchiveCache::default()),
             prompt_projection_cache: Arc::new(WorkspacePromptProjectionCache::default()),
             runtime_id: None,
             worker_mutation_identity: None,
@@ -486,62 +496,28 @@ impl ProfileRuntimeWorkerFactory {
     async fn resolve_profile_source_archive(
         &self,
         source: &ProfileSourceArchiveSource,
-        request_audience: Option<&str>,
+        config_bundle: Option<&ConfigBundle>,
     ) -> Result<crate::profile_archive::VerifiedProfileSourceArchive, String> {
         match source {
             ProfileSourceArchiveSource::Embedded { archive } => archive
                 .verify()
                 .map_err(|err| format!("failed to verify embedded profile source archive: {err}")),
-            ProfileSourceArchiveSource::Http { location } => {
-                self.fetch_profile_source_archive(location, request_audience)
-                    .await
-            }
-        }
-    }
-
-    async fn fetch_profile_source_archive(
-        &self,
-        location: &ProfileSourceArchiveHttpRef,
-        request_audience: Option<&str>,
-    ) -> Result<crate::profile_archive::VerifiedProfileSourceArchive, String> {
-        if let Some(cached) = self.profile_archive_cache.get(&location.archive.digest) {
-            let response = fetch_profile_source_archive_http(
-                location,
-                Some(&location.archive.digest),
-                self.worker_mutation_identity.as_ref(),
-                self.runtime_request_audience
-                    .as_deref()
-                    .or(request_audience),
-            )
-            .await?;
-            if let Some(fetched) = response {
-                self.profile_archive_cache.insert(fetched.clone());
-                fetched.verify().map_err(|err| {
-                    format!("failed to verify fetched profile source archive: {err}")
+            ProfileSourceArchiveSource::WorkspaceConfig { archive } => {
+                let bundle = config_bundle.ok_or_else(|| {
+                    "Workspace Config profile source requires a resolved Config Bundle".to_string()
+                })?;
+                let embedded = bundle.profile_source_archive.as_ref().ok_or_else(|| {
+                    "resolved Workspace Config is missing its profile source archive".to_string()
+                })?;
+                if &embedded.reference != archive {
+                    return Err(
+                        "Workspace Config profile source archive reference mismatch".to_string()
+                    );
+                }
+                embedded.verify().map_err(|err| {
+                    format!("failed to verify Workspace Config profile source archive: {err}")
                 })
-            } else {
-                cached
-                    .verify()
-                    .map_err(|err| format!("failed to verify cached profile source archive: {err}"))
             }
-        } else {
-            let archive = fetch_profile_source_archive_http(
-                location,
-                None,
-                self.worker_mutation_identity.as_ref(),
-                self.runtime_request_audience
-                    .as_deref()
-                    .or(request_audience),
-            )
-            .await?
-            .ok_or_else(|| {
-                "profile source archive HTTP revalidation returned 304 without a cached archive"
-                    .to_string()
-            })?;
-            self.profile_archive_cache.insert(archive.clone());
-            archive
-                .verify()
-                .map_err(|err| format!("failed to verify fetched profile source archive: {err}"))
         }
     }
 }
@@ -627,91 +603,112 @@ impl RuntimeWorkspaceBackendRef {
 }
 
 #[cfg(feature = "http-server")]
-async fn fetch_profile_source_archive_http(
-    location: &ProfileSourceArchiveHttpRef,
-    cached_digest: Option<&str>,
+async fn fetch_workspace_config_http(
+    request: &WorkspaceConfigFetchRequest,
     identity: Option<&RuntimeIdentityMaterial>,
     audience: Option<&str>,
-) -> Result<Option<crate::profile_archive::ProfileSourceArchive>, String> {
-    let client = reqwest::Client::new();
-    let url = reqwest::Url::parse(&location.url)
-        .map_err(|error| format!("profile source archive URL is invalid: {error}"))?;
+) -> Result<WorkspaceConfigFetchResult, String> {
+    let mut url = reqwest::Url::parse(&request.workspace_api.base_url)
+        .map_err(|error| format!("Workspace API base URL is invalid: {error}"))?;
+    url.set_path(&format!(
+        "/api/w/{}/runtime-config",
+        request.workspace_api.workspace_id
+    ));
+    let profile = match &request.profile {
+        crate::catalog::ProfileSelector::Builtin(value)
+        | crate::catalog::ProfileSelector::Named(value) => value.clone(),
+    };
+    url.query_pairs_mut().append_pair("profile", &profile);
+
     let path = url.path().to_owned();
-    let workspace_id = path
-        .split('/')
-        .collect::<Vec<_>>()
-        .windows(2)
-        .find_map(|parts| (parts[0] == "w").then_some(parts[1]))
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "profile source archive URL is not workspace-scoped".to_owned())?;
-    let mut request = client.get(url);
+    let request_target = match url.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.clone(),
+    };
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(WORKSPACE_CONFIG_HTTP_TIMEOUT)
+        .build()
+        .map_err(|error| format!("failed to build Workspace Config HTTP client: {error}"))?;
+    let mut http_request = client.get(url);
     if let Some(identity) = identity {
-        let audience = audience.ok_or_else(|| {
-            "profile source archive request proof audience is unavailable".to_owned()
-        })?;
+        let audience = audience
+            .ok_or_else(|| "Workspace Config request proof audience is unavailable".to_owned())?;
         let proof = RuntimeRequestSourceSigner::from_identity(identity)
             .issue(
                 audience,
-                workspace_id,
+                &request.workspace_api.workspace_id,
                 None,
                 BACKEND_RESOURCE_FETCH_PERMISSION,
                 "GET",
-                &path,
+                &request_target,
                 b"",
                 i64::try_from(unix_now_seconds()).unwrap_or(i64::MAX),
                 30,
             )
             .map_err(|error| error.to_string())?;
-        request = request.header(RUNTIME_REQUEST_SOURCE_PROOF_HEADER, proof);
+        http_request = http_request.header(RUNTIME_REQUEST_SOURCE_PROOF_HEADER, proof);
     }
-    if cached_digest == Some(location.archive.digest.as_str()) {
-        if let Some(etag) = location.etag.as_deref() {
-            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
-        }
+    if let Some(cached) = request.cached.as_ref() {
+        http_request = http_request.header(
+            reqwest::header::IF_NONE_MATCH,
+            workspace_config_etag(&cached.digest),
+        );
     }
-    let response = request
+
+    let response = http_request
         .send()
         .await
-        .map_err(|err| format!("failed to fetch profile source archive: {err}"))?;
+        .map_err(|error| format!("failed to fetch latest Workspace Config: {error}"))?;
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-        return Ok(None);
+        return Ok(WorkspaceConfigFetchResult::NotModified);
     }
     if !response.status().is_success() {
-        let status = response.status();
         return Err(format!(
-            "profile source archive fetch failed with HTTP {status}"
+            "latest Workspace Config fetch failed with HTTP {}",
+            response.status()
         ));
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|err| format!("failed to read profile source archive response: {err}"))?
-        .to_vec();
-    let archive = crate::profile_archive::ProfileSourceArchive {
-        reference: location.archive.clone(),
-        content: bytes,
-    };
-    if archive.content.len() as u64 != archive.reference.size_bytes {
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_WORKSPACE_CONFIG_RESPONSE_BYTES as u64)
+    {
+        return Err("latest Workspace Config response exceeds the size limit".to_string());
+    }
+    let response_etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .ok_or_else(|| "latest Workspace Config response is missing its ETag".to_string())?;
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|error| format!("failed to read latest Workspace Config: {error}"))?;
+        if body.len().saturating_add(chunk.len()) > MAX_WORKSPACE_CONFIG_RESPONSE_BYTES {
+            return Err("latest Workspace Config response exceeds the size limit".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let bundle = serde_json::from_slice::<ConfigBundle>(&body)
+        .map_err(|error| format!("failed to decode latest Workspace Config: {error}"))?;
+    let expected_etag = workspace_config_etag(&bundle.metadata.digest);
+    if response_etag != expected_etag {
         return Err(format!(
-            "profile source archive size mismatch: expected {}, got {}",
-            archive.reference.size_bytes,
-            archive.content.len()
+            "latest Workspace Config ETag mismatch: expected {expected_etag}, got {response_etag}"
         ));
     }
-    Ok(Some(archive))
+    Ok(WorkspaceConfigFetchResult::Modified(bundle))
 }
 
 #[cfg(not(feature = "http-server"))]
-async fn fetch_profile_source_archive_http(
-    _location: &ProfileSourceArchiveHttpRef,
-    _cached_digest: Option<&str>,
+async fn fetch_workspace_config_http(
+    _request: &WorkspaceConfigFetchRequest,
     _identity: Option<&RuntimeIdentityMaterial>,
     _audience: Option<&str>,
-) -> Result<Option<crate::profile_archive::ProfileSourceArchive>, String> {
-    Err(
-        "HTTP profile source archive fetch requires the worker-runtime http-server feature"
-            .to_string(),
-    )
+) -> Result<WorkspaceConfigFetchResult, String> {
+    Err("Workspace Config fetch requires the worker-runtime http-server feature".to_string())
 }
 
 fn runtime_local_workdir_session(
@@ -803,6 +800,18 @@ fn validate_worker_memory_settings(
 
 #[async_trait]
 impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
+    async fn fetch_workspace_config(
+        &self,
+        request: WorkspaceConfigFetchRequest,
+    ) -> Result<WorkspaceConfigFetchResult, String> {
+        fetch_workspace_config_http(
+            &request,
+            self.worker_mutation_identity.as_ref(),
+            self.runtime_request_audience.as_deref(),
+        )
+        .await
+    }
+
     fn observe_workspace_prompt_projection(
         &self,
         projection: worker::WorkspacePromptProjection,
@@ -856,10 +865,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         let archive = self
             .resolve_profile_source_archive(
                 &request.request.profile_source,
-                request
-                    .workspace_scope
-                    .as_ref()
-                    .map(|scope| scope.server_id.as_str()),
+                request.config_bundle.as_ref(),
             )
             .await?;
         let (mut manifest, mut loader) = {
@@ -1555,6 +1561,14 @@ where
 {
     fn backend_id(&self) -> &str {
         &self.backend_id
+    }
+
+    fn fetch_workspace_config(
+        &self,
+        request: WorkspaceConfigFetchRequest,
+    ) -> Result<WorkspaceConfigFetchResult, String> {
+        let factory = self.factory.clone();
+        self.run_on_adapter_runtime(async move { factory.fetch_workspace_config(request).await })
     }
 
     fn observe_workspace_prompt_projection(

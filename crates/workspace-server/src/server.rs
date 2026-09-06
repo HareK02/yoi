@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use axum::body::Bytes;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, Query, Request, State};
-use axum::http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, ORIGIN, SET_COOKIE};
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, ORIGIN, SET_COOKIE,
+};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -1596,7 +1598,10 @@ async fn authorize_scoped_workspace_request(
         {
             worker_runtime::auth::WORKSPACE_WORKER_DISCOVERY_PERMISSION
         } else if path.starts_with("/api/runtime/v1/workspaces/")
-            || path.contains("/profile-source-archives/")
+            || path
+                .split('?')
+                .next()
+                .is_some_and(|path| path.ends_with("/runtime-config"))
         {
             worker_runtime::auth::BACKEND_RESOURCE_FETCH_PERMISSION
         } else {
@@ -1705,7 +1710,10 @@ async fn authorize_workspace_api_request(
         {
             worker_runtime::auth::WORKSPACE_WORKER_DISCOVERY_PERMISSION
         } else if path.starts_with("/api/runtime/v1/workspaces/")
-            || path.contains("/profile-source-archives/")
+            || path
+                .split('?')
+                .next()
+                .is_some_and(|path| path.ends_with("/runtime-config"))
         {
             worker_runtime::auth::BACKEND_RESOURCE_FETCH_PERMISSION
         } else {
@@ -3112,8 +3120,8 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         .route("/api/hosts", get(list_hosts))
         .route("/api/w/{workspace_id}/hosts", get(scoped_list_hosts))
         .route(
-            "/api/w/{workspace_id}/profile-source-archives/{digest}",
-            get(scoped_get_profile_source_archive),
+            "/api/w/{workspace_id}/runtime-config",
+            get(get_latest_workspace_runtime_config),
         )
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories",
@@ -3750,12 +3758,6 @@ struct ScopedRepositoryCredentialPath {
 struct ScopedRepositoryHostTrustPath {
     workspace_id: String,
     host_trust_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ScopedProfileArchivePath {
-    workspace_id: String,
-    digest: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -8940,30 +8942,99 @@ async fn scoped_list_hosts(
     list_hosts(State(api)).await
 }
 
-async fn scoped_get_profile_source_archive(
+#[derive(Debug, Deserialize)]
+struct LatestWorkspaceRuntimeConfigQuery {
+    profile: String,
+}
+
+async fn get_latest_workspace_runtime_config(
     State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedProfileArchivePath>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Query(query): Query<LatestWorkspaceRuntimeConfigQuery>,
     headers: HeaderMap,
-) -> ApiResult<(StatusCode, HeaderMap, Vec<u8>)> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    let archive = api
-        .resource_broker
-        .profile_source_archive(&path.digest)
-        .ok_or_else(|| Error::Store("profile source archive not found".to_string()))?;
-    let etag = format!("\"profile-source:{}\"", archive.reference.digest);
+    source: Option<Extension<crate::worker_source::VerifiedRuntimeRequestSource>>,
+) -> Response {
+    let Some(Extension(_source)) = source else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "runtime_config_source_required" })),
+        )
+            .into_response();
+    };
+    if let Err(error) = validate_workspace_scope(&api, &path.workspace_id) {
+        return error.into_response();
+    }
+    let config_state = match api.config_store.load_workspace_config(&path.workspace_id) {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "workspace_config_not_found" })),
+            )
+                .into_response();
+        }
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+    let profile_projection = match crate::profile_settings::project_profiles_from_workspace_config(
+        &path.workspace_id,
+        &config_state,
+    ) {
+        Ok(projection) => projection,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+    if crate::profile_settings::selector_for_workspace_candidate(
+        &profile_projection,
+        &query.profile,
+    )
+    .is_none()
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "runtime_config_profile_not_found" })),
+        )
+            .into_response();
+    };
+    let prompt_catalog = match api
+        .prompt_projection_cache
+        .resolve(&path.workspace_id, &config_state)
+    {
+        Ok(catalog) => catalog,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+    let Some(bundle) =
+        (match crate::profile_settings::build_virtual_profile_config_bundle_with_prompt_projection(
+            &profile_projection,
+            &config_state,
+            &path.workspace_id,
+            &api.config.workspace_created_at,
+            &query.profile,
+            prompt_catalog.as_ref(),
+        ) {
+            Ok(bundle) => bundle,
+            Err(error) => return ApiError::from(error).into_response(),
+        })
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "runtime_config_profile_not_found" })),
+        )
+            .into_response();
+    };
+    let etag = worker_runtime::config_bundle::workspace_config_etag(&bundle.metadata.digest);
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(ETAG, etag.parse().expect("Workspace Config ETag is valid"));
+    response_headers.insert(
+        CACHE_CONTROL,
+        "no-cache".parse().expect("valid cache policy"),
+    );
     if headers
         .get(IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == etag))
     {
-        let mut response_headers = HeaderMap::new();
-        response_headers.insert(ETAG, etag.parse().unwrap());
-        return Ok((StatusCode::NOT_MODIFIED, response_headers, Vec::new()));
+        return (StatusCode::NOT_MODIFIED, response_headers).into_response();
     }
-    let mut response_headers = HeaderMap::new();
-    response_headers.insert(ETAG, etag.parse().unwrap());
-    response_headers.insert(CONTENT_TYPE, "application/x-tar".parse().unwrap());
-    Ok((StatusCode::OK, response_headers, archive.content))
+    (StatusCode::OK, response_headers, Json(bundle)).into_response()
 }
 
 async fn scoped_list_runtimes(
@@ -25846,42 +25917,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_signed_profile_source_archive_fetch_uses_resource_permission() {
+    async fn runtime_fetches_latest_workspace_config_with_etag_revalidation() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let mut api = test_api(workspace.path()).await;
         let identity =
             worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-test").unwrap();
         configure_runtime_request_auth(&mut api, &identity, "runtime-test");
-        let handle = api.resource_broker.issue_profile_source_archive_handle(
-            TEST_WORKSPACE_ID,
-            crate::resource_broker::BackendResourceTarget::Runtime("runtime-test"),
-            test_profile_archive(),
-        );
-        let path = format!(
-            "/api/w/{TEST_WORKSPACE_ID}/profile-source-archives/{}",
-            handle.digest
-        );
-        let proof = worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&identity)
-            .issue(
-                "server-test",
-                TEST_WORKSPACE_ID,
-                None,
-                worker_runtime::auth::BACKEND_RESOURCE_FETCH_PERMISSION,
-                "GET",
-                &path,
-                b"",
-                i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap_or(i64::MAX),
-                30,
-            )
-            .unwrap();
-        let response = build_router(api)
+        let target =
+            format!("/api/w/{TEST_WORKSPACE_ID}/runtime-config?profile=builtin%3Acompanion");
+        let issue = || {
+            worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&identity)
+                .issue(
+                    "server-test",
+                    TEST_WORKSPACE_ID,
+                    None,
+                    worker_runtime::auth::BACKEND_RESOURCE_FETCH_PERMISSION,
+                    "GET",
+                    &target,
+                    b"",
+                    i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap_or(i64::MAX),
+                    30,
+                )
+                .unwrap()
+        };
+        let app = build_router(api);
+        let response = app
+            .clone()
             .oneshot(
                 Request::builder()
-                    .uri(path)
+                    .uri(&target)
                     .header(
                         worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
-                        proof,
+                        issue(),
                     )
                     .body(Body::empty())
                     .unwrap(),
@@ -25889,12 +25957,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let etag = response.headers().get(ETAG).unwrap().clone();
+        assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-cache");
+        let bundle: worker_runtime::config_bundle::ConfigBundle =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(bundle.profile_source_archive.is_some());
         assert_eq!(
-            response.headers().get(ETAG).unwrap().to_str().unwrap(),
-            format!("\"profile-source:{}\"", handle.digest)
+            etag.to_str().unwrap(),
+            worker_runtime::config_bundle::workspace_config_etag(&bundle.metadata.digest)
         );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(&target)
+                    .header(
+                        worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+                        issue(),
+                    )
+                    .header(IF_NONE_MATCH, etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
         assert!(
-            !to_bytes(response.into_body(), usize::MAX)
+            to_bytes(response.into_body(), usize::MAX)
                 .await
                 .unwrap()
                 .is_empty()
@@ -25994,22 +26084,13 @@ mod tests {
                 "builtin:companion".to_string(),
             ),
             display_name: None,
-            profile_source: worker_runtime::catalog::ProfileSourceArchiveSource::Http {
-                location: worker_runtime::catalog::ProfileSourceArchiveHttpRef {
-                    url: "http://127.0.0.1/profile-source.tar".to_string(),
-                    etag: None,
-                    archive: worker_runtime::profile_archive::ProfileSourceArchiveRef {
-                        id: "test-profile-source".to_string(),
-                        digest: "test-digest".to_string(),
-                        size_bytes: 0,
-                        source_graph: worker_runtime::profile_archive::ProfileSourceGraphSummary {
-                            source_count: 0,
-                            total_source_bytes: 0,
-                            entrypoints: std::collections::BTreeMap::new(),
-                            import_count: 0,
-                        },
-                    },
-                },
+            profile_source: worker_runtime::catalog::ProfileSourceArchiveSource::Embedded {
+                archive: crate::profile_settings::builtin_profile_source_archive(
+                    &worker_runtime::catalog::ProfileSelector::Builtin(
+                        "builtin:default".to_string(),
+                    ),
+                )
+                .unwrap(),
             },
             config_bundle: Some(worker_runtime::catalog::ConfigBundleRef {
                 id: bundle.metadata.id,

@@ -1,6 +1,7 @@
 use crate::catalog::{
-    RepositoryRefObservation, RepositoryRefObservationRequest,
+    ConfigBundleRef, ProfileSelector, RepositoryRefObservation, RepositoryRefObservationRequest,
     WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest, WorkingDirectoryStatus,
+    WorkspaceApiRef,
 };
 use crate::config_bundle::ConfigBundle;
 use crate::error::RuntimeError;
@@ -265,6 +266,22 @@ pub struct WorkerExecutionRestoreRequest {
     pub config_bundle: Option<ConfigBundle>,
 }
 
+/// Runtime-side request to refresh the latest Workspace Config before Worker creation.
+#[derive(Clone, Debug)]
+pub struct WorkspaceConfigFetchRequest {
+    pub workspace_api: WorkspaceApiRef,
+    pub profile: ProfileSelector,
+    pub expected: ConfigBundleRef,
+    pub cached: Option<ConfigBundleRef>,
+}
+
+/// Result of a conditional Workspace Config fetch.
+#[derive(Clone, Debug)]
+pub enum WorkspaceConfigFetchResult {
+    NotModified,
+    Modified(ConfigBundle),
+}
+
 /// Backend outcome for Worker spawn/restore operations.
 #[derive(Clone, Debug)]
 pub enum WorkerExecutionSpawnResult {
@@ -290,6 +307,13 @@ impl WorkerExecutionSpawnResult {
 
 pub trait WorkerExecutionBackend: Send + Sync + 'static {
     fn backend_id(&self) -> &str;
+
+    fn fetch_workspace_config(
+        &self,
+        _request: WorkspaceConfigFetchRequest,
+    ) -> Result<WorkspaceConfigFetchResult, String> {
+        Err("execution backend does not support Workspace Config fetching".to_string())
+    }
 
     fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult;
 
@@ -470,6 +494,13 @@ impl WorkerExecutionBackendRef {
             backend_id,
             backend,
         })
+    }
+
+    pub(crate) fn fetch_workspace_config(
+        &self,
+        request: WorkspaceConfigFetchRequest,
+    ) -> Result<WorkspaceConfigFetchResult, String> {
+        self.backend.fetch_workspace_config(request)
     }
 
     pub(crate) fn spawn_worker(

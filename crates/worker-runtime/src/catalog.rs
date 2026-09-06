@@ -15,32 +15,22 @@ pub enum ProfileSelector {
     Named(String),
 }
 
-/// Runtime fetch/caching metadata for a Backend-authored Decodal profile source archive.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProfileSourceArchiveHttpRef {
-    pub url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub etag: Option<String>,
-    pub archive: ProfileSourceArchiveRef,
-}
-
 /// Profile source material available to a Runtime during Worker creation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProfileSourceArchiveSource {
     /// Backend-internal embedded runtimes may receive already-built archive bytes.
     Embedded { archive: ProfileSourceArchive },
-    /// Standalone runtimes fetch/cache the tar archive over HTTP.
-    Http {
-        location: ProfileSourceArchiveHttpRef,
-    },
+    /// Standalone runtimes resolve this immutable archive from the latest
+    /// Workspace Config bundle before creating the Worker.
+    WorkspaceConfig { archive: ProfileSourceArchiveRef },
 }
 
 impl ProfileSourceArchiveSource {
     pub fn reference(&self) -> ProfileSourceArchiveRef {
         match self {
             Self::Embedded { archive } => archive.reference.clone(),
-            Self::Http { location } => location.archive.clone(),
+            Self::WorkspaceConfig { archive } => archive.clone(),
         }
     }
 }

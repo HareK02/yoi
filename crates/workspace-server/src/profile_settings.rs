@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use config_source::{ConfigContentType, ConfigSchemaContribution, VirtualPath};
-use manifest::{ProfileSource, resolve_profile_artifact_value};
+use manifest::{ProfileSource, builtin_profile_catalog_snapshot, resolve_profile_artifact_value};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use worker::EffectivePromptCatalog;
@@ -361,6 +361,38 @@ pub fn build_virtual_profile_config_bundle(
     )
 }
 
+pub(crate) fn builtin_profile_source_archive(
+    profile: &worker_runtime::catalog::ProfileSelector,
+) -> std::result::Result<ProfileSourceArchive, String> {
+    let selected_profile = match profile {
+        worker_runtime::catalog::ProfileSelector::Builtin(value) => {
+            if value.starts_with("builtin:") {
+                value.clone()
+            } else {
+                format!("builtin:{value}")
+            }
+        }
+        worker_runtime::catalog::ProfileSelector::Named(value) => {
+            return Err(format!(
+                "builtin profile source catalog has no named entrypoint for '{value}'"
+            ));
+        }
+    };
+    let catalog = builtin_profile_catalog_snapshot();
+    if !catalog.entrypoints.contains_key(&selected_profile) {
+        return Err(format!(
+            "builtin profile source catalog has no entrypoint for '{selected_profile}'"
+        ));
+    }
+    ProfileSourceArchive::build(ProfileSourceArchiveInput {
+        id: catalog.id.to_owned(),
+        entrypoints: catalog.entrypoints,
+        imports: catalog.imports,
+        sources: catalog.sources,
+    })
+    .map_err(|error| format!("failed to build builtin profile source archive: {error}"))
+}
+
 pub fn build_virtual_profile_config_bundle_with_prompt_projection(
     projection: &ProfileConfigProjection,
     state: &WorkspaceConfigState,
@@ -371,13 +403,17 @@ pub fn build_virtual_profile_config_bundle_with_prompt_projection(
 ) -> Result<Option<ConfigBundle>> {
     validate_prompt_projection_matches_state(workspace_id, state, prompt_projection)?;
     let prompt_catalog = prompt_projection.catalog().clone();
-    let archive = projection
-        .entries
-        .get(selector)
-        .map(|entry| build_virtual_profile_archive(selector, entry, &projection.sources, state))
-        .transpose()?;
     let profile_selector = selector_for_builtin_candidate(selector)
         .unwrap_or_else(|| worker_runtime::catalog::ProfileSelector::Named(selector.to_string()));
+    let archive = match projection.entries.get(selector) {
+        Some(entry) => Some(build_virtual_profile_archive(
+            selector,
+            entry,
+            &projection.sources,
+            state,
+        )?),
+        None => Some(builtin_profile_source_archive(&profile_selector).map_err(Error::Store)?),
+    };
     let bundle_id = virtual_profile_bundle_id(
         state,
         workspace_id,
