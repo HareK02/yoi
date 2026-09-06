@@ -2338,14 +2338,6 @@ impl WorkspaceApi {
                         Uuid::new_v4().to_string(),
                     )
                 });
-        if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
-            self.store.reserve_worker_workdir_attachment(
-                &self.config.workspace_id,
-                workdir_id,
-                reservation_id,
-                &now_registry_timestamp(),
-            )?;
-        }
         let request_fingerprint = worker_spawn_create_fingerprint(&request)
             .map_err(|message| Error::Config(message.to_string()))?;
         let current_memory_settings = self
@@ -2378,54 +2370,127 @@ impl WorkspaceApi {
             })?;
         let worker_id = reservation.worker_id;
         request.resolved_memory_settings = Some(reservation.memory_settings);
+        let reservation_fingerprint = reservation.create_fingerprint.clone();
         let create_binding = WorkerCreateBinding {
             worker_id,
             create_fingerprint: reservation.create_fingerprint,
         };
-        let result = match self
+        let compensation_context = WorkerSpawnCompensationContext {
+            assignment: None,
+            prepared_workdir_id: attachment_reservation
+                .as_ref()
+                .map(|(workdir_id, _)| workdir_id.as_str()),
+            cleanup_spawned_workdir: false,
+        };
+        if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref()
+            && let Err(error) = self.store.reserve_worker_workdir_attachment(
+                &self.config.workspace_id,
+                workdir_id,
+                reservation_id,
+                &now_registry_timestamp(),
+            )
+        {
+            let mut diagnostics = Vec::new();
+            if let Err(cleanup_error) = self.config_store.fail_worker_create_reservation(
+                &self.config.workspace_id,
+                runtime_id,
+                worker_id,
+                &reservation_fingerprint,
+            ) {
+                diagnostics.push(spawn_compensation_diagnostic(
+                    "worker_spawn_compensation_create_reservation_release_failed",
+                    format!(
+                        "Failed to terminalize Worker create reservation {} and release its resource key: {}",
+                        worker_id,
+                        sanitize_backend_error(&cleanup_error.to_string())
+                    ),
+                ));
+            }
+            return Err(ApiError::with_diagnostics(error, diagnostics));
+        }
+        let mut result = match self
             .runtime
             .spawn_worker(runtime_id, create_binding, request)
         {
             Ok(result) => result,
             Err(error) => {
-                if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
-                    let _ = self.store.release_worker_workdir_attachment_reservation(
-                        &self.config.workspace_id,
-                        workdir_id,
-                        reservation_id,
-                    );
-                }
-                return Err(error.into_error().into());
+                let diagnostics = compensate_failed_workspace_worker_create(
+                    self,
+                    runtime_id,
+                    worker_id,
+                    &reservation_fingerprint,
+                    None,
+                    &compensation_context,
+                    attachment_reservation
+                        .as_ref()
+                        .map(|(workdir_id, reservation_id)| {
+                            (workdir_id.as_str(), reservation_id.as_str())
+                        }),
+                );
+                return Err(ApiError::with_diagnostics(error.into_error(), diagnostics));
             }
         };
         let Some(worker) = result.worker.as_ref() else {
-            if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
-                self.store.release_worker_workdir_attachment_reservation(
-                    &self.config.workspace_id,
-                    workdir_id,
-                    reservation_id,
-                )?;
-            }
+            result
+                .diagnostics
+                .extend(compensate_failed_workspace_worker_create(
+                    self,
+                    runtime_id,
+                    worker_id,
+                    &reservation_fingerprint,
+                    None,
+                    &compensation_context,
+                    attachment_reservation
+                        .as_ref()
+                        .map(|(workdir_id, reservation_id)| {
+                            (workdir_id.as_str(), reservation_id.as_str())
+                        }),
+                ));
             return Ok(result);
         };
         let worker_ref = worker.worker.clone();
         if worker_ref.worker_id != worker_id.to_string() {
-            if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
-                let _ = self.store.release_worker_workdir_attachment_reservation(
-                    &self.config.workspace_id,
-                    workdir_id,
-                    reservation_id,
-                );
-            }
-            return Err(Error::RuntimeOperationFailed {
-                runtime_id: runtime_id.to_string(),
-                code: "workspace_worker_identity_mismatch".to_string(),
-                message: format!(
-                    "Runtime returned Worker {} for reserved Workspace Worker {}",
-                    worker_ref.worker_id, worker_id
-                ),
-            }
-            .into());
+            let diagnostics = compensate_failed_workspace_worker_create(
+                self,
+                runtime_id,
+                worker_id,
+                &reservation_fingerprint,
+                Some(worker),
+                &compensation_context,
+                attachment_reservation
+                    .as_ref()
+                    .map(|(workdir_id, reservation_id)| {
+                        (workdir_id.as_str(), reservation_id.as_str())
+                    }),
+            );
+            return Err(ApiError::with_diagnostics(
+                Error::RuntimeOperationFailed {
+                    runtime_id: runtime_id.to_string(),
+                    code: "workspace_worker_identity_mismatch".to_string(),
+                    message: format!(
+                        "Runtime returned Worker {} for reserved Workspace Worker {}",
+                        worker_ref.worker_id, worker_id
+                    ),
+                },
+                diagnostics,
+            ));
+        }
+        if result.state != WorkerOperationState::Accepted {
+            let diagnostics = compensate_failed_workspace_worker_create(
+                self,
+                runtime_id,
+                worker_id,
+                &reservation_fingerprint,
+                Some(worker),
+                &compensation_context,
+                attachment_reservation
+                    .as_ref()
+                    .map(|(workdir_id, reservation_id)| {
+                        (workdir_id.as_str(), reservation_id.as_str())
+                    }),
+            );
+            result.diagnostics.extend(diagnostics);
+            return Ok(result);
         }
         let replacement = match self
             .runtime
@@ -2433,48 +2498,63 @@ impl WorkspaceApi {
         {
             Ok(replacement) => replacement,
             Err(error) => {
-                let _ = self.runtime.delete_worker(&worker_ref);
-                if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
-                    let _ = self.store.release_worker_workdir_attachment_reservation(
-                        &self.config.workspace_id,
-                        workdir_id,
-                        reservation_id,
-                    );
-                }
-                return Err(error.into_error().into());
+                let diagnostics = compensate_failed_workspace_worker_create(
+                    self,
+                    runtime_id,
+                    worker_id,
+                    &reservation_fingerprint,
+                    Some(worker),
+                    &compensation_context,
+                    attachment_reservation
+                        .as_ref()
+                        .map(|(workdir_id, reservation_id)| {
+                            (workdir_id.as_str(), reservation_id.as_str())
+                        }),
+                );
+                return Err(ApiError::with_diagnostics(error.into_error(), diagnostics));
             }
         };
         if replacement.state != WorkerOperationState::Accepted {
-            let _ = self.runtime.delete_worker(&worker_ref);
-            if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
-                let _ = self.store.release_worker_workdir_attachment_reservation(
-                    &self.config.workspace_id,
-                    workdir_id,
-                    reservation_id,
-                );
-            }
-            return Err(Error::RuntimeOperationFailed {
-                runtime_id: runtime_id.to_string(),
-                code: "worker_workspace_api_replace_failed".to_string(),
-                message: replacement
-                    .diagnostics
-                    .first()
-                    .map(|diagnostic| diagnostic.message.clone())
-                    .unwrap_or_else(|| {
-                        "Runtime rejected Workspace API replacement after spawn".to_string()
+            let diagnostics = compensate_failed_workspace_worker_create(
+                self,
+                runtime_id,
+                worker_id,
+                &reservation_fingerprint,
+                Some(worker),
+                &compensation_context,
+                attachment_reservation
+                    .as_ref()
+                    .map(|(workdir_id, reservation_id)| {
+                        (workdir_id.as_str(), reservation_id.as_str())
                     }),
-            }
-            .into());
+            );
+            return Err(ApiError::with_diagnostics(
+                Error::RuntimeOperationFailed {
+                    runtime_id: runtime_id.to_string(),
+                    code: "worker_workspace_api_replace_failed".to_string(),
+                    message: replacement
+                        .diagnostics
+                        .first()
+                        .map(|diagnostic| diagnostic.message.clone())
+                        .unwrap_or_else(|| {
+                            "Runtime rejected Workspace API replacement after spawn".to_string()
+                        }),
+                },
+                diagnostics,
+            ));
         }
         if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
             if let Err(error) = parse_runtime_worker_id_for_registry(&worker.worker.worker_id) {
-                let _ = self.runtime.delete_worker(&worker_ref);
-                let _ = self.store.release_worker_workdir_attachment_reservation(
-                    &self.config.workspace_id,
-                    workdir_id,
-                    reservation_id,
+                let diagnostics = compensate_failed_workspace_worker_create(
+                    self,
+                    runtime_id,
+                    worker_id,
+                    &reservation_fingerprint,
+                    Some(worker),
+                    &compensation_context,
+                    Some((workdir_id.as_str(), reservation_id.as_str())),
                 );
-                return Err(error);
+                return Err(api_error_with_additional_diagnostics(error, diagnostics));
             }
             let compensation_context = WorkerSpawnCompensationContext {
                 assignment: None,
@@ -2489,20 +2569,23 @@ impl WorkspaceApi {
                 WorkerRegistryDisplayNamePolicy::PreserveExisting,
             )
             .map(|_| ());
-            if let Err(mut error) = finalize_worker_spawn_stage(
+            if let Err(error) = finalize_worker_spawn_stage(
                 self,
                 worker,
                 &compensation_context,
                 WorkerSpawnFinalizeStage::WorkerRegistry,
                 registry_result,
             ) {
-                append_attachment_reservation_release_diagnostic(
+                let diagnostics = compensate_failed_workspace_worker_create(
                     self,
-                    workdir_id,
-                    reservation_id,
-                    &mut error,
+                    runtime_id,
+                    worker_id,
+                    &reservation_fingerprint,
+                    None,
+                    &compensation_context,
+                    Some((workdir_id.as_str(), reservation_id.as_str())),
                 );
-                return Err(error);
+                return Err(api_error_with_additional_diagnostics(error, diagnostics));
             }
 
             let attachment = WorkerWorkdirLinkRecord {
@@ -2517,25 +2600,43 @@ impl WorkspaceApi {
                 .store
                 .finalize_reserved_worker_workdir_attachment(&attachment, reservation_id)
                 .map_err(ApiError::from);
-            if let Err(mut error) = finalize_worker_spawn_stage(
+            if let Err(error) = finalize_worker_spawn_stage(
                 self,
                 worker,
                 &compensation_context,
                 WorkerSpawnFinalizeStage::WorkdirAttachment,
                 attachment_result,
             ) {
-                append_attachment_reservation_release_diagnostic(
+                let diagnostics = compensate_failed_workspace_worker_create(
                     self,
-                    workdir_id,
-                    reservation_id,
-                    &mut error,
+                    runtime_id,
+                    worker_id,
+                    &reservation_fingerprint,
+                    None,
+                    &compensation_context,
+                    Some((workdir_id.as_str(), reservation_id.as_str())),
                 );
-                return Err(error);
+                return Err(api_error_with_additional_diagnostics(error, diagnostics));
             }
         }
-        self.config_store
+        if let Err(error) = self
+            .config_store
             .complete_worker_create_reservation(&self.config.workspace_id, worker_id)
-            .map_err(|error| Error::Config(error.to_string()))?;
+        {
+            let diagnostics = compensate_failed_workspace_worker_create(
+                self,
+                runtime_id,
+                worker_id,
+                &reservation_fingerprint,
+                Some(worker),
+                &compensation_context,
+                None,
+            );
+            return Err(ApiError::with_diagnostics(
+                Error::Config(error.to_string()),
+                diagnostics,
+            ));
+        }
         Ok(result)
     }
 
@@ -14174,25 +14275,87 @@ fn finalize_worker_spawn_stage<T>(
     ))
 }
 
-fn append_attachment_reservation_release_diagnostic(
+fn api_error_with_additional_diagnostics(
+    mut error: ApiError,
+    diagnostics: Vec<RuntimeDiagnostic>,
+) -> ApiError {
+    error.diagnostics.extend(diagnostics);
+    error
+}
+
+fn compensate_failed_workspace_worker_create(
     api: &WorkspaceApi,
-    workdir_id: &str,
-    reservation_id: &str,
-    error: &mut ApiError,
-) {
-    if let Err(release_error) = api.store.release_worker_workdir_attachment_reservation(
-        &api.config.workspace_id,
-        workdir_id,
-        reservation_id,
-    ) {
-        error.diagnostics.push(spawn_compensation_diagnostic(
+    runtime_id: &str,
+    reservation_worker_id: WorkerId,
+    create_fingerprint: &str,
+    worker: Option<&WorkerSummary>,
+    context: &WorkerSpawnCompensationContext<'_>,
+    attachment_reservation: Option<(&str, &str)>,
+) -> Vec<RuntimeDiagnostic> {
+    let mut diagnostics = Vec::new();
+    let reserved_worker_ref =
+        RuntimeWorkerRef::new(runtime_id.to_string(), reservation_worker_id.to_string());
+    let mut reserved_worker_absent = false;
+    if let Some(worker) = worker {
+        let (returned_worker_absent, delete_diagnostics) =
+            delete_runtime_worker_for_spawn_compensation(api, &worker.worker);
+        diagnostics.extend(delete_diagnostics);
+        if returned_worker_absent {
+            diagnostics.extend(finalize_spawn_compensation_after_worker_delete(
+                api, worker, context,
+            ));
+        }
+        if worker.worker == reserved_worker_ref {
+            reserved_worker_absent = returned_worker_absent;
+        }
+    }
+    if !reserved_worker_absent {
+        let (worker_absent, delete_diagnostics) =
+            delete_runtime_worker_for_spawn_compensation(api, &reserved_worker_ref);
+        reserved_worker_absent = worker_absent;
+        diagnostics.extend(delete_diagnostics);
+    }
+    if let Some((workdir_id, reservation_id)) = attachment_reservation
+        && let Err(error) = api.store.release_worker_workdir_attachment_reservation(
+            &api.config.workspace_id,
+            workdir_id,
+            reservation_id,
+        )
+    {
+        diagnostics.push(spawn_compensation_diagnostic(
             "worker_spawn_compensation_attachment_reservation_release_failed",
             format!(
                 "Failed to release Workdir `{workdir_id}` attachment reservation `{reservation_id}`: {}",
-                sanitize_backend_error(&release_error.to_string())
+                sanitize_backend_error(&error.to_string())
             ),
         ));
     }
+    if reserved_worker_absent {
+        if let Err(error) = api.config_store.fail_worker_create_reservation(
+            &api.config.workspace_id,
+            runtime_id,
+            reservation_worker_id,
+            create_fingerprint,
+        ) {
+            diagnostics.push(spawn_compensation_diagnostic(
+                "worker_spawn_compensation_create_reservation_release_failed",
+                format!(
+                    "Failed to terminalize Worker create reservation {} and release its resource key: {}",
+                    reservation_worker_id,
+                    sanitize_backend_error(&error.to_string())
+                ),
+            ));
+        }
+    } else {
+        diagnostics.push(spawn_compensation_diagnostic(
+            "worker_spawn_compensation_create_reservation_retained",
+            format!(
+                "Retained Worker create reservation {} and its resource key because Runtime Worker absence could not be confirmed",
+                reservation_worker_id
+            ),
+        ));
+    }
+    diagnostics
 }
 
 fn compensate_failed_worker_spawn(
@@ -14200,6 +14363,21 @@ fn compensate_failed_worker_spawn(
     worker: &WorkerSummary,
     context: &WorkerSpawnCompensationContext<'_>,
 ) -> Vec<RuntimeDiagnostic> {
+    let (runtime_deleted, mut diagnostics) =
+        delete_runtime_worker_for_spawn_compensation(api, &worker.worker);
+    if !runtime_deleted {
+        return diagnostics;
+    }
+    diagnostics.extend(finalize_spawn_compensation_after_worker_delete(
+        api, worker, context,
+    ));
+    diagnostics
+}
+
+fn delete_runtime_worker_for_spawn_compensation(
+    api: &WorkspaceApi,
+    worker_ref: &RuntimeWorkerRef,
+) -> (bool, Vec<RuntimeDiagnostic>) {
     let mut diagnostics = Vec::new();
     let lifecycle_request = WorkerLifecycleRequest {
         reason: Some("Backend spawn finalize failed; compensating Runtime Worker".to_string()),
@@ -14207,8 +14385,8 @@ fn compensate_failed_worker_spawn(
     };
     let cancellation = api
         .runtime
-        .cancel_worker(&worker.worker, lifecycle_request.clone());
-    let stop = api.runtime.stop_worker(&worker.worker, lifecycle_request);
+        .cancel_worker(worker_ref, lifecycle_request.clone());
+    let stop = api.runtime.stop_worker(worker_ref, lifecycle_request);
     let stop_accepted = stop
         .as_ref()
         .is_ok_and(|result| result.state == WorkerOperationState::Accepted);
@@ -14218,12 +14396,12 @@ fn compensate_failed_worker_spawn(
         format!("{cancellation}; {stop}")
     });
 
-    let runtime_deleted = match api.runtime.delete_worker(&worker.worker) {
+    let runtime_deleted = match api.runtime.delete_worker(worker_ref) {
         Ok(result) if result.state == WorkerOperationState::Accepted && result.deleted => true,
         Ok(result) => {
             let mut message = format!(
                 "Runtime did not delete Worker {}:{}: state={:?}, deleted={}",
-                worker.worker.runtime_id, worker.worker.worker_id, result.state, result.deleted
+                worker_ref.runtime_id, worker_ref.worker_id, result.state, result.deleted
             );
             if let Some(detail) = termination_detail.as_deref() {
                 message.push_str(&format!("; cancellation: {detail}"));
@@ -14244,8 +14422,8 @@ fn compensate_failed_worker_spawn(
         Err(error) => {
             let mut message = format!(
                 "Failed to delete Runtime Worker {}:{}: {}",
-                worker.worker.runtime_id,
-                worker.worker.worker_id,
+                worker_ref.runtime_id,
+                worker_ref.worker_id,
                 error.message()
             );
             if let Some(detail) = termination_detail.as_deref() {
@@ -14258,13 +14436,7 @@ fn compensate_failed_worker_spawn(
             false
         }
     };
-    if !runtime_deleted {
-        return diagnostics;
-    }
-    diagnostics.extend(finalize_spawn_compensation_after_worker_delete(
-        api, worker, context,
-    ));
-    diagnostics
+    (runtime_deleted, diagnostics)
 }
 
 fn finalize_spawn_compensation_after_worker_delete(
@@ -14336,6 +14508,20 @@ fn finalize_spawn_compensation_after_worker_delete(
                 )),
             }
         }
+    }
+    if let Ok(worker_id) = parse_runtime_worker_id_for_registry(&worker.worker.worker_id)
+        && let Err(error) = api
+            .config_store
+            .release_removed_worker_resource_key(&api.config.workspace_id, worker_id)
+    {
+        diagnostics.push(spawn_compensation_diagnostic(
+            "worker_spawn_compensation_resource_key_release_failed",
+            format!(
+                "Failed to release removed Workspace Worker resource key {}: {}",
+                worker.worker.worker_id,
+                sanitize_backend_error(&error.to_string())
+            ),
+        ));
     }
     diagnostics
 }
@@ -18886,6 +19072,25 @@ mod tests {
         }));
         assert!(find_workspace_orchestrator(&api).is_none());
         assert!(!workspace_orchestrator_response(&api, "failed").online);
+        let (reserved_creates, worker_resource_keys): (i64, i64) = api
+            .config_store
+            .with_conn(|conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM worker_create_reservations WHERE state = 'reserved'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM workspace_resource_keys WHERE resource_kind = 'worker'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(reserved_creates, 0);
+        assert_eq!(worker_resource_keys, 0);
 
         let Json(retried) = scoped_start_workspace_orchestrator(
             State(api),

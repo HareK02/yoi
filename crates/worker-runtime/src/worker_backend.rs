@@ -1216,6 +1216,7 @@ pub struct WorkerRuntimeExecutionBackend<F = ProfileRuntimeWorkerFactory> {
     working_directory_materializer: Option<Arc<dyn WorkingDirectoryMaterializer>>,
     runtime: Mutex<Option<Runtime>>,
     workers: Mutex<HashMap<crate::identity::WorkerRef, RuntimeWorkerExecution>>,
+    spawn_restore_timeout: Duration,
 }
 
 impl WorkerRuntimeExecutionBackend<ProfileRuntimeWorkerFactory> {
@@ -1243,6 +1244,7 @@ where
             working_directory_materializer: None,
             runtime: Mutex::new(Some(runtime)),
             workers: Mutex::new(HashMap::new()),
+            spawn_restore_timeout: RUNTIME_TASK_TIMEOUT,
         })
     }
 
@@ -1256,6 +1258,12 @@ where
         materializer: impl WorkingDirectoryMaterializer,
     ) -> Self {
         self.working_directory_materializer = Some(Arc::new(materializer));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_spawn_restore_timeout(mut self, timeout: Duration) -> Self {
+        self.spawn_restore_timeout = timeout;
         self
     }
 
@@ -1295,6 +1303,39 @@ where
             let _ = tx.send(result);
         })?;
         Self::wait_for_runtime_task(rx)
+    }
+
+    fn run_spawn_restore_on_adapter_runtime<T, Fut>(&self, task: Fut) -> Result<T, String>
+    where
+        T: Send + 'static,
+        Fut: Future<Output = Result<T, String>> + Send + 'static,
+    {
+        let timeout = self.spawn_restore_timeout;
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.spawn_on_adapter_runtime(async move {
+            let mut handle = tokio::spawn(task);
+            let result = tokio::select! {
+                biased;
+                result = &mut handle => match result {
+                    Ok(result) => result,
+                    Err(err) => Err(format!("worker adapter task failed: {err}")),
+                },
+                _ = tokio::time::sleep(timeout) => {
+                    handle.abort();
+                    match handle.await {
+                        Ok(result) => result,
+                        Err(err) if err.is_cancelled() => Err(format!(
+                            "worker adapter task did not complete within {} seconds and was cancelled",
+                            timeout.as_secs_f64()
+                        )),
+                        Err(err) => Err(format!("worker adapter task failed: {err}")),
+                    }
+                }
+            };
+            let _ = tx.send(result);
+        })?;
+        rx.recv()
+            .map_err(|err| format!("worker adapter task did not complete: {err}"))?
     }
 
     fn get_execution(
@@ -1756,8 +1797,9 @@ where
         let factory = self.factory.clone();
         let bridge_context = request.context.clone();
         let worker_ref = request.worker_ref.clone();
-        let spawn_result =
-            self.run_on_adapter_runtime(async move { factory.spawn_controller(request).await });
+        let spawn_result = self.run_spawn_restore_on_adapter_runtime(async move {
+            factory.spawn_controller(request).await
+        });
 
         let controller = match spawn_result {
             Ok(controller) => controller,
@@ -1859,8 +1901,9 @@ where
         let factory = self.factory.clone();
         let bridge_context = request.context.clone();
         let worker_ref = request.worker_ref.clone();
-        let restore_result =
-            self.run_on_adapter_runtime(async move { factory.restore_controller(request).await });
+        let restore_result = self.run_spawn_restore_on_adapter_runtime(async move {
+            factory.restore_controller(request).await
+        });
 
         let controller = match restore_result {
             Ok(controller) => controller,
@@ -2100,21 +2143,24 @@ where
         if let Err(message) = shutdown_wait {
             return WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message);
         }
-        if let Err(error) = artifact_cleanup.delete_uncommitted_uploaded_files() {
-            return WorkerExecutionResult::errored(
-                WorkerExecutionOperation::Stop,
-                format!("uploaded_file_cleanup_failed: {error}"),
-            );
-        }
+        let artifact_cleanup_error = artifact_cleanup
+            .delete_uncommitted_uploaded_files()
+            .err()
+            .map(|error| format!("uploaded_file_cleanup_failed: {error}"));
         match self.workers.lock() {
             Ok(mut workers) => {
                 workers.remove(handle.worker_ref());
-                result
             }
-            Err(_) => WorkerExecutionResult::errored(
-                WorkerExecutionOperation::Stop,
-                "worker adapter registry lock is poisoned after shutdown",
-            ),
+            Err(poisoned) => {
+                poisoned.into_inner().remove(handle.worker_ref());
+            }
+        }
+        if let Some(message) = artifact_cleanup_error {
+            let mut result = result;
+            result.message = Some(message);
+            result
+        } else {
+            result
         }
     }
 
@@ -2178,7 +2224,7 @@ mod tests {
     use std::fs;
     use std::pin::Pin;
     use std::process::Command;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::Runtime as EmbeddedRuntime;
     use crate::catalog::{
@@ -2487,6 +2533,87 @@ mod tests {
     #[cfg(not(feature = "ws-server"))]
     fn test_execution_context(worker_ref: WorkerRef) -> WorkerExecutionContext {
         WorkerExecutionContext::new(worker_ref)
+    }
+
+    struct DelayedFactory {
+        completed: Arc<AtomicBool>,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl RuntimeWorkerFactory for DelayedFactory {
+        async fn spawn_controller(
+            &self,
+            _request: WorkerExecutionSpawnRequest,
+        ) -> Result<RuntimeWorkerController, String> {
+            tokio::time::sleep(self.delay).await;
+            self.completed.store(true, Ordering::SeqCst);
+            Err("delayed factory completed".to_string())
+        }
+
+        async fn restore_controller(
+            &self,
+            _request: WorkerExecutionRestoreRequest,
+        ) -> Result<RuntimeWorkerController, String> {
+            tokio::time::sleep(self.delay).await;
+            self.completed.store(true, Ordering::SeqCst);
+            Err("delayed factory completed".to_string())
+        }
+    }
+
+    #[test]
+    fn create_timeout_cancels_factory_and_removes_persisted_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_store_dir = root.path().join("runtime");
+        let completed = Arc::new(AtomicBool::new(false));
+        let backend = Arc::new(
+            WorkerRuntimeExecutionBackend::new(DelayedFactory {
+                completed: completed.clone(),
+                delay: Duration::from_millis(200),
+            })
+            .unwrap()
+            .with_spawn_restore_timeout(Duration::from_millis(20)),
+        );
+        let runtime = EmbeddedRuntime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions {
+                root: runtime_store_dir.clone(),
+                runtime_id: "create-timeout-runtime".to_string(),
+                display_name: None,
+            },
+            backend.clone(),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let request = create_request("create timeout");
+        let worker_id = request.worker_id;
+        let create_runtime = runtime.clone();
+        let create = std::thread::spawn(move || create_runtime.create_worker(request));
+        std::thread::sleep(Duration::from_millis(5));
+
+        let delete_error = runtime
+            .delete_worker(&crate::identity::WorkerRef::new(worker_id))
+            .unwrap_err();
+        let error = create.join().unwrap().unwrap_err();
+
+        assert!(matches!(
+            delete_error,
+            crate::error::RuntimeError::WorkerNotFound { worker_id: missing } if missing == worker_id
+        ));
+        assert!(error.to_string().contains("was cancelled"));
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "timed out factory future must not resume after create returns"
+        );
+        assert!(runtime.list_workers().unwrap().is_empty());
+        assert!(backend.workers.lock().unwrap().is_empty());
+        assert!(
+            !runtime_store_dir
+                .join("workers")
+                .join(worker_id.to_string())
+                .exists(),
+            "failed create must remove its persisted Worker aggregate"
+        );
     }
 
     struct MockFactory {

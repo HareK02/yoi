@@ -153,6 +153,7 @@ impl Drop for RuntimeEventSelectorSubscription {
 #[derive(Clone, Debug)]
 pub struct Runtime {
     inner: Arc<Mutex<RuntimeState>>,
+    worker_operations: Arc<Mutex<BTreeMap<WorkerId, Arc<Mutex<()>>>>>,
 }
 
 impl Runtime {
@@ -166,6 +167,7 @@ impl Runtime {
         let state = RuntimeState::new(options.display_name);
         Self {
             inner: Arc::new(Mutex::new(state)),
+            worker_operations: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -222,6 +224,7 @@ impl Runtime {
         state.execution_backend = execution_backend;
         let runtime = Self {
             inner: Arc::new(Mutex::new(state)),
+            worker_operations: Arc::new(Mutex::new(BTreeMap::new())),
         };
         runtime.restore_persisted_worker_executions()?;
         Ok(runtime)
@@ -781,6 +784,10 @@ impl Runtime {
         request: CreateWorkerRequest,
         scope: Option<&RuntimeWorkspaceScope>,
     ) -> Result<WorkerDetail, RuntimeError> {
+        let operation_lock = self.worker_operation_lock(request.worker_id)?;
+        let _operation_guard = operation_lock
+            .lock()
+            .map_err(|_| RuntimeError::StatePoisoned)?;
         if let Some(existing) = self.existing_worker_for_create(&request, scope)? {
             return Ok(existing);
         }
@@ -893,8 +900,7 @@ impl Runtime {
             initial_input.submission_request_id = Some(expected_submission_id.clone());
             let dispatch_result = backend.dispatch_input(&handle, initial_input.clone());
             if !dispatch_result.is_accepted() {
-                let _ = backend.stop_worker(&handle);
-                self.rollback_failed_create(&worker_ref)?;
+                self.cleanup_connected_failed_create(&backend, &worker_ref, &handle)?;
                 return Err(RuntimeError::WorkerExecutionRejected {
                     worker_id: worker_ref.worker_id.clone(),
                     operation: dispatch_result.operation,
@@ -908,8 +914,7 @@ impl Runtime {
                 .as_ref()
                 .is_some_and(|ack| ack.submission_request_id == expected_submission_id);
             if !has_commit_ack {
-                let _ = backend.stop_worker(&handle);
-                self.rollback_failed_create(&worker_ref)?;
+                self.cleanup_connected_failed_create(&backend, &worker_ref, &handle)?;
                 let result = WorkerExecutionResult::rejected(
                     WorkerExecutionOperation::Input,
                     "execution backend accepted initial input without a durable session commit acknowledgement",
@@ -922,21 +927,36 @@ impl Runtime {
                     result,
                 });
             }
-            let detail = self.commit_created_worker(
+            let detail = match self.commit_created_worker(
                 &worker_ref,
-                handle,
+                handle.clone(),
                 working_directory,
                 dispatch_result,
-            )?;
-            self.record_input_observation(&worker_ref, initial_input)?;
+            ) {
+                Ok(detail) => detail,
+                Err(error) => {
+                    self.cleanup_connected_failed_create(&backend, &worker_ref, &handle)?;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.record_input_observation(&worker_ref, initial_input) {
+                self.cleanup_connected_failed_create(&backend, &worker_ref, &handle)?;
+                return Err(error);
+            }
             Ok(detail)
         } else {
-            self.commit_created_worker(
+            match self.commit_created_worker(
                 &worker_ref,
-                handle,
+                handle.clone(),
                 working_directory,
                 WorkerExecutionResult::accepted(WorkerExecutionOperation::Spawn),
-            )
+            ) {
+                Ok(detail) => Ok(detail),
+                Err(error) => {
+                    self.cleanup_connected_failed_create(&backend, &worker_ref, &handle)?;
+                    Err(error)
+                }
+            }
         }
     }
 
@@ -1639,14 +1659,43 @@ impl Runtime {
         Ok(detail)
     }
 
+    fn cleanup_connected_failed_create(
+        &self,
+        backend: &WorkerExecutionBackendRef,
+        worker_ref: &WorkerRef,
+        handle: &WorkerExecutionHandle,
+    ) -> Result<(), RuntimeError> {
+        let stop_result = backend.stop_worker(handle);
+        if stop_result.is_accepted() {
+            return self.rollback_failed_create(worker_ref);
+        }
+        let mut state = self.lock()?;
+        let record = state.worker_mut(worker_ref)?;
+        record.execution_handle = Some(handle.clone());
+        record.worker_state = stop_result.worker_state.clone();
+        state.persist_runtime_snapshot()?;
+        state.persist_worker(&worker_ref.worker_id)?;
+        Ok(())
+    }
+
     fn rollback_failed_create(&self, worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
-        if let Some(record) = state.workers.remove(&worker_ref.worker_id) {
+        if state.workers.contains_key(&worker_ref.worker_id) {
+            state.delete_worker_snapshot(&worker_ref.worker_id)?;
+            let record = state
+                .workers
+                .remove(&worker_ref.worker_id)
+                .expect("Worker existence checked before failed-create rollback");
             let workspace_id = record.workspace_id.clone();
             if let Some(workspace_id) = workspace_id.as_deref() {
                 state.forget_workspace_owner_if_unused(workspace_id);
             }
+            #[cfg(feature = "ws-server")]
+            state
+                .observation_events
+                .retain(|event| event.worker_ref != *worker_ref);
             state.publish_worker_removed(worker_ref.worker_id, workspace_id.as_deref())?;
+            state.persist_runtime_snapshot()?;
         }
         Ok(())
     }
@@ -1800,6 +1849,10 @@ impl Runtime {
         &self,
         worker_ref: &WorkerRef,
     ) -> Result<WorkerDeleteResult, RuntimeError> {
+        let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
+        let _operation_guard = operation_lock
+            .lock()
+            .map_err(|_| RuntimeError::StatePoisoned)?;
         let mut state = self.lock()?;
         state.ensure_running()?;
         state.ensure_worker_ref(worker_ref)?;
@@ -2258,6 +2311,17 @@ impl Runtime {
         state.workers.remove(&request.worker_id);
         state.persist_runtime_snapshot()?;
         Ok(result)
+    }
+
+    fn worker_operation_lock(&self, worker_id: WorkerId) -> Result<Arc<Mutex<()>>, RuntimeError> {
+        let mut operations = self
+            .worker_operations
+            .lock()
+            .map_err(|_| RuntimeError::StatePoisoned)?;
+        Ok(operations
+            .entry(worker_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone())
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, RuntimeState>, RuntimeError> {

@@ -1468,6 +1468,146 @@ impl SqliteWorkspaceStore {
         })
     }
 
+    pub(crate) fn fail_worker_create_reservation(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        worker_id: WorkerId,
+        create_fingerprint: &str,
+    ) -> Result<()> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let reservation = tx
+                .query_row(
+                    "SELECT runtime_id, create_fingerprint, state \
+                     FROM worker_create_reservations \
+                     WHERE workspace_id = ?1 AND worker_id = ?2",
+                    params![workspace_id, worker_id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    Error::Store(format!(
+                        "Worker create reservation {} was not found",
+                        worker_id
+                    ))
+                })?;
+            if reservation.0 != runtime_id || reservation.1 != create_fingerprint {
+                return Err(Error::InvalidInput(format!(
+                    "Worker create reservation {} does not match the failed create",
+                    worker_id
+                )));
+            }
+            let registry_exists = tx
+                .query_row(
+                    "SELECT 1 FROM worker_registry \
+                     WHERE workspace_id = ?1 AND worker_id = ?2 LIMIT 1",
+                    params![workspace_id, worker_id.to_string()],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if registry_exists {
+                return Err(Error::InvalidInput(format!(
+                    "Worker create reservation {} cannot fail while its registry row exists",
+                    worker_id
+                )));
+            }
+            match reservation.2.as_str() {
+                "reserved" | "created" => {
+                    tx.execute(
+                        "UPDATE worker_create_reservations \
+                         SET state = 'removed', updated_at = ?3 \
+                         WHERE workspace_id = ?1 AND worker_id = ?2 AND state IN ('reserved', 'created')",
+                        params![
+                            workspace_id,
+                            worker_id.to_string(),
+                            chrono::Utc::now().to_rfc3339()
+                        ],
+                    )?;
+                }
+                "removed" => {}
+                state => {
+                    return Err(Error::InvalidInput(format!(
+                        "Worker create reservation {} cannot fail from state {state}",
+                        worker_id
+                    )));
+                }
+            }
+            tx.execute(
+                "DELETE FROM workspace_resource_keys \
+                 WHERE workspace_id = ?1 AND resource_kind = ?2 AND resource_id = ?3",
+                params![
+                    workspace_id,
+                    WorkspaceResourceKind::Worker.as_str(),
+                    worker_id.to_string()
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn release_removed_worker_resource_key(
+        &self,
+        workspace_id: &str,
+        worker_id: WorkerId,
+    ) -> Result<bool> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let reservation_state = tx
+                .query_row(
+                    "SELECT state FROM worker_create_reservations \
+                     WHERE workspace_id = ?1 AND worker_id = ?2",
+                    params![workspace_id, worker_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(reservation_state) = reservation_state else {
+                tx.commit()?;
+                return Ok(false);
+            };
+            if reservation_state != "removed" {
+                return Err(Error::InvalidInput(format!(
+                    "Worker resource key {} cannot be released from create reservation state {reservation_state}",
+                    worker_id
+                )));
+            }
+            let registry_exists = tx
+                .query_row(
+                    "SELECT 1 FROM worker_registry \
+                     WHERE workspace_id = ?1 AND worker_id = ?2 LIMIT 1",
+                    params![workspace_id, worker_id.to_string()],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if registry_exists {
+                return Err(Error::InvalidInput(format!(
+                    "Worker resource key {} cannot be released while its registry row exists",
+                    worker_id
+                )));
+            }
+            let released = tx.execute(
+                "DELETE FROM workspace_resource_keys \
+                 WHERE workspace_id = ?1 AND resource_kind = ?2 AND resource_id = ?3",
+                params![
+                    workspace_id,
+                    WorkspaceResourceKind::Worker.as_str(),
+                    worker_id.to_string()
+                ],
+            )? > 0;
+            tx.commit()?;
+            Ok(released)
+        })
+    }
+
     fn materialize_workspace_config(&self, workspace_id: &str, created_at: &str) -> Result<()> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -8681,6 +8821,58 @@ mod tests {
             Some("W-2")
         );
         store
+            .fail_worker_create_reservation(
+                "workspace-a",
+                "arcadia",
+                second.worker_id,
+                &second.create_fingerprint,
+            )
+            .unwrap();
+        store
+            .fail_worker_create_reservation(
+                "workspace-a",
+                "arcadia",
+                second.worker_id,
+                &second.create_fingerprint,
+            )
+            .unwrap();
+        assert!(
+            !store
+                .has_active_worker_create_reservation(
+                    "workspace-a",
+                    &RuntimeWorkerRef::new("arcadia", second.worker_id.to_string())
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .resource_key(
+                    "workspace-a",
+                    WorkspaceResourceKind::Worker,
+                    &second.worker_id.to_string()
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .resolve_resource_reference("workspace-a", WorkspaceResourceKind::Worker, "W-2")
+                .unwrap(),
+            None
+        );
+        let failed_state: String = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT state FROM worker_create_reservations \
+                     WHERE workspace_id = 'workspace-a' AND worker_id = ?1",
+                    [second.worker_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(Error::from)
+            })
+            .unwrap();
+        assert_eq!(failed_state, "removed");
+        store
             .complete_worker_create_reservation("workspace-a", reserved.worker_id)
             .unwrap();
         assert!(
@@ -8714,6 +8906,16 @@ mod tests {
             .unwrap();
         assert!(
             store
+                .fail_worker_create_reservation(
+                    "workspace-a",
+                    "arcadia",
+                    reserved.worker_id,
+                    &reserved.create_fingerprint,
+                )
+                .is_err()
+        );
+        assert!(
+            store
                 .delete_worker_registry("workspace-a", &reserved_worker)
                 .unwrap()
         );
@@ -8729,6 +8931,29 @@ mod tests {
             })
             .unwrap();
         assert_eq!(removed_state, "removed");
+        assert!(
+            store
+                .release_removed_worker_resource_key("workspace-a", reserved.worker_id)
+                .unwrap()
+        );
+        store
+            .fail_worker_create_reservation(
+                "workspace-a",
+                "arcadia",
+                reserved.worker_id,
+                &reserved.create_fingerprint,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .resource_key(
+                    "workspace-a",
+                    WorkspaceResourceKind::Worker,
+                    &reserved.worker_id.to_string(),
+                )
+                .unwrap(),
+            None
+        );
         assert!(
             store
                 .reserve_worker_create(
