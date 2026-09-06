@@ -375,6 +375,19 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
     ) -> Result<WorkspaceDeletionOperationResponse> {
         validate_operation_projection(child_operation_ids, blockers)?;
         self.with_transaction(|tx| {
+            let current = read_operation(tx, operation_id)?
+                .ok_or_else(|| Error::InvalidInput("Workspace deletion operation".to_string()))?
+                .response;
+            let mut merged_child_operation_ids = current.child_operation_ids;
+            for child_operation_id in child_operation_ids {
+                if !merged_child_operation_ids
+                    .iter()
+                    .any(|existing| existing == child_operation_id)
+                {
+                    merged_child_operation_ids.push(child_operation_id.clone());
+                }
+            }
+            validate_operation_projection(&merged_child_operation_ids, blockers)?;
             let now = Utc::now().to_rfc3339();
             let completed_at =
                 matches!(state, WorkspaceDeletionState::Succeeded).then_some(now.as_str());
@@ -386,7 +399,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 params![
                     operation_id,
                     deletion_state_label(state),
-                    serde_json::to_string(child_operation_ids)
+                    serde_json::to_string(&merged_child_operation_ids)
                         .map_err(|error| Error::Store(error.to_string()))?,
                     serde_json::to_string(blockers)
                         .map_err(|error| Error::Store(error.to_string()))?,
@@ -660,10 +673,24 @@ fn workspace_database_blockers(
             "Remove current Ticket assignments before deleting the Workspace.",
         ),
         (
-            "SELECT COUNT(*) FROM worker_create_reservations WHERE workspace_id = ?1 AND state = 'reserved'",
+            "SELECT COUNT(*)
+             FROM worker_create_reservations reservation
+             WHERE reservation.workspace_id = ?1
+               AND (
+                    reservation.state = 'reserved'
+                    OR (
+                        reservation.state = 'created'
+                        AND NOT EXISTS (
+                            SELECT 1 FROM worker_registry worker
+                            WHERE worker.workspace_id = reservation.workspace_id
+                              AND worker.runtime_id = reservation.runtime_id
+                              AND worker.worker_id = reservation.worker_id
+                        )
+                    )
+               )",
             WorkspaceDeletionBlockerKind::CleanupUnavailable,
             "worker",
-            "Wait for or cancel pending Worker creation reservations.",
+            "Reconcile pending or incompletely finalized Worker creation reservations.",
         ),
         (
             "SELECT COUNT(*) FROM worker_removal_operations WHERE workspace_id = ?1 AND state IN ('planned', 'blocked', 'executing', 'failed', 'stale')",
@@ -940,6 +967,19 @@ mod tests {
             duplicate.child_operation_ids,
             with_child.child_operation_ids
         );
+        let stale_failure_update = store
+            .update_workspace_deletion_operation(
+                &request.operation_id,
+                WorkspaceDeletionState::Blocked,
+                &[],
+                &[],
+                Some("retryable_failure"),
+            )
+            .expect("stale failure update");
+        assert_eq!(
+            stale_failure_update.child_operation_ids,
+            with_child.child_operation_ids
+        );
         let completed = store
             .finalize_workspace_deletion(&request.operation_id)
             .expect("finalize");
@@ -1025,7 +1065,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_worker_and_workdir_creation_block_reservation_without_orphans() {
+    fn incomplete_worker_create_and_pending_workdir_create_block_without_orphans() {
         let (store, owner, workspace_id) = setup();
         store
             .with_conn(|conn| {
@@ -1034,7 +1074,7 @@ mod tests {
                         workspace_id, allocation_key, worker_id, runtime_id,
                         create_fingerprint, state, created_at, updated_at
                      ) VALUES (?1, 'allocation', 'worker-pending', 'runtime-a',
-                               'fingerprint', 'reserved', '1', '1')",
+                               'fingerprint', 'created', '1', '1')",
                     params![workspace_id],
                 )?;
                 conn.execute(
@@ -1082,6 +1122,32 @@ mod tests {
                 .workspace_deletion_operation_for_recovery(&request.operation_id)
                 .expect("operation lookup")
                 .is_none()
+        );
+
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO worker_registry (
+                        workspace_id, runtime_id, worker_id, display_name,
+                        created_at, updated_at, retention_state
+                     ) VALUES (?1, 'runtime-a', 'worker-pending', 'Created worker', '1', '1', 'normal')",
+                    params![workspace_id],
+                )?;
+                conn.execute(
+                    "DELETE FROM workdir_create_operations WHERE operation_id = 'workdir-create'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("finalized worker creation");
+        let reconciled = store
+            .workspace_deletion_preflight(&owner, &workspace_id)
+            .expect("reconciled preflight");
+        assert!(
+            !reconciled
+                .blockers
+                .iter()
+                .any(|blocker| blocker.message.contains("Worker creation reservations"))
         );
     }
 
