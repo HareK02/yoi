@@ -1,5 +1,5 @@
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agen::Engine;
@@ -24,6 +24,15 @@ use worker::{
 };
 
 type TestStore = CombinedStore<FsStore, FsWorkerStore>;
+
+static NEXT_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
+
+fn worker_command(handle: &WorkerHandle) -> protocol::WorkerCommandEnvelope {
+    protocol::WorkerCommandEnvelope::for_snapshot(
+        NEXT_COMMAND_ID.fetch_add(1, Ordering::Relaxed),
+        &handle.shared_state.snapshot(),
+    )
+}
 
 /// Reconstruct a worker-history-like `Vec<Item>` from the live session
 /// log mirror held by the Worker's broadcast sink. Replaces the previous
@@ -313,7 +322,12 @@ async fn controller_grants_read_scope_for_exact_bash_output_directory() {
     }));
     assert!(!handle.runtime_dir.path().join("bash-output").exists());
 
-    handle.send(Method::Shutdown).await.unwrap();
+    handle
+        .send(Method::Shutdown {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
     shutdown_rx.await.unwrap();
 }
 
@@ -346,7 +360,12 @@ async fn shutdown_closes_bound_workdir_session() {
         WorkerController::spawn(worker, runtime_base.path(), &bash_output_dir)
             .await
             .unwrap();
-    handle.send(Method::Shutdown).await.unwrap();
+    handle
+        .send(Method::Shutdown {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), shutdown_rx)
         .await
         .expect("controller should shut down")
@@ -461,7 +480,12 @@ async fn controller_projects_workdir_command_events_and_snapshot_state() {
         !durable_history.contains("ready") && !durable_history.contains("done"),
         "operational command chunks must not be appended to Worker history: {durable_history}"
     );
-    handle.send(Method::Shutdown).await.unwrap();
+    handle
+        .send(Method::Shutdown {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -533,7 +557,12 @@ async fn controller_refreshes_command_snapshot_after_high_output_provider_lag() 
         .await
         .unwrap();
     assert_eq!(output.status, workdir::CommandStatus::Cancelled);
-    handle.send(Method::Shutdown).await.unwrap();
+    handle
+        .send(Method::Shutdown {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -575,13 +604,13 @@ async fn controller_startup_failure_closes_bound_workdir_session() {
 async fn wait_for_status(handle: &WorkerHandle, status: WorkerStatus) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
-        if handle.shared_state.get_status() == status {
+        if handle.shared_state.catalog_status() == status {
             return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
             "timed out waiting for status {status:?}; current={:?}",
-            handle.shared_state.get_status()
+            handle.shared_state.catalog_status()
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -1033,7 +1062,8 @@ async fn run_end_returns_to_idle_without_busy_status() {
                     Ok(Event::RunEnd { result: protocol::RunResult::Finished }) => {
                         saw_run_end = true;
                     }
-                    Ok(Event::Status { status: WorkerStatus::Idle }) if saw_run_end => {
+                    Ok(Event::WorkerState { snapshot })
+                        if saw_run_end && snapshot.catalog_status() == WorkerStatus::Idle => {
                         saw_idle_status = true;
                         break;
                     }
@@ -1050,7 +1080,7 @@ async fn run_end_returns_to_idle_without_busy_status() {
         saw_idle_status,
         "expected idle status immediately after RunEnd"
     );
-    assert_eq!(handle.shared_state.get_status(), WorkerStatus::Idle);
+    assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Idle);
 }
 
 #[tokio::test]
@@ -1128,9 +1158,7 @@ async fn snapshot_includes_user_input_for_in_flight_turn() {
         loop {
             if matches!(
                 events.recv().await,
-                Ok(Event::Status {
-                    status: WorkerStatus::Running,
-                })
+                Ok(Event::WorkerState { snapshot }) if snapshot.catalog_status() == WorkerStatus::Running
             ) {
                 break;
             }
@@ -1205,8 +1233,8 @@ async fn attach_snapshot_includes_current_status() {
     loop {
         let event = reader.next::<Event>().await.unwrap().unwrap();
         match event {
-            Event::Snapshot { status, .. } => {
-                assert_eq!(status, WorkerStatus::Running);
+            Event::Snapshot { state, .. } => {
+                assert_eq!(state.catalog_status(), WorkerStatus::Running);
                 return;
             }
             Event::Alert(_) => continue,
@@ -1221,7 +1249,7 @@ async fn shared_state_starts_idle() {
     let worker = make_worker(client).await;
     let handle = spawn_controller(worker).await;
 
-    assert_eq!(handle.shared_state.get_status(), WorkerStatus::Idle);
+    assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Idle);
 }
 
 #[tokio::test]
@@ -1241,7 +1269,7 @@ async fn run_updates_shared_state_to_idle_after_completion() {
     // Wait for the run to complete
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    assert_eq!(handle.shared_state.get_status(), WorkerStatus::Idle);
+    assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Idle);
 }
 
 #[tokio::test]
@@ -1364,7 +1392,12 @@ async fn submit_while_running_is_durably_queued() {
     assert_eq!(accepted, Some(protocol::SubmissionDisposition::Queued));
     let pending_snapshot = pending_snapshot.expect("pending snapshot");
     assert_eq!(pending_snapshot.submissions.len(), 1);
-    handle.send(Method::Pause).await.unwrap();
+    handle
+        .send(Method::Pause {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
     wait_for_status(&handle, WorkerStatus::Paused).await;
     handle
         .send(Method::ContinuePending {
@@ -1386,17 +1419,22 @@ async fn submit_while_running_is_durably_queued() {
     .await
     .expect("paused ContinuePending rejection");
     assert!(rejection.contains("Resume or Cancel"));
-    assert_eq!(handle.shared_state.get_status(), WorkerStatus::Paused);
+    assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Paused);
 }
 
 #[tokio::test]
-async fn resume_without_pause_returns_error() {
+async fn resume_without_pause_returns_invalid_state_acknowledgement() {
     let client = MockClient::new(simple_text_events());
     let worker = make_worker(client).await;
     let handle = spawn_controller(worker).await;
     let mut rx = handle.subscribe();
 
-    handle.send(Method::Resume).await.unwrap();
+    handle
+        .send(Method::Resume {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
 
     let mut saw_not_paused = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -1404,7 +1442,10 @@ async fn resume_without_pause_returns_error() {
         tokio::select! {
             event = rx.recv() => {
                 match event {
-                    Ok(Event::Error { code, .. }) if code == worker::ErrorCode::NotPaused => {
+                    Ok(Event::CommandAcknowledged { acknowledgement })
+                        if acknowledgement.command == protocol::WorkerCommandKind::Resume
+                            && acknowledgement.disposition
+                                == protocol::WorkerCommandDisposition::InvalidState => {
                         saw_not_paused = true;
                         break;
                     }
@@ -1416,17 +1457,22 @@ async fn resume_without_pause_returns_error() {
         }
     }
 
-    assert!(saw_not_paused, "should see not_paused error");
+    assert!(saw_not_paused, "should see invalid-state acknowledgement");
 }
 
 #[tokio::test]
-async fn cancel_without_run_returns_error() {
+async fn cancel_without_run_returns_invalid_state_acknowledgement() {
     let client = MockClient::new(simple_text_events());
     let worker = make_worker(client).await;
     let handle = spawn_controller(worker).await;
     let mut rx = handle.subscribe();
 
-    handle.send(Method::Cancel).await.unwrap();
+    handle
+        .send(Method::Cancel {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
 
     let mut saw_not_running = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -1434,7 +1480,10 @@ async fn cancel_without_run_returns_error() {
         tokio::select! {
             event = rx.recv() => {
                 match event {
-                    Ok(Event::Error { code, .. }) if code == worker::ErrorCode::NotRunning => {
+                    Ok(Event::CommandAcknowledged { acknowledgement })
+                        if acknowledgement.command == protocol::WorkerCommandKind::Cancel
+                            && acknowledgement.disposition
+                                == protocol::WorkerCommandDisposition::InvalidState => {
                         saw_not_running = true;
                         break;
                     }
@@ -1446,7 +1495,7 @@ async fn cancel_without_run_returns_error() {
         }
     }
 
-    assert!(saw_not_running, "should see not_running error");
+    assert!(saw_not_running, "should see invalid-state acknowledgement");
 }
 
 #[tokio::test]
@@ -1822,7 +1871,7 @@ async fn notify_while_idle_with_auto_run_false_waits_for_explicit_run() {
     }
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert_eq!(handle.shared_state.get_status(), WorkerStatus::Idle);
+    assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Idle);
     assert!(
         client_for_assert.captured_requests().is_empty(),
         "weak Notify must not stage RunForNotification while idle"
@@ -1919,7 +1968,7 @@ async fn worker_event_turn_ended_while_idle_auto_starts_turn_and_injects_system_
         saw_worker_event_in_mirror,
         "Method::WorkerEvent should commit a SystemItem::WorkerEvent entry"
     );
-    assert_eq!(handle.shared_state.get_status(), WorkerStatus::Idle);
+    assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Idle);
 
     let requests = client_for_assert.captured_requests();
     assert_eq!(
@@ -1982,7 +2031,7 @@ async fn worker_event_scope_sub_delegated_while_idle_stays_control_plane_only() 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     assert_eq!(
-        handle.shared_state.get_status(),
+        handle.shared_state.catalog_status(),
         WorkerStatus::Idle,
         "control-plane ScopeSubDelegated must not auto-start the parent LLM"
     );
@@ -2085,7 +2134,12 @@ async fn weak_notify_while_running_is_deduped_and_survives_until_next_submit() {
             .await
             .unwrap();
     }
-    handle.send(Method::Cancel).await.unwrap();
+    handle
+        .send(Method::Cancel {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
     wait_for_status(&handle, WorkerStatus::Idle).await;
 
     let mut rx = handle.subscribe();
@@ -2482,7 +2536,12 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
         "text_delta should arrive before pause"
     );
 
-    handle.send(Method::Pause).await.unwrap();
+    handle
+        .send(Method::Pause {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
 
     // The controller emits RunEnd { Paused } when the
     // EngineError::Cancelled is translated under pause_requested.
@@ -2498,9 +2557,14 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
     );
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert_eq!(handle.shared_state.get_status(), WorkerStatus::Paused);
+    assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Paused);
 
-    handle.send(Method::Resume).await.unwrap();
+    handle
+        .send(Method::Resume {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
 
     assert!(
         drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
@@ -2514,7 +2578,7 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
     );
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert_eq!(handle.shared_state.get_status(), WorkerStatus::Idle);
+    assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Idle);
 
     // History consistency: exactly [user "hello", assistant
     // "resumed output"]. No artifacts from the aborted stream
@@ -2614,7 +2678,12 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
         "tool_call_done should arrive before pause"
     );
 
-    handle.send(Method::Pause).await.unwrap();
+    handle
+        .send(Method::Pause {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
     assert!(
         drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
             e,
@@ -2626,7 +2695,7 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
         "expected RunEnd::Paused"
     );
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert_eq!(handle.shared_state.get_status(), WorkerStatus::Paused);
+    assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Paused);
 
     // New user input while Paused → `Worker::run` observes
     // `last_run_interrupted` and runs its interrupt-prep step, which
@@ -2785,7 +2854,12 @@ async fn paused_cancel_abandons_resume_and_next_input_is_fresh_run() {
         "tool_call_done should arrive before pause"
     );
 
-    handle.send(Method::Pause).await.unwrap();
+    handle
+        .send(Method::Pause {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
     assert!(
         drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
             e,
@@ -2798,7 +2872,12 @@ async fn paused_cancel_abandons_resume_and_next_input_is_fresh_run() {
     );
     wait_for_status(&handle, WorkerStatus::Paused).await;
 
-    handle.send(Method::Cancel).await.unwrap();
+    handle
+        .send(Method::Cancel {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
     wait_for_status(&handle, WorkerStatus::Idle).await;
     let (entries_after_cancel, _rx_after_cancel) = handle.sink.subscribe_with_snapshot();
     assert!(
@@ -2824,17 +2903,22 @@ async fn paused_cancel_abandons_resume_and_next_input_is_fresh_run() {
         "paused cancel must not resume or start another LLM request"
     );
 
-    handle.send(Method::Resume).await.unwrap();
+    handle
+        .send(Method::Resume {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
     assert!(
         drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
             e,
-            Event::Error {
-                code: worker::ErrorCode::NotPaused,
-                ..
-            }
+            Event::CommandAcknowledged { acknowledgement }
+                if acknowledgement.command == protocol::WorkerCommandKind::Resume
+                    && acknowledgement.disposition
+                        == protocol::WorkerCommandDisposition::InvalidState
         ))
         .await,
-        "resume after paused cancel should be rejected as not paused"
+        "resume after paused cancel should receive invalid-state acknowledgement"
     );
     assert_eq!(
         client_for_assert.captured_requests().len(),
@@ -2943,7 +3027,12 @@ async fn empty_turn_cancel_rolls_back_submit_entries_and_emits_signal() {
         .await
         .unwrap();
     wait_for_status(&handle, WorkerStatus::Running).await;
-    handle.send(Method::Cancel).await.unwrap();
+    handle
+        .send(Method::Cancel {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
 
     assert!(
         drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
@@ -2981,7 +3070,12 @@ async fn empty_turn_pause_rolls_back_and_snapshot_does_not_restore_input() {
         .await
         .unwrap();
     wait_for_status(&handle, WorkerStatus::Running).await;
-    handle.send(Method::Pause).await.unwrap();
+    handle
+        .send(Method::Pause {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
 
     assert!(
         drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
@@ -3038,7 +3132,12 @@ async fn empty_turn_rollback_removes_only_the_most_recent_turn() {
         .await
         .unwrap();
     wait_for_status(&handle, WorkerStatus::Running).await;
-    handle.send(Method::Cancel).await.unwrap();
+    handle
+        .send(Method::Cancel {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
     assert!(
         drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
             e,
@@ -3095,7 +3194,12 @@ async fn pause_after_assistant_token_does_not_rollback() {
         .await,
         "assistant token should be visible before pause"
     );
-    handle.send(Method::Pause).await.unwrap();
+    handle
+        .send(Method::Pause {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
 
     assert!(
         drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(

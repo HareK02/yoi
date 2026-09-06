@@ -36,8 +36,6 @@ use worker_runtime::config_bundle::{
     ConfigBundleMetadata, ConfigBundleProvenance, ConfigProfileDescriptor,
 };
 use worker_runtime::error::RuntimeError as EmbeddedRuntimeError;
-#[cfg(test)]
-use worker_runtime::execution::WorkerExecutionRunState;
 use worker_runtime::fs_store::FsRuntimeStoreOptions;
 use worker_runtime::http_server::{
     RUNTIME_PING_PERMISSION, RUNTIME_WORKSPACE_SCOPE_HEADER,
@@ -245,7 +243,10 @@ pub struct WorkerSummary {
     #[serde(default)]
     pub tags: Vec<String>,
     pub workspace: WorkerWorkspaceSummary,
+    /// Runtime catalog lifecycle compatibility state.
     pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_state: Option<protocol::WorkerStateSnapshot>,
     pub last_seen_at: Option<String>,
     #[serde(default)]
     pub pinned: bool,
@@ -337,6 +338,7 @@ pub(crate) fn workspace_worker_summary(
             workspace_id: summary.workspace.workspace_id,
         },
         state: summary.state,
+        worker_state: summary.worker_state,
         last_seen_at: summary.last_seen_at,
         pinned: summary.pinned,
         retention_state: summary.retention_state,
@@ -2000,6 +2002,7 @@ impl EmbeddedWorkerRuntime {
                 workspace_id: summary.workspace_id.clone(),
             },
             state: embedded_worker_status_label(summary.status).to_string(),
+            worker_state: summary.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
             retention_state: "transient".to_string(),
@@ -2039,6 +2042,7 @@ impl EmbeddedWorkerRuntime {
                 workspace_id: detail.workspace_id.clone(),
             },
             state: embedded_worker_status_label(detail.status).to_string(),
+            worker_state: detail.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
             retention_state: "transient".to_string(),
@@ -3342,6 +3346,7 @@ impl RemoteWorkerRuntime {
                 workspace_id: summary.workspace_id.clone(),
             },
             state: embedded_worker_status_label(summary.status).to_string(),
+            worker_state: summary.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
             retention_state: "transient".to_string(),
@@ -3385,6 +3390,7 @@ impl RemoteWorkerRuntime {
                 workspace_id: detail.workspace_id.clone(),
             },
             state: embedded_worker_status_label(detail.status).to_string(),
+            worker_state: detail.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
             retention_state: "transient".to_string(),
@@ -4732,6 +4738,7 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
             workspace_id: None,
         },
         state: "unsupported".to_string(),
+        worker_state: None,
         last_seen_at: None,
         pinned: false,
         retention_state: "transient".to_string(),
@@ -5170,7 +5177,6 @@ mod tests {
                     request.worker_ref,
                     self.backend_id(),
                 ),
-                run_state: WorkerExecutionRunState::Idle,
                 working_directory: request
                     .working_directory
                     .as_ref()
@@ -5199,8 +5205,8 @@ mod tests {
             let content = input.content;
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(10));
-                let _ = context.publish_protocol_event(protocol::Event::Status {
-                    status: protocol::WorkerStatus::Running,
+                let _ = context.publish_protocol_event(protocol::Event::WorkerState {
+                    snapshot: protocol::WorkerStatus::Running.into(),
                 });
                 let _ = context.publish_protocol_event(protocol::Event::TextDone {
                     text: format!("echo: {content}"),
@@ -5208,14 +5214,13 @@ mod tests {
                 let _ = context.publish_protocol_event(protocol::Event::RunEnd {
                     result: protocol::RunResult::Finished,
                 });
-                let _ = context.publish_protocol_event(protocol::Event::Status {
-                    status: protocol::WorkerStatus::Idle,
+                let _ = context.publish_protocol_event(protocol::Event::WorkerState {
+                    snapshot: protocol::WorkerStatus::Idle.into(),
                 });
             });
             if let Some(submission_request_id) = submission_request_id {
                 worker_runtime::execution::WorkerExecutionResult::accepted_submission(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
-                    WorkerExecutionRunState::Busy,
                     submission_request_id,
                     uuid::Uuid::now_v7().to_string(),
                     protocol::SubmissionDisposition::Started,
@@ -5223,7 +5228,6 @@ mod tests {
             } else {
                 worker_runtime::execution::WorkerExecutionResult::accepted(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
-                    WorkerExecutionRunState::Busy,
                 )
             }
         }
@@ -5256,6 +5260,7 @@ mod tests {
                         workspace_id: None,
                     },
                     state: "available".to_string(),
+                    worker_state: None,
                     last_seen_at: None,
                     pinned: false,
                     retention_state: "transient".to_string(),

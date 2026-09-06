@@ -52,11 +52,7 @@
     import { pushWorkspaceAlert } from "$lib/workspace/alerts/store";
     import { workspaceApiPath } from "$lib/workspace/api/http";
     import { workspaceMultiplexer, type WorkspaceMultiplexerSubscription } from "$lib/workspace/multiplexer";
-    import type {
-        Diagnostic,
-        Worker,
-        PodProtocolEvent,
-    } from "$lib/workspace/sidebar/types";
+    import type { Diagnostic, Worker } from "$lib/workspace/sidebar/types";
 
     type Props = {
         data: {
@@ -207,7 +203,6 @@
     );
     let pendingObservationEvents: ConsoleEventInput[] = [];
     let protocolEventSequence = 0;
-    let pendingObservedStates: Array<string | null> = [];
     let pendingStreamDiagnostics: Diagnostic[] = [];
     let observationFlushHandle: number | null = null;
     let nextReloadToken = 0;
@@ -249,7 +244,9 @@
     const diagnostics = $derived(
         mergeDiagnostics(worker?.diagnostics ?? [], streamDiagnostics),
     );
-    const workerState = $derived(liveWorkerState ?? worker?.state ?? "loading");
+    const workerState = $derived(
+        liveWorkerState ?? (worker?.state === "stopped" ? "stopped" : "loading"),
+    );
     const workerRunning = $derived(workerState === "running");
     const workerPaused = $derived(workerState === "paused");
     const composerEditable = $derived(protocolState === "open" && !sending);
@@ -343,7 +340,6 @@
             observationFlushHandle = null;
         }
         pendingObservationEvents = [];
-        pendingObservedStates = [];
         pendingStreamDiagnostics = [];
     }
 
@@ -359,18 +355,15 @@
     function flushObservationBatch() {
         observationFlushHandle = null;
         const eventBatch = pendingObservationEvents;
-        const stateBatch = pendingObservedStates;
         const diagnosticBatch = pendingStreamDiagnostics;
         pendingObservationEvents = [];
-        pendingObservedStates = [];
         pendingStreamDiagnostics = [];
 
         if (eventBatch.length > 0) {
-            const latestState = stateBatch.findLast((state) => state !== null);
-            if (latestState) {
-                liveWorkerState = latestState;
-            }
             consoleProjection = consoleProjector.append(eventBatch);
+            liveWorkerState = consoleProjection.status === "shutdown"
+                ? "shutdown"
+                : workerStateFromSnapshot(consoleProjection.workerState);
             advanceEventObservedAtVersion();
         }
 
@@ -407,7 +400,6 @@
             event: payload,
             observedAtMs,
         });
-        pendingObservedStates.push(workerStateFromProtocolEvent(payload));
         scheduleObservationFlush();
     }
 
@@ -541,9 +533,42 @@
         }
     }
 
+    let nextWorkerCommandId = 1;
+
+    function lifecycleMethod(
+        command: "pause" | "cancel" | "resume" | "compact",
+    ): ProtocolMethod | null {
+        const state = consoleProjection.workerState;
+        if (!state) {
+            sendError = "Worker state snapshot is not available; reconnect before sending control.";
+            return null;
+        }
+        const commandId = Math.max(
+            nextWorkerCommandId,
+            state.last_command_id + 1,
+        );
+        nextWorkerCommandId = commandId + 1;
+        const envelope = {
+            command_id: commandId,
+            expected_execution_generation: state.execution_generation,
+            expected_worker_state_revision: state.revision,
+        };
+        switch (command) {
+            case "pause":
+                return { method: "pause", params: { command: envelope } };
+            case "cancel":
+                return { method: "cancel", params: { command: envelope } };
+            case "resume":
+                return { method: "resume", params: { command: envelope } };
+            case "compact":
+                return { method: "compact", params: { command: envelope } };
+        }
+    }
+
     function sendWorkerControl(command: "pause" | "cancel" | "resume") {
         const label = command[0].toUpperCase() + command.slice(1);
-        sendControl({ method: command }, label);
+        const method = lifecycleMethod(command);
+        if (method) sendControl(method, label);
     }
 
     function isEditableTarget(target: EventTarget | null): boolean {
@@ -627,8 +652,11 @@
                         auto_run: true,
                     },
                 };
-            case "compact":
-                return { method: "compact" };
+            case "compact": {
+                const method = lifecycleMethod("compact");
+                if (!method) throw new Error("Worker state snapshot is not available");
+                return method;
+            }
             case "list_rewind_targets":
                 return { method: "list_rewind_targets" };
             case "register_peer":
@@ -691,7 +719,7 @@
 
     function handleComposerSubmit() {
         if (workerRunning) {
-            sendControl({ method: "cancel" }, "Stop");
+            sendWorkerControl("cancel");
             return;
         }
         void submitDraft(composerInputElement?.snapshot() ?? draft);
@@ -889,18 +917,16 @@
         handleComposerSubmit();
     }
 
-    function workerStateFromProtocolEvent(
-        event: PodProtocolEvent,
+    function workerStateFromSnapshot(
+        snapshot: ConsoleProjection["workerState"],
     ): string | null {
-        switch (event.event) {
-            case "snapshot":
-            case "status":
-                return event.data.status;
-            case "shutdown":
-                return "shutdown";
-            default:
-                return null;
-        }
+        if (!snapshot) return null;
+        return snapshot.state.kind === "idle"
+            ? "idle"
+            : snapshot.state.state.kind === "run" &&
+                  snapshot.state.state.state === "paused"
+              ? "paused"
+              : "running";
     }
 
     function connectProtocolTransport(
@@ -1620,7 +1646,10 @@
                 type="button"
                 class="secondary-button"
                 disabled={protocolState !== "open"}
-                onclick={() => sendControl({ method: "compact" }, "Compact")}
+                onclick={() => {
+                    const method = lifecycleMethod("compact");
+                    if (method) sendControl(method, "Compact");
+                }}
             >
                 Compact
             </button>

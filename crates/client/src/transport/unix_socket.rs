@@ -113,8 +113,8 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let event = encode_event(&Event::Status {
-                status: WorkerStatus::Idle,
+            let event = encode_event(&Event::WorkerState {
+                snapshot: WorkerStatus::Idle.into(),
             })
             .unwrap();
             stream.write_all(event.as_bytes()).await.unwrap();
@@ -126,12 +126,7 @@ mod tests {
             .await
             .expect("client should receive event while alive")
             .expect("transport should succeed");
-        assert!(matches!(
-            event,
-            Some(Event::Status {
-                status: WorkerStatus::Idle
-            })
-        ));
+        assert!(matches!(event, Some(Event::WorkerState { .. })));
         server.await.unwrap();
     }
 

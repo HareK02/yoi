@@ -620,7 +620,7 @@ Deno.test("Worker Console paste chips preserve typed draft and target authority"
       consolePage.includes("preserveExactText: value.textPastes.length > 0") &&
       consolePage.includes("composerDrafts.set(activeComposerTargetKey") &&
       consolePage.includes("switchComposerTarget(target)") &&
-      consolePage.includes('sendControl({ method: "cancel" }, "Stop")'),
+      consolePage.includes('sendWorkerControl("cancel")'),
     "Paste chips should use shared threshold classification, atomic keyboard behavior, accessible labels, typed restore, and per-Worker draft authority",
   );
 });
@@ -787,7 +787,10 @@ Deno.test("Worker Console page is routed by runtime_id and worker_id through bac
       consolePage.includes(
         'const composerEditable = $derived(protocolState === "open" && !sending);',
       ) &&
-      consolePage.includes('sendControl({ method: "cancel" }, "Stop")') &&
+      consolePage.includes('sendWorkerControl("cancel")') &&
+      consolePage.includes("lifecycleMethod(command)") &&
+      consolePage.includes("expected_worker_state_revision") &&
+      consolePage.includes("expected_execution_generation") &&
       consolePage.includes("onsubmit={handleComposerSubmit}") &&
       consolePage.includes("disabled={!composerEditable}") &&
       consolePage.includes("class:stop={workerRunning}") &&

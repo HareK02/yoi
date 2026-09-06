@@ -75,7 +75,12 @@ Deno.test("new invoke and running snapshot reset run activity", () => {
         data: {
           entries: [],
           greeting: { text: "", profile: "" },
-          status: "idle",
+          state: {
+            execution_generation: 1,
+            revision: 0,
+            last_command_id: 0,
+            state: { kind: "idle" },
+          },
           in_flight: {},
           internal_workers: [],
         },

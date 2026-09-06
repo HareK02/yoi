@@ -572,7 +572,7 @@ async fn run_e2e_rewind_fixture(
             pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
             entries: Vec::new(),
         },
-        status: WorkerStatus::Idle,
+        state: WorkerStatus::Idle.into(),
         greeting: Greeting {
             worker_name: worker_name.clone(),
             cwd: workspace_root.display().to_string(),
@@ -1438,13 +1438,15 @@ fn handle_cancel_or_shutdown(app: &mut App) -> Option<Method> {
         WorkerStatus::Running | WorkerStatus::Paused
     ) {
         app.shutdown_confirm = None;
-        return Some(Method::Cancel);
+        let command = app.next_command_envelope();
+        return Some(Method::Cancel { command });
     }
     if let Some(pressed_at) = app.shutdown_confirm
         && pressed_at.elapsed() < CONFIRM_TIMEOUT
     {
         app.shutdown_confirm = None;
-        return Some(Method::Shutdown);
+        let command = app.next_command_envelope();
+        return Some(Method::Shutdown { command });
     }
     app.shutdown_confirm = Some(std::time::Instant::now());
     app.flash_actionbar_notice(
@@ -1460,7 +1462,8 @@ fn handle_cancel_or_shutdown(app: &mut App) -> Option<Method> {
 /// Idle / Paused → 2-tap to quit the TUI (the Worker keeps running).
 fn handle_pause_or_quit(app: &mut App) -> Option<Method> {
     if app.worker_status == WorkerStatus::Running {
-        return Some(Method::Pause);
+        let command = app.next_command_envelope();
+        return Some(Method::Pause { command });
     }
     if let Some(t) = app.quit_confirm
         && t.elapsed() < CONFIRM_TIMEOUT
@@ -2090,7 +2093,7 @@ mod tests {
                 &mut app,
                 KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
             ),
-            Some(Method::Pause)
+            Some(Method::Pause { .. })
         ));
         assert_eq!(app.queued_input_count(), 1);
 
@@ -2100,7 +2103,7 @@ mod tests {
                 &mut app,
                 KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
             ),
-            Some(Method::Cancel)
+            Some(Method::Cancel { .. })
         ));
         assert_eq!(app.queued_input_count(), 1);
     }
@@ -2114,7 +2117,7 @@ mod tests {
             &mut app,
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
         );
-        assert!(matches!(cancel, Some(Method::Cancel)));
+        assert!(matches!(cancel, Some(Method::Cancel { .. })));
     }
 
     #[test]
@@ -2136,7 +2139,7 @@ mod tests {
 
         assert!(matches!(
             handle_key(&mut app, ctrl_x()),
-            Some(Method::Shutdown)
+            Some(Method::Shutdown { .. })
         ));
         assert!(app.shutdown_confirm.is_none());
     }
@@ -2466,7 +2469,7 @@ mod tests {
         }
 
         let method = handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(method, Some(protocol::Method::Compact)));
+        assert!(matches!(method, Some(protocol::Method::Compact { .. })));
         assert!(!app.is_command_mode());
         assert_eq!(input_text(&app), "");
         assert_eq!(app.queued_input_count(), 0);
@@ -2573,7 +2576,7 @@ mod tests {
                 pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: vec![],
             },
-            status: WorkerStatus::Idle,
+            state: WorkerStatus::Idle.into(),
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });
@@ -2606,7 +2609,7 @@ mod tests {
                 pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: vec![],
             },
-            status: WorkerStatus::Idle,
+            state: WorkerStatus::Idle.into(),
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });
@@ -2743,8 +2746,8 @@ mod tests {
                 kind: protocol::InternalWorkerKind::SubWorker,
             },
             revision: 1,
-            event: Box::new(Event::Status {
-                status: WorkerStatus::Running,
+            event: Box::new(Event::WorkerState {
+                snapshot: WorkerStatus::Running.into(),
             }),
         });
         enter_command_mode(&mut app);
@@ -2859,8 +2862,8 @@ mod tests {
                 kind: protocol::InternalWorkerKind::SubWorker,
             },
             revision: 1,
-            event: Box::new(Event::Status {
-                status: WorkerStatus::Running,
+            event: Box::new(Event::WorkerState {
+                snapshot: WorkerStatus::Running.into(),
             }),
         });
 
@@ -2885,8 +2888,8 @@ mod tests {
                 kind: protocol::InternalWorkerKind::SubWorker,
             },
             revision: 1,
-            event: Box::new(Event::Status {
-                status: WorkerStatus::Running,
+            event: Box::new(Event::WorkerState {
+                snapshot: WorkerStatus::Running.into(),
             }),
         });
         handle_key(&mut app, key(KeyCode::Tab));
@@ -2902,7 +2905,7 @@ mod tests {
         );
 
         assert!(first.is_none());
-        assert!(matches!(second, Some(Method::Shutdown)));
+        assert!(matches!(second, Some(Method::Shutdown { .. })));
         assert_eq!(app.worker_status, WorkerStatus::Idle);
     }
 
@@ -2924,8 +2927,8 @@ mod tests {
                 kind: protocol::InternalWorkerKind::SubWorker,
             },
             revision: 1,
-            event: Box::new(Event::Status {
-                status: WorkerStatus::Running,
+            event: Box::new(Event::WorkerState {
+                snapshot: WorkerStatus::Running.into(),
             }),
         });
 

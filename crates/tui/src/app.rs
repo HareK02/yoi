@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use protocol::{
     AlertLevel, AlertSource, CompletionEntry, CompletionKind, ErrorCode, Event, InFlightBlock,
     InFlightSnapshot, InFlightToolCallState, InternalWorkerRef, InternalWorkerSnapshot, Method,
-    RewindTarget, RunResult, Segment, WorkerStatus,
+    RewindTarget, RunResult, Segment, WorkerCommandEnvelope, WorkerStateSnapshot, WorkerStatus,
 };
 
 use crate::block::{
@@ -225,8 +225,10 @@ pub struct WorkerViewTab {
 pub struct App {
     pub worker_name: String,
     pub connected: bool,
-    /// Last controller status reported by the Worker. Drives the status line
-    /// and Ctrl-key routing; do not infer this solely from replayed history.
+    /// Latest authoritative revisioned live execution state.
+    pub worker_state: WorkerStateSnapshot,
+    next_command_id: u64,
+    /// Derived Runtime-catalog compatibility projection used by existing UI.
     pub worker_status: WorkerStatus,
     /// True while the Worker is in `WorkerStatus::Running`.
     pub running: bool,
@@ -337,6 +339,8 @@ impl App {
         Self {
             worker_name,
             connected: false,
+            worker_state: WorkerStateSnapshot::initial(1),
+            next_command_id: 1,
             worker_status: WorkerStatus::Idle,
             running: false,
             paused: false,
@@ -745,7 +749,8 @@ impl App {
             if self.paused {
                 self.input_history.cancel_browse();
                 self.input.clear();
-                return Some(Method::Resume);
+                let command = self.next_command_envelope();
+                return Some(Method::Resume { command });
             }
             return None;
         }
@@ -1114,6 +1119,31 @@ impl App {
         }
     }
 
+    pub fn next_command_envelope(&mut self) -> WorkerCommandEnvelope {
+        let command_id = self
+            .next_command_id
+            .max(self.worker_state.last_command_id.saturating_add(1));
+        let command = WorkerCommandEnvelope::for_snapshot(command_id, &self.worker_state);
+        self.next_command_id = command_id.saturating_add(1);
+        command
+    }
+
+    fn apply_worker_state_snapshot(&mut self, snapshot: &WorkerStateSnapshot) {
+        match protocol::apply_worker_state_snapshot(&mut self.worker_state, snapshot) {
+            Ok(protocol::WorkerStateSnapshotApply::Applied) => {
+                self.set_worker_status(self.worker_state.catalog_status());
+            }
+            Ok(
+                protocol::WorkerStateSnapshotApply::Duplicate
+                | protocol::WorkerStateSnapshotApply::Stale,
+            ) => {}
+            Err(error) => self.handle_error(
+                ErrorCode::Internal,
+                format!("worker state stream rejected: {error}"),
+            ),
+        }
+    }
+
     pub fn handle_worker_event(&mut self, event: Event) -> Option<Method> {
         if self.rewind_refresh_fence && event_is_stale_after_rewind(&event) {
             return None;
@@ -1150,18 +1180,14 @@ impl App {
                 self.assistant_streaming = false;
             }
             Event::TurnStart { .. } => {
-                self.set_worker_status(WorkerStatus::Running);
                 self.run_requests += 1;
                 self.current_tool = None;
                 self.latest_llm_wait_event = None;
                 self.assistant_streaming = false;
             }
-            Event::InvokeStart { .. } => {
-                self.set_worker_status(WorkerStatus::Running);
-            }
+            Event::InvokeStart { .. } => {}
             // UI consumers of per-attempt LlmCall semantics remain out of scope;
-            // the run-level status starts at InvokeStart and TurnStart counts each
-            // LLM request within that run.
+            // authoritative run state comes only from WorkerStateSnapshot.
             Event::LlmCallStart { .. } | Event::LlmCallEnd { .. } => {
                 self.latest_llm_wait_event = None;
             }
@@ -1368,12 +1394,7 @@ impl App {
                         output_tokens: self.run_output_tokens,
                     });
                     self.pending_submit_rollback = None;
-                    self.reset_run_state(match result {
-                        RunResult::Paused => WorkerStatus::Paused,
-                        RunResult::Finished | RunResult::LimitReached | RunResult::RolledBack => {
-                            WorkerStatus::Idle
-                        }
-                    });
+                    self.reset_run_state();
                 }
             }
             Event::CompactStart { .. } => {
@@ -1443,7 +1464,7 @@ impl App {
             Event::Snapshot {
                 session,
                 greeting,
-                status,
+                state,
                 in_flight,
                 internal_workers,
             } => {
@@ -1451,7 +1472,7 @@ impl App {
                 self.pending_submissions = session.pending_submissions.clone();
                 self.restore_snapshot(&session, greeting, in_flight);
                 self.replace_internal_worker_snapshots(internal_workers);
-                self.set_worker_status(status);
+                self.apply_worker_state_snapshot(&state);
             }
             Event::InternalWorker {
                 worker,
@@ -1461,9 +1482,12 @@ impl App {
             Event::InternalWorkerRemoved { worker, revision } => {
                 self.remove_internal_worker(worker, revision)
             }
-            Event::Status { status } => {
+            Event::WorkerState { snapshot } => {
                 self.rewind_refresh_fence = false;
-                self.set_worker_status(status);
+                self.apply_worker_state_snapshot(&snapshot);
+            }
+            Event::CommandAcknowledged { acknowledgement } => {
+                self.apply_worker_state_snapshot(&acknowledgement.state);
             }
             // Command telemetry is an operational Web Console surface. The
             // TUI continues to render the final Bash ToolResult from history.
@@ -1503,7 +1527,7 @@ impl App {
                 };
                 self.completion = None;
                 self.close_rewind_picker();
-                self.reset_run_state(self.worker_status);
+                self.reset_run_state();
                 let mut message = if restored_composer {
                     format!(
                         "Rewound session: discarded {} log entries; restored selected input to composer.",
@@ -1551,8 +1575,7 @@ impl App {
         None
     }
 
-    fn reset_run_state(&mut self, status: WorkerStatus) {
-        self.set_worker_status(status);
+    fn reset_run_state(&mut self) {
         self.run_requests = 0;
         self.run_upload_tokens = 0;
         self.run_output_tokens = 0;
@@ -1582,7 +1605,7 @@ impl App {
             "Rolled back empty assistant turn; no local submitted input was available to restore."
                 .to_owned()
         };
-        self.reset_run_state(WorkerStatus::Idle);
+        self.reset_run_state();
         self.blocks.push(Block::Alert {
             level: AlertLevel::Warn,
             source: AlertSource::Worker,
@@ -2026,12 +2049,18 @@ impl App {
             self.input_mode = CommandInputMode::Composer;
             self.command_completion_selected = None;
         }
-        if let Some(Method::ListRewindTargets) = result.method.as_ref() {
+        let mut method = result.method;
+        if let Some(Method::Compact { .. }) = method {
+            method = Some(Method::Compact {
+                command: self.next_command_envelope(),
+            });
+        }
+        if let Some(Method::ListRewindTargets) = method.as_ref() {
             self.completion = None;
             self.rewind_picker = None;
             self.rewind_request_pending = true;
         }
-        result.method
+        method
     }
 
     fn push_command_diagnostic(&mut self, message: impl Into<String>) {
@@ -2761,8 +2790,8 @@ mod rewind_refresh_tests {
         });
         assert!(!blocks_contain(&app, "stale tail after rewind"));
 
-        app.handle_worker_event(Event::Status {
-            status: WorkerStatus::Idle,
+        app.handle_worker_event(Event::WorkerState {
+            snapshot: WorkerStatus::Idle.into(),
         });
         app.handle_worker_event(Event::TextDelta {
             text: "new live tail after status".into(),
@@ -3478,7 +3507,7 @@ mod completion_flow_tests {
         let mut app = App::new("test".into());
         app.set_worker_status(WorkerStatus::Paused);
 
-        assert!(matches!(app.submit_input(), Some(Method::Resume)));
+        assert!(matches!(app.submit_input(), Some(Method::Resume { .. })));
         assert_eq!(app.queued_input_count(), 0);
     }
 
@@ -3533,7 +3562,7 @@ mod completion_flow_tests {
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             session: public_session(vec![session_start_value]),
-            status: WorkerStatus::Running,
+            state: test_worker_state(WorkerStatus::Running),
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });
@@ -3545,14 +3574,98 @@ mod completion_flow_tests {
     }
 
     #[test]
+    fn occurrence_events_do_not_infer_foreground_worker_state() {
+        let mut app = App::new("test".into());
+        app.handle_worker_event(Event::TurnStart { turn: 1 });
+        app.handle_worker_event(Event::InvokeStart {
+            kind: protocol::InvokeKind::UserSend,
+        });
+        app.handle_worker_event(Event::RunEnd {
+            result: RunResult::Paused,
+        });
+        assert_eq!(app.worker_state.state, protocol::WorkerState::Idle);
+        assert_eq!(app.worker_status, WorkerStatus::Idle);
+
+        let running = WorkerStateSnapshot {
+            execution_generation: 1,
+            revision: 1,
+            state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                protocol::WorkerRunState::Running,
+            )),
+            last_command_id: 0,
+        };
+        app.handle_worker_event(Event::WorkerState {
+            snapshot: running.clone(),
+        });
+        app.handle_worker_event(Event::RunEnd {
+            result: RunResult::Finished,
+        });
+        assert_eq!(app.worker_state, running);
+        assert_eq!(app.worker_status, WorkerStatus::Running);
+    }
+
+    #[test]
+    fn worker_state_events_and_acknowledgements_share_monotonic_application() {
+        let mut app = App::new("test".into());
+        let running = WorkerStateSnapshot {
+            execution_generation: 4,
+            revision: 3,
+            state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                protocol::WorkerRunState::Running,
+            )),
+            last_command_id: 2,
+        };
+        app.handle_worker_event(Event::WorkerState {
+            snapshot: running.clone(),
+        });
+        app.handle_worker_event(Event::WorkerState {
+            snapshot: WorkerStateSnapshot {
+                revision: 2,
+                state: protocol::WorkerState::Idle,
+                ..running.clone()
+            },
+        });
+        assert_eq!(app.worker_state, running);
+
+        let paused = WorkerStateSnapshot {
+            revision: 4,
+            state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                protocol::WorkerRunState::Paused,
+            )),
+            last_command_id: 3,
+            ..running.clone()
+        };
+        app.handle_worker_event(Event::CommandAcknowledged {
+            acknowledgement: protocol::WorkerCommandAcknowledgement {
+                command_id: 3,
+                command: protocol::WorkerCommandKind::Pause,
+                disposition: protocol::WorkerCommandDisposition::Accepted,
+                state: paused.clone(),
+            },
+        });
+        assert_eq!(app.worker_state, paused);
+
+        app.handle_worker_event(Event::WorkerState {
+            snapshot: WorkerStateSnapshot {
+                state: protocol::WorkerState::Idle,
+                ..paused.clone()
+            },
+        });
+        assert_eq!(app.worker_state, paused);
+        assert!(app.run_error_messages.iter().any(|message| {
+            message.contains("conflicting worker state snapshots at generation 4 revision 4")
+        }));
+    }
+
+    #[test]
     fn snapshot_replaces_live_error_with_one_durable_run_error_block() {
         let mut app = App::new("test".into());
         app.handle_worker_event(Event::Error {
             code: ErrorCode::ProviderError,
             message: "provider unavailable".into(),
         });
-        app.handle_worker_event(Event::Status {
-            status: WorkerStatus::Idle,
+        app.handle_worker_event(Event::WorkerState {
+            snapshot: WorkerStatus::Idle.into(),
         });
 
         let live_errors = app
@@ -3577,7 +3690,7 @@ mod completion_flow_tests {
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             session: public_session(vec![serde_json::to_value(run_errored).unwrap()]),
-            status: WorkerStatus::Idle,
+            state: test_worker_state(WorkerStatus::Idle),
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });
@@ -3641,7 +3754,7 @@ mod completion_flow_tests {
                 pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
-            status: WorkerStatus::Running,
+            state: test_worker_state(WorkerStatus::Running),
             in_flight: InFlightSnapshot {
                 blocks: vec![
                     InFlightBlock::Thinking {
@@ -3968,7 +4081,7 @@ mod completion_flow_tests {
                 pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
-            status: WorkerStatus::Idle,
+            state: test_worker_state(WorkerStatus::Idle),
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });
@@ -4020,7 +4133,7 @@ mod completion_flow_tests {
                 pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
-            status: WorkerStatus::Idle,
+            state: test_worker_state(WorkerStatus::Idle),
             in_flight: Default::default(),
             internal_workers: vec![InternalWorkerSnapshot {
                 worker: InternalWorkerRef {
@@ -4168,6 +4281,13 @@ mod completion_flow_tests {
             .count()
     }
 
+    fn test_worker_state(status: WorkerStatus) -> WorkerStateSnapshot {
+        let mut snapshot = WorkerStateSnapshot::from(status);
+        snapshot.execution_generation = 1;
+        snapshot.revision = 1;
+        snapshot
+    }
+
     fn test_greeting() -> protocol::Greeting {
         protocol::Greeting {
             worker_name: "test".into(),
@@ -4194,7 +4314,7 @@ mod completion_flow_tests {
                 entries: Vec::new(),
             },
             greeting,
-            status: WorkerStatus::Idle,
+            state: test_worker_state(WorkerStatus::Idle),
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });
@@ -4393,7 +4513,7 @@ mod completion_flow_tests {
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             session: public_session(assistant_item_entries),
-            status: WorkerStatus::Running,
+            state: test_worker_state(WorkerStatus::Running),
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });

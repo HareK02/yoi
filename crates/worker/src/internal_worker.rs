@@ -295,6 +295,38 @@ impl InternalWorkerSessionStatus {
     }
 }
 
+fn send_internal_worker_state(
+    event_tx: &broadcast::Sender<Event>,
+    state_revision: &std::sync::atomic::AtomicU64,
+    status: InternalWorkerSessionStatus,
+) {
+    let state = match status {
+        InternalWorkerSessionStatus::Idle
+        | InternalWorkerSessionStatus::Stopped
+        | InternalWorkerSessionStatus::Failed => protocol::WorkerState::Idle,
+        InternalWorkerSessionStatus::Paused => protocol::WorkerState::Busy(
+            protocol::WorkerBusyState::Run(protocol::WorkerRunState::Paused),
+        ),
+        InternalWorkerSessionStatus::Running => protocol::WorkerState::Busy(
+            protocol::WorkerBusyState::Run(protocol::WorkerRunState::Running),
+        ),
+        InternalWorkerSessionStatus::Stopping => protocol::WorkerState::Busy(
+            protocol::WorkerBusyState::Run(protocol::WorkerRunState::Cancelling),
+        ),
+    };
+    let revision = state_revision
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+        .saturating_add(1);
+    let _ = event_tx.send(Event::WorkerState {
+        snapshot: protocol::WorkerStateSnapshot {
+            execution_generation: 1,
+            revision,
+            last_command_id: 0,
+            state,
+        },
+    });
+}
+
 fn classify_internal_turn_result(
     result: Result<WorkerRunResult, WorkerError>,
 ) -> (InternalWorkerSessionStatus, Option<String>) {
@@ -351,6 +383,7 @@ pub(crate) struct InternalWorkerSessionSnapshot {
 pub(crate) struct InternalWorkerSessionHandle {
     command_tx: tokio::sync::mpsc::Sender<InternalWorkerSessionCommand>,
     status: Arc<std::sync::atomic::AtomicU8>,
+    state_revision: Arc<std::sync::atomic::AtomicU64>,
     store: EphemeralSessionStore,
     session_id: SessionId,
     segment_id: SegmentId,
@@ -398,6 +431,10 @@ impl InternalWorkerSessionHandle {
     pub(crate) fn emit_test_text_delta(&self, text: &str) {
         let block_id = self.in_flight.start_text_block();
         self.in_flight.text_delta(block_id, text.to_owned());
+    }
+
+    fn emit_worker_state(&self, status: InternalWorkerSessionStatus) {
+        send_internal_worker_state(&self.event_tx, &self.state_revision, status);
     }
 
     pub(crate) fn protocol_snapshot(&self) -> InternalWorkerSessionSnapshot {
@@ -473,9 +510,7 @@ impl InternalWorkerSessionHandle {
             });
             return Err(InternalWorkerSessionError::Unavailable);
         }
-        let _ = self.event_tx.send(Event::Status {
-            status: WorkerStatus::Running,
-        });
+        self.emit_worker_state(InternalWorkerSessionStatus::Running);
         Ok(())
     }
 
@@ -770,11 +805,13 @@ pub(crate) async fn prepare_internal_worker_session(
     let status = Arc::new(std::sync::atomic::AtomicU8::new(
         InternalWorkerSessionStatus::Idle.encode(),
     ));
+    let state_revision = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let state_changed = Arc::new(tokio::sync::Notify::new());
     let last_error = Arc::new(Mutex::new(None));
     let handle = InternalWorkerSessionHandle {
         command_tx,
         status: status.clone(),
+        state_revision: state_revision.clone(),
         store,
         session_id,
         segment_id,
@@ -810,19 +847,11 @@ pub(crate) async fn prepare_internal_worker_session(
                                         message,
                                     });
                                 }
-                                let protocol_status = match turn_status {
-                                    InternalWorkerSessionStatus::Idle => WorkerStatus::Idle,
-                                    InternalWorkerSessionStatus::Paused => WorkerStatus::Paused,
-                                    InternalWorkerSessionStatus::Stopped
-                                    | InternalWorkerSessionStatus::Failed => WorkerStatus::Stopped,
-                                    InternalWorkerSessionStatus::Running
-                                    | InternalWorkerSessionStatus::Stopping => {
-                                        unreachable!("run completion cannot remain active")
-                                    }
-                                };
-                                let _ = event_tx.send(Event::Status {
-                                    status: protocol_status,
-                                });
+                                send_internal_worker_state(
+                                    &event_tx,
+                                    &state_revision,
+                                    turn_status,
+                                );
                                 if let Some(callback) = &on_turn_end {
                                     callback(turn_status);
                                 }
@@ -864,9 +893,11 @@ pub(crate) async fn prepare_internal_worker_session(
             InternalWorkerSessionStatus::Stopped.encode(),
             std::sync::atomic::Ordering::Release,
         );
-        let _ = event_tx.send(Event::Status {
-            status: WorkerStatus::Stopped,
-        });
+        send_internal_worker_state(
+            &event_tx,
+            &state_revision,
+            InternalWorkerSessionStatus::Stopped,
+        );
         let _ = event_tx.send(Event::Shutdown);
         state_changed.notify_waiters();
         if let Some(done) = stop_done {
@@ -1118,6 +1149,7 @@ pub(crate) fn test_internal_worker_session(
         status: Arc::new(std::sync::atomic::AtomicU8::new(
             InternalWorkerSessionStatus::Idle.encode(),
         )),
+        state_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         store,
         session_id,
         segment_id,

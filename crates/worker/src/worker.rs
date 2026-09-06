@@ -4571,15 +4571,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         Ok(())
     }
 
-    fn persist_and_send_compact_done(
-        &mut self,
-        lifecycle: CompactionLifecycle,
-    ) -> Result<(), WorkerError> {
-        self.persist_compaction_lifecycle(&lifecycle)?;
-        self.send_event(Event::CompactDone { lifecycle });
-        Ok(())
-    }
-
     fn persist_and_send_compact_failed(
         &mut self,
         lifecycle: CompactionLifecycle,
@@ -4724,7 +4715,97 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         Ok(rewrite_guard)
     }
 
+    /// Terminalize and clean up any compaction that was left active by the
+    /// previous controller generation. This runs before the restored
+    /// controller publishes its first Idle state.
+    pub async fn recover_unfinished_compaction(&mut self) -> Result<(), WorkerError> {
+        let (entries, _) = self.sink.subscribe_with_snapshot();
+        let latest_payload = entries.iter().rev().find_map(|entry| match entry {
+            LogEntry::Extension {
+                domain, payload, ..
+            } if domain == COMPACTION_EXTENSION_DOMAIN => Some(payload.clone()),
+            _ => None,
+        });
+        let Some(payload) = latest_payload else {
+            return Ok(());
+        };
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CompactionLifecycleWire {
+            schema_version: u32,
+            compaction_id: String,
+            revision: u64,
+            #[serde(default)]
+            internal_worker: Option<protocol::InternalWorkerRef>,
+            state: CompactionLifecycleState,
+            started_at_ms: u64,
+            #[serde(default)]
+            ended_at_ms: Option<u64>,
+            #[serde(default)]
+            summary: Option<String>,
+            #[serde(default)]
+            error: Option<String>,
+            #[serde(default)]
+            new_segment_id: Option<String>,
+        }
+        let wire: CompactionLifecycleWire = serde_json::from_value(payload).map_err(|error| {
+            WorkerError::InvalidState(format!("decode compaction lifecycle: {error}"))
+        })?;
+        if !matches!(wire.schema_version, 2 | 3) {
+            return Err(WorkerError::InvalidState(format!(
+                "unsupported compaction lifecycle schema version {}",
+                wire.schema_version
+            )));
+        }
+        let mut lifecycle = CompactionLifecycle {
+            schema_version: wire.schema_version,
+            compaction_id: wire.compaction_id,
+            revision: wire.revision,
+            internal_worker: wire.internal_worker,
+            state: wire.state,
+            started_at_ms: wire.started_at_ms,
+            ended_at_ms: wire.ended_at_ms,
+            summary: wire.summary,
+            error: wire.error,
+            new_segment_id: wire.new_segment_id,
+        };
+        match lifecycle.state {
+            CompactionLifecycleState::Running => {
+                lifecycle.schema_version = 3;
+                lifecycle.revision = lifecycle.revision.saturating_add(1);
+                lifecycle.state = CompactionLifecycleState::Interrupted;
+                lifecycle.ended_at_ms = Some(segment_log::now_millis());
+                lifecycle.error =
+                    Some("worker execution restarted before compaction completed".into());
+                self.persist_compaction_lifecycle(&lifecycle)?;
+                self.send_event(Event::CompactFailed {
+                    lifecycle: lifecycle.clone(),
+                });
+                self.release_compaction_service(&lifecycle).await;
+            }
+            CompactionLifecycleState::Interrupted => {
+                self.release_compaction_service(&lifecycle).await;
+            }
+            CompactionLifecycleState::Done | CompactionLifecycleState::Failed => {}
+        }
+        Ok(())
+    }
+
     pub async fn manual_compact(&mut self) -> Result<ManualCompactResult, WorkerError> {
+        self.manual_compact_inner(None).await
+    }
+
+    pub async fn manual_compact_with_cancel(
+        &mut self,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<ManualCompactResult, WorkerError> {
+        self.manual_compact_inner(Some(cancel)).await
+    }
+
+    async fn manual_compact_inner(
+        &mut self,
+        mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<ManualCompactResult, WorkerError> {
         if self.manifest.compaction.is_none() {
             let message =
                 "manual compact is unavailable because [compaction] is not configured".to_string();
@@ -4764,7 +4845,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             return Ok(ManualCompactResult::Skipped { message });
         }
 
-        match self.compact(retained).await {
+        match self.compact_with_cancel(retained, cancel.take()).await {
             Ok(new_segment_id) => {
                 info!(new_segment_id = %new_segment_id, "Manual compaction succeeded");
                 if let Some(ref state) = state {
@@ -4937,11 +5018,19 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Runs one parent-owned observable compaction service and returns the new
     /// Segment ID. Lifecycle revisions are committed before they are broadcast.
     pub async fn compact(&mut self, retained_tokens: u64) -> Result<SegmentId, WorkerError> {
+        self.compact_with_cancel(retained_tokens, None).await
+    }
+
+    async fn compact_with_cancel(
+        &mut self,
+        retained_tokens: u64,
+        mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<SegmentId, WorkerError> {
         let _rewrite_guard = self
             .prepare_session_rewrite(SessionRewriteKind::Compact)
             .await?;
         let mut lifecycle = CompactionLifecycle {
-            schema_version: 2,
+            schema_version: 3,
             compaction_id: uuid::Uuid::now_v7().to_string(),
             revision: 1,
             internal_worker: None,
@@ -4953,16 +5042,25 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             new_segment_id: None,
         };
         self.persist_and_send_compact_start(lifecycle.clone())?;
-        match self.compact_impl(retained_tokens, &mut lifecycle).await {
-            Ok((new_segment_id, summary)) => {
-                lifecycle.revision = lifecycle.revision.saturating_add(1);
-                lifecycle.state = CompactionLifecycleState::Done;
-                lifecycle.ended_at_ms = Some(segment_log::now_millis());
-                lifecycle.summary = Some(summary);
-                lifecycle.new_segment_id = Some(new_segment_id.to_string());
-                let terminal = self.persist_and_send_compact_done(lifecycle.clone());
+        let outcome = if let Some(cancel) = cancel.as_mut() {
+            tokio::select! {
+                biased;
+                changed = cancel.changed() => {
+                    let _ = changed;
+                    Err(WorkerError::CompactCancelled)
+                }
+                result = self.compact_impl(retained_tokens, &mut lifecycle) => result,
+            }
+        } else {
+            self.compact_impl(retained_tokens, &mut lifecycle).await
+        };
+        match outcome {
+            Ok((new_segment_id, _summary)) => {
+                debug_assert_eq!(lifecycle.state, CompactionLifecycleState::Done);
+                self.send_event(Event::CompactDone {
+                    lifecycle: lifecycle.clone(),
+                });
                 self.release_compaction_service(&lifecycle).await;
-                terminal?;
                 Ok(new_segment_id)
             }
             Err(error) => {
@@ -5543,6 +5641,24 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 })?,
             });
         }
+        // Commit the terminal lifecycle in the same atomic replacement-segment
+        // creation as the rewritten history. Restore can therefore never see a
+        // replacement segment without the Done fact for the compaction that
+        // created it.
+        lifecycle.revision = lifecycle.revision.saturating_add(1);
+        lifecycle.state = CompactionLifecycleState::Done;
+        lifecycle.ended_at_ms = Some(segment_log::now_millis());
+        lifecycle.summary = Some(summary_text.clone());
+        lifecycle.new_segment_id = Some(new_segment_id.to_string());
+        initial_entries.push(LogEntry::Extension {
+            ts: segment_log::now_millis(),
+            domain: COMPACTION_EXTENSION_DOMAIN.to_string(),
+            payload: serde_json::to_value(&*lifecycle).map_err(|error| {
+                WorkerError::InvalidState(format!(
+                    "serialize terminal compaction lifecycle: {error}"
+                ))
+            })?,
+        });
         self.store
             .create_segment(old_loc.session_id, new_segment_id, &initial_entries)?;
         self.segment_state.set_location(SegmentLocation {
@@ -10163,6 +10279,56 @@ mod build_summary_prompt_tests {
             WorkerHistoryProvenance::HumanInput { ref account_id } if account_id == "account-1"
         ));
         assert_eq!(state.notification_receipts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restore_terminalizes_running_compaction_before_idle_publication() {
+        let (_dir, mut worker) = rewind_test_worker().await;
+        let lifecycle = CompactionLifecycle {
+            schema_version: 3,
+            compaction_id: "compact-before-restart".into(),
+            revision: 1,
+            internal_worker: None,
+            state: CompactionLifecycleState::Running,
+            started_at_ms: segment_log::now_millis(),
+            ended_at_ms: None,
+            summary: None,
+            error: None,
+            new_segment_id: None,
+        };
+        worker.persist_compaction_lifecycle(&lifecycle).unwrap();
+
+        worker.recover_unfinished_compaction().await.unwrap();
+
+        let (entries, _) = worker.sink.subscribe_with_snapshot();
+        let restored = entries.iter().rev().find_map(|entry| match entry {
+            LogEntry::Extension {
+                domain, payload, ..
+            } if domain == COMPACTION_EXTENSION_DOMAIN => {
+                serde_json::from_value::<CompactionLifecycle>(payload.clone()).ok()
+            }
+            _ => None,
+        });
+        let restored = restored.expect("terminal compaction lifecycle");
+        assert_eq!(restored.state, CompactionLifecycleState::Interrupted);
+        assert_eq!(restored.revision, 2);
+        assert!(
+            restored
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("restarted"))
+        );
+
+        let mut future = lifecycle;
+        future.schema_version = 4;
+        future.compaction_id = "future-compaction".into();
+        worker.persist_compaction_lifecycle(&future).unwrap();
+        let error = worker.recover_unfinished_compaction().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported compaction lifecycle schema version 4")
+        );
     }
 
     fn minimal_manifest() -> WorkerManifest {

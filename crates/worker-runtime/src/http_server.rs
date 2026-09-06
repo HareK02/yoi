@@ -2205,8 +2205,8 @@ mod tests {
     };
     use crate::execution::{
         WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation,
-        WorkerExecutionRestoreRequest, WorkerExecutionResult, WorkerExecutionRunState,
-        WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
+        WorkerExecutionRestoreRequest, WorkerExecutionResult, WorkerExecutionSpawnRequest,
+        WorkerExecutionSpawnResult,
     };
     use crate::management::RuntimeOptions;
     use axum::body::to_bytes;
@@ -2895,7 +2895,6 @@ mod tests {
         fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
-                run_state: WorkerExecutionRunState::Idle,
                 working_directory: request
                     .working_directory
                     .as_ref()
@@ -2909,7 +2908,6 @@ mod tests {
         ) -> WorkerExecutionSpawnResult {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
-                run_state: WorkerExecutionRunState::Idle,
                 working_directory: request.previous_working_directory,
             }
         }
@@ -2922,24 +2920,17 @@ mod tests {
             if let Some(submission_id) = input.submission_request_id {
                 WorkerExecutionResult::accepted_submission(
                     WorkerExecutionOperation::Input,
-                    WorkerExecutionRunState::Idle,
                     submission_id.clone(),
                     submission_id,
                     protocol::SubmissionDisposition::Started,
                 )
             } else {
-                WorkerExecutionResult::accepted(
-                    WorkerExecutionOperation::Input,
-                    WorkerExecutionRunState::Idle,
-                )
+                WorkerExecutionResult::accepted(WorkerExecutionOperation::Input)
             }
         }
 
         fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
-            WorkerExecutionResult::accepted(
-                WorkerExecutionOperation::Stop,
-                WorkerExecutionRunState::Stopped,
-            )
+            WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop)
         }
     }
 
@@ -3211,8 +3202,7 @@ mod ws_tests {
     };
     use crate::execution::{
         WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation,
-        WorkerExecutionResult, WorkerExecutionRunState, WorkerExecutionSpawnRequest,
-        WorkerExecutionSpawnResult,
+        WorkerExecutionResult, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
     };
     use crate::management::RuntimeOptions;
     use futures::{SinkExt, StreamExt};
@@ -3232,7 +3222,6 @@ mod ws_tests {
         fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
-                run_state: WorkerExecutionRunState::Idle,
                 working_directory: request
                     .working_directory
                     .as_ref()
@@ -3248,17 +3237,38 @@ mod ws_tests {
             if let Some(submission_id) = input.submission_request_id {
                 WorkerExecutionResult::accepted_submission(
                     WorkerExecutionOperation::Input,
-                    WorkerExecutionRunState::Idle,
                     submission_id.clone(),
                     submission_id,
                     protocol::SubmissionDisposition::Started,
                 )
             } else {
-                WorkerExecutionResult::accepted(
-                    WorkerExecutionOperation::Input,
-                    WorkerExecutionRunState::Idle,
-                )
+                WorkerExecutionResult::accepted(WorkerExecutionOperation::Input)
             }
+        }
+
+        fn worker_snapshot(&self, handle: &WorkerExecutionHandle) -> Option<protocol::Event> {
+            Some(protocol::Event::Snapshot {
+                session: protocol::SessionSnapshot {
+                    pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                    entries: Vec::new(),
+                },
+                greeting: protocol::Greeting {
+                    worker_name: handle.worker_ref().worker_id.to_string(),
+                    cwd: String::new(),
+                    provider: "ws-test".to_string(),
+                    model: "ws-test".to_string(),
+                    scope_summary: "WebSocket test execution snapshot".to_string(),
+                    tools: Vec::new(),
+                    context_window: 0,
+                    context_tokens: 0,
+                },
+                state: protocol::WorkerStateSnapshot::initial(1),
+                in_flight: protocol::InFlightSnapshot {
+                    blocks: Vec::new(),
+                    commands: Vec::new(),
+                },
+                internal_workers: Vec::new(),
+            })
         }
 
         fn dispatch_method(
@@ -3266,10 +3276,7 @@ mod ws_tests {
             _handle: &WorkerExecutionHandle,
             _method: protocol::Method,
         ) -> WorkerExecutionResult {
-            WorkerExecutionResult::accepted(
-                WorkerExecutionOperation::ProtocolMethod,
-                WorkerExecutionRunState::Idle,
-            )
+            WorkerExecutionResult::accepted(WorkerExecutionOperation::ProtocolMethod)
         }
     }
 
@@ -3480,16 +3487,16 @@ mod ws_tests {
         runtime
             .observe_worker_event(
                 &other.worker_ref,
-                protocol::Event::Status {
-                    status: protocol::WorkerStatus::Running,
+                protocol::Event::WorkerState {
+                    snapshot: protocol::WorkerStatus::Running.into(),
                 },
             )
             .unwrap();
         runtime
             .observe_worker_event(
                 &worker_ref,
-                protocol::Event::Status {
-                    status: protocol::WorkerStatus::Running,
+                protocol::Event::WorkerState {
+                    snapshot: protocol::WorkerStatus::Running.into(),
                 },
             )
             .unwrap();
@@ -3504,7 +3511,16 @@ mod ws_tests {
                 ..
             }) if delivered_subscription_id == subscription_id
                 && worker.worker_id.as_str() == worker_ref.worker_id.to_string()
-                && worker.state == protocol::subscription::SubscriptionWorkerState::Running
+                && worker.state == protocol::subscription::SubscriptionWorkerState::Idle
+                && matches!(
+                    worker.worker_state,
+                    Some(protocol::WorkerStateSnapshot {
+                        state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                            protocol::WorkerRunState::Running
+                        )),
+                        ..
+                    })
+                )
         ));
 
         let unsubscribe_request_id =

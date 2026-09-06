@@ -25,7 +25,9 @@ export function applyRunActivityEvent(
     case "invoke_start":
       return { ...emptyRunActivityStats(), startedAtMs: observedAtMs };
     case "snapshot":
-      return event.data.status === "running"
+      return event.data.state.state.kind === "busy" &&
+          !(event.data.state.state.state.kind === "run" &&
+            event.data.state.state.state.state === "paused")
         ? { ...emptyRunActivityStats(), startedAtMs: observedAtMs }
         : emptyRunActivityStats();
     case "turn_start":
