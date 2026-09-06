@@ -573,6 +573,11 @@ pub struct SubscriptionWorker {
     pub resource_key: Option<String>,
     /// Producer-owned monotonic revision for this Worker subject.
     pub subject_revision: u64,
+    /// Latest revisioned foreground state observed from the Worker. This remains
+    /// absent until an authoritative Worker snapshot/event has been applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_state: Option<crate::WorkerStateSnapshot>,
+    /// Runtime catalog lifecycle compatibility projection; not foreground-state authority.
     pub state: SubscriptionWorkerState,
     #[serde(default)]
     pub has_running_internal_workers: bool,
@@ -874,6 +879,7 @@ mod tests {
             runtime_id: None,
             resource_key: None,
             subject_revision: 0,
+            worker_state: None,
             state: SubscriptionWorkerState::Idle,
             has_running_internal_workers: false,
             workspace_id: Some("workspace-1".to_string()),

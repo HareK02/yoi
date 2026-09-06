@@ -1,5 +1,6 @@
 <script lang="ts">
   import { workspaceRoute } from '$lib/workspace/api/http';
+  import { liveWorkerState } from '$lib/workspace/sidebar/worker-state';
   import type { PageData } from './$types';
   let { data }: { data: PageData } = $props();
 </script>
@@ -24,7 +25,7 @@
       >Open console</a>
     </header>
     <dl class="resource-meta">
-      <dt>Status</dt><dd>{data.worker.state}</dd>
+      <dt>Status</dt><dd>{liveWorkerState(data.worker)}</dd>
       <dt>Profile</dt><dd>{data.worker.profile}</dd>
       <dt>Internal ID</dt><dd><code>{data.worker.worker_id}</code></dd>
     </dl>

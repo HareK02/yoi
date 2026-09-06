@@ -17,7 +17,7 @@ use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::ipc::server::SocketServer;
 use crate::runtime::dir::RuntimeDir;
 use crate::segment_log_sink::SegmentLogSink;
-use crate::shared_state::WorkerSharedState;
+use crate::shared_state::{WorkerCommandAdmission, WorkerSharedState};
 use crate::shutdown_after_idle::{
     ShutdownAfterIdleRequest, TicketIntakeReadyShutdownHook, is_ticket_intake_role,
     take_shutdown_request_after_status,
@@ -181,21 +181,40 @@ impl WorkerHandle {
     }
 }
 
+fn command_admission_disposition(
+    admission: WorkerCommandAdmission,
+) -> Result<(), WorkerCommandDisposition> {
+    match admission {
+        WorkerCommandAdmission::Accepted => Ok(()),
+        WorkerCommandAdmission::Retry | WorkerCommandAdmission::StaleCommandId => {
+            Err(WorkerCommandDisposition::StaleCommandId)
+        }
+        WorkerCommandAdmission::Conflict => Err(WorkerCommandDisposition::Conflict),
+        WorkerCommandAdmission::ExecutionGenerationMismatch => {
+            Err(WorkerCommandDisposition::StaleExecutionGeneration)
+        }
+        WorkerCommandAdmission::StateRevisionMismatch => {
+            Err(WorkerCommandDisposition::StaleWorkerStateRevision)
+        }
+    }
+}
+
 fn validate_command(
+    envelope: WorkerCommandEnvelope,
+    kind: WorkerCommandKind,
+    shared_state: &WorkerSharedState,
+) -> Result<(), WorkerCommandDisposition> {
+    command_admission_disposition(shared_state.admit_command(envelope, kind, true))
+}
+
+fn validate_shutdown_command(
     envelope: WorkerCommandEnvelope,
     shared_state: &WorkerSharedState,
 ) -> Result<(), WorkerCommandDisposition> {
-    let snapshot = shared_state.snapshot();
-    if envelope.expected_execution_generation != snapshot.execution_generation {
-        return Err(WorkerCommandDisposition::StaleExecutionGeneration);
+    match shared_state.admit_command(envelope, WorkerCommandKind::Shutdown, false) {
+        WorkerCommandAdmission::Accepted | WorkerCommandAdmission::Retry => Ok(()),
+        admission => command_admission_disposition(admission),
     }
-    if envelope.expected_worker_state_revision != snapshot.revision {
-        return Err(WorkerCommandDisposition::StaleWorkerStateRevision);
-    }
-    if !shared_state.accept_command_id(envelope.command_id) {
-        return Err(WorkerCommandDisposition::StaleCommandId);
-    }
-    Ok(())
 }
 
 fn acknowledge_command(
@@ -205,6 +224,7 @@ fn acknowledge_command(
     command: WorkerCommandKind,
     disposition: WorkerCommandDisposition,
 ) {
+    shared_state.complete_command(command_id, command, disposition);
     let _ = working_event_tx.send(Event::CommandAcknowledged {
         acknowledgement: WorkerCommandAcknowledgement {
             command_id,
@@ -1913,7 +1933,9 @@ async fn controller_loop<C, St>(
                 }
             }
             Method::Resume { command } => {
-                if let Err(disposition) = validate_command(command, &shared_state) {
+                if let Err(disposition) =
+                    validate_command(command, WorkerCommandKind::Resume, &shared_state)
+                {
                     acknowledge_command(
                         &working_event_tx,
                         &shared_state,
@@ -1953,7 +1975,9 @@ async fn controller_loop<C, St>(
             }
 
             Method::Cancel { command } => {
-                if let Err(disposition) = validate_command(command, &shared_state) {
+                if let Err(disposition) =
+                    validate_command(command, WorkerCommandKind::Cancel, &shared_state)
+                {
                     acknowledge_command(
                         &working_event_tx,
                         &shared_state,
@@ -2017,7 +2041,9 @@ async fn controller_loop<C, St>(
             }
 
             Method::Pause { command } => {
-                if let Err(disposition) = validate_command(command, &shared_state) {
+                if let Err(disposition) =
+                    validate_command(command, WorkerCommandKind::Pause, &shared_state)
+                {
                     acknowledge_command(
                         &working_event_tx,
                         &shared_state,
@@ -2036,7 +2062,9 @@ async fn controller_loop<C, St>(
             }
 
             Method::Compact { command } => {
-                if let Err(disposition) = validate_command(command, &shared_state) {
+                if let Err(disposition) =
+                    validate_command(command, WorkerCommandKind::Compact, &shared_state)
+                {
                     acknowledge_command(
                         &working_event_tx,
                         &shared_state,
@@ -2081,7 +2109,11 @@ async fn controller_loop<C, St>(
                             method = method_rx.recv() => {
                                 match method {
                                     Some(Method::Cancel { command }) => {
-                                        if let Err(disposition) = validate_command(command, &shared_state) {
+                                        if let Err(disposition) = validate_command(
+                                            command,
+                                            WorkerCommandKind::Cancel,
+                                            &shared_state,
+                                        ) {
                                             acknowledge_command(
                                                 &working_event_tx,
                                                 &shared_state,
@@ -2101,7 +2133,18 @@ async fn controller_loop<C, St>(
                                         let _ = cancel_tx.send(true);
                                     }
                                     Some(Method::Shutdown { command }) => {
-                                        shared_state.accept_command_id(command.command_id);
+                                        if let Err(disposition) =
+                                            validate_shutdown_command(command, &shared_state)
+                                        {
+                                            acknowledge_command(
+                                                &working_event_tx,
+                                                &shared_state,
+                                                command.command_id,
+                                                WorkerCommandKind::Shutdown,
+                                                disposition,
+                                            );
+                                            continue;
+                                        }
                                         shutdown_after_compaction = true;
                                         acknowledge_command(
                                             &working_event_tx,
@@ -2196,9 +2239,18 @@ async fn controller_loop<C, St>(
             },
 
             Method::Shutdown { command } => {
-                // Shutdown remains unconditional/retryable even when the caller's
-                // live-state fence is stale.
-                shared_state.accept_command_id(command.command_id);
+                // Shutdown ignores the state-revision fence but remains bound to the
+                // current execution generation and command payload identity.
+                if let Err(disposition) = validate_shutdown_command(command, &shared_state) {
+                    acknowledge_command(
+                        &working_event_tx,
+                        &shared_state,
+                        command.command_id,
+                        WorkerCommandKind::Shutdown,
+                        disposition,
+                    );
+                    continue;
+                }
                 acknowledge_command(
                     &working_event_tx,
                     &shared_state,
@@ -2544,7 +2596,9 @@ where
             method = method_rx.recv(), if input_commit.is_none() => {
                 match method {
                     Some(Method::Cancel { command }) => {
-                        if let Err(disposition) = validate_command(command, shared_state) {
+                        if let Err(disposition) =
+                            validate_command(command, WorkerCommandKind::Cancel, shared_state)
+                        {
                             acknowledge_command(
                                 working_event_tx,
                                 shared_state,
@@ -2583,7 +2637,9 @@ where
                         let _ = cancel_tx.try_send(());
                     }
                     Some(Method::Pause { command }) => {
-                        if let Err(disposition) = validate_command(command, shared_state) {
+                        if let Err(disposition) =
+                            validate_command(command, WorkerCommandKind::Pause, shared_state)
+                        {
                             acknowledge_command(
                                 working_event_tx,
                                 shared_state,
@@ -2623,7 +2679,16 @@ where
                         let _ = pause_tx.try_send(());
                     }
                     Some(Method::Shutdown { command }) => {
-                        shared_state.accept_command_id(command.command_id);
+                        if let Err(disposition) = validate_shutdown_command(command, shared_state) {
+                            acknowledge_command(
+                                working_event_tx,
+                                shared_state,
+                                command.command_id,
+                                WorkerCommandKind::Shutdown,
+                                disposition,
+                            );
+                            continue;
+                        }
                         shutdown_requested = true;
                         set_controller_state(
                             shared_state,
@@ -2705,7 +2770,9 @@ where
                         }
                     }
                     Some(Method::Resume { command }) => {
-                        if let Err(disposition) = validate_command(command, shared_state) {
+                        if let Err(disposition) =
+                            validate_command(command, WorkerCommandKind::Resume, shared_state)
+                        {
                             acknowledge_command(
                                 working_event_tx,
                                 shared_state,
@@ -2763,7 +2830,9 @@ where
                         }
                     }
                     Some(Method::Compact { command }) => {
-                        if let Err(disposition) = validate_command(command, shared_state) {
+                        if let Err(disposition) =
+                            validate_command(command, WorkerCommandKind::Compact, shared_state)
+                        {
                             acknowledge_command(
                                 working_event_tx,
                                 shared_state,
@@ -3677,6 +3746,7 @@ mod tests {
                     expected_execution_generation: 8,
                     expected_worker_state_revision: 0,
                 },
+                WorkerCommandKind::Pause,
                 &shared,
             ),
             Err(WorkerCommandDisposition::StaleExecutionGeneration)
@@ -3688,6 +3758,7 @@ mod tests {
                     expected_execution_generation: 9,
                     expected_worker_state_revision: 1,
                 },
+                WorkerCommandKind::Pause,
                 &shared,
             ),
             Err(WorkerCommandDisposition::StaleWorkerStateRevision)
@@ -3699,6 +3770,7 @@ mod tests {
                     expected_execution_generation: 9,
                     expected_worker_state_revision: 0,
                 },
+                WorkerCommandKind::Pause,
                 &shared,
             )
             .is_ok()
@@ -3708,11 +3780,24 @@ mod tests {
                 WorkerCommandEnvelope {
                     command_id: 1,
                     expected_execution_generation: 9,
-                    expected_worker_state_revision: 1,
+                    expected_worker_state_revision: 0,
                 },
+                WorkerCommandKind::Pause,
                 &shared,
             ),
             Err(WorkerCommandDisposition::StaleCommandId)
+        );
+        assert_eq!(
+            validate_command(
+                WorkerCommandEnvelope {
+                    command_id: 1,
+                    expected_execution_generation: 9,
+                    expected_worker_state_revision: 0,
+                },
+                WorkerCommandKind::Cancel,
+                &shared,
+            ),
+            Err(WorkerCommandDisposition::Conflict)
         );
         assert!(
             validate_command(
@@ -3721,6 +3806,7 @@ mod tests {
                     expected_execution_generation: 9,
                     expected_worker_state_revision: 1,
                 },
+                WorkerCommandKind::Pause,
                 &shared,
             )
             .is_ok()

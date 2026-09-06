@@ -1,16 +1,36 @@
+use std::collections::VecDeque;
 use std::sync::{
     OnceLock, RwLock,
     atomic::{AtomicBool, Ordering},
 };
 
 use protocol::{
-    WorkerBusyState, WorkerMaintenanceState, WorkerRunState, WorkerState, WorkerStateSnapshot,
-    WorkerStatus,
+    WorkerBusyState, WorkerCommandDisposition, WorkerCommandEnvelope, WorkerCommandKind,
+    WorkerMaintenanceState, WorkerRunState, WorkerState, WorkerStateSnapshot, WorkerStatus,
 };
 use serde_json::json;
 use session_store::SegmentId;
 
 use crate::fs_view::WorkerFsView;
+
+const COMPLETED_COMMAND_RETENTION: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AcceptedWorkerCommand {
+    envelope: WorkerCommandEnvelope,
+    kind: WorkerCommandKind,
+    disposition: Option<WorkerCommandDisposition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerCommandAdmission {
+    Accepted,
+    Retry,
+    Conflict,
+    StaleCommandId,
+    ExecutionGenerationMismatch,
+    StateRevisionMismatch,
+}
 
 /// Shared state between WorkerController and runtime directory.
 ///
@@ -23,6 +43,7 @@ pub struct WorkerSharedState {
     pub manifest_toml: String,
     pub greeting: protocol::Greeting,
     state: RwLock<WorkerStateSnapshot>,
+    accepted_commands: RwLock<VecDeque<AcceptedWorkerCommand>>,
     /// Worker-from-the-inside view of the filesystem. Set once in
     /// `WorkerController::start` after the local WorkdirSession provider is
     /// materialised, and read from the IPC server layer to answer
@@ -55,6 +76,7 @@ impl WorkerSharedState {
             manifest_toml,
             greeting,
             state: RwLock::new(WorkerStateSnapshot::initial(execution_generation)),
+            accepted_commands: RwLock::new(VecDeque::new()),
             fs_view: OnceLock::new(),
             flow_transition_enabled: AtomicBool::new(false),
         }
@@ -92,17 +114,99 @@ impl WorkerSharedState {
         snapshot.clone()
     }
 
-    pub fn accept_command_id(&self, command_id: u64) -> bool {
+    pub(crate) fn admit_command(
+        &self,
+        envelope: WorkerCommandEnvelope,
+        kind: WorkerCommandKind,
+        require_state_revision: bool,
+    ) -> WorkerCommandAdmission {
         let mut snapshot = self
             .state
             .write()
             .expect("worker state lock poisoned; refusing command admission");
-        if command_id <= snapshot.last_command_id {
-            return false;
+        let mut accepted = self
+            .accepted_commands
+            .write()
+            .expect("worker command ledger lock poisoned; refusing command admission");
+        if let Some(existing) = accepted
+            .iter()
+            .find(|accepted| accepted.envelope.command_id == envelope.command_id)
+        {
+            return if existing.envelope == envelope && existing.kind == kind {
+                WorkerCommandAdmission::Retry
+            } else {
+                WorkerCommandAdmission::Conflict
+            };
         }
-        snapshot.last_command_id = command_id;
+        if envelope.expected_execution_generation != snapshot.execution_generation {
+            return WorkerCommandAdmission::ExecutionGenerationMismatch;
+        }
+        if require_state_revision && envelope.expected_worker_state_revision != snapshot.revision {
+            return WorkerCommandAdmission::StateRevisionMismatch;
+        }
+        if envelope.command_id <= snapshot.last_command_id {
+            return WorkerCommandAdmission::StaleCommandId;
+        }
+
+        snapshot.last_command_id = envelope.command_id;
         snapshot.revision = snapshot.revision.saturating_add(1);
-        true
+        accepted.push_back(AcceptedWorkerCommand {
+            envelope,
+            kind,
+            disposition: None,
+        });
+        WorkerCommandAdmission::Accepted
+    }
+
+    pub(crate) fn complete_command(
+        &self,
+        command_id: u64,
+        kind: WorkerCommandKind,
+        disposition: WorkerCommandDisposition,
+    ) {
+        if !matches!(
+            disposition,
+            WorkerCommandDisposition::Accepted | WorkerCommandDisposition::InvalidState
+        ) {
+            return;
+        }
+        let mut accepted = self
+            .accepted_commands
+            .write()
+            .expect("worker command ledger lock poisoned; refusing command completion");
+        if let Some(command) = accepted
+            .iter_mut()
+            .find(|command| command.envelope.command_id == command_id && command.kind == kind)
+        {
+            command.disposition.get_or_insert(disposition);
+        }
+        while accepted
+            .iter()
+            .filter(|command| command.disposition.is_some())
+            .count()
+            > COMPLETED_COMMAND_RETENTION
+        {
+            let Some(index) = accepted
+                .iter()
+                .position(|command| command.disposition.is_some())
+            else {
+                break;
+            };
+            accepted.remove(index);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn command_result(
+        &self,
+        command_id: u64,
+    ) -> Option<Option<WorkerCommandDisposition>> {
+        self.accepted_commands
+            .read()
+            .expect("worker command ledger lock poisoned")
+            .iter()
+            .find(|command| command.envelope.command_id == command_id)
+            .map(|command| command.disposition)
     }
 
     pub fn snapshot(&self) -> WorkerStateSnapshot {
@@ -190,9 +294,17 @@ mod tests {
     }
 
     #[test]
-    fn accepted_command_id_advances_the_snapshot_revision_atomically() {
+    fn accepted_command_identity_advances_revision_and_detects_reuse_conflicts() {
         let state = test_state();
-        assert!(state.accept_command_id(9));
+        let envelope = WorkerCommandEnvelope {
+            command_id: 9,
+            expected_execution_generation: 7,
+            expected_worker_state_revision: 0,
+        };
+        assert_eq!(
+            state.admit_command(envelope, WorkerCommandKind::Pause, true),
+            WorkerCommandAdmission::Accepted
+        );
         assert_eq!(
             state.snapshot(),
             WorkerStateSnapshot {
@@ -202,7 +314,24 @@ mod tests {
                 state: WorkerState::Idle,
             }
         );
-        assert!(!state.accept_command_id(9));
+        assert_eq!(state.command_result(9), Some(None));
+        state.complete_command(
+            9,
+            WorkerCommandKind::Pause,
+            WorkerCommandDisposition::Accepted,
+        );
+        assert_eq!(
+            state.command_result(9),
+            Some(Some(WorkerCommandDisposition::Accepted))
+        );
+        assert_eq!(
+            state.admit_command(envelope, WorkerCommandKind::Pause, true),
+            WorkerCommandAdmission::Retry
+        );
+        assert_eq!(
+            state.admit_command(envelope, WorkerCommandKind::Cancel, true),
+            WorkerCommandAdmission::Conflict
+        );
         assert_eq!(state.snapshot().revision, 1);
     }
 

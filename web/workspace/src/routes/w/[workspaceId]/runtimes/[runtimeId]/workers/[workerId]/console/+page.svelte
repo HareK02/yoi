@@ -52,11 +52,7 @@
     import { pushWorkspaceAlert } from "$lib/workspace/alerts/store";
     import { workspaceApiPath } from "$lib/workspace/api/http";
     import { workspaceMultiplexer, type WorkspaceMultiplexerSubscription } from "$lib/workspace/multiplexer";
-    import type {
-        Diagnostic,
-        Worker,
-        PodProtocolEvent,
-    } from "$lib/workspace/sidebar/types";
+    import type { Diagnostic, Worker } from "$lib/workspace/sidebar/types";
 
     type Props = {
         data: {
@@ -207,7 +203,6 @@
     );
     let pendingObservationEvents: ConsoleEventInput[] = [];
     let protocolEventSequence = 0;
-    let pendingObservedStates: Array<string | null> = [];
     let pendingStreamDiagnostics: Diagnostic[] = [];
     let observationFlushHandle: number | null = null;
     let nextReloadToken = 0;
@@ -249,7 +244,9 @@
     const diagnostics = $derived(
         mergeDiagnostics(worker?.diagnostics ?? [], streamDiagnostics),
     );
-    const workerState = $derived(liveWorkerState ?? worker?.state ?? "loading");
+    const workerState = $derived(
+        liveWorkerState ?? (worker?.state === "stopped" ? "stopped" : "loading"),
+    );
     const workerRunning = $derived(workerState === "running");
     const workerPaused = $derived(workerState === "paused");
     const composerEditable = $derived(protocolState === "open" && !sending);
@@ -343,7 +340,6 @@
             observationFlushHandle = null;
         }
         pendingObservationEvents = [];
-        pendingObservedStates = [];
         pendingStreamDiagnostics = [];
     }
 
@@ -359,18 +355,15 @@
     function flushObservationBatch() {
         observationFlushHandle = null;
         const eventBatch = pendingObservationEvents;
-        const stateBatch = pendingObservedStates;
         const diagnosticBatch = pendingStreamDiagnostics;
         pendingObservationEvents = [];
-        pendingObservedStates = [];
         pendingStreamDiagnostics = [];
 
         if (eventBatch.length > 0) {
-            const latestState = stateBatch.findLast((state) => state !== null);
-            if (latestState) {
-                liveWorkerState = latestState;
-            }
             consoleProjection = consoleProjector.append(eventBatch);
+            liveWorkerState = consoleProjection.status === "shutdown"
+                ? "shutdown"
+                : workerStateFromSnapshot(consoleProjection.workerState);
             advanceEventObservedAtVersion();
         }
 
@@ -407,7 +400,6 @@
             event: payload,
             observedAtMs,
         });
-        pendingObservedStates.push(workerStateFromProtocolEvent(payload));
         scheduleObservationFlush();
     }
 
@@ -925,36 +917,16 @@
         handleComposerSubmit();
     }
 
-    function workerStateFromProtocolEvent(
-        event: PodProtocolEvent,
+    function workerStateFromSnapshot(
+        snapshot: ConsoleProjection["workerState"],
     ): string | null {
-        switch (event.event) {
-            case "snapshot":
-                return event.data.state.state.kind === "idle"
-                    ? "idle"
-                    : event.data.state.state.state.kind === "run" &&
-                        event.data.state.state.state.state === "paused"
-                      ? "paused"
-                      : "running";
-            case "worker_state":
-                return event.data.snapshot.state.kind === "idle"
-                    ? "idle"
-                    : event.data.snapshot.state.state.kind === "run" &&
-                        event.data.snapshot.state.state.state === "paused"
-                      ? "paused"
-                      : "running";
-            case "command_acknowledged":
-                return event.data.acknowledgement.state.state.kind === "idle"
-                    ? "idle"
-                    : event.data.acknowledgement.state.state.state.kind === "run" &&
-                        event.data.acknowledgement.state.state.state.state === "paused"
-                      ? "paused"
-                      : "running";
-            case "shutdown":
-                return "shutdown";
-            default:
-                return null;
-        }
+        if (!snapshot) return null;
+        return snapshot.state.kind === "idle"
+            ? "idle"
+            : snapshot.state.state.kind === "run" &&
+                  snapshot.state.state.state === "paused"
+              ? "paused"
+              : "running";
     }
 
     function connectProtocolTransport(

@@ -202,7 +202,16 @@ async fn equal_downstream_selectors_share_one_upstream_subscription() {
             BrokerSubscriptionEvent::Event {
                 payload: SubscriptionEventPayload::WorkerUpserted { ref worker },
                 ..
-            } if worker.state == SubscriptionWorkerState::Running
+            } if worker.state == SubscriptionWorkerState::Idle
+                && matches!(
+                    worker.worker_state,
+                    Some(protocol::WorkerStateSnapshot {
+                        state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                            protocol::WorkerRunState::Running
+                        )),
+                        ..
+                    })
+                )
         ));
     }
     let mut late = broker.subscribe("runtime-test", selector.clone()).unwrap();
@@ -212,7 +221,18 @@ async fn equal_downstream_selectors_share_one_upstream_subscription() {
     assert!(matches!(
         snapshot,
         SubscriptionSnapshot::Workers { workers }
-            if workers.iter().any(|worker| worker.state == SubscriptionWorkerState::Running)
+            if workers.iter().any(|worker| {
+                worker.state == SubscriptionWorkerState::Idle
+                    && matches!(
+                        worker.worker_state,
+                        Some(protocol::WorkerStateSnapshot {
+                            state: protocol::WorkerState::Busy(
+                                protocol::WorkerBusyState::Run(protocol::WorkerRunState::Running)
+                            ),
+                            ..
+                        })
+                    )
+            })
     ));
     drop(late);
 
@@ -337,8 +357,18 @@ async fn embedded_runtime_uses_in_process_subscription_source() {
         )
         .unwrap();
     assert!(matches!(next_event(&mut subscription).await,
-        BrokerSubscriptionEvent::Event { payload: SubscriptionEventPayload::WorkerUpserted { worker }, .. }
-        if worker.runtime_id.as_deref() == Some("embedded-worker-runtime") && worker.state == SubscriptionWorkerState::Running));
+    BrokerSubscriptionEvent::Event { payload: SubscriptionEventPayload::WorkerUpserted { worker }, .. }
+    if worker.runtime_id.as_deref() == Some("embedded-worker-runtime")
+        && worker.state == SubscriptionWorkerState::Idle
+        && matches!(
+            worker.worker_state,
+            Some(protocol::WorkerStateSnapshot {
+                state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                    protocol::WorkerRunState::Running
+                )),
+                ..
+            })
+        )));
     let mut late = broker
         .subscribe(
             "embedded-worker-runtime",
@@ -351,7 +381,18 @@ async fn embedded_runtime_uses_in_process_subscription_source() {
     assert!(matches!(
         snapshot,
         SubscriptionSnapshot::Workers { workers }
-            if workers.iter().any(|worker| worker.state == SubscriptionWorkerState::Running)
+            if workers.iter().any(|worker| {
+                worker.state == SubscriptionWorkerState::Idle
+                    && matches!(
+                        worker.worker_state,
+                        Some(protocol::WorkerStateSnapshot {
+                            state: protocol::WorkerState::Busy(
+                                protocol::WorkerBusyState::Run(protocol::WorkerRunState::Running)
+                            ),
+                            ..
+                        })
+                    )
+            })
     ));
 
     runtime

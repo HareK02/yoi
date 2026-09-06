@@ -19,7 +19,7 @@ command_id: number, expected_execution_generation: number, expected_worker_state
 
 export type WorkerCommandKind = "resume" | "cancel" | "pause" | "compact" | "shutdown";
 
-export type WorkerCommandDisposition = "accepted" | "stale_execution_generation" | "stale_worker_state_revision" | "stale_command_id" | "invalid_state";
+export type WorkerCommandDisposition = "accepted" | "stale_execution_generation" | "stale_worker_state_revision" | "stale_command_id" | "conflict" | "invalid_state";
 
 export type WorkerCommandAcknowledgement = { command_id: number, command: WorkerCommandKind, disposition: WorkerCommandDisposition,
 /**
@@ -233,7 +233,16 @@ resource_key?: string | null,
 /**
  * Producer-owned monotonic revision for this Worker subject.
  */
-subject_revision: number, state: SubscriptionWorkerState, has_running_internal_workers: boolean, workspace_id?: string | null, display_name?: string | null, profile?: string | null,
+subject_revision: number,
+/**
+ * Latest revisioned foreground state observed from the Worker. This remains
+ * absent until an authoritative Worker snapshot/event has been applied.
+ */
+worker_state?: WorkerStateSnapshot | null,
+/**
+ * Runtime catalog lifecycle compatibility projection; not foreground-state authority.
+ */
+state: SubscriptionWorkerState, has_running_internal_workers: boolean, workspace_id?: string | null, display_name?: string | null, profile?: string | null,
 /**
  * Workspace-facing Repository key. Runtime producers leave this unset and
  * Workspace Server projections replace `repository_id` with this field.

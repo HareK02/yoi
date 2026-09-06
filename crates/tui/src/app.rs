@@ -1180,18 +1180,14 @@ impl App {
                 self.assistant_streaming = false;
             }
             Event::TurnStart { .. } => {
-                self.set_worker_status(WorkerStatus::Running);
                 self.run_requests += 1;
                 self.current_tool = None;
                 self.latest_llm_wait_event = None;
                 self.assistant_streaming = false;
             }
-            Event::InvokeStart { .. } => {
-                self.set_worker_status(WorkerStatus::Running);
-            }
+            Event::InvokeStart { .. } => {}
             // UI consumers of per-attempt LlmCall semantics remain out of scope;
-            // the run-level status starts at InvokeStart and TurnStart counts each
-            // LLM request within that run.
+            // authoritative run state comes only from WorkerStateSnapshot.
             Event::LlmCallStart { .. } | Event::LlmCallEnd { .. } => {
                 self.latest_llm_wait_event = None;
             }
@@ -1398,12 +1394,7 @@ impl App {
                         output_tokens: self.run_output_tokens,
                     });
                     self.pending_submit_rollback = None;
-                    self.reset_run_state(match result {
-                        RunResult::Paused => WorkerStatus::Paused,
-                        RunResult::Finished | RunResult::LimitReached | RunResult::RolledBack => {
-                            WorkerStatus::Idle
-                        }
-                    });
+                    self.reset_run_state();
                 }
             }
             Event::CompactStart { .. } => {
@@ -1536,7 +1527,7 @@ impl App {
                 };
                 self.completion = None;
                 self.close_rewind_picker();
-                self.reset_run_state(self.worker_status);
+                self.reset_run_state();
                 let mut message = if restored_composer {
                     format!(
                         "Rewound session: discarded {} log entries; restored selected input to composer.",
@@ -1584,8 +1575,7 @@ impl App {
         None
     }
 
-    fn reset_run_state(&mut self, status: WorkerStatus) {
-        self.set_worker_status(status);
+    fn reset_run_state(&mut self) {
         self.run_requests = 0;
         self.run_upload_tokens = 0;
         self.run_output_tokens = 0;
@@ -1615,7 +1605,7 @@ impl App {
             "Rolled back empty assistant turn; no local submitted input was available to restore."
                 .to_owned()
         };
-        self.reset_run_state(WorkerStatus::Idle);
+        self.reset_run_state();
         self.blocks.push(Block::Alert {
             level: AlertLevel::Warn,
             source: AlertSource::Worker,
@@ -3581,6 +3571,37 @@ mod completion_flow_tests {
         assert!(app.running);
         assert_eq!(app.blocks.len(), 1);
         assert!(matches!(app.blocks.first(), Some(Block::Greeting(_))));
+    }
+
+    #[test]
+    fn occurrence_events_do_not_infer_foreground_worker_state() {
+        let mut app = App::new("test".into());
+        app.handle_worker_event(Event::TurnStart { turn: 1 });
+        app.handle_worker_event(Event::InvokeStart {
+            kind: protocol::InvokeKind::UserSend,
+        });
+        app.handle_worker_event(Event::RunEnd {
+            result: RunResult::Paused,
+        });
+        assert_eq!(app.worker_state.state, protocol::WorkerState::Idle);
+        assert_eq!(app.worker_status, WorkerStatus::Idle);
+
+        let running = WorkerStateSnapshot {
+            execution_generation: 1,
+            revision: 1,
+            state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                protocol::WorkerRunState::Running,
+            )),
+            last_command_id: 0,
+        };
+        app.handle_worker_event(Event::WorkerState {
+            snapshot: running.clone(),
+        });
+        app.handle_worker_event(Event::RunEnd {
+            result: RunResult::Finished,
+        });
+        assert_eq!(app.worker_state, running);
+        assert_eq!(app.worker_status, WorkerStatus::Running);
     }
 
     #[test]

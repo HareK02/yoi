@@ -125,6 +125,7 @@ pub enum WorkerCommandDisposition {
     StaleExecutionGeneration,
     StaleWorkerStateRevision,
     StaleCommandId,
+    Conflict,
     InvalidState,
 }
 

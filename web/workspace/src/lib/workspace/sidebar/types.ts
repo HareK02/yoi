@@ -19,6 +19,7 @@ import type {
   Event as PodProtocolEvent,
   Method as PodProtocolMethod,
   Segment as PodProtocolSegment,
+  WorkerStateSnapshot,
 } from "$lib/generated/protocol";
 import type {
   GitCommitSummary as SharedGitCommitSummary,
@@ -99,6 +100,7 @@ export type Worker = {
   tags: string[];
   workspace: { visibility: string; identity: string };
   state: string;
+  worker_state?: WorkerStateSnapshot | null;
   pinned?: boolean;
   retention_state?: string;
   last_seen_at?: string | null;

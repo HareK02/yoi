@@ -1568,7 +1568,12 @@ pub struct WorkerSummary {
     #[serde(default)]
     pub tags: Vec<String>,
     pub workspace: WorkerWorkspaceSummary,
+    /// Runtime catalog lifecycle compatibility state. Live foreground state, when
+    /// available, is carried separately in `worker_state`.
     pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub worker_state: Option<protocol::WorkerStateSnapshot>,
     pub last_seen_at: Option<String>,
     #[serde(default)]
     pub pinned: bool,

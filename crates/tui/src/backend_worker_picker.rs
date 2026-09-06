@@ -321,7 +321,7 @@ fn row_line(
         Span::raw("  "),
         Span::styled(
             pad_column(&worker_state(worker), widths.state),
-            state_style(worker.state.as_str()),
+            state_style(worker_state_label(worker)),
         ),
         Span::raw("  "),
         Span::styled(
@@ -341,8 +341,20 @@ fn worker_name(worker: &BackendWorkerSummary) -> &str {
     }
 }
 
+fn worker_state_label(worker: &BackendWorkerSummary) -> &str {
+    match worker.worker_state.as_ref().map(|state| &state.state) {
+        Some(protocol::WorkerState::Idle) => "idle",
+        Some(protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+            protocol::WorkerRunState::Paused,
+        ))) => "paused",
+        Some(protocol::WorkerState::Busy(_)) => "running",
+        None if worker.state == "stopped" => "stopped",
+        None => "unknown",
+    }
+}
+
 fn worker_state(worker: &BackendWorkerSummary) -> String {
-    format!("[{}]", worker.state)
+    format!("[{}]", worker_state_label(worker))
 }
 
 fn text_width(value: &str) -> usize {
@@ -413,7 +425,15 @@ mod tests {
                 identity: "ws".to_string(),
                 workspace_id: Some("ws".to_string()),
             },
-            state: "running".to_string(),
+            state: "idle".to_string(),
+            worker_state: Some(protocol::WorkerStateSnapshot {
+                execution_generation: 1,
+                revision: 1,
+                state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                    protocol::WorkerRunState::Running,
+                )),
+                last_command_id: 0,
+            }),
             last_seen_at: None,
             pinned: false,
             retention_state: String::new(),
@@ -450,6 +470,7 @@ mod tests {
         worker.display_name = "Coder".to_string();
         worker.label = "Coder · T-585".to_string();
         worker.state = "stopped".to_string();
+        worker.worker_state = None;
         worker.working_directory = Some(
             serde_json::from_value(serde_json::json!({
                 "working_directory_id": "001a06a9f0202000000",
@@ -478,12 +499,19 @@ mod tests {
         short.label = "Coder".to_string();
         short.display_name = short.label.clone();
         short.state = "idle".to_string();
+        short.worker_state = Some(protocol::WorkerStateSnapshot {
+            execution_generation: 1,
+            revision: 2,
+            state: protocol::WorkerState::Idle,
+            last_command_id: 0,
+        });
 
         let mut long = worker("runtime-a", "worker-b", None);
         long.resource_key = "W-100".to_string();
         long.label = "Longer worker · T-9".to_string();
         long.display_name = long.label.clone();
         long.state = "stopped".to_string();
+        long.worker_state = None;
 
         for worker in [&mut short, &mut long] {
             worker.working_directory = Some(
