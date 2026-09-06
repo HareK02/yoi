@@ -1264,7 +1264,7 @@ impl SqliteWorkspaceStore {
             let existing = tx
                 .query_row(
                     "SELECT worker_id, runtime_id, request_fingerprint, create_fingerprint, \
-                            memory_settings_revision, memory_language \
+                            memory_settings_revision, memory_language, state \
                      FROM worker_create_reservations \
                      WHERE workspace_id = ?1 AND allocation_key = ?2",
                     params![workspace_id, allocation_key],
@@ -1276,11 +1276,17 @@ impl SqliteWorkspaceStore {
                             row.get::<_, String>(3)?,
                             row.get::<_, Option<i64>>(4)?,
                             row.get::<_, Option<String>>(5)?,
+                            row.get::<_, String>(6)?,
                         ))
                     },
                 )
                 .optional()?;
-            if let Some((worker_id, reserved_runtime_id, stored_request_fingerprint, create_fingerprint, revision, language)) = existing {
+            if let Some((worker_id, reserved_runtime_id, stored_request_fingerprint, create_fingerprint, revision, language, state)) = existing {
+                if state == "removed" {
+                    return Err(Error::InvalidInput(format!(
+                        "Worker create allocation {allocation_key} was terminally removed"
+                    )));
+                }
                 if reserved_runtime_id != runtime_id
                     || stored_request_fingerprint.as_deref() != Some(request_fingerprint)
                 {
@@ -1391,7 +1397,7 @@ impl SqliteWorkspaceStore {
             let changed = conn.execute(
                 "UPDATE worker_create_reservations \
                  SET state = 'created', updated_at = ?3 \
-                 WHERE workspace_id = ?1 AND worker_id = ?2",
+                 WHERE workspace_id = ?1 AND worker_id = ?2 AND state IN ('reserved', 'created')",
                 params![
                     workspace_id,
                     worker_id.to_string(),
@@ -3746,6 +3752,20 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 "DELETE FROM worker_registry WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
                 params![workspace_id, worker.runtime_id, worker.worker_id],
             )?;
+            if changed != 0 {
+                tx.execute(
+                    "UPDATE worker_create_reservations
+                     SET state = 'removed', updated_at = ?4
+                     WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                       AND state = 'created'",
+                    params![
+                        workspace_id,
+                        worker.runtime_id,
+                        worker.worker_id,
+                        chrono::Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
             tx.commit()?;
             Ok(changed > 0)
         })
@@ -6430,6 +6450,39 @@ fn migrate_workspace_deletion_v52_to_v53(conn: &Connection) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
     tx.execute_batch(
         r#"
+        CREATE TABLE worker_create_reservations_v53 (
+            workspace_id TEXT NOT NULL,
+            allocation_key TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            create_fingerprint TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('reserved', 'created', 'removed')),
+            request_fingerprint TEXT,
+            memory_settings_revision INTEGER,
+            memory_language TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, allocation_key),
+            UNIQUE (workspace_id, worker_id),
+            FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+            CHECK (
+                (request_fingerprint IS NULL AND memory_settings_revision IS NULL AND memory_language IS NULL)
+                OR
+                (request_fingerprint IS NOT NULL AND memory_settings_revision IS NOT NULL AND memory_settings_revision > 0 AND memory_language IS NOT NULL AND length(trim(memory_language)) > 0)
+            )
+        );
+        INSERT INTO worker_create_reservations_v53 (
+            workspace_id, allocation_key, worker_id, runtime_id, create_fingerprint,
+            state, request_fingerprint, memory_settings_revision, memory_language,
+            created_at, updated_at
+        )
+        SELECT workspace_id, allocation_key, worker_id, runtime_id, create_fingerprint,
+               state, request_fingerprint, memory_settings_revision, memory_language,
+               created_at, updated_at
+        FROM worker_create_reservations;
+        DROP TABLE worker_create_reservations;
+        ALTER TABLE worker_create_reservations_v53 RENAME TO worker_create_reservations;
+
         CREATE TABLE workspace_deletion_operations (
             operation_id TEXT PRIMARY KEY,
             request_fingerprint TEXT NOT NULL,
@@ -6489,6 +6542,16 @@ fn verify_workspace_deletion_schema(conn: &Connection) -> Result<()> {
     if columns != expected {
         return Err(Error::Store(
             "workspace_deletion_operations schema does not match schema-53".to_string(),
+        ));
+    }
+    let reservation_sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'worker_create_reservations'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !reservation_sql.contains("'removed'") {
+        return Err(Error::Store(
+            "worker_create_reservations schema lacks terminal removed state".to_string(),
         ));
     }
     Ok(())
@@ -7217,6 +7280,38 @@ mod tests {
             r#"
             DROP INDEX workspace_deletion_operations_workspace_recent;
             DROP TABLE workspace_deletion_operations;
+            CREATE TABLE worker_create_reservations_v52 (
+                workspace_id TEXT NOT NULL,
+                allocation_key TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                create_fingerprint TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('reserved', 'created')),
+                request_fingerprint TEXT,
+                memory_settings_revision INTEGER,
+                memory_language TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, allocation_key),
+                UNIQUE (workspace_id, worker_id),
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+                CHECK (
+                    (request_fingerprint IS NULL AND memory_settings_revision IS NULL AND memory_language IS NULL)
+                    OR
+                    (request_fingerprint IS NOT NULL AND memory_settings_revision IS NOT NULL AND memory_settings_revision > 0 AND memory_language IS NOT NULL AND length(trim(memory_language)) > 0)
+                )
+            );
+            INSERT INTO worker_create_reservations_v52 (
+                workspace_id, allocation_key, worker_id, runtime_id, create_fingerprint,
+                state, request_fingerprint, memory_settings_revision, memory_language,
+                created_at, updated_at
+            )
+            SELECT workspace_id, allocation_key, worker_id, runtime_id, create_fingerprint,
+                   state, request_fingerprint, memory_settings_revision, memory_language,
+                   created_at, updated_at
+            FROM worker_create_reservations;
+            DROP TABLE worker_create_reservations;
+            ALTER TABLE worker_create_reservations_v52 RENAME TO worker_create_reservations;
             DELETE FROM __yoi_schema_migrations;
             INSERT INTO __yoi_schema_migrations(version, name)
             VALUES (52, 'workspace schema baseline');
@@ -7230,12 +7325,30 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
         prepare_schema_v52(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at)
+             VALUES('owner','user','owner','Owner','1','1');
+             INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at)
+             VALUES('workspace-a','owner','Workspace A','active','1','1');
+             INSERT INTO worker_create_reservations(
+                workspace_id,allocation_key,worker_id,runtime_id,create_fingerprint,state,created_at,updated_at
+             ) VALUES('workspace-a','allocation','worker-a','runtime-a','fingerprint','created','1','1');",
+        )
+        .unwrap();
+        drop(conn);
 
         let store = SqliteWorkspaceStore::open(&path).unwrap();
         store
             .with_conn(|conn| {
                 assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
                 verify_workspace_deletion_schema(conn)?;
+                let reservation_state: String = conn.query_row(
+                    "SELECT state FROM worker_create_reservations WHERE workspace_id='workspace-a' AND allocation_key='allocation'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(reservation_state, "created");
                 let violations: i64 =
                     conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
                         row.get(0)
@@ -7269,6 +7382,14 @@ mod tests {
             vec!["unexpected".to_string()]
         );
         assert_eq!(current_schema_version(&conn).unwrap(), 52);
+        let reservation_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='worker_create_reservations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!reservation_sql.contains("'removed'"));
     }
 
     #[test]
@@ -7875,6 +7996,46 @@ mod tests {
             })
             .unwrap();
         assert_eq!(state, "created");
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO worker_registry (
+                        workspace_id, runtime_id, worker_id, display_name,
+                        created_at, updated_at, retention_state
+                     ) VALUES ('workspace-a', 'arcadia', ?1, 'Worker', '1', '1', 'normal')",
+                    [reserved.worker_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            store
+                .delete_worker_registry("workspace-a", &reserved_worker)
+                .unwrap()
+        );
+        let removed_state: String = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT state FROM worker_create_reservations
+                     WHERE workspace_id = 'workspace-a' AND worker_id = ?1",
+                    [reserved.worker_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(Error::from)
+            })
+            .unwrap();
+        assert_eq!(removed_state, "removed");
+        assert!(
+            store
+                .reserve_worker_create(
+                    "workspace-a",
+                    "arcadia",
+                    "operation-1",
+                    "sha256:one",
+                    &updated_memory_settings,
+                )
+                .is_err()
+        );
 
         store
             .with_conn(|conn| {

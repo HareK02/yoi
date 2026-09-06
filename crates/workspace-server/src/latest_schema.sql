@@ -659,7 +659,7 @@ CREATE TABLE worker_create_reservations (
             worker_id TEXT NOT NULL,
             runtime_id TEXT NOT NULL,
             create_fingerprint TEXT NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('reserved', 'created')),
+            state TEXT NOT NULL CHECK (state IN ('reserved', 'created', 'removed')),
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL, request_fingerprint TEXT, memory_settings_revision INTEGER, memory_language TEXT,
             PRIMARY KEY (workspace_id, allocation_key),

@@ -846,6 +846,7 @@ fn parse_deletion_state(value: &str) -> Result<WorkspaceDeletionState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::ControlPlaneStore;
     use std::collections::BTreeSet;
     use tempfile::tempdir;
 
@@ -1145,6 +1146,73 @@ mod tests {
             .expect("reconciled preflight");
         assert!(
             !reconciled
+                .blockers
+                .iter()
+                .any(|blocker| blocker.message.contains("Worker creation reservations"))
+        );
+    }
+
+    #[test]
+    fn worker_registry_removal_terminalizes_created_reservation() {
+        let (store, owner, workspace_id) = setup();
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO worker_create_reservations (
+                        workspace_id, allocation_key, worker_id, runtime_id,
+                        create_fingerprint, state, created_at, updated_at
+                     ) VALUES (?1, 'allocation', 'worker-created', 'runtime-a',
+                               'fingerprint', 'created', '1', '1')",
+                    params![workspace_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO worker_registry (
+                        workspace_id, runtime_id, worker_id, display_name,
+                        created_at, updated_at, retention_state
+                     ) VALUES (?1, 'runtime-a', 'worker-created', 'Created worker', '1', '1', 'normal')",
+                    params![workspace_id],
+                )?;
+                Ok(())
+            })
+            .expect("created worker fixture");
+        let before = store
+            .workspace_deletion_preflight(&owner, &workspace_id)
+            .expect("preflight before removal");
+        assert!(
+            !before
+                .blockers
+                .iter()
+                .any(|blocker| blocker.message.contains("Worker creation reservations"))
+        );
+
+        assert!(
+            store
+                .delete_worker_registry(
+                    &workspace_id,
+                    &worker_runtime::identity::RuntimeWorkerRef {
+                        runtime_id: "runtime-a".to_string(),
+                        worker_id: "worker-created".to_string(),
+                    },
+                )
+                .expect("remove worker registry")
+        );
+        let state: String = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT state FROM worker_create_reservations
+                     WHERE workspace_id = ?1 AND allocation_key = 'allocation'",
+                    params![workspace_id],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .expect("reservation state");
+        assert_eq!(state, "removed");
+        let after = store
+            .workspace_deletion_preflight(&owner, &workspace_id)
+            .expect("preflight after removal");
+        assert!(
+            !after
                 .blockers
                 .iter()
                 .any(|blocker| blocker.message.contains("Worker creation reservations"))
