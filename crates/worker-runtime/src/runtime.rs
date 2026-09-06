@@ -47,6 +47,7 @@ use protocol::{Event, Method};
 use std::collections::BTreeMap;
 #[cfg(feature = "ws-server")]
 use std::collections::VecDeque;
+use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 #[cfg(feature = "ws-server")]
@@ -780,6 +781,20 @@ impl Runtime {
     }
 
     fn create_worker_with_workspace(
+        &self,
+        request: CreateWorkerRequest,
+        scope: Option<&RuntimeWorkspaceScope>,
+    ) -> Result<WorkerDetail, RuntimeError> {
+        let worker_id = request.worker_id;
+        let workspace_id = scope.map(|scope| scope.workspace_id.as_str());
+        let result = self.create_worker_with_workspace_inner(request, scope);
+        if let Err(error) = &result {
+            write_runtime_worker_create_failure(worker_id, workspace_id, error);
+        }
+        result
+    }
+
+    fn create_worker_with_workspace_inner(
         &self,
         request: CreateWorkerRequest,
         scope: Option<&RuntimeWorkspaceScope>,
@@ -3362,6 +3377,69 @@ fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), R
     Ok(())
 }
 
+fn runtime_worker_create_failure_log_line(
+    worker_id: WorkerId,
+    workspace_id: Option<&str>,
+    error: &RuntimeError,
+) -> String {
+    let (error_kind, operation, outcome) = match error {
+        RuntimeError::RuntimeStopped => ("runtime_stopped", None, None),
+        RuntimeError::InvalidInitialInputKind { .. } => ("invalid_initial_input_kind", None, None),
+        RuntimeError::WorkerNotFound { .. } => ("worker_not_found", None, None),
+        RuntimeError::WorkerExecutionUnavailable { .. } => {
+            ("worker_execution_unavailable", None, None)
+        }
+        RuntimeError::ExecutionBackendUnavailable { .. } => {
+            ("execution_backend_unavailable", None, None)
+        }
+        RuntimeError::WorkerExecutionRejected {
+            operation, outcome, ..
+        } => (
+            "worker_execution_rejected",
+            Some(format!("{operation:?}")),
+            Some(format!("{outcome:?}")),
+        ),
+        RuntimeError::LimitTooLarge { .. } => ("limit_too_large", None, None),
+        RuntimeError::InvalidRequest(_) => ("invalid_request", None, None),
+        RuntimeError::WorkspaceOwnerMismatch { .. } => ("workspace_owner_mismatch", None, None),
+        RuntimeError::WorkingDirectory(_) => ("working_directory", None, None),
+        RuntimeError::ConfigBundleMissing { .. } => ("config_bundle_missing", None, None),
+        RuntimeError::ConfigBundleDigestMismatch { .. } => {
+            ("config_bundle_digest_mismatch", None, None)
+        }
+        RuntimeError::InvalidProfileSelector { .. } => ("invalid_profile_selector", None, None),
+        RuntimeError::UnsupportedConfigDeclaration { .. } => {
+            ("unsupported_config_declaration", None, None)
+        }
+        RuntimeError::StoreIo { .. } => ("store_io", None, None),
+        RuntimeError::StoreMissing { .. } => ("store_missing", None, None),
+        RuntimeError::StoreCorrupt { .. } => ("store_corrupt", None, None),
+        RuntimeError::StatePoisoned => ("state_poisoned", None, None),
+    };
+    serde_json::json!({
+        "level": "ERROR",
+        "event": "worker_create_failed",
+        "component": "runtime",
+        "workspace_id": workspace_id,
+        "worker_id": worker_id.to_string(),
+        "error_kind": error_kind,
+        "operation": operation,
+        "outcome": outcome,
+    })
+    .to_string()
+}
+
+fn write_runtime_worker_create_failure(
+    worker_id: WorkerId,
+    workspace_id: Option<&str>,
+    error: &RuntimeError,
+) {
+    let line = runtime_worker_create_failure_log_line(worker_id, workspace_id, error);
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "{line}");
+    let _ = stdout.flush();
+}
+
 fn validate_create_workspace_scope(
     request: &CreateWorkerRequest,
     workspace_id: Option<&str>,
@@ -3484,6 +3562,24 @@ mod tests {
     #[cfg(feature = "fs-store")]
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn worker_create_failure_log_is_structured_for_stdout() {
+        let worker_id = WorkerId::now_v7();
+        let line = runtime_worker_create_failure_log_line(
+            worker_id,
+            Some("workspace-a"),
+            &RuntimeError::InvalidRequest("rejected create".to_string()),
+        );
+        let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(event["level"], "ERROR");
+        assert_eq!(event["event"], "worker_create_failed");
+        assert_eq!(event["component"], "runtime");
+        assert_eq!(event["workspace_id"], "workspace-a");
+        assert_eq!(event["worker_id"], worker_id.to_string());
+        assert_eq!(event["error_kind"], "invalid_request");
+        assert!(event.get("message").is_none());
+    }
 
     fn test_command() -> protocol::WorkerCommandEnvelope {
         protocol::WorkerCommandEnvelope {

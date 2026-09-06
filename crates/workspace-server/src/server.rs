@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -2406,6 +2407,12 @@ impl WorkspaceApi {
                     ),
                 ));
             }
+            write_workspace_worker_create_failure(
+                runtime_id,
+                worker_id,
+                "workdir_attachment_reserve",
+                &diagnostics,
+            );
             return Err(ApiError::with_diagnostics(error, diagnostics));
         }
         let mut result = match self
@@ -2419,6 +2426,7 @@ impl WorkspaceApi {
                     runtime_id,
                     worker_id,
                     &reservation_fingerprint,
+                    "runtime_spawn_transport",
                     None,
                     &compensation_context,
                     attachment_reservation
@@ -2438,6 +2446,7 @@ impl WorkspaceApi {
                     runtime_id,
                     worker_id,
                     &reservation_fingerprint,
+                    "runtime_spawn_rejected",
                     None,
                     &compensation_context,
                     attachment_reservation
@@ -2455,6 +2464,7 @@ impl WorkspaceApi {
                 runtime_id,
                 worker_id,
                 &reservation_fingerprint,
+                "runtime_worker_identity",
                 Some(worker),
                 &compensation_context,
                 attachment_reservation
@@ -2481,6 +2491,7 @@ impl WorkspaceApi {
                 runtime_id,
                 worker_id,
                 &reservation_fingerprint,
+                "runtime_spawn_rejected",
                 Some(worker),
                 &compensation_context,
                 attachment_reservation
@@ -2503,6 +2514,7 @@ impl WorkspaceApi {
                     runtime_id,
                     worker_id,
                     &reservation_fingerprint,
+                    "workspace_api_transport",
                     Some(worker),
                     &compensation_context,
                     attachment_reservation
@@ -2520,6 +2532,7 @@ impl WorkspaceApi {
                 runtime_id,
                 worker_id,
                 &reservation_fingerprint,
+                "workspace_api_rejected",
                 Some(worker),
                 &compensation_context,
                 attachment_reservation
@@ -2550,6 +2563,7 @@ impl WorkspaceApi {
                     runtime_id,
                     worker_id,
                     &reservation_fingerprint,
+                    "worker_registry_identity",
                     Some(worker),
                     &compensation_context,
                     Some((workdir_id.as_str(), reservation_id.as_str())),
@@ -2581,6 +2595,7 @@ impl WorkspaceApi {
                     runtime_id,
                     worker_id,
                     &reservation_fingerprint,
+                    "worker_registry_finalize",
                     None,
                     &compensation_context,
                     Some((workdir_id.as_str(), reservation_id.as_str())),
@@ -2612,6 +2627,7 @@ impl WorkspaceApi {
                     runtime_id,
                     worker_id,
                     &reservation_fingerprint,
+                    "workdir_attachment_finalize",
                     None,
                     &compensation_context,
                     Some((workdir_id.as_str(), reservation_id.as_str())),
@@ -2628,6 +2644,7 @@ impl WorkspaceApi {
                 runtime_id,
                 worker_id,
                 &reservation_fingerprint,
+                "create_reservation_complete",
                 Some(worker),
                 &compensation_context,
                 None,
@@ -14275,6 +14292,37 @@ fn finalize_worker_spawn_stage<T>(
     ))
 }
 
+fn workspace_worker_create_failure_log_line(
+    runtime_id: &str,
+    worker_id: WorkerId,
+    phase: &str,
+    diagnostics: &[RuntimeDiagnostic],
+) -> String {
+    serde_json::json!({
+        "level": "ERROR",
+        "event": "worker_create_failed",
+        "component": "workspace_server",
+        "runtime_id": runtime_id,
+        "worker_id": worker_id.to_string(),
+        "phase": phase,
+        "cleanup_succeeded": diagnostics.is_empty(),
+        "cleanup_diagnostics": diagnostics,
+    })
+    .to_string()
+}
+
+fn write_workspace_worker_create_failure(
+    runtime_id: &str,
+    worker_id: WorkerId,
+    phase: &str,
+    diagnostics: &[RuntimeDiagnostic],
+) {
+    let line = workspace_worker_create_failure_log_line(runtime_id, worker_id, phase, diagnostics);
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "{line}");
+    let _ = stdout.flush();
+}
+
 fn api_error_with_additional_diagnostics(
     mut error: ApiError,
     diagnostics: Vec<RuntimeDiagnostic>,
@@ -14288,6 +14336,7 @@ fn compensate_failed_workspace_worker_create(
     runtime_id: &str,
     reservation_worker_id: WorkerId,
     create_fingerprint: &str,
+    failure_phase: &str,
     worker: Option<&WorkerSummary>,
     context: &WorkerSpawnCompensationContext<'_>,
     attachment_reservation: Option<(&str, &str)>,
@@ -14355,6 +14404,12 @@ fn compensate_failed_workspace_worker_create(
             ),
         ));
     }
+    write_workspace_worker_create_failure(
+        runtime_id,
+        reservation_worker_id,
+        failure_phase,
+        &diagnostics,
+    );
     diagnostics
 }
 
@@ -19555,6 +19610,34 @@ mod tests {
     fn backend_errors_preserve_operation_details() {
         let sanitized = sanitize_backend_error("failed to open server database");
         assert_eq!(sanitized, "failed to open server database");
+    }
+
+    #[test]
+    fn worker_create_failure_log_is_structured_for_stdout() {
+        let worker_id = WorkerId::now_v7();
+        let diagnostics = vec![RuntimeDiagnostic {
+            code: "worker_cleanup_failed".to_string(),
+            severity: DiagnosticSeverity::Error,
+            message: "cleanup failed".to_string(),
+        }];
+        let line = workspace_worker_create_failure_log_line(
+            "runtime-a",
+            worker_id,
+            "runtime_spawn_transport",
+            &diagnostics,
+        );
+        let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(event["level"], "ERROR");
+        assert_eq!(event["event"], "worker_create_failed");
+        assert_eq!(event["component"], "workspace_server");
+        assert_eq!(event["runtime_id"], "runtime-a");
+        assert_eq!(event["worker_id"], worker_id.to_string());
+        assert_eq!(event["phase"], "runtime_spawn_transport");
+        assert_eq!(event["cleanup_succeeded"], false);
+        assert_eq!(
+            event["cleanup_diagnostics"][0]["code"],
+            "worker_cleanup_failed"
+        );
     }
 
     #[test]
