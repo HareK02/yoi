@@ -3246,6 +3246,31 @@ mod ws_tests {
             }
         }
 
+        fn worker_snapshot(&self, handle: &WorkerExecutionHandle) -> Option<protocol::Event> {
+            Some(protocol::Event::Snapshot {
+                session: protocol::SessionSnapshot {
+                    pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                    entries: Vec::new(),
+                },
+                greeting: protocol::Greeting {
+                    worker_name: handle.worker_ref().worker_id.to_string(),
+                    cwd: String::new(),
+                    provider: "ws-test".to_string(),
+                    model: "ws-test".to_string(),
+                    scope_summary: "WebSocket test execution snapshot".to_string(),
+                    tools: Vec::new(),
+                    context_window: 0,
+                    context_tokens: 0,
+                },
+                state: protocol::WorkerStateSnapshot::initial(1),
+                in_flight: protocol::InFlightSnapshot {
+                    blocks: Vec::new(),
+                    commands: Vec::new(),
+                },
+                internal_workers: Vec::new(),
+            })
+        }
+
         fn dispatch_method(
             &self,
             _handle: &WorkerExecutionHandle,
