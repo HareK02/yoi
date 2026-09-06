@@ -24,13 +24,13 @@ export function buildWorkspaceBreadcrumbs(
     .map(decodeURIComponent);
 
   if (
-    segments[0] === "runtimes" &&
-    segments[2] === "workers" &&
-    segments[3]
+    segments[0] === "workers" &&
+    segments[1] &&
+    segments[2] === "console"
   ) {
     return [
       { label: "workers", href: `${workspaceRoot}/workers` },
-      { label: context.workerName?.trim() || segments[3] },
+      { label: context.workerName?.trim() || segments[1] },
     ];
   }
 

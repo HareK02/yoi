@@ -15,7 +15,6 @@ import type {
   WorkerStatus,
 } from "$lib/generated/protocol";
 import { stringify as stringifyYaml } from "yaml";
-import { workspaceRoute } from "$lib/workspace/api/http";
 import {
   applyRunActivityEvent,
   emptyRunActivityStats,
@@ -219,31 +218,6 @@ export type WorkerTarget = {
   runtime_id: string;
   worker_id: string;
 };
-
-export function workerConsoleHref(
-  target: WorkerTarget,
-  workspaceId: string,
-): string {
-  return workspaceRoute(
-    workspaceId,
-    `/runtimes/${encodeURIComponent(target.runtime_id)}/workers/${
-      encodeURIComponent(
-        target.worker_id,
-      )
-    }/console`,
-  );
-}
-
-export function workerConsolePath(
-  workspaceId: string,
-  runtimeId: string,
-  workerId: string,
-): string {
-  return workerConsoleHref(
-    { runtime_id: runtimeId, worker_id: workerId },
-    workspaceId,
-  );
-}
 
 export type ConsoleEventInput = {
   eventId: string;

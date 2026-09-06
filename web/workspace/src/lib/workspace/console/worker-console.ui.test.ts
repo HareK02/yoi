@@ -371,7 +371,7 @@ Deno.test("root layout keeps Workspace selection explicit", async () => {
 Deno.test("Worker Console uses protocol observation events without transcript fetch", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
       import.meta.url,
     ),
   );
@@ -395,7 +395,7 @@ Deno.test("Worker Console uses protocol observation events without transcript fe
 Deno.test("Worker Console owns its narrower centered shell width", async () => {
   const page = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
       import.meta.url,
     ),
   );
@@ -494,7 +494,7 @@ Deno.test("Worker Console renders Edit diffs without preformatted template gaps"
 Deno.test("Worker Console exposes a foldable timeline beside the scroll body", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
       import.meta.url,
     ),
   );
@@ -529,7 +529,7 @@ Deno.test("Worker Console exposes a foldable timeline beside the scroll body", a
 Deno.test("Worker Console removes redundant chrome and uses shared alerts", async () => {
   const page = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
       import.meta.url,
     ),
   );
@@ -558,7 +558,7 @@ Deno.test("Worker Console removes redundant chrome and uses shared alerts", asyn
 Deno.test("Worker Console composer keeps a compact bounded chip editor", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
       import.meta.url,
     ),
   );
@@ -592,7 +592,7 @@ Deno.test("Worker Console composer keeps a compact bounded chip editor", async (
 Deno.test("Worker Console paste chips preserve typed draft and target authority", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
       import.meta.url,
     ),
   );
@@ -724,24 +724,28 @@ Deno.test("workspace Worker sidebar links New to the dedicated create page", asy
   );
 });
 
-Deno.test("Worker Console page is routed by runtime_id and worker_id through backend APIs", async () => {
+Deno.test("Worker Console route resolves logical Worker authority before Runtime APIs", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
       import.meta.url,
     ),
   );
   const routeLoad = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.ts",
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.ts",
       import.meta.url,
     ),
   );
 
   assert(
-    routeLoad.includes("workspaceId") &&
-      routeLoad.includes("runtimeId") && routeLoad.includes("workerId"),
-    "route load should expose workspace and target ids",
+    routeLoad.includes("params.workerRef") &&
+      routeLoad.includes("resourceKey(params.workerRef)") &&
+      routeLoad.includes("/workers/${encodeURIComponent(reference)}") &&
+      routeLoad.includes("canonicalResourceReference") &&
+      routeLoad.includes("runtimeId: result.data?.runtime_id") &&
+      routeLoad.includes("workerId: result.data?.worker_id"),
+    "route load should resolve the logical Worker reference before exposing its execution target",
   );
   assert(
     consolePage.includes("workspaceApiPath(workspaceId, path)") &&
@@ -951,7 +955,7 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
 Deno.test("Workspace Worker list and Console share the multiplexed connection", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
       import.meta.url,
     ),
   );
@@ -988,7 +992,7 @@ Deno.test("Workspace Worker list and Console share the multiplexed connection", 
 Deno.test("Web Console renders the client-projected Worker task store", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
       import.meta.url,
     ),
   );
@@ -1027,7 +1031,7 @@ Deno.test("Web Console renders the client-projected Worker task store", async ()
 Deno.test("Web Console switches main and direct SubWorker views from the Tasks row", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
       import.meta.url,
     ),
   );
@@ -1071,7 +1075,7 @@ Deno.test("Web Console switches main and direct SubWorker views from the Tasks r
 Deno.test("Web Console uses Notify while running and exposes durable pending controls", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
       import.meta.url,
     ),
   );

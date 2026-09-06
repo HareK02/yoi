@@ -13439,6 +13439,14 @@ fn browser_worker_spawn_policy(
     }
 }
 
+fn browser_worker_console_href(workspace_id: &str, resource_key: &str) -> String {
+    format!(
+        "/w/{}/workers/{}/console",
+        encode_path_segment(workspace_id),
+        encode_path_segment(resource_key)
+    )
+}
+
 async fn create_workspace_worker(
     State(api): State<WorkspaceApi>,
     headers: HeaderMap,
@@ -13750,18 +13758,22 @@ fn browser_worker_response_from_summary(
     let runtime_id = worker.worker.runtime_id.clone();
     let worker_id = worker.worker.worker_id.clone();
     let workspace_id = api.workspace_id().to_string();
-    let console_href = format!(
-        "/w/{}/runtimes/{}/workers/{}/console",
-        encode_path_segment(&workspace_id),
-        encode_path_segment(&runtime_id),
-        encode_path_segment(&worker_id)
-    );
+    let resource_key = api
+        .store
+        .resource_key(&workspace_id, WorkspaceResourceKind::Worker, &worker_id)?
+        .ok_or_else(|| {
+            Error::Store(format!(
+                "Workspace Worker `{worker_id}` has no resource key after registration"
+            ))
+        })?;
+    let worker = worker_launch_worker_summary(worker);
+    let console_href = browser_worker_console_href(&workspace_id, &resource_key);
     Ok(BrowserCreateWorkerResponse {
         workspace_id,
         runtime_id,
         worker_id,
         console_href,
-        worker: worker_launch_worker_summary(worker),
+        worker,
         diagnostics: diagnostics
             .into_iter()
             .map(workspace_api::Diagnostic::from)
@@ -17192,6 +17204,13 @@ mod tests {
         MemoryStagingRecord, ObjectiveRecord, ObjectiveResourceRecord, ObjectiveTicketLinkRecord,
         SqliteWorkspaceStore, UserRecord, WorkspaceRecord, WorkspaceRuntimeBinding,
     };
+
+    #[test]
+    fn browser_worker_console_href_uses_logical_worker_route() {
+        let href = browser_worker_console_href("workspace/one", "W-7");
+        assert_eq!(href, "/w/workspace%2Fone/workers/W-7/console");
+        assert!(!href.contains("/runtimes/"));
+    }
 
     #[tokio::test]
     async fn workspace_mutation_gate_serializes_deletion_with_active_mutations() {

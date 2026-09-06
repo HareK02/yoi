@@ -6,7 +6,7 @@ function assert(condition: unknown, message: string): asserts condition {
 Deno.test("Worker Console exposes Overview and Normal display modes", async () => {
   const page = await Deno.readTextFile(
     new URL(
-      "../src/routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "../src/routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
       import.meta.url,
     ),
   );

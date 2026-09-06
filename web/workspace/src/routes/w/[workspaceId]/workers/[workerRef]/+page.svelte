@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { workspaceRoute } from '$lib/workspace/api/http';
+  import { workerConsoleHref } from '$lib/workspace/resource-links';
   import { liveWorkerState } from '$lib/workspace/sidebar/worker-state';
   import type { PageData } from './$types';
   let { data }: { data: PageData } = $props();
@@ -18,10 +18,7 @@
       </div>
       <a
         class="button-primary"
-        href={workspaceRoute(
-          data.workspaceId,
-          `/runtimes/${data.worker.runtime_id}/workers/${data.worker.worker_id}/console`,
-        )}
+        href={workerConsoleHref(data.workspaceId, data.worker)}
       >Open console</a>
     </header>
     <dl class="resource-meta">

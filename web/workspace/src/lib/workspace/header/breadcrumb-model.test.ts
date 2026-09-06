@@ -25,7 +25,7 @@ Deno.test("Ticket detail breadcrumbs expose the Ticket list and current id", () 
 Deno.test("Worker console breadcrumbs use the logical Workers route and display name", () => {
   assertEquals(
     buildWorkspaceBreadcrumbs(
-      "/w/workspace/runtimes/runtime-a/workers/worker-7/console",
+      "/w/workspace/workers/W-7-review-worker/console",
       "workspace",
       { workerName: "Review Worker" },
     ),
@@ -39,12 +39,12 @@ Deno.test("Worker console breadcrumbs use the logical Workers route and display 
 Deno.test("Worker console breadcrumbs fall back to Worker id", () => {
   assertEquals(
     buildWorkspaceBreadcrumbs(
-      "/w/workspace/runtimes/runtime-a/workers/worker-7/console",
+      "/w/workspace/workers/W-7-review-worker/console",
       "workspace",
     ),
     [
       { label: "workers", href: "/w/workspace/workers" },
-      { label: "worker-7" },
+      { label: "W-7-review-worker" },
     ],
   );
 });

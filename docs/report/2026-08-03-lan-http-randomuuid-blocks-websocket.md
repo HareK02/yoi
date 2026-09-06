@@ -17,7 +17,7 @@ context ではない。`crypto.randomUUID()` は secure context 限定なので�
 Worker Console の `connectProtocolTransport` は、最初に `protocolState` を
 `"connecting"` に設定してから `WorkspaceMultiplexer.subscribe()` を呼ぶ。
 
-- `web/workspace/src/routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte`
+- `web/workspace/src/routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte`
   - `protocolState = "connecting"`
   - 直後に `workspaceMultiplexer(...).subscribe(...)`
 - `web/workspace/src/lib/workspace/multiplexer.ts`

@@ -186,7 +186,7 @@ Deno.test("Composer input uses boundary-aware Up and Down history navigation", a
   );
   const consoleSource = await Deno.readTextFile(
     new URL(
-      "../src/routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "../src/routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
       import.meta.url,
     ),
   );

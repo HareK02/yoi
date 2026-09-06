@@ -87,7 +87,7 @@ Deno.test("sidebar running status reuses the green symbol spinner", async () => 
 Deno.test("running status is Composer-side above mini Tasks", async () => {
   const page = await Deno.readTextFile(
     new URL(
-      "../src/routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "../src/routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
       import.meta.url,
     ),
   );

@@ -12,8 +12,8 @@ import {
   resolveConsoleWorkerView,
   segmentsToText,
   selectConsoleTimelineLines,
-  workerConsoleHref,
 } from "./model.ts";
+import { workerConsoleHref } from "../resource-links.ts";
 
 declare const Deno: {
   test(name: string, fn: () => void): void;
@@ -461,14 +461,13 @@ Deno.test("reload snapshot projects provenance-annotated history entries", () =>
   );
 });
 
-Deno.test("workerConsoleHref encodes runtime and worker target authority", () => {
+Deno.test("workerConsoleHref uses logical Worker resource authority", () => {
   assert(
-    workerConsoleHref({
-      runtime_id: "local runtime",
-      worker_id: "worker/one",
-    }, "workspace-1") ===
-      "/w/workspace-1/runtimes/local%20runtime/workers/worker%2Fone/console",
-    "href should contain encoded runtime_id and worker_id segments",
+    workerConsoleHref("workspace-1", {
+      resource_key: "W-123",
+      display_name: "Worker One",
+    }) === "/w/workspace-1/workers/W-123-worker-one/console",
+    "href should contain the canonical logical Worker reference",
   );
 });
 

@@ -45,3 +45,10 @@ export function workerHref(
   const reference = canonicalResourceReference(worker.resource_key, worker.display_name);
   return `/w/${encodeURIComponent(workspaceId)}/workers/${encodeURIComponent(reference)}`;
 }
+
+export function workerConsoleHref(
+  workspaceId: string,
+  worker: { resource_key: string; display_name: string },
+): string {
+  return `${workerHref(workspaceId, worker)}/console`;
+}

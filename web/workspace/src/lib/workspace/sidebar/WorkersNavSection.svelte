@@ -1,6 +1,6 @@
 <script lang="ts">
   import Spinner from '$lib/workspace/console/Spinner.svelte';
-  import { workerConsoleHref } from '$lib/workspace/console/model';
+  import { workerConsoleHref } from '$lib/workspace/resource-links';
   import { pushWorkspaceAlert } from '$lib/workspace/alerts/store';
   import {
     canDeleteSidebarWorker,
@@ -168,7 +168,7 @@
     {#if error}<p class="section-state error">{error}</p>{/if}
     <ul class="nav-list" aria-label="Workers">
       {#each visibleWorkers as worker (`${worker.runtime_id}:${worker.worker_id}`)}
-        {@const href = workerConsoleHref(worker, workspaceId)}
+        {@const href = workerConsoleHref(workspaceId, worker)}
         {@const activity = sidebarWorkerActivity(worker)}
         {@const key = workerKey(worker)}
         {@const label = worker.display_name || worker.label}
