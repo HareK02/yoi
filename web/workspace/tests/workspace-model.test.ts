@@ -6,6 +6,8 @@ declare const Deno: {
 import {
   parseRepositoryListApiResult,
   parseRepositoryListResponse,
+  parseWorkspaceDeletionOperationResponse,
+  parseWorkspaceDeletionPreflightResponse,
   parseWorkspaceResponse,
 } from "../src/lib/workspace/api/workspace-model.ts";
 
@@ -107,6 +109,108 @@ Deno.test("workspace response requires the permission projection", () => {
     () => parseWorkspaceResponse(stale),
     "permissions must be an object",
   );
+});
+
+Deno.test("Workspace deletion DTOs fail closed and preserve durable operation state", () => {
+  const preflight = parseWorkspaceDeletionPreflightResponse({
+    workspace_id: "workspace-a",
+    display_name: "Alpha",
+    expected_revision: "2026-01-01T00:00:00Z",
+    can_delete: true,
+    resources: {
+      workers: 2,
+      workdirs: 1,
+      repositories: 1,
+      runtime_bindings: 1,
+      secrets: 0,
+      artifacts: 3,
+    },
+    blockers: [],
+  });
+  if (preflight.resources.workers !== 2) {
+    throw new Error("worker count was not preserved");
+  }
+
+  const operation = parseWorkspaceDeletionOperationResponse({
+    operation_id: "delete-alpha",
+    workspace_id: "workspace-a",
+    display_name: "Alpha",
+    state: "blocked",
+    resources: preflight.resources,
+    child_operation_ids: ["worker-remove:arcadia/7"],
+    blockers: [{
+      kind: "dirty_workdir",
+      resource_kind: "workdir",
+      resource_key: "WD-1",
+      message: "Workdir is dirty",
+    }],
+    failure_category: null,
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:01:00Z",
+    completed_at: null,
+  });
+  if (operation.state !== "blocked") {
+    throw new Error("operation state was not preserved");
+  }
+
+  assertThrows(
+    () =>
+      parseWorkspaceDeletionPreflightResponse({
+        ...preflight,
+        unexpected: true,
+      }),
+    "unexpected is not part",
+  );
+  assertThrows(
+    () =>
+      parseWorkspaceDeletionOperationResponse({
+        ...operation,
+        state: "unknown",
+      }),
+    ".state is invalid",
+  );
+  assertThrows(
+    () =>
+      parseWorkspaceDeletionOperationResponse({
+        ...operation,
+        operation_id: "x".repeat(129),
+      }),
+    ".operation_id is too long",
+  );
+  assertThrows(
+    () =>
+      parseWorkspaceDeletionOperationResponse({
+        ...operation,
+        blockers: Array.from({ length: 1025 }, () => operation.blockers[0]),
+      }),
+    ".blockers has too many items",
+  );
+});
+
+Deno.test("Workspace settings exposes owner-gated typed destructive confirmation", async () => {
+  const source = await Deno.readTextFile(
+    new URL(
+      "../src/routes/w/[workspaceId]/settings/workspace/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  for (
+    const token of [
+      "permissions.delete_workspace",
+      "preflightWorkspaceDeletion",
+      "startWorkspaceDeletion",
+      "deletionConfirmation",
+      "disposeWorkspaceMultiplexer(workspaceId)",
+      "disposeWorkspaceWorkersStore(workspaceId)",
+      "sessionStorage.setItem(deletionStorageKey",
+      "storedDeletionRequest()",
+      "trackDeletion(request.operation_id)",
+    ]
+  ) {
+    if (!source.includes(token)) {
+      throw new Error(`Workspace deletion UI should include ${token}`);
+    }
+  }
 });
 
 Deno.test("Repository settings consume the validated shared wire shape", async () => {

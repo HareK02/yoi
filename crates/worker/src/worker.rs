@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -68,6 +69,243 @@ const LARGE_PASTE_INLINE_MAX_BYTES: usize = 32 * 1024;
 const WORKER_ORCHESTRATION_INSTRUCTION_ID: &str = "worker.orchestration";
 const WORKER_ORCHESTRATION_PROMPT_REF: &str = "common.worker_orchestration";
 const FEATURE_HOOK_CHAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN: &str = "worker.pending_activations.v1";
+const MAX_PENDING_SUBMISSIONS: usize = 32;
+const MAX_PENDING_SUBMISSION_BYTES: u64 = 1024 * 1024;
+const MAX_PENDING_ARTIFACT_REFS: usize = 64;
+const MAX_ACTIVATION_REQUEST_ID_BYTES: usize = 128;
+const MAX_SUBMISSION_RECEIPTS: usize = 128;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PendingSubmission {
+    pub(crate) submission_request_id: String,
+    source_namespace: String,
+    pub(crate) submission_id: String,
+    payload_digest: String,
+    accepted_at_ms: u64,
+    activation_sequence: u64,
+    pub(crate) provenance: WorkerHistoryProvenance,
+    #[serde(default)]
+    was_queued: bool,
+    pub(crate) input: Vec<Segment>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SubmissionReceipt {
+    submission_request_id: String,
+    source_namespace: String,
+    submission_id: String,
+    payload_digest: String,
+    disposition: protocol::SubmissionDisposition,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PendingNotification {
+    pub(crate) notification_request_id: String,
+    source_namespace: String,
+    pub(crate) message: String,
+    payload_digest: String,
+    pub(crate) auto_run: bool,
+    accepted_at_ms: u64,
+    activation_sequence: u64,
+    pub(crate) provenance: WorkerHistoryProvenance,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct NotificationReceipt {
+    notification_request_id: String,
+    source_namespace: String,
+    payload_digest: String,
+    auto_run: bool,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PendingActivationState {
+    revision: u64,
+    next_activation_sequence: u64,
+    /// A prepared activation remains in checkpoints until the same atomic
+    /// UserInput record commits the clearing checkpoint. Restore puts it back
+    /// at the FIFO head.
+    activating: Option<PendingSubmission>,
+    activating_notification: Option<PendingNotification>,
+    pending: VecDeque<PendingSubmission>,
+    pending_notifications: VecDeque<PendingNotification>,
+    receipts: VecDeque<SubmissionReceipt>,
+    notification_receipts: VecDeque<NotificationReceipt>,
+}
+
+impl PendingActivationState {
+    pub(crate) fn snapshot(&self) -> protocol::PendingSubmissionsSnapshot {
+        let pending_notification = self
+            .pending_notifications
+            .iter()
+            .find(|notification| notification.auto_run);
+        let head_id = match (self.pending.front(), pending_notification) {
+            (Some(submission), Some(notification))
+                if notification.activation_sequence < submission.activation_sequence =>
+            {
+                Some(notification_head_id(
+                    &notification.source_namespace,
+                    &notification.notification_request_id,
+                ))
+            }
+            (Some(submission), _) => Some(submission.submission_id.clone()),
+            (None, Some(notification)) => Some(notification_head_id(
+                &notification.source_namespace,
+                &notification.notification_request_id,
+            )),
+            (None, None) => None,
+        };
+        protocol::PendingSubmissionsSnapshot {
+            revision: self.revision,
+            notification_count: u32::try_from(self.pending_notifications.len()).unwrap_or(u32::MAX),
+            head_id,
+            submissions: self
+                .pending
+                .iter()
+                .map(|pending| protocol::PendingSubmissionSummary {
+                    submission_id: pending.submission_id.clone(),
+                    accepted_at_ms: pending.accepted_at_ms,
+                    segment_count: u32::try_from(pending.input.len()).unwrap_or(u32::MAX),
+                    byte_len: submission_payload_len(&pending.input),
+                })
+                .collect(),
+        }
+    }
+
+    fn live_artifact_pin_owner_ids(&self) -> Vec<String> {
+        self.activating
+            .iter()
+            .chain(self.pending.iter())
+            .map(|submission| submission.submission_id.clone())
+            .collect()
+    }
+
+    fn remember_notification_receipt(&mut self, receipt: NotificationReceipt) {
+        self.notification_receipts.push_back(receipt);
+        while self.notification_receipts.len() > MAX_SUBMISSION_RECEIPTS {
+            self.notification_receipts.pop_front();
+        }
+    }
+
+    fn remember_receipt(&mut self, receipt: SubmissionReceipt) {
+        self.receipts.push_back(receipt);
+        while self.receipts.len() > MAX_SUBMISSION_RECEIPTS {
+            self.receipts.pop_front();
+        }
+    }
+}
+
+fn notification_payload_digest(message: &str, auto_run: bool) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(if auto_run {
+        &b"auto\0"[..]
+    } else {
+        &b"deferred\0"[..]
+    });
+    hasher.update(message.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub(crate) fn authenticated_input_provenance(
+    source: &protocol::AuthenticatedInputSource,
+) -> WorkerHistoryProvenance {
+    match source {
+        protocol::AuthenticatedInputSource::UntrustedWire => WorkerHistoryProvenance::LegacyUnknown,
+        protocol::AuthenticatedInputSource::Account { account_id } => {
+            WorkerHistoryProvenance::HumanInput {
+                account_id: account_id.clone(),
+            }
+        }
+        protocol::AuthenticatedInputSource::Worker {
+            runtime_id,
+            worker_id,
+        } => WorkerHistoryProvenance::WorkerInput {
+            actor: session_store::LoggedWorkerSubject {
+                workspace_id: None,
+                runtime_id: Some(runtime_id.clone()),
+                worker_id: worker_id.clone(),
+            },
+        },
+        protocol::AuthenticatedInputSource::SubWorker { session_id } => {
+            WorkerHistoryProvenance::WorkerInput {
+                actor: session_store::LoggedWorkerSubject {
+                    workspace_id: None,
+                    runtime_id: None,
+                    worker_id: session_id.clone(),
+                },
+            }
+        }
+        protocol::AuthenticatedInputSource::Backend { operation_id } => {
+            WorkerHistoryProvenance::BackendInstruction {
+                operation_id: Some(operation_id.clone()),
+            }
+        }
+    }
+}
+
+fn notification_head_id(source_namespace: &str, request_id: &str) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(source_namespace.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(request_id.as_bytes());
+    format!(
+        "notification:{}",
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
+fn submission_payload_len(input: &[Segment]) -> u64 {
+    serde_json::to_vec(input)
+        .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+        .unwrap_or(u64::MAX)
+}
+
+fn submission_payload_digest(input: &[Segment]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(serde_json::to_vec(input).unwrap_or_default())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn submission_uploaded_file_refs(
+    input: &[Segment],
+) -> impl Iterator<Item = &protocol::UploadedFileRef> {
+    input.iter().filter_map(|segment| match segment {
+        Segment::UploadedFile { file } => Some(file),
+        _ => None,
+    })
+}
+
+fn submission_artifact_ref_count(input: &[Segment]) -> usize {
+    input
+        .iter()
+        .filter(|segment| {
+            matches!(
+                segment,
+                Segment::PasteArtifact { .. } | Segment::UploadedFile { .. }
+            )
+        })
+        .count()
+}
+
+fn pending_activation_extension(state: &PendingActivationState) -> SessionExtension {
+    SessionExtension {
+        domain: SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN.to_owned(),
+        payload: serde_json::to_value(state).expect("pending activation state must serialize"),
+    }
+}
 
 fn hook_run_exit(exit: &EngineRunExit) -> RunCommittedExit {
     match exit {
@@ -970,18 +1208,740 @@ where
     }
 }
 
-/// Type-erased commit handle for the interceptor. Lets the
-/// interceptor commit `SystemItem`s without being generic over the
+#[derive(Debug, Clone)]
+pub(crate) enum PendingActivation {
+    Submission(PendingSubmission),
+    Notification(PendingNotification),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SubmissionAcceptance {
+    pub(crate) submission_request_id: String,
+    pub(crate) submission_id: String,
+    pub(crate) disposition: protocol::SubmissionDisposition,
+    pub(crate) activation: Option<PendingSubmission>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PendingSubmissionError {
+    #[error("submission_request_id must not be empty")]
+    EmptyRequestId,
+    #[error("activation request id exceeds {MAX_ACTIVATION_REQUEST_ID_BYTES} bytes")]
+    RequestIdLimit,
+    #[error("submission input must contain at least one typed segment")]
+    EmptyInput,
+    #[error("submission request id was already used with a different payload")]
+    IdempotencyConflict,
+    #[error("pending submission queue is full (maximum {MAX_PENDING_SUBMISSIONS})")]
+    CountLimit,
+    #[error("pending submission bytes exceed {MAX_PENDING_SUBMISSION_BYTES}")]
+    ByteLimit,
+    #[error("pending submission artifact references exceed {MAX_PENDING_ARTIFACT_REFS}")]
+    ArtifactLimit,
+    #[error("pending queue revision conflict: expected {expected}, current {current}")]
+    RevisionConflict { expected: u64, current: u64 },
+    #[error("pending queue head conflict: expected {expected}, current {current:?}")]
+    HeadConflict {
+        expected: String,
+        current: Option<String>,
+    },
+    #[error("pending submission not found: {0}")]
+    NotFound(String),
+    #[error("pending submission state persistence failed: {0}")]
+    Store(#[from] StoreError),
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingSubmissionHandle<St: Clone> {
+    state: Arc<Mutex<PendingActivationState>>,
+    writer: LogWriterHandle<St>,
+}
+
+impl<St> PendingSubmissionHandle<St>
+where
+    St: Store + Clone,
+{
+    fn validate_fence(
+        state: &PendingActivationState,
+        expected_revision: u64,
+        expected_head_id: Option<&str>,
+    ) -> Result<(), PendingSubmissionError> {
+        if state.revision != expected_revision {
+            return Err(PendingSubmissionError::RevisionConflict {
+                expected: expected_revision,
+                current: state.revision,
+            });
+        }
+        if let Some(expected) = expected_head_id {
+            let current = state.snapshot().head_id;
+            if current.as_deref() != Some(expected) {
+                return Err(PendingSubmissionError::HeadConflict {
+                    expected: expected.to_owned(),
+                    current,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_locked(&self, state: &PendingActivationState) -> Result<(), PendingSubmissionError> {
+        self.writer.append_entry_locked(LogEntry::Extension {
+            ts: segment_log::now_millis(),
+            domain: SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN.to_owned(),
+            payload: serde_json::to_value(state).expect("pending activation state must serialize"),
+        })?;
+        Ok(())
+    }
+
+    fn pin_submission_files(
+        &self,
+        pending: &PendingSubmission,
+    ) -> Result<(), PendingSubmissionError> {
+        let session_id = self.writer.state.location().session_id;
+        let mut pinned = Vec::new();
+        for reference in submission_uploaded_file_refs(&pending.input) {
+            if pinned.iter().any(|existing: &protocol::UploadedFileRef| {
+                existing.artifact_id == reference.artifact_id
+            }) {
+                continue;
+            }
+            if let Err(pin_error) =
+                self.writer
+                    .store
+                    .pin_uploaded_file(session_id, reference, &pending.submission_id)
+            {
+                let mut rollback_error = None;
+                for acquired in pinned.iter().rev() {
+                    if let Err(error) = self.writer.store.release_uploaded_file_pin(
+                        session_id,
+                        &acquired.artifact_id,
+                        &pending.submission_id,
+                    ) {
+                        rollback_error.get_or_insert(error);
+                    }
+                }
+                return Err(rollback_error.unwrap_or(pin_error).into());
+            }
+            pinned.push(reference.clone());
+        }
+        Ok(())
+    }
+
+    fn release_submission_files(
+        &self,
+        pending: &PendingSubmission,
+    ) -> Result<(), PendingSubmissionError> {
+        let session_id = self.writer.state.location().session_id;
+        let mut released = Vec::new();
+        let mut first_error = None;
+        for reference in submission_uploaded_file_refs(&pending.input) {
+            if released
+                .iter()
+                .any(|artifact_id: &String| artifact_id == &reference.artifact_id)
+            {
+                continue;
+            }
+            if let Err(error) = self.writer.store.release_uploaded_file_pin(
+                session_id,
+                &reference.artifact_id,
+                &pending.submission_id,
+            ) {
+                first_error.get_or_insert(error);
+            }
+            released.push(reference.artifact_id.clone());
+        }
+        match first_error {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accept(
+        &self,
+        submission_request_id: String,
+        input: Vec<Segment>,
+        activate_now: bool,
+    ) -> Result<SubmissionAcceptance, PendingSubmissionError> {
+        self.accept_from_source(
+            submission_request_id,
+            input,
+            self.direct_client_namespace(),
+            WorkerHistoryProvenance::LegacyUnknown,
+            activate_now,
+        )
+    }
+
+    pub(crate) fn accept_from_source(
+        &self,
+        submission_request_id: String,
+        input: Vec<Segment>,
+        source_namespace: String,
+        provenance: WorkerHistoryProvenance,
+        activate_now: bool,
+    ) -> Result<SubmissionAcceptance, PendingSubmissionError> {
+        if submission_request_id.trim().is_empty() {
+            return Err(PendingSubmissionError::EmptyRequestId);
+        }
+        if submission_request_id.len() > MAX_ACTIVATION_REQUEST_ID_BYTES {
+            return Err(PendingSubmissionError::RequestIdLimit);
+        }
+        if input.is_empty() {
+            return Err(PendingSubmissionError::EmptyInput);
+        }
+        let payload_digest = submission_payload_digest(&input);
+        let _append_guard = self
+            .writer
+            .state
+            .append_lock
+            .lock()
+            .expect("segment append lock poisoned");
+        let mut current = self
+            .state
+            .lock()
+            .expect("pending activation state poisoned");
+        let original = current.clone();
+        if let Some(receipt) = current.receipts.iter().find(|receipt| {
+            receipt.submission_request_id == submission_request_id
+                && receipt.source_namespace == source_namespace
+        }) {
+            if receipt.payload_digest != payload_digest {
+                return Err(PendingSubmissionError::IdempotencyConflict);
+            }
+            return Ok(SubmissionAcceptance {
+                submission_request_id,
+                submission_id: receipt.submission_id.clone(),
+                disposition: receipt.disposition,
+                activation: None,
+            });
+        }
+
+        let submission_id = uuid::Uuid::now_v7().to_string();
+        let pending = PendingSubmission {
+            submission_request_id: submission_request_id.clone(),
+            source_namespace: source_namespace.clone(),
+            submission_id: submission_id.clone(),
+            payload_digest: payload_digest.clone(),
+            accepted_at_ms: segment_log::now_millis(),
+            activation_sequence: current.next_activation_sequence,
+            provenance,
+            was_queued: !activate_now,
+            input,
+        };
+        current.next_activation_sequence = current.next_activation_sequence.saturating_add(1);
+        let disposition = if activate_now {
+            protocol::SubmissionDisposition::Started
+        } else {
+            protocol::SubmissionDisposition::Queued
+        };
+        current.remember_receipt(SubmissionReceipt {
+            submission_request_id: submission_request_id.clone(),
+            source_namespace,
+            submission_id: submission_id.clone(),
+            payload_digest,
+            disposition,
+        });
+        current.revision = current.revision.saturating_add(1);
+
+        if activate_now {
+            current.activating = Some(pending.clone());
+        } else {
+            let count = current
+                .pending
+                .len()
+                .saturating_add(current.pending_notifications.len())
+                .saturating_add(1);
+            if count > MAX_PENDING_SUBMISSIONS {
+                *current = original;
+                return Err(PendingSubmissionError::CountLimit);
+            }
+            let bytes = current
+                .pending
+                .iter()
+                .map(|pending| submission_payload_len(&pending.input))
+                .sum::<u64>()
+                .saturating_add(
+                    current
+                        .pending_notifications
+                        .iter()
+                        .map(|pending| u64::try_from(pending.message.len()).unwrap_or(u64::MAX))
+                        .sum::<u64>(),
+                )
+                .saturating_add(submission_payload_len(&pending.input));
+            if bytes > MAX_PENDING_SUBMISSION_BYTES {
+                *current = original;
+                return Err(PendingSubmissionError::ByteLimit);
+            }
+            let artifact_refs = current
+                .pending
+                .iter()
+                .map(|pending| submission_artifact_ref_count(&pending.input))
+                .sum::<usize>()
+                .saturating_add(submission_artifact_ref_count(&pending.input));
+            if artifact_refs > MAX_PENDING_ARTIFACT_REFS {
+                *current = original;
+                return Err(PendingSubmissionError::ArtifactLimit);
+            }
+            current.pending.push_back(pending.clone());
+        }
+        if !activate_now {
+            if let Err(error) = self.pin_submission_files(&pending) {
+                *current = original;
+                return Err(error);
+            }
+            if let Err(error) = self.persist_locked(&current) {
+                let _ = self.release_submission_files(&pending);
+                *current = original;
+                return Err(error);
+            }
+        }
+        Ok(SubmissionAcceptance {
+            submission_request_id,
+            submission_id,
+            disposition,
+            activation: activate_now.then_some(pending),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accept_notification(
+        &self,
+        notification_request_id: String,
+        message: String,
+        auto_run: bool,
+    ) -> Result<bool, PendingSubmissionError> {
+        self.accept_notification_from_source(
+            notification_request_id,
+            message,
+            self.direct_client_namespace(),
+            WorkerHistoryProvenance::LegacyUnknown,
+            auto_run,
+        )
+    }
+
+    pub(crate) fn accept_notification_from_source(
+        &self,
+        notification_request_id: String,
+        message: String,
+        source_namespace: String,
+        provenance: WorkerHistoryProvenance,
+        auto_run: bool,
+    ) -> Result<bool, PendingSubmissionError> {
+        if notification_request_id.trim().is_empty() {
+            return Err(PendingSubmissionError::EmptyRequestId);
+        }
+        if notification_request_id.len() > MAX_ACTIVATION_REQUEST_ID_BYTES {
+            return Err(PendingSubmissionError::RequestIdLimit);
+        }
+        let payload_digest = notification_payload_digest(&message, auto_run);
+        let _append_guard = self
+            .writer
+            .state
+            .append_lock
+            .lock()
+            .expect("segment append lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("pending activation state poisoned");
+        if let Some(receipt) = state.notification_receipts.iter().find(|receipt| {
+            receipt.notification_request_id == notification_request_id
+                && receipt.source_namespace == source_namespace
+        }) {
+            if receipt.payload_digest != payload_digest || receipt.auto_run != auto_run {
+                return Err(PendingSubmissionError::IdempotencyConflict);
+            }
+            return Ok(false);
+        }
+        if state
+            .pending
+            .len()
+            .saturating_add(state.pending_notifications.len())
+            >= MAX_PENDING_SUBMISSIONS
+        {
+            return Err(PendingSubmissionError::CountLimit);
+        }
+        let queued_bytes = state
+            .pending
+            .iter()
+            .map(|pending| submission_payload_len(&pending.input))
+            .sum::<u64>()
+            .saturating_add(
+                state
+                    .pending_notifications
+                    .iter()
+                    .map(|pending| u64::try_from(pending.message.len()).unwrap_or(u64::MAX))
+                    .sum::<u64>(),
+            )
+            .saturating_add(u64::try_from(message.len()).unwrap_or(u64::MAX));
+        if queued_bytes > MAX_PENDING_SUBMISSION_BYTES {
+            return Err(PendingSubmissionError::ByteLimit);
+        }
+        let original = state.clone();
+        let activation_sequence = state.next_activation_sequence;
+        state.next_activation_sequence = state.next_activation_sequence.saturating_add(1);
+        state.pending_notifications.push_back(PendingNotification {
+            notification_request_id: notification_request_id.clone(),
+            source_namespace: source_namespace.clone(),
+            message,
+            payload_digest: payload_digest.clone(),
+            auto_run,
+            accepted_at_ms: segment_log::now_millis(),
+            activation_sequence,
+            provenance,
+        });
+        state.remember_notification_receipt(NotificationReceipt {
+            notification_request_id,
+            source_namespace,
+            payload_digest,
+            auto_run,
+        });
+        state.revision = state.revision.saturating_add(1);
+        if let Err(error) = self.persist_locked(&state) {
+            *state = original;
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn activating_passive_notification_id(&self) -> Option<String> {
+        self.state
+            .lock()
+            .expect("pending activation state poisoned")
+            .activating_notification
+            .as_ref()
+            .filter(|notification| !notification.auto_run)
+            .map(|notification| notification.notification_request_id.clone())
+    }
+
+    pub(crate) fn next_passive_notification_identity(&self) -> Option<(String, String)> {
+        self.state
+            .lock()
+            .expect("pending activation state poisoned")
+            .pending_notifications
+            .iter()
+            .find(|notification| !notification.auto_run)
+            .map(|notification| {
+                (
+                    notification.source_namespace.clone(),
+                    notification.notification_request_id.clone(),
+                )
+            })
+    }
+
+    pub(crate) fn prepare_notification(
+        &self,
+        source_namespace: &str,
+        notification_request_id: &str,
+    ) -> Option<PendingNotification> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("pending activation state poisoned");
+        if state.activating_notification.is_some() {
+            return None;
+        }
+        let index = state
+            .pending_notifications
+            .iter()
+            .position(|notification| {
+                notification.notification_request_id == notification_request_id
+                    && notification.source_namespace == source_namespace
+            })?;
+        let notification = state
+            .pending_notifications
+            .remove(index)
+            .expect("located pending notification must exist");
+        state.activating_notification = Some(notification.clone());
+        state.revision = state.revision.saturating_add(1);
+        Some(notification)
+    }
+
+    pub(crate) fn prepare_next_activation(
+        &self,
+        fence: Option<(u64, &str)>,
+    ) -> Result<Option<PendingActivation>, PendingSubmissionError> {
+        let _append_guard = self
+            .writer
+            .state
+            .append_lock
+            .lock()
+            .expect("segment append lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("pending activation state poisoned");
+        if let Some((expected_revision, expected_head_id)) = fence {
+            Self::validate_fence(&state, expected_revision, Some(expected_head_id))?;
+        }
+        if state.activating.is_some()
+            || state
+                .activating_notification
+                .as_ref()
+                .is_some_and(|notification| notification.auto_run)
+        {
+            return Ok(None);
+        }
+        let has_staged_passive_notification = state.activating_notification.is_some();
+        let submission_sequence = state.pending.front().map(|item| item.activation_sequence);
+        let notification_index = if has_staged_passive_notification {
+            None
+        } else {
+            state
+                .pending_notifications
+                .iter()
+                .position(|item| item.auto_run)
+        };
+        let notification_sequence = notification_index
+            .and_then(|index| state.pending_notifications.get(index))
+            .map(|item| item.activation_sequence);
+        if notification_sequence.is_some()
+            && (submission_sequence.is_none() || notification_sequence < submission_sequence)
+        {
+            let notification = state
+                .pending_notifications
+                .remove(notification_index.expect("notification sequence came from an item"))
+                .expect("notification sequence came from an existing item");
+            state.activating_notification = Some(notification.clone());
+            state.revision = state.revision.saturating_add(1);
+            return Ok(Some(PendingActivation::Notification(notification)));
+        }
+        if submission_sequence.is_some() {
+            let pending = state
+                .pending
+                .pop_front()
+                .expect("submission sequence came from queue head");
+            state.activating = Some(pending.clone());
+            state.revision = state.revision.saturating_add(1);
+            return Ok(Some(PendingActivation::Submission(pending)));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn abort_activation(&self, pending: PendingSubmission) {
+        let _append_guard = self
+            .writer
+            .state
+            .append_lock
+            .lock()
+            .expect("segment append lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("pending activation state poisoned");
+        if state.activating.as_ref().map(|item| &item.submission_id) != Some(&pending.submission_id)
+        {
+            return;
+        }
+        state.activating = None;
+        if pending.was_queued {
+            state.pending.push_front(pending.clone());
+        } else {
+            state
+                .receipts
+                .retain(|receipt| receipt.submission_id != pending.submission_id);
+        }
+        state.revision = state.revision.saturating_add(1);
+        if let Err(error) = self.persist_locked(&state) {
+            tracing::error!(error = %error, "failed to persist aborted pending activation");
+        }
+    }
+
+    pub(crate) fn activation_extension(&self) -> SessionExtension {
+        let state = self
+            .state
+            .lock()
+            .expect("pending activation state poisoned");
+        let mut committed = state.clone();
+        if let Some(activating) = &committed.activating
+            && let Some(receipt) = committed
+                .receipts
+                .iter_mut()
+                .find(|receipt| receipt.submission_id == activating.submission_id)
+        {
+            receipt.disposition = protocol::SubmissionDisposition::Started;
+        }
+        committed.activating = None;
+        committed.revision = committed.revision.saturating_add(1);
+        pending_activation_extension(&committed)
+    }
+
+    pub(crate) fn finish_activation(&self, submission_id: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("pending activation state poisoned");
+        if state
+            .activating
+            .as_ref()
+            .map(|item| item.submission_id.as_str())
+            == Some(submission_id)
+        {
+            if let Some(receipt) = state
+                .receipts
+                .iter_mut()
+                .find(|receipt| receipt.submission_id == submission_id)
+            {
+                receipt.disposition = protocol::SubmissionDisposition::Started;
+            }
+            state.activating = None;
+            state.revision = state.revision.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn notification_activation_extension(&self) -> SessionExtension {
+        let state = self
+            .state
+            .lock()
+            .expect("pending activation state poisoned");
+        let mut committed = state.clone();
+        committed.activating = None;
+        committed.activating_notification = None;
+        committed.revision = committed.revision.saturating_add(1);
+        pending_activation_extension(&committed)
+    }
+
+    pub(crate) fn finish_notification_activation(&self, notification_request_id: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("pending activation state poisoned");
+        if state
+            .activating_notification
+            .as_ref()
+            .map(|item| item.notification_request_id.as_str())
+            == Some(notification_request_id)
+        {
+            state.activating_notification = None;
+            state.revision = state.revision.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn direct_client_namespace(&self) -> String {
+        format!("direct:{}", self.writer.state.location().session_id)
+    }
+
+    pub(crate) fn snapshot(&self) -> protocol::PendingSubmissionsSnapshot {
+        self.state
+            .lock()
+            .expect("pending activation state poisoned")
+            .snapshot()
+    }
+
+    fn reconcile_uploaded_file_pins(&self) -> Result<u64, StoreError> {
+        let live_owner_ids = self
+            .state
+            .lock()
+            .expect("pending activation state poisoned")
+            .live_artifact_pin_owner_ids();
+        Ok(self
+            .writer
+            .store
+            .reconcile_uploaded_file_pins(self.writer.state.session_id(), &live_owner_ids)?)
+    }
+
+    pub(crate) fn cancel(
+        &self,
+        submission_id: &str,
+        expected_revision: u64,
+    ) -> Result<protocol::PendingSubmissionsSnapshot, PendingSubmissionError> {
+        let _append_guard = self
+            .writer
+            .state
+            .append_lock
+            .lock()
+            .expect("segment append lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("pending activation state poisoned");
+        Self::validate_fence(&state, expected_revision, None)?;
+        let original = state.clone();
+        let Some(index) = state
+            .pending
+            .iter()
+            .position(|pending| pending.submission_id == submission_id)
+        else {
+            return Err(PendingSubmissionError::NotFound(submission_id.to_owned()));
+        };
+        let removed = state
+            .pending
+            .remove(index)
+            .expect("located pending submission must exist");
+        state.revision = state.revision.saturating_add(1);
+        if let Err(error) = self.persist_locked(&state) {
+            *state = original;
+            return Err(error);
+        }
+        self.release_submission_files(&removed)?;
+        Ok(state.snapshot())
+    }
+
+    pub(crate) fn clear(
+        &self,
+        expected_revision: u64,
+    ) -> Result<protocol::PendingSubmissionsSnapshot, PendingSubmissionError> {
+        let _append_guard = self
+            .writer
+            .state
+            .append_lock
+            .lock()
+            .expect("segment append lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("pending activation state poisoned");
+        Self::validate_fence(&state, expected_revision, None)?;
+        let original = state.clone();
+        let removed = state.pending.drain(..).collect::<Vec<_>>();
+        state.pending_notifications.clear();
+        state.revision = state.revision.saturating_add(1);
+        if let Err(error) = self.persist_locked(&state) {
+            *state = original;
+            return Err(error);
+        }
+        for pending in &removed {
+            self.release_submission_files(pending)?;
+        }
+        Ok(state.snapshot())
+    }
+}
+
+impl PendingSubmissionHandle<session_store::FsStore> {
+    #[cfg(test)]
+    pub(crate) fn for_test(root: &std::path::Path) -> Self {
+        let store = session_store::FsStore::new(root).expect("test session store");
+        let session_id = session_store::new_session_id();
+        let segment_id = session_store::new_segment_id();
+        store
+            .create_segment(session_id, segment_id, &[])
+            .expect("test session segment");
+        Self {
+            state: Arc::new(Mutex::new(PendingActivationState::default())),
+            writer: LogWriterHandle {
+                store,
+                state: SegmentState::new(session_id, segment_id, 0),
+                sink: SegmentLogSink::new(),
+                in_flight: None,
+            },
+        }
+    }
+}
+
+/// Type-erased commit handle for the interceptor. Lets the interceptor commit `SystemItem`s without being generic over the
 /// concrete `Store` type.
 pub trait SystemItemCommitter: Send + Sync {
     fn commit_log_entry(&self, entry: LogEntry) -> Result<(), StoreError>;
 
-    fn commit_system_item(
+    fn commit_system_item_with_extensions(
         &self,
         item: SystemItem,
+        extensions: Vec<SessionExtension>,
+        history_provenance: Option<WorkerHistoryProvenance>,
     ) -> Result<HistoryEntry<SessionHistoryMetadata>, StoreError> {
         let metadata = new_history_metadata(
-            WorkerHistoryProvenance::BackendInstruction { operation_id: None },
+            history_provenance
+                .unwrap_or(WorkerHistoryProvenance::BackendInstruction { operation_id: None }),
             None,
         );
         let history_item = item.to_history_item();
@@ -991,6 +1951,7 @@ pub trait SystemItemCommitter: Send + Sync {
                 item,
                 metadata: metadata.clone(),
             },
+            extensions,
         })?;
         Ok(HistoryEntry::new(history_item, metadata))
     }
@@ -1027,8 +1988,6 @@ where
     }
 }
 
-pub const WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN: &str = "worker.input-submission.v1";
-
 #[derive(Clone)]
 struct PreparedFlowProjection {
     selector: String,
@@ -1049,6 +2008,7 @@ pub struct WorkerSession {
     session_id: SessionId,
     revision: u64,
     history: History<SessionHistoryMetadata>,
+    pending_activations: Arc<Mutex<PendingActivationState>>,
 }
 
 impl WorkerSession {
@@ -1058,7 +2018,37 @@ impl WorkerSession {
             session_id,
             revision,
             history: History::from_entries(entries),
+            pending_activations: Arc::new(Mutex::new(PendingActivationState::default())),
         }
+    }
+
+    fn restore_pending_activations(&mut self, extensions: &[(String, serde_json::Value)]) {
+        let Some(payload) = extensions.iter().rev().find_map(|(domain, payload)| {
+            (domain == SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN).then_some(payload)
+        }) else {
+            return;
+        };
+        if let Ok(mut state) = serde_json::from_value::<PendingActivationState>(payload.clone()) {
+            if let Some(activating) = state.activating.take() {
+                state.pending.push_front(activating);
+                state.revision = state.revision.saturating_add(1);
+            }
+            if let Some(activating) = state.activating_notification.take() {
+                state.pending_notifications.push_front(activating);
+                state.revision = state.revision.saturating_add(1);
+            }
+            *self
+                .pending_activations
+                .lock()
+                .expect("pending activation state poisoned") = state;
+        }
+    }
+
+    pub fn pending_submissions(&self) -> protocol::PendingSubmissionsSnapshot {
+        self.pending_activations
+            .lock()
+            .expect("pending activation state poisoned")
+            .snapshot()
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -1312,6 +2302,21 @@ impl<C: LlmClient + 'static, St: Store + Clone + 'static> Worker<C, St> {
             sink: self.sink.clone(),
             in_flight: self.in_flight.clone(),
         }
+    }
+
+    pub(crate) fn pending_activation_state(&self) -> Arc<Mutex<PendingActivationState>> {
+        self.session.pending_activations.clone()
+    }
+
+    pub(crate) fn pending_submission_handle(&self) -> PendingSubmissionHandle<St> {
+        PendingSubmissionHandle {
+            state: self.session.pending_activations.clone(),
+            writer: self.log_writer_handle(),
+        }
+    }
+
+    pub fn pending_submissions(&self) -> protocol::PendingSubmissionsSnapshot {
+        self.session.pending_submissions()
     }
 
     /// Attach a type-erased system-item commit handle. The controller
@@ -1675,6 +2680,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 },
                 metadata: skill_metadata.clone(),
             },
+            extensions: Vec::new(),
         })?;
         let history_entry = HistoryEntry::new(agen::Item::system_message(body), skill_metadata);
         let mut annotate = history_annotator(
@@ -1965,6 +2971,30 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .truncate(loc.session_id, loc.segment_id, truncate_entries)?;
         self.segment_state.set_entries_written(truncate_entries);
         self.sink.truncate_silent(truncate_entries);
+        let pending_state = self
+            .session
+            .pending_activations
+            .lock()
+            .expect("pending activation state poisoned")
+            .clone();
+        if !pending_state.pending.is_empty()
+            || !pending_state.pending_notifications.is_empty()
+            || pending_state.activating.is_some()
+            || pending_state.activating_notification.is_some()
+            || !pending_state.receipts.is_empty()
+            || !pending_state.notification_receipts.is_empty()
+        {
+            let checkpoint = LogEntry::Extension {
+                ts: segment_log::now_millis(),
+                domain: SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN.to_owned(),
+                payload: serde_json::to_value(&pending_state).map_err(|error| {
+                    RewindError::Invalid(format!(
+                        "serialize pending submissions during rewind: {error}"
+                    ))
+                })?,
+            };
+            self.commit_entry(checkpoint)?;
+        }
 
         let history_entries = restore_history_entries(loc.session_id, loc.segment_id, &retained)
             .map_err(|error| RewindError::Invalid(error.into()))?;
@@ -2534,7 +3564,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Convenience: run with a single `Segment::Text`.
     ///
     /// Equivalent to `run(vec![Segment::text(s)])`. The dumb-client
-    /// counterpart of [`protocol::Method::run_text`]; primarily for
+    /// counterpart of [`protocol::Method::submit_text`]; primarily for
     /// tests and tools that have only a string in hand.
     pub async fn run_text(&mut self, s: impl Into<String>) -> Result<WorkerRunResult, WorkerError>
     where
@@ -2785,8 +3815,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     where
         St: Clone + 'static,
     {
-        self.run_with_input_extensions_and_commit_hook(input, input_extensions, || {})
-            .await
+        self.run_with_input_extensions_and_commit_hook(
+            input,
+            input_extensions,
+            WorkerHistoryProvenance::LegacyUnknown,
+            || {},
+        )
+        .await
     }
 
     /// Run user input and invoke `on_input_committed` only after the annotated
@@ -2797,6 +3832,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         &mut self,
         input: Vec<Segment>,
         mut input_extensions: Vec<SessionExtension>,
+        input_provenance: WorkerHistoryProvenance,
         on_input_committed: F,
     ) -> Result<WorkerRunResult, WorkerError>
     where
@@ -2844,8 +3880,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             trigger: protocol::InvokeKind::UserSend,
         })?;
 
-        let projected_input =
-            self.projected_input_history(&input, flow_projection.as_ref(), &projected_entry_ids);
+        let projected_input = self.projected_input_history(
+            &input,
+            flow_projection.as_ref(),
+            &projected_entry_ids,
+            &input_provenance,
+        );
 
         // Persist original typed segments together with the exact ordered
         // model-visible item+origin projection before any entry becomes live.
@@ -2858,6 +3898,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 .map(to_logged_history_entry)
                 .collect(),
         })?;
+        self.finalize_uploaded_segment_bindings(
+            &input,
+            &projected_entry_ids,
+            flow_projection.is_some(),
+        );
         if let Some(state) = pending_flow_state {
             *self
                 .flow_runtime_state
@@ -3051,6 +4096,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 },
                 metadata: interrupt_metadata.clone(),
             },
+            extensions: Vec::new(),
         })?;
         let interrupt_entry =
             HistoryEntry::new(agen::Item::system_message(system_note), interrupt_metadata);
@@ -3077,6 +4123,36 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             ts: segment_log::now_millis(),
         })?;
         Ok(())
+    }
+
+    fn finalize_uploaded_segment_bindings(
+        &self,
+        input: &[Segment],
+        projected_entry_ids: &[SessionHistoryEntryId],
+        one_entry_per_segment: bool,
+    ) {
+        for (index, segment) in input.iter().enumerate() {
+            let Segment::UploadedFile { file } = segment else {
+                continue;
+            };
+            let entry_index = if one_entry_per_segment { index } else { 0 };
+            let source_entry_id = projected_entry_ids
+                .get(entry_index)
+                .expect("projected input id exists for every uploaded file")
+                .0
+                .as_str();
+            if let Err(error) = self.store.finalize_uploaded_file_binding(
+                self.session_id(),
+                &file.artifact_id,
+                source_entry_id,
+            ) {
+                tracing::warn!(
+                    artifact_id = %file.artifact_id,
+                    error = %error,
+                    "deferred uploaded file pin finalization to cleanup reconciliation"
+                );
+            }
+        }
     }
 
     fn materialize_large_pastes(
@@ -3150,6 +4226,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         input: &[Segment],
         flow_projection: Option<&PreparedFlowProjection>,
         entry_ids: &[SessionHistoryEntryId],
+        provenance: &WorkerHistoryProvenance,
     ) -> Vec<HistoryEntry<SessionHistoryMetadata>> {
         if let Some(flow) = flow_projection {
             return input
@@ -3170,10 +4247,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     other => history_entry_with_id(
                         Item::user_message(Segment::flatten_to_text(std::slice::from_ref(other))),
                         entry_id.clone(),
-                        // Current public submit transport does not carry a
-                        // trusted account/Worker subject envelope. Fail closed
-                        // instead of promoting role=user to HumanInput.
-                        WorkerHistoryProvenance::LegacyUnknown,
+                        provenance.clone(),
                     ),
                 })
                 .collect();
@@ -3185,7 +4259,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 .first()
                 .expect("projected Worker input always has one entry id")
                 .clone(),
-            WorkerHistoryProvenance::LegacyUnknown,
+            provenance.clone(),
         )]
     }
 
@@ -3497,15 +4571,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         Ok(())
     }
 
-    fn persist_and_send_compact_done(
-        &mut self,
-        lifecycle: CompactionLifecycle,
-    ) -> Result<(), WorkerError> {
-        self.persist_compaction_lifecycle(&lifecycle)?;
-        self.send_event(Event::CompactDone { lifecycle });
-        Ok(())
-    }
-
     fn persist_and_send_compact_failed(
         &mut self,
         lifecycle: CompactionLifecycle,
@@ -3650,7 +4715,97 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         Ok(rewrite_guard)
     }
 
+    /// Terminalize and clean up any compaction that was left active by the
+    /// previous controller generation. This runs before the restored
+    /// controller publishes its first Idle state.
+    pub async fn recover_unfinished_compaction(&mut self) -> Result<(), WorkerError> {
+        let (entries, _) = self.sink.subscribe_with_snapshot();
+        let latest_payload = entries.iter().rev().find_map(|entry| match entry {
+            LogEntry::Extension {
+                domain, payload, ..
+            } if domain == COMPACTION_EXTENSION_DOMAIN => Some(payload.clone()),
+            _ => None,
+        });
+        let Some(payload) = latest_payload else {
+            return Ok(());
+        };
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CompactionLifecycleWire {
+            schema_version: u32,
+            compaction_id: String,
+            revision: u64,
+            #[serde(default)]
+            internal_worker: Option<protocol::InternalWorkerRef>,
+            state: CompactionLifecycleState,
+            started_at_ms: u64,
+            #[serde(default)]
+            ended_at_ms: Option<u64>,
+            #[serde(default)]
+            summary: Option<String>,
+            #[serde(default)]
+            error: Option<String>,
+            #[serde(default)]
+            new_segment_id: Option<String>,
+        }
+        let wire: CompactionLifecycleWire = serde_json::from_value(payload).map_err(|error| {
+            WorkerError::InvalidState(format!("decode compaction lifecycle: {error}"))
+        })?;
+        if !matches!(wire.schema_version, 2 | 3) {
+            return Err(WorkerError::InvalidState(format!(
+                "unsupported compaction lifecycle schema version {}",
+                wire.schema_version
+            )));
+        }
+        let mut lifecycle = CompactionLifecycle {
+            schema_version: wire.schema_version,
+            compaction_id: wire.compaction_id,
+            revision: wire.revision,
+            internal_worker: wire.internal_worker,
+            state: wire.state,
+            started_at_ms: wire.started_at_ms,
+            ended_at_ms: wire.ended_at_ms,
+            summary: wire.summary,
+            error: wire.error,
+            new_segment_id: wire.new_segment_id,
+        };
+        match lifecycle.state {
+            CompactionLifecycleState::Running => {
+                lifecycle.schema_version = 3;
+                lifecycle.revision = lifecycle.revision.saturating_add(1);
+                lifecycle.state = CompactionLifecycleState::Interrupted;
+                lifecycle.ended_at_ms = Some(segment_log::now_millis());
+                lifecycle.error =
+                    Some("worker execution restarted before compaction completed".into());
+                self.persist_compaction_lifecycle(&lifecycle)?;
+                self.send_event(Event::CompactFailed {
+                    lifecycle: lifecycle.clone(),
+                });
+                self.release_compaction_service(&lifecycle).await;
+            }
+            CompactionLifecycleState::Interrupted => {
+                self.release_compaction_service(&lifecycle).await;
+            }
+            CompactionLifecycleState::Done | CompactionLifecycleState::Failed => {}
+        }
+        Ok(())
+    }
+
     pub async fn manual_compact(&mut self) -> Result<ManualCompactResult, WorkerError> {
+        self.manual_compact_inner(None).await
+    }
+
+    pub async fn manual_compact_with_cancel(
+        &mut self,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<ManualCompactResult, WorkerError> {
+        self.manual_compact_inner(Some(cancel)).await
+    }
+
+    async fn manual_compact_inner(
+        &mut self,
+        mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<ManualCompactResult, WorkerError> {
         if self.manifest.compaction.is_none() {
             let message =
                 "manual compact is unavailable because [compaction] is not configured".to_string();
@@ -3690,7 +4845,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             return Ok(ManualCompactResult::Skipped { message });
         }
 
-        match self.compact(retained).await {
+        match self.compact_with_cancel(retained, cancel.take()).await {
             Ok(new_segment_id) => {
                 info!(new_segment_id = %new_segment_id, "Manual compaction succeeded");
                 if let Some(ref state) = state {
@@ -3863,11 +5018,19 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Runs one parent-owned observable compaction service and returns the new
     /// Segment ID. Lifecycle revisions are committed before they are broadcast.
     pub async fn compact(&mut self, retained_tokens: u64) -> Result<SegmentId, WorkerError> {
+        self.compact_with_cancel(retained_tokens, None).await
+    }
+
+    async fn compact_with_cancel(
+        &mut self,
+        retained_tokens: u64,
+        mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<SegmentId, WorkerError> {
         let _rewrite_guard = self
             .prepare_session_rewrite(SessionRewriteKind::Compact)
             .await?;
         let mut lifecycle = CompactionLifecycle {
-            schema_version: 2,
+            schema_version: 3,
             compaction_id: uuid::Uuid::now_v7().to_string(),
             revision: 1,
             internal_worker: None,
@@ -3879,16 +5042,25 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             new_segment_id: None,
         };
         self.persist_and_send_compact_start(lifecycle.clone())?;
-        match self.compact_impl(retained_tokens, &mut lifecycle).await {
-            Ok((new_segment_id, summary)) => {
-                lifecycle.revision = lifecycle.revision.saturating_add(1);
-                lifecycle.state = CompactionLifecycleState::Done;
-                lifecycle.ended_at_ms = Some(segment_log::now_millis());
-                lifecycle.summary = Some(summary);
-                lifecycle.new_segment_id = Some(new_segment_id.to_string());
-                let terminal = self.persist_and_send_compact_done(lifecycle.clone());
+        let outcome = if let Some(cancel) = cancel.as_mut() {
+            tokio::select! {
+                biased;
+                changed = cancel.changed() => {
+                    let _ = changed;
+                    Err(WorkerError::CompactCancelled)
+                }
+                result = self.compact_impl(retained_tokens, &mut lifecycle) => result,
+            }
+        } else {
+            self.compact_impl(retained_tokens, &mut lifecycle).await
+        };
+        match outcome {
+            Ok((new_segment_id, _summary)) => {
+                debug_assert_eq!(lifecycle.state, CompactionLifecycleState::Done);
+                self.send_event(Event::CompactDone {
+                    lifecycle: lifecycle.clone(),
+                });
                 self.release_compaction_service(&lifecycle).await;
-                terminal?;
                 Ok(new_segment_id)
             }
             Err(error) => {
@@ -4437,6 +5609,22 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         {
             initial_entries.push(checkpoint);
         }
+        initial_entries.push(LogEntry::Extension {
+            ts: segment_log::now_millis(),
+            domain: SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN.to_owned(),
+            payload: serde_json::to_value(
+                &*self
+                    .session
+                    .pending_activations
+                    .lock()
+                    .expect("pending activation state poisoned"),
+            )
+            .map_err(|error| {
+                WorkerError::InvalidState(format!(
+                    "serialize pending submissions during compaction: {error}"
+                ))
+            })?,
+        });
         if let Some(flow_state) = self
             .flow_runtime_state
             .lock()
@@ -4453,6 +5641,24 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 })?,
             });
         }
+        // Commit the terminal lifecycle in the same atomic replacement-segment
+        // creation as the rewritten history. Restore can therefore never see a
+        // replacement segment without the Done fact for the compaction that
+        // created it.
+        lifecycle.revision = lifecycle.revision.saturating_add(1);
+        lifecycle.state = CompactionLifecycleState::Done;
+        lifecycle.ended_at_ms = Some(segment_log::now_millis());
+        lifecycle.summary = Some(summary_text.clone());
+        lifecycle.new_segment_id = Some(new_segment_id.to_string());
+        initial_entries.push(LogEntry::Extension {
+            ts: segment_log::now_millis(),
+            domain: COMPACTION_EXTENSION_DOMAIN.to_string(),
+            payload: serde_json::to_value(&*lifecycle).map_err(|error| {
+                WorkerError::InvalidState(format!(
+                    "serialize terminal compaction lifecycle: {error}"
+                ))
+            })?,
+        });
         self.store
             .create_segment(old_loc.session_id, new_segment_id, &initial_entries)?;
         self.segment_state.set_location(SegmentLocation {
@@ -5257,6 +6463,12 @@ where
             history_persistence_wired: false,
             log_writer: None,
         };
+        worker
+            .session
+            .restore_pending_activations(&state.extensions);
+        worker
+            .pending_submission_handle()
+            .reconcile_uploaded_file_pins()?;
         worker.apply_permissions_from_manifest();
         worker.apply_prune_from_manifest();
         worker.write_worker_metadata_active(SegmentLocation {
@@ -7202,8 +8414,15 @@ mod build_summary_prompt_tests {
             serde_json::to_value(&state).unwrap(),
         );
         let projected_ids = vec![SessionHistoryEntryId::new(), SessionHistoryEntryId::new()];
-        let projected =
-            worker.projected_input_history(&segments, projection.as_ref(), &projected_ids);
+        let input_provenance = WorkerHistoryProvenance::HumanInput {
+            account_id: "account-1".into(),
+        };
+        let projected = worker.projected_input_history(
+            &segments,
+            projection.as_ref(),
+            &projected_ids,
+            &input_provenance,
+        );
         worker
             .commit_entry(LogEntry::AnnotatedUserInput {
                 ts: segment_log::now_millis(),
@@ -7230,6 +8449,7 @@ mod build_summary_prompt_tests {
             projected[0].annotation.origin,
             WorkerHistoryProvenance::FlowInstruction { .. }
         ));
+        assert_eq!(projected[1].annotation.origin, input_provenance);
         assert_eq!(state.instance.definition_revision, 3);
         assert_eq!(state.instance.current_state.as_str(), "implement");
         assert_eq!(workspace_client.requests.lock().unwrap().len(), 1);
@@ -7312,7 +8532,12 @@ mod build_summary_prompt_tests {
                 .delete_uploaded_file(worker.session_id(), &file.artifact_id),
             Err(StoreError::ArtifactAlreadyCommitted)
         ));
-        let projected = worker.projected_input_history(&input, None, &[entry_id]);
+        let projected = worker.projected_input_history(
+            &input,
+            None,
+            &[entry_id],
+            &WorkerHistoryProvenance::LegacyUnknown,
+        );
         let text = projected[0].item.as_text().unwrap();
         assert!(text.contains("notes.md"));
         assert!(text.contains(&file.artifact_id));
@@ -7394,7 +8619,12 @@ mod build_summary_prompt_tests {
                 if retained.source_entry_id == artifact.source_entry_id
         ));
 
-        let history = worker.projected_input_history(&input, None, &[entry_id]);
+        let history = worker.projected_input_history(
+            &input,
+            None,
+            &[entry_id],
+            &WorkerHistoryProvenance::LegacyUnknown,
+        );
         assert!(!history[0].item.as_text().unwrap().contains("終端"));
         append_test_entry(
             &worker,
@@ -7668,6 +8898,47 @@ mod build_summary_prompt_tests {
         );
         assert_eq!(worker.history().len(), 1);
         assert_eq!(worker.history()[0].as_text().unwrap(), "first message");
+    }
+
+    #[tokio::test]
+    async fn rewind_preserves_notification_only_pending_activation_checkpoint() {
+        let (_dir, mut worker) = rewind_test_worker().await;
+        append_user_turn(&worker, 10, "first message");
+        append_user_turn(&worker, 20, "second message");
+        worker
+            .pending_submission_handle()
+            .accept_notification("notification-1".into(), "keep me".into(), true)
+            .unwrap();
+        let (head_entries, targets) = worker.list_rewind_targets().unwrap();
+
+        worker
+            .rewind_to(targets.last().unwrap().id.clone(), head_entries)
+            .await
+            .unwrap();
+
+        let location = worker.segment_state.location();
+        let entries = worker
+            .store
+            .read_all(location.session_id, location.segment_id)
+            .unwrap();
+        let restored: PendingActivationState = entries
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                LogEntry::Extension {
+                    domain, payload, ..
+                } if domain == SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN => {
+                    serde_json::from_value(payload.clone()).ok()
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(restored.pending_notifications.len(), 1);
+        assert_eq!(restored.notification_receipts.len(), 1);
+        assert_eq!(
+            restored.pending_notifications[0].notification_request_id,
+            "notification-1"
+        );
     }
 
     #[tokio::test]
@@ -8512,6 +9783,551 @@ mod build_summary_prompt_tests {
         assert_eq!(
             capture_handle.capture().unwrap().run_exit,
             CommittedRunExit::Finished
+        );
+    }
+
+    #[test]
+    fn submission_retry_identity_is_scoped_to_authenticated_source_and_keeps_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        let input = vec![Segment::text("same request")];
+        let account_a = WorkerHistoryProvenance::HumanInput {
+            account_id: "account-a".into(),
+        };
+        let account_b = WorkerHistoryProvenance::HumanInput {
+            account_id: "account-b".into(),
+        };
+        let first = handle
+            .accept_from_source(
+                "request-1".into(),
+                input.clone(),
+                "account:account-a".into(),
+                account_a.clone(),
+                false,
+            )
+            .unwrap();
+        let replay = handle
+            .accept_from_source(
+                "request-1".into(),
+                input.clone(),
+                "account:account-a".into(),
+                account_a.clone(),
+                false,
+            )
+            .unwrap();
+        let other_source = handle
+            .accept_from_source(
+                "request-1".into(),
+                input,
+                "account:account-b".into(),
+                account_b.clone(),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(replay.submission_id, first.submission_id);
+        assert_ne!(other_source.submission_id, first.submission_id);
+        let state = handle.state.lock().unwrap();
+        assert_eq!(state.pending[0].provenance, account_a);
+        assert_eq!(state.pending[1].provenance, account_b);
+    }
+
+    #[test]
+    fn restore_reconciliation_clears_interrupted_acceptance_pin_for_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        let session_id = handle.writer.state.session_id();
+        let segment_id = handle.writer.state.location().segment_id;
+        let limits = session_store::UploadedFileLimits {
+            max_file_bytes: 1024,
+            max_session_bytes: 2048,
+        };
+        let file = handle
+            .writer
+            .store
+            .write_uploaded_file(session_id, "retry.txt", "text/plain", b"retry", limits)
+            .unwrap();
+        handle
+            .writer
+            .store
+            .pin_uploaded_file(session_id, &file, "interrupted-before-checkpoint")
+            .unwrap();
+        drop(handle);
+        let handle = PendingSubmissionHandle {
+            state: Arc::new(Mutex::new(PendingActivationState::default())),
+            writer: LogWriterHandle {
+                store: session_store::FsStore::new(temp.path()).unwrap(),
+                state: SegmentState::new(session_id, segment_id, 0),
+                sink: SegmentLogSink::new(),
+                in_flight: None,
+            },
+        };
+
+        assert_eq!(handle.reconcile_uploaded_file_pins().unwrap(), 1);
+        let accepted = handle
+            .accept(
+                "request-after-restore".into(),
+                vec![Segment::UploadedFile { file: file.clone() }],
+                false,
+            )
+            .unwrap();
+        assert!(!accepted.submission_id.is_empty());
+        assert_eq!(handle.reconcile_uploaded_file_pins().unwrap(), 0);
+        assert!(matches!(
+            handle
+                .writer
+                .store
+                .delete_uploaded_file(session_id, &file.artifact_id),
+            Err(StoreError::ArtifactAlreadyCommitted)
+        ));
+    }
+
+    #[test]
+    fn rejected_submission_rolls_back_uploaded_file_pins_acquired_before_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        let session_id = handle.writer.state.session_id();
+        let limits = session_store::UploadedFileLimits {
+            max_file_bytes: 1024,
+            max_session_bytes: 2048,
+        };
+        let first = handle
+            .writer
+            .store
+            .write_uploaded_file(session_id, "first.txt", "text/plain", b"first", limits)
+            .unwrap();
+        let second = handle
+            .writer
+            .store
+            .write_uploaded_file(session_id, "second.txt", "text/plain", b"second", limits)
+            .unwrap();
+        handle
+            .writer
+            .store
+            .pin_uploaded_file(session_id, &second, "other-submission")
+            .unwrap();
+
+        assert!(
+            handle
+                .accept(
+                    "request-partial-pin".into(),
+                    vec![
+                        Segment::UploadedFile {
+                            file: first.clone(),
+                        },
+                        Segment::UploadedFile {
+                            file: second.clone(),
+                        },
+                    ],
+                    false,
+                )
+                .is_err()
+        );
+        assert!(handle.snapshot().submissions.is_empty());
+        assert!(
+            handle
+                .writer
+                .store
+                .delete_uploaded_file(session_id, &first.artifact_id)
+                .unwrap()
+        );
+        assert!(matches!(
+            handle
+                .writer
+                .store
+                .delete_uploaded_file(session_id, &second.artifact_id),
+            Err(StoreError::ArtifactAlreadyCommitted)
+        ));
+        handle
+            .writer
+            .store
+            .release_uploaded_file_pin(session_id, &second.artifact_id, "other-submission")
+            .unwrap();
+        assert!(
+            handle
+                .writer
+                .store
+                .delete_uploaded_file(session_id, &second.artifact_id)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn queued_submission_pins_uploaded_file_until_cancelled() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        let session_id = handle.writer.state.session_id();
+        let reference = handle
+            .writer
+            .store
+            .write_uploaded_file(
+                session_id,
+                "queued.txt",
+                "text/plain",
+                b"queued artifact",
+                session_store::UploadedFileLimits {
+                    max_file_bytes: 1024,
+                    max_session_bytes: 2048,
+                },
+            )
+            .unwrap();
+        let accepted = handle
+            .accept(
+                "artifact-request".into(),
+                vec![Segment::UploadedFile {
+                    file: reference.clone(),
+                }],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            handle
+                .writer
+                .store
+                .delete_uncommitted_uploaded_files(session_id)
+                .unwrap(),
+            0
+        );
+        assert!(
+            handle
+                .writer
+                .store
+                .read_uploaded_file_by_id(session_id, &reference.artifact_id)
+                .is_ok()
+        );
+
+        handle
+            .cancel(&accepted.submission_id, handle.snapshot().revision)
+            .unwrap();
+        assert_eq!(
+            handle
+                .writer
+                .store
+                .delete_uncommitted_uploaded_files(session_id)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn pending_submission_queue_is_durable_idempotent_and_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        let input = vec![Segment::text("queued")];
+        let accepted = handle
+            .accept("request-1".into(), input.clone(), false)
+            .unwrap();
+        assert_eq!(
+            accepted.disposition,
+            protocol::SubmissionDisposition::Queued
+        );
+        assert_eq!(handle.snapshot().submissions.len(), 1);
+
+        let replay = handle
+            .accept("request-1".into(), input.clone(), false)
+            .unwrap();
+        assert_eq!(replay.submission_id, accepted.submission_id);
+        assert!(replay.activation.is_none());
+        assert_eq!(handle.snapshot().submissions.len(), 1);
+        assert!(matches!(
+            handle.accept("request-1".into(), vec![Segment::text("different")], false),
+            Err(PendingSubmissionError::IdempotencyConflict)
+        ));
+
+        let entries = handle
+            .writer
+            .store
+            .read_all(
+                handle.writer.state.session_id(),
+                handle.writer.state.segment_id(),
+            )
+            .unwrap();
+        let payload = entries
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                LogEntry::Extension {
+                    domain, payload, ..
+                } if domain == SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN => {
+                    Some(payload.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let restored: PendingActivationState = serde_json::from_value(payload).unwrap();
+        assert_eq!(restored.pending.len(), 1);
+        assert_eq!(restored.pending[0].submission_id, accepted.submission_id);
+
+        let fence = handle.snapshot();
+        assert!(matches!(
+            handle.cancel(&accepted.submission_id, fence.revision.saturating_sub(1)),
+            Err(PendingSubmissionError::RevisionConflict { .. })
+        ));
+        assert!(matches!(
+            handle.prepare_next_activation(Some((fence.revision, "wrong-head"))),
+            Err(PendingSubmissionError::HeadConflict { .. })
+        ));
+        assert_eq!(handle.snapshot(), fence);
+
+        let snapshot = handle
+            .cancel(&accepted.submission_id, handle.snapshot().revision)
+            .unwrap();
+        assert!(snapshot.submissions.is_empty());
+        assert!(matches!(
+            handle.cancel(&accepted.submission_id, handle.snapshot().revision),
+            Err(PendingSubmissionError::NotFound(_))
+        ));
+
+        for index in 0..MAX_PENDING_SUBMISSIONS {
+            handle
+                .accept(
+                    format!("limit-{index}"),
+                    vec![Segment::text(format!("value-{index}"))],
+                    false,
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            handle.accept("over-limit".into(), vec![Segment::text("too much")], false),
+            Err(PendingSubmissionError::CountLimit)
+        ));
+        assert_eq!(handle.snapshot().submissions.len(), MAX_PENDING_SUBMISSIONS);
+        let cleared = handle.clear(handle.snapshot().revision).unwrap();
+        assert!(cleared.submissions.is_empty());
+        assert_eq!(cleared.notification_count, 0);
+    }
+
+    #[test]
+    fn durable_notification_commits_authenticated_history_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        let provenance = WorkerHistoryProvenance::HumanInput {
+            account_id: "account-1".into(),
+        };
+        let committed = handle
+            .writer
+            .commit_system_item_with_extensions(
+                SystemItem::Notification {
+                    message: "notice".into(),
+                    body: "notice".into(),
+                    prompt_provenance: None,
+                },
+                Vec::new(),
+                Some(provenance.clone()),
+            )
+            .unwrap();
+        assert_eq!(committed.annotation.origin, provenance);
+    }
+
+    #[test]
+    fn notification_retry_identity_is_scoped_to_authenticated_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        let account_a = WorkerHistoryProvenance::HumanInput {
+            account_id: "account-a".into(),
+        };
+        let account_b = WorkerHistoryProvenance::HumanInput {
+            account_id: "account-b".into(),
+        };
+        assert!(
+            handle
+                .accept_notification_from_source(
+                    "request-1".into(),
+                    "notice".into(),
+                    "account:account-a".into(),
+                    account_a.clone(),
+                    false,
+                )
+                .unwrap()
+        );
+        assert!(
+            !handle
+                .accept_notification_from_source(
+                    "request-1".into(),
+                    "notice".into(),
+                    "account:account-a".into(),
+                    account_a.clone(),
+                    false,
+                )
+                .unwrap()
+        );
+        assert!(
+            handle
+                .accept_notification_from_source(
+                    "request-1".into(),
+                    "notice".into(),
+                    "account:account-b".into(),
+                    account_b.clone(),
+                    false,
+                )
+                .unwrap()
+        );
+        let state = handle.state.lock().unwrap();
+        assert_eq!(state.pending_notifications[0].provenance, account_a);
+        assert_eq!(state.pending_notifications[1].provenance, account_b);
+    }
+
+    #[test]
+    fn notification_and_submit_share_activation_order_and_notification_dedupes() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        assert!(
+            handle
+                .accept_notification("notification-1".into(), "notice".into(), true)
+                .unwrap()
+        );
+        assert!(
+            !handle
+                .accept_notification("notification-1".into(), "notice".into(), true)
+                .unwrap()
+        );
+        assert!(matches!(
+            handle.accept_notification("notification-1".into(), "different".into(), true),
+            Err(PendingSubmissionError::IdempotencyConflict)
+        ));
+        assert!(matches!(
+            handle.accept_notification("notification-1".into(), "notice".into(), false),
+            Err(PendingSubmissionError::IdempotencyConflict)
+        ));
+        handle
+            .accept("request-1".into(), vec![Segment::text("submit")], false)
+            .unwrap();
+
+        let first = handle.prepare_next_activation(None).unwrap().unwrap();
+        assert!(matches!(
+            first,
+            PendingActivation::Notification(PendingNotification { ref message, .. })
+                if message == "notice"
+        ));
+        let committed = handle.notification_activation_extension();
+        let committed_state: PendingActivationState =
+            serde_json::from_value(committed.payload).unwrap();
+        assert!(committed_state.pending_notifications.is_empty());
+        assert!(committed_state.activating_notification.is_none());
+        handle.finish_notification_activation("notification-1");
+        let second = handle.prepare_next_activation(None).unwrap().unwrap();
+        assert!(matches!(second, PendingActivation::Submission(_)));
+    }
+
+    #[test]
+    fn restoring_an_in_flight_activation_requeues_it_at_the_fifo_head() {
+        let mut session = WorkerSession::new(session_store::new_session_id(), Vec::new());
+        let state = PendingActivationState {
+            revision: 4,
+            next_activation_sequence: 3,
+            activating: Some(PendingSubmission {
+                submission_request_id: "request-1".into(),
+                source_namespace: "direct:test".into(),
+                submission_id: "submission-1".into(),
+                payload_digest: submission_payload_digest(&[Segment::text("first")]),
+                accepted_at_ms: 1,
+                activation_sequence: 0,
+                provenance: WorkerHistoryProvenance::LegacyUnknown,
+                was_queued: false,
+                input: vec![Segment::text("first")],
+            }),
+            activating_notification: Some(PendingNotification {
+                notification_request_id: "notification-1".into(),
+                source_namespace: "account:account-1".into(),
+                message: "deferred notice".into(),
+                payload_digest: notification_payload_digest("deferred notice", false),
+                auto_run: false,
+                accepted_at_ms: 3,
+                activation_sequence: 2,
+                provenance: WorkerHistoryProvenance::HumanInput {
+                    account_id: "account-1".into(),
+                },
+            }),
+            pending: VecDeque::from([PendingSubmission {
+                submission_request_id: "request-2".into(),
+                source_namespace: "direct:test".into(),
+                submission_id: "submission-2".into(),
+                payload_digest: submission_payload_digest(&[Segment::text("second")]),
+                accepted_at_ms: 2,
+                activation_sequence: 1,
+                provenance: WorkerHistoryProvenance::LegacyUnknown,
+                was_queued: true,
+                input: vec![Segment::text("second")],
+            }]),
+            pending_notifications: VecDeque::new(),
+            receipts: VecDeque::new(),
+            notification_receipts: VecDeque::from([NotificationReceipt {
+                notification_request_id: "notification-1".into(),
+                source_namespace: "account:account-1".into(),
+                payload_digest: notification_payload_digest("deferred notice", false),
+                auto_run: false,
+            }]),
+        };
+        session.restore_pending_activations(&[(
+            SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN.into(),
+            serde_json::to_value(state).unwrap(),
+        )]);
+        let state = session
+            .pending_activations
+            .lock()
+            .expect("pending activation state poisoned");
+        assert!(state.activating.is_none());
+        assert_eq!(state.pending.len(), 2);
+        assert_eq!(state.pending[0].submission_id, "submission-1");
+        assert_eq!(state.pending[1].submission_id, "submission-2");
+        assert!(state.activating_notification.is_none());
+        assert_eq!(state.pending_notifications.len(), 1);
+        assert!(!state.pending_notifications[0].auto_run);
+        assert!(matches!(
+            state.pending_notifications[0].provenance,
+            WorkerHistoryProvenance::HumanInput { ref account_id } if account_id == "account-1"
+        ));
+        assert_eq!(state.notification_receipts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restore_terminalizes_running_compaction_before_idle_publication() {
+        let (_dir, mut worker) = rewind_test_worker().await;
+        let lifecycle = CompactionLifecycle {
+            schema_version: 3,
+            compaction_id: "compact-before-restart".into(),
+            revision: 1,
+            internal_worker: None,
+            state: CompactionLifecycleState::Running,
+            started_at_ms: segment_log::now_millis(),
+            ended_at_ms: None,
+            summary: None,
+            error: None,
+            new_segment_id: None,
+        };
+        worker.persist_compaction_lifecycle(&lifecycle).unwrap();
+
+        worker.recover_unfinished_compaction().await.unwrap();
+
+        let (entries, _) = worker.sink.subscribe_with_snapshot();
+        let restored = entries.iter().rev().find_map(|entry| match entry {
+            LogEntry::Extension {
+                domain, payload, ..
+            } if domain == COMPACTION_EXTENSION_DOMAIN => {
+                serde_json::from_value::<CompactionLifecycle>(payload.clone()).ok()
+            }
+            _ => None,
+        });
+        let restored = restored.expect("terminal compaction lifecycle");
+        assert_eq!(restored.state, CompactionLifecycleState::Interrupted);
+        assert_eq!(restored.revision, 2);
+        assert!(
+            restored
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("restarted"))
+        );
+
+        let mut future = lifecycle;
+        future.schema_version = 4;
+        future.compaction_id = "future-compaction".into();
+        worker.persist_compaction_lifecycle(&future).unwrap();
+        let error = worker.recover_unfinished_compaction().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported compaction lifecycle schema version 4")
         );
     }
 

@@ -33,6 +33,7 @@ pub mod workdir_create_operations;
 mod workdir_removal;
 pub mod worker_source;
 pub mod workspace_catalog;
+mod workspace_deletion;
 mod workspace_subscription;
 
 pub use authority::{
@@ -40,7 +41,7 @@ pub use authority::{
     ObjectiveAuthority, SqliteWorkspaceAuthority, TicketAuthority, TicketMergeRevisionSource,
     WorkspaceAuthority,
 };
-pub use config::{BackendRuntimesConfigFile, ResolvedWorkspaceBackendConfig, ServerHostConfigFile};
+pub use config::{ResolvedWorkspaceBackendConfig, ServerHostConfigFile};
 pub use identity::{WORKSPACE_IDENTITY_RELATIVE_PATH, WorkspaceIdentity};
 pub use records::{ObjectiveDetail, ObjectiveSummary, TicketDetail, TicketSummary};
 pub use repositories::{ConfiguredRepository, RepositoryLogRead, RepositoryRegistryReader};
@@ -118,6 +119,17 @@ pub enum Error {
     WorkspacePermissionDenied(String),
     #[error("Workspace config update conflict: {0}")]
     WorkspaceConfigConflict(String),
+    #[error("Runtime binding conflict: {0}")]
+    RuntimeBindingConflict(String),
+    #[error("Runtime binding revision conflict: expected {expected:?}, current {actual:?}")]
+    RuntimeBindingRevisionConflict {
+        expected: Option<u64>,
+        actual: Option<u64>,
+    },
+    #[error("Runtime public key fingerprint is already bound in this Workspace: {fingerprint}")]
+    RuntimeBindingFingerprintConflict { fingerprint: String },
+    #[error("Runtime binding was not found for {runtime_id}")]
+    RuntimeBindingNotFound { runtime_id: String },
     #[error("Repository conflict: {0}")]
     RepositoryConflict(String),
     #[error("Registry inconsistency: {0}")]

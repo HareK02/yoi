@@ -539,6 +539,8 @@ pub enum WorkspaceAuthConfig {
 pub struct WorkspacePermissionSummary {
     pub manage_repositories: bool,
     pub manage_secrets: bool,
+    pub manage_runtimes: bool,
+    pub delete_workspace: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -603,6 +605,341 @@ pub struct UpdateWorkspaceMetadataRequest {
 pub struct WorkspaceMetadataMutationResponse {
     pub workspace: WorkspaceMetadataSettingsResponse,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+pub const WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES: usize = 128;
+pub const WORKSPACE_DELETION_MAX_REVISION_BYTES: usize = 128;
+pub const WORKSPACE_DELETION_MAX_CONFIRMATION_BYTES: usize = 256;
+pub const WORKSPACE_DELETION_MAX_BLOCKERS: usize = 1024;
+pub const WORKSPACE_DELETION_MAX_CHILD_OPERATION_IDS: usize = 4096;
+pub const WORKSPACE_DELETION_MAX_RESOURCE_VALUE_BYTES: usize = 128;
+pub const WORKSPACE_DELETION_MAX_BLOCKER_MESSAGE_BYTES: usize = 512;
+
+fn deserialize_workspace_deletion_operation_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() > WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES {
+        return Err(serde::de::Error::custom(
+            "Workspace deletion operation_id is too long",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_workspace_deletion_revision<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() > WORKSPACE_DELETION_MAX_REVISION_BYTES {
+        return Err(serde::de::Error::custom(
+            "Workspace deletion revision is too long",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_workspace_deletion_confirmation<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() > WORKSPACE_DELETION_MAX_CONFIRMATION_BYTES {
+        return Err(serde::de::Error::custom(
+            "Workspace deletion confirmation is too long",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_workspace_deletion_resource_value<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if value
+        .as_ref()
+        .is_some_and(|value| value.len() > WORKSPACE_DELETION_MAX_RESOURCE_VALUE_BYTES)
+    {
+        return Err(serde::de::Error::custom(
+            "Workspace deletion resource value is too long",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_workspace_deletion_blocker_message<'de, D>(
+    deserializer: D,
+) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() > WORKSPACE_DELETION_MAX_BLOCKER_MESSAGE_BYTES {
+        return Err(serde::de::Error::custom(
+            "Workspace deletion blocker message is too long",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_workspace_deletion_blockers<'de, D>(
+    deserializer: D,
+) -> Result<Vec<WorkspaceDeletionBlocker>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Vec::<WorkspaceDeletionBlocker>::deserialize(deserializer)?;
+    if value.len() > WORKSPACE_DELETION_MAX_BLOCKERS {
+        return Err(serde::de::Error::custom(
+            "too many Workspace deletion blockers",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_workspace_deletion_child_operation_ids<'de, D>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Vec::<String>::deserialize(deserializer)?;
+    if value.len() > WORKSPACE_DELETION_MAX_CHILD_OPERATION_IDS {
+        return Err(serde::de::Error::custom(
+            "too many Workspace deletion child operations",
+        ));
+    }
+    if value
+        .iter()
+        .any(|operation_id| operation_id.len() > WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES)
+    {
+        return Err(serde::de::Error::custom(
+            "Workspace deletion child operation_id is too long",
+        ));
+    }
+    Ok(value)
+}
+
+/// Lifecycle state for one durable Workspace deletion operation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceDeletionState {
+    Queued,
+    Running,
+    Blocked,
+    Failed,
+    Succeeded,
+}
+
+/// Stable category explaining why Workspace deletion cannot currently advance.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceDeletionBlockerKind {
+    LastAccessibleWorkspace,
+    RevisionConflict,
+    DirtyWorkdir,
+    WorkerRemovalBlocked,
+    WorkdirRemovalBlocked,
+    RetentionHold,
+    CleanupUnavailable,
+}
+
+/// One bounded, user-actionable blocker returned by preflight or execution.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct WorkspaceDeletionBlocker {
+    pub kind: WorkspaceDeletionBlockerKind,
+    pub resource_kind: Option<String>,
+    pub resource_key: Option<String>,
+    pub message: String,
+}
+
+/// Workspace-owned resources summarized before destructive confirmation.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDeletionResourceCounts {
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub workers: u64,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub workdirs: u64,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub repositories: u64,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub runtime_bindings: u64,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub secrets: u64,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub artifacts: u64,
+}
+
+/// Owner-only impact preview for deleting one Workspace.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct WorkspaceDeletionPreflightResponse {
+    pub workspace_id: String,
+    pub display_name: String,
+    /// Opaque persisted Workspace metadata revision used as a CAS fence.
+    pub expected_revision: String,
+    pub can_delete: bool,
+    pub resources: WorkspaceDeletionResourceCounts,
+    pub blockers: Vec<WorkspaceDeletionBlocker>,
+}
+
+/// Idempotent request to start or resume Workspace deletion.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct WorkspaceDeletionRequest {
+    pub operation_id: String,
+    pub expected_revision: String,
+    pub confirmation: String,
+}
+
+/// Durable deletion operation projection used by request responses and polling.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct WorkspaceDeletionOperationResponse {
+    pub operation_id: String,
+    pub workspace_id: String,
+    pub display_name: String,
+    pub state: WorkspaceDeletionState,
+    pub resources: WorkspaceDeletionResourceCounts,
+    pub child_operation_ids: Vec<String>,
+    pub blockers: Vec<WorkspaceDeletionBlocker>,
+    pub failure_category: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceDeletionBlockerWire {
+    kind: WorkspaceDeletionBlockerKind,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_resource_value")]
+    resource_kind: Option<String>,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_resource_value")]
+    resource_key: Option<String>,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_blocker_message")]
+    message: String,
+}
+
+impl<'de> Deserialize<'de> for WorkspaceDeletionBlocker {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = WorkspaceDeletionBlockerWire::deserialize(deserializer)?;
+        Ok(Self {
+            kind: wire.kind,
+            resource_kind: wire.resource_kind,
+            resource_key: wire.resource_key,
+            message: wire.message,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceDeletionPreflightResponseWire {
+    workspace_id: String,
+    display_name: String,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_revision")]
+    expected_revision: String,
+    can_delete: bool,
+    resources: WorkspaceDeletionResourceCounts,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_blockers")]
+    blockers: Vec<WorkspaceDeletionBlocker>,
+}
+
+impl<'de> Deserialize<'de> for WorkspaceDeletionPreflightResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = WorkspaceDeletionPreflightResponseWire::deserialize(deserializer)?;
+        Ok(Self {
+            workspace_id: wire.workspace_id,
+            display_name: wire.display_name,
+            expected_revision: wire.expected_revision,
+            can_delete: wire.can_delete,
+            resources: wire.resources,
+            blockers: wire.blockers,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceDeletionRequestWire {
+    #[serde(deserialize_with = "deserialize_workspace_deletion_operation_id")]
+    operation_id: String,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_revision")]
+    expected_revision: String,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_confirmation")]
+    confirmation: String,
+}
+
+impl<'de> Deserialize<'de> for WorkspaceDeletionRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = WorkspaceDeletionRequestWire::deserialize(deserializer)?;
+        Ok(Self {
+            operation_id: wire.operation_id,
+            expected_revision: wire.expected_revision,
+            confirmation: wire.confirmation,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceDeletionOperationResponseWire {
+    #[serde(deserialize_with = "deserialize_workspace_deletion_operation_id")]
+    operation_id: String,
+    workspace_id: String,
+    display_name: String,
+    state: WorkspaceDeletionState,
+    resources: WorkspaceDeletionResourceCounts,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_child_operation_ids")]
+    child_operation_ids: Vec<String>,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_blockers")]
+    blockers: Vec<WorkspaceDeletionBlocker>,
+    failure_category: Option<String>,
+    created_at: String,
+    updated_at: String,
+    completed_at: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for WorkspaceDeletionOperationResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = WorkspaceDeletionOperationResponseWire::deserialize(deserializer)?;
+        Ok(Self {
+            operation_id: wire.operation_id,
+            workspace_id: wire.workspace_id,
+            display_name: wire.display_name,
+            state: wire.state,
+            resources: wire.resources,
+            child_operation_ids: wire.child_operation_ids,
+            blockers: wire.blockers,
+            failure_category: wire.failure_category,
+            created_at: wire.created_at,
+            updated_at: wire.updated_at,
+            completed_at: wire.completed_at,
+        })
+    }
 }
 
 /// Read-only Profile catalog projected from one active Workspace config revision.
@@ -1135,6 +1472,7 @@ pub struct ObjectiveLinkTicketRequest {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeSourceKind {
     EmbeddedWorkerRuntime,
@@ -1142,6 +1480,7 @@ pub enum RuntimeSourceKind {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeSourceStatus {
     Active,
@@ -1149,6 +1488,7 @@ pub enum RuntimeSourceStatus {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeIdentityAuthority {
     RuntimeRegistryProjection,
@@ -1156,6 +1496,8 @@ pub enum RuntimeIdentityAuthority {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeSourceSummary {
     pub kind: RuntimeSourceKind,
     pub status: RuntimeSourceStatus,
@@ -1164,6 +1506,7 @@ pub struct RuntimeSourceSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct RuntimeSummary {
     pub runtime_id: String,
     pub label: String,
@@ -1180,6 +1523,8 @@ pub struct RuntimeSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeManagementSummary {
     pub built_in: bool,
     pub config_managed: bool,
@@ -1189,10 +1534,122 @@ pub struct RuntimeManagementSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkspaceRuntimeResource {
     #[serde(flatten)]
     pub runtime: RuntimeSummary,
     pub management: RuntimeManagementSummary,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeTrustKeyStatus {
+    Unconfigured,
+    Active,
+    Revoked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeTrustKeyState {
+    pub status: RuntimeTrustKeyStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
+    pub revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeTrustAuditAction {
+    Created,
+    Replaced,
+    Reactivated,
+    Revoked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeTrustAuditEntry {
+    pub action: RuntimeTrustAuditAction,
+    pub actor_account_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_fingerprint: Option<String>,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub revision: u64,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRuntimeDetail {
+    pub workspace_id: String,
+    pub runtime: WorkspaceRuntimeResource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    pub trust_key: RuntimeTrustKeyState,
+    #[serde(default)]
+    pub recent_audit: Vec<RuntimeTrustAuditEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeTrustKeyRevealResponse {
+    pub public_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PutRuntimeTrustKeyRequest {
+    pub public_key: String,
+    #[serde(default)]
+    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
+    pub expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RevokeRuntimeTrustKeyRequest {
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub expected_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeTrustConflictKind {
+    StaleRevision,
+    FingerprintInUse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeTrustConflictResponse {
+    pub error: RuntimeTrustConflictKind,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub current_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1205,16 +1662,39 @@ pub struct CreateRemoteRuntimeRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeConnectionTestStatus {
+    Compatible,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeConnectionTestFailureKind {
+    Authentication,
+    Authorization,
+    NetworkUnreachable,
+    Timeout,
+    TlsOrTransport,
+    MalformedResponse,
+    ProtocolVersionMismatch,
+    RuntimeIdentityMismatch,
+    Configuration,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConnectionTestResponse {
     pub workspace_id: String,
     pub runtime_id: String,
     pub checked_at: String,
-    pub state: String,
-    pub protocol_version: Option<String>,
-    pub compatibility_basis: String,
-    #[serde(default)]
-    pub capabilities: Vec<String>,
-    pub health_result: String,
+    pub status: RuntimeConnectionTestStatus,
+    pub failure_kind: Option<RuntimeConnectionTestFailureKind>,
+    pub expected_protocol_version: u32,
+    pub actual_protocol_version: Option<u32>,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -1424,7 +1904,12 @@ pub struct WorkerSummary {
     #[serde(default)]
     pub tags: Vec<String>,
     pub workspace: WorkerWorkspaceSummary,
+    /// Runtime catalog lifecycle compatibility state. Live foreground state, when
+    /// available, is carried separately in `worker_state`.
     pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub worker_state: Option<protocol::WorkerStateSnapshot>,
     pub last_seen_at: Option<String>,
     #[serde(default)]
     pub pinned: bool,
@@ -2348,6 +2833,13 @@ pub fn catalog_typescript() -> String {
         WorkspaceCreateResponse::decl(&config),
         WorkspaceAuthConfig::decl(&config),
         WorkspacePermissionSummary::decl(&config),
+        WorkspaceDeletionState::decl(&config),
+        WorkspaceDeletionBlockerKind::decl(&config),
+        WorkspaceDeletionBlocker::decl(&config),
+        WorkspaceDeletionResourceCounts::decl(&config),
+        WorkspaceDeletionPreflightResponse::decl(&config),
+        WorkspaceDeletionRequest::decl(&config),
+        WorkspaceDeletionOperationResponse::decl(&config),
         DiagnosticSeverity::decl(&config),
         Diagnostic::decl(&config),
         WorkspaceExtensionPointState::decl(&config),
@@ -2371,6 +2863,26 @@ pub fn catalog_typescript() -> String {
         RepositoryListResponse::decl(&config),
         RepositoryDetailResponse::decl(&config),
         RepositoryLogResponse::decl(&config),
+        RuntimeSourceKind::decl(&config),
+        RuntimeSourceStatus::decl(&config),
+        RuntimeIdentityAuthority::decl(&config),
+        RuntimeSourceSummary::decl(&config),
+        RuntimeSummary::decl(&config),
+        RuntimeManagementSummary::decl(&config),
+        WorkspaceRuntimeResource::decl(&config),
+        RuntimeTrustKeyStatus::decl(&config),
+        RuntimeTrustKeyState::decl(&config),
+        RuntimeTrustAuditAction::decl(&config),
+        RuntimeTrustAuditEntry::decl(&config),
+        WorkspaceRuntimeDetail::decl(&config),
+        RuntimeTrustKeyRevealResponse::decl(&config),
+        PutRuntimeTrustKeyRequest::decl(&config),
+        RevokeRuntimeTrustKeyRequest::decl(&config),
+        RuntimeTrustConflictKind::decl(&config),
+        RuntimeTrustConflictResponse::decl(&config),
+        RuntimeConnectionTestStatus::decl(&config),
+        RuntimeConnectionTestFailureKind::decl(&config),
+        RuntimeConnectionTestResponse::decl(&config),
     ]
     .map(|declaration| format!("export {declaration}"));
 
@@ -2982,6 +3494,81 @@ mod tests {
     }
 
     #[test]
+    fn workspace_deletion_wire_contract_is_closed_and_typed() {
+        let preflight = WorkspaceDeletionPreflightResponse {
+            workspace_id: "workspace-test".to_string(),
+            display_name: "Test".to_string(),
+            expected_revision: "revision-7".to_string(),
+            can_delete: true,
+            resources: WorkspaceDeletionResourceCounts {
+                workers: 2,
+                workdirs: 1,
+                repositories: 1,
+                runtime_bindings: 1,
+                secrets: 0,
+                artifacts: 3,
+            },
+            blockers: Vec::new(),
+        };
+        let value = serde_json::to_value(&preflight).unwrap();
+        assert_eq!(
+            serde_json::from_value::<WorkspaceDeletionPreflightResponse>(value.clone()).unwrap(),
+            preflight
+        );
+        let mut stale = value.as_object().unwrap().clone();
+        stale.insert("revision".to_string(), serde_json::json!(7));
+        assert!(
+            serde_json::from_value::<WorkspaceDeletionPreflightResponse>(stale.into()).is_err()
+        );
+
+        assert!(
+            serde_json::from_value::<WorkspaceDeletionRequest>(serde_json::json!({
+                "operation_id": "delete-test",
+                "expected_revision": "revision-7",
+                "confirmation": "Test",
+                "workspace_id": "caller-controlled"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<WorkspaceDeletionRequest>(serde_json::json!({
+                "operation_id": "x".repeat(WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES + 1),
+                "expected_revision": "revision-7",
+                "confirmation": "Test"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<WorkspaceDeletionOperationResponse>(serde_json::json!({
+                "operation_id": "delete-test",
+                "workspace_id": "workspace-test",
+                "display_name": "Test",
+                "state": "blocked",
+                "resources": {
+                    "workers": 0,
+                    "workdirs": 0,
+                    "repositories": 0,
+                    "runtime_bindings": 0,
+                    "secrets": 0,
+                    "artifacts": 0
+                },
+                "child_operation_ids": [],
+                "blockers": (0..=WORKSPACE_DELETION_MAX_BLOCKERS).map(|_| serde_json::json!({
+                    "kind": "cleanup_unavailable",
+                    "resource_kind": null,
+                    "resource_key": null,
+                    "message": "blocked"
+                })).collect::<Vec<_>>(),
+                "failure_category": null,
+                "created_at": "1",
+                "updated_at": "1",
+                "completed_at": null
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn workspace_and_repository_response_shapes_round_trip() {
         let workspace = serde_json::json!({
             "workspace_id": "workspace-test",
@@ -2996,7 +3583,9 @@ mod tests {
             }},
             "permissions": {
                 "manage_repositories": true,
-                "manage_secrets": true
+                "manage_secrets": true,
+                "manage_runtimes": true,
+                "delete_workspace": true
             },
             "extension_points": {
                 "store": "sqlite",
@@ -3060,6 +3649,102 @@ mod tests {
         assert!(serde_json::from_value::<RepositoryListResponse>(stale).is_err());
     }
 
+    #[test]
+    fn runtime_detail_and_trust_mutations_are_closed_and_typed() {
+        let detail = serde_json::json!({
+            "workspace_id": "workspace-test",
+            "runtime": {
+                "runtime_id": "runtime-test",
+                "label": "Runtime Test",
+                "kind": "remote_http",
+                "status": "active",
+                "source": {
+                    "kind": "remote_http",
+                    "status": "active",
+                    "identity_authority": "runtime_registry_projection",
+                    "note": "active"
+                },
+                "host_ids": [],
+                "worker_creation_available": true,
+                "os": "linux",
+                "arch": "x86_64",
+                "diagnostics": [],
+                "management": {
+                    "built_in": false,
+                    "config_managed": true,
+                    "removable": true,
+                    "endpoint_configured": true,
+                    "token_ref_configured": false
+                }
+            },
+            "endpoint": "https://runtime.example",
+            "trust_key": {
+                "status": "active",
+                "fingerprint": "SHA256:test",
+                "revision": 2,
+                "created_at": "2026-09-01T12:00:00Z",
+                "updated_at": "2026-09-01T13:00:00Z"
+            },
+            "recent_audit": [{
+                "action": "replaced",
+                "actor_account_id": "account-owner",
+                "old_fingerprint": "SHA256:old",
+                "new_fingerprint": "SHA256:test",
+                "revision": 2,
+                "at": "2026-09-01T13:00:00Z"
+            }]
+        });
+        let parsed: WorkspaceRuntimeDetail = serde_json::from_value(detail.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), detail);
+
+        let mut unknown = detail;
+        unknown["trust_key"]["private_key"] = serde_json::json!("forbidden");
+        assert!(serde_json::from_value::<WorkspaceRuntimeDetail>(unknown).is_err());
+        assert!(
+            serde_json::from_value::<RuntimeTrustKeyRevealResponse>(serde_json::json!({
+                "public_key": "yoi-ed25519-pub:v1:key",
+                "private_key": "forbidden"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<PutRuntimeTrustKeyRequest>(serde_json::json!({
+                "public_key": "key",
+                "expected_revision": 1,
+                "replace": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<RevokeRuntimeTrustKeyRequest>(serde_json::json!({
+                "expected_revision": 1,
+                "delete_runtime": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_connection_test_response_is_closed_and_typed() {
+        let compatible = serde_json::json!({
+            "workspace_id": "workspace-test",
+            "runtime_id": "runtime-test",
+            "checked_at": "2026-09-01T12:00:00Z",
+            "status": "compatible",
+            "failure_kind": null,
+            "expected_protocol_version": 1,
+            "actual_protocol_version": 1,
+            "diagnostics": []
+        });
+        let parsed: RuntimeConnectionTestResponse =
+            serde_json::from_value(compatible.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), compatible);
+
+        let mut unknown = compatible;
+        unknown["capabilities"] = serde_json::json!(["shell"]);
+        assert!(serde_json::from_value::<RuntimeConnectionTestResponse>(unknown).is_err());
+    }
+
     #[cfg(feature = "typescript")]
     #[test]
     fn generated_catalog_typescript_keeps_public_wrappers_and_nullability() {
@@ -3080,6 +3765,9 @@ mod tests {
         assert!(output.contains(
             "export type WorkspaceProfileSourceProvenance = \"project_profile_source_tree\""
         ));
+        assert!(output.contains("export type RuntimeConnectionTestResponse ="));
+        assert!(output.contains("status: RuntimeConnectionTestStatus"));
+        assert!(output.contains("failure_kind: RuntimeConnectionTestFailureKind | null"));
         assert!(!output.contains("repository_key: string, display_name"));
     }
 

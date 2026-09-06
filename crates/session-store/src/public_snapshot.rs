@@ -71,7 +71,7 @@ pub fn project_session_snapshot(session_id: SessionId, log: &[LogEntry]) -> Sess
                     entries.push(history_entry(entry, *ts, data));
                 }
             }
-            LogEntry::AnnotatedSystemItem { ts, entry } => entries.push(system_entry(
+            LogEntry::AnnotatedSystemItem { ts, entry, .. } => entries.push(system_entry(
                 &entry.item,
                 entry.metadata.entry_id.0.clone(),
                 *ts,
@@ -100,7 +100,10 @@ pub fn project_session_snapshot(session_id: SessionId, log: &[LogEntry]) -> Sess
         }
     }
 
-    SessionSnapshot { entries }
+    SessionSnapshot {
+        pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+        entries,
+    }
 }
 
 fn extend_history(

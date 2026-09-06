@@ -72,6 +72,41 @@ impl LlmClient for MockClient {
     }
 }
 
+#[derive(Clone)]
+struct BlockingCompactClient {
+    calls: Arc<AtomicUsize>,
+}
+
+impl BlockingCompactClient {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmClient for BlockingCompactClient {
+    fn clone_boxed(&self) -> Box<dyn LlmClient> {
+        Box::new(self.clone())
+    }
+
+    async fn stream(
+        &self,
+        _request: Request,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, ClientError>> + Send>>, ClientError>
+    {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            Ok(Box::pin(futures::stream::iter(
+                single_text_events("seed").into_iter().map(Ok),
+            )))
+        } else {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+    }
+}
+
 fn single_text_events(text: &str) -> Vec<LlmEvent> {
     vec![
         LlmEvent::text_block_start(0),
@@ -156,10 +191,10 @@ target = "./"
 permission = "write"
 "#;
 
-async fn make_worker_with_manifest(
-    manifest_toml: &str,
-    client: MockClient,
-) -> Worker<MockClient, TestStore> {
+async fn make_worker_with_manifest<C>(manifest_toml: &str, client: C) -> Worker<C, TestStore>
+where
+    C: LlmClient + Clone + Send + Sync + 'static,
+{
     let manifest = worker::WorkerManifest::from_toml(manifest_toml).unwrap();
 
     let store_tmp = tempfile::tempdir().unwrap();
@@ -615,11 +650,143 @@ async fn pre_run_compact_failure_broadcasts_start_and_failed() {
 }
 
 #[tokio::test]
+async fn manual_compact_cancel_terminalizes_before_returning_idle() {
+    let worker =
+        make_worker_with_manifest(POST_RUN_MANIFEST_TOML, BlockingCompactClient::new()).await;
+    let runtime_tmp = tempfile::tempdir().unwrap();
+    let bash_output_dir = runtime_tmp.path().join("bash-output");
+    let (handle, shutdown_receiver) =
+        WorkerController::spawn(worker, runtime_tmp.path(), &bash_output_dir)
+            .await
+            .unwrap();
+    let mut rx = handle.subscribe();
+
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "seed history",
+        ))
+        .await
+        .expect("send seed run");
+    loop {
+        if matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timeout waiting for seed run")
+                .expect("event"),
+            Event::RunEnd {
+                result: RunResult::Finished
+            }
+        ) {
+            break;
+        }
+    }
+
+    let compact = protocol::WorkerCommandEnvelope::for_snapshot(1, &handle.shared_state.snapshot());
+    handle
+        .send(Method::Compact { command: compact })
+        .await
+        .expect("send compact");
+    loop {
+        if matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timeout waiting for compact start")
+                .expect("event"),
+            Event::CompactStart { .. }
+        ) {
+            break;
+        }
+    }
+
+    let cancel = protocol::WorkerCommandEnvelope::for_snapshot(2, &handle.shared_state.snapshot());
+    handle
+        .send(Method::Cancel { command: cancel })
+        .await
+        .expect("send compact cancel");
+    let mut saw_interrupted = false;
+    let mut saw_idle = false;
+    while !(saw_interrupted && saw_idle) {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for compact cancellation")
+            .expect("event")
+        {
+            Event::CompactFailed { lifecycle }
+                if lifecycle.state == protocol::CompactionLifecycleState::Interrupted =>
+            {
+                saw_interrupted = true;
+            }
+            Event::WorkerState { snapshot }
+                if snapshot.catalog_status() == protocol::WorkerStatus::Idle =>
+            {
+                assert!(
+                    saw_interrupted,
+                    "Idle must follow durable Interrupted evidence"
+                );
+                saw_idle = true;
+            }
+            _ => {}
+        }
+    }
+
+    let compact = protocol::WorkerCommandEnvelope::for_snapshot(3, &handle.shared_state.snapshot());
+    handle
+        .send(Method::Compact { command: compact })
+        .await
+        .expect("send second compact");
+    loop {
+        if matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timeout waiting for second compact start")
+                .expect("event"),
+            Event::CompactStart { .. }
+        ) {
+            break;
+        }
+    }
+    let shutdown =
+        protocol::WorkerCommandEnvelope::for_snapshot(4, &handle.shared_state.snapshot());
+    handle
+        .send(Method::Shutdown { command: shutdown })
+        .await
+        .expect("send shutdown during compact");
+    let mut interrupted_before_shutdown = false;
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for shutdown")
+            .expect("event")
+        {
+            Event::CompactFailed { lifecycle }
+                if lifecycle.state == protocol::CompactionLifecycleState::Interrupted =>
+            {
+                interrupted_before_shutdown = true;
+            }
+            Event::Shutdown => {
+                assert!(
+                    interrupted_before_shutdown,
+                    "shutdown must await terminal compaction evidence"
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), shutdown_receiver)
+        .await
+        .expect("controller shutdown timeout")
+        .expect("shutdown confirmation");
+}
+
+#[tokio::test]
 async fn controller_compact_method_emits_start_and_done() {
     let client = MockClient::new(vec![
         text_events_with_usage("hi", 1000),
         write_summary_tool_use_events("manual-summary", "manual compact summary"),
         single_text_events("done"),
+        single_text_events("follow-up"),
     ]);
     let worker = make_worker_with_manifest(POST_RUN_MANIFEST_TOML, client).await;
     let runtime_tmp = tempfile::tempdir().unwrap();
@@ -630,7 +797,10 @@ async fn controller_compact_method_emits_start_and_done() {
     let mut rx = handle.subscribe();
 
     handle
-        .send(Method::run_text("seed history"))
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "seed history",
+        ))
         .await
         .expect("send run");
     loop {
@@ -646,7 +816,11 @@ async fn controller_compact_method_emits_start_and_done() {
         }
     }
 
-    handle.send(Method::Compact).await.expect("send compact");
+    let command = protocol::WorkerCommandEnvelope::for_snapshot(1, &handle.shared_state.snapshot());
+    handle
+        .send(Method::Compact { command })
+        .await
+        .expect("send compact");
     let mut saw_start = false;
     loop {
         match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
@@ -667,5 +841,30 @@ async fn controller_compact_method_emits_start_and_done() {
     }
 
     assert!(saw_start, "manual compact should emit CompactStart");
-    let _ = handle.send(Method::Shutdown).await;
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "run after compact",
+        ))
+        .await
+        .expect("send follow-up run");
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for follow-up run")
+            .expect("event")
+        {
+            Event::RunEnd {
+                result: RunResult::Finished,
+            } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        handle.shared_state.catalog_status(),
+        protocol::WorkerStatus::Idle,
+        "successful manual compaction must release the execution fence"
+    );
+    let command = protocol::WorkerCommandEnvelope::for_snapshot(2, &handle.shared_state.snapshot());
+    let _ = handle.send(Method::Shutdown { command }).await;
 }

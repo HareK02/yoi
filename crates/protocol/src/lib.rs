@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 
 pub use identity::{WorkerId, WorkerIdParseError};
 
+/// Allocate an opaque idempotency key for one client Submit request.
+pub fn new_submission_request_id() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -27,21 +32,264 @@ fn is_false(value: &bool) -> bool {
 // Method (Client → Worker via Unix Socket)
 // ---------------------------------------------------------------------------
 
+/// Trusted Server → Runtime transport header carrying the authenticated
+/// browser Account identity for one Worker protocol connection.
+///
+/// Runtime accepts this only after its normal HTTP authentication succeeds;
+/// serialized [`Method`] payloads cannot set authenticated source identity.
+pub const AUTHENTICATED_ACCOUNT_ID_HEADER: &str = "x-yoi-authenticated-account-id";
+
+/// Trusted source identity attached by an authenticated transport boundary.
+///
+/// Public clients cannot select this value directly. Runtime/Backend adapters
+/// stamp it before forwarding an accepted Submit or Notify to a Worker.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuthenticatedInputSource {
+    /// Assigned whenever a serialized tracked method crosses an untrusted
+    /// protocol boundary. Receivers must handle it exactly like public input.
+    UntrustedWire,
+    Account {
+        account_id: String,
+    },
+    Worker {
+        runtime_id: String,
+        worker_id: String,
+    },
+    SubWorker {
+        session_id: String,
+    },
+    Backend {
+        operation_id: String,
+    },
+}
+
+impl Default for AuthenticatedInputSource {
+    fn default() -> Self {
+        Self::UntrustedWire
+    }
+}
+
+impl AuthenticatedInputSource {
+    pub fn namespace(&self) -> String {
+        match self {
+            Self::UntrustedWire => "untrusted-wire".into(),
+            Self::Account { account_id } => format!("account:{account_id}"),
+            Self::Worker {
+                runtime_id,
+                worker_id,
+            } => format!("worker:{runtime_id}:{worker_id}"),
+            Self::SubWorker { session_id } => format!("sub_worker:{session_id}"),
+            Self::Backend { operation_id } => format!("backend:{operation_id}"),
+        }
+    }
+}
+
+/// Immutable identity and revision fence for one state-changing Worker command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct WorkerCommandEnvelope {
+    /// Caller-owned sequence. A controller accepts command ids in strictly
+    /// increasing order for one execution generation.
+    pub command_id: u64,
+    pub expected_execution_generation: u64,
+    pub expected_worker_state_revision: u64,
+}
+
+impl WorkerCommandEnvelope {
+    pub fn for_snapshot(command_id: u64, snapshot: &WorkerStateSnapshot) -> Self {
+        Self {
+            command_id,
+            expected_execution_generation: snapshot.execution_generation,
+            expected_worker_state_revision: snapshot.revision,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerCommandKind {
+    Resume,
+    Cancel,
+    Pause,
+    Compact,
+    Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerCommandDisposition {
+    Accepted,
+    StaleExecutionGeneration,
+    StaleWorkerStateRevision,
+    StaleCommandId,
+    Conflict,
+    InvalidState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct WorkerCommandAcknowledgement {
+    pub command_id: u64,
+    pub command: WorkerCommandKind,
+    pub disposition: WorkerCommandDisposition,
+    /// The complete authoritative state observed after command admission.
+    pub state: WorkerStateSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", content = "state", rename_all = "snake_case")]
+pub enum WorkerState {
+    Idle,
+    Busy(WorkerBusyState),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", content = "state", rename_all = "snake_case")]
+pub enum WorkerBusyState {
+    Run(WorkerRunState),
+    Maintenance(WorkerMaintenanceState),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRunState {
+    Running,
+    Pausing,
+    Paused,
+    Cancelling,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerMaintenanceState {
+    Compacting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct WorkerStateSnapshot {
+    pub execution_generation: u64,
+    pub revision: u64,
+    /// Highest lifecycle command id observed by this controller generation.
+    pub last_command_id: u64,
+    pub state: WorkerState,
+}
+
+impl WorkerStateSnapshot {
+    pub fn initial(execution_generation: u64) -> Self {
+        Self {
+            execution_generation,
+            revision: 0,
+            last_command_id: 0,
+            state: WorkerState::Idle,
+        }
+    }
+
+    /// Compatibility projection for Runtime catalog lifecycle. This value is
+    /// never command-admission authority and cannot produce `Stopped`.
+    pub fn catalog_status(&self) -> WorkerStatus {
+        match self.state {
+            WorkerState::Idle => WorkerStatus::Idle,
+            WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Paused)) => WorkerStatus::Paused,
+            WorkerState::Busy(WorkerBusyState::Run(_))
+            | WorkerState::Busy(WorkerBusyState::Maintenance(_)) => WorkerStatus::Running,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerStateSnapshotApply {
+    Applied,
+    Duplicate,
+    Stale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerStateSnapshotConflict {
+    pub execution_generation: u64,
+    pub revision: u64,
+}
+
+impl std::fmt::Display for WorkerStateSnapshotConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "conflicting worker state snapshots at generation {} revision {}",
+            self.execution_generation, self.revision
+        )
+    }
+}
+
+impl std::error::Error for WorkerStateSnapshotConflict {}
+
+pub fn apply_worker_state_snapshot(
+    current: &mut WorkerStateSnapshot,
+    incoming: &WorkerStateSnapshot,
+) -> Result<WorkerStateSnapshotApply, WorkerStateSnapshotConflict> {
+    use std::cmp::Ordering;
+
+    let ordering = (incoming.execution_generation, incoming.revision)
+        .cmp(&(current.execution_generation, current.revision));
+    match ordering {
+        Ordering::Greater => {
+            *current = incoming.clone();
+            Ok(WorkerStateSnapshotApply::Applied)
+        }
+        Ordering::Less => Ok(WorkerStateSnapshotApply::Stale),
+        Ordering::Equal if incoming == current => Ok(WorkerStateSnapshotApply::Duplicate),
+        Ordering::Equal => Err(WorkerStateSnapshotConflict {
+            execution_generation: incoming.execution_generation,
+            revision: incoming.revision,
+        }),
+    }
+}
+
+impl From<WorkerStatus> for WorkerStateSnapshot {
+    fn from(status: WorkerStatus) -> Self {
+        let state = match status {
+            WorkerStatus::Idle | WorkerStatus::Stopped => WorkerState::Idle,
+            WorkerStatus::Running => {
+                WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running))
+            }
+            WorkerStatus::Paused => WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Paused)),
+        };
+        Self {
+            execution_generation: 1,
+            revision: 0,
+            last_command_id: 0,
+            state,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Method {
-    Run {
+    /// Durably accept typed input for immediate activation or the session FIFO.
+    ///
+    /// `submission_request_id` is generated by the authenticated caller and is
+    /// used only for idempotent retry. Worker allocates the durable
+    /// `submission_id` returned by [`Event::SubmissionAccepted`].
+    Submit {
+        submission_request_id: String,
         input: Vec<Segment>,
     },
-    /// Runtime-internal Run carrying an opaque correlation id that is committed
-    /// with the resulting UserInput entry. This variant is not serializable on
-    /// the public Client → Worker protocol.
-    #[serde(skip)]
+    /// Authenticated transport form of Submit. Trusted adapters replace
+    /// public Submit before forwarding it to the Worker.
     #[cfg_attr(feature = "typescript", ts(skip))]
-    RunTracked {
+    SubmitTracked {
+        submission_request_id: String,
         input: Vec<Segment>,
-        submission_id: String,
+        #[serde(skip_deserializing, default)]
+        source: AuthenticatedInputSource,
     },
     /// Human-readable text injected into the target Worker's LLM context
     /// as a non-blocking system message. `auto_run` controls whether an
@@ -50,26 +298,63 @@ pub enum Method {
     /// No side effects beyond LLM context; use `WorkerEvent` for typed
     /// lifecycle reports.
     Notify {
+        notification_request_id: String,
         message: String,
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         auto_run: bool,
     },
+    /// Authenticated transport form of Notify.
+    #[cfg_attr(feature = "typescript", ts(skip))]
+    NotifyTracked {
+        notification_request_id: String,
+        message: String,
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        auto_run: bool,
+        #[serde(skip_deserializing, default)]
+        source: AuthenticatedInputSource,
+    },
     /// Typed lifecycle report from a child Worker to its direct parent.
     WorkerEvent(WorkerEvent),
-    Resume,
-    Cancel,
+    /// Return the authoritative FIFO summary without exposing queued payloads.
+    ListPendingSubmissions,
+    /// Remove one queued submission. Running or already activated submissions
+    /// are immutable and therefore cannot be cancelled here.
+    CancelPendingSubmission {
+        submission_id: String,
+        expected_revision: u64,
+    },
+    /// Remove every queued submission while preserving the active run.
+    ClearPendingSubmissions {
+        expected_revision: u64,
+    },
+    /// Activate the next queued submission while the Worker is idle. This is an
+    /// explicit recovery operation and never resumes a paused run implicitly.
+    ContinuePending {
+        expected_revision: u64,
+        expected_head_id: String,
+    },
+    Resume {
+        command: WorkerCommandEnvelope,
+    },
+    Cancel {
+        command: WorkerCommandEnvelope,
+    },
     /// Stop the in-flight turn and transition to `Paused`.
     ///
     /// Unlike `Cancel` (which discards and returns to `Idle`), a paused
-    /// Worker can resume the interrupted work via `Resume`, or start a
-    /// fresh turn via `Run` (orphan `tool_use` items are closed with a
+    /// Worker can resume the interrupted work via `Resume`, or accept a
+    /// fresh `Submit` (orphan `tool_use` items are closed with a
     /// synthetic tool result before the new user message is appended).
-    Pause,
+    Pause {
+        command: WorkerCommandEnvelope,
+    },
     /// Request an explicit compaction while the Worker is otherwise idle.
     ///
     /// This is a typed control method: clients must not send `compact` as a
-    /// `Method::Run` user message.
-    Compact,
+    /// `Method::Submit` user message.
+    Compact {
+        command: WorkerCommandEnvelope,
+    },
     /// Ask the Worker to list valid rewind targets from its authoritative session log.
     ListRewindTargets,
     /// Truncate the current session back to the selected rewind target and
@@ -78,7 +363,9 @@ pub enum Method {
         target: RewindTargetId,
         expected_head_entries: usize,
     },
-    Shutdown,
+    Shutdown {
+        command: WorkerCommandEnvelope,
+    },
     /// Request a list of completion candidates from the Worker.
     ///
     /// Reply is sent on the same socket as `Event::Completions` (not
@@ -181,7 +468,7 @@ impl WorkerEvent {
 
 /// One typed piece of a user submission.
 ///
-/// `Method::Run` and `Event::UserMessage` carry `Vec<Segment>`. Dumb
+/// `Method::Submit` and `Event::UserMessage` carry `Vec<Segment>`. Dumb
 /// clients (CLI piping, scripts) only need to produce a single
 /// `Segment::Text`; richer clients (TUI / GUI) construct typed atoms
 /// (paste chips, file refs) and
@@ -404,12 +691,13 @@ impl Segment {
 }
 
 impl Method {
-    /// Convenience: a `Run` carrying a single `Segment::Text`.
+    /// Convenience: a `Submit` carrying a single `Segment::Text`.
     /// Used by dumb clients, inter-Worker tools, and tests that only have
     /// a string to forward.
-    pub fn run_text(s: impl Into<String>) -> Self {
-        Self::Run {
-            input: vec![Segment::text(s)],
+    pub fn submit_text(submission_request_id: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::Submit {
+            submission_request_id: submission_request_id.into(),
+            input: vec![Segment::text(text)],
         }
     }
 }
@@ -503,6 +791,39 @@ pub enum ToolResultDisposition {
     OutcomeUnknown,
 }
 
+/// Durable acceptance result for one idempotent Submit request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum SubmissionDisposition {
+    Started,
+    Queued,
+}
+
+/// Bounded public projection of one pending submission. Payload segments and
+/// provenance remain in the session log and are intentionally not exposed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct PendingSubmissionSummary {
+    pub submission_id: String,
+    pub accepted_at_ms: u64,
+    pub segment_count: u32,
+    pub byte_len: u64,
+}
+
+/// Revisioned session-owned FIFO projection used by snapshots and live events.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct PendingSubmissionsSnapshot {
+    pub revision: u64,
+    #[serde(default)]
+    pub notification_count: u32,
+    #[serde(default)]
+    pub head_id: Option<String>,
+    #[serde(default)]
+    pub submissions: Vec<PendingSubmissionSummary>,
+}
+
 /// Canonical, storage-independent projection of committed session history.
 ///
 /// Worker protocols expose this DTO instead of append-log records. New
@@ -511,6 +832,8 @@ pub enum ToolResultDisposition {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct SessionSnapshot {
+    #[serde(default)]
+    pub pending_submissions: PendingSubmissionsSnapshot,
     pub entries: Vec<SessionSnapshotEntry>,
 }
 
@@ -609,16 +932,27 @@ pub struct SessionToolAttachment {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum Event {
-    /// A user input message was accepted, persisted as
-    /// `LogEntry::AnnotatedUserInput`, and is about to start a new turn.
-    /// Broadcast to every subscribed client so TUI / GUI instances show
-    /// the same user line that reconnect snapshots would replay from
-    /// history; clients must not synthesize a separate pending/fake
-    /// message for accepted runs.
-    ///
-    /// Fires exactly once per committed user input, after
-    /// `InvokeStart { kind: UserSend }` and before the first
-    /// `TurnStart`. Rejected runs (e.g. `AlreadyRunning`) do not emit.
+    /// Durable Submit acceptance. A `Started` receipt follows the atomic
+    /// UserInput commit; a `Queued` receipt follows the durable FIFO checkpoint.
+    /// Repeating the same request id and exact payload returns the same receipt
+    /// without appending or activating twice.
+    SubmissionAccepted {
+        submission_request_id: String,
+        submission_id: String,
+        disposition: SubmissionDisposition,
+    },
+    /// Correlated rejection before durable acceptance.
+    SubmissionRejected {
+        submission_request_id: String,
+        message: String,
+    },
+    /// Revisioned FIFO replacement following enqueue, activation, cancel, or clear.
+    PendingSubmissionsChanged {
+        pending: PendingSubmissionsSnapshot,
+    },
+    /// A user input message persisted as `LogEntry::AnnotatedUserInput` and
+    /// activated for a turn. Broadcast to every subscribed client so TUI / GUI
+    /// instances show the same user line that reconnect snapshots replay.
     UserMessage {
         segments: Vec<Segment>,
     },
@@ -641,7 +975,7 @@ pub enum Event {
     ///
     /// Marker event for the start of an Invoke range; the range extends
     /// implicitly until the next `InvokeStart`. Fires for every accepted
-    /// `Method::Run` (kind=`UserSend`), `Method::Notify` (kind=`Notify`),
+    /// `Method::Submit` (kind=`UserSend`), `Method::Notify` (kind=`Notify`),
     /// `Method::WorkerEvent` re-injection (kind=`WorkerEvent`), and any other
     /// IDLE-breaking trigger. Mid-run interrupts (e.g. hook output,
     /// typed system reminder insertion that doesn't break IDLE) do not
@@ -798,8 +1132,9 @@ pub enum Event {
     Snapshot {
         session: SessionSnapshot,
         greeting: Greeting,
-        #[serde(default)]
-        status: WorkerStatus,
+        /// Full revisioned live execution state. `Stopped` remains Runtime
+        /// catalog authority and is deliberately not represented here.
+        state: WorkerStateSnapshot,
         /// Unfinished model output that has already streamed in the current
         /// run but is not yet represented by committed snapshot entries.
         #[serde(default, skip_serializing_if = "InFlightSnapshot::is_empty")]
@@ -836,8 +1171,11 @@ pub enum Event {
     },
     /// Current Worker controller status. Broadcast on every controller-level
     /// transition and included in `History` snapshots for late attach.
-    Status {
-        status: WorkerStatus,
+    WorkerState {
+        snapshot: WorkerStateSnapshot,
+    },
+    CommandAcknowledged {
+        acknowledgement: WorkerCommandAcknowledgement,
     },
     /// Bounded, provider-owned command telemetry for the live Console. This is
     /// intentionally not a history entry and is reconstructed from
@@ -1193,7 +1531,7 @@ pub enum TurnResult {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum InvokeKind {
-    /// `Method::Run` — a user submission.
+    /// `Method::Submit` — a user submission.
     UserSend,
     /// `Method::Notify` — free-text notification injected into history.
     Notify,
@@ -1216,7 +1554,7 @@ pub enum RunResult {
     Finished,
     Paused,
     LimitReached,
-    /// The accepted Method::Run produced no assistant/tool output before
+    /// The accepted Method::Submit produced no assistant/tool output before
     /// user interruption, so the Worker rolled the submit-time turn state back
     /// to its pre-submit snapshot. Clients should treat the Worker as Idle and
     /// restore the just-submitted input into the editable composer if desired.
@@ -1285,26 +1623,82 @@ mod tests {
     use super::*;
 
     #[test]
-    fn method_run_json_roundtrip() {
-        let json = r#"{"method":"run","params":{"input":[{"kind":"text","content":"Hello"}]}}"#;
+    fn worker_state_snapshot_apply_is_monotonic_and_detects_conflicts() {
+        let mut current = WorkerStateSnapshot::initial(4);
+        let mut newer = current.clone();
+        newer.revision = 1;
+        newer.state = WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running));
+
+        assert_eq!(
+            apply_worker_state_snapshot(&mut current, &newer),
+            Ok(WorkerStateSnapshotApply::Applied)
+        );
+        assert_eq!(
+            apply_worker_state_snapshot(&mut current, &newer),
+            Ok(WorkerStateSnapshotApply::Duplicate)
+        );
+
+        let stale_revision = WorkerStateSnapshot::initial(4);
+        assert_eq!(
+            apply_worker_state_snapshot(&mut current, &stale_revision),
+            Ok(WorkerStateSnapshotApply::Stale)
+        );
+        let stale_generation = WorkerStateSnapshot {
+            execution_generation: 3,
+            revision: u64::MAX,
+            ..newer.clone()
+        };
+        assert_eq!(
+            apply_worker_state_snapshot(&mut current, &stale_generation),
+            Ok(WorkerStateSnapshotApply::Stale)
+        );
+
+        let conflicting = WorkerStateSnapshot {
+            state: WorkerState::Idle,
+            ..newer.clone()
+        };
+        assert_eq!(
+            apply_worker_state_snapshot(&mut current, &conflicting),
+            Err(WorkerStateSnapshotConflict {
+                execution_generation: 4,
+                revision: 1,
+            })
+        );
+        assert_eq!(current, newer);
+
+        let next_generation = WorkerStateSnapshot::initial(5);
+        assert_eq!(
+            apply_worker_state_snapshot(&mut current, &next_generation),
+            Ok(WorkerStateSnapshotApply::Applied)
+        );
+        assert_eq!(current, next_generation);
+    }
+
+    #[test]
+    fn method_submit_json_roundtrip_and_run_is_rejected() {
+        let json = r#"{"method":"submit","params":{"submission_request_id":"request-1","input":[{"kind":"text","content":"Hello"}]}}"#;
         let method: Method = serde_json::from_str(json).unwrap();
         match &method {
-            Method::Run { input } => {
+            Method::Submit { input, .. } => {
                 assert_eq!(input.len(), 1);
                 match &input[0] {
                     Segment::Text { content } => assert_eq!(content, "Hello"),
                     other => panic!("expected Text, got {other:?}"),
                 }
             }
-            other => panic!("expected Run, got {other:?}"),
+            other => panic!("expected Submit, got {other:?}"),
         }
         let serialized = serde_json::to_string(&method).unwrap();
         assert_eq!(serialized, json);
+        assert!(
+            serde_json::from_str::<Method>(r#"{"method":"run","params":{"input":[]}}"#).is_err()
+        );
     }
 
     #[test]
-    fn method_run_paste_segment_roundtrip() {
-        let method = Method::Run {
+    fn method_submit_paste_segment_roundtrip() {
+        let method = Method::Submit {
+            submission_request_id: "request-1".to_string(),
             input: vec![
                 Segment::text("see "),
                 Segment::Paste {
@@ -1318,7 +1712,7 @@ mod tests {
         let json = serde_json::to_string(&method).unwrap();
         let decoded: Method = serde_json::from_str(&json).unwrap();
         match decoded {
-            Method::Run { input } => {
+            Method::Submit { input, .. } => {
                 assert_eq!(input.len(), 2);
                 match &input[1] {
                     Segment::Paste {
@@ -1335,7 +1729,7 @@ mod tests {
                     other => panic!("expected Paste, got {other:?}"),
                 }
             }
-            other => panic!("expected Run, got {other:?}"),
+            other => panic!("expected Submit, got {other:?}"),
         }
     }
 
@@ -1389,8 +1783,9 @@ mod tests {
     }
 
     #[test]
-    fn method_run_flow_segment_roundtrip() {
-        let method = Method::Run {
+    fn method_submit_flow_segment_roundtrip() {
+        let method = Method::Submit {
+            submission_request_id: "request-1".to_string(),
             input: vec![
                 Segment::Flow {
                     selector: "builtin:coder-review".to_string(),
@@ -1404,7 +1799,7 @@ mod tests {
         let decoded = serde_json::from_str::<Method>(&json).unwrap();
         assert!(matches!(
             decoded,
-            Method::Run { input }
+            Method::Submit { input, .. }
                 if matches!(
                     input.as_slice(),
                     [
@@ -1416,15 +1811,26 @@ mod tests {
     }
 
     #[test]
-    fn runtime_tracked_run_is_not_public_protocol_json() {
-        let method = Method::RunTracked {
+    fn authenticated_submit_replaces_wire_source_with_transport_identity() {
+        let method = Method::SubmitTracked {
             input: vec![Segment::text("private")],
-            submission_id: "submission-1".to_string(),
+            submission_request_id: "request-1".to_string(),
+            source: AuthenticatedInputSource::Account {
+                account_id: "account-1".into(),
+            },
         };
-        assert!(serde_json::to_string(&method).is_err());
+        let json = serde_json::to_string(&method).unwrap();
+        let decoded = serde_json::from_str::<Method>(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            Method::SubmitTracked {
+                source: AuthenticatedInputSource::UntrustedWire,
+                ..
+            }
+        ));
         assert!(
             serde_json::from_str::<Method>(
-                r#"{"method":"run_tracked","input":[],"submission_id":"forged"}"#,
+                r#"{"method":"submit_tracked","input":[],"submission_request_id":"forged"}"#,
             )
             .is_err()
         );
@@ -1442,42 +1848,53 @@ mod tests {
     }
 
     #[test]
-    fn method_run_with_unknown_segment_decodes() {
-        let json = r#"{"method":"run","params":{"input":[{"kind":"text","content":"hi"},{"kind":"future_thing","x":1}]}}"#;
+    fn method_submit_with_unknown_segment_decodes() {
+        let json = r#"{"method":"submit","params":{"submission_request_id":"request-1","input":[{"kind":"text","content":"hi"},{"kind":"future_thing","x":1}]}}"#;
         let method: Method = serde_json::from_str(json).unwrap();
         match method {
-            Method::Run { input } => {
+            Method::Submit { input, .. } => {
                 assert_eq!(input.len(), 2);
                 assert!(matches!(input[0], Segment::Text { .. }));
                 assert!(matches!(input[1], Segment::Unknown));
             }
-            other => panic!("expected Run, got {other:?}"),
+            other => panic!("expected Submit, got {other:?}"),
         }
     }
 
     #[test]
-    fn method_without_params() {
-        let json = r#"{"method":"resume"}"#;
-        let method: Method = serde_json::from_str(json).unwrap();
-        assert!(matches!(method, Method::Resume));
+    fn lifecycle_method_without_command_fails_closed() {
+        let error = serde_json::from_str::<Method>(r#"{"method":"resume"}"#).unwrap_err();
+        assert!(error.to_string().contains("params"));
     }
 
     #[test]
-    fn method_pause_roundtrip() {
-        let json = r#"{"method":"pause"}"#;
-        let method: Method = serde_json::from_str(json).unwrap();
-        assert!(matches!(method, Method::Pause));
-        let serialized = serde_json::to_string(&method).unwrap();
-        assert_eq!(serialized, json);
-    }
-
-    #[test]
-    fn method_compact_roundtrip() {
-        let json = r#"{"method":"compact"}"#;
-        let method: Method = serde_json::from_str(json).unwrap();
-        assert!(matches!(method, Method::Compact));
-        let serialized = serde_json::to_string(&method).unwrap();
-        assert_eq!(serialized, json);
+    fn lifecycle_methods_roundtrip_with_fences() {
+        for method in [
+            Method::Pause {
+                command: WorkerCommandEnvelope {
+                    command_id: 11,
+                    expected_execution_generation: 4,
+                    expected_worker_state_revision: 8,
+                },
+            },
+            Method::Compact {
+                command: WorkerCommandEnvelope {
+                    command_id: 12,
+                    expected_execution_generation: 4,
+                    expected_worker_state_revision: 9,
+                },
+            },
+        ] {
+            let json = serde_json::to_string(&method).unwrap();
+            let decoded: Method = serde_json::from_str(&json).unwrap();
+            match decoded {
+                Method::Pause { command } | Method::Compact { command } => {
+                    assert_eq!(command.expected_execution_generation, 4);
+                    assert!(command.command_id >= 11);
+                }
+                other => panic!("unexpected lifecycle method: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1648,11 +2065,11 @@ mod tests {
 
     #[test]
     fn method_notify_json_roundtrip_defaults_to_auto_run() {
-        let json = r#"{"method":"notify","params":{"message":"turn done"}}"#;
+        let json = r#"{"method":"notify","params":{"notification_request_id":"notification-1","message":"turn done"}}"#;
         let method: Method = serde_json::from_str(json).unwrap();
         assert!(matches!(
             method,
-            Method::Notify { ref message, auto_run: true } if message == "turn done"
+            Method::Notify { ref message, auto_run: true, .. } if message == "turn done"
         ));
         let serialized = serde_json::to_string(&method).unwrap();
         assert_eq!(serialized, json);
@@ -1660,11 +2077,11 @@ mod tests {
 
     #[test]
     fn method_notify_weak_json_roundtrip_serializes_auto_run_false() {
-        let json = r#"{"method":"notify","params":{"message":"progress","auto_run":false}}"#;
+        let json = r#"{"method":"notify","params":{"notification_request_id":"notification-1","message":"progress","auto_run":false}}"#;
         let method: Method = serde_json::from_str(json).unwrap();
         assert!(matches!(
             method,
-            Method::Notify { ref message, auto_run: false } if message == "progress"
+            Method::Notify { ref message, auto_run: false, .. } if message == "progress"
         ));
         assert_eq!(serde_json::to_string(&method).unwrap(), json);
     }
@@ -1725,6 +2142,7 @@ mod tests {
     fn event_snapshot_format() {
         let event = Event::Snapshot {
             session: SessionSnapshot {
+                pending_submissions: PendingSubmissionsSnapshot::default(),
                 entries: vec![SessionSnapshotEntry {
                     entry_id: "entry-1".into(),
                     timestamp: 1,
@@ -1745,7 +2163,7 @@ mod tests {
                 context_window: 200_000,
                 context_tokens: 42_000,
             },
-            status: WorkerStatus::Paused,
+            state: WorkerStatus::Paused.into(),
             in_flight: InFlightSnapshot::default(),
             internal_workers: Vec::new(),
         };
@@ -1762,12 +2180,13 @@ mod tests {
         assert_eq!(parsed["data"]["greeting"]["tools"][0], "Read");
         assert_eq!(parsed["data"]["greeting"]["context_window"], 200_000);
         assert_eq!(parsed["data"]["greeting"]["context_tokens"], 42_000);
-        assert_eq!(parsed["data"]["status"], "paused");
+        assert_eq!(parsed["data"]["state"]["state"]["kind"], "busy");
+        assert_eq!(parsed["data"]["state"]["state"]["state"]["state"], "paused");
     }
 
     #[test]
     fn event_snapshot_in_flight_roundtrip_and_default() {
-        let inbound = r#"{"event":"snapshot","data":{"session":{"entries":[]},"greeting":{"worker_name":"test","cwd":"/tmp","provider":"p","model":"m","scope_summary":"s","tools":[]},"status":"running"}}"#;
+        let inbound = r#"{"event":"snapshot","data":{"session":{"entries":[]},"greeting":{"worker_name":"test","cwd":"/tmp","provider":"p","model":"m","scope_summary":"s","tools":[]},"state":{"execution_generation":1,"revision":1,"last_command_id":0,"state":{"kind":"busy","state":{"kind":"run","state":"running"}}}}}"#;
         let decoded: Event = serde_json::from_str(inbound).unwrap();
         match decoded {
             Event::Snapshot { in_flight, .. } => assert!(in_flight.is_empty()),
@@ -1776,6 +2195,7 @@ mod tests {
 
         let event = Event::Snapshot {
             session: SessionSnapshot {
+                pending_submissions: PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
             greeting: Greeting {
@@ -1788,7 +2208,7 @@ mod tests {
                 context_window: 0,
                 context_tokens: 0,
             },
-            status: WorkerStatus::Running,
+            state: WorkerStatus::Running.into(),
             in_flight: InFlightSnapshot {
                 blocks: vec![
                     InFlightBlock::Text {
@@ -1844,6 +2264,7 @@ mod tests {
     fn event_segment_rotated_roundtrip() {
         let event = Event::SegmentRotated {
             session: SessionSnapshot {
+                pending_submissions: PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
         };
@@ -1875,20 +2296,32 @@ mod tests {
     }
 
     #[test]
-    fn event_status_format() {
-        let event = Event::Status {
-            status: WorkerStatus::Running,
+    fn event_worker_state_format() {
+        let event = Event::WorkerState {
+            snapshot: WorkerStateSnapshot {
+                execution_generation: 7,
+                revision: 3,
+                last_command_id: 9,
+                state: WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running)),
+            },
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["event"], "status");
-        assert_eq!(parsed["data"]["status"], "running");
+        assert_eq!(parsed["event"], "worker_state");
+        assert_eq!(parsed["data"]["snapshot"]["execution_generation"], 7);
+        assert_eq!(parsed["data"]["snapshot"]["revision"], 3);
+        assert_eq!(parsed["data"]["snapshot"]["state"]["kind"], "busy");
 
         let decoded: Event = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             decoded,
-            Event::Status {
-                status: WorkerStatus::Running
+            Event::WorkerState {
+                snapshot: WorkerStateSnapshot {
+                    execution_generation: 7,
+                    revision: 3,
+                    state: WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running)),
+                    ..
+                }
             }
         ));
     }
@@ -1929,19 +2362,10 @@ mod tests {
     }
 
     #[test]
-    fn event_snapshot_without_status_defaults_to_idle() {
+    fn event_snapshot_without_worker_state_fails_closed() {
         let json = r#"{"event":"snapshot","data":{"session":{"entries":[]},"greeting":{"worker_name":"test","cwd":"/tmp","provider":"anthropic","model":"claude","scope_summary":"","tools":[]}}}"#;
-        let decoded: Event = serde_json::from_str(json).unwrap();
-        match decoded {
-            Event::Snapshot {
-                status, greeting, ..
-            } => {
-                assert_eq!(status, WorkerStatus::Idle);
-                assert_eq!(greeting.context_window, 0);
-                assert_eq!(greeting.context_tokens, 0);
-            }
-            other => panic!("expected Snapshot, got {other:?}"),
-        }
+        let error = serde_json::from_str::<Event>(json).unwrap_err();
+        assert!(error.to_string().contains("state"));
     }
 
     #[test]
@@ -2354,7 +2778,12 @@ mod tests {
                     "scope_summary": "scope",
                     "tools": []
                 },
-                "status": "idle"
+                "state": {
+                    "execution_generation": 1,
+                    "revision": 0,
+                    "last_command_id": 0,
+                    "state": { "kind": "idle" }
+                }
             }
         }))
         .unwrap();

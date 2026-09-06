@@ -1,4 +1,4 @@
-import type { Event } from "$lib/generated/protocol";
+import type { Event, WorkerStateSnapshot, WorkerStatus } from "$lib/generated/protocol";
 import {
   type ConsoleEventInput,
   type ConsoleLine,
@@ -18,6 +18,23 @@ import {
 declare const Deno: {
   test(name: string, fn: () => void): void;
 };
+
+function workerState(status: WorkerStatus): WorkerStateSnapshot {
+  return {
+    execution_generation: 1,
+    revision: status === "idle" ? 0 : 1,
+    last_command_id: 0,
+    state: status === "idle"
+      ? { kind: "idle" }
+      : {
+        kind: "busy",
+        state: {
+          kind: "run",
+          state: status === "paused" ? "paused" : "running",
+        },
+      },
+  };
+}
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) {
@@ -131,7 +148,7 @@ function snapshotEvent(cwd: string, entries: unknown[] = []): Event {
         context_window: 100,
         context_tokens: 20,
       },
-      status: "idle",
+      state: workerState("idle"),
       in_flight: { blocks: [] },
     },
   };
@@ -201,6 +218,66 @@ Deno.test("console routing projects live errors but not completion replies", () 
   );
 });
 
+Deno.test("Worker state events and acknowledgements apply monotonically", () => {
+  const projector = createConsoleProjector();
+  const running: WorkerStateSnapshot = {
+    execution_generation: 4,
+    revision: 3,
+    last_command_id: 2,
+    state: { kind: "busy", state: { kind: "run", state: "running" } },
+  };
+  const paused: WorkerStateSnapshot = {
+    ...running,
+    revision: 4,
+    last_command_id: 3,
+    state: { kind: "busy", state: { kind: "run", state: "paused" } },
+  };
+  let projection = projector.append([
+    {
+      eventId: "running",
+      event: { event: "worker_state", data: { snapshot: running } },
+    },
+    {
+      eventId: "stale",
+      event: {
+        event: "worker_state",
+        data: { snapshot: { ...running, revision: 2, state: { kind: "idle" } } },
+      },
+    },
+    {
+      eventId: "pause-ack",
+      event: {
+        event: "command_acknowledged",
+        data: {
+          acknowledgement: {
+            command_id: 3,
+            command: "pause",
+            disposition: "accepted",
+            state: paused,
+          },
+        },
+      },
+    },
+  ]);
+  assertEquals(projection.workerState, paused);
+  assertEquals(projection.status, "paused");
+
+  projection = projector.append([{
+    eventId: "conflict",
+    event: {
+      event: "worker_state",
+      data: { snapshot: { ...paused, state: { kind: "idle" } } },
+    },
+  }]);
+  assertEquals(projection.workerState, paused);
+  assert(
+    projection.lines.some((line) =>
+      line.eventId === "conflict:worker-state-conflict" && line.error
+    ),
+    "conflicting equal-version snapshots must fail closed",
+  );
+});
+
 Deno.test("snapshot replaces a live error with one durable run_errored row", () => {
   const projector = createConsoleProjector();
   let projection = projector.append([
@@ -213,7 +290,7 @@ Deno.test("snapshot replaces a live error with one durable run_errored row", () 
     },
     {
       eventId: "idle-after-error",
-      event: { event: "status", data: { status: "idle" } } satisfies Event,
+      event: { event: "worker_state", data: { snapshot: workerState("idle") } } satisfies Event,
     },
   ]);
 
@@ -653,7 +730,7 @@ Deno.test("projectConsole streams distinct Bash stdout and stderr through termin
 Deno.test("snapshot restores bounded in-flight Bash command output", () => {
   const snapshot = snapshotEvent("/repo");
   if (snapshot.event !== "snapshot") throw new Error("snapshot fixture expected");
-  snapshot.data.status = "running";
+  snapshot.data.state = workerState("running");
   snapshot.data.in_flight = {
     blocks: [{
       kind: "tool_call",
@@ -1403,7 +1480,7 @@ Deno.test("projectConsole hides lifecycle events and renders system items", () =
   const projection = projectConsole([
     {
       eventId: "30",
-      event: { event: "status", data: { status: "running" } } satisfies Event,
+      event: { event: "worker_state", data: { snapshot: workerState("running") } } satisfies Event,
     },
     {
       eventId: "31",
@@ -1527,7 +1604,7 @@ Deno.test("projectConsole renders snapshot entries and in-flight output", () => 
             context_window: 100,
             context_tokens: 20,
           },
-          status: "running",
+          state: workerState("running"),
           in_flight: {
             blocks: [
               { kind: "text", text: "partial" },
@@ -1578,7 +1655,7 @@ Deno.test("projectConsole restores system items from snapshot entries", () => {
           context_window: 100,
           context_tokens: 20,
         },
-        status: "idle",
+        state: workerState("idle"),
       },
     } satisfies Event,
   }]);
@@ -1922,7 +1999,7 @@ Deno.test("console Worker views expose only direct Internal Workers", () => {
               kind: "sub_worker",
             },
             revision: 1,
-            event: { event: "status", data: { status: "running" } },
+            event: { event: "worker_state", data: { snapshot: workerState("running") } },
           },
         },
       },
@@ -1941,7 +2018,7 @@ Deno.test("console Worker views expose only direct Internal Workers", () => {
           kind: "sub_worker",
         },
         revision: 1,
-        event: { event: "status", data: { status: "idle" } },
+        event: { event: "worker_state", data: { snapshot: workerState("idle") } },
       },
     },
   }]);
@@ -2033,7 +2110,7 @@ Deno.test("parent snapshot authoritatively replaces Internal Worker projections"
           kind: "sub_worker",
         },
         revision: 1,
-        event: { event: "status", data: { status: "running" } },
+        event: { event: "worker_state", data: { snapshot: workerState("running") } },
       },
     },
   }]);
@@ -2150,6 +2227,12 @@ Deno.test("snapshot restores TaskStore state from system history", () => {
   const event = snapshotEvent("/repo");
   if (event.event !== "snapshot") throw new Error("snapshot fixture expected");
   event.data.session = {
+    pending_submissions: {
+      revision: 0,
+      notification_count: 0,
+      head_id: null,
+      submissions: [],
+    },
     entries: [{
       entry_id: "task-reminder-1",
       timestamp: 1,

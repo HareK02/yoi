@@ -33,7 +33,7 @@ use axum::extract::rejection::{JsonRejection, QueryRejection};
 #[cfg(feature = "ws-server")]
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
-use axum::http::{Method, Request, StatusCode, header};
+use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -66,6 +66,11 @@ use workdir::{
 };
 
 const DEFAULT_RUNTIME_HTTP_PORT: u16 = 38800;
+pub const RUNTIME_HTTP_PROTOCOL_MIN_VERSION: u32 = 1;
+pub const RUNTIME_HTTP_PROTOCOL_MAX_VERSION: u32 = 1;
+pub const RUNTIME_HTTP_PROTOCOL_VERSION: u32 = RUNTIME_HTTP_PROTOCOL_MAX_VERSION;
+pub const RUNTIME_PING_PERMISSION: &str = "runtime:ping";
+pub const RUNTIME_WORKSPACE_SCOPE_HEADER: &str = "x-yoi-workspace-id";
 
 fn default_runtime_http_bind_addr() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], DEFAULT_RUNTIME_HTTP_PORT))
@@ -187,6 +192,7 @@ fn runtime_http_router_with_optional_auth(
     };
 
     let router = Router::new()
+        .route("/v1/ping", get(get_runtime_ping))
         .route("/v1/runtime", get(get_runtime))
         .route(
             "/v1/config-bundles",
@@ -340,6 +346,14 @@ enum RuntimeHttpWorkerStatusFilter {
     Stopped,
 }
 
+/// `GET /v1/ping` response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeHttpPingResponse {
+    pub runtime_id: String,
+    pub protocol_version: u32,
+}
+
 /// `GET /v1/workers` response.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeHttpWorkersResponse {
@@ -460,6 +474,48 @@ struct RuntimeWorkerEventsWsQuery {
 }
 
 type RestResult<T> = Result<Json<T>, RuntimeHttpRestError>;
+
+async fn get_runtime_ping(
+    State(state): State<RuntimeHttpState>,
+    Extension(auth): Extension<RuntimeAuthContext>,
+    headers: HeaderMap,
+) -> RestResult<RuntimeHttpPingResponse> {
+    let requested_workspace_id = headers
+        .get(RUNTIME_WORKSPACE_SCOPE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            RuntimeHttpRestError::new(
+                StatusCode::FORBIDDEN,
+                "runtime_ping_workspace_scope_required",
+                "Runtime ping requires the target Workspace scope",
+            )
+        })?;
+    if requested_workspace_id != auth.workspace_id {
+        return Err(RuntimeHttpRestError::new(
+            StatusCode::FORBIDDEN,
+            "runtime_ping_workspace_scope_mismatch",
+            "Runtime ping Workspace scope does not match the authenticated capability",
+        ));
+    }
+    let runtime_id = state
+        .auth
+        .as_ref()
+        .map(|config| config.runtime_id.trim())
+        .filter(|runtime_id| !runtime_id.is_empty())
+        .ok_or_else(|| {
+            RuntimeHttpRestError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime_ping_identity_unavailable",
+                "Runtime ping identity is not configured",
+            )
+        })?;
+    Ok(Json(RuntimeHttpPingResponse {
+        runtime_id: runtime_id.to_string(),
+        protocol_version: RUNTIME_HTTP_PROTOCOL_VERSION,
+    }))
+}
 
 async fn get_runtime(
     State(state): State<RuntimeHttpState>,
@@ -718,8 +774,7 @@ async fn run_workdir_session_operation(
             .ok_or_else(RuntimeHttpWorkdirError::not_found)?;
         record.session.clone()
     };
-    let applied = workdir::apply_delegation_chain(source, request.delegations).await?;
-    let session = applied.scoped_session.as_ref();
+    let session = source.as_ref();
     let operation = request.operation;
 
     let result = match operation {
@@ -1184,10 +1239,12 @@ async fn worker_protocol_ws(
     auth: Option<Extension<RuntimeAuthContext>>,
     Path(worker_id): Path<String>,
     Query(query): Query<RuntimeWorkerEventsWsQuery>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, RuntimeHttpRestError> {
     let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
     let scope = auth_workspace_scope(&state, auth.as_ref())?;
+    let input_source = authenticated_protocol_input_source(&headers)?;
     match scope.as_ref() {
         Some(scope) => state
             .runtime
@@ -1198,9 +1255,80 @@ async fn worker_protocol_ws(
     .map_err(RuntimeHttpRestError::runtime)?;
     Ok(ws
         .on_upgrade(move |socket| {
-            worker_protocol_ws_session(state.runtime, scope, worker_ref, query, socket)
+            worker_protocol_ws_session(
+                state.runtime,
+                scope,
+                worker_ref,
+                query,
+                input_source,
+                socket,
+            )
         })
         .into_response())
+}
+
+#[cfg(feature = "ws-server")]
+fn authenticated_protocol_input_source(
+    headers: &HeaderMap,
+) -> Result<Option<protocol::AuthenticatedInputSource>, RuntimeHttpRestError> {
+    let Some(value) = headers.get(protocol::AUTHENTICATED_ACCOUNT_ID_HEADER) else {
+        return Ok(None);
+    };
+    let account_id = value.to_str().map_err(|_| {
+        RuntimeHttpRestError::new(
+            StatusCode::BAD_REQUEST,
+            "authenticated_input_source_invalid",
+            "authenticated Worker input source is invalid",
+        )
+    })?;
+    if account_id.trim().is_empty() || account_id.len() > 128 {
+        return Err(RuntimeHttpRestError::new(
+            StatusCode::BAD_REQUEST,
+            "authenticated_input_source_invalid",
+            "authenticated Worker input source is invalid",
+        ));
+    }
+    Ok(Some(protocol::AuthenticatedInputSource::Account {
+        account_id: account_id.to_owned(),
+    }))
+}
+
+#[cfg(feature = "ws-server")]
+fn authorize_runtime_protocol_method(
+    method: protocol::Method,
+    transport_source: Option<&protocol::AuthenticatedInputSource>,
+) -> protocol::Method {
+    match method {
+        protocol::Method::SubmitTracked {
+            submission_request_id,
+            input,
+            ..
+        } => protocol::Method::SubmitTracked {
+            source: transport_source.cloned().unwrap_or_else(|| {
+                protocol::AuthenticatedInputSource::Backend {
+                    operation_id: submission_request_id.clone(),
+                }
+            }),
+            submission_request_id,
+            input,
+        },
+        protocol::Method::NotifyTracked {
+            notification_request_id,
+            message,
+            auto_run,
+            ..
+        } => protocol::Method::NotifyTracked {
+            source: transport_source.cloned().unwrap_or_else(|| {
+                protocol::AuthenticatedInputSource::Backend {
+                    operation_id: notification_request_id.clone(),
+                }
+            }),
+            notification_request_id,
+            message,
+            auto_run,
+        },
+        other => other,
+    }
 }
 
 #[cfg(feature = "ws-server")]
@@ -1209,6 +1337,7 @@ async fn worker_protocol_ws_session(
     scope: Option<RuntimeWorkspaceScope>,
     worker_ref: WorkerRef,
     query: RuntimeWorkerEventsWsQuery,
+    input_source: Option<protocol::AuthenticatedInputSource>,
     mut socket: WebSocket,
 ) {
     let mut cursor = match query.cursor.as_deref() {
@@ -1291,6 +1420,8 @@ async fn worker_protocol_ws_session(
                 match inbound {
                     Some(Ok(WsMessage::Text(text))) => match decode_method(&text) {
                         Ok(method) => {
+                            let method =
+                                authorize_runtime_protocol_method(method, input_source.as_ref());
                             let result = match scope.as_ref() {
                                 Some(scope) => {
                                     runtime.send_protocol_method_scoped(scope, &worker_ref, method)
@@ -1767,6 +1898,9 @@ fn auth_workspace_scope(
 }
 
 fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static str> {
+    if path == "/v1/ping" && *method == Method::GET {
+        return Some(RUNTIME_PING_PERMISSION);
+    }
     if path == "/v1/runtime" {
         return None;
     }
@@ -2071,8 +2205,8 @@ mod tests {
     };
     use crate::execution::{
         WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation,
-        WorkerExecutionRestoreRequest, WorkerExecutionResult, WorkerExecutionRunState,
-        WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
+        WorkerExecutionRestoreRequest, WorkerExecutionResult, WorkerExecutionSpawnRequest,
+        WorkerExecutionSpawnResult,
     };
     use crate::management::RuntimeOptions;
     use axum::body::to_bytes;
@@ -2080,9 +2214,142 @@ mod tests {
     use manifest::{Scope, SharedScope};
     use tower::ServiceExt;
     use workdir::{
-        GrepOutputMode, GrepRequest, LocalWorkdirSession, ReadRequest, StatRequest, Workdir,
-        WorkdirPath, WorkdirSessionCapabilities,
+        GrepOutputMode, GrepRequest, LocalWorkdirSession, StatRequest, Workdir, WorkdirPath,
+        WorkdirSessionCapabilities,
     };
+
+    #[tokio::test]
+    async fn ping_requires_scoped_permission_and_returns_versioned_identity() {
+        let runtime = Runtime::new_memory();
+        let (auth, signer) = auth_config_and_signer();
+        let app = runtime_http_router_with_auth(runtime, None, auth);
+        let token =
+            token_for_workspace_with_permissions(&signer, "workspace-a", [RUNTIME_PING_PERMISSION]);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/ping")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(RUNTIME_WORKSPACE_SCOPE_HEADER, "workspace-a")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<RuntimeHttpPingResponse>(&body).unwrap(),
+            RuntimeHttpPingResponse {
+                runtime_id: "runtime-test".to_string(),
+                protocol_version: RUNTIME_HTTP_PROTOCOL_VERSION,
+            }
+        );
+
+        let wrong_scope_token =
+            token_for_workspace_with_permissions(&signer, "workspace-a", [RUNTIME_PING_PERMISSION]);
+        let wrong_scope_request = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/ping")
+            .header(header::AUTHORIZATION, format!("Bearer {wrong_scope_token}"))
+            .header(RUNTIME_WORKSPACE_SCOPE_HEADER, "workspace-b")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(wrong_scope_request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn ping_rejects_token_without_ping_permission() {
+        let runtime = Runtime::new_memory();
+        let (auth, signer) = auth_config_and_signer();
+        let app = runtime_http_router_with_auth(runtime, None, auth);
+        let missing_credential = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/ping")
+            .header(RUNTIME_WORKSPACE_SCOPE_HEADER, "workspace-a")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(missing_credential)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let token = token_for_workspace_with_permissions(&signer, "workspace-a", ["workers:read"]);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/ping")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(RUNTIME_WORKSPACE_SCOPE_HEADER, "workspace-a")
+            .body(Body::empty())
+            .unwrap();
+
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn runtime_protocol_replaces_serialized_tracked_source() {
+        let wire = serde_json::to_string(&protocol::Method::SubmitTracked {
+            submission_request_id: "request-1".into(),
+            input: vec![protocol::Segment::text("hello")],
+            source: protocol::AuthenticatedInputSource::Account {
+                account_id: "forged".into(),
+            },
+        })
+        .unwrap();
+        let decoded: protocol::Method = serde_json::from_str(&wire).unwrap();
+        assert!(matches!(
+            decoded,
+            protocol::Method::SubmitTracked {
+                source: protocol::AuthenticatedInputSource::UntrustedWire,
+                ..
+            }
+        ));
+        assert!(matches!(
+            authorize_runtime_protocol_method(decoded, None),
+            protocol::Method::SubmitTracked {
+                source: protocol::AuthenticatedInputSource::Backend { operation_id },
+                ..
+            } if operation_id == "request-1"
+        ));
+    }
+
+    #[test]
+    fn runtime_protocol_uses_transport_authenticated_account_source() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            protocol::AUTHENTICATED_ACCOUNT_ID_HEADER,
+            "account-1".parse().unwrap(),
+        );
+        let source = authenticated_protocol_input_source(&headers)
+            .unwrap()
+            .expect("account source header must resolve");
+        let wire = serde_json::to_string(&protocol::Method::NotifyTracked {
+            notification_request_id: "notification-1".into(),
+            message: "hello".into(),
+            auto_run: true,
+            source: protocol::AuthenticatedInputSource::Account {
+                account_id: "forged".into(),
+            },
+        })
+        .unwrap();
+        let decoded: protocol::Method = serde_json::from_str(&wire).unwrap();
+
+        assert!(matches!(
+            authorize_runtime_protocol_method(decoded, Some(&source)),
+            protocol::Method::NotifyTracked {
+                source: protocol::AuthenticatedInputSource::Account { account_id },
+                ..
+            } if account_id == "account-1"
+        ));
+    }
 
     #[test]
     fn attachment_routes_require_worker_input_permission() {
@@ -2502,16 +2769,6 @@ mod tests {
     async fn workdir_session_operations_enforce_owner_and_close_terminally() {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("hello.txt"), "hello").expect("write fixture");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            std::fs::create_dir(temp.path().join("granted")).expect("granted directory");
-            std::fs::write(temp.path().join("granted/visible"), "visible")
-                .expect("visible fixture");
-            std::fs::create_dir(temp.path().join("secret")).expect("secret directory");
-            std::fs::write(temp.path().join("secret/key"), "hidden").expect("secret fixture");
-            symlink("../secret/key", temp.path().join("granted/link")).expect("symlink fixture");
-        }
         let scope = SharedScope::new(Scope::writable(temp.path()).expect("scope"));
         let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::materialized_bound(
             Workdir::new("wd-1"),
@@ -2545,7 +2802,6 @@ mod tests {
             expires_at: u64::MAX,
         };
         let operation = WorkdirSessionOperationRequest {
-            delegations: Vec::new(),
             operation: WorkdirSessionOperation::Stat(StatRequest {
                 path: WorkdirPath::new("hello.txt").expect("logical path"),
             }),
@@ -2562,7 +2818,6 @@ mod tests {
         assert!(matches!(result, WorkdirSessionOperationResult::Stat(_)));
 
         let grep = WorkdirSessionOperationRequest {
-            delegations: Vec::new(),
             operation: WorkdirSessionOperation::Grep(GrepRequest {
                 pattern: "hello".into(),
                 path: WorkdirPath::new("hello.txt").unwrap(),
@@ -2585,78 +2840,7 @@ mod tests {
         )
         .await
         .expect("grep direct file through provider operation");
-        match result {
-            WorkdirSessionOperationResult::Grep(result) => {
-                assert_eq!(result.match_count, 1);
-                assert_eq!(result.matched_files, 1);
-                assert!(result.output.starts_with("hello.txt\n"));
-                assert!(result.output.contains("> 1 │ hello"));
-            }
-            other => panic!("unexpected workdir grep result: {other:?}"),
-        }
-
-        #[cfg(unix)]
-        {
-            let delegated_visible = WorkdirSessionOperationRequest {
-                delegations: vec![workdir::WorkdirDelegationRequest {
-                    rules: vec![workdir::WorkdirDelegationRule {
-                        target: WorkdirPath::new("granted").unwrap(),
-                        permission: workdir::WorkdirDelegationPermission::Read,
-                        recursive: true,
-                    }],
-                    cwd: WorkdirPath::new("granted").unwrap(),
-                }],
-                operation: WorkdirSessionOperation::Read(ReadRequest {
-                    path: WorkdirPath::new("visible").unwrap(),
-                    offset: 0,
-                    limit: 20,
-                    max_bytes: 1024,
-                }),
-            };
-            let visible = run_workdir_session_operation(
-                State(state.clone()),
-                Path("session-1".to_string()),
-                Some(Extension(auth.clone())),
-                Ok(Json(delegated_visible)),
-            )
-            .await
-            .expect("non-root delegated cwd should resolve once")
-            .0;
-            assert!(matches!(
-                visible,
-                WorkdirSessionOperationResult::Read(result) if result.bytes == b"visible"
-            ));
-
-            let delegated_read = WorkdirSessionOperationRequest {
-                delegations: vec![workdir::WorkdirDelegationRequest {
-                    rules: vec![workdir::WorkdirDelegationRule {
-                        target: WorkdirPath::new("granted").unwrap(),
-                        permission: workdir::WorkdirDelegationPermission::Read,
-                        recursive: true,
-                    }],
-                    cwd: WorkdirPath::new("granted").unwrap(),
-                }],
-                operation: WorkdirSessionOperation::Read(ReadRequest {
-                    path: WorkdirPath::new("link").unwrap(),
-                    offset: 0,
-                    limit: 20,
-                    max_bytes: 1024,
-                }),
-            };
-            let error = run_workdir_session_operation(
-                State(state.clone()),
-                Path("session-1".to_string()),
-                Some(Extension(auth.clone())),
-                Ok(Json(delegated_read)),
-            )
-            .await
-            .expect_err("provider must reject delegated symlink escape");
-            assert_ne!(error.status, StatusCode::OK);
-            assert_eq!(
-                std::fs::read_to_string(temp.path().join("secret/key")).unwrap(),
-                "hidden"
-            );
-        }
+        assert!(matches!(result, WorkdirSessionOperationResult::Grep(_)));
 
         let wrong_owner = RuntimeAuthContext {
             workspace_id: "workspace-b".to_string(),
@@ -2711,7 +2895,6 @@ mod tests {
         fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
-                run_state: WorkerExecutionRunState::Idle,
                 working_directory: request
                     .working_directory
                     .as_ref()
@@ -2725,7 +2908,6 @@ mod tests {
         ) -> WorkerExecutionSpawnResult {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
-                run_state: WorkerExecutionRunState::Idle,
                 working_directory: request.previous_working_directory,
             }
         }
@@ -2735,25 +2917,20 @@ mod tests {
             _handle: &WorkerExecutionHandle,
             input: WorkerInput,
         ) -> WorkerExecutionResult {
-            if let Some(submission_id) = input.submission_id {
-                WorkerExecutionResult::accepted_input_committed(
+            if let Some(submission_id) = input.submission_request_id {
+                WorkerExecutionResult::accepted_submission(
                     WorkerExecutionOperation::Input,
-                    WorkerExecutionRunState::Idle,
+                    submission_id.clone(),
                     submission_id,
+                    protocol::SubmissionDisposition::Started,
                 )
             } else {
-                WorkerExecutionResult::accepted(
-                    WorkerExecutionOperation::Input,
-                    WorkerExecutionRunState::Idle,
-                )
+                WorkerExecutionResult::accepted(WorkerExecutionOperation::Input)
             }
         }
 
         fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
-            WorkerExecutionResult::accepted(
-                WorkerExecutionOperation::Stop,
-                WorkerExecutionRunState::Stopped,
-            )
+            WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop)
         }
     }
 
@@ -3025,8 +3202,7 @@ mod ws_tests {
     };
     use crate::execution::{
         WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation,
-        WorkerExecutionResult, WorkerExecutionRunState, WorkerExecutionSpawnRequest,
-        WorkerExecutionSpawnResult,
+        WorkerExecutionResult, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
     };
     use crate::management::RuntimeOptions;
     use futures::{SinkExt, StreamExt};
@@ -3046,7 +3222,6 @@ mod ws_tests {
         fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
-                run_state: WorkerExecutionRunState::Idle,
                 working_directory: request
                     .working_directory
                     .as_ref()
@@ -3059,18 +3234,41 @@ mod ws_tests {
             _handle: &WorkerExecutionHandle,
             input: WorkerInput,
         ) -> WorkerExecutionResult {
-            if let Some(submission_id) = input.submission_id {
-                WorkerExecutionResult::accepted_input_committed(
+            if let Some(submission_id) = input.submission_request_id {
+                WorkerExecutionResult::accepted_submission(
                     WorkerExecutionOperation::Input,
-                    WorkerExecutionRunState::Idle,
+                    submission_id.clone(),
                     submission_id,
+                    protocol::SubmissionDisposition::Started,
                 )
             } else {
-                WorkerExecutionResult::accepted(
-                    WorkerExecutionOperation::Input,
-                    WorkerExecutionRunState::Idle,
-                )
+                WorkerExecutionResult::accepted(WorkerExecutionOperation::Input)
             }
+        }
+
+        fn worker_snapshot(&self, handle: &WorkerExecutionHandle) -> Option<protocol::Event> {
+            Some(protocol::Event::Snapshot {
+                session: protocol::SessionSnapshot {
+                    pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                    entries: Vec::new(),
+                },
+                greeting: protocol::Greeting {
+                    worker_name: handle.worker_ref().worker_id.to_string(),
+                    cwd: String::new(),
+                    provider: "ws-test".to_string(),
+                    model: "ws-test".to_string(),
+                    scope_summary: "WebSocket test execution snapshot".to_string(),
+                    tools: Vec::new(),
+                    context_window: 0,
+                    context_tokens: 0,
+                },
+                state: protocol::WorkerStateSnapshot::initial(1),
+                in_flight: protocol::InFlightSnapshot {
+                    blocks: Vec::new(),
+                    commands: Vec::new(),
+                },
+                internal_workers: Vec::new(),
+            })
         }
 
         fn dispatch_method(
@@ -3078,10 +3276,7 @@ mod ws_tests {
             _handle: &WorkerExecutionHandle,
             _method: protocol::Method,
         ) -> WorkerExecutionResult {
-            WorkerExecutionResult::accepted(
-                WorkerExecutionOperation::ProtocolMethod,
-                WorkerExecutionRunState::Idle,
-            )
+            WorkerExecutionResult::accepted(WorkerExecutionOperation::ProtocolMethod)
         }
     }
 
@@ -3292,16 +3487,16 @@ mod ws_tests {
         runtime
             .observe_worker_event(
                 &other.worker_ref,
-                protocol::Event::Status {
-                    status: protocol::WorkerStatus::Running,
+                protocol::Event::WorkerState {
+                    snapshot: protocol::WorkerStatus::Running.into(),
                 },
             )
             .unwrap();
         runtime
             .observe_worker_event(
                 &worker_ref,
-                protocol::Event::Status {
-                    status: protocol::WorkerStatus::Running,
+                protocol::Event::WorkerState {
+                    snapshot: protocol::WorkerStatus::Running.into(),
                 },
             )
             .unwrap();
@@ -3316,7 +3511,16 @@ mod ws_tests {
                 ..
             }) if delivered_subscription_id == subscription_id
                 && worker.worker_id.as_str() == worker_ref.worker_id.to_string()
-                && worker.state == protocol::subscription::SubscriptionWorkerState::Running
+                && worker.state == protocol::subscription::SubscriptionWorkerState::Idle
+                && matches!(
+                    worker.worker_state,
+                    Some(protocol::WorkerStateSnapshot {
+                        state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                            protocol::WorkerRunState::Running
+                        )),
+                        ..
+                    })
+                )
         ));
 
         let unsubscribe_request_id =

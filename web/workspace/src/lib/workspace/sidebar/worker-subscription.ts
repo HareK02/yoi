@@ -5,6 +5,7 @@ import {
   applyWorkspaceWorkersFrame,
   createWorkspaceWorkersProjection,
 } from './worker-subscription-model';
+import { liveWorkerState } from './worker-state';
 import { compareWorkersForSidebar } from './workers';
 import type { Worker } from './types';
 
@@ -21,6 +22,10 @@ export type WorkspaceWorkersState = {
 };
 
 const stores = new Map<string, Readable<WorkspaceWorkersState>>();
+
+export function disposeWorkspaceWorkersStore(workspaceId: string): void {
+  stores.delete(workspaceId);
+}
 
 export function workspaceWorkersStore(workspaceId: string): Readable<WorkspaceWorkersState> {
   const cached = stores.get(workspaceId);
@@ -86,7 +91,8 @@ function projectWorker(worker: SubscriptionWorker): SidebarWorker {
     profile: worker.profile ?? null,
     tags: [],
     workspace: { visibility: 'workspace', identity: 'runtime_subscription_worker' },
-    state: worker.state,
+    state: liveWorkerState(worker),
+    worker_state: worker.worker_state,
     pinned: false,
     retention_state: 'transient',
     implementation: {

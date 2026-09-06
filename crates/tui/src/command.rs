@@ -409,7 +409,12 @@ fn compact_command(invocation: CommandInvocation<'_>) -> CommandExecution {
     let _ = invocation.environment;
     let _ = invocation.args.raw();
     CommandExecution {
-        method: Some(Method::Compact),
+        method: Some(Method::Compact {
+            command: protocol::WorkerCommandEnvelope::for_snapshot(
+                0,
+                &protocol::WorkerStateSnapshot::initial(1),
+            ),
+        }),
         diagnostics: vec![CommandDiagnostic::new("compact requested")],
         exit_command_mode: true,
         clear_input: true,
@@ -483,7 +488,7 @@ mod tests {
     fn compact_command_returns_compact_method_not_run() {
         let registry = CommandRegistry::builtins();
         let result = registry.dispatch("compact", &env());
-        assert!(matches!(result.method, Some(Method::Compact)));
+        assert!(matches!(result.method, Some(Method::Compact { .. })));
         assert!(result.exit_command_mode);
         assert!(result.clear_input);
         assert!(result.diagnostics[0].message.contains("compact requested"));

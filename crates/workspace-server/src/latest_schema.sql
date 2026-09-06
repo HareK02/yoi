@@ -433,15 +433,37 @@ CREATE TABLE ticket_worker_assignments (
                 (principal_kind != 'worker' AND runtime_id IS NULL AND worker_id IS NULL AND principal_id IS NOT NULL AND length(trim(principal_id)) > 0)
             )
         );
-CREATE TABLE trusted_runtime_records (
-    runtime_id TEXT PRIMARY KEY,
+CREATE TABLE workspace_runtime_bindings (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
     display_name TEXT NOT NULL,
     base_url TEXT NOT NULL,
     public_key TEXT NOT NULL,
+    public_key_fingerprint TEXT NOT NULL,
+    binding_revision INTEGER NOT NULL DEFAULT 1 CHECK (binding_revision > 0),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    revoked_at TEXT
-, workspace_id TEXT REFERENCES workspaces(workspace_id) ON DELETE RESTRICT);
+    revoked_at TEXT,
+    PRIMARY KEY (workspace_id, runtime_id),
+    UNIQUE (workspace_id, public_key_fingerprint),
+    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT
+);
+CREATE TABLE workspace_runtime_binding_audit (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    actor_account_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('created', 'replaced', 'reactivated', 'revoked')),
+    old_fingerprint TEXT,
+    new_fingerprint TEXT,
+    binding_revision INTEGER NOT NULL CHECK (binding_revision > 0),
+    at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, runtime_id, binding_revision),
+    FOREIGN KEY(workspace_id, runtime_id)
+        REFERENCES workspace_runtime_bindings(workspace_id, runtime_id) ON DELETE RESTRICT,
+    FOREIGN KEY(actor_account_id) REFERENCES accounts(account_id) ON DELETE RESTRICT
+);
+CREATE INDEX idx_workspace_runtime_binding_audit_recent
+    ON workspace_runtime_binding_audit(workspace_id, runtime_id, binding_revision DESC);
 CREATE TABLE typed_ticket_artifacts (
     workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, relative_path TEXT NOT NULL, content BLOB NOT NULL,
     PRIMARY KEY (workspace_id, ticket_id, relative_path),
@@ -637,7 +659,7 @@ CREATE TABLE worker_create_reservations (
             worker_id TEXT NOT NULL,
             runtime_id TEXT NOT NULL,
             create_fingerprint TEXT NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('reserved', 'created')),
+            state TEXT NOT NULL CHECK (state IN ('reserved', 'created', 'removed')),
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL, request_fingerprint TEXT, memory_settings_revision INTEGER, memory_language TEXT,
             PRIMARY KEY (workspace_id, allocation_key),
@@ -651,11 +673,12 @@ CREATE TABLE worker_diagnostics_archives (
         FOREIGN KEY(operation_id) REFERENCES worker_removal_operations(operation_id),
         FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE);
 CREATE TABLE worker_mutation_source_proof_jtis (
+            workspace_id TEXT NOT NULL,
             runtime_id TEXT NOT NULL,
             jti TEXT NOT NULL,
             expires_at INTEGER NOT NULL,
             consumed_at TEXT NOT NULL,
-            PRIMARY KEY (runtime_id, jti)
+            PRIMARY KEY (workspace_id, runtime_id, jti)
         );
 CREATE TABLE worker_orphan_diagnostics (
         diagnostic_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL, worker_id TEXT NOT NULL,
@@ -857,8 +880,8 @@ CREATE INDEX idx_ticket_worker_assignments_principal
             ON ticket_worker_assignments(workspace_id, role, principal_kind, principal_id, runtime_id, worker_id, assigned_at DESC);
 CREATE INDEX idx_ticket_worker_assignments_ticket
             ON ticket_worker_assignments(workspace_id, ticket_id, role, assigned_at DESC);
-CREATE INDEX idx_trusted_runtime_records_workspace
-            ON trusted_runtime_records(workspace_id, revoked_at, runtime_id);
+CREATE INDEX idx_workspace_runtime_bindings_workspace
+            ON workspace_runtime_bindings(workspace_id, revoked_at, runtime_id);
 CREATE INDEX idx_typed_ticket_relations_workspace_target
     ON typed_ticket_relations(workspace_id, target, at DESC);
 CREATE INDEX idx_typed_tickets_workspace_state_updated
@@ -917,6 +940,28 @@ CREATE UNIQUE INDEX worker_workdir_links_active_worker_unique
             WHERE unlinked_at IS NULL;
 CREATE INDEX worker_workdir_links_workdir
             ON worker_workdir_links(workspace_id, workdir_id);
+CREATE TABLE workspace_deletion_operations (
+    operation_id TEXT PRIMARY KEY,
+    request_fingerprint TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    workspace_display_name TEXT NOT NULL,
+    workspace_revision TEXT NOT NULL,
+    owner_account_id TEXT NOT NULL,
+    actor_account_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('queued', 'running', 'blocked', 'failed', 'succeeded')),
+    resource_counts_json TEXT NOT NULL,
+    child_operation_ids_json TEXT NOT NULL,
+    blockers_json TEXT NOT NULL,
+    failure_category TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    FOREIGN KEY(owner_account_id) REFERENCES accounts(account_id) ON DELETE RESTRICT,
+    FOREIGN KEY(actor_account_id) REFERENCES accounts(account_id) ON DELETE RESTRICT
+);
+CREATE INDEX workspace_deletion_operations_workspace_recent
+    ON workspace_deletion_operations(workspace_id, created_at DESC);
+
 CREATE TRIGGER seed_worker_retention_policy_after_workspace_insert AFTER INSERT ON workspaces BEGIN
         INSERT INTO workspace_worker_retention_policy_revisions
           (workspace_id,policy_id,revision,session_disposition,metadata_disposition,archive_retention_kind,archive_retention_seconds,diagnostics_disposition,diagnostics_retention_seconds,created_at)

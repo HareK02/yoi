@@ -110,18 +110,19 @@ On the Workspace Server host, register the Runtime public key copied from `yoi-r
 
 ```bash
 yoi-server trust-runtime add \
+  --workspace-id '<WORKSPACE_ID>' \
   --runtime-id runtime-main \
   --base-url http://127.0.0.1:38800 \
   --public-key '<RUNTIME_PUBLIC_KEY>' \
   --display-name 'Runtime main'
 ```
 
-This writes a trusted Runtime record to the Server DB. During `yoi-server serve`, active trusted Runtime records are loaded as remote Runtime sources and receive signed capability tokens. You do not need to duplicate the same Runtime in `runtimes.toml` for this trust-backed path.
+This writes a Workspace-scoped Runtime binding and trust fingerprint to the Server DB. During `yoi-server serve`, active bindings are loaded as remote Runtime sources and receive signed capability tokens. Repository-external Runtime files are not registration or trust authority.
 
 Verify:
 
 ```bash
-yoi-server trust-runtime list --json
+yoi-server trust-runtime list --workspace-id '<WORKSPACE_ID>' --json
 ```
 
 ## 5. Start Runtime and Workspace Server
@@ -160,7 +161,7 @@ An empty Server DB is valid. Open the Web UI, create or authenticate the Account
 Check both trust stores:
 
 ```bash
-yoi-server trust-runtime list --json
+yoi-server trust-runtime list --workspace-id '<WORKSPACE_ID>' --json
 yoi-runtime trust-server list --json
 ```
 
@@ -203,6 +204,7 @@ After Runtime identity rotation, Server must be updated with the new Runtime pub
 
 ```bash
 yoi-server trust-runtime add \
+  --workspace-id '<WORKSPACE_ID>' \
   --runtime-id runtime-main \
   --base-url http://127.0.0.1:38800 \
   --public-key '<NEW_RUNTIME_PUBLIC_KEY>' \
@@ -214,7 +216,9 @@ yoi-server trust-runtime add \
 Revoke a trusted Runtime on Server:
 
 ```bash
-yoi-server trust-runtime revoke --runtime-id runtime-main
+yoi-server trust-runtime revoke \
+  --workspace-id '<WORKSPACE_ID>' \
+  --runtime-id runtime-main
 ```
 
 Remove a trusted Server from Runtime:
@@ -252,7 +256,7 @@ Confirm the `--runtime-id` registered on Server exactly matches the Runtime iden
 
 ```bash
 yoi-runtime identity show --json
-yoi-server trust-runtime list --json
+yoi-server trust-runtime list --workspace-id '<WORKSPACE_ID>' --json
 ```
 
 `RUNTIME_ID` is the token audience; mismatches are rejected by Runtime.

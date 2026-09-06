@@ -6,7 +6,7 @@ use worker_runtime::catalog::{
 };
 use worker_runtime::execution::{
     WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation, WorkerExecutionResult,
-    WorkerExecutionRunState, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
+    WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
 };
 use worker_runtime::identity::WorkerId;
 use worker_runtime::profile_archive::{ProfileSourceArchiveRef, ProfileSourceGraphSummary};
@@ -22,7 +22,6 @@ impl WorkerExecutionBackend for TestExecutionBackend {
     fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
         WorkerExecutionSpawnResult::connected(
             WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
-            WorkerExecutionRunState::Idle,
             None,
         )
     }
@@ -32,25 +31,20 @@ impl WorkerExecutionBackend for TestExecutionBackend {
         _handle: &WorkerExecutionHandle,
         input: worker_runtime::interaction::WorkerInput,
     ) -> WorkerExecutionResult {
-        if let Some(submission_id) = input.submission_id {
-            WorkerExecutionResult::accepted_input_committed(
+        if let Some(submission_request_id) = input.submission_request_id {
+            WorkerExecutionResult::accepted_submission(
                 WorkerExecutionOperation::Input,
-                WorkerExecutionRunState::Busy,
-                submission_id,
+                submission_request_id,
+                uuid::Uuid::now_v7().to_string(),
+                protocol::SubmissionDisposition::Started,
             )
         } else {
-            WorkerExecutionResult::accepted(
-                WorkerExecutionOperation::Input,
-                WorkerExecutionRunState::Busy,
-            )
+            WorkerExecutionResult::accepted(WorkerExecutionOperation::Input)
         }
     }
 
     fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
-        WorkerExecutionResult::accepted(
-            WorkerExecutionOperation::Stop,
-            WorkerExecutionRunState::Stopped,
-        )
+        WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop)
     }
 }
 
@@ -197,8 +191,8 @@ async fn equal_downstream_selectors_share_one_upstream_subscription() {
     runtime
         .observe_worker_event(
             &worker.worker_ref,
-            protocol::Event::Status {
-                status: protocol::WorkerStatus::Running,
+            protocol::Event::WorkerState {
+                snapshot: protocol::WorkerStatus::Running.into(),
             },
         )
         .unwrap();
@@ -208,7 +202,16 @@ async fn equal_downstream_selectors_share_one_upstream_subscription() {
             BrokerSubscriptionEvent::Event {
                 payload: SubscriptionEventPayload::WorkerUpserted { ref worker },
                 ..
-            } if worker.state == SubscriptionWorkerState::Running
+            } if worker.state == SubscriptionWorkerState::Idle
+                && matches!(
+                    worker.worker_state,
+                    Some(protocol::WorkerStateSnapshot {
+                        state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                            protocol::WorkerRunState::Running
+                        )),
+                        ..
+                    })
+                )
         ));
     }
     let mut late = broker.subscribe("runtime-test", selector.clone()).unwrap();
@@ -218,7 +221,18 @@ async fn equal_downstream_selectors_share_one_upstream_subscription() {
     assert!(matches!(
         snapshot,
         SubscriptionSnapshot::Workers { workers }
-            if workers.iter().any(|worker| worker.state == SubscriptionWorkerState::Running)
+            if workers.iter().any(|worker| {
+                worker.state == SubscriptionWorkerState::Idle
+                    && matches!(
+                        worker.worker_state,
+                        Some(protocol::WorkerStateSnapshot {
+                            state: protocol::WorkerState::Busy(
+                                protocol::WorkerBusyState::Run(protocol::WorkerRunState::Running)
+                            ),
+                            ..
+                        })
+                    )
+            })
     ));
     drop(late);
 
@@ -337,14 +351,24 @@ async fn embedded_runtime_uses_in_process_subscription_source() {
     runtime
         .observe_worker_event(
             &worker.worker_ref,
-            protocol::Event::Status {
-                status: protocol::WorkerStatus::Running,
+            protocol::Event::WorkerState {
+                snapshot: protocol::WorkerStatus::Running.into(),
             },
         )
         .unwrap();
     assert!(matches!(next_event(&mut subscription).await,
-        BrokerSubscriptionEvent::Event { payload: SubscriptionEventPayload::WorkerUpserted { worker }, .. }
-        if worker.runtime_id.as_deref() == Some("embedded-worker-runtime") && worker.state == SubscriptionWorkerState::Running));
+    BrokerSubscriptionEvent::Event { payload: SubscriptionEventPayload::WorkerUpserted { worker }, .. }
+    if worker.runtime_id.as_deref() == Some("embedded-worker-runtime")
+        && worker.state == SubscriptionWorkerState::Idle
+        && matches!(
+            worker.worker_state,
+            Some(protocol::WorkerStateSnapshot {
+                state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                    protocol::WorkerRunState::Running
+                )),
+                ..
+            })
+        )));
     let mut late = broker
         .subscribe(
             "embedded-worker-runtime",
@@ -357,7 +381,18 @@ async fn embedded_runtime_uses_in_process_subscription_source() {
     assert!(matches!(
         snapshot,
         SubscriptionSnapshot::Workers { workers }
-            if workers.iter().any(|worker| worker.state == SubscriptionWorkerState::Running)
+            if workers.iter().any(|worker| {
+                worker.state == SubscriptionWorkerState::Idle
+                    && matches!(
+                        worker.worker_state,
+                        Some(protocol::WorkerStateSnapshot {
+                            state: protocol::WorkerState::Busy(
+                                protocol::WorkerBusyState::Run(protocol::WorkerRunState::Running)
+                            ),
+                            ..
+                        })
+                    )
+            })
     ));
 
     runtime

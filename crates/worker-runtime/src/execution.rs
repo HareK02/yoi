@@ -15,18 +15,6 @@ use std::fmt;
 use std::sync::Arc;
 use workdir::WorkdirSessionHandle;
 
-/// Current execution-side run state for a Worker.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkerExecutionRunState {
-    #[default]
-    Stopped,
-    Idle,
-    Busy,
-    Rejected,
-    Errored,
-}
-
 /// Execution operation that produced a result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,14 +29,12 @@ pub enum WorkerExecutionOperation {
     Cancel,
 }
 
-/// Evidence that a user input reached the durable Worker session boundary.
-///
-/// This is intentionally distinct from accepting a method on the Worker's
-/// in-memory channel. For Flow submissions, the committed UserInput entry also
-/// carries the initial Flow runtime-state extension.
+/// Evidence that a Submit request reached the durable Worker session boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkerInputCommitAck {
+pub struct WorkerSubmissionAck {
+    pub submission_request_id: String,
     pub submission_id: String,
+    pub disposition: protocol::SubmissionDisposition,
 }
 
 /// Typed execution result class. Results are transient operation outcomes and
@@ -57,11 +43,12 @@ pub struct WorkerInputCommitAck {
 pub struct WorkerExecutionResult {
     pub operation: WorkerExecutionOperation,
     pub outcome: WorkerExecutionOutcome,
-    pub run_state: WorkerExecutionRunState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_state: Option<protocol::WorkerStateSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_commit: Option<WorkerInputCommitAck>,
+    pub submission: Option<WorkerSubmissionAck>,
 }
 
 /// Backend result class for a Worker execution operation.
@@ -76,31 +63,36 @@ pub enum WorkerExecutionOutcome {
 }
 
 impl WorkerExecutionResult {
-    pub fn accepted(
-        operation: WorkerExecutionOperation,
-        run_state: WorkerExecutionRunState,
-    ) -> Self {
+    pub fn accepted(operation: WorkerExecutionOperation) -> Self {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Accepted,
-            run_state,
+            worker_state: None,
             message: None,
-            input_commit: None,
+            submission: None,
         }
     }
 
-    pub fn accepted_input_committed(
+    pub fn with_worker_state(mut self, worker_state: protocol::WorkerStateSnapshot) -> Self {
+        self.worker_state = Some(worker_state);
+        self
+    }
+
+    pub fn accepted_submission(
         operation: WorkerExecutionOperation,
-        run_state: WorkerExecutionRunState,
+        submission_request_id: impl Into<String>,
         submission_id: impl Into<String>,
+        disposition: protocol::SubmissionDisposition,
     ) -> Self {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Accepted,
-            run_state,
+            worker_state: None,
             message: None,
-            input_commit: Some(WorkerInputCommitAck {
+            submission: Some(WorkerSubmissionAck {
+                submission_request_id: submission_request_id.into(),
                 submission_id: submission_id.into(),
+                disposition,
             }),
         }
     }
@@ -109,9 +101,9 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Busy,
-            run_state: WorkerExecutionRunState::Busy,
+            worker_state: None,
             message: Some(message.into()),
-            input_commit: None,
+            submission: None,
         }
     }
 
@@ -119,9 +111,9 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Rejected,
-            run_state: WorkerExecutionRunState::Stopped,
+            worker_state: None,
             message: Some(message.into()),
-            input_commit: None,
+            submission: None,
         }
     }
 
@@ -129,9 +121,9 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Errored,
-            run_state: WorkerExecutionRunState::Errored,
+            worker_state: None,
             message: Some(message.into()),
-            input_commit: None,
+            submission: None,
         }
     }
 
@@ -139,9 +131,9 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Unsupported,
-            run_state: WorkerExecutionRunState::Stopped,
+            worker_state: None,
             message: Some(message.into()),
-            input_commit: None,
+            submission: None,
         }
     }
 
@@ -278,7 +270,6 @@ pub struct WorkerExecutionRestoreRequest {
 pub enum WorkerExecutionSpawnResult {
     Connected {
         handle: WorkerExecutionHandle,
-        run_state: WorkerExecutionRunState,
         working_directory: Option<WorkingDirectoryStatus>,
     },
     Rejected(WorkerExecutionResult),
@@ -288,12 +279,10 @@ pub enum WorkerExecutionSpawnResult {
 impl WorkerExecutionSpawnResult {
     pub fn connected(
         handle: WorkerExecutionHandle,
-        run_state: WorkerExecutionRunState,
         working_directory: Option<WorkingDirectoryStatus>,
     ) -> Self {
         Self::Connected {
             handle,
-            run_state,
             working_directory,
         }
     }
@@ -618,14 +607,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn input_commit_ack_survives_json_round_trip() {
-        let result = WorkerExecutionResult::accepted_input_committed(
+    fn submission_ack_survives_json_round_trip() {
+        let result = WorkerExecutionResult::accepted_submission(
             WorkerExecutionOperation::Input,
-            WorkerExecutionRunState::Busy,
+            "request-1",
             "submission-1",
+            protocol::SubmissionDisposition::Started,
         );
 
         let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"submission_request_id\":\"request-1\""));
         assert!(json.contains("\"submission_id\":\"submission-1\""));
         assert_eq!(
             serde_json::from_str::<WorkerExecutionResult>(&json).unwrap(),

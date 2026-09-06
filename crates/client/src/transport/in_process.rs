@@ -89,17 +89,20 @@ mod tests {
         let mut client = Client::new(socket);
 
         client
-            .send(&Method::run_text("hello"))
+            .send(&Method::submit_text(
+                protocol::new_submission_request_id(),
+                "hello",
+            ))
             .await
             .expect("send method");
         assert!(matches!(
             peer.next().await.as_deref().map(decode_method),
-            Some(Ok(Method::Run { .. }))
+            Some(Ok(Method::Submit { .. }))
         ));
 
         peer.send(
-            encode_event(&Event::Status {
-                status: WorkerStatus::Idle,
+            encode_event(&Event::WorkerState {
+                snapshot: WorkerStatus::Idle.into(),
             })
             .expect("encode event"),
         )
@@ -107,9 +110,7 @@ mod tests {
         .expect("send event");
         assert!(matches!(
             client.next_event().await,
-            Ok(Some(Event::Status {
-                status: WorkerStatus::Idle
-            }))
+            Ok(Some(Event::WorkerState { .. }))
         ));
     }
 }

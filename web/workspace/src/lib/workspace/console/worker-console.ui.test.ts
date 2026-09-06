@@ -620,7 +620,7 @@ Deno.test("Worker Console paste chips preserve typed draft and target authority"
       consolePage.includes("preserveExactText: value.textPastes.length > 0") &&
       consolePage.includes("composerDrafts.set(activeComposerTargetKey") &&
       consolePage.includes("switchComposerTarget(target)") &&
-      consolePage.includes('sendControl({ method: "cancel" }, "Stop")'),
+      consolePage.includes('sendWorkerControl("cancel")'),
     "Paste chips should use shared threshold classification, atomic keyboard behavior, accessible labels, typed restore, and per-Worker draft authority",
   );
 });
@@ -655,6 +655,9 @@ Deno.test("workspace Runtime inventory lives under Settings admin routes", async
       import.meta.url,
     ),
   );
+  const runtimeConnectionApi = await Deno.readTextFile(
+    new URL("../api/runtime-connection.ts", import.meta.url),
+  );
   const workdirsPage = await Deno.readTextFile(
     new URL(
       "./../../../routes/w/[workspaceId]/settings/runtimes/[runtimeId]/workdirs/+page.svelte",
@@ -678,9 +681,11 @@ Deno.test("workspace Runtime inventory lives under Settings admin routes", async
     runtimesPage.includes("Add remote Runtime") &&
       runtimesPage.includes("Open workdirs") &&
       runtimesPage.includes("settings-runtime-table") &&
-      runtimesPage.includes(
-        "/runtimes/${encodeURIComponent(runtime.runtime_id)}/connection-tests",
-      ) &&
+      runtimesPage.includes("testRuntimeConnection") &&
+      runtimesPage.includes("data.workspaceId") &&
+      runtimesPage.includes("runtime.runtime_id") &&
+      runtimeConnectionApi.includes("/runtimes/${") &&
+      runtimeConnectionApi.includes("}/connection-tests") &&
       runtimesPage.includes(
         "/settings/runtimes/${encodeURIComponent(runtime.runtime_id)}/workdirs",
       ),
@@ -782,7 +787,10 @@ Deno.test("Worker Console page is routed by runtime_id and worker_id through bac
       consolePage.includes(
         'const composerEditable = $derived(protocolState === "open" && !sending);',
       ) &&
-      consolePage.includes('sendControl({ method: "cancel" }, "Stop")') &&
+      consolePage.includes('sendWorkerControl("cancel")') &&
+      consolePage.includes("lifecycleMethod(command)") &&
+      consolePage.includes("expected_worker_state_revision") &&
+      consolePage.includes("expected_execution_generation") &&
       consolePage.includes("onsubmit={handleComposerSubmit}") &&
       consolePage.includes("disabled={!composerEditable}") &&
       consolePage.includes("class:stop={workerRunning}") &&
@@ -1057,5 +1065,48 @@ Deno.test("Web Console switches main and direct SubWorker views from the Tasks r
       consoleModel.includes("children.map") &&
       consoleModel.includes("resolveConsoleWorkerView"),
     "Worker view selection should expose only direct SubWorker session identities with main fallback",
+  );
+});
+
+Deno.test("Web Console uses Notify while running and exposes durable pending controls", async () => {
+  const consolePage = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+
+  for (
+    const token of [
+      'method: "submit"',
+      'method: "notify"',
+      "notification_request_id: crypto.randomUUID()",
+      "submission_request_id: crypto.randomUUID()",
+      'payload.event === "pending_submissions_changed"',
+      'method: "cancel_pending_submission"',
+      'method: "clear_pending_submissions"',
+      'method: "continue_pending"',
+      "handleQueueSubmit",
+      "handleNotifySubmit",
+      'submitDraft(composerInputElement?.snapshot() ?? draft, "queue")',
+      "disabled={!canQueueDraft}",
+      "disabled={!canNotifyDraft}",
+      ">Queue Submit</button>",
+      ">Notify</button>",
+    ]
+  ) {
+    assert(
+      consolePage.includes(token),
+      `missing durable pending control token: ${token}`,
+    );
+  }
+
+  const userCase = consolePage.slice(
+    consolePage.indexOf('case "user":'),
+    consolePage.indexOf('case "compact":'),
+  );
+  assert(
+    !userCase.includes("workerRunning"),
+    "ordinary text must remain Submit instead of being implicitly converted to Notify",
   );
 });

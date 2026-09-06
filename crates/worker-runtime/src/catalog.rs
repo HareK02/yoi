@@ -307,6 +307,8 @@ pub struct WorkerSummary {
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_state: Option<protocol::WorkerStateSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<WorkingDirectoryStatus>,
@@ -325,6 +327,8 @@ pub struct WorkerDetail {
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_state: Option<protocol::WorkerStateSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<WorkingDirectoryStatus>,
@@ -341,6 +345,8 @@ pub struct WorkerDetail {
 pub struct WorkerLifecycleAck {
     pub worker_ref: WorkerRef,
     pub status: WorkerStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_state: Option<protocol::WorkerStateSnapshot>,
 }
 
 #[cfg(test)]

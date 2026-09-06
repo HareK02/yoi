@@ -4,6 +4,7 @@
   import { workerHref } from '$lib/workspace/resource-links';
   import { formatCurrentWorkdirRevision } from '$lib/workspace/settings/workdir-revision';
   import { canOpenWorkerConsole } from '$lib/workspace/sidebar/workers';
+  import { liveWorkerState } from '$lib/workspace/sidebar/worker-state';
   import type { CleanupWorkerCandidate, RuntimeCleanupExecutionResponse, RuntimeCleanupPlanResponse, Worker } from '$lib/workspace/sidebar/types';
   import type { PageProps } from './$types';
 
@@ -136,7 +137,7 @@
   }
 
   function workerStatus(worker: Worker): string {
-    return worker.state;
+    return liveWorkerState(worker);
   }
 
   function workerProfile(worker: Worker): string {

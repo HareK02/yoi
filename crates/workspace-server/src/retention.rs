@@ -464,6 +464,7 @@ impl SqliteWorkspaceStore {
                 tx.execute("INSERT OR IGNORE INTO worker_tombstones(workspace_id,runtime_id,worker_id,display_name,profile,worker_created_at,removed_at,archive_id,policy_id,policy_revision,operation_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,worker.display_name,worker.profile,worker.created_at,now,plan.archive_id,plan.policy_id,plan.policy_revision,operation_id])?;
             }
             let deleted=tx.execute("DELETE FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND updated_at=?4",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,plan.worker_revision])?;
+            tx.execute("UPDATE worker_create_reservations SET state='removed',updated_at=?4 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state='created'",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,now])?;
             if deleted!=1{return Err(StoreError::InvalidInput(format!("stale:{}:removal fence changed",plan.plan_id)));}
             tx.execute("UPDATE worker_removal_operations SET state='succeeded',failure_category=NULL,updated_at=?1 WHERE operation_id=?2",params![now,operation_id])?;
             tx.execute("INSERT OR IGNORE INTO worker_retention_audit_events(event_id,operation_id,workspace_id,event_kind,detail,created_at) VALUES(?1,?2,?3,'worker_removed',?4,?5)",params![stable("wre",operation_id),operation_id,workspace_id,format!("runtime_id={} worker_id={} session={} metadata={} diagnostics={}",plan.worker.runtime_id,plan.worker.worker_id,sess(plan.session_disposition),meta(plan.metadata_disposition),diag(plan.diagnostics_disposition)),now])?;
@@ -1166,6 +1167,7 @@ mod tests {
         s.with_conn(|conn| {
             conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit) VALUES('w','ticket-old','ticket-old','Old Ticket','open','task','normal','','planning',1)", [])?;
             conn.execute("INSERT INTO worker_registry(workspace_id,worker_id,runtime_id,display_name,profile,retention_state,created_at,updated_at) VALUES('w','1','r','old worker','builtin:coder','normal','created','rev1')", [])?;
+            conn.execute("INSERT INTO worker_create_reservations(workspace_id,allocation_key,worker_id,runtime_id,create_fingerprint,state,created_at,updated_at) VALUES('w','allocation-old',?1,'r','fingerprint','created','created','created')", [worker_id().to_string()])?;
             conn.execute("INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,runtime_id,worker_id,assigned_by,assigned_at) VALUES('w','ticket-old','assignment-old','r','1','test','t')", [])?;
             conn.execute("DELETE FROM worker_registry WHERE workspace_id='w' AND runtime_id='r' AND worker_id='1'", [])?;
             conn.execute("DELETE FROM typed_tickets WHERE workspace_id='w' AND ticket_id='ticket-old'", [])?;
@@ -1212,6 +1214,15 @@ mod tests {
             WorkerRemovalPlanState::Succeeded
         );
         assert!(s.worker_tombstone("w", &p.worker).unwrap().is_some());
+        let reservation_state: String = s.with_conn(|conn| {
+            conn.query_row(
+                "SELECT state FROM worker_create_reservations WHERE workspace_id='w' AND allocation_key='allocation-old'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
+        }).unwrap();
+        assert_eq!(reservation_state, "removed");
         assert_eq!(
             s.commit_worker_removal("w", &p.operation_id, &p.input_fingerprint, &result)
                 .unwrap()

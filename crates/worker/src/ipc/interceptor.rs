@@ -176,18 +176,39 @@ impl WorkerInterceptor {
     /// `Item::system_message`s reach the worker via
     /// `ContinueWith` / `pending_history_appends`, so on-disk order
     /// matches worker-history order.
-    fn commit_system_items(&self, items: &[SystemItem]) -> Result<(), session_store::StoreError> {
+    fn commit_system_items_with_extensions(
+        &self,
+        items: &[(
+            SystemItem,
+            Vec<session_store::SessionExtension>,
+            Option<session_store::LoggedSessionHistoryOrigin>,
+        )],
+    ) -> Result<(), session_store::StoreError> {
         let Some(writer) = self.log_writer.as_ref() else {
             return Ok(());
         };
-        for item in items {
-            let entry = writer.commit_system_item(item.clone())?;
+        for (item, extensions, history_provenance) in items {
+            let entry = writer.commit_system_item_with_extensions(
+                item.clone(),
+                extensions.clone(),
+                history_provenance.clone(),
+            )?;
             self.pending_committed_history
                 .lock()
                 .expect("pending committed history poisoned")
                 .push_back(entry);
         }
         Ok(())
+    }
+
+    fn commit_system_items(&self, items: &[SystemItem]) -> Result<(), session_store::StoreError> {
+        self.commit_system_items_with_extensions(
+            &items
+                .iter()
+                .cloned()
+                .map(|item| (item, Vec::new(), None))
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn current_turn_index(&self) -> usize {
@@ -327,7 +348,11 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
             projection_digest: projection.catalog_digest.clone(),
             logical_name: "internal.notify_wrapper".to_string(),
         };
-        let mut system_items: Vec<SystemItem> = Vec::with_capacity(drained.len());
+        let mut system_items: Vec<(
+            SystemItem,
+            Vec<session_store::SessionExtension>,
+            Option<session_store::LoggedSessionHistoryOrigin>,
+        )> = Vec::with_capacity(drained.len());
         let mut items: Vec<Item> = Vec::with_capacity(drained.len());
         for entry in &drained {
             let system_item = match build_system_item_with_provenance(
@@ -345,9 +370,9 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
                 }
             };
             items.push(system_item.to_history_item());
-            system_items.push(system_item);
+            system_items.push((system_item, entry.extensions(), entry.history_provenance()));
         }
-        if let Err(error) = self.commit_system_items(&system_items) {
+        if let Err(error) = self.commit_system_items_with_extensions(&system_items) {
             self.pending_notifies.requeue_front(drained);
             return Err(InterceptorError::new(
                 InterceptorErrorCategory::Dependency,

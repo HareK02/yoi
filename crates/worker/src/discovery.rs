@@ -779,10 +779,10 @@ async fn probe_socket(socket_path: &Path) -> LiveInfo {
             loop {
                 match tokio::time::timeout(PROBE_TIMEOUT, reader.next::<Event>()).await {
                     Ok(Ok(Some(Event::Snapshot {
-                        status: snapshot_status,
+                        state: snapshot_state,
                         ..
                     }))) => {
-                        status = Some(snapshot_status);
+                        status = Some(snapshot_state.catalog_status());
                         break;
                     }
                     Ok(Ok(Some(Event::Alert(_)))) => continue,
@@ -1012,7 +1012,19 @@ async fn send_peer_notify(socket_path: &Path, message: String) -> io::Result<()>
 }
 
 async fn send_notify(socket_path: &Path, message: String, auto_run: bool) -> io::Result<()> {
-    connect_and_send(socket_path, &Method::Notify { message, auto_run }).await
+    let notification_request_id = protocol::new_submission_request_id();
+    connect_and_send(
+        socket_path,
+        &Method::NotifyTracked {
+            notification_request_id: notification_request_id.clone(),
+            message,
+            auto_run,
+            source: protocol::AuthenticatedInputSource::Backend {
+                operation_id: notification_request_id,
+            },
+        },
+    )
+    .await
 }
 
 fn json_content<T: Serialize>(value: &T) -> Result<String, ToolError> {
@@ -1482,6 +1494,7 @@ mod tests {
             writer
                 .write(&Event::Snapshot {
                     session: protocol::SessionSnapshot {
+                        pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                         entries: Vec::new(),
                     },
                     greeting: protocol::Greeting {
@@ -1494,7 +1507,7 @@ mod tests {
                         context_window: 0,
                         context_tokens: 0,
                     },
-                    status: WorkerStatus::Idle,
+                    state: WorkerStatus::Idle.into(),
                     in_flight: Default::default(),
                     internal_workers: Vec::new(),
                 })
@@ -1517,6 +1530,7 @@ mod tests {
             writer
                 .write(&Event::Snapshot {
                     session: protocol::SessionSnapshot {
+                        pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                         entries: Vec::new(),
                     },
                     greeting: protocol::Greeting {
@@ -1529,14 +1543,17 @@ mod tests {
                         context_window: 0,
                         context_tokens: 0,
                     },
-                    status: WorkerStatus::Idle,
+                    state: WorkerStatus::Idle.into(),
                     in_flight: Default::default(),
                     internal_workers: Vec::new(),
                 })
                 .await
                 .unwrap();
             let method = reader.next::<Method>().await.unwrap().unwrap();
-            if let Method::Notify { message, auto_run } = method {
+            if let Method::NotifyTracked {
+                message, auto_run, ..
+            } = method
+            {
                 assert!(auto_run);
                 tx.send(message).await.unwrap();
             } else {
@@ -1608,6 +1625,7 @@ mod tests {
             writer
                 .write(&Event::Snapshot {
                     session: protocol::SessionSnapshot {
+                        pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                         entries: Vec::new(),
                     },
                     greeting: protocol::Greeting {
@@ -1620,7 +1638,7 @@ mod tests {
                         context_window: 0,
                         context_tokens: 0,
                     },
-                    status: WorkerStatus::Idle,
+                    state: WorkerStatus::Idle.into(),
                     in_flight: Default::default(),
                     internal_workers: Vec::new(),
                 })
@@ -1634,6 +1652,7 @@ mod tests {
             writer
                 .write(&Event::Snapshot {
                     session: protocol::SessionSnapshot {
+                        pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                         entries: Vec::new(),
                     },
                     greeting: protocol::Greeting {
@@ -1646,14 +1665,17 @@ mod tests {
                         context_window: 0,
                         context_tokens: 0,
                     },
-                    status: WorkerStatus::Idle,
+                    state: WorkerStatus::Idle.into(),
                     in_flight: Default::default(),
                     internal_workers: Vec::new(),
                 })
                 .await
                 .unwrap();
             let method = reader.next::<Method>().await.unwrap().unwrap();
-            if let Method::Notify { message, auto_run } = method {
+            if let Method::NotifyTracked {
+                message, auto_run, ..
+            } = method
+            {
                 assert!(!auto_run);
                 tx.send(message).await.unwrap();
             } else {
@@ -1738,6 +1760,7 @@ mod tests {
             writer
                 .write(&Event::Snapshot {
                     session: protocol::SessionSnapshot {
+                        pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                         entries: Vec::new(),
                     },
                     greeting: protocol::Greeting {
@@ -1750,7 +1773,7 @@ mod tests {
                         context_window: 0,
                         context_tokens: 0,
                     },
-                    status: WorkerStatus::Paused,
+                    state: WorkerStatus::Paused.into(),
                     in_flight: Default::default(),
                     internal_workers: Vec::new(),
                 })
@@ -1790,6 +1813,8 @@ mod tests {
                     let _ = writer
                         .write(&Event::Snapshot {
                             session: protocol::SessionSnapshot {
+                                pending_submissions: protocol::PendingSubmissionsSnapshot::default(
+                                ),
                                 entries: Vec::new(),
                             },
                             greeting: protocol::Greeting {
@@ -1802,7 +1827,7 @@ mod tests {
                                 context_window: 0,
                                 context_tokens: 0,
                             },
-                            status: WorkerStatus::Idle,
+                            state: WorkerStatus::Idle.into(),
                             in_flight: Default::default(),
                             internal_workers: Vec::new(),
                         })

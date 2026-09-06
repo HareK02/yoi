@@ -112,6 +112,8 @@ pub enum LogEntry {
     AnnotatedSystemItem {
         ts: u64,
         entry: LoggedSystemHistoryEntry,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        extensions: Vec<SessionExtension>,
     },
 
     /// Turn boundary. Records the turn count after increment.
@@ -312,12 +314,19 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
                 state.annotated_history.push(entry.clone());
                 state.history.push(Item::from(entry.item.clone()));
             }
-            LogEntry::AnnotatedSystemItem { entry, .. } => {
+            LogEntry::AnnotatedSystemItem {
+                entry, extensions, ..
+            } => {
                 state.annotated_history.push(LoggedHistoryEntry {
                     item: LoggedItem::from(entry.item.to_history_item()),
                     metadata: entry.metadata.clone(),
                 });
                 state.history.push(entry.item.to_history_item());
+                state.extensions.extend(
+                    extensions
+                        .iter()
+                        .map(|extension| (extension.domain.clone(), extension.payload.clone())),
+                );
             }
             LogEntry::TurnEnd { turn_count, .. } => {
                 if let Some(active_turn_count) = &mut state.active_run_turn_count {

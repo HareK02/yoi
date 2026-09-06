@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use protocol::{
     AlertLevel, AlertSource, CompletionEntry, CompletionKind, ErrorCode, Event, InFlightBlock,
     InFlightSnapshot, InFlightToolCallState, InternalWorkerRef, InternalWorkerSnapshot, Method,
-    RewindTarget, RunResult, Segment, WorkerStatus,
+    RewindTarget, RunResult, Segment, WorkerCommandEnvelope, WorkerStateSnapshot, WorkerStatus,
 };
 
 use crate::block::{
@@ -100,23 +100,6 @@ struct RollbackSubmitState {
     segments: Vec<Segment>,
     block_start: usize,
     turn_before: usize,
-}
-
-#[derive(Clone)]
-pub struct QueuedInput {
-    segments: Vec<Segment>,
-    preview: String,
-}
-
-impl QueuedInput {
-    fn new(segments: Vec<Segment>) -> Self {
-        let preview = Segment::flatten_to_text(&segments);
-        Self { segments, preview }
-    }
-
-    pub fn preview(&self) -> &str {
-        &self.preview
-    }
 }
 
 struct ComposerInputHistory {
@@ -242,8 +225,10 @@ pub struct WorkerViewTab {
 pub struct App {
     pub worker_name: String,
     pub connected: bool,
-    /// Last controller status reported by the Worker. Drives the status line
-    /// and Ctrl-key routing; do not infer this solely from replayed history.
+    /// Latest authoritative revisioned live execution state.
+    pub worker_state: WorkerStateSnapshot,
+    next_command_id: u64,
+    /// Derived Runtime-catalog compatibility projection used by existing UI.
     pub worker_status: WorkerStatus,
     /// True while the Worker is in `WorkerStatus::Running`.
     pub running: bool,
@@ -272,7 +257,7 @@ pub struct App {
     /// Current transient actionbar notice. Notices are local UI state only:
     /// they are never appended to transcript/session history or LLM context.
     actionbar_notice: Option<ActionbarNotice>,
-    /// Normal composer input that is submitted as `Method::Run`.
+    /// Normal composer input that is submitted as `Method::Submit`.
     pub input: InputBuffer,
     /// Separate command-line input. It is never submitted as a user message.
     pub command_input: InputBuffer,
@@ -333,9 +318,8 @@ pub struct App {
     /// Top entry index of the task pane's visible window. Clamped on
     /// render so it never points past the end of the list.
     pub task_pane_scroll: usize,
-    /// TUI-local FIFO of user inputs submitted while the Worker is already running.
-    /// Entries have not been sent to the Worker yet, so they remain editable/cancellable locally.
-    queued_inputs: VecDeque<QueuedInput>,
+    /// Authoritative WorkerSession FIFO summary received from snapshot/live events.
+    pending_submissions: protocol::PendingSubmissionsSnapshot,
     /// TUI-local readline-style composer input history. This is intentionally
     /// client-side only: recalled entries are plain drafts until submitted again.
     input_history: ComposerInputHistory,
@@ -355,6 +339,8 @@ impl App {
         Self {
             worker_name,
             connected: false,
+            worker_state: WorkerStateSnapshot::initial(1),
+            next_command_id: 1,
             worker_status: WorkerStatus::Idle,
             running: false,
             paused: false,
@@ -395,7 +381,7 @@ impl App {
             text_selection: TextSelectionState::default(),
             task_pane_open: false,
             task_pane_scroll: 0,
-            queued_inputs: VecDeque::new(),
+            pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
             input_history: ComposerInputHistory::new(),
             input_history_store: None,
             pending_submit_rollback: None,
@@ -763,23 +749,40 @@ impl App {
             if self.paused {
                 self.input_history.cancel_browse();
                 self.input.clear();
-                return Some(Method::Resume);
+                let command = self.next_command_envelope();
+                return Some(Method::Resume { command });
             }
             return None;
         }
         self.record_input_history(segments.clone());
-        if self.running {
-            self.queued_inputs.push_back(QueuedInput::new(segments));
-            self.input.clear();
-            self.completion = None;
-            return None;
-        }
         self.input.clear();
         Some(self.method_for_run(segments))
     }
 
+    pub fn submit_notify_input(&mut self) -> Option<Method> {
+        let segments = self.input.submit_segments();
+        if segments_are_blank(&segments) {
+            return None;
+        }
+        if segments
+            .iter()
+            .any(|segment| matches!(segment, Segment::UploadedFile { .. }))
+        {
+            self.push_error("Notify accepts text only; remove attachments or queue a Submit.");
+            return None;
+        }
+        let message = Segment::flatten_to_text(&segments);
+        self.record_input_history(segments);
+        self.input.clear();
+        Some(Method::Notify {
+            notification_request_id: protocol::new_submission_request_id(),
+            message,
+            auto_run: true,
+        })
+    }
+
     pub fn restore_unsent_run(&mut self, method: &Method) {
-        let Method::Run { input } = method else {
+        let Method::Submit { input, .. } = method else {
             return;
         };
         self.pending_submit_rollback = None;
@@ -787,8 +790,9 @@ impl App {
             self.input.replace_with_segments(input);
             self.completion = None;
         } else {
-            self.queued_inputs
-                .push_front(QueuedInput::new(input.clone()));
+            self.push_error(
+                "Submit transport failed; current Composer was preserved and the unsent input was not queued.",
+            );
         }
     }
 
@@ -804,7 +808,10 @@ impl App {
             block_start: self.blocks.len(),
             turn_before: self.turn_index,
         });
-        Method::Run { input: segments }
+        Method::Submit {
+            submission_request_id: protocol::new_submission_request_id(),
+            input: segments,
+        }
     }
 
     fn record_input_history(&mut self, segments: Vec<Segment>) {
@@ -825,7 +832,7 @@ impl App {
     }
 
     pub fn queued_input_count(&self) -> usize {
-        self.queued_inputs.len()
+        self.pending_submissions.submissions.len()
     }
 
     #[cfg(test)]
@@ -910,36 +917,31 @@ impl App {
         }
     }
 
+    pub fn continue_pending_method(&self) -> Option<Method> {
+        Some(Method::ContinuePending {
+            expected_revision: self.pending_submissions.revision,
+            expected_head_id: self.pending_submissions.head_id.clone()?,
+        })
+    }
+
+    pub fn clear_pending_method(&self) -> Method {
+        Method::ClearPendingSubmissions {
+            expected_revision: self.pending_submissions.revision,
+        }
+    }
+
+    pub fn cancel_pending_method(&self, submission_id: String) -> Method {
+        Method::CancelPendingSubmission {
+            submission_id,
+            expected_revision: self.pending_submissions.revision,
+        }
+    }
+
     pub fn next_queued_input_preview(&self) -> Option<&str> {
-        self.queued_inputs.front().map(QueuedInput::preview)
-    }
-
-    pub fn clear_queued_inputs(&mut self) -> usize {
-        let cleared = self.queued_inputs.len();
-        self.queued_inputs.clear();
-        cleared
-    }
-
-    pub fn restore_next_queued_input_to_composer(&mut self) -> bool {
-        if self.queued_inputs.is_empty() {
-            return false;
-        }
-        if !self.input.is_empty() {
-            self.push_error("Composer is not empty; clear it before editing queued input.");
-            return false;
-        }
-        let Some(queued) = self.queued_inputs.pop_front() else {
-            return false;
-        };
-        self.input_history.cancel_browse();
-        self.input.replace_with_segments(&queued.segments);
-        self.completion = None;
-        true
-    }
-
-    fn pop_next_queued_run(&mut self) -> Option<Method> {
-        let queued = self.queued_inputs.pop_front()?;
-        Some(self.method_for_run(queued.segments))
+        self.pending_submissions
+            .submissions
+            .first()
+            .map(|submission| submission.submission_id.as_str())
     }
 
     pub fn clear_actionbar_notice(&mut self) {
@@ -1117,12 +1119,42 @@ impl App {
         }
     }
 
+    pub fn next_command_envelope(&mut self) -> WorkerCommandEnvelope {
+        let command_id = self
+            .next_command_id
+            .max(self.worker_state.last_command_id.saturating_add(1));
+        let command = WorkerCommandEnvelope::for_snapshot(command_id, &self.worker_state);
+        self.next_command_id = command_id.saturating_add(1);
+        command
+    }
+
+    fn apply_worker_state_snapshot(&mut self, snapshot: &WorkerStateSnapshot) {
+        match protocol::apply_worker_state_snapshot(&mut self.worker_state, snapshot) {
+            Ok(protocol::WorkerStateSnapshotApply::Applied) => {
+                self.set_worker_status(self.worker_state.catalog_status());
+            }
+            Ok(
+                protocol::WorkerStateSnapshotApply::Duplicate
+                | protocol::WorkerStateSnapshotApply::Stale,
+            ) => {}
+            Err(error) => self.handle_error(
+                ErrorCode::Internal,
+                format!("worker state stream rejected: {error}"),
+            ),
+        }
+    }
+
     pub fn handle_worker_event(&mut self, event: Event) -> Option<Method> {
         if self.rewind_refresh_fence && event_is_stale_after_rewind(&event) {
             return None;
         }
 
         match event {
+            Event::SubmissionAccepted { .. } => {}
+            Event::SubmissionRejected { message, .. } => self.push_error(message),
+            Event::PendingSubmissionsChanged { pending } => {
+                self.pending_submissions = pending;
+            }
             Event::UserMessage { segments } => {
                 self.turn_index += 1;
                 self.blocks.push(Block::TurnHeader {
@@ -1148,18 +1180,14 @@ impl App {
                 self.assistant_streaming = false;
             }
             Event::TurnStart { .. } => {
-                self.set_worker_status(WorkerStatus::Running);
                 self.run_requests += 1;
                 self.current_tool = None;
                 self.latest_llm_wait_event = None;
                 self.assistant_streaming = false;
             }
-            Event::InvokeStart { .. } => {
-                self.set_worker_status(WorkerStatus::Running);
-            }
+            Event::InvokeStart { .. } => {}
             // UI consumers of per-attempt LlmCall semantics remain out of scope;
-            // the run-level status starts at InvokeStart and TurnStart counts each
-            // LLM request within that run.
+            // authoritative run state comes only from WorkerStateSnapshot.
             Event::LlmCallStart { .. } | Event::LlmCallEnd { .. } => {
                 self.latest_llm_wait_event = None;
             }
@@ -1366,15 +1394,7 @@ impl App {
                         output_tokens: self.run_output_tokens,
                     });
                     self.pending_submit_rollback = None;
-                    self.reset_run_state(match result {
-                        RunResult::Paused => WorkerStatus::Paused,
-                        RunResult::Finished | RunResult::LimitReached | RunResult::RolledBack => {
-                            WorkerStatus::Idle
-                        }
-                    });
-                    if matches!(result, RunResult::Finished | RunResult::LimitReached) {
-                        return self.pop_next_queued_run();
-                    }
+                    self.reset_run_state();
                 }
             }
             Event::CompactStart { .. } => {
@@ -1444,14 +1464,15 @@ impl App {
             Event::Snapshot {
                 session,
                 greeting,
-                status,
+                state,
                 in_flight,
                 internal_workers,
             } => {
                 self.rewind_refresh_fence = false;
+                self.pending_submissions = session.pending_submissions.clone();
                 self.restore_snapshot(&session, greeting, in_flight);
                 self.replace_internal_worker_snapshots(internal_workers);
-                self.set_worker_status(status);
+                self.apply_worker_state_snapshot(&state);
             }
             Event::InternalWorker {
                 worker,
@@ -1461,9 +1482,12 @@ impl App {
             Event::InternalWorkerRemoved { worker, revision } => {
                 self.remove_internal_worker(worker, revision)
             }
-            Event::Status { status } => {
+            Event::WorkerState { snapshot } => {
                 self.rewind_refresh_fence = false;
-                self.set_worker_status(status);
+                self.apply_worker_state_snapshot(&snapshot);
+            }
+            Event::CommandAcknowledged { acknowledgement } => {
+                self.apply_worker_state_snapshot(&acknowledgement.state);
             }
             // Command telemetry is an operational Web Console surface. The
             // TUI continues to render the final Bash ToolResult from history.
@@ -1503,7 +1527,7 @@ impl App {
                 };
                 self.completion = None;
                 self.close_rewind_picker();
-                self.reset_run_state(self.worker_status);
+                self.reset_run_state();
                 let mut message = if restored_composer {
                     format!(
                         "Rewound session: discarded {} log entries; restored selected input to composer.",
@@ -1551,8 +1575,7 @@ impl App {
         None
     }
 
-    fn reset_run_state(&mut self, status: WorkerStatus) {
-        self.set_worker_status(status);
+    fn reset_run_state(&mut self) {
         self.run_requests = 0;
         self.run_upload_tokens = 0;
         self.run_output_tokens = 0;
@@ -1582,7 +1605,7 @@ impl App {
             "Rolled back empty assistant turn; no local submitted input was available to restore."
                 .to_owned()
         };
-        self.reset_run_state(WorkerStatus::Idle);
+        self.reset_run_state();
         self.blocks.push(Block::Alert {
             level: AlertLevel::Warn,
             source: AlertSource::Worker,
@@ -2026,12 +2049,18 @@ impl App {
             self.input_mode = CommandInputMode::Composer;
             self.command_completion_selected = None;
         }
-        if let Some(Method::ListRewindTargets) = result.method.as_ref() {
+        let mut method = result.method;
+        if let Some(Method::Compact { .. }) = method {
+            method = Some(Method::Compact {
+                command: self.next_command_envelope(),
+            });
+        }
+        if let Some(Method::ListRewindTargets) = method.as_ref() {
             self.completion = None;
             self.rewind_picker = None;
             self.rewind_request_pending = true;
         }
-        result.method
+        method
     }
 
     fn push_command_diagnostic(&mut self, message: impl Into<String>) {
@@ -2681,7 +2710,10 @@ mod rewind_refresh_tests {
         });
 
         app.handle_worker_event(Event::RewindApplied {
-            session: protocol::SessionSnapshot { entries: vec![] },
+            session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                entries: vec![],
+            },
             input: vec![Segment::text("selected rewind input")],
             summary: summary(3),
         });
@@ -2700,7 +2732,10 @@ mod rewind_refresh_tests {
         });
 
         app.handle_worker_event(Event::RewindApplied {
-            session: protocol::SessionSnapshot { entries: vec![] },
+            session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                entries: vec![],
+            },
             input: vec![Segment::text("rewound input")],
             summary: summary(1),
         });
@@ -2743,7 +2778,10 @@ mod rewind_refresh_tests {
         });
 
         app.handle_worker_event(Event::RewindApplied {
-            session: protocol::SessionSnapshot { entries: vec![] },
+            session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                entries: vec![],
+            },
             input: vec![Segment::text("rewound input")],
             summary: summary(2),
         });
@@ -2752,8 +2790,8 @@ mod rewind_refresh_tests {
         });
         assert!(!blocks_contain(&app, "stale tail after rewind"));
 
-        app.handle_worker_event(Event::Status {
-            status: WorkerStatus::Idle,
+        app.handle_worker_event(Event::WorkerState {
+            snapshot: WorkerStatus::Idle.into(),
         });
         app.handle_worker_event(Event::TextDelta {
             text: "new live tail after status".into(),
@@ -2877,7 +2915,7 @@ mod composer_history_persistence_tests {
                 path: "src/lib.rs".into(),
             },
         ]);
-        assert!(matches!(app.submit_input(), Some(Method::Run { .. })));
+        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
 
         let mut reloaded = App::new_with_input_history_store("test".into(), store);
         assert!(reloaded.browse_input_history_older());
@@ -2958,7 +2996,7 @@ mod composer_history_persistence_tests {
             app.insert_char(c);
         }
         match app.submit_input() {
-            Some(Method::Run { input }) => input,
+            Some(Method::Submit { input, .. }) => input,
             other => panic!("expected Run, got {other:?}"),
         }
     }
@@ -3424,72 +3462,44 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn running_submit_is_queued_locally_and_clears_composer() {
+    fn running_submit_is_sent_to_the_worker_and_not_queued_locally() {
         let mut app = App::new("test".into());
         app.set_worker_status(WorkerStatus::Running);
         insert_text(&mut app, "queued turn");
 
-        assert!(app.submit_input().is_none());
+        let method = app.submit_input();
 
-        assert_eq!(app.queued_input_count(), 1);
-        assert_eq!(app.next_queued_input_preview(), Some("queued turn"));
+        assert!(matches!(method, Some(Method::Submit { .. })));
+        assert_eq!(app.queued_input_count(), 0);
         assert_eq!(input_text(&app), "");
     }
 
     #[test]
-    fn finished_run_auto_sends_next_queued_input() {
+    fn pending_submission_projection_is_worker_authoritative() {
         let mut app = App::new("test".into());
-        app.set_worker_status(WorkerStatus::Running);
-        insert_text(&mut app, "next turn");
-        assert!(app.submit_input().is_none());
-
-        let method = app.handle_worker_event(Event::RunEnd {
-            result: RunResult::Finished,
+        app.handle_worker_event(Event::PendingSubmissionsChanged {
+            pending: protocol::PendingSubmissionsSnapshot {
+                revision: 3,
+                notification_count: 0,
+                head_id: Some("submission-1".into()),
+                submissions: vec![protocol::PendingSubmissionSummary {
+                    submission_id: "submission-1".into(),
+                    accepted_at_ms: 7,
+                    segment_count: 2,
+                    byte_len: 42,
+                }],
+            },
         });
 
-        match method {
-            Some(Method::Run { input }) => {
-                assert_eq!(Segment::flatten_to_text(&input), "next turn");
-            }
-            other => panic!("expected queued Run, got {other:?}"),
-        }
-        assert_eq!(app.queued_input_count(), 0);
-    }
-
-    #[test]
-    fn limit_reached_run_auto_sends_next_queued_input() {
-        let mut app = App::new("test".into());
-        app.set_worker_status(WorkerStatus::Running);
-        insert_text(&mut app, "next after limit");
-        assert!(app.submit_input().is_none());
-
-        let method = app.handle_worker_event(Event::RunEnd {
-            result: RunResult::LimitReached,
-        });
-
-        match method {
-            Some(Method::Run { input }) => {
-                assert_eq!(Segment::flatten_to_text(&input), "next after limit");
-            }
-            other => panic!("expected queued Run, got {other:?}"),
-        }
-        assert_eq!(app.queued_input_count(), 0);
-    }
-
-    #[test]
-    fn paused_and_rolled_back_run_do_not_auto_send_queue() {
-        for result in [RunResult::Paused, RunResult::RolledBack] {
-            let mut app = App::new("test".into());
-            app.set_worker_status(WorkerStatus::Running);
-            insert_text(&mut app, "held turn");
-            assert!(app.submit_input().is_none());
-
-            let method = app.handle_worker_event(Event::RunEnd { result });
-
-            assert!(method.is_none());
-            assert_eq!(app.queued_input_count(), 1);
-            assert_eq!(app.next_queued_input_preview(), Some("held turn"));
-        }
+        assert_eq!(app.queued_input_count(), 1);
+        assert_eq!(app.next_queued_input_preview(), Some("submission-1"));
+        assert!(
+            app.handle_worker_event(Event::RunEnd {
+                result: RunResult::Finished,
+            })
+            .is_none()
+        );
+        assert_eq!(app.queued_input_count(), 1);
     }
 
     #[test]
@@ -3497,25 +3507,7 @@ mod completion_flow_tests {
         let mut app = App::new("test".into());
         app.set_worker_status(WorkerStatus::Paused);
 
-        assert!(matches!(app.submit_input(), Some(Method::Resume)));
-        assert_eq!(app.queued_input_count(), 0);
-    }
-
-    #[test]
-    fn queued_input_can_be_restored_to_composer_or_cleared() {
-        let mut app = App::new("test".into());
-        app.set_worker_status(WorkerStatus::Running);
-        insert_text(&mut app, "edit me");
-        assert!(app.submit_input().is_none());
-
-        assert!(app.restore_next_queued_input_to_composer());
-        assert_eq!(app.queued_input_count(), 0);
-        assert_eq!(input_text(&app), "edit me");
-
-        app.input.clear();
-        insert_text(&mut app, "clear me");
-        assert!(app.submit_input().is_none());
-        assert_eq!(app.clear_queued_inputs(), 1);
+        assert!(matches!(app.submit_input(), Some(Method::Resume { .. })));
         assert_eq!(app.queued_input_count(), 0);
     }
 
@@ -3530,7 +3522,7 @@ mod completion_flow_tests {
             app.insert_char(c);
         }
         match app.submit_input() {
-            Some(Method::Run { input }) => input,
+            Some(Method::Submit { input, .. }) => input,
             other => panic!("expected Run, got {other:?}"),
         }
     }
@@ -3570,7 +3562,7 @@ mod completion_flow_tests {
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             session: public_session(vec![session_start_value]),
-            status: WorkerStatus::Running,
+            state: test_worker_state(WorkerStatus::Running),
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });
@@ -3582,14 +3574,98 @@ mod completion_flow_tests {
     }
 
     #[test]
+    fn occurrence_events_do_not_infer_foreground_worker_state() {
+        let mut app = App::new("test".into());
+        app.handle_worker_event(Event::TurnStart { turn: 1 });
+        app.handle_worker_event(Event::InvokeStart {
+            kind: protocol::InvokeKind::UserSend,
+        });
+        app.handle_worker_event(Event::RunEnd {
+            result: RunResult::Paused,
+        });
+        assert_eq!(app.worker_state.state, protocol::WorkerState::Idle);
+        assert_eq!(app.worker_status, WorkerStatus::Idle);
+
+        let running = WorkerStateSnapshot {
+            execution_generation: 1,
+            revision: 1,
+            state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                protocol::WorkerRunState::Running,
+            )),
+            last_command_id: 0,
+        };
+        app.handle_worker_event(Event::WorkerState {
+            snapshot: running.clone(),
+        });
+        app.handle_worker_event(Event::RunEnd {
+            result: RunResult::Finished,
+        });
+        assert_eq!(app.worker_state, running);
+        assert_eq!(app.worker_status, WorkerStatus::Running);
+    }
+
+    #[test]
+    fn worker_state_events_and_acknowledgements_share_monotonic_application() {
+        let mut app = App::new("test".into());
+        let running = WorkerStateSnapshot {
+            execution_generation: 4,
+            revision: 3,
+            state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                protocol::WorkerRunState::Running,
+            )),
+            last_command_id: 2,
+        };
+        app.handle_worker_event(Event::WorkerState {
+            snapshot: running.clone(),
+        });
+        app.handle_worker_event(Event::WorkerState {
+            snapshot: WorkerStateSnapshot {
+                revision: 2,
+                state: protocol::WorkerState::Idle,
+                ..running.clone()
+            },
+        });
+        assert_eq!(app.worker_state, running);
+
+        let paused = WorkerStateSnapshot {
+            revision: 4,
+            state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                protocol::WorkerRunState::Paused,
+            )),
+            last_command_id: 3,
+            ..running.clone()
+        };
+        app.handle_worker_event(Event::CommandAcknowledged {
+            acknowledgement: protocol::WorkerCommandAcknowledgement {
+                command_id: 3,
+                command: protocol::WorkerCommandKind::Pause,
+                disposition: protocol::WorkerCommandDisposition::Accepted,
+                state: paused.clone(),
+            },
+        });
+        assert_eq!(app.worker_state, paused);
+
+        app.handle_worker_event(Event::WorkerState {
+            snapshot: WorkerStateSnapshot {
+                state: protocol::WorkerState::Idle,
+                ..paused.clone()
+            },
+        });
+        assert_eq!(app.worker_state, paused);
+        assert!(app.run_error_messages.iter().any(|message| {
+            message.contains("conflicting worker state snapshots at generation 4 revision 4")
+        }));
+    }
+
+    #[test]
     fn snapshot_replaces_live_error_with_one_durable_run_error_block() {
         let mut app = App::new("test".into());
         app.handle_worker_event(Event::Error {
             code: ErrorCode::ProviderError,
             message: "provider unavailable".into(),
         });
-        app.handle_worker_event(Event::Status {
-            status: WorkerStatus::Idle,
+        app.handle_worker_event(Event::WorkerState {
+            snapshot: WorkerStatus::Idle.into(),
         });
 
         let live_errors = app
@@ -3614,7 +3690,7 @@ mod completion_flow_tests {
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             session: public_session(vec![serde_json::to_value(run_errored).unwrap()]),
-            status: WorkerStatus::Idle,
+            state: test_worker_state(WorkerStatus::Idle),
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });
@@ -3675,9 +3751,10 @@ mod completion_flow_tests {
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
-            status: WorkerStatus::Running,
+            state: test_worker_state(WorkerStatus::Running),
             in_flight: InFlightSnapshot {
                 blocks: vec![
                     InFlightBlock::Thinking {
@@ -3783,6 +3860,7 @@ mod completion_flow_tests {
             revision,
             status: WorkerStatus::Idle,
             session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
             in_flight: protocol::InFlightSnapshot::default(),
@@ -4000,9 +4078,10 @@ mod completion_flow_tests {
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
-            status: WorkerStatus::Idle,
+            state: test_worker_state(WorkerStatus::Idle),
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });
@@ -4051,9 +4130,10 @@ mod completion_flow_tests {
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
-            status: WorkerStatus::Idle,
+            state: test_worker_state(WorkerStatus::Idle),
             in_flight: Default::default(),
             internal_workers: vec![InternalWorkerSnapshot {
                 worker: InternalWorkerRef {
@@ -4064,6 +4144,7 @@ mod completion_flow_tests {
                 },
                 revision: 4,
                 session: protocol::SessionSnapshot {
+                    pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                     entries: Vec::new(),
                 },
                 status: WorkerStatus::Running,
@@ -4200,6 +4281,13 @@ mod completion_flow_tests {
             .count()
     }
 
+    fn test_worker_state(status: WorkerStatus) -> WorkerStateSnapshot {
+        let mut snapshot = WorkerStateSnapshot::from(status);
+        snapshot.execution_generation = 1;
+        snapshot.revision = 1;
+        snapshot
+    }
+
     fn test_greeting() -> protocol::Greeting {
         protocol::Greeting {
             worker_name: "test".into(),
@@ -4222,10 +4310,11 @@ mod completion_flow_tests {
 
         app.handle_worker_event(Event::Snapshot {
             session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
             },
             greeting,
-            status: WorkerStatus::Idle,
+            state: test_worker_state(WorkerStatus::Idle),
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });
@@ -4424,7 +4513,7 @@ mod completion_flow_tests {
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             session: public_session(assistant_item_entries),
-            status: WorkerStatus::Running,
+            state: test_worker_state(WorkerStatus::Running),
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });
@@ -4437,23 +4526,23 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn input_history_records_queued_inputs_and_suppresses_consecutive_duplicates() {
+    fn input_history_records_running_submits_and_suppresses_consecutive_duplicates() {
         let mut app = App::new("test".into());
         app.running = true;
 
         for c in "repeat".chars() {
             app.insert_char(c);
         }
-        assert!(app.submit_input().is_none());
+        assert!(app.submit_input().is_some());
         assert_eq!(app.input_history_len(), 1);
-        assert_eq!(app.queued_input_count(), 1);
+        assert_eq!(app.queued_input_count(), 0);
 
         for c in "repeat".chars() {
             app.insert_char(c);
         }
-        assert!(app.submit_input().is_none());
+        assert!(app.submit_input().is_some());
         assert_eq!(app.input_history_len(), 1);
-        assert_eq!(app.queued_input_count(), 2);
+        assert_eq!(app.queued_input_count(), 0);
 
         app.insert_char(' ');
         assert!(app.submit_input().is_none());
@@ -4481,7 +4570,7 @@ mod completion_flow_tests {
             },
         ];
         app.input.replace_with_segments(&original);
-        assert!(matches!(app.submit_input(), Some(Method::Run { .. })));
+        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
 
         assert!(app.browse_input_history_older());
         assert_eq!(app.input.submit_segments(), original);
@@ -4493,7 +4582,7 @@ mod completion_flow_tests {
         for c in "sent".chars() {
             app.insert_char(c);
         }
-        assert!(matches!(app.submit_input(), Some(Method::Run { .. })));
+        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
 
         for c in "draft".chars() {
             app.insert_char(c);
@@ -4511,7 +4600,7 @@ mod completion_flow_tests {
         for c in "sent".chars() {
             app.insert_char(c);
         }
-        assert!(matches!(app.submit_input(), Some(Method::Run { .. })));
+        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
 
         assert!(app.browse_input_history_older());
         assert!(app.input_history_is_browsing());
@@ -4528,17 +4617,19 @@ mod completion_flow_tests {
         for c in "first".chars() {
             app.insert_char(c);
         }
-        assert!(matches!(app.submit_input(), Some(Method::Run { .. })));
+        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
         for c in "second".chars() {
             app.insert_char(c);
         }
-        assert!(matches!(app.submit_input(), Some(Method::Run { .. })));
+        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
 
         assert!(app.browse_input_history_older());
         assert!(app.browse_input_history_older());
         let method = app.submit_input();
         match method {
-            Some(Method::Run { input }) => assert_eq!(Segment::flatten_to_text(&input), "first"),
+            Some(Method::Submit { input, .. }) => {
+                assert_eq!(Segment::flatten_to_text(&input), "first")
+            }
             other => panic!("expected recalled run, got {other:?}"),
         }
         assert_eq!(app.input_history_len(), 3);

@@ -5,6 +5,7 @@ function assertEquals(actual: unknown, expected: unknown): void {
     throw new Error(`expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
   }
 }
+import { liveWorkerState } from './worker-state';
 import {
   applyWorkspaceWorkersFrame,
   createWorkspaceWorkersProjection,
@@ -32,6 +33,22 @@ function worker(
     working_directory_id: null,
   };
 }
+
+Deno.test('Worker list state uses the authoritative live snapshot separately from lifecycle', () => {
+  const active = worker('runtime-a', 'worker-1', 1);
+  active.worker_state = {
+    execution_generation: 4,
+    revision: 2,
+    last_command_id: 1,
+    state: { kind: 'busy', state: { kind: 'run', state: 'paused' } },
+  };
+  assertEquals(liveWorkerState(active), 'paused');
+
+  const unavailable = worker('runtime-a', 'worker-2', 1);
+  assertEquals(liveWorkerState(unavailable), 'unknown');
+  unavailable.state = 'stopped';
+  assertEquals(liveWorkerState(unavailable), 'stopped');
+});
 
 Deno.test('workspace Worker snapshot keeps equal local ids from different Runtimes', () => {
   const projection = createWorkspaceWorkersProjection();

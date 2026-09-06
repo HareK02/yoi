@@ -25,10 +25,10 @@ impl WorkerInputKind {
 pub struct WorkerInput {
     pub kind: WorkerInputKind,
     pub content: String,
-    /// Runtime-generated correlation id. This is never accepted from public
-    /// JSON input and is consumed only by the execution backend.
-    #[serde(skip)]
-    pub submission_id: Option<String>,
+    /// Authenticated client-generated idempotency key. Runtime generates one
+    /// only for trusted internal callers that omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segments: Option<Vec<Segment>>,
 }
@@ -38,7 +38,7 @@ impl WorkerInput {
         Self {
             kind: WorkerInputKind::User,
             content: content.into(),
-            submission_id: None,
+            submission_request_id: None,
             segments: None,
         }
     }
@@ -47,7 +47,7 @@ impl WorkerInput {
         Self {
             kind: WorkerInputKind::Notify,
             content: content.into(),
-            submission_id: None,
+            submission_request_id: None,
             segments: None,
         }
     }
@@ -56,6 +56,21 @@ impl WorkerInput {
 #[cfg(test)]
 mod tests {
     use super::WorkerInput;
+
+    #[test]
+    fn submission_request_id_round_trips_for_authenticated_client_retry() {
+        let input: WorkerInput = serde_json::from_value(serde_json::json!({
+            "kind": "user",
+            "content": "message",
+            "submission_request_id": "request-1"
+        }))
+        .unwrap();
+        assert_eq!(input.submission_request_id.as_deref(), Some("request-1"));
+        assert_eq!(
+            serde_json::to_value(input).unwrap()["submission_request_id"],
+            "request-1"
+        );
+    }
 
     #[test]
     fn notify_is_an_operation_and_legacy_system_kind_is_rejected() {
@@ -78,4 +93,7 @@ mod tests {
 pub struct WorkerInteractionAck {
     pub worker_ref: WorkerRef,
     pub status: WorkerStatus,
+    /// Present for User Submit and absent for non-Submit interactions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submission: Option<crate::execution::WorkerSubmissionAck>,
 }

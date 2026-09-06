@@ -112,26 +112,27 @@ mod tests {
     async fn encodes_methods_and_decodes_events_above_transport() {
         let mut socket = TestSocket::default();
         socket.incoming.push_back(
-            encode_event(&Event::Status {
-                status: WorkerStatus::Idle,
+            encode_event(&Event::WorkerState {
+                snapshot: WorkerStatus::Idle.into(),
             })
             .expect("encode event"),
         );
         let mut client = Client::new(socket);
 
         client
-            .send(&Method::run_text("hello"))
+            .send(&Method::submit_text(
+                protocol::new_submission_request_id(),
+                "hello",
+            ))
             .await
             .expect("send method");
         assert!(matches!(
             decode_method(&client.socket.sent[0]),
-            Ok(Method::Run { .. })
+            Ok(Method::Submit { .. })
         ));
         assert!(matches!(
             client.next_event().await,
-            Ok(Some(Event::Status {
-                status: WorkerStatus::Idle
-            }))
+            Ok(Some(Event::WorkerState { .. }))
         ));
     }
 }

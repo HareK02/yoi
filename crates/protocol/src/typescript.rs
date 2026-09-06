@@ -8,11 +8,14 @@ use crate::{
     CompletionKind, ErrorCode, Event, Greeting, InFlightBlock, InFlightSnapshot,
     InFlightToolCallState, InternalWorkerKind, InternalWorkerRef, InternalWorkerSnapshot,
     InvokeKind, MemoryWorkerEvent, Method, PasteArtifactAvailability, PasteArtifactMediaType,
-    PasteArtifactRef, Permission, RewindSummary, RewindTarget, RewindTargetId, RunResult,
-    ScopeRule, Segment, SessionContentPart, SessionEntryProvenance, SessionMessageRole,
-    SessionSnapshot, SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment,
-    ToolResultDisposition, TurnResult, UploadedFileAvailability, UploadedFileRef, WorkerEvent,
-    WorkerStatus,
+    PasteArtifactRef, PendingSubmissionSummary, PendingSubmissionsSnapshot, Permission,
+    RewindSummary, RewindTarget, RewindTargetId, RunResult, ScopeRule, Segment, SessionContentPart,
+    SessionEntryProvenance, SessionMessageRole, SessionSnapshot, SessionSnapshotEntry,
+    SessionSnapshotEntryData, SessionToolAttachment, SubmissionDisposition, ToolResultDisposition,
+    TurnResult, UploadedFileAvailability, UploadedFileRef, WorkerBusyState,
+    WorkerCommandAcknowledgement, WorkerCommandDisposition, WorkerCommandEnvelope,
+    WorkerCommandKind, WorkerEvent, WorkerMaintenanceState, WorkerRunState, WorkerState,
+    WorkerStateSnapshot, WorkerStatus,
     subscription::{
         EventSubscriptionSelector, SubscriptionEvent, SubscriptionEventPayload, SubscriptionFrame,
         SubscriptionFramePayload, SubscriptionId, SubscriptionRejectionCode, SubscriptionRequest,
@@ -46,6 +49,15 @@ pub fn generated_protocol_types() -> String {
     push_decl::<AlertSource>(&cfg, &mut output);
     push_decl::<CompletionKind>(&cfg, &mut output);
     push_decl::<WorkerStatus>(&cfg, &mut output);
+    push_decl::<WorkerCommandEnvelope>(&cfg, &mut output);
+    push_decl::<WorkerCommandKind>(&cfg, &mut output);
+    push_decl::<WorkerCommandDisposition>(&cfg, &mut output);
+    push_decl::<WorkerCommandAcknowledgement>(&cfg, &mut output);
+    push_decl::<WorkerRunState>(&cfg, &mut output);
+    push_decl::<WorkerMaintenanceState>(&cfg, &mut output);
+    push_decl::<WorkerBusyState>(&cfg, &mut output);
+    push_decl::<WorkerState>(&cfg, &mut output);
+    push_decl::<WorkerStateSnapshot>(&cfg, &mut output);
     push_decl::<TurnResult>(&cfg, &mut output);
     push_decl::<InvokeKind>(&cfg, &mut output);
     push_decl::<RunResult>(&cfg, &mut output);
@@ -75,6 +87,9 @@ pub fn generated_protocol_types() -> String {
     push_decl::<SessionToolAttachment>(&cfg, &mut output);
     push_decl::<SessionSnapshotEntryData>(&cfg, &mut output);
     push_decl::<SessionSnapshotEntry>(&cfg, &mut output);
+    push_decl::<PendingSubmissionSummary>(&cfg, &mut output);
+    push_decl::<PendingSubmissionsSnapshot>(&cfg, &mut output);
+    push_decl::<SubmissionDisposition>(&cfg, &mut output);
     push_decl::<SessionSnapshot>(&cfg, &mut output);
     push_decl::<InternalWorkerKind>(&cfg, &mut output);
     push_decl::<InternalWorkerRef>(&cfg, &mut output);
