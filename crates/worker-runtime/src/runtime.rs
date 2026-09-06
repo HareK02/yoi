@@ -1732,27 +1732,9 @@ impl Runtime {
                 return Ok(snapshot);
             }
         }
-        Ok(protocol::Event::Snapshot {
-            session: protocol::SessionSnapshot {
-                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
-                entries: Vec::new(),
-            },
-            greeting: protocol::Greeting {
-                worker_name: worker_ref.worker_id.to_string(),
-                cwd: String::new(),
-                provider: "worker-runtime".to_string(),
-                model: "worker-runtime".to_string(),
-                scope_summary: "runtime worker observation".to_string(),
-                tools: Vec::new(),
-                context_window: 0,
-                context_tokens: 0,
-            },
-            state: protocol::WorkerStateSnapshot::initial(1),
-            in_flight: protocol::InFlightSnapshot {
-                blocks: Vec::new(),
-                commands: Vec::new(),
-            },
-            internal_workers: Vec::new(),
+        Err(RuntimeError::WorkerExecutionUnavailable {
+            worker_id: worker_ref.worker_id,
+            message: "authoritative Worker snapshot is unavailable".to_string(),
         })
     }
 
@@ -4972,6 +4954,26 @@ mod tests {
             }
             other => panic!("expected snapshot, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "ws-server")]
+    #[test]
+    fn observation_snapshot_fails_closed_when_backend_snapshot_is_unavailable() {
+        let runtime = runtime_with_backend();
+        let detail = runtime
+            .create_worker(task_request("snapshot unavailable"))
+            .unwrap();
+
+        assert!(matches!(
+            runtime
+                .worker_observation_snapshot(&detail.worker_ref)
+                .unwrap_err(),
+            RuntimeError::WorkerExecutionUnavailable {
+                worker_id,
+                message,
+            } if worker_id == detail.worker_ref.worker_id
+                && message == "authoritative Worker snapshot is unavailable"
+        ));
     }
 
     struct InputOnlyBackend;

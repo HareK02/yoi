@@ -18865,6 +18865,34 @@ mod tests {
             )
         }
 
+        fn worker_snapshot(
+            &self,
+            handle: &worker_runtime::execution::WorkerExecutionHandle,
+        ) -> Option<protocol::Event> {
+            Some(protocol::Event::Snapshot {
+                session: protocol::SessionSnapshot {
+                    pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                    entries: Vec::new(),
+                },
+                greeting: protocol::Greeting {
+                    worker_name: handle.worker_ref().worker_id.to_string(),
+                    cwd: String::new(),
+                    provider: "deterministic-workspace-server-test".to_string(),
+                    model: "deterministic-workspace-server-test".to_string(),
+                    scope_summary: "test execution snapshot".to_string(),
+                    tools: Vec::new(),
+                    context_window: 0,
+                    context_tokens: 0,
+                },
+                state: protocol::WorkerStateSnapshot::initial(1),
+                in_flight: protocol::InFlightSnapshot {
+                    blocks: Vec::new(),
+                    commands: Vec::new(),
+                },
+                internal_workers: Vec::new(),
+            })
+        }
+
         fn stop_worker(
             &self,
             _handle: &worker_runtime::execution::WorkerExecutionHandle,
