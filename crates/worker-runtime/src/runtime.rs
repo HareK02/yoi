@@ -1867,16 +1867,49 @@ impl Runtime {
         let _operation_guard = operation_lock
             .lock()
             .map_err(|_| RuntimeError::StatePoisoned)?;
+        let (backend, execution_handle) = {
+            let state = self.lock()?;
+            state.ensure_running()?;
+            state.ensure_worker_ref(worker_ref)?;
+            let worker = state.worker(worker_ref)?;
+            if worker.status.is_active() {
+                return Err(RuntimeError::InvalidRequest(format!(
+                    "worker {} is running and must be stopped before deletion",
+                    worker_ref.worker_id
+                )));
+            }
+            (
+                state.execution_backend.clone(),
+                worker.execution_handle.clone(),
+            )
+        };
+        if let Some(handle) = execution_handle {
+            let backend = backend.ok_or_else(|| RuntimeError::ExecutionBackendUnavailable {
+                message: "Worker deletion requires its execution backend to confirm shutdown"
+                    .to_string(),
+            })?;
+            let result = backend.stop_worker(&handle);
+            if !result.is_accepted() {
+                return Err(RuntimeError::WorkerExecutionRejected {
+                    worker_id: worker_ref.worker_id,
+                    operation: result.operation,
+                    outcome: result.outcome,
+                    message: result.message_or_default(),
+                    result,
+                });
+            }
+        }
         let mut state = self.lock()?;
         state.ensure_running()?;
         state.ensure_worker_ref(worker_ref)?;
         let worker = state.worker(worker_ref)?;
         if worker.status.is_active() {
             return Err(RuntimeError::InvalidRequest(format!(
-                "worker {} is running and must be stopped before deletion",
+                "worker {} became active before deletion",
                 worker_ref.worker_id
             )));
         }
+        state.delete_worker_snapshot(&worker_ref.worker_id)?;
         let removed = state.workers.remove(&worker_ref.worker_id).ok_or_else(|| {
             RuntimeError::WorkerNotFound {
                 worker_id: worker_ref.worker_id,
@@ -1892,7 +1925,6 @@ impl Runtime {
             .retain(|event| event.worker_ref != *worker_ref);
         state.publish_worker_removed(worker_ref.worker_id, removed_workspace_id.as_deref())?;
         state.persist_runtime_snapshot()?;
-        state.delete_worker_snapshot(&worker_ref.worker_id)?;
         Ok(WorkerDeleteResult {
             worker_id: removed.worker_id,
             deleted: true,
@@ -4136,6 +4168,7 @@ mod tests {
     #[derive(Default)]
     struct TestExecutionBackend {
         dispatch_result: Mutex<Option<WorkerExecutionResult>>,
+        stop_result: Mutex<Option<WorkerExecutionResult>>,
         restore_result: Mutex<Option<WorkerExecutionSpawnResult>>,
         restore_count: Mutex<u64>,
         run_generations: Mutex<Vec<u64>>,
@@ -4155,6 +4188,10 @@ mod tests {
     impl TestExecutionBackend {
         fn set_dispatch_result(&self, result: WorkerExecutionResult) {
             *self.dispatch_result.lock().unwrap() = Some(result);
+        }
+
+        fn set_stop_result(&self, result: WorkerExecutionResult) {
+            *self.stop_result.lock().unwrap() = Some(result);
         }
 
         fn preserve_commit_ack_submission_id(&self) {
@@ -4314,7 +4351,11 @@ mod tests {
         }
 
         fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
-            WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop)
+            self.stop_result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop))
         }
 
         fn cancel_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
@@ -5607,6 +5648,69 @@ mod tests {
         ));
         let summary = runtime.summary().unwrap();
         assert_eq!(summary.worker_count, 0);
+    }
+
+    #[test]
+    fn delete_worker_waits_for_execution_shutdown_before_removing_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = root.path().join("runtime");
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions {
+                root: store_root.clone(),
+                runtime_id: "delete-shutdown-barrier".to_string(),
+                display_name: None,
+            },
+            backend.clone(),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        backend.set_dispatch_result(WorkerExecutionResult::errored(
+            WorkerExecutionOperation::Input,
+            "initial input failed",
+        ));
+        backend.set_stop_result(WorkerExecutionResult::errored(
+            WorkerExecutionOperation::Stop,
+            "shutdown is still pending",
+        ));
+        let mut request = task_request("delete shutdown barrier");
+        request.initial_input = Some(WorkerInput::user("start"));
+        let worker_id = request.worker_id;
+        runtime.create_worker(request).unwrap_err();
+        let worker_ref = WorkerRef::new(worker_id);
+        backend.set_stop_result(WorkerExecutionResult::errored(
+            WorkerExecutionOperation::Stop,
+            "shutdown is still pending",
+        ));
+
+        let error = runtime.delete_worker(&worker_ref).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RuntimeError::WorkerExecutionRejected {
+                operation: WorkerExecutionOperation::Stop,
+                ..
+            }
+        ));
+        assert_eq!(
+            runtime.worker_detail(&worker_ref).unwrap().status,
+            WorkerStatus::Stopped
+        );
+        assert!(
+            store_root
+                .join("workers")
+                .join(worker_id.to_string())
+                .exists(),
+            "Worker aggregate must remain until backend shutdown is confirmed"
+        );
+
+        assert!(runtime.delete_worker(&worker_ref).unwrap().deleted);
+        assert!(
+            !store_root
+                .join("workers")
+                .join(worker_id.to_string())
+                .exists()
+        );
     }
 
     #[test]
