@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use worker_runtime::auth::{RuntimeIdentityMaterial, decode_public_key};
 use yoi_workspace_server::hosts::{RemoteRuntimeAuthConfig, RemoteRuntimeConfig};
-use yoi_workspace_server::store::{SqliteWorkspaceStore, WorkspaceRuntimeBinding};
+use yoi_workspace_server::store::{
+    SqliteWorkspaceStore, WorkspaceRuntimeAuthenticationMode, WorkspaceRuntimeBinding,
+    WorkspaceRuntimeBindingState,
+};
 use yoi_workspace_server::{
     ControlPlaneStore, ResolvedWorkspaceBackendConfig, ServerConfig, ServerHostConfigFile,
     WorkspaceIdentity, WorkspaceRecord, serve_workspace_catalog,
@@ -335,6 +338,10 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
                     public_key,
                     public_key_fingerprint: String::new(),
                     binding_revision: 1,
+                    state: WorkspaceRuntimeBindingState::Verified,
+                    authentication_mode: WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer,
+                    workspace_key_id: None,
+                    workspace_key_generation: None,
                     created_at: now.clone(),
                     updated_at: now,
                     revoked_at: None,
@@ -984,6 +991,10 @@ mod tests {
             public_key,
             public_key_fingerprint: String::new(),
             binding_revision: 1,
+            state: WorkspaceRuntimeBindingState::Verified,
+            authentication_mode: WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer,
+            workspace_key_id: None,
+            workspace_key_generation: None,
             created_at: "2026-07-26T00:00:00Z".to_string(),
             updated_at: "2026-07-26T00:00:00Z".to_string(),
             revoked_at: None,

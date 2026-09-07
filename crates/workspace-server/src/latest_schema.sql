@@ -441,12 +441,26 @@ CREATE TABLE workspace_runtime_bindings (
     public_key TEXT NOT NULL,
     public_key_fingerprint TEXT NOT NULL,
     binding_revision INTEGER NOT NULL DEFAULT 1 CHECK (binding_revision > 0),
+    state TEXT NOT NULL CHECK (state IN ('configured', 'verified', 'revoked')),
+    authentication_mode TEXT NOT NULL CHECK (authentication_mode IN ('legacy_server_issuer', 'workspace_identity')),
+    workspace_key_id TEXT,
+    workspace_key_generation INTEGER CHECK (workspace_key_generation > 0),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     revoked_at TEXT,
     PRIMARY KEY (workspace_id, runtime_id),
     UNIQUE (workspace_id, public_key_fingerprint),
-    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT
+    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
+    CHECK (
+        (authentication_mode = 'legacy_server_issuer' AND workspace_key_id IS NULL AND workspace_key_generation IS NULL)
+        OR
+        (authentication_mode = 'workspace_identity' AND workspace_key_id IS NOT NULL AND workspace_key_generation IS NOT NULL)
+    ),
+    CHECK (
+        (state = 'revoked' AND revoked_at IS NOT NULL)
+        OR
+        (state != 'revoked' AND revoked_at IS NULL)
+    )
 );
 CREATE TABLE workspace_runtime_binding_audit (
     workspace_id TEXT NOT NULL,

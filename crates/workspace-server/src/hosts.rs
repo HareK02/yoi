@@ -69,6 +69,7 @@ const EMBEDDED_HOST_KIND: &str = "embedded-worker-runtime-host";
 const REMOTE_HOST_KIND: &str = "remote-worker-runtime-host";
 const MAX_DIAGNOSTICS: usize = 16;
 const MAX_RUNTIME_PING_RESPONSE_BYTES: usize = 8 * 1024;
+const MAX_REMOTE_RUNTIME_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 // Runtime creation can spend up to 60s bootstrapping; durable Submit
 // acceptance is acknowledged before the potentially long run preparation.
 const REMOTE_WORKER_CREATE_TIMEOUT: Duration = Duration::from_secs(80);
@@ -3060,18 +3061,25 @@ impl RemoteWorkerRuntime {
         validate_backend_identifier("runtime_id", &config.runtime_id)?;
         let base_url = config.base_url.trim_end_matches('/').to_string();
         let timeout = config.timeout;
-        let http =
-            run_blocking_http(move || BlockingHttpClient::builder().timeout(timeout).build())
-                .map_err(|err| RuntimeRegistryError::RuntimeOperationFailed {
-                    runtime_id: config.runtime_id.clone(),
-                    code: "remote_runtime_client_build_failed".to_string(),
-                    message: err.to_string(),
-                })?;
+        let http = run_blocking_http(move || {
+            BlockingHttpClient::builder()
+                .timeout(timeout)
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
+                .build()
+        })
+        .map_err(|err| RuntimeRegistryError::RuntimeOperationFailed {
+            runtime_id: config.runtime_id.clone(),
+            code: "remote_runtime_client_build_failed".to_string(),
+            message: err.to_string(),
+        })?;
         // Workdir command-output waits are bounded to 20 seconds by Runtime;
         // leave transport margin while retaining a finite client timeout.
         let workdir_timeout = timeout.max(Duration::from_secs(30));
         let async_http = AsyncHttpClient::builder()
             .timeout(workdir_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()
             .map_err(|err| RuntimeRegistryError::RuntimeOperationFailed {
                 runtime_id: config.runtime_id.clone(),
@@ -3312,12 +3320,36 @@ impl RemoteWorkerRuntime {
                 .map_err(|err| remote_reqwest_diagnostic(&runtime_id, err))?;
             let status = response.status();
             if status.is_success() {
-                response.json::<T>().map_err(|err| {
+                let mut body = Vec::new();
+                response
+                    .take((MAX_REMOTE_RUNTIME_RESPONSE_BYTES + 1) as u64)
+                    .read_to_end(&mut body)
+                    .map_err(|_| {
+                        diagnostic(
+                            "remote_runtime_response_read_failed",
+                            DiagnosticSeverity::Error,
+                            format!(
+                                "Remote Runtime response could not be read for '{}'",
+                                runtime_id
+                            ),
+                        )
+                    })?;
+                if body.len() > MAX_REMOTE_RUNTIME_RESPONSE_BYTES {
+                    return Err(diagnostic(
+                        "remote_runtime_response_too_large",
+                        DiagnosticSeverity::Error,
+                        format!(
+                            "Remote Runtime response exceeded the allowed size for '{}'",
+                            runtime_id
+                        ),
+                    ));
+                }
+                serde_json::from_slice::<T>(&body).map_err(|_| {
                     diagnostic(
                         "remote_runtime_malformed_response",
                         DiagnosticSeverity::Error,
                         format!(
-                            "Remote Runtime returned malformed JSON for '{}': {err}",
+                            "Remote Runtime returned malformed JSON for '{}'",
                             runtime_id
                         ),
                     )
@@ -4516,7 +4548,13 @@ fn remote_http_status_diagnostic(
     status: StatusCode,
     response: reqwest::blocking::Response,
 ) -> RuntimeDiagnostic {
-    let error = response.json::<RuntimeHttpErrorResponse>().ok();
+    let mut body = Vec::new();
+    let error = response
+        .take((MAX_RUNTIME_PING_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut body)
+        .ok()
+        .filter(|_| body.len() <= MAX_RUNTIME_PING_RESPONSE_BYTES)
+        .and_then(|_| serde_json::from_slice::<RuntimeHttpErrorResponse>(&body).ok());
     let remote_code = error
         .as_ref()
         .map(|error| error.error.code.as_str())

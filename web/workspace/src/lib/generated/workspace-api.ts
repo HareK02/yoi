@@ -344,12 +344,30 @@ export type RuntimeSummary = {
   diagnostics: Array<Diagnostic>;
 };
 
+export type WorkspaceRuntimeBindingState =
+  | "configured"
+  | "verified"
+  | "revoked";
+
+export type WorkspaceRuntimeAuthenticationMode =
+  | "legacy_server_issuer"
+  | "workspace_identity";
+
+export type WorkspaceRuntimeBindingSummary = {
+  state: WorkspaceRuntimeBindingState;
+  authentication_mode: WorkspaceRuntimeAuthenticationMode;
+  revision: number;
+  workspace_key_id?: string | null;
+  workspace_key_generation?: number | null;
+};
+
 export type RuntimeManagementSummary = {
   built_in: boolean;
   config_managed: boolean;
   removable: boolean;
   endpoint_configured: boolean;
   token_ref_configured: boolean;
+  binding?: WorkspaceRuntimeBindingSummary | null;
 };
 
 export type WorkspaceRuntimeResource = {
@@ -416,6 +434,18 @@ export type RuntimeTrustConflictResponse = {
   message: string;
   current_revision?: number;
   current_fingerprint?: string | null;
+};
+
+export type RuntimePublicIdentityBundle = {
+  identity_id: string;
+  public_key: string;
+};
+
+export type CreateRemoteRuntimeRequest = {
+  public_bundle: RuntimePublicIdentityBundle;
+  display_name?: string | null;
+  endpoint: string;
+  expected_revision?: number | null;
 };
 
 export type RuntimeConnectionTestStatus = "compatible" | "failed";

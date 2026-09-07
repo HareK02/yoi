@@ -1580,6 +1580,38 @@ pub struct RuntimeSummary {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceRuntimeBindingState {
+    Configured,
+    Verified,
+    Revoked,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceRuntimeAuthenticationMode {
+    LegacyServerIssuer,
+    WorkspaceIdentity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRuntimeBindingSummary {
+    pub state: WorkspaceRuntimeBindingState,
+    pub authentication_mode: WorkspaceRuntimeAuthenticationMode,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
+    pub workspace_key_generation: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
@@ -1589,6 +1621,8 @@ pub struct RuntimeManagementSummary {
     pub removable: bool,
     pub endpoint_configured: bool,
     pub token_ref_configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<WorkspaceRuntimeBindingSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1711,12 +1745,24 @@ pub struct RuntimeTrustConflictResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RuntimePublicIdentityBundle {
+    pub identity_id: String,
+    pub public_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct CreateRemoteRuntimeRequest {
-    pub runtime_id: String,
+    pub public_bundle: RuntimePublicIdentityBundle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub endpoint: String,
-    pub token_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
+    pub expected_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2930,6 +2976,9 @@ pub fn catalog_typescript() -> String {
         RuntimeIdentityAuthority::decl(&config),
         RuntimeSourceSummary::decl(&config),
         RuntimeSummary::decl(&config),
+        WorkspaceRuntimeBindingState::decl(&config),
+        WorkspaceRuntimeAuthenticationMode::decl(&config),
+        WorkspaceRuntimeBindingSummary::decl(&config),
         RuntimeManagementSummary::decl(&config),
         WorkspaceRuntimeResource::decl(&config),
         RuntimeTrustKeyStatus::decl(&config),
@@ -2942,6 +2991,8 @@ pub fn catalog_typescript() -> String {
         RevokeRuntimeTrustKeyRequest::decl(&config),
         RuntimeTrustConflictKind::decl(&config),
         RuntimeTrustConflictResponse::decl(&config),
+        RuntimePublicIdentityBundle::decl(&config),
+        CreateRemoteRuntimeRequest::decl(&config),
         RuntimeConnectionTestStatus::decl(&config),
         RuntimeConnectionTestFailureKind::decl(&config),
         RuntimeConnectionTestResponse::decl(&config),
