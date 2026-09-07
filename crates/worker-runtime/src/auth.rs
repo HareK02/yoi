@@ -2,6 +2,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -66,6 +67,74 @@ pub enum RuntimeAuthError {
     WrongOperation,
     #[error("source proof mutation target does not match the request")]
     WrongMutationTarget,
+}
+
+pub(crate) struct SignedJsonToken<T> {
+    pub payload: String,
+    pub signature: Vec<u8>,
+    pub claims: T,
+}
+
+pub(crate) fn sign_json_token<T: Serialize>(
+    token_prefix: &str,
+    signing_input_prefix: &str,
+    signing_key: &Ed25519KeyPair,
+    claims: &T,
+) -> Result<String, RuntimeAuthError> {
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims)?);
+    let signing_input = format!("{signing_input_prefix}{payload}");
+    let signature = signing_key.sign(signing_input.as_bytes());
+    Ok(format!(
+        "{token_prefix}.{payload}.{}",
+        URL_SAFE_NO_PAD.encode(signature.as_ref())
+    ))
+}
+
+pub(crate) fn decode_signed_json_token<T: DeserializeOwned>(
+    token: &str,
+    expected_prefix: &str,
+) -> Result<SignedJsonToken<T>, RuntimeAuthError> {
+    let (prefix, payload, signature) = split_three_part_token(token)?;
+    if prefix != expected_prefix {
+        return Err(RuntimeAuthError::InvalidTokenFormat);
+    }
+    let signature = URL_SAFE_NO_PAD.decode(signature)?;
+    let claims = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload)?)?;
+    Ok(SignedJsonToken {
+        payload: payload.to_string(),
+        signature,
+        claims,
+    })
+}
+
+pub(crate) fn verify_signed_json_token(
+    signing_input_prefix: &str,
+    payload: &str,
+    signature: &[u8],
+    public_key: &str,
+) -> Result<(), RuntimeAuthError> {
+    let public_key = decode_public_key(public_key)?;
+    let signing_input = format!("{signing_input_prefix}{payload}");
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(signing_input.as_bytes(), signature)
+        .map_err(|_| RuntimeAuthError::InvalidSignature)
+}
+
+fn split_three_part_token(token: &str) -> Result<(&str, &str, &str), RuntimeAuthError> {
+    let mut parts = token.split('.');
+    let prefix = parts.next().unwrap_or_default();
+    let payload = parts.next().unwrap_or_default();
+    let signature = parts.next().unwrap_or_default();
+    if prefix.is_empty() || payload.is_empty() || signature.is_empty() || parts.next().is_some() {
+        return Err(RuntimeAuthError::InvalidTokenFormat);
+    }
+    Ok((prefix, payload, signature))
+}
+
+pub(crate) fn is_request_body_digest(value: &str) -> bool {
+    URL_SAFE_NO_PAD
+        .decode(value)
+        .is_ok_and(|decoded| decoded.len() == 32 && URL_SAFE_NO_PAD.encode(decoded) == value)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,28 +392,22 @@ impl RuntimeRequestSourceSigner {
             exp: now_unix.saturating_add(ttl_seconds),
             jti: new_token_id()?,
         };
-        let payload = serde_json::to_vec(&claims)?;
-        let payload = URL_SAFE_NO_PAD.encode(payload);
-        let signing_input = format!("{RUNTIME_REQUEST_SOURCE_SIGNING_INPUT_PREFIX}{payload}");
         let private = decode_private_key(&self.private_key)?;
         let key_pair = Ed25519KeyPair::from_pkcs8(&private)
             .map_err(|_| RuntimeAuthError::InvalidPrivateKey)?;
-        let signature = URL_SAFE_NO_PAD.encode(key_pair.sign(signing_input.as_bytes()).as_ref());
-        Ok(format!(
-            "{RUNTIME_REQUEST_SOURCE_PROOF_PREFIX}.{payload}.{signature}"
-        ))
+        sign_json_token(
+            RUNTIME_REQUEST_SOURCE_PROOF_PREFIX,
+            RUNTIME_REQUEST_SOURCE_SIGNING_INPUT_PREFIX,
+            &key_pair,
+            &claims,
+        )
     }
 }
 
 pub fn decode_runtime_request_source_claims(
     proof: &str,
 ) -> Result<RuntimeRequestSourceClaims, RuntimeAuthError> {
-    let (prefix, payload, _signature) = split_runtime_request_source_proof(proof)?;
-    if prefix != RUNTIME_REQUEST_SOURCE_PROOF_PREFIX {
-        return Err(RuntimeAuthError::InvalidTokenFormat);
-    }
-    let payload = URL_SAFE_NO_PAD.decode(payload)?;
-    serde_json::from_slice(&payload).map_err(RuntimeAuthError::from)
+    Ok(decode_signed_json_token(proof, RUNTIME_REQUEST_SOURCE_PROOF_PREFIX)?.claims)
 }
 
 pub fn verify_runtime_request_source(
@@ -352,17 +415,17 @@ pub fn verify_runtime_request_source(
     public_key: &str,
     expected: &RuntimeRequestSourceExpectation<'_>,
 ) -> Result<RuntimeRequestSourceClaims, RuntimeAuthError> {
-    let (prefix, payload, signature) = split_runtime_request_source_proof(proof)?;
-    if prefix != RUNTIME_REQUEST_SOURCE_PROOF_PREFIX {
-        return Err(RuntimeAuthError::InvalidTokenFormat);
-    }
-    let signature = URL_SAFE_NO_PAD.decode(signature)?;
-    let signing_input = format!("{RUNTIME_REQUEST_SOURCE_SIGNING_INPUT_PREFIX}{payload}");
-    let public_key = decode_public_key(public_key)?;
-    UnparsedPublicKey::new(&ED25519, public_key)
-        .verify(signing_input.as_bytes(), &signature)
-        .map_err(|_| RuntimeAuthError::InvalidSignature)?;
-    let claims = decode_runtime_request_source_claims(proof)?;
+    let signed = decode_signed_json_token::<RuntimeRequestSourceClaims>(
+        proof,
+        RUNTIME_REQUEST_SOURCE_PROOF_PREFIX,
+    )?;
+    verify_signed_json_token(
+        RUNTIME_REQUEST_SOURCE_SIGNING_INPUT_PREFIX,
+        &signed.payload,
+        &signed.signature,
+        public_key,
+    )?;
+    let claims = signed.claims;
     if claims.iss != expected.identity_id
         || claims.aud != expected.audience
         || claims.workspace_id != expected.workspace_id
@@ -378,17 +441,6 @@ pub fn verify_runtime_request_source(
         return Err(RuntimeAuthError::Expired);
     }
     Ok(claims)
-}
-
-fn split_runtime_request_source_proof(proof: &str) -> Result<(&str, &str, &str), RuntimeAuthError> {
-    let mut parts = proof.split('.');
-    let prefix = parts.next().unwrap_or_default();
-    let payload = parts.next().unwrap_or_default();
-    let signature = parts.next().unwrap_or_default();
-    if prefix.is_empty() || payload.is_empty() || signature.is_empty() || parts.next().is_some() {
-        return Err(RuntimeAuthError::InvalidTokenFormat);
-    }
-    Ok((prefix, payload, signature))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

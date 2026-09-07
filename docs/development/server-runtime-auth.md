@@ -125,11 +125,13 @@ The bundle contains `workspace_id`, `backend_url`, `key_id`, `algorithm`, `publi
 Inspect the Runtime trust records without exposing private material:
 
 ```bash
-yoi-runtime trust-workspace list --fs-root /var/lib/yoi-runtime
+yoi-runtime trust-workspace list --offset 0 --limit 100 --fs-root /var/lib/yoi-runtime
 yoi-runtime trust-workspace show \
   --workspace-id '<WORKSPACE_ID>' \
   --fs-root /var/lib/yoi-runtime
 ```
+
+`list` returns a bounded page with `offset`, `limit`, `total`, and `records`; advance `--offset` to inspect later pages. The records contain public trust metadata only.
 
 An exact repeated `add` is idempotent. A different bundle for an existing Workspace is rejected; use the explicit `replace` operation after verifying the new public fingerprint out of band:
 

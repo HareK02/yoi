@@ -2,9 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
+use ring::signature::Ed25519KeyPair;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use workspace_api::WorkspacePublicIdentityBundle;
@@ -18,6 +16,7 @@ const MAX_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_ID_BYTES: usize = 256;
 const MAX_ISSUER_BYTES: usize = 2 * 1024;
 const MAX_OPERATION_BYTES: usize = 128;
+pub const MAX_WORKSPACE_ISSUER_TRUST_RECORDS: usize = 4_096;
 const MAX_REPLAY_ENTRIES: usize = 65_536;
 const MAX_TOKEN_LIFETIME_SECONDS: i64 = 300;
 const MAX_CLOCK_SKEW_SECONDS: i64 = 30;
@@ -105,6 +104,8 @@ pub enum WorkspaceIssuerTrustError {
     InvalidTrustGeneration,
     #[error("Workspace signing identity replacement revision is stale")]
     StaleIdentityRevision,
+    #[error("Workspace issuer trust record limit was reached")]
+    TrustRecordLimitExceeded,
     #[error("Workspace issuer trust generation overflow")]
     TrustGenerationOverflow,
 }
@@ -112,6 +113,9 @@ pub enum WorkspaceIssuerTrustError {
 pub fn validate_workspace_issuer_trust_records(
     records: &[WorkspaceIssuerTrustRecord],
 ) -> Result<(), WorkspaceCapabilityVerificationError> {
+    if records.len() > MAX_WORKSPACE_ISSUER_TRUST_RECORDS {
+        return Err(WorkspaceCapabilityVerificationError::TrustRecordLimitExceeded);
+    }
     let mut seen = std::collections::HashSet::new();
     for record in records {
         validate_trust_record(record)?;
@@ -147,6 +151,9 @@ pub fn add_workspace_issuer_trust(
         return Err(WorkspaceIssuerTrustError::AlreadyExists(
             bundle.workspace_id,
         ));
+    }
+    if records.len() >= MAX_WORKSPACE_ISSUER_TRUST_RECORDS {
+        return Err(WorkspaceIssuerTrustError::TrustRecordLimitExceeded);
     }
     let record = WorkspaceIssuerTrustRecord::from_bundle(bundle, 1, now_unix)?;
     records.push(record.clone());
@@ -250,7 +257,9 @@ fn validate_id(value: &str) -> Result<(), WorkspaceIssuerTrustError> {
     if value.is_empty()
         || value.len() > MAX_ID_BYTES
         || value.trim() != value
-        || value.chars().any(char::is_control)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
     {
         return Err(WorkspaceIssuerTrustError::InvalidIdentifier);
     }
@@ -386,12 +395,12 @@ impl WorkspaceCapabilityVerifier {
         if token.len() > MAX_TOKEN_BYTES {
             return Err(WorkspaceCapabilityVerificationError::MalformedToken);
         }
-        let (payload, signature) = split_workspace_token(token)?;
-        let claims_json = URL_SAFE_NO_PAD
-            .decode(payload)
-            .map_err(|_| WorkspaceCapabilityVerificationError::MalformedToken)?;
-        let claims: WorkspaceCapabilityClaims = serde_json::from_slice(&claims_json)
-            .map_err(|_| WorkspaceCapabilityVerificationError::MalformedClaims)?;
+        let signed = crate::auth::decode_signed_json_token::<WorkspaceCapabilityClaims>(
+            token,
+            WORKSPACE_TOKEN_PREFIX,
+        )
+        .map_err(|_| WorkspaceCapabilityVerificationError::MalformedToken)?;
+        let claims = signed.claims;
         validate_claim_shape(&claims)?;
 
         if claims.issuer_workspace_id != expected.workspace_id {
@@ -418,12 +427,18 @@ impl WorkspaceCapabilityVerifier {
             return Err(WorkspaceCapabilityVerificationError::StaleIdentityRevision);
         }
 
-        let public_key = crate::auth::decode_public_key(&record.public_key)
-            .map_err(|_| WorkspaceCapabilityVerificationError::TrustRecordCorrupt)?;
-        let signing_input = format!("{WORKSPACE_SIGNING_INPUT_PREFIX}{payload}");
-        UnparsedPublicKey::new(&ED25519, public_key)
-            .verify(signing_input.as_bytes(), &signature)
-            .map_err(|_| WorkspaceCapabilityVerificationError::InvalidSignature)?;
+        crate::auth::verify_signed_json_token(
+            WORKSPACE_SIGNING_INPUT_PREFIX,
+            &signed.payload,
+            &signed.signature,
+            &record.public_key,
+        )
+        .map_err(|error| match error {
+            RuntimeAuthError::InvalidSignature => {
+                WorkspaceCapabilityVerificationError::InvalidSignature
+            }
+            _ => WorkspaceCapabilityVerificationError::TrustRecordCorrupt,
+        })?;
 
         if claims.runtime_id != expected.runtime_id {
             return Err(WorkspaceCapabilityVerificationError::WrongRuntime);
@@ -483,6 +498,8 @@ pub enum WorkspaceCapabilityVerificationError {
     TrustAuthorityMissing,
     #[error("Workspace issuer trust contains duplicate Workspace identities")]
     DuplicateWorkspaceTrust,
+    #[error("Workspace issuer trust contains too many records")]
+    TrustRecordLimitExceeded,
     #[error("Workspace issuer trust record is corrupt")]
     TrustRecordCorrupt,
     #[error("Workspace capability token is malformed")]
@@ -536,37 +553,13 @@ pub fn issue_workspace_capability_token(
     claims: &WorkspaceCapabilityClaims,
 ) -> Result<String, WorkspaceCapabilityVerificationError> {
     validate_claim_shape(claims)?;
-    let payload = serde_json::to_vec(claims)
-        .map_err(|_| WorkspaceCapabilityVerificationError::MalformedClaims)?;
-    let payload = URL_SAFE_NO_PAD.encode(payload);
-    let signing_input = format!("{WORKSPACE_SIGNING_INPUT_PREFIX}{payload}");
-    let signature = signing_key.sign(signing_input.as_bytes());
-    Ok(format!(
-        "{WORKSPACE_TOKEN_PREFIX}.{payload}.{}",
-        URL_SAFE_NO_PAD.encode(signature.as_ref())
-    ))
-}
-
-fn split_workspace_token(
-    token: &str,
-) -> Result<(&str, Vec<u8>), WorkspaceCapabilityVerificationError> {
-    let mut parts = token.split('.');
-    if parts.next() != Some(WORKSPACE_TOKEN_PREFIX) {
-        return Err(WorkspaceCapabilityVerificationError::MalformedToken);
-    }
-    let payload = parts
-        .next()
-        .ok_or(WorkspaceCapabilityVerificationError::MalformedToken)?;
-    let signature = parts
-        .next()
-        .ok_or(WorkspaceCapabilityVerificationError::MalformedToken)?;
-    if parts.next().is_some() || payload.is_empty() || signature.is_empty() {
-        return Err(WorkspaceCapabilityVerificationError::MalformedToken);
-    }
-    let signature = URL_SAFE_NO_PAD
-        .decode(signature)
-        .map_err(|_| WorkspaceCapabilityVerificationError::MalformedToken)?;
-    Ok((payload, signature))
+    crate::auth::sign_json_token(
+        WORKSPACE_TOKEN_PREFIX,
+        WORKSPACE_SIGNING_INPUT_PREFIX,
+        signing_key,
+        claims,
+    )
+    .map_err(|_| WorkspaceCapabilityVerificationError::MalformedClaims)
 }
 
 fn validate_trust_record(
@@ -617,7 +610,9 @@ fn validate_claim_shape(
         if value.is_empty()
             || value.len() > MAX_ID_BYTES
             || value.trim() != value
-            || value.chars().any(char::is_control)
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
         {
             return Err(WorkspaceCapabilityVerificationError::InvalidIdentifier);
         }
@@ -626,7 +621,9 @@ fn validate_claim_shape(
         if worker_id.is_empty()
             || worker_id.len() > MAX_ID_BYTES
             || worker_id.trim() != worker_id
-            || worker_id.chars().any(char::is_control)
+            || !worker_id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
         {
             return Err(WorkspaceCapabilityVerificationError::InvalidIdentifier);
         }
@@ -651,15 +648,11 @@ fn validate_claim_shape(
 }
 
 fn is_sha256_digest(value: &str) -> bool {
-    value.len() == 71
-        && value.starts_with("sha256:")
-        && value[7..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    crate::auth::is_request_body_digest(value)
 }
 
 pub fn workspace_request_body_digest(body: &[u8]) -> String {
-    format!("sha256:{}", hex_lower(&Sha256::digest(body)))
+    crate::auth::request_body_digest(body)
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -808,6 +801,13 @@ mod tests {
             add_workspace_issuer_trust(&mut records, bundle_v1.clone(), 11).unwrap();
         assert_eq!(mutation, WorkspaceIssuerTrustMutation::Unchanged);
         assert_eq!(replay, first);
+
+        let oversized_records =
+            vec![first.clone(); MAX_WORKSPACE_ISSUER_TRUST_RECORDS.saturating_add(1)];
+        assert_eq!(
+            validate_workspace_issuer_trust_records(&oversized_records).unwrap_err(),
+            WorkspaceCapabilityVerificationError::TrustRecordLimitExceeded
+        );
 
         let (_, stale_other_key) = identity("workspace-1", "WK-stale", 1);
         assert_eq!(

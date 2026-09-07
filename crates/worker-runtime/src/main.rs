@@ -26,9 +26,9 @@ use worker_runtime::http_server::{
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 use worker_runtime::working_directory::RuntimeGitCacheMaterializer;
 use worker_runtime::workspace_issuer::{
-    WorkspaceIssuerTrustMutation, WorkspaceIssuerTrustRecord, add_workspace_issuer_trust,
-    replace_workspace_issuer_trust, revoke_workspace_issuer_trust,
-    validate_workspace_issuer_trust_records,
+    MAX_WORKSPACE_ISSUER_TRUST_RECORDS, WorkspaceIssuerTrustError, WorkspaceIssuerTrustMutation,
+    WorkspaceIssuerTrustRecord, add_workspace_issuer_trust, replace_workspace_issuer_trust,
+    revoke_workspace_issuer_trust, validate_workspace_issuer_trust_records,
 };
 use worker_runtime::{Runtime, RuntimeOptions};
 
@@ -516,7 +516,18 @@ impl From<std::io::Error> for ProcessError {
     }
 }
 
+const MAX_RUNTIME_AUTH_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_WORKSPACE_IDENTITY_BUNDLE_BYTES: u64 = 64 * 1024;
+const DEFAULT_TRUST_WORKSPACE_LIST_LIMIT: usize = 100;
+const MAX_TRUST_WORKSPACE_LIST_LIMIT: usize = 100;
+
+#[derive(Serialize)]
+struct WorkspaceIssuerTrustListPage {
+    offset: usize,
+    limit: usize,
+    total: usize,
+    records: Vec<WorkspaceIssuerTrustRecord>,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct RuntimeAuthFile {
@@ -550,7 +561,7 @@ fn run_trust_workspace_command(mut args: VecDeque<String>) -> Result<(), Process
     match subcommand.as_str() {
         "add" | "replace" => {
             let bundle_path = take_required_auth_option(&mut args, "--bundle")?;
-            let config = parse_auth_storage_flags(&mut args)?;
+            let config = parse_trust_workspace_storage_flags(&mut args)?;
             let auth_path = runtime_auth_path(&config);
             let mut auth = read_runtime_auth_file(&auth_path)?;
             let bundle_bytes = read_workspace_identity_bundle(Path::new(&bundle_path))?;
@@ -563,7 +574,7 @@ fn run_trust_workspace_command(mut args: VecDeque<String>) -> Result<(), Process
             } else {
                 replace_workspace_issuer_trust(&mut auth.workspace_issuers, bundle, now_unix)
             }
-            .map_err(|error| ProcessError::auth(error.to_string()))?;
+            .map_err(workspace_trust_process_error)?;
             if mutation != WorkspaceIssuerTrustMutation::Unchanged {
                 write_runtime_auth_file(&auth_path, &auth)?;
             }
@@ -571,29 +582,32 @@ fn run_trust_workspace_command(mut args: VecDeque<String>) -> Result<(), Process
             Ok(())
         }
         "list" => {
-            let config = parse_auth_storage_flags(&mut args)?;
+            let (config, offset, limit) = parse_trust_workspace_list_flags(&mut args)?;
             let auth_path = runtime_auth_path(&config);
             let mut records = read_runtime_auth_file(&auth_path)?.workspace_issuers;
             records.sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
-            let output = serde_json::to_string_pretty(&records)
-                .map_err(|_| ProcessError::auth("Workspace issuer trust output failed"))?;
+            let total = records.len();
+            let records = records.into_iter().skip(offset).take(limit).collect();
+            let output = serde_json::to_string_pretty(&WorkspaceIssuerTrustListPage {
+                offset,
+                limit,
+                total,
+                records,
+            })
+            .map_err(|_| ProcessError::auth("Workspace issuer trust output failed"))?;
             println!("{output}");
             Ok(())
         }
         "show" => {
             let workspace_id = take_required_auth_option(&mut args, "--workspace-id")?;
-            let config = parse_auth_storage_flags(&mut args)?;
+            let config = parse_trust_workspace_storage_flags(&mut args)?;
             let auth_path = runtime_auth_path(&config);
             let auth = read_runtime_auth_file(&auth_path)?;
             let record = auth
                 .workspace_issuers
                 .iter()
                 .find(|record| record.workspace_id == workspace_id)
-                .ok_or_else(|| {
-                    ProcessError::auth(format!(
-                        "Workspace issuer trust is not registered for `{workspace_id}`"
-                    ))
-                })?;
+                .ok_or_else(|| ProcessError::auth("Workspace issuer trust is not registered"))?;
             let output = serde_json::to_string_pretty(record)
                 .map_err(|_| ProcessError::auth("Workspace issuer trust output failed"))?;
             println!("{output}");
@@ -601,7 +615,7 @@ fn run_trust_workspace_command(mut args: VecDeque<String>) -> Result<(), Process
         }
         "revoke" => {
             let workspace_id = take_required_auth_option(&mut args, "--workspace-id")?;
-            let config = parse_auth_storage_flags(&mut args)?;
+            let config = parse_trust_workspace_storage_flags(&mut args)?;
             let auth_path = runtime_auth_path(&config);
             let mut auth = read_runtime_auth_file(&auth_path)?;
             let (mutation, record) = revoke_workspace_issuer_trust(
@@ -609,17 +623,126 @@ fn run_trust_workspace_command(mut args: VecDeque<String>) -> Result<(), Process
                 &workspace_id,
                 unix_now_i64()?,
             )
-            .map_err(|error| ProcessError::auth(error.to_string()))?;
+            .map_err(workspace_trust_process_error)?;
             if mutation != WorkspaceIssuerTrustMutation::Unchanged {
                 write_runtime_auth_file(&auth_path, &auth)?;
             }
             print_workspace_trust_mutation(mutation, &record);
             Ok(())
         }
-        _ => Err(ProcessError::usage(format!(
-            "unknown trust-workspace command `{subcommand}`"
-        ))),
+        _ => Err(ProcessError::usage(
+            "unknown trust-workspace command".to_string(),
+        )),
     }
+}
+
+fn parse_trust_workspace_storage_flags(
+    args: &mut VecDeque<String>,
+) -> Result<ProcessConfig, ProcessError> {
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if matches!(argument.as_str(), "--fs-root" | "--fs-runtime-dir") {
+            if index + 1 >= args.len() {
+                return Err(ProcessError::usage(
+                    "invalid trust-workspace storage arguments".to_string(),
+                ));
+            }
+            index += 2;
+            continue;
+        }
+        if argument
+            .strip_prefix("--fs-root=")
+            .or_else(|| argument.strip_prefix("--fs-runtime-dir="))
+            .is_some_and(|value| !value.is_empty())
+        {
+            index += 1;
+            continue;
+        }
+        return Err(ProcessError::usage(
+            "invalid trust-workspace storage arguments".to_string(),
+        ));
+    }
+    parse_auth_storage_flags(args)
+        .map_err(|_| ProcessError::usage("invalid trust-workspace storage arguments".to_string()))
+}
+
+fn parse_trust_workspace_list_flags(
+    args: &mut VecDeque<String>,
+) -> Result<(ProcessConfig, usize, usize), ProcessError> {
+    let mut storage = VecDeque::new();
+    let mut offset = None;
+    let mut limit = None;
+    while let Some(argument) = args.pop_front() {
+        if matches!(argument.as_str(), "--fs-root" | "--fs-runtime-dir") {
+            let value = args.pop_front().ok_or_else(|| {
+                ProcessError::usage("invalid trust-workspace list arguments".to_string())
+            })?;
+            storage.push_back(argument);
+            storage.push_back(value);
+            continue;
+        }
+        if argument.starts_with("--fs-root=") || argument.starts_with("--fs-runtime-dir=") {
+            if argument.ends_with('=') {
+                return Err(ProcessError::usage(
+                    "invalid trust-workspace list arguments".to_string(),
+                ));
+            }
+            storage.push_back(argument);
+            continue;
+        }
+        let (name, inline_value) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(name, value)| {
+                (name, Some(value))
+            });
+        if !matches!(name, "--offset" | "--limit") {
+            return Err(ProcessError::usage(
+                "invalid trust-workspace list arguments".to_string(),
+            ));
+        }
+        let value = match inline_value {
+            Some(value) if !value.is_empty() => value.to_string(),
+            Some(_) => {
+                return Err(ProcessError::usage(
+                    "invalid trust-workspace list arguments".to_string(),
+                ));
+            }
+            None => args.pop_front().ok_or_else(|| {
+                ProcessError::usage("invalid trust-workspace list arguments".to_string())
+            })?,
+        };
+        let parsed = value.parse::<usize>().map_err(|_| {
+            ProcessError::usage("invalid trust-workspace list arguments".to_string())
+        })?;
+        match name {
+            "--offset" if offset.replace(parsed).is_none() => {}
+            "--limit"
+                if (1..=MAX_TRUST_WORKSPACE_LIST_LIMIT).contains(&parsed)
+                    && limit.replace(parsed).is_none() => {}
+            _ => {
+                return Err(ProcessError::usage(
+                    "invalid trust-workspace list arguments".to_string(),
+                ));
+            }
+        }
+    }
+    let config = parse_trust_workspace_storage_flags(&mut storage)?;
+    let offset = offset.unwrap_or(0);
+    if offset > MAX_WORKSPACE_ISSUER_TRUST_RECORDS {
+        return Err(ProcessError::usage(
+            "invalid trust-workspace list arguments".to_string(),
+        ));
+    }
+    Ok((
+        config,
+        offset,
+        limit.unwrap_or(DEFAULT_TRUST_WORKSPACE_LIST_LIMIT),
+    ))
+}
+
+fn workspace_trust_process_error(_: WorkspaceIssuerTrustError) -> ProcessError {
+    ProcessError::auth("Workspace issuer trust mutation was rejected")
 }
 
 fn read_workspace_identity_bundle(path: &Path) -> Result<Vec<u8>, ProcessError> {
@@ -649,13 +772,15 @@ fn take_required_auth_option(
     let argument = args
         .pop_front()
         .ok_or_else(|| ProcessError::usage(format!("missing required `{expected}`")))?;
-    let (flag, inline_value) = split_flag_value(argument)?;
+    let (flag, inline_value) = split_flag_value(argument)
+        .map_err(|_| ProcessError::usage("invalid trust-workspace argument".to_string()))?;
     if flag != expected {
-        return Err(ProcessError::usage(format!(
-            "expected `{expected}`, found `{flag}`"
-        )));
+        return Err(ProcessError::usage(
+            "invalid trust-workspace argument".to_string(),
+        ));
     }
     take_value(&flag, inline_value, args)
+        .map_err(|_| ProcessError::usage("invalid trust-workspace argument".to_string()))
 }
 
 fn unix_now_i64() -> Result<i64, ProcessError> {
@@ -695,8 +820,19 @@ fn read_runtime_auth_file(path: &Path) -> Result<RuntimeAuthFile, ProcessError> 
     if !path.exists() {
         return Ok(RuntimeAuthFile::default());
     }
-    let contents = std::fs::read_to_string(path)
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(path)
         .map_err(|_| ProcessError::auth("runtime auth store is unavailable"))?;
+    let mut contents = Vec::new();
+    file.take(MAX_RUNTIME_AUTH_FILE_BYTES + 1)
+        .read_to_end(&mut contents)
+        .map_err(|_| ProcessError::auth("runtime auth store is unavailable"))?;
+    if contents.len() as u64 > MAX_RUNTIME_AUTH_FILE_BYTES {
+        return Err(ProcessError::auth("runtime auth store is too large"));
+    }
+    let contents = String::from_utf8(contents)
+        .map_err(|_| ProcessError::auth("runtime auth store is corrupt"))?;
     let auth: RuntimeAuthFile = toml::from_str(&contents)
         .map_err(|_| ProcessError::auth("runtime auth store is corrupt"))?;
     validate_workspace_issuer_trust_records(&auth.workspace_issuers)
@@ -710,6 +846,9 @@ fn write_runtime_auth_file(path: &Path, auth: &RuntimeAuthFile) -> Result<(), Pr
     }
     let contents = toml::to_string_pretty(auth)
         .map_err(|_| ProcessError::auth("runtime auth store serialization failed"))?;
+    if contents.len() as u64 > MAX_RUNTIME_AUTH_FILE_BYTES {
+        return Err(ProcessError::auth("runtime auth store is too large"));
+    }
     write_secret_file(path, contents.as_bytes())
 }
 
@@ -1122,7 +1261,7 @@ Auth commands:
   trust-server add --server-id ID --public-key KEY [--display-name NAME] [--replace] [--fs-root PATH] [--fs-runtime-dir PATH]
   trust-server list [--json] [--fs-root PATH] [--fs-runtime-dir PATH]
   trust-workspace add --bundle PATH [--fs-root PATH] [--fs-runtime-dir PATH]
-  trust-workspace list [--fs-root PATH] [--fs-runtime-dir PATH]
+  trust-workspace list [--offset N] [--limit N] [--fs-root PATH] [--fs-runtime-dir PATH]
   trust-workspace show --workspace-id ID [--fs-root PATH] [--fs-runtime-dir PATH]
   trust-workspace replace --bundle PATH [--fs-root PATH] [--fs-runtime-dir PATH]
   trust-workspace revoke --workspace-id ID [--fs-root PATH] [--fs-runtime-dir PATH]
@@ -1459,6 +1598,62 @@ mod tests {
         assert_eq!(error, "runtime auth store is corrupt");
         assert!(!error.contains(private_marker));
         assert!(!error.contains(&path.to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn trust_workspace_errors_and_pagination_are_bounded_and_secret_free() {
+        let temp = tempfile::tempdir().unwrap();
+        let secret_path = "/private/operator/path/must-not-appear";
+        for args in [
+            VecDeque::from([secret_path.to_string()]),
+            VecDeque::from([
+                "show".to_string(),
+                "--workspace-id".to_string(),
+                secret_path.to_string(),
+                "--fs-root".to_string(),
+                temp.path().to_string_lossy().into_owned(),
+            ]),
+            VecDeque::from([
+                "list".to_string(),
+                secret_path.to_string(),
+                "--fs-root".to_string(),
+                temp.path().to_string_lossy().into_owned(),
+            ]),
+        ] {
+            let error = run_trust_workspace_command(args).unwrap_err().to_string();
+            assert!(
+                !error.contains(secret_path),
+                "unexpected diagnostic: {error}"
+            );
+        }
+
+        let mut page_args = VecDeque::from([
+            "--offset".to_string(),
+            "2".to_string(),
+            "--limit=7".to_string(),
+            "--fs-root".to_string(),
+            temp.path().to_string_lossy().into_owned(),
+        ]);
+        let (_, offset, limit) = parse_trust_workspace_list_flags(&mut page_args).unwrap();
+        assert_eq!((offset, limit), (2, 7));
+        let error = parse_trust_workspace_list_flags(&mut VecDeque::from([
+            "--limit".to_string(),
+            "101".to_string(),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert_eq!(error, "invalid trust-workspace list arguments");
+    }
+
+    #[test]
+    fn oversized_runtime_auth_store_fails_closed_before_parsing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("runtime-auth.toml");
+        std::fs::write(&path, vec![b'x'; MAX_RUNTIME_AUTH_FILE_BYTES as usize + 1]).unwrap();
+        assert_eq!(
+            read_runtime_auth_file(&path).unwrap_err().to_string(),
+            "runtime auth store is too large"
+        );
     }
 
     #[test]
