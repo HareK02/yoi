@@ -65,7 +65,7 @@ By default, Runtime auth state is stored at:
 <data_dir>/runtime/auth.toml
 ```
 
-If the Runtime process is launched with `--fs-root` or `--fs-runtime-dir`, pass the same flags to every `identity` and `trust-server` command. Otherwise the setup command may write an auth file that the server process never reads.
+If the Runtime process is launched with `--fs-root` or `--fs-runtime-dir`, pass the same flags to every `identity`, `trust-server`, and `trust-workspace` command. Otherwise the setup command may write an auth file that the server process never reads.
 
 Example with explicit Runtime storage:
 
@@ -103,6 +103,53 @@ Verify:
 ```bash
 yoi-runtime trust-server list --json
 ```
+
+## Workspace issuer trust foundation
+
+Workspace signing identity is Workspace-scoped. Provision the identity through the authenticated owner-only Workspace Settings operation, then export the public bundle from:
+
+```text
+GET /api/w/<WORKSPACE_ID>/settings/workspace/signing-identity
+```
+
+Save the response's `identity` object—not the outer response wrapper—as `workspace-public-identity.json`, and transfer only that document to the Runtime host:
+
+```bash
+yoi-runtime trust-workspace add \
+  --bundle workspace-public-identity.json \
+  --fs-root /var/lib/yoi-runtime
+```
+
+The bundle contains `workspace_id`, `backend_url`, `key_id`, `algorithm`, `public_key`, `public_key_fingerprint`, and the Workspace signing identity `revision`. It never contains the Workspace private key. Do not transfer the Server-side private-material file or place private material in Runtime configuration.
+
+Inspect the Runtime trust records without exposing private material:
+
+```bash
+yoi-runtime trust-workspace list --fs-root /var/lib/yoi-runtime
+yoi-runtime trust-workspace show \
+  --workspace-id '<WORKSPACE_ID>' \
+  --fs-root /var/lib/yoi-runtime
+```
+
+An exact repeated `add` is idempotent. A different bundle for an existing Workspace is rejected; use the explicit `replace` operation after verifying the new public fingerprint out of band:
+
+```bash
+yoi-runtime trust-workspace replace \
+  --bundle workspace-public-identity-v2.json \
+  --fs-root /var/lib/yoi-runtime
+```
+
+Runtime increments a local `trust_generation` on replacement and revocation. Signed claims bind the issuer URL, Workspace signing identity revision, Runtime trust generation, live Workspace–Runtime `binding_revision`, Runtime/Worker target, operation, request-body SHA-256 digest, expiry, and one-time `jti`. Claims are accepted only when the Workspace identity revision, Runtime trust generation, and caller-supplied current binding revision all match exactly. Revoke trust without deleting its generation fence:
+
+```bash
+yoi-runtime trust-workspace revoke \
+  --workspace-id '<WORKSPACE_ID>' \
+  --fs-root /var/lib/yoi-runtime
+```
+
+For rotation, create and export the new Workspace identity first, verify its fingerprint, replace Runtime trust, update the Workspace–Runtime binding authority, and only then issue claims under the new key/generation. For emergency revocation, revoke Runtime trust first and stop issuing claims; reactivation requires an explicit `replace` with an active public bundle. Runtime auth state is written atomically with private file permissions and survives restart; malformed trust state fails closed.
+
+This command establishes the Runtime-side trust and claim-verifier foundation only. The Runtime auth store is read during process startup; once signed verification is connected, a controlled Runtime restart will be required before a changed trust record affects verification. Do not restart a live Runtime until its active Worker lifecycle has been handled. Until the signed-verification cutover Ticket is integrated, existing remote control traffic continues to select the legacy trusted-Server verifier explicitly; Runtime never falls back from one verifier mode to the other.
 
 ## 4. Register the Runtime public key and endpoint on Server
 

@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use worker_runtime::auth::{
@@ -24,6 +25,11 @@ use worker_runtime::http_server::{
 };
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 use worker_runtime::working_directory::RuntimeGitCacheMaterializer;
+use worker_runtime::workspace_issuer::{
+    WorkspaceIssuerTrustMutation, WorkspaceIssuerTrustRecord, add_workspace_issuer_trust,
+    replace_workspace_issuer_trust, revoke_workspace_issuer_trust,
+    validate_workspace_issuer_trust_records,
+};
 use worker_runtime::{Runtime, RuntimeOptions};
 
 fn main() -> ExitCode {
@@ -72,7 +78,7 @@ fn run() -> Result<(), ProcessError> {
     }
     if matches!(
         args.first().map(String::as_str),
-        Some("identity" | "trust-server")
+        Some("identity" | "trust-server" | "trust-workspace")
     ) {
         return run_auth_command(args);
     }
@@ -170,7 +176,7 @@ fn run_migration_command(mut args: Vec<String>) -> Result<(), ProcessError> {
     println!(
         "{}",
         serde_json::to_string_pretty(&plan)
-            .map_err(|error| ProcessError::Auth(format!("encode migration plan: {error}")))?
+            .map_err(|error| ProcessError::auth(format!("encode migration plan: {error}")))?
     );
     Ok(())
 }
@@ -198,12 +204,12 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
     > = None;
     if let Some(endpoint) = config.backend_resource_endpoint.clone() {
         let identity = runtime_auth.identity.as_ref().ok_or_else(|| {
-            ProcessError::Auth(
+            ProcessError::auth(
                 "--backend-resource-endpoint requires a configured Runtime identity".to_owned(),
             )
         })?;
         let [trusted_server] = runtime_auth.trusted_servers.as_slice() else {
-            return Err(ProcessError::Auth(
+            return Err(ProcessError::auth(
                 "--backend-resource-endpoint requires exactly one trusted Server identity"
                     .to_owned(),
             ));
@@ -468,6 +474,10 @@ impl ProcessError {
     fn usage(message: String) -> Self {
         Self::Usage(message)
     }
+
+    fn auth(message: impl Into<String>) -> Self {
+        Self::Auth(message.into())
+    }
 }
 
 impl fmt::Display for ProcessError {
@@ -512,6 +522,8 @@ struct RuntimeAuthFile {
     identity: Option<RuntimeIdentityMaterial>,
     #[serde(default)]
     trusted_servers: Vec<TrustedServerKey>,
+    #[serde(default)]
+    workspace_issuers: Vec<WorkspaceIssuerTrustRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -527,6 +539,134 @@ fn runtime_public_identity_view(identity: &RuntimeIdentityMaterial) -> RuntimePu
     }
 }
 
+fn run_trust_workspace_command(mut args: VecDeque<String>) -> Result<(), ProcessError> {
+    let subcommand = args.pop_front().ok_or_else(|| {
+        ProcessError::usage(
+            "trust-workspace requires add, list, show, replace, or revoke".to_string(),
+        )
+    })?;
+    match subcommand.as_str() {
+        "add" | "replace" => {
+            let bundle_path = take_required_auth_option(&mut args, "--bundle")?;
+            let config = parse_auth_storage_flags(&mut args)?;
+            let auth_path = runtime_auth_path(&config);
+            let mut auth = read_runtime_auth_file(&auth_path)?;
+            let bundle_bytes = std::fs::read(&bundle_path).map_err(|_| {
+                ProcessError::auth("Workspace signing public identity bundle is unavailable")
+            })?;
+            let bundle = serde_json::from_slice(&bundle_bytes).map_err(|_| {
+                ProcessError::auth("Workspace signing public identity bundle is invalid")
+            })?;
+            let now_unix = unix_now_i64()?;
+            let (mutation, record) = if subcommand == "add" {
+                add_workspace_issuer_trust(&mut auth.workspace_issuers, bundle, now_unix)
+            } else {
+                replace_workspace_issuer_trust(&mut auth.workspace_issuers, bundle, now_unix)
+            }
+            .map_err(|error| ProcessError::auth(error.to_string()))?;
+            if mutation != WorkspaceIssuerTrustMutation::Unchanged {
+                write_runtime_auth_file(&auth_path, &auth)?;
+            }
+            print_workspace_trust_mutation(mutation, &record);
+            Ok(())
+        }
+        "list" => {
+            let config = parse_auth_storage_flags(&mut args)?;
+            let auth_path = runtime_auth_path(&config);
+            let mut records = read_runtime_auth_file(&auth_path)?.workspace_issuers;
+            records.sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
+            let output = serde_json::to_string_pretty(&records)
+                .map_err(|_| ProcessError::auth("Workspace issuer trust output failed"))?;
+            println!("{output}");
+            Ok(())
+        }
+        "show" => {
+            let workspace_id = take_required_auth_option(&mut args, "--workspace-id")?;
+            let config = parse_auth_storage_flags(&mut args)?;
+            let auth_path = runtime_auth_path(&config);
+            let auth = read_runtime_auth_file(&auth_path)?;
+            let record = auth
+                .workspace_issuers
+                .iter()
+                .find(|record| record.workspace_id == workspace_id)
+                .ok_or_else(|| {
+                    ProcessError::auth(format!(
+                        "Workspace issuer trust is not registered for `{workspace_id}`"
+                    ))
+                })?;
+            let output = serde_json::to_string_pretty(record)
+                .map_err(|_| ProcessError::auth("Workspace issuer trust output failed"))?;
+            println!("{output}");
+            Ok(())
+        }
+        "revoke" => {
+            let workspace_id = take_required_auth_option(&mut args, "--workspace-id")?;
+            let config = parse_auth_storage_flags(&mut args)?;
+            let auth_path = runtime_auth_path(&config);
+            let mut auth = read_runtime_auth_file(&auth_path)?;
+            let (mutation, record) = revoke_workspace_issuer_trust(
+                &mut auth.workspace_issuers,
+                &workspace_id,
+                unix_now_i64()?,
+            )
+            .map_err(|error| ProcessError::auth(error.to_string()))?;
+            if mutation != WorkspaceIssuerTrustMutation::Unchanged {
+                write_runtime_auth_file(&auth_path, &auth)?;
+            }
+            print_workspace_trust_mutation(mutation, &record);
+            Ok(())
+        }
+        _ => Err(ProcessError::usage(format!(
+            "unknown trust-workspace command `{subcommand}`"
+        ))),
+    }
+}
+
+fn take_required_auth_option(
+    args: &mut VecDeque<String>,
+    expected: &str,
+) -> Result<String, ProcessError> {
+    let argument = args
+        .pop_front()
+        .ok_or_else(|| ProcessError::usage(format!("missing required `{expected}`")))?;
+    let (flag, inline_value) = split_flag_value(argument)?;
+    if flag != expected {
+        return Err(ProcessError::usage(format!(
+            "expected `{expected}`, found `{flag}`"
+        )));
+    }
+    take_value(&flag, inline_value, args)
+}
+
+fn unix_now_i64() -> Result<i64, ProcessError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ProcessError::auth("system clock is before the Unix epoch"))?
+        .as_secs();
+    i64::try_from(now).map_err(|_| ProcessError::auth("system clock is out of range"))
+}
+
+fn print_workspace_trust_mutation(
+    mutation: WorkspaceIssuerTrustMutation,
+    record: &WorkspaceIssuerTrustRecord,
+) {
+    let action = match mutation {
+        WorkspaceIssuerTrustMutation::Added => "added",
+        WorkspaceIssuerTrustMutation::Replaced => "replaced",
+        WorkspaceIssuerTrustMutation::Revoked => "revoked",
+        WorkspaceIssuerTrustMutation::Unchanged => "unchanged",
+    };
+    println!(
+        "Workspace issuer trust {action}: workspace={} key={} fingerprint={} identity_revision={} trust_generation={} state={:?}",
+        record.workspace_id,
+        record.key_id,
+        record.public_key_fingerprint,
+        record.identity_revision,
+        record.trust_generation,
+        record.state,
+    );
+}
+
 fn runtime_auth_path(config: &ProcessConfig) -> PathBuf {
     config.resolved_fs_paths().runtime_dir.join("auth.toml")
 }
@@ -535,34 +675,50 @@ fn read_runtime_auth_file(path: &Path) -> Result<RuntimeAuthFile, ProcessError> 
     if !path.exists() {
         return Ok(RuntimeAuthFile::default());
     }
-    let contents = std::fs::read_to_string(path)?;
-    toml::from_str(&contents)
-        .map_err(|error| ProcessError::Auth(format!("failed to parse {}: {error}", path.display())))
+    let contents = std::fs::read_to_string(path)
+        .map_err(|_| ProcessError::auth("runtime auth store is unavailable"))?;
+    let auth: RuntimeAuthFile = toml::from_str(&contents)
+        .map_err(|_| ProcessError::auth("runtime auth store is corrupt"))?;
+    validate_workspace_issuer_trust_records(&auth.workspace_issuers)
+        .map_err(|_| ProcessError::auth("runtime Workspace issuer trust store is corrupt"))?;
+    Ok(auth)
 }
 
 fn write_runtime_auth_file(path: &Path, auth: &RuntimeAuthFile) -> Result<(), ProcessError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let contents = toml::to_string_pretty(auth).map_err(|error| {
-        ProcessError::Auth(format!("failed to serialize {}: {error}", path.display()))
-    })?;
+    let contents = toml::to_string_pretty(auth)
+        .map_err(|_| ProcessError::auth("runtime auth store serialization failed"))?;
     write_secret_file(path, contents.as_bytes())
 }
 
 fn write_secret_file(path: &Path, contents: &[u8]) -> Result<(), ProcessError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| ProcessError::auth("runtime auth store path has no parent"))?;
+    let temporary_path = parent.join(format!(".runtime-auth-{}.tmp", uuid::Uuid::now_v7()));
+    let write_result = (|| -> Result<(), ProcessError> {
         let mut options = std::fs::OpenOptions::new();
-        options.create(true).write(true).truncate(true).mode(0o600);
-        std::io::Write::write_all(&mut options.open(path)?, contents)?;
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary_path)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary_path, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents)?;
-    }
-    Ok(())
+    write_result
 }
 
 fn load_runtime_http_auth(
@@ -609,6 +765,7 @@ fn run_auth_command(args: Vec<String>) -> Result<(), ProcessError> {
     match command.as_str() {
         "identity" => run_identity_command(args),
         "trust-server" => run_trust_server_command(args),
+        "trust-workspace" => run_trust_workspace_command(args),
         _ => Err(ProcessError::usage(format!(
             "unknown auth command `{command}`"
         ))),
@@ -668,7 +825,7 @@ fn run_identity_command(mut args: VecDeque<String>) -> Result<(), ProcessError> 
             })?;
             auth.identity = Some(
                 RuntimeIdentityMaterial::generate(runtime_id)
-                    .map_err(|error| ProcessError::Auth(error.to_string()))?,
+                    .map_err(|error| ProcessError::auth(error.to_string()))?,
             );
             write_runtime_auth_file(&path, &auth)?;
             let identity = auth.identity.as_ref().unwrap();
@@ -721,7 +878,7 @@ fn run_identity_command(mut args: VecDeque<String>) -> Result<(), ProcessError> 
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&view)
-                        .map_err(|error| ProcessError::Auth(error.to_string()))?
+                        .map_err(|error| ProcessError::auth(error.to_string()))?
                 );
             } else {
                 println!("runtime_id={}", view.identity_id);
@@ -852,7 +1009,7 @@ fn run_trust_server_command(mut args: VecDeque<String>) -> Result<(), ProcessErr
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&auth.trusted_servers)
-                        .map_err(|error| ProcessError::Auth(error.to_string()))?
+                        .map_err(|error| ProcessError::auth(error.to_string()))?
                 );
             } else {
                 for server in auth.trusted_servers {
@@ -944,6 +1101,11 @@ Auth commands:
   identity show [--json] [--fs-root PATH] [--fs-runtime-dir PATH]
   trust-server add --server-id ID --public-key KEY [--display-name NAME] [--replace] [--fs-root PATH] [--fs-runtime-dir PATH]
   trust-server list [--json] [--fs-root PATH] [--fs-runtime-dir PATH]
+  trust-workspace add --bundle PATH [--fs-root PATH] [--fs-runtime-dir PATH]
+  trust-workspace list [--fs-root PATH] [--fs-runtime-dir PATH]
+  trust-workspace show --workspace-id ID [--fs-root PATH] [--fs-runtime-dir PATH]
+  trust-workspace replace --bundle PATH [--fs-root PATH] [--fs-runtime-dir PATH]
+  trust-workspace revoke --workspace-id ID [--fs-root PATH] [--fs-runtime-dir PATH]
   trust-server revoke --server-id ID [--fs-root PATH] [--fs-runtime-dir PATH]"#
 }
 
@@ -1119,6 +1281,149 @@ mod tests {
                 .contains("decode migrated Runtime snapshot")
         );
         assert_eq!(std::fs::read(root.join("runtime.json")).unwrap(), before);
+    }
+
+    #[test]
+    fn workspace_issuer_trust_cli_persists_across_reload_and_writes_private_mode() {
+        use sha2::{Digest as _, Sha256};
+        use workspace_api::WorkspacePublicIdentityBundle;
+
+        let temp = tempfile::tempdir().unwrap();
+        let identity = RuntimeIdentityMaterial::generate("WK-1").unwrap();
+        let public_key = decode_public_key(&identity.public_key).unwrap();
+        let fingerprint = Sha256::digest(public_key);
+        let fingerprint = format!(
+            "sha256:{}",
+            fingerprint
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let bundle_path = temp.path().join("workspace-public.json");
+        std::fs::write(
+            &bundle_path,
+            serde_json::to_vec(&WorkspacePublicIdentityBundle {
+                workspace_id: "workspace-1".to_string(),
+                backend_url: "https://backend.example.test".to_string(),
+                key_id: "WK-1".to_string(),
+                algorithm: "ed25519".to_string(),
+                public_key: identity.public_key,
+                public_key_fingerprint: fingerprint,
+                revision: 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        run_trust_workspace_command(VecDeque::from([
+            "add".to_string(),
+            "--bundle".to_string(),
+            bundle_path.to_string_lossy().into_owned(),
+            "--fs-root".to_string(),
+            temp.path().to_string_lossy().into_owned(),
+        ]))
+        .unwrap();
+        let config = ProcessConfig {
+            fs_root: Some(temp.path().to_path_buf()),
+            ..ProcessConfig::default().unwrap()
+        };
+        let path = runtime_auth_path(&config);
+        let first = read_runtime_auth_file(&path).unwrap();
+        assert_eq!(first.workspace_issuers.len(), 1);
+        assert_eq!(first.workspace_issuers[0].trust_generation, 1);
+
+        run_trust_workspace_command(VecDeque::from([
+            "add".to_string(),
+            "--bundle".to_string(),
+            bundle_path.to_string_lossy().into_owned(),
+            "--fs-root".to_string(),
+            temp.path().to_string_lossy().into_owned(),
+        ]))
+        .unwrap();
+        let replay = read_runtime_auth_file(&path).unwrap();
+        assert_eq!(replay.workspace_issuers[0].trust_generation, 1);
+
+        let replacement = RuntimeIdentityMaterial::generate("WK-2").unwrap();
+        let public_key = decode_public_key(&replacement.public_key).unwrap();
+        let fingerprint = Sha256::digest(public_key);
+        let fingerprint = format!(
+            "sha256:{}",
+            fingerprint
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        std::fs::write(
+            &bundle_path,
+            serde_json::to_vec(&WorkspacePublicIdentityBundle {
+                workspace_id: "workspace-1".to_string(),
+                backend_url: "https://backend.example.test".to_string(),
+                key_id: "WK-2".to_string(),
+                algorithm: "ed25519".to_string(),
+                public_key: replacement.public_key,
+                public_key_fingerprint: fingerprint,
+                revision: 2,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        for command in ["replace", "show", "list"] {
+            let mut args = VecDeque::from([command.to_string()]);
+            match command {
+                "replace" => {
+                    args.push_back("--bundle".to_string());
+                    args.push_back(bundle_path.to_string_lossy().into_owned());
+                }
+                "show" => {
+                    args.push_back("--workspace-id".to_string());
+                    args.push_back("workspace-1".to_string());
+                }
+                "list" => {}
+                _ => unreachable!(),
+            }
+            args.push_back("--fs-root".to_string());
+            args.push_back(temp.path().to_string_lossy().into_owned());
+            run_trust_workspace_command(args).unwrap();
+        }
+        run_trust_workspace_command(VecDeque::from([
+            "revoke".to_string(),
+            "--workspace-id".to_string(),
+            "workspace-1".to_string(),
+            "--fs-root".to_string(),
+            temp.path().to_string_lossy().into_owned(),
+        ]))
+        .unwrap();
+        let revoked = read_runtime_auth_file(&path).unwrap();
+        assert_eq!(revoked.workspace_issuers[0].trust_generation, 3);
+        assert_eq!(
+            revoked.workspace_issuers[0].state,
+            worker_runtime::workspace_issuer::WorkspaceIssuerTrustState::Revoked
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_workspace_issuer_trust_fails_closed_without_echoing_store_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("runtime-auth.toml");
+        let private_marker = "private-key-material-must-not-appear";
+        std::fs::write(
+            &path,
+            format!("identity = {{ private_key_pkcs8 = \"{private_marker}\" }}\n[[workspace_issuers]]\nworkspace_id = []\n"),
+        )
+        .unwrap();
+        let error = read_runtime_auth_file(&path).unwrap_err().to_string();
+        assert_eq!(error, "runtime auth store is corrupt");
+        assert!(!error.contains(private_marker));
+        assert!(!error.contains(&path.to_string_lossy().into_owned()));
     }
 
     #[test]
