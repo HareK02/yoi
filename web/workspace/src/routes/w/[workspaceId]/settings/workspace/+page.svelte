@@ -5,6 +5,7 @@
     WorkspaceDeletionPreflightResponse,
     WorkspaceDeletionRequest,
     WorkspaceMetadataSettingsResponse,
+    WorkspaceSigningIdentityResponse,
   } from '$lib/generated/workspace-api';
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
@@ -18,6 +19,8 @@
   import DiagnosticsList from '$lib/workspace/settings/DiagnosticsList.svelte';
   import {
     fetchWorkspaceMetadata,
+    fetchWorkspaceSigningIdentity,
+    provisionWorkspaceSigningIdentity,
     updateWorkspaceMetadata,
   } from '$lib/workspace/settings/profile-api';
   import type { PageProps } from './$types';
@@ -26,6 +29,14 @@
   let workspaceId = $derived(data.workspace?.workspace_id ?? '');
 
   let workspaceMetadata = $state<WorkspaceMetadataSettingsResponse | null>(null);
+  let signingIdentity = $state<WorkspaceSigningIdentityResponse | null>(null);
+  let identityLoading = $state(true);
+  let identityError = $state<string | null>(null);
+  let provisioningIdentity = $state(false);
+  let identityCopied = $state(false);
+  let identityBundleText = $derived(
+    signingIdentity?.public_bundle ? JSON.stringify(signingIdentity.public_bundle, null, 2) : ''
+  );
   let displayNameDraft = $state('');
   let loading = $state(true);
   let submitting = $state(false);
@@ -58,6 +69,17 @@
           workspaceMetadata = response;
           displayNameDraft = response.display_name;
           diagnostics = response.diagnostics;
+          if (data.workspace?.permissions.delete_workspace) {
+            try {
+              signingIdentity = await fetchWorkspaceSigningIdentity(workspaceId);
+            } catch (err) {
+              identityError = err instanceof Error ? err.message : 'Workspace identity request failed';
+            } finally {
+              identityLoading = false;
+            }
+          } else {
+            identityLoading = false;
+          }
         }
       } catch (err) {
         if (!cancelled) {
@@ -90,6 +112,30 @@
       message = err instanceof Error ? err.message : 'workspace update failed';
     } finally {
       submitting = false;
+    }
+  }
+
+  async function provisionIdentity() {
+    provisioningIdentity = true;
+    identityError = null;
+    try {
+      signingIdentity = await provisionWorkspaceSigningIdentity(workspaceId);
+    } catch (err) {
+      identityError = err instanceof Error ? err.message : 'Workspace identity provisioning failed';
+    } finally {
+      provisioningIdentity = false;
+    }
+  }
+
+  async function copyIdentityBundle() {
+    const bundle = signingIdentity?.public_bundle;
+    if (!bundle) return;
+    identityCopied = false;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(bundle, null, 2));
+      identityCopied = true;
+    } catch (err) {
+      identityError = err instanceof Error ? err.message : 'Workspace identity bundle copy failed';
     }
   }
 
@@ -232,6 +278,52 @@
 </section>
 
 {#if data.workspace?.permissions.delete_workspace}
+  <section class="settings-section" aria-labelledby="workspace-identity-title">
+    <div class="section-heading">
+      <div>
+        <h2 id="workspace-identity-title">Workspace public identity</h2>
+        <p>Use this public bundle when connecting a Runtime to this Workspace.</p>
+      </div>
+      {#if signingIdentity?.public_bundle}
+        <button type="button" onclick={() => void copyIdentityBundle()}>
+          {identityCopied ? 'Copied' : 'Copy bundle'}
+        </button>
+      {/if}
+    </div>
+    {#if identityError}
+      <p class="status-message error">{identityError}</p>
+    {/if}
+    {#if identityLoading}
+      <p>Loading identity…</p>
+    {:else if signingIdentity?.identity.state === 'pending_provisioning'}
+      <p>This existing Workspace needs one explicit signing identity provisioning operation.</p>
+      <button
+        type="button"
+        disabled={provisioningIdentity}
+        onclick={() => void provisionIdentity()}
+      >{provisioningIdentity ? 'Provisioning…' : 'Provision identity'}</button>
+    {:else if signingIdentity?.public_bundle}
+      <dl class="metadata-list">
+        <div>
+          <dt>Key</dt>
+          <dd><code>{signingIdentity.identity.key_id}</code></dd>
+        </div>
+        <div>
+          <dt>Fingerprint</dt>
+          <dd><code>{signingIdentity.identity.public_key_fingerprint}</code></dd>
+        </div>
+        <div>
+          <dt>Revision</dt>
+          <dd><code>{signingIdentity.identity.revision}</code></dd>
+        </div>
+      </dl>
+      <label class="identity-bundle">
+        <span>Public identity bundle</span>
+        <textarea readonly rows="9" value={identityBundleText}></textarea>
+      </label>
+    {/if}
+  </section>
+
   <section class="settings-section danger-zone" aria-labelledby="workspace-danger-title">
     <div>
       <h2 id="workspace-danger-title">Danger zone</h2>
@@ -286,6 +378,13 @@
 {/if}
 
 <style>
+  .section-heading { display: flex; justify-content: space-between; align-items: start; gap: var(--space-4); }
+  .section-heading p { margin-block: var(--space-1) 0; }
+  .metadata-list { display: grid; gap: var(--space-2); }
+  .metadata-list div { display: grid; grid-template-columns: 8rem minmax(0, 1fr); gap: var(--space-3); }
+  .metadata-list dd { margin: 0; overflow-wrap: anywhere; }
+  .identity-bundle { display: grid; gap: var(--space-2); margin-top: var(--space-4); }
+  .identity-bundle textarea { width: 100%; resize: vertical; font-family: var(--font-mono); font-size: 0.75rem; }
   .danger-zone { display: flex; justify-content: space-between; align-items: start; gap: var(--space-4); border-top: 1px solid var(--color-danger, #b42318); }
   .danger-zone p { max-width: 68ch; }
   .danger-button { color: white; background: var(--color-danger, #b42318); border-color: var(--color-danger, #b42318); }

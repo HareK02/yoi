@@ -18,11 +18,12 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 53;
+const LATEST_SCHEMA_VERSION: i64 = 54;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
 const WORKSPACE_DELETION_MIGRATION_NAME: &str = "durable Workspace deletion operations";
+const WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME: &str = "Workspace signing identity authority";
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -39,6 +40,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 53,
         name: WORKSPACE_DELETION_MIGRATION_NAME,
         apply: migrate_workspace_deletion_v52_to_v53,
+    },
+    Migration {
+        version: 54,
+        name: WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME,
+        apply: migrate_workspace_signing_identity_v53_to_v54,
     },
 ];
 
@@ -133,6 +139,66 @@ pub struct WorkspaceBootstrapResult {
     pub repository: RepositoryRecord,
     pub config_revision: u64,
     pub replayed: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct WorkspaceSigningIdentityRecord {
+    pub workspace_id: String,
+    pub key_id: String,
+    pub algorithm: String,
+    pub public_key: Option<String>,
+    pub public_key_fingerprint: Option<String>,
+    pub private_material_ref: String,
+    pub revision: u64,
+    pub state: String,
+    pub created_at: String,
+    pub provisioned_at: Option<String>,
+    pub updated_at: String,
+}
+
+impl std::fmt::Debug for WorkspaceSigningIdentityRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkspaceSigningIdentityRecord")
+            .field("workspace_id", &self.workspace_id)
+            .field("key_id", &self.key_id)
+            .field("algorithm", &self.algorithm)
+            .field("public_key", &self.public_key)
+            .field("public_key_fingerprint", &self.public_key_fingerprint)
+            .field("private_material_ref", &"[REDACTED]")
+            .field("revision", &self.revision)
+            .field("state", &self.state)
+            .field("created_at", &self.created_at)
+            .field("provisioned_at", &self.provisioned_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSigningIdentityActivation {
+    pub workspace_id: String,
+    pub key_id: String,
+    pub public_key: String,
+    pub public_key_fingerprint: String,
+    pub private_material_ref: String,
+    pub revision: u64,
+    pub provisioned_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSigningIdentityProvisioningOperation {
+    pub operation_key: String,
+    pub request_fingerprint: String,
+    pub operation_kind: String,
+    pub workspace_id: String,
+    pub key_id: String,
+    pub private_material_ref: String,
+    pub revision: u64,
+    pub actor_account_id: String,
+    pub state: String,
+    pub created_at: String,
+    pub completed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -602,7 +668,23 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     fn create_workspace_bootstrap(
         &self,
         record: &WorkspaceBootstrapRecord,
+        signing_identity: &WorkspaceSigningIdentityActivation,
+        identity_provisioning_operation_key: &str,
     ) -> Result<WorkspaceBootstrapResult>;
+    fn reserve_workspace_signing_identity_provisioning(
+        &self,
+        operation: &WorkspaceSigningIdentityProvisioningOperation,
+    ) -> Result<WorkspaceSigningIdentityProvisioningOperation>;
+    fn get_workspace_signing_identity(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<WorkspaceSigningIdentityRecord>>;
+    fn activate_workspace_signing_identity(
+        &self,
+        activation: &WorkspaceSigningIdentityActivation,
+        identity_provisioning_operation_key: &str,
+        actor_account_id: &str,
+    ) -> Result<WorkspaceSigningIdentityRecord>;
     fn workspace_runtime_binding_matches(&self, expected: &WorkspaceRuntimeBinding)
     -> Result<bool>;
     async fn get_workspace_runtime_binding(
@@ -2205,6 +2287,17 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ) VALUES (?1, 1, 'English', ?2, ?3)"#,
                 params![record.workspace_id, record.created_at, record.updated_at],
             )?;
+            tx.execute(
+                r#"INSERT OR IGNORE INTO workspace_signing_identities (
+                    workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
+                    private_material_ref, revision, state, created_at, provisioned_at, updated_at
+                ) VALUES (
+                    ?1, 'WK-' || lower(hex(randomblob(16))), 'ed25519', NULL, NULL,
+                    'workspace-signing/' || ?1 || '/ed25519-v1', 1,
+                    'pending_provisioning', ?2, NULL, ?3
+                )"#,
+                params![record.workspace_id, record.created_at, record.updated_at],
+            )?;
             tx.commit()?;
             Ok(())
         })?;
@@ -2227,8 +2320,15 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn create_workspace_bootstrap(
         &self,
         record: &WorkspaceBootstrapRecord,
+        signing_identity: &WorkspaceSigningIdentityActivation,
+        identity_provisioning_operation_key: &str,
     ) -> Result<WorkspaceBootstrapResult> {
         validate_repository_record_identity(&record.repository)?;
+        if signing_identity.workspace_id != record.workspace.workspace_id {
+            return Err(Error::Store(
+                "Workspace signing identity does not belong to the Workspace bootstrap".to_string(),
+            ));
+        }
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let owner_kind = tx
@@ -2272,6 +2372,43 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     params![workspace.workspace_id, record.repository.repository_key],
                     read_repository_record,
                 )?;
+                let persisted_identity = tx.query_row(
+                    r#"SELECT workspace_id, key_id, algorithm, public_key,
+                              public_key_fingerprint, private_material_ref, revision, state,
+                              created_at, provisioned_at, updated_at
+                       FROM workspace_signing_identities WHERE workspace_id = ?1"#,
+                    params![workspace.workspace_id],
+                    read_workspace_signing_identity,
+                )?;
+                if persisted_identity.workspace_id != signing_identity.workspace_id
+                    || persisted_identity.key_id != signing_identity.key_id
+                    || persisted_identity.public_key.as_deref()
+                        != Some(signing_identity.public_key.as_str())
+                    || persisted_identity.public_key_fingerprint.as_deref()
+                        != Some(signing_identity.public_key_fingerprint.as_str())
+                    || persisted_identity.private_material_ref
+                        != signing_identity.private_material_ref
+                    || persisted_identity.revision != signing_identity.revision
+                    || persisted_identity.state != "active"
+                {
+                    return Err(Error::Store(
+                        "Workspace create replay signing identity does not match persisted authority"
+                            .to_string(),
+                    ));
+                }
+                let provisioning_state: Option<String> = tx
+                    .query_row(
+                        "SELECT state FROM workspace_signing_identity_provisioning_operations WHERE operation_key = ?1",
+                        params![identity_provisioning_operation_key],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if provisioning_state.as_deref() != Some("completed") {
+                    return Err(Error::Store(
+                        "Workspace create replay lacks completed signing identity provisioning evidence"
+                            .to_string(),
+                    ));
+                }
                 let config_revision = crate::config_source::load_state(&tx, &workspace.workspace_id)?
                     .ok_or_else(|| Error::Store("Workspace config is missing".to_string()))?
                     .snapshot
@@ -2371,6 +2508,58 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             .snapshot
             .revision;
             tx.execute(
+                r#"INSERT INTO workspace_signing_identities (
+                    workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
+                    private_material_ref, revision, state, created_at, provisioned_at, updated_at
+                ) VALUES (?1, ?2, 'ed25519', ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?8)"#,
+                params![
+                    signing_identity.workspace_id,
+                    signing_identity.key_id,
+                    signing_identity.public_key,
+                    signing_identity.public_key_fingerprint,
+                    signing_identity.private_material_ref,
+                    signing_identity.revision,
+                    record.workspace.created_at,
+                    signing_identity.provisioned_at,
+                ],
+            )?;
+            tx.execute(
+                r#"INSERT INTO workspace_signing_identity_audit (
+                    event_id, workspace_id, key_id, action, revision,
+                    public_key_fingerprint, actor_account_id, created_at
+                ) VALUES (?1, ?2, ?3, 'provisioned', ?4, ?5, ?6, ?7)"#,
+                params![
+                    uuid::Uuid::now_v7().to_string(),
+                    signing_identity.workspace_id,
+                    signing_identity.key_id,
+                    signing_identity.revision,
+                    signing_identity.public_key_fingerprint,
+                    record.workspace.owner_account_id,
+                    signing_identity.provisioned_at,
+                ],
+            )?;
+            let completed = tx.execute(
+                r#"UPDATE workspace_signing_identity_provisioning_operations
+                   SET state = 'completed', completed_at = ?2
+                   WHERE operation_key = ?1 AND state = 'pending'
+                     AND workspace_id = ?3 AND key_id = ?4
+                     AND private_material_ref = ?5 AND revision = ?6"#,
+                params![
+                    identity_provisioning_operation_key,
+                    signing_identity.provisioned_at,
+                    signing_identity.workspace_id,
+                    signing_identity.key_id,
+                    signing_identity.private_material_ref,
+                    signing_identity.revision,
+                ],
+            )?;
+            if completed != 1 {
+                return Err(Error::Store(
+                    "Workspace signing identity provisioning reservation is missing or inconsistent"
+                        .to_string(),
+                ));
+            }
+            tx.execute(
                 r#"INSERT INTO workspace_create_operations (
                     operation_key, request_fingerprint, workspace_id, created_at
                 ) VALUES (?1, ?2, ?3, ?4)"#,
@@ -2388,6 +2577,245 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 config_revision,
                 replayed: false,
             })
+        })
+    }
+
+    fn reserve_workspace_signing_identity_provisioning(
+        &self,
+        operation: &WorkspaceSigningIdentityProvisioningOperation,
+    ) -> Result<WorkspaceSigningIdentityProvisioningOperation> {
+        for (label, value) in [
+            ("operation_key", operation.operation_key.as_str()),
+            (
+                "request_fingerprint",
+                operation.request_fingerprint.as_str(),
+            ),
+            ("workspace_id", operation.workspace_id.as_str()),
+            ("key_id", operation.key_id.as_str()),
+            (
+                "private_material_ref",
+                operation.private_material_ref.as_str(),
+            ),
+            ("actor_account_id", operation.actor_account_id.as_str()),
+        ] {
+            validate_non_empty(label, value)?;
+        }
+        if !matches!(
+            operation.operation_kind.as_str(),
+            "workspace_create" | "existing_workspace"
+        ) || operation.revision == 0
+        {
+            return Err(Error::Store(
+                "Workspace signing identity provisioning reservation is invalid".to_string(),
+            ));
+        }
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(existing) = tx
+                .query_row(
+                    r#"SELECT operation_key, request_fingerprint, operation_kind, workspace_id,
+                              key_id, private_material_ref, revision, actor_account_id, state,
+                              created_at, completed_at
+                       FROM workspace_signing_identity_provisioning_operations
+                       WHERE operation_key = ?1"#,
+                    params![operation.operation_key],
+                    read_workspace_signing_identity_provisioning_operation,
+                )
+                .optional()?
+            {
+                if existing.request_fingerprint != operation.request_fingerprint
+                    || existing.operation_kind != operation.operation_kind
+                {
+                    return Err(Error::WorkspaceConfigConflict(
+                        "Workspace signing identity operation key was already used with different input"
+                            .to_string(),
+                    ));
+                }
+                tx.commit()?;
+                return Ok(existing);
+            }
+            tx.execute(
+                r#"INSERT INTO workspace_signing_identity_provisioning_operations (
+                    operation_key, request_fingerprint, operation_kind, workspace_id,
+                    key_id, private_material_ref, revision, actor_account_id, state,
+                    created_at, completed_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, NULL)"#,
+                params![
+                    operation.operation_key,
+                    operation.request_fingerprint,
+                    operation.operation_kind,
+                    operation.workspace_id,
+                    operation.key_id,
+                    operation.private_material_ref,
+                    operation.revision,
+                    operation.actor_account_id,
+                    operation.created_at,
+                ],
+            )
+            .map_err(|error| {
+                if matches!(error, rusqlite::Error::SqliteFailure(_, _)) {
+                    Error::WorkspaceConfigConflict(
+                        "Workspace already has a signing identity provisioning operation"
+                            .to_string(),
+                    )
+                } else {
+                    Error::from(error)
+                }
+            })?;
+            tx.commit()?;
+            Ok(operation.clone())
+        })
+    }
+
+    fn get_workspace_signing_identity(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<WorkspaceSigningIdentityRecord>> {
+        validate_identifier("workspace_id", workspace_id)?;
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT workspace_id, key_id, algorithm, public_key,
+                          public_key_fingerprint, private_material_ref, revision, state,
+                          created_at, provisioned_at, updated_at
+                   FROM workspace_signing_identities WHERE workspace_id = ?1"#,
+                params![workspace_id],
+                read_workspace_signing_identity,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn activate_workspace_signing_identity(
+        &self,
+        activation: &WorkspaceSigningIdentityActivation,
+        identity_provisioning_operation_key: &str,
+        actor_account_id: &str,
+    ) -> Result<WorkspaceSigningIdentityRecord> {
+        validate_identifier("workspace_id", &activation.workspace_id)?;
+        validate_non_empty(
+            "identity_provisioning_operation_key",
+            identity_provisioning_operation_key,
+        )?;
+        validate_identifier("actor_account_id", actor_account_id)?;
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let operation = tx
+                .query_row(
+                    r#"SELECT operation_key, request_fingerprint, operation_kind, workspace_id,
+                              key_id, private_material_ref, revision, actor_account_id, state,
+                              created_at, completed_at
+                       FROM workspace_signing_identity_provisioning_operations
+                       WHERE operation_key = ?1"#,
+                    params![identity_provisioning_operation_key],
+                    read_workspace_signing_identity_provisioning_operation,
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    Error::Store(
+                        "Workspace signing identity provisioning operation is missing".to_string(),
+                    )
+                })?;
+            if operation.workspace_id != activation.workspace_id
+                || operation.key_id != activation.key_id
+                || operation.private_material_ref != activation.private_material_ref
+                || operation.revision != activation.revision
+                || operation.actor_account_id != actor_account_id
+            {
+                return Err(Error::Store(
+                    "Workspace signing identity provisioning operation is inconsistent".to_string(),
+                ));
+            }
+            let existing = tx.query_row(
+                r#"SELECT workspace_id, key_id, algorithm, public_key,
+                          public_key_fingerprint, private_material_ref, revision, state,
+                          created_at, provisioned_at, updated_at
+                   FROM workspace_signing_identities WHERE workspace_id = ?1"#,
+                params![activation.workspace_id],
+                read_workspace_signing_identity,
+            )?;
+            if existing.key_id != activation.key_id
+                || existing.private_material_ref != activation.private_material_ref
+                || existing.revision != activation.revision
+            {
+                return Err(Error::Store(
+                    "Workspace signing identity activation does not match persisted metadata"
+                        .to_string(),
+                ));
+            }
+            if existing.state == "active" {
+                if existing.public_key.as_deref() != Some(activation.public_key.as_str())
+                    || existing.public_key_fingerprint.as_deref()
+                        != Some(activation.public_key_fingerprint.as_str())
+                {
+                    return Err(Error::Store(
+                        "Workspace signing identity replay does not match active authority"
+                            .to_string(),
+                    ));
+                }
+                tx.execute(
+                    r#"UPDATE workspace_signing_identity_provisioning_operations
+                       SET state = 'completed', completed_at = COALESCE(completed_at, ?2)
+                       WHERE operation_key = ?1"#,
+                    params![
+                        identity_provisioning_operation_key,
+                        activation.provisioned_at
+                    ],
+                )?;
+                tx.commit()?;
+                return Ok(existing);
+            }
+            if existing.state != "pending_provisioning" {
+                return Err(Error::Store(
+                    "Workspace signing identity has an unknown lifecycle state".to_string(),
+                ));
+            }
+            tx.execute(
+                r#"UPDATE workspace_signing_identities
+                   SET public_key = ?2, public_key_fingerprint = ?3, state = 'active',
+                       provisioned_at = ?4, updated_at = ?4
+                   WHERE workspace_id = ?1 AND state = 'pending_provisioning'"#,
+                params![
+                    activation.workspace_id,
+                    activation.public_key,
+                    activation.public_key_fingerprint,
+                    activation.provisioned_at,
+                ],
+            )?;
+            tx.execute(
+                r#"INSERT INTO workspace_signing_identity_audit (
+                    event_id, workspace_id, key_id, action, revision,
+                    public_key_fingerprint, actor_account_id, created_at
+                ) VALUES (?1, ?2, ?3, 'provisioned', ?4, ?5, ?6, ?7)"#,
+                params![
+                    uuid::Uuid::now_v7().to_string(),
+                    activation.workspace_id,
+                    activation.key_id,
+                    activation.revision,
+                    activation.public_key_fingerprint,
+                    actor_account_id,
+                    activation.provisioned_at,
+                ],
+            )?;
+            tx.execute(
+                r#"UPDATE workspace_signing_identity_provisioning_operations
+                   SET state = 'completed', completed_at = ?2
+                   WHERE operation_key = ?1"#,
+                params![
+                    identity_provisioning_operation_key,
+                    activation.provisioned_at
+                ],
+            )?;
+            let activated = tx.query_row(
+                r#"SELECT workspace_id, key_id, algorithm, public_key,
+                          public_key_fingerprint, private_material_ref, revision, state,
+                          created_at, provisioned_at, updated_at
+                   FROM workspace_signing_identities WHERE workspace_id = ?1"#,
+                params![activation.workspace_id],
+                read_workspace_signing_identity,
+            )?;
+            tx.commit()?;
+            Ok(activated)
         })
     }
 
@@ -5806,6 +6234,46 @@ fn read_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceR
     })
 }
 
+fn read_workspace_signing_identity(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkspaceSigningIdentityRecord> {
+    let revision: i64 = row.get(6)?;
+    Ok(WorkspaceSigningIdentityRecord {
+        workspace_id: row.get(0)?,
+        key_id: row.get(1)?,
+        algorithm: row.get(2)?,
+        public_key: row.get(3)?,
+        public_key_fingerprint: row.get(4)?,
+        private_material_ref: row.get(5)?,
+        revision: u64::try_from(revision)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, revision))?,
+        state: row.get(7)?,
+        created_at: row.get(8)?,
+        provisioned_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+fn read_workspace_signing_identity_provisioning_operation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkspaceSigningIdentityProvisioningOperation> {
+    let revision: i64 = row.get(6)?;
+    Ok(WorkspaceSigningIdentityProvisioningOperation {
+        operation_key: row.get(0)?,
+        request_fingerprint: row.get(1)?,
+        operation_kind: row.get(2)?,
+        workspace_id: row.get(3)?,
+        key_id: row.get(4)?,
+        private_material_ref: row.get(5)?,
+        revision: u64::try_from(revision)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, revision))?,
+        actor_account_id: row.get(7)?,
+        state: row.get(8)?,
+        created_at: row.get(9)?,
+        completed_at: row.get(10)?,
+    })
+}
+
 fn repository_registration_intent_matches(
     existing: &RepositoryRecord,
     requested: &RepositoryRecord,
@@ -7036,9 +7504,164 @@ fn migrate_workspace_deletion_v52_to_v53(conn: &Connection) -> Result<()> {
     verify_workspace_deletion_schema(&tx)?;
     tx.execute(
         "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![LATEST_SCHEMA_VERSION, WORKSPACE_DELETION_MIGRATION_NAME],
+        params![53_i64, WORKSPACE_DELETION_MIGRATION_NAME],
     )?;
     tx.commit()?;
+    Ok(())
+}
+
+fn migrate_workspace_signing_identity_v53_to_v54(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 53 {
+        return Err(Error::Store(format!(
+            "expected schema version 53 before {WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch(
+        r#"
+        CREATE TABLE workspace_signing_identities (
+            workspace_id TEXT PRIMARY KEY,
+            key_id TEXT NOT NULL UNIQUE,
+            algorithm TEXT NOT NULL CHECK (algorithm = 'ed25519'),
+            public_key TEXT,
+            public_key_fingerprint TEXT,
+            private_material_ref TEXT NOT NULL UNIQUE,
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            state TEXT NOT NULL CHECK (state IN ('pending_provisioning', 'active')),
+            created_at TEXT NOT NULL,
+            provisioned_at TEXT,
+            updated_at TEXT NOT NULL,
+            CHECK (
+                (state = 'pending_provisioning' AND public_key IS NULL AND public_key_fingerprint IS NULL AND provisioned_at IS NULL)
+                OR
+                (state = 'active' AND public_key IS NOT NULL AND public_key_fingerprint IS NOT NULL AND provisioned_at IS NOT NULL)
+            ),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+        CREATE TABLE workspace_signing_identity_provisioning_operations (
+            operation_key TEXT PRIMARY KEY,
+            request_fingerprint TEXT NOT NULL,
+            operation_kind TEXT NOT NULL CHECK (operation_kind IN ('workspace_create', 'existing_workspace')),
+            workspace_id TEXT NOT NULL UNIQUE,
+            key_id TEXT NOT NULL UNIQUE,
+            private_material_ref TEXT NOT NULL UNIQUE,
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            actor_account_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
+            created_at TEXT NOT NULL,
+            completed_at TEXT
+        );
+        CREATE TABLE workspace_signing_identity_audit (
+            event_id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            key_id TEXT NOT NULL,
+            action TEXT NOT NULL CHECK (action IN ('provisioned')),
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            public_key_fingerprint TEXT NOT NULL,
+            actor_account_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+        CREATE INDEX workspace_signing_identity_audit_workspace_idx
+            ON workspace_signing_identity_audit(workspace_id, created_at DESC);
+        INSERT INTO workspace_signing_identities (
+            workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
+            private_material_ref, revision, state, created_at, provisioned_at, updated_at
+        )
+        SELECT workspace_id,
+               'WK-' || lower(hex(randomblob(16))),
+               'ed25519', NULL, NULL,
+               'workspace-signing/' || workspace_id || '/ed25519-v1',
+               1, 'pending_provisioning', created_at, NULL, updated_at
+        FROM workspaces;
+        "#,
+    )?;
+    verify_workspace_signing_identity_schema(&tx)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![
+            LATEST_SCHEMA_VERSION,
+            WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn verify_workspace_signing_identity_schema(conn: &Connection) -> Result<()> {
+    for (table, expected) in [
+        (
+            "workspace_signing_identities",
+            vec![
+                "workspace_id",
+                "key_id",
+                "algorithm",
+                "public_key",
+                "public_key_fingerprint",
+                "private_material_ref",
+                "revision",
+                "state",
+                "created_at",
+                "provisioned_at",
+                "updated_at",
+            ],
+        ),
+        (
+            "workspace_signing_identity_provisioning_operations",
+            vec![
+                "operation_key",
+                "request_fingerprint",
+                "operation_kind",
+                "workspace_id",
+                "key_id",
+                "private_material_ref",
+                "revision",
+                "actor_account_id",
+                "state",
+                "created_at",
+                "completed_at",
+            ],
+        ),
+        (
+            "workspace_signing_identity_audit",
+            vec![
+                "event_id",
+                "workspace_id",
+                "key_id",
+                "action",
+                "revision",
+                "public_key_fingerprint",
+                "actor_account_id",
+                "created_at",
+            ],
+        ),
+    ] {
+        let actual = table_columns(conn, table)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let expected = expected
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        if actual != expected {
+            return Err(Error::Store(format!(
+                "{table} schema does not match schema-54"
+            )));
+        }
+    }
+    let pending_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM workspaces w LEFT JOIN workspace_signing_identities i ON i.workspace_id = w.workspace_id WHERE i.workspace_id IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if pending_count != 0 {
+        return Err(Error::Store(
+            "schema-54 failed to initialize every existing Workspace signing identity as pending"
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -7759,7 +8382,8 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
 
     verify_schema_history(conn, LATEST_SCHEMA_VERSION)?;
     verify_workspace_runtime_binding_schema(conn)?;
-    verify_workspace_deletion_schema(conn)
+    verify_workspace_deletion_schema(conn)?;
+    verify_workspace_signing_identity_schema(conn)
 }
 
 fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
@@ -7852,6 +8476,10 @@ mod tests {
         create_latest_workspace_schema(&conn).unwrap();
         conn.execute_batch(
             r#"
+            DROP INDEX workspace_signing_identity_audit_workspace_idx;
+            DROP TABLE workspace_signing_identity_audit;
+            DROP TABLE workspace_signing_identity_provisioning_operations;
+            DROP TABLE workspace_signing_identities;
             DROP INDEX workspace_deletion_operations_workspace_recent;
             DROP TABLE workspace_deletion_operations;
             CREATE TABLE worker_create_reservations_v52 (
@@ -7969,6 +8597,10 @@ mod tests {
                     version: 53,
                     name: WORKSPACE_DELETION_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 54,
+                    name: WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -7990,6 +8622,7 @@ mod tests {
                         (51, WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME.to_string()),
                         (52, RUNTIME_BINDING_AUDIT_MIGRATION_NAME.to_string()),
                         (53, WORKSPACE_DELETION_MIGRATION_NAME.to_string()),
+                        (54, WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME.to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -8008,6 +8641,14 @@ mod tests {
                         |row| row.get::<_, i64>(0),
                     )?,
                     1
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT state FROM workspace_signing_identities WHERE workspace_id='workspace-a'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    "pending_provisioning"
                 );
                 Ok(())
             })
@@ -8031,7 +8672,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![52, 53]
+            vec![52, 53, 54]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
@@ -8039,7 +8680,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 4);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 5);
     }
 
     #[test]
@@ -8204,6 +8845,42 @@ mod tests {
     }
 
     #[test]
+    fn schema_v53_signing_identity_migration_rolls_back_on_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        prepare_schema_v52(&path);
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        migrate_workspace_deletion_v52_to_v53(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE workspace_signing_identity_audit (unexpected TEXT NOT NULL);",
+        )
+        .unwrap();
+        let before = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='workspace_signing_identity_audit'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+
+        assert!(migrate_workspace_signing_identity_v53_to_v54(&conn).is_err());
+        assert_eq!(current_schema_version(&conn).unwrap(), 53);
+        assert!(!table_exists(&conn, "workspace_signing_identities").unwrap());
+        assert!(
+            !table_exists(&conn, "workspace_signing_identity_provisioning_operations").unwrap()
+        );
+        let after = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='workspace_signing_identity_audit'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
     fn schema_v52_workspace_deletion_migration_rolls_back_on_failure() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
@@ -8251,6 +8928,12 @@ mod tests {
                     VALUES
                         ('workspace-a', 'owner', 'Workspace A', 'active', '1', '1'),
                         ('workspace-b', 'owner', 'Workspace B', 'active', '1', '1');
+                    INSERT INTO workspace_signing_identities(
+                        workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
+                        private_material_ref, revision, state, created_at, provisioned_at, updated_at
+                    ) VALUES
+                        ('workspace-a', 'WK-a', 'ed25519', NULL, NULL, 'workspace-signing/workspace-a/ed25519-v1', 1, 'pending_provisioning', '1', NULL, '1'),
+                        ('workspace-b', 'WK-b', 'ed25519', NULL, NULL, 'workspace-signing/workspace-b/ed25519-v1', 1, 'pending_provisioning', '1', NULL, '1');
                     "#,
                 )?;
                 Ok(())
@@ -9647,13 +10330,13 @@ INSERT INTO worker_registry (
         let conn = Connection::open_in_memory().unwrap();
         configure_sqlite(&conn).unwrap();
         conn.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (54, 'future')",
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (55, 'future')",
             [],
         )
         .unwrap();
 
         let error = apply_migrations(&conn).unwrap_err().to_string();
-        assert!(error.contains("schema version 54 is newer"), "{error}");
+        assert!(error.contains("schema version 55 is newer"), "{error}");
         assert!(error.contains("refusing to serve"), "{error}");
     }
 
@@ -9695,6 +10378,14 @@ INSERT INTO accounts (account_id, kind, handle, display_name, created_at, update
 VALUES ('owner-account', 'user', 'owner-account', 'Owner Account', '2026-01-01', '2026-01-01');
 INSERT INTO workspaces (workspace_id, owner_account_id, display_name, state, created_at, updated_at)
 VALUES ('workspace-a', 'owner-account', 'A', 'active', '2026-01-01', '2026-01-01');
+INSERT INTO workspace_signing_identities (
+    workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
+    private_material_ref, revision, state, created_at, provisioned_at, updated_at
+) VALUES (
+    'workspace-a', 'WK-a', 'ed25519', NULL, NULL,
+    'workspace-signing/workspace-a/ed25519-v1', 1, 'pending_provisioning',
+    '2026-01-01', NULL, '2026-01-01'
+);
 INSERT INTO typed_tickets (
     workspace_id, ticket_id, slug, title, status, kind, priority, body,
     workflow_state, workflow_state_explicit
@@ -9717,6 +10408,14 @@ DELETE FROM typed_tickets
 WHERE workspace_id = 'workspace-a' AND ticket_id = 'ticket-a';
 INSERT INTO workspaces (workspace_id, owner_account_id, display_name, state, created_at, updated_at)
 VALUES ('workspace-b', 'owner-account', 'B', 'active', '2026-01-01', '2026-01-01');
+INSERT INTO workspace_signing_identities (
+    workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
+    private_material_ref, revision, state, created_at, provisioned_at, updated_at
+) VALUES (
+    'workspace-b', 'WK-b', 'ed25519', NULL, NULL,
+    'workspace-signing/workspace-b/ed25519-v1', 1, 'pending_provisioning',
+    '2026-01-01', NULL, '2026-01-01'
+);
 INSERT INTO typed_tickets (
     workspace_id, ticket_id, slug, title, status, kind, priority, body,
     workflow_state, workflow_state_explicit
@@ -9800,13 +10499,26 @@ INSERT INTO worker_registry (
             updated_at: "1".to_string(),
         };
 
+        let signing_identity = WorkspaceSigningIdentityActivation {
+            workspace_id: workspace.workspace_id.clone(),
+            key_id: "WK-store-test".to_string(),
+            public_key: "test-public-key".to_string(),
+            public_key_fingerprint: "sha256:test-public-key".to_string(),
+            private_material_ref: "workspace-signing/store-test/ed25519-v1".to_string(),
+            revision: 1,
+            provisioned_at: "1".to_string(),
+        };
         let error = store
-            .create_workspace_bootstrap(&WorkspaceBootstrapRecord {
-                operation_key: "invalid-key".to_string(),
-                request_fingerprint: "sha256:invalid-key".to_string(),
-                workspace: workspace.clone(),
-                repository,
-            })
+            .create_workspace_bootstrap(
+                &WorkspaceBootstrapRecord {
+                    operation_key: "invalid-key".to_string(),
+                    request_fingerprint: "sha256:invalid-key".to_string(),
+                    workspace: workspace.clone(),
+                    repository,
+                },
+                &signing_identity,
+                "identity-store-test",
+            )
             .unwrap_err()
             .to_string();
 
@@ -9843,12 +10555,34 @@ INSERT INTO worker_registry (
             workspace,
             repository: valid_repository,
         };
-        assert!(!store.create_workspace_bootstrap(&first).unwrap().replayed);
+        store
+            .reserve_workspace_signing_identity_provisioning(
+                &WorkspaceSigningIdentityProvisioningOperation {
+                    operation_key: "identity-store-test".to_string(),
+                    request_fingerprint: "sha256:create-workspace".to_string(),
+                    operation_kind: "workspace_create".to_string(),
+                    workspace_id: first.workspace.workspace_id.clone(),
+                    key_id: signing_identity.key_id.clone(),
+                    private_material_ref: signing_identity.private_material_ref.clone(),
+                    revision: signing_identity.revision,
+                    actor_account_id: first.workspace.owner_account_id.clone(),
+                    state: "pending".to_string(),
+                    created_at: "1".to_string(),
+                    completed_at: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            !store
+                .create_workspace_bootstrap(&first, &signing_identity, "identity-store-test")
+                .unwrap()
+                .replayed
+        );
         let mut duplicate = first;
         duplicate.operation_key = "duplicate-workspace".to_string();
         duplicate.repository.repository_id = Uuid::now_v7().to_string();
         let error = store
-            .create_workspace_bootstrap(&duplicate)
+            .create_workspace_bootstrap(&duplicate, &signing_identity, "identity-store-test")
             .unwrap_err()
             .to_string();
         assert!(

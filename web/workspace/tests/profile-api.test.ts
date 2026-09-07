@@ -28,6 +28,7 @@ import {
   fetchWorkspaceMetadata,
   parseProfileSettingsResponse,
   parseWorkspaceMetadataSettingsResponse,
+  parseWorkspaceSigningIdentityResponse,
   ProfileApiError,
   updateWorkspaceMetadata,
 } from "../src/lib/workspace/settings/profile-api.ts";
@@ -168,6 +169,78 @@ Deno.test("profile settings parser rejects missing, mistyped, stale, and invalid
     () => parseProfileSettingsResponse(invalidProvenance),
     ProfileApiError,
   );
+});
+
+Deno.test("Workspace signing identity parser validates active and pending public contracts", () => {
+  const active = {
+    identity: {
+      workspace_id: "workspace-1",
+      key_id: "WK-1",
+      algorithm: "ed25519",
+      public_key: "public-key",
+      public_key_fingerprint: "sha256:fingerprint",
+      revision: 1,
+      state: "active",
+      created_at: "2026-01-01T00:00:00Z",
+      provisioned_at: "2026-01-01T00:00:00Z",
+    },
+    public_bundle: {
+      workspace_id: "workspace-1",
+      backend_url: "https://backend.example.test",
+      key_id: "WK-1",
+      algorithm: "ed25519",
+      public_key: "public-key",
+      public_key_fingerprint: "sha256:fingerprint",
+      revision: 1,
+    },
+  };
+  assertEquals(
+    parseWorkspaceSigningIdentityResponse(active).public_bundle?.key_id,
+    "WK-1",
+  );
+  assertEquals(
+    parseWorkspaceSigningIdentityResponse({
+      identity: {
+        workspace_id: "workspace-1",
+        key_id: "WK-1",
+        algorithm: "ed25519",
+        revision: 1,
+        state: "pending_provisioning",
+        created_at: "2026-01-01T00:00:00Z",
+      },
+    }).public_bundle,
+    undefined,
+  );
+
+  for (
+    const mutate of [
+      (value: Record<string, unknown>) => {
+        value.private_material_ref = "must-not-be-accepted";
+      },
+      (value: Record<string, unknown>) => {
+        (value.identity as Record<string, unknown>).revision =
+          Number.MAX_SAFE_INTEGER + 1;
+      },
+      (value: Record<string, unknown>) => {
+        (value.identity as Record<string, unknown>).public_key = "x".repeat(
+          17_000,
+        );
+      },
+      (value: Record<string, unknown>) => {
+        (value.public_bundle as Record<string, unknown>).key_id = "WK-other";
+      },
+      (value: Record<string, unknown>) => {
+        delete value.public_bundle;
+      },
+    ]
+  ) {
+    const value = structuredClone(active);
+    mutate(value);
+    assertThrows(
+      () => parseWorkspaceSigningIdentityResponse(value),
+      ProfileApiError,
+    );
+  }
 });
 
 Deno.test("workspace metadata parser rejects incomplete or stale response fields", () => {

@@ -165,6 +165,35 @@ export type WorkspaceMetadataMutationResponse = {
   diagnostics: Array<Diagnostic>;
 };
 
+export type WorkspaceSigningIdentityState = "pending_provisioning" | "active";
+
+export type WorkspaceSigningIdentityPublic = {
+  workspace_id: string;
+  key_id: string;
+  algorithm: string;
+  public_key?: string;
+  public_key_fingerprint?: string;
+  revision: number;
+  state: WorkspaceSigningIdentityState;
+  created_at: string;
+  provisioned_at?: string;
+};
+
+export type WorkspacePublicIdentityBundle = {
+  workspace_id: string;
+  backend_url: string;
+  key_id: string;
+  algorithm: string;
+  public_key: string;
+  public_key_fingerprint: string;
+  revision: number;
+};
+
+export type WorkspaceSigningIdentityResponse = {
+  identity: WorkspaceSigningIdentityPublic;
+  public_bundle?: WorkspacePublicIdentityBundle;
+};
+
 export type ProfileSettingsResponse = {
   workspace_id: string;
   registry_revision: string;
