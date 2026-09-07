@@ -315,7 +315,10 @@
         <div><dt>Kind</dt><dd>{runtime.kind}</dd></div>
         <div><dt>Endpoint</dt><dd>{detail.endpoint ?? 'Not configured'}</dd></div>
         <div><dt>Status</dt><dd>{runtime.status}</dd></div>
-        <div><dt>Binding status</dt><dd>{trust.status}</dd></div>
+        <div><dt>Relationship state</dt><dd>{runtime.management.binding?.state ?? 'Not configured'}</dd></div>
+        <div><dt>Authentication mode</dt><dd>{runtime.management.binding?.authentication_mode ?? '—'}</dd></div>
+        <div><dt>Workspace signing key</dt><dd><code>{runtime.management.binding?.workspace_key_id ?? '—'}</code></dd></div>
+        <div><dt>Runtime key status</dt><dd>{trust.status}</dd></div>
         <div><dt>Fingerprint</dt><dd><code>{trust.fingerprint ?? '—'}</code></dd></div>
         <div><dt>Revision</dt><dd>{trust.revision?.toString() ?? '—'}</dd></div>
         <div><dt>Created</dt><dd>{formatTimestamp(trust.created_at)}</dd></div>

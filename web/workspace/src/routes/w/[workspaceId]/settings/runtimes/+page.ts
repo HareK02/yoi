@@ -1,5 +1,6 @@
 import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
 import { parseWorkspaceRuntimeList } from "$lib/workspace/api/runtime-management";
+import { parseWorkspaceSigningIdentityResponse } from "$lib/workspace/settings/profile-api";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {
@@ -16,9 +17,24 @@ export const load: PageLoad = async ({ fetch, params }) => {
     },
   );
 
+  const signingIdentity = await loadJson(
+    fetch,
+    workspaceApiPath(params.workspaceId, "/signing-identity"),
+    undefined,
+    (value) => {
+      const response = parseWorkspaceSigningIdentityResponse(value);
+      if (response.identity.workspace_id !== params.workspaceId) {
+        throw new Error("Workspace signing identity did not match the route");
+      }
+      return response;
+    },
+  );
+
   return {
     workspaceId: params.workspaceId,
     runtimes: runtimes.data,
     runtimesError: runtimes.error,
+    signingIdentity: signingIdentity.data,
+    signingIdentityError: signingIdentity.error,
   };
 };

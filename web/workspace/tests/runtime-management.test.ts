@@ -39,6 +39,13 @@ function runtime() {
       removable: false,
       endpoint_configured: true,
       token_ref_configured: false,
+      binding: {
+        state: "verified",
+        authentication_mode: "workspace_identity",
+        revision: 3,
+        workspace_key_id: "WK-1",
+        workspace_key_generation: 1,
+      },
     },
     runtime_id: "arcadia",
     label: "Arcadia",
@@ -95,6 +102,11 @@ Deno.test("Runtime list and detail parsers return generated Runtime DTO shapes",
     "Runtime ID was not preserved",
   );
 
+  assert(
+    list.items[0]?.management.binding?.state === "verified",
+    "binding state was not preserved",
+  );
+
   const parsed = parseWorkspaceRuntimeDetail(detail());
   assert(
     parsed.trust_key.revision === 3,
@@ -103,6 +115,20 @@ Deno.test("Runtime list and detail parsers return generated Runtime DTO shapes",
   assert(
     parsed.recent_audit[0]?.revision === 3,
     "audit revision was not normalized",
+  );
+});
+
+Deno.test("Runtime management parser rejects Workspace identity bindings without key metadata", () => {
+  const payload = detail();
+  const binding = payload.runtime.management.binding as Partial<
+    typeof payload.runtime.management.binding
+  >;
+  delete binding.workspace_key_id;
+  delete binding.workspace_key_generation;
+  binding.state = "configured";
+  assertThrows(
+    () => parseWorkspaceRuntimeDetail(payload),
+    "requires Workspace signing key identity metadata",
   );
 });
 

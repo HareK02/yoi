@@ -1,5 +1,6 @@
 import type {
   Diagnostic,
+  CreateRemoteRuntimeRequest,
   PutRuntimeTrustKeyRequest,
   RevokeRuntimeTrustKeyRequest,
   RuntimeIdentityAuthority,
@@ -14,6 +15,9 @@ import type {
   RuntimeTrustKeyRevealResponse,
   RuntimeTrustKeyState,
   RuntimeTrustKeyStatus,
+  WorkspaceRuntimeAuthenticationMode,
+  WorkspaceRuntimeBindingState,
+  WorkspaceRuntimeBindingSummary,
   WorkspaceRuntimeDetail,
   WorkspaceRuntimeResource,
 } from "$lib/generated/workspace-api.ts";
@@ -66,6 +70,15 @@ const AUDIT_ACTIONS = new Set<RuntimeTrustAuditAction>([
 const CONFLICT_KINDS = new Set<RuntimeTrustConflictKind>([
   "stale_revision",
   "fingerprint_in_use",
+]);
+const BINDING_STATES = new Set<WorkspaceRuntimeBindingState>([
+  "configured",
+  "verified",
+  "revoked",
+]);
+const AUTHENTICATION_MODES = new Set<WorkspaceRuntimeAuthenticationMode>([
+  "legacy_server_issuer",
+  "workspace_identity",
 ]);
 
 const encoder = new TextEncoder();
@@ -286,6 +299,54 @@ function runtimeSource(value: unknown, path: string): RuntimeSourceSummary {
   };
 }
 
+function runtimeBinding(
+  value: unknown,
+  path: string,
+): WorkspaceRuntimeBindingSummary {
+  const item = object(value, path);
+  exactKeys(
+    item,
+    ["state", "authentication_mode", "revision"],
+    ["workspace_key_id", "workspace_key_generation"],
+    path,
+  );
+  const authenticationMode = enumValue(
+    item.authentication_mode,
+    `${path}.authentication_mode`,
+    AUTHENTICATION_MODES,
+  );
+  const workspaceKeyId = optionalNullableString(
+    item.workspace_key_id,
+    `${path}.workspace_key_id`,
+    LIMITS.idBytes,
+  );
+  const workspaceKeyGeneration = optionalNullableRevision(
+    item.workspace_key_generation,
+    `${path}.workspace_key_generation`,
+  );
+  if (
+    authenticationMode === "workspace_identity" &&
+    (workspaceKeyId == null || workspaceKeyGeneration == null)
+  ) {
+    return fail(path, "requires Workspace signing key identity metadata");
+  }
+  if (
+    authenticationMode === "legacy_server_issuer" &&
+    (workspaceKeyId != null || workspaceKeyGeneration != null)
+  ) {
+    return fail(path, "must not attach Workspace key metadata to legacy authority");
+  }
+  return {
+    state: enumValue(item.state, `${path}.state`, BINDING_STATES),
+    authentication_mode: authenticationMode,
+    revision: safeRevision(item.revision, `${path}.revision`),
+    ...(workspaceKeyId === undefined ? {} : { workspace_key_id: workspaceKeyId }),
+    ...(workspaceKeyGeneration === undefined
+      ? {}
+      : { workspace_key_generation: workspaceKeyGeneration }),
+  };
+}
+
 function runtimeManagement(
   value: unknown,
   path: string,
@@ -300,9 +361,12 @@ function runtimeManagement(
       "endpoint_configured",
       "token_ref_configured",
     ],
-    [],
+    ["binding"],
     path,
   );
+  const binding = item.binding == null
+    ? undefined
+    : runtimeBinding(item.binding, `${path}.binding`);
   return {
     built_in: boolean(item.built_in, `${path}.built_in`),
     config_managed: boolean(item.config_managed, `${path}.config_managed`),
@@ -315,6 +379,7 @@ function runtimeManagement(
       item.token_ref_configured,
       `${path}.token_ref_configured`,
     ),
+    ...(binding === undefined ? {} : { binding }),
   };
 }
 
@@ -711,6 +776,30 @@ async function finishMutation(
     );
   }
   return detail;
+}
+
+export async function createRemoteRuntime(
+  workspaceId: string,
+  request: CreateRemoteRuntimeRequest,
+  fetchImpl: typeof fetch = fetch,
+): Promise<WorkspaceRuntimeResource> {
+  const response = await fetchImpl(
+    workspaceApiPath(workspaceId, "/runtimes"),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request),
+    },
+  );
+  const payload = await readBoundedJson(response);
+  if (!response.ok) throw requestErrorFrom(payload, response.status);
+  const runtime = runtimeResource(payload, "Runtime create response");
+  if (runtime.runtime_id !== request.public_bundle.identity_id) {
+    throw new RuntimeTrustRequestError(
+      "Runtime create response did not match the submitted public bundle",
+    );
+  }
+  return runtime;
 }
 
 export async function revealRuntimeTrustKey(
