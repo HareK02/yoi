@@ -16,7 +16,9 @@ const WORKSPACE_SIGNING_INPUT_PREFIX: &str = "yoi.workspace.capability.v1.";
 const WORKSPACE_SIGNING_ALGORITHM: &str = "ed25519";
 const MAX_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_ID_BYTES: usize = 256;
+const MAX_ISSUER_BYTES: usize = 2 * 1024;
 const MAX_OPERATION_BYTES: usize = 128;
+const MAX_REPLAY_ENTRIES: usize = 65_536;
 const MAX_TOKEN_LIFETIME_SECONDS: i64 = 300;
 const MAX_CLOCK_SKEW_SECONDS: i64 = 30;
 
@@ -212,6 +214,12 @@ fn validate_bundle(
 ) -> Result<(), WorkspaceIssuerTrustError> {
     validate_id(&bundle.workspace_id)?;
     validate_id(&bundle.key_id)?;
+    if bundle.backend_url.len() > MAX_ISSUER_BYTES
+        || bundle.backend_url.trim() != bundle.backend_url
+        || bundle.backend_url.chars().any(char::is_control)
+    {
+        return Err(WorkspaceIssuerTrustError::InvalidBackendUrl);
+    }
     let backend_url = url::Url::parse(&bundle.backend_url)
         .map_err(|_| WorkspaceIssuerTrustError::InvalidBackendUrl)?;
     if !matches!(backend_url.scheme(), "http" | "https")
@@ -331,6 +339,9 @@ impl WorkspaceClaimReplayProtection for InMemoryWorkspaceClaimReplayProtection {
         );
         if consumed.contains_key(&key) {
             return Ok(false);
+        }
+        if consumed.len() >= MAX_REPLAY_ENTRIES {
+            return Err(WorkspaceCapabilityVerificationError::ReplayAuthorityUnavailable);
         }
         consumed.insert(key, expires_at);
         Ok(true)
@@ -580,6 +591,12 @@ fn validate_trust_record(
 fn validate_claim_shape(
     claims: &WorkspaceCapabilityClaims,
 ) -> Result<(), WorkspaceCapabilityVerificationError> {
+    if claims.issuer.len() > MAX_ISSUER_BYTES
+        || claims.issuer.trim() != claims.issuer
+        || claims.issuer.chars().any(char::is_control)
+    {
+        return Err(WorkspaceCapabilityVerificationError::WrongIssuer);
+    }
     let issuer = url::Url::parse(&claims.issuer)
         .map_err(|_| WorkspaceCapabilityVerificationError::WrongIssuer)?;
     if !matches!(issuer.scheme(), "http" | "https")

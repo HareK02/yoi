@@ -516,6 +516,8 @@ impl From<std::io::Error> for ProcessError {
     }
 }
 
+const MAX_WORKSPACE_IDENTITY_BUNDLE_BYTES: u64 = 64 * 1024;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct RuntimeAuthFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -551,9 +553,7 @@ fn run_trust_workspace_command(mut args: VecDeque<String>) -> Result<(), Process
             let config = parse_auth_storage_flags(&mut args)?;
             let auth_path = runtime_auth_path(&config);
             let mut auth = read_runtime_auth_file(&auth_path)?;
-            let bundle_bytes = std::fs::read(&bundle_path).map_err(|_| {
-                ProcessError::auth("Workspace signing public identity bundle is unavailable")
-            })?;
+            let bundle_bytes = read_workspace_identity_bundle(Path::new(&bundle_path))?;
             let bundle = serde_json::from_slice(&bundle_bytes).map_err(|_| {
                 ProcessError::auth("Workspace signing public identity bundle is invalid")
             })?;
@@ -620,6 +620,26 @@ fn run_trust_workspace_command(mut args: VecDeque<String>) -> Result<(), Process
             "unknown trust-workspace command `{subcommand}`"
         ))),
     }
+}
+
+fn read_workspace_identity_bundle(path: &Path) -> Result<Vec<u8>, ProcessError> {
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(path).map_err(|_| {
+        ProcessError::auth("Workspace signing public identity bundle is unavailable")
+    })?;
+    let mut bytes = Vec::new();
+    file.take(MAX_WORKSPACE_IDENTITY_BUNDLE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            ProcessError::auth("Workspace signing public identity bundle is unavailable")
+        })?;
+    if bytes.len() as u64 > MAX_WORKSPACE_IDENTITY_BUNDLE_BYTES {
+        return Err(ProcessError::auth(
+            "Workspace signing public identity bundle is too large",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn take_required_auth_option(
@@ -1399,6 +1419,21 @@ mod tests {
             revoked.workspace_issuers[0].state,
             worker_runtime::workspace_issuer::WorkspaceIssuerTrustState::Revoked
         );
+
+        let oversized_bundle = temp.path().join("oversized-public-bundle.json");
+        std::fs::write(
+            &oversized_bundle,
+            vec![b'x'; MAX_WORKSPACE_IDENTITY_BUNDLE_BYTES as usize + 1],
+        )
+        .unwrap();
+        let error = read_workspace_identity_bundle(&oversized_bundle)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "Workspace signing public identity bundle is too large"
+        );
+        assert!(!error.contains(&oversized_bundle.to_string_lossy().into_owned()));
 
         #[cfg(unix)]
         {

@@ -112,7 +112,7 @@ Workspace signing identity is Workspace-scoped. Provision the identity through t
 GET /api/w/<WORKSPACE_ID>/settings/workspace/signing-identity
 ```
 
-Save the response's `identity` object—not the outer response wrapper—as `workspace-public-identity.json`, and transfer only that document to the Runtime host:
+Save the response's non-null `public_bundle` object—not the outer response wrapper—as `workspace-public-identity.json`, and transfer only that document to the Runtime host:
 
 ```bash
 yoi-runtime trust-workspace add \
