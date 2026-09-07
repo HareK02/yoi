@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -3499,23 +3498,29 @@ async fn log_failed_api_response(request: Request, next: Next) -> Response {
 
     if uri.path().starts_with("/api/") && (status.is_client_error() || status.is_server_error()) {
         let error = response.extensions().get::<ApiErrorLog>();
-        eprintln!(
-            "{} yoi-server {}",
-            Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-            failed_api_log_json(&method, &uri, status, error)
+        let event = api_failure_log_event(&method, &uri, status, error);
+        tracing::error!(
+            target: "yoi::api",
+            event = event.event,
+            method = event.method,
+            path = event.path,
+            status = event.status,
+            kind = event.kind.unwrap_or("unknown"),
+            message = event.message.unwrap_or(""),
+            diagnostics = ?event.diagnostics.unwrap_or_default(),
         );
     }
 
     response
 }
 
-fn failed_api_log_json(
-    method: &Method,
-    uri: &Uri,
+fn api_failure_log_event<'a>(
+    method: &'a Method,
+    uri: &'a Uri,
     status: StatusCode,
-    error: Option<&ApiErrorLog>,
-) -> String {
-    let event = ApiFailureLogEvent {
+    error: Option<&'a ApiErrorLog>,
+) -> ApiFailureLogEvent<'a> {
+    ApiFailureLogEvent {
         event: "api_error",
         method: method.as_str(),
         path: uri.path(),
@@ -3523,7 +3528,17 @@ fn failed_api_log_json(
         kind: error.map(|error| error.kind.as_str()),
         message: error.map(|error| error.message.as_str()),
         diagnostics: error.map(|error| error.diagnostics.as_slice()),
-    };
+    }
+}
+
+#[cfg(test)]
+fn failed_api_log_json(
+    method: &Method,
+    uri: &Uri,
+    status: StatusCode,
+    error: Option<&ApiErrorLog>,
+) -> String {
+    let event = api_failure_log_event(method, uri, status, error);
     serde_json::to_string(&event).unwrap_or_else(|serialization_error| {
         format!(
             "{{\"event\":\"api_error\",\"status\":{},\"log_serialization_error\":{:?}}}",
@@ -14292,35 +14307,23 @@ fn finalize_worker_spawn_stage<T>(
     ))
 }
 
-fn workspace_worker_create_failure_log_line(
-    runtime_id: &str,
-    worker_id: WorkerId,
-    phase: &str,
-    diagnostics: &[RuntimeDiagnostic],
-) -> String {
-    serde_json::json!({
-        "level": "ERROR",
-        "event": "worker_create_failed",
-        "component": "workspace_server",
-        "runtime_id": runtime_id,
-        "worker_id": worker_id.to_string(),
-        "phase": phase,
-        "cleanup_succeeded": diagnostics.is_empty(),
-        "cleanup_diagnostics": diagnostics,
-    })
-    .to_string()
-}
-
 fn write_workspace_worker_create_failure(
     runtime_id: &str,
     worker_id: WorkerId,
     phase: &str,
     diagnostics: &[RuntimeDiagnostic],
 ) {
-    let line = workspace_worker_create_failure_log_line(runtime_id, worker_id, phase, diagnostics);
-    let mut stdout = std::io::stdout().lock();
-    let _ = writeln!(stdout, "{line}");
-    let _ = stdout.flush();
+    tracing::error!(
+        target: "yoi::worker_create",
+        event = "worker_create_failed",
+        component = "workspace_server",
+        runtime_id,
+        worker_id = %worker_id,
+        phase,
+        cleanup_succeeded = diagnostics.is_empty(),
+        cleanup_diagnostics = ?diagnostics,
+        "Worker creation failed"
+    );
 }
 
 fn api_error_with_additional_diagnostics(
@@ -19610,34 +19613,6 @@ mod tests {
     fn backend_errors_preserve_operation_details() {
         let sanitized = sanitize_backend_error("failed to open server database");
         assert_eq!(sanitized, "failed to open server database");
-    }
-
-    #[test]
-    fn worker_create_failure_log_is_structured_for_stdout() {
-        let worker_id = WorkerId::now_v7();
-        let diagnostics = vec![RuntimeDiagnostic {
-            code: "worker_cleanup_failed".to_string(),
-            severity: DiagnosticSeverity::Error,
-            message: "cleanup failed".to_string(),
-        }];
-        let line = workspace_worker_create_failure_log_line(
-            "runtime-a",
-            worker_id,
-            "runtime_spawn_transport",
-            &diagnostics,
-        );
-        let event: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(event["level"], "ERROR");
-        assert_eq!(event["event"], "worker_create_failed");
-        assert_eq!(event["component"], "workspace_server");
-        assert_eq!(event["runtime_id"], "runtime-a");
-        assert_eq!(event["worker_id"], worker_id.to_string());
-        assert_eq!(event["phase"], "runtime_spawn_transport");
-        assert_eq!(event["cleanup_succeeded"], false);
-        assert_eq!(
-            event["cleanup_diagnostics"][0]["code"],
-            "worker_cleanup_failed"
-        );
     }
 
     #[test]

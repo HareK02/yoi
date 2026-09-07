@@ -47,7 +47,6 @@ use protocol::{Event, Method};
 use std::collections::BTreeMap;
 #[cfg(feature = "ws-server")]
 use std::collections::VecDeque;
-use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 #[cfg(feature = "ws-server")]
@@ -3377,12 +3376,10 @@ fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), R
     Ok(())
 }
 
-fn runtime_worker_create_failure_log_line(
-    worker_id: WorkerId,
-    workspace_id: Option<&str>,
+fn runtime_worker_create_failure_fields(
     error: &RuntimeError,
-) -> String {
-    let (error_kind, operation, outcome) = match error {
+) -> (&'static str, Option<String>, Option<String>) {
+    match error {
         RuntimeError::RuntimeStopped => ("runtime_stopped", None, None),
         RuntimeError::InvalidInitialInputKind { .. } => ("invalid_initial_input_kind", None, None),
         RuntimeError::WorkerNotFound { .. } => ("worker_not_found", None, None),
@@ -3415,18 +3412,7 @@ fn runtime_worker_create_failure_log_line(
         RuntimeError::StoreMissing { .. } => ("store_missing", None, None),
         RuntimeError::StoreCorrupt { .. } => ("store_corrupt", None, None),
         RuntimeError::StatePoisoned => ("state_poisoned", None, None),
-    };
-    serde_json::json!({
-        "level": "ERROR",
-        "event": "worker_create_failed",
-        "component": "runtime",
-        "workspace_id": workspace_id,
-        "worker_id": worker_id.to_string(),
-        "error_kind": error_kind,
-        "operation": operation,
-        "outcome": outcome,
-    })
-    .to_string()
+    }
 }
 
 fn write_runtime_worker_create_failure(
@@ -3434,10 +3420,18 @@ fn write_runtime_worker_create_failure(
     workspace_id: Option<&str>,
     error: &RuntimeError,
 ) {
-    let line = runtime_worker_create_failure_log_line(worker_id, workspace_id, error);
-    let mut stdout = std::io::stdout().lock();
-    let _ = writeln!(stdout, "{line}");
-    let _ = stdout.flush();
+    let (error_kind, operation, outcome) = runtime_worker_create_failure_fields(error);
+    tracing::error!(
+        target: "yoi::worker_create",
+        event = "worker_create_failed",
+        component = "runtime",
+        workspace_id = workspace_id.unwrap_or(""),
+        worker_id = %worker_id,
+        error_kind,
+        operation = operation.as_deref().unwrap_or(""),
+        outcome = outcome.as_deref().unwrap_or(""),
+        "Worker creation failed"
+    );
 }
 
 fn validate_create_workspace_scope(
@@ -3564,21 +3558,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
-    fn worker_create_failure_log_is_structured_for_stdout() {
-        let worker_id = WorkerId::now_v7();
-        let line = runtime_worker_create_failure_log_line(
-            worker_id,
-            Some("workspace-a"),
-            &RuntimeError::InvalidRequest("rejected create".to_string()),
+    fn worker_create_failure_fields_exclude_raw_error_messages() {
+        let (error_kind, operation, outcome) = runtime_worker_create_failure_fields(
+            &RuntimeError::InvalidRequest("private-token".to_string()),
         );
-        let event: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(event["level"], "ERROR");
-        assert_eq!(event["event"], "worker_create_failed");
-        assert_eq!(event["component"], "runtime");
-        assert_eq!(event["workspace_id"], "workspace-a");
-        assert_eq!(event["worker_id"], worker_id.to_string());
-        assert_eq!(event["error_kind"], "invalid_request");
-        assert!(event.get("message").is_none());
+        assert_eq!(error_kind, "invalid_request");
+        assert_eq!(operation, None);
+        assert_eq!(outcome, None);
     }
 
     fn test_command() -> protocol::WorkerCommandEnvelope {

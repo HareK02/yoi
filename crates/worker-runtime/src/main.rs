@@ -53,6 +53,18 @@ fn main() -> ExitCode {
     }
 }
 
+fn init_serve_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stdout)
+        .with_ansi(false)
+        .json()
+        .flatten_event(true)
+        .try_init();
+}
+
 fn run() -> Result<(), ProcessError> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if matches!(args.first().map(String::as_str), Some("migrate")) {
@@ -68,6 +80,7 @@ fn run() -> Result<(), ProcessError> {
         println!("{}", usage());
         return Ok(());
     };
+    init_serve_tracing();
     config.http.auth = load_runtime_http_auth(&config)?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()

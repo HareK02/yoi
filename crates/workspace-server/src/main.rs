@@ -553,7 +553,20 @@ fn run_migrate(options: MigrateOptions) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+fn init_serve_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stdout)
+        .with_ansi(false)
+        .json()
+        .flatten_event(true)
+        .try_init();
+}
+
 async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Error>> {
+    init_serve_tracing();
     let database_path = ServerConfig::default_server_database_path();
     if let Some(parent) = database_path.parent() {
         tokio::fs::create_dir_all(parent).await?;

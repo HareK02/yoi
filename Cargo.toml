@@ -132,6 +132,7 @@ tokio-tungstenite = "0.29"
 tower = "0.5"
 toml = "1.1"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2.5"
 uuid = "1.23"
 zeroize = "1"
