@@ -224,13 +224,13 @@ The expected authoring flow is Rust-first: generate the starter, edit `src/lib.r
 
 ## Enabling a Plugin in a workspace
 
-Enablement belongs in the resolved Profile/config path for the workspace. For local dogfooding or private experiments, use the ignored local overlay rather than committing secrets or local paths:
+Enablement belongs in the resolved Profile/config path for the workspace. Add it to the project Profile source selected by the Backend-managed, revisioned Workspace Virtual Config. Ambient files below the Workdir are not a Profile override layer and are not read when the Worker starts. Keep raw secrets and machine-local paths out of the Profile; refer to separately managed secrets where a capability supports them.
+
+The following TOML shows the equivalent low-level Profile/config artifact shape; it is not an ambient workspace override file:
 
 ```toml
-# .yoi/override.local.toml
-
-[features]
-plugins = true
+[feature.plugins]
+enabled = true
 
 [[plugins.enabled]]
 id = "project:example.echo"

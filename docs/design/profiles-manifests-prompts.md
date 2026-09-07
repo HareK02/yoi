@@ -25,9 +25,9 @@ A resolved Manifest is the concrete contract used to create or restore a Worker.
 
 Source/partial layers may omit fields. Resolved manifests should be explicit enough that Worker creation does not depend on ambient configuration later changing under it.
 
-`--manifest <path>` exists as an explicit low-level escape hatch. Normal fresh startup should select a Profile through `profiles.toml` / builtin defaults rather than ambient manifest cascades.
+`--manifest <path>` exists as an explicit low-level escape hatch. Normal fresh startup selects a `builtin:*` or `project:*` Profile from the Backend-managed Workspace Config revision rather than applying an ambient manifest cascade.
 
-For normal Profile/default startup, a workspace may add `.yoi/override.local.toml` as a final local manifest layer. Yoi discovers the nearest ancestor `.yoi/override.local.toml` from the workspace base used for profile resolution, resolves relative paths in that file against its containing `.yoi` directory, and applies it after the selected Profile and builtin defaults. This file is intended for machine-local choices such as provider/model, worker language, prompt pack, and permission policy tweaks; it is ignored by git via the repository `*.local.*` rule. It is not applied in explicit `--manifest <path>` mode, and it cannot set `worker.name` because Worker identity remains a runtime input.
+Project Profiles are evaluated from the revisioned Virtual Config's Decodal source/import closure. The Backend packages that closure into a digest-bound Profile source archive, delivers it with the resolved launch bundle, and the Worker persists the resulting Manifest for restore. Files below the Workdir are not implicit Profile override layers.
 
 ## Local stdio MCP server declarations
 
@@ -77,7 +77,7 @@ Prompts live under `resources/prompts` so builtins, project overrides, and user 
 
 The prompt layer should explain policy and behavior, but it should not smuggle volatile state into model context. Runtime facts that affect later turns must still go through history.
 
-Builtin resources should be embedded at compile time. User/project profiles, explicit profile paths, prompt overlays, provider/model overrides, and explicit manifests remain filesystem-based.
+Builtin resources should be embedded at compile time. Project Profiles and prompt overlays belong to the Backend-managed revisioned Workspace Config and travel as digest-bound source archives. User Profile registries, provider/model catalog overrides, and explicit low-level Manifests remain filesystem-based where those local resolution paths are used.
 
 ## Why this separation matters
 
