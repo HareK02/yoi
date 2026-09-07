@@ -22,13 +22,16 @@ use worker_runtime::error::RuntimeError;
 use worker_runtime::fs_store::{FsRuntimeStore, FsRuntimeStoreOptions};
 use worker_runtime::http_server::{
     RuntimeHttpServerConfig, RuntimeHttpServerError, RuntimeHttpStoreSelection,
+    WorkspaceRuntimeHttpAuth,
 };
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 use worker_runtime::working_directory::RuntimeGitCacheMaterializer;
 use worker_runtime::workspace_issuer::{
-    MAX_WORKSPACE_ISSUER_TRUST_RECORDS, WorkspaceIssuerTrustError, WorkspaceIssuerTrustMutation,
-    WorkspaceIssuerTrustRecord, add_workspace_issuer_trust, replace_workspace_issuer_trust,
-    revoke_workspace_issuer_trust, validate_workspace_issuer_trust_records,
+    FileWorkspaceClaimReplayProtection, FileWorkspaceRuntimeVerificationAuthority,
+    MAX_WORKSPACE_ISSUER_TRUST_RECORDS, RuntimeVerificationSigner, WorkspaceCapabilityVerifier,
+    WorkspaceIssuerTrustError, WorkspaceIssuerTrustMutation, WorkspaceIssuerTrustRecord,
+    add_workspace_issuer_trust, replace_workspace_issuer_trust, revoke_workspace_issuer_trust,
+    validate_workspace_issuer_trust_records,
 };
 use worker_runtime::{Runtime, RuntimeOptions};
 
@@ -88,6 +91,7 @@ fn run() -> Result<(), ProcessError> {
     };
     init_serve_tracing();
     config.http.auth = load_runtime_http_auth(&config)?;
+    let workspace_http_auth = load_workspace_runtime_http_auth(&config)?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -99,14 +103,25 @@ fn run() -> Result<(), ProcessError> {
         eprintln!(
             "yoi-runtime listening on {local_addr}; intended client is a trusted backend/proxy, not a browser"
         );
-        worker_runtime::http_server::serve_runtime_http_with_auth(
-            worker_runtime,
-            listener,
-            config.http.local_token,
-            config.http.auth,
-        )
-        .await
-        .map_err(ProcessError::from)
+        let server = if let Some(workspace_auth) = workspace_http_auth {
+            worker_runtime::http_server::serve_runtime_http_with_workspace_auth(
+                worker_runtime,
+                listener,
+                config.http.local_token,
+                config.http.auth,
+                workspace_auth,
+            )
+            .await
+        } else {
+            worker_runtime::http_server::serve_runtime_http_with_auth(
+                worker_runtime,
+                listener,
+                config.http.local_token,
+                config.http.auth,
+            )
+            .await
+        };
+        server.map_err(ProcessError::from)
     })?;
     Ok(())
 }
@@ -878,6 +893,35 @@ fn write_secret_file(path: &Path, contents: &[u8]) -> Result<(), ProcessError> {
         let _ = std::fs::remove_file(&temporary_path);
     }
     write_result
+}
+
+fn load_workspace_runtime_http_auth(
+    config: &ProcessConfig,
+) -> Result<Option<WorkspaceRuntimeHttpAuth>, ProcessError> {
+    let auth = read_runtime_auth_file(&runtime_auth_path(config))?;
+    let Some(identity) = auth.identity else {
+        return Ok(None);
+    };
+    if auth.workspace_issuers.is_empty() {
+        return Ok(None);
+    }
+    let replay_path = runtime_auth_path(config).with_extension("workspace-replay.json");
+    let verifier = WorkspaceCapabilityVerifier::new(
+        auth.workspace_issuers,
+        Arc::new(FileWorkspaceClaimReplayProtection::new(replay_path)),
+    )
+    .map_err(|error| ProcessError::auth(format!("invalid Workspace issuer trust: {error}")))?;
+    let signer = RuntimeVerificationSigner::from_identity(&identity)
+        .map_err(|error| ProcessError::auth(format!("invalid Runtime identity: {error}")))?;
+    let verifications_path =
+        runtime_auth_path(config).with_extension("workspace-verifications.json");
+    Ok(Some(WorkspaceRuntimeHttpAuth {
+        verifier,
+        signer,
+        verifications: Arc::new(FileWorkspaceRuntimeVerificationAuthority::new(
+            verifications_path,
+        )),
+    }))
 }
 
 fn load_runtime_http_auth(

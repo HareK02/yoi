@@ -293,7 +293,12 @@ mod client {
     /// implementations can mint short-lived capability tokens without making a
     /// Worker-bound session expire with the token used to open it.
     pub trait WorkdirHttpAuthorization: std::fmt::Debug + Send + Sync {
-        fn bearer_token(&self) -> Result<String, WorkdirError>;
+        fn bearer_token(
+            &self,
+            method: &str,
+            path_and_query: &str,
+            body: &[u8],
+        ) -> Result<String, WorkdirError>;
     }
 
     struct FixedBearerToken(Arc<str>);
@@ -305,7 +310,12 @@ mod client {
     }
 
     impl WorkdirHttpAuthorization for FixedBearerToken {
-        fn bearer_token(&self) -> Result<String, WorkdirError> {
+        fn bearer_token(
+            &self,
+            _method: &str,
+            _path_and_query: &str,
+            _body: &[u8],
+        ) -> Result<String, WorkdirError> {
             Ok(self.0.to_string())
         }
     }
@@ -354,10 +364,14 @@ mod client {
                 &base_url,
                 &["v1", "working-directories", workdir_id.as_str(), "sessions"],
             )?;
+            let body = serde_json::to_vec(&request)
+                .map_err(|error| WorkdirError::Unavailable(error.to_string()))?;
+            let token = authorization.bearer_token("POST", url.path(), &body)?;
             let response = client
                 .post(url)
-                .bearer_auth(authorization.bearer_token()?)
-                .json(&request)
+                .bearer_auth(token)
+                .header("content-type", "application/json")
+                .body(body)
                 .send()
                 .await
                 .map_err(http_unavailable)?;
@@ -401,11 +415,15 @@ mod client {
                 ],
             )?;
             let operation = WorkdirSessionOperationRequest { operation };
+            let body = serde_json::to_vec(&operation)
+                .map_err(|error| WorkdirError::Unavailable(error.to_string()))?;
+            let token = self.authorization.bearer_token("POST", url.path(), &body)?;
             let response = self
                 .client
                 .post(url)
-                .bearer_auth(self.authorization.bearer_token()?)
-                .json(&operation)
+                .bearer_auth(token)
+                .header("content-type", "application/json")
+                .body(body)
                 .send()
                 .await
                 .map_err(http_unavailable)?;
@@ -543,10 +561,11 @@ mod client {
                 &self.base_url,
                 &["v1", "workdir-sessions", self.session_id.as_str()],
             )?;
+            let token = self.authorization.bearer_token("DELETE", url.path(), &[])?;
             let response = self
                 .client
                 .delete(url)
-                .bearer_auth(self.authorization.bearer_token()?)
+                .bearer_auth(token)
                 .send()
                 .await
                 .map_err(http_unavailable)?;

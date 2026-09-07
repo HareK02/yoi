@@ -9,6 +9,10 @@ use chrono::{SecondsFormat, Utc};
 use ring::signature::KeyPair;
 use serde::{Deserialize, Serialize};
 use worker_runtime::auth::{RuntimeIdentityMaterial, encode_public_key};
+use worker_runtime::workspace_issuer::{
+    WorkspaceCapabilityClaims, WorkspaceCapabilityVerificationError,
+    assemble_workspace_capability_token, workspace_capability_signing_input,
+};
 use zeroize::Zeroize;
 
 use crate::store::{
@@ -252,6 +256,16 @@ impl WorkspaceSigningIdentityService {
         let signing_key =
             material.signing_key(workspace_id, &identity.key_id, identity.revision)?;
         Ok(signing_key.sign(payload).as_ref().to_vec())
+    }
+
+    pub fn issue_workspace_capability(
+        &self,
+        workspace_id: &str,
+        claims: &WorkspaceCapabilityClaims,
+    ) -> Result<String> {
+        let input = workspace_capability_signing_input(claims).map_err(capability_error)?;
+        let signature = self.sign(workspace_id, input.bytes())?;
+        assemble_workspace_capability_token(input, &signature).map_err(capability_error)
     }
 
     pub fn delete_material(&self, workspace_id: &str) -> Result<()> {
@@ -569,6 +583,13 @@ fn material_io_error(action: &str, error: std::io::Error) -> Error {
     identity_error(
         "workspace_signing_identity_material_io_failed",
         format!("failed to {action} Workspace signing private material: {error}"),
+    )
+}
+
+fn capability_error(error: WorkspaceCapabilityVerificationError) -> Error {
+    identity_error(
+        "workspace_capability_issuance_failed",
+        format!("failed to issue Workspace capability: {error}"),
     )
 }
 

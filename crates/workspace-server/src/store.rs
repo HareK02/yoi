@@ -18,7 +18,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 55;
+const LATEST_SCHEMA_VERSION: i64 = 56;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -26,6 +26,8 @@ const WORKSPACE_DELETION_MIGRATION_NAME: &str = "durable Workspace deletion oper
 const WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME: &str = "Workspace signing identity authority";
 const WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME: &str =
     "Workspace Runtime binding state and identity mode";
+const WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME: &str =
+    "Workspace-signed Runtime verification evidence";
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -52,6 +54,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 55,
         name: WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME,
         apply: migrate_workspace_runtime_binding_state_v54_to_v55,
+    },
+    Migration {
+        version: 56,
+        name: WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME,
+        apply: migrate_workspace_runtime_verification_v55_to_v56,
     },
 ];
 
@@ -206,6 +213,23 @@ pub struct WorkspaceSigningIdentityProvisioningOperation {
     pub state: String,
     pub created_at: String,
     pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceRuntimeVerificationEvidence {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub binding_revision: u64,
+    pub workspace_key_id: String,
+    pub workspace_identity_revision: u64,
+    pub workspace_trust_generation: u64,
+    pub runtime_public_key_fingerprint: String,
+    pub runtime_identity_revision: u64,
+    pub challenge_id: String,
+    pub state: String,
+    pub last_outcome: String,
+    pub verified_at: Option<String>,
+    pub checked_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -732,6 +756,25 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     ) -> Result<WorkspaceSigningIdentityRecord>;
     fn workspace_runtime_binding_matches(&self, expected: &WorkspaceRuntimeBinding)
     -> Result<bool>;
+    fn workspace_runtime_verification_matches(
+        &self,
+        binding: &WorkspaceRuntimeBinding,
+        workspace_identity_revision: u64,
+        workspace_trust_generation: u64,
+    ) -> Result<bool>;
+    async fn get_workspace_runtime_verification(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Result<Option<WorkspaceRuntimeVerificationEvidence>>;
+    async fn record_workspace_runtime_verification_attempt(
+        &self,
+        evidence: &WorkspaceRuntimeVerificationEvidence,
+    ) -> Result<()>;
+    async fn complete_workspace_runtime_verification(
+        &self,
+        evidence: &WorkspaceRuntimeVerificationEvidence,
+    ) -> Result<WorkspaceRuntimeBinding>;
     async fn get_workspace_runtime_binding(
         &self,
         workspace_id: &str,
@@ -2179,6 +2222,183 @@ impl SqliteWorkspaceStore {
         })
     }
 
+    pub fn workspace_runtime_verification_matches(
+        &self,
+        binding: &WorkspaceRuntimeBinding,
+        workspace_identity_revision: u64,
+        workspace_trust_generation: u64,
+    ) -> Result<bool> {
+        let Some(evidence) =
+            self.get_workspace_runtime_verification(&binding.workspace_id, &binding.runtime_id)?
+        else {
+            return Ok(false);
+        };
+        Ok(evidence.state == "verified"
+            && evidence.verified_at.is_some()
+            && evidence.binding_revision == binding.binding_revision
+            && evidence.workspace_key_id == binding.workspace_key_id.as_deref().unwrap_or_default()
+            && evidence.workspace_identity_revision == workspace_identity_revision
+            && evidence.workspace_trust_generation == workspace_trust_generation
+            && evidence.runtime_public_key_fingerprint == binding.public_key_fingerprint
+            && evidence.runtime_identity_revision > 0)
+    }
+
+    pub fn get_workspace_runtime_verification(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Result<Option<WorkspaceRuntimeVerificationEvidence>> {
+        validate_identifier("workspace_id", workspace_id)?;
+        validate_identifier("runtime_id", runtime_id)?;
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT workspace_id, runtime_id, binding_revision, workspace_key_id,
+                          workspace_identity_revision, workspace_trust_generation,
+                          runtime_public_key_fingerprint, runtime_identity_revision,
+                          challenge_id, state, last_outcome, verified_at, checked_at
+                   FROM workspace_runtime_verifications
+                   WHERE workspace_id = ?1 AND runtime_id = ?2"#,
+                params![workspace_id, runtime_id],
+                read_workspace_runtime_verification,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    pub fn record_workspace_runtime_verification_attempt(
+        &self,
+        evidence: &WorkspaceRuntimeVerificationEvidence,
+    ) -> Result<()> {
+        validate_workspace_runtime_verification(evidence)?;
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO workspace_runtime_verifications (
+                       workspace_id, runtime_id, binding_revision, workspace_key_id,
+                       workspace_identity_revision, workspace_trust_generation,
+                       runtime_public_key_fingerprint, runtime_identity_revision,
+                       challenge_id, state, last_outcome, verified_at, checked_at
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                   ON CONFLICT(workspace_id, runtime_id) DO UPDATE SET
+                       binding_revision = excluded.binding_revision,
+                       workspace_key_id = excluded.workspace_key_id,
+                       workspace_identity_revision = excluded.workspace_identity_revision,
+                       workspace_trust_generation = excluded.workspace_trust_generation,
+                       runtime_public_key_fingerprint = excluded.runtime_public_key_fingerprint,
+                       runtime_identity_revision = excluded.runtime_identity_revision,
+                       challenge_id = excluded.challenge_id,
+                       state = excluded.state,
+                       last_outcome = excluded.last_outcome,
+                       verified_at = excluded.verified_at,
+                       checked_at = excluded.checked_at"#,
+                params![
+                    evidence.workspace_id,
+                    evidence.runtime_id,
+                    evidence.binding_revision,
+                    evidence.workspace_key_id,
+                    evidence.workspace_identity_revision,
+                    evidence.workspace_trust_generation,
+                    evidence.runtime_public_key_fingerprint,
+                    evidence.runtime_identity_revision,
+                    evidence.challenge_id,
+                    evidence.state,
+                    evidence.last_outcome,
+                    evidence.verified_at,
+                    evidence.checked_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn complete_workspace_runtime_verification(
+        &self,
+        evidence: &WorkspaceRuntimeVerificationEvidence,
+    ) -> Result<WorkspaceRuntimeBinding> {
+        validate_workspace_runtime_verification(evidence)?;
+        if evidence.state != "verified" || evidence.verified_at.is_none() {
+            return Err(Error::Store(
+                "completed Runtime verification evidence must be verified".to_string(),
+            ));
+        }
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
+                r#"UPDATE workspace_runtime_bindings
+                   SET state = 'verified', updated_at = ?7
+                   WHERE workspace_id = ?1 AND runtime_id = ?2
+                     AND binding_revision = ?3
+                     AND state IN ('configured', 'verified')
+                     AND authentication_mode = 'workspace_identity'
+                     AND workspace_key_id = ?4
+                     AND workspace_key_generation = ?5
+                     AND public_key_fingerprint = ?6
+                     AND revoked_at IS NULL"#,
+                params![
+                    evidence.workspace_id,
+                    evidence.runtime_id,
+                    evidence.binding_revision,
+                    evidence.workspace_key_id,
+                    evidence.workspace_trust_generation,
+                    evidence.runtime_public_key_fingerprint,
+                    evidence.checked_at,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(Error::RuntimeBindingConflict(
+                    "Runtime verification evidence no longer matches the configured binding"
+                        .to_string(),
+                ));
+            }
+            tx.execute(
+                r#"INSERT INTO workspace_runtime_verifications (
+                       workspace_id, runtime_id, binding_revision, workspace_key_id,
+                       workspace_identity_revision, workspace_trust_generation,
+                       runtime_public_key_fingerprint, runtime_identity_revision,
+                       challenge_id, state, last_outcome, verified_at, checked_at
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                   ON CONFLICT(workspace_id, runtime_id) DO UPDATE SET
+                       binding_revision = excluded.binding_revision,
+                       workspace_key_id = excluded.workspace_key_id,
+                       workspace_identity_revision = excluded.workspace_identity_revision,
+                       workspace_trust_generation = excluded.workspace_trust_generation,
+                       runtime_public_key_fingerprint = excluded.runtime_public_key_fingerprint,
+                       runtime_identity_revision = excluded.runtime_identity_revision,
+                       challenge_id = excluded.challenge_id,
+                       state = excluded.state,
+                       last_outcome = excluded.last_outcome,
+                       verified_at = excluded.verified_at,
+                       checked_at = excluded.checked_at"#,
+                params![
+                    evidence.workspace_id,
+                    evidence.runtime_id,
+                    evidence.binding_revision,
+                    evidence.workspace_key_id,
+                    evidence.workspace_identity_revision,
+                    evidence.workspace_trust_generation,
+                    evidence.runtime_public_key_fingerprint,
+                    evidence.runtime_identity_revision,
+                    evidence.challenge_id,
+                    evidence.state,
+                    evidence.last_outcome,
+                    evidence.verified_at,
+                    evidence.checked_at,
+                ],
+            )?;
+            let binding = tx.query_row(
+                r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
+                          public_key_fingerprint, binding_revision, state, authentication_mode,
+                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+                   FROM workspace_runtime_bindings
+                   WHERE workspace_id = ?1 AND runtime_id = ?2"#,
+                params![evidence.workspace_id, evidence.runtime_id],
+                read_workspace_runtime_binding,
+            )?;
+            tx.commit()?;
+            Ok(binding)
+        })
+    }
+
     pub fn list_workspace_runtime_binding_audit(
         &self,
         workspace_id: &str,
@@ -2917,6 +3137,42 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             &expected.runtime_id,
         )?
         .is_some_and(|binding| binding == *expected && binding.revoked_at.is_none()))
+    }
+
+    fn workspace_runtime_verification_matches(
+        &self,
+        binding: &WorkspaceRuntimeBinding,
+        workspace_identity_revision: u64,
+        workspace_trust_generation: u64,
+    ) -> Result<bool> {
+        SqliteWorkspaceStore::workspace_runtime_verification_matches(
+            self,
+            binding,
+            workspace_identity_revision,
+            workspace_trust_generation,
+        )
+    }
+
+    async fn get_workspace_runtime_verification(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Result<Option<WorkspaceRuntimeVerificationEvidence>> {
+        SqliteWorkspaceStore::get_workspace_runtime_verification(self, workspace_id, runtime_id)
+    }
+
+    async fn record_workspace_runtime_verification_attempt(
+        &self,
+        evidence: &WorkspaceRuntimeVerificationEvidence,
+    ) -> Result<()> {
+        SqliteWorkspaceStore::record_workspace_runtime_verification_attempt(self, evidence)
+    }
+
+    async fn complete_workspace_runtime_verification(
+        &self,
+        evidence: &WorkspaceRuntimeVerificationEvidence,
+    ) -> Result<WorkspaceRuntimeBinding> {
+        SqliteWorkspaceStore::complete_workspace_runtime_verification(self, evidence)
     }
 
     async fn get_workspace_runtime_binding(
@@ -6424,6 +6680,56 @@ fn account_select_sql(where_clause: &str) -> String {
     )
 }
 
+fn read_workspace_runtime_verification(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkspaceRuntimeVerificationEvidence> {
+    Ok(WorkspaceRuntimeVerificationEvidence {
+        workspace_id: row.get(0)?,
+        runtime_id: row.get(1)?,
+        binding_revision: row.get(2)?,
+        workspace_key_id: row.get(3)?,
+        workspace_identity_revision: row.get(4)?,
+        workspace_trust_generation: row.get(5)?,
+        runtime_public_key_fingerprint: row.get(6)?,
+        runtime_identity_revision: row.get(7)?,
+        challenge_id: row.get(8)?,
+        state: row.get(9)?,
+        last_outcome: row.get(10)?,
+        verified_at: row.get(11)?,
+        checked_at: row.get(12)?,
+    })
+}
+
+fn validate_workspace_runtime_verification(
+    evidence: &WorkspaceRuntimeVerificationEvidence,
+) -> Result<()> {
+    for (field, value) in [
+        ("workspace_id", evidence.workspace_id.as_str()),
+        ("runtime_id", evidence.runtime_id.as_str()),
+        ("workspace_key_id", evidence.workspace_key_id.as_str()),
+        ("challenge_id", evidence.challenge_id.as_str()),
+    ] {
+        validate_identifier(field, value)?;
+    }
+    if evidence.binding_revision == 0
+        || evidence.workspace_identity_revision == 0
+        || evidence.workspace_trust_generation == 0
+        || evidence.runtime_identity_revision == 0
+    {
+        return Err(Error::InvalidInput(
+            "Runtime verification revisions and generations must be positive".to_string(),
+        ));
+    }
+    validate_non_empty(
+        "runtime_public_key_fingerprint",
+        &evidence.runtime_public_key_fingerprint,
+    )?;
+    validate_non_empty("verification state", &evidence.state)?;
+    validate_non_empty("verification outcome", &evidence.last_outcome)?;
+    validate_non_empty("checked_at", &evidence.checked_at)?;
+    Ok(())
+}
+
 fn read_workspace_runtime_binding(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<WorkspaceRuntimeBinding> {
@@ -7817,6 +8123,80 @@ fn migrate_workspace_runtime_binding_state_v54_to_v55(conn: &Connection) -> Resu
     Ok(())
 }
 
+fn migrate_workspace_runtime_verification_v55_to_v56(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 55 {
+        return Err(Error::Store(format!(
+            "expected schema version 55 before {WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS workspace_runtime_verifications (
+            workspace_id TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            binding_revision INTEGER NOT NULL CHECK(binding_revision > 0),
+            workspace_key_id TEXT NOT NULL,
+            workspace_identity_revision INTEGER NOT NULL CHECK(workspace_identity_revision > 0),
+            workspace_trust_generation INTEGER NOT NULL CHECK(workspace_trust_generation > 0),
+            runtime_public_key_fingerprint TEXT NOT NULL,
+            runtime_identity_revision INTEGER NOT NULL CHECK(runtime_identity_revision > 0),
+            challenge_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('pending', 'verified', 'failed')),
+            last_outcome TEXT NOT NULL,
+            verified_at TEXT,
+            checked_at TEXT NOT NULL,
+            PRIMARY KEY(workspace_id, runtime_id),
+            FOREIGN KEY(workspace_id, runtime_id)
+                REFERENCES workspace_runtime_bindings(workspace_id, runtime_id)
+                ON DELETE CASCADE,
+            CHECK((state = 'verified' AND verified_at IS NOT NULL)
+               OR (state != 'verified' AND verified_at IS NULL))
+        );
+        CREATE INDEX IF NOT EXISTS workspace_runtime_verifications_state_idx
+            ON workspace_runtime_verifications(workspace_id, state, checked_at DESC);
+        "#,
+    )?;
+    verify_workspace_runtime_verification_schema(&tx)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![56_i64, WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn verify_workspace_runtime_verification_schema(conn: &Connection) -> Result<()> {
+    let actual = table_columns(conn, "workspace_runtime_verifications")?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let expected = [
+        "workspace_id",
+        "runtime_id",
+        "binding_revision",
+        "workspace_key_id",
+        "workspace_identity_revision",
+        "workspace_trust_generation",
+        "runtime_public_key_fingerprint",
+        "runtime_identity_revision",
+        "challenge_id",
+        "state",
+        "last_outcome",
+        "verified_at",
+        "checked_at",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(Error::Store(format!(
+            "workspace_runtime_verifications schema does not match schema-56: {actual:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn verify_workspace_signing_identity_schema(conn: &Connection) -> Result<()> {
     for (table, expected) in [
         (
@@ -8679,6 +9059,7 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
 
     verify_schema_history(conn, LATEST_SCHEMA_VERSION)?;
     verify_workspace_runtime_binding_schema(conn)?;
+    verify_workspace_runtime_verification_schema(conn)?;
     verify_workspace_deletion_schema(conn)?;
     verify_workspace_signing_identity_schema(conn)
 }
@@ -8902,6 +9283,10 @@ mod tests {
                     version: 55,
                     name: WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 56,
+                    name: WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -8927,6 +9312,10 @@ mod tests {
                         (
                             55,
                             WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME.to_string(),
+                        ),
+                        (
+                            56,
+                            WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME.to_string(),
                         ),
                     ]
                 );
@@ -8997,7 +9386,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![52, 53, 54, 55]
+            vec![52, 53, 54, 55, 56]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
@@ -9005,7 +9394,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 6);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 7);
     }
 
     #[test]
@@ -9369,6 +9758,123 @@ mod tests {
                 .revoked_at
                 .is_some()
         );
+    }
+
+    #[test]
+    fn workspace_runtime_verification_is_revision_bound_and_restart_safe() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO accounts(account_id, kind, handle, display_name, created_at, updated_at)
+                    VALUES ('owner', 'user', 'owner', 'Owner', '1', '1');
+                    INSERT INTO workspaces(workspace_id, owner_account_id, display_name, state, created_at, updated_at)
+                    VALUES ('workspace-a', 'owner', 'Workspace A', 'active', '1', '1');
+                    INSERT INTO workspace_signing_identities(
+                        workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
+                        private_material_ref, revision, state, created_at, provisioned_at, updated_at
+                    ) VALUES ('workspace-a', 'WK-a', 'ed25519', 'key', 'sha256:key',
+                              'workspace-signing/workspace-a/ed25519-v1', 1, 'active', '1', '1', '1');
+                    "#,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let runtime_identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-a").unwrap();
+        store
+            .upsert_workspace_runtime_binding(
+                WorkspaceRuntimeBinding {
+                    workspace_id: "workspace-a".to_string(),
+                    runtime_id: "runtime-a".to_string(),
+                    display_name: "runtime-a".to_string(),
+                    base_url: "https://runtime.test".to_string(),
+                    public_key: runtime_identity.public_key,
+                    public_key_fingerprint: String::new(),
+                    binding_revision: 1,
+                    state: WorkspaceRuntimeBindingState::Configured,
+                    authentication_mode: WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity,
+                    workspace_key_id: Some("WK-a".to_string()),
+                    workspace_key_generation: Some(1),
+                    created_at: "1".to_string(),
+                    updated_at: "1".to_string(),
+                    revoked_at: None,
+                },
+                false,
+            )
+            .unwrap();
+        let persisted = store
+            .get_workspace_runtime_binding("workspace-a", "runtime-a")
+            .unwrap()
+            .unwrap();
+        let evidence = WorkspaceRuntimeVerificationEvidence {
+            workspace_id: "workspace-a".to_string(),
+            runtime_id: "runtime-a".to_string(),
+            binding_revision: persisted.binding_revision,
+            workspace_key_id: "WK-a".to_string(),
+            workspace_identity_revision: 1,
+            workspace_trust_generation: 1,
+            runtime_public_key_fingerprint: persisted.public_key_fingerprint.clone(),
+            runtime_identity_revision: 1,
+            challenge_id: "challenge-a".to_string(),
+            state: "verified".to_string(),
+            last_outcome: "verified".to_string(),
+            verified_at: Some("2".to_string()),
+            checked_at: "2".to_string(),
+        };
+        let verified = store
+            .complete_workspace_runtime_verification(&evidence)
+            .unwrap();
+        assert_eq!(verified.state, WorkspaceRuntimeBindingState::Verified);
+        drop(store);
+
+        let reopened = SqliteWorkspaceStore::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .get_workspace_runtime_verification("workspace-a", "runtime-a")
+                .unwrap(),
+            Some(evidence)
+        );
+        assert_eq!(
+            reopened
+                .get_workspace_runtime_binding("workspace-a", "runtime-a")
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkspaceRuntimeBindingState::Verified
+        );
+    }
+
+    #[test]
+    fn schema_v55_migrates_runtime_verification_table_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "DROP TABLE workspace_runtime_verifications;
+                     DELETE FROM __yoi_schema_migrations;
+                     INSERT INTO __yoi_schema_migrations(version, name)
+                     VALUES (55, 'Workspace Runtime binding state and identity mode');",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 55);
+        migrate_workspace_runtime_verification_v55_to_v56(&conn).unwrap();
+        drop(conn);
+        let migrated = Connection::open(&path).unwrap();
+        configure_sqlite(&migrated).unwrap();
+        assert_eq!(current_schema_version(&migrated).unwrap(), 56);
+        assert!(table_exists(&migrated, "workspace_runtime_verifications").unwrap());
     }
 
     #[test]
@@ -10691,13 +11197,13 @@ INSERT INTO worker_registry (
         let conn = Connection::open_in_memory().unwrap();
         configure_sqlite(&conn).unwrap();
         conn.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (56, 'future')",
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (57, 'future')",
             [],
         )
         .unwrap();
 
         let error = apply_migrations(&conn).unwrap_err().to_string();
-        assert!(error.contains("schema version 56 is newer"), "{error}");
+        assert!(error.contains("schema version 57 is newer"), "{error}");
         assert!(error.contains("refusing to serve"), "{error}");
     }
 

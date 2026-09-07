@@ -462,6 +462,28 @@ CREATE TABLE workspace_runtime_bindings (
         (state != 'revoked' AND revoked_at IS NULL)
     )
 );
+CREATE TABLE workspace_runtime_verifications (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    binding_revision INTEGER NOT NULL CHECK(binding_revision > 0),
+    workspace_key_id TEXT NOT NULL,
+    workspace_identity_revision INTEGER NOT NULL CHECK(workspace_identity_revision > 0),
+    workspace_trust_generation INTEGER NOT NULL CHECK(workspace_trust_generation > 0),
+    runtime_public_key_fingerprint TEXT NOT NULL,
+    runtime_identity_revision INTEGER NOT NULL CHECK(runtime_identity_revision > 0),
+    challenge_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending', 'verified', 'failed')),
+    last_outcome TEXT NOT NULL,
+    verified_at TEXT,
+    checked_at TEXT NOT NULL,
+    PRIMARY KEY(workspace_id, runtime_id),
+    FOREIGN KEY(workspace_id, runtime_id)
+        REFERENCES workspace_runtime_bindings(workspace_id, runtime_id) ON DELETE CASCADE,
+    CHECK((state = 'verified' AND verified_at IS NOT NULL)
+       OR (state != 'verified' AND verified_at IS NULL))
+);
+CREATE INDEX workspace_runtime_verifications_state_idx
+    ON workspace_runtime_verifications(workspace_id, state, checked_at DESC);
 CREATE TABLE workspace_runtime_binding_audit (
     workspace_id TEXT NOT NULL,
     runtime_id TEXT NOT NULL,

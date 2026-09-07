@@ -970,6 +970,12 @@ fn runtime_token(
     config: &RemoteRuntimeConfig,
     workspace_id: &str,
 ) -> Result<Option<String>, String> {
+    if let Some(authorization) = config.workspace_authorization.as_ref() {
+        return authorization
+            .issue("GET", "/v1/protocol/ws", "workers:list", None, &[])
+            .map(Some)
+            .map_err(|error| error.message);
+    }
     let Some(auth) = config.auth.as_ref() else {
         return Ok(config.bearer_token.clone());
     };
