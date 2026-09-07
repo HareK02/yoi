@@ -13548,6 +13548,33 @@ async fn create_remote_runtime(
             "an active Workspace signing identity is required before registering a Runtime",
         ));
     }
+    let existing = api
+        .store
+        .get_workspace_runtime_binding(&api.config.workspace_id, &runtime_id)
+        .await?;
+    if existing
+        .as_ref()
+        .is_some_and(|binding| binding.state == StoredRuntimeBindingState::Verified)
+    {
+        return Err(Error::RuntimeBindingConflict(
+            "a verified Runtime binding must be revoked before it can be replaced as configured"
+                .to_string(),
+        )
+        .into());
+    }
+    match api
+        .runtime
+        .unregister_if_idle(&runtime_id, api.config.max_records.min(200))
+        .map_err(|err| err.into_error())?
+    {
+        RuntimeRegistryUnregisterResult::Removed | RuntimeRegistryUnregisterResult::NotFound => {}
+        RuntimeRegistryUnregisterResult::BlockedByWorkers { worker_count, .. } => {
+            return Err(Error::RuntimeBindingConflict(format!(
+                "Runtime `{runtime_id}` still has {worker_count} active worker(s) and cannot become a configured-only binding"
+            ))
+            .into());
+        }
+    }
     let now = Utc::now().to_rfc3339();
     let record = WorkspaceRuntimeBinding {
         workspace_id: api.config.workspace_id.clone(),
@@ -13575,6 +13602,12 @@ async fn create_remote_runtime(
         .store
         .put_workspace_runtime_binding_key(record, request.expected_revision, &actor.account_id)
         .await?;
+    api.runtime_binding_expectations
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(api.config.workspace_id.clone(), runtime_id.clone()));
+    api.runtime_subscription_broker
+        .unregister_runtime(&runtime_id);
     let resource = workspace_runtime_resources_response(&api, &api.config.workspace_id)
         .await?
         .items
@@ -19948,6 +19981,19 @@ mod tests {
         api.signing_identities
             .provision_existing(&api.config.workspace_id, &actor.account_id)
             .unwrap();
+        api.runtime.register_or_replace(
+            RemoteWorkerRuntime::new(
+                RemoteRuntimeConfig::new(
+                    "configured-runtime",
+                    "Stale Runtime",
+                    "https://8.8.8.8",
+                    None,
+                ),
+                api.config.workspace_id.clone(),
+                "http://127.0.0.1:1".to_string(),
+            )
+            .unwrap(),
+        );
         let runtime_identity = RuntimeIdentityMaterial::generate("configured-runtime").unwrap();
         let request = CreateRemoteRuntimeRequest {
             public_bundle: workspace_api::RuntimePublicIdentityBundle {
@@ -19989,6 +20035,24 @@ mod tests {
         assert!(binding.workspace_key_id.is_some());
         assert_eq!(binding.workspace_key_generation, Some(1));
         assert!(!created.runtime.worker_creation_available);
+        assert!(
+            api.runtime
+                .list_runtimes(100)
+                .items
+                .iter()
+                .all(|runtime| runtime.runtime_id != "configured-runtime"),
+            "configured binding must remove a stale active Runtime projection"
+        );
+        assert!(
+            !api.runtime_binding_expectations
+                .read()
+                .unwrap()
+                .contains_key(&(
+                    api.config.workspace_id.clone(),
+                    "configured-runtime".to_string(),
+                )),
+            "configured binding must not remain a control expectation"
+        );
         let replacement_identity = RuntimeIdentityMaterial::generate("configured-runtime").unwrap();
         let generic_put = scoped_put_runtime_trust_key(
             State(api.clone()),

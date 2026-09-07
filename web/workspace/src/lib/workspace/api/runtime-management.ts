@@ -1,6 +1,6 @@
 import type {
-  Diagnostic,
   CreateRemoteRuntimeRequest,
+  Diagnostic,
   PutRuntimeTrustKeyRequest,
   RevokeRuntimeTrustKeyRequest,
   RuntimeIdentityAuthority,
@@ -334,13 +334,18 @@ function runtimeBinding(
     authenticationMode === "legacy_server_issuer" &&
     (workspaceKeyId != null || workspaceKeyGeneration != null)
   ) {
-    return fail(path, "must not attach Workspace key metadata to legacy authority");
+    return fail(
+      path,
+      "must not attach Workspace key metadata to legacy authority",
+    );
   }
   return {
     state: enumValue(item.state, `${path}.state`, BINDING_STATES),
     authentication_mode: authenticationMode,
     revision: safeRevision(item.revision, `${path}.revision`),
-    ...(workspaceKeyId === undefined ? {} : { workspace_key_id: workspaceKeyId }),
+    ...(workspaceKeyId === undefined
+      ? {}
+      : { workspace_key_id: workspaceKeyId }),
     ...(workspaceKeyGeneration === undefined
       ? {}
       : { workspace_key_generation: workspaceKeyGeneration }),
@@ -713,6 +718,26 @@ function requestErrorFrom(
 ): RuntimeTrustRequestError {
   try {
     const response = object(value, "Runtime trust error");
+    if ("details" in response) {
+      exactKeys(
+        response,
+        ["error", "details"],
+        [],
+        "Runtime trust error",
+      );
+      boundedString(
+        response.error,
+        "Runtime trust error.error",
+        LIMITS.idBytes,
+      );
+      return new RuntimeTrustRequestError(
+        boundedString(
+          response.details,
+          "Runtime trust error.details",
+          LIMITS.conflictMessageBytes,
+        ),
+      );
+    }
     exactKeys(
       response,
       ["error", "message", "diagnostics"],

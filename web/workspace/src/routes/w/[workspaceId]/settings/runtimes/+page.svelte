@@ -7,6 +7,7 @@
   } from '$lib/generated/workspace-api';
   import {
     createRemoteRuntime,
+    previewRuntimePublicKeyFingerprint,
     RuntimeTrustRequestError,
   } from '$lib/workspace/api/runtime-management';
   import { testRuntimeConnection } from '$lib/workspace/api/runtime-connection';
@@ -19,6 +20,8 @@
   let runtimePublicBundle = $state('');
   let displayName = $state('');
   let endpoint = $state('');
+  let runtimeFingerprint = $state<string | null>(null);
+  let fingerprintConfirmation = $state('');
   let showAddRuntime = $state(false);
   let busyRuntimeId = $state<string | null>(null);
   let requestError = $state<string | null>(null);
@@ -82,12 +85,43 @@
       : '';
   }
 
+  async function copyWorkspaceBundle(): Promise<void> {
+    requestError = null;
+    try {
+      await navigator.clipboard.writeText(workspacePublicBundle());
+    } catch {
+      requestError = 'Workspace public bundle could not be copied';
+    }
+  }
+
+  async function previewRuntimeFingerprint(): Promise<void> {
+    requestError = null;
+    runtimeFingerprint = null;
+    fingerprintConfirmation = '';
+    busyRuntimeId = 'preview';
+    try {
+      const bundle = parseRuntimePublicBundle(runtimePublicBundle);
+      runtimeFingerprint = await previewRuntimePublicKeyFingerprint(bundle.public_key);
+    } catch (error) {
+      requestError = error instanceof Error ? error.message : String(error);
+    } finally {
+      busyRuntimeId = null;
+    }
+  }
+
   async function addRuntime(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     requestError = null;
     busyRuntimeId = 'create';
     try {
       const publicBundle = parseRuntimePublicBundle(runtimePublicBundle);
+      const currentFingerprint = await previewRuntimePublicKeyFingerprint(publicBundle.public_key);
+      if (
+        runtimeFingerprint !== currentFingerprint ||
+        fingerprintConfirmation.trim() !== currentFingerprint
+      ) {
+        throw new Error('Preview and confirm the exact Runtime public key fingerprint before registration');
+      }
       await createRemoteRuntime(data.workspaceId, {
         public_bundle: publicBundle,
         display_name: displayName || null,
@@ -95,6 +129,8 @@
         expected_revision: null,
       });
       runtimePublicBundle = '';
+      runtimeFingerprint = null;
+      fingerprintConfirmation = '';
       displayName = '';
       endpoint = '';
       showAddRuntime = false;
@@ -149,12 +185,31 @@
           <small>Run <code>yoi-runtime identity show --json</code> on the Runtime host and paste the result.</small>
           <textarea
             bind:value={runtimePublicBundle}
+            oninput={() => {
+              runtimeFingerprint = null;
+              fingerprintConfirmation = '';
+            }}
             required
             rows="5"
             spellcheck="false"
             placeholder={runtimeBundlePlaceholder}
           ></textarea>
+          <button type="button" disabled={busyRuntimeId !== null} onclick={previewRuntimeFingerprint}>
+            Preview fingerprint
+          </button>
         </label>
+        {#if runtimeFingerprint}
+          <label>
+            Runtime key fingerprint
+            <code>{runtimeFingerprint}</code>
+            <input
+              bind:value={fingerprintConfirmation}
+              required
+              autocomplete="off"
+              placeholder="Enter the fingerprint exactly"
+            />
+          </label>
+        {/if}
         <label>
           Display name
           <input bind:value={displayName} autocomplete="off" />
@@ -174,6 +229,7 @@
             It contains no private key material.
           </p>
           <pre>{workspacePublicBundle()}</pre>
+          <button type="button" onclick={copyWorkspaceBundle}>Copy Workspace public bundle</button>
           <pre>yoi-runtime trust-workspace add --bundle workspace-public-bundle.json</pre>
           <p>
             Runtime registration remains <code>configured</code> until authenticated verification is completed.
@@ -183,7 +239,10 @@
         {/if}
       </section>
       <div class="settings-action-row">
-        <button type="submit" disabled={busyRuntimeId !== null}>Add Runtime</button>
+        <button
+          type="submit"
+          disabled={busyRuntimeId !== null || !runtimeFingerprint || fingerprintConfirmation.trim() !== runtimeFingerprint}
+        >Add Runtime</button>
         <button type="button" disabled={busyRuntimeId !== null} onclick={() => showAddRuntime = false}>
           Cancel
         </button>

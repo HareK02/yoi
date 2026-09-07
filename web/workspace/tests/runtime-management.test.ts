@@ -3,6 +3,7 @@ declare const Deno: {
 };
 
 import {
+  createRemoteRuntime,
   parseRuntimeTrustConflict,
   parseRuntimeTrustKeyRevealResponse,
   parseWorkspaceRuntimeDetail,
@@ -310,4 +311,40 @@ Deno.test("typed trust conflict is validated and preserves authoritative revisio
       }),
     "request should serialize the generated bigint revision as a safe JSON integer",
   );
+});
+
+Deno.test("Runtime create surfaces bounded Settings error details", async () => {
+  const fetchImpl = (() =>
+    Promise.resolve(
+      new Response(
+        JSON.stringify({
+          error: "remote_runtime_endpoint_not_allowed",
+          details: "Runtime endpoint must use public https egress",
+        }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      ),
+    )) as typeof fetch;
+
+  try {
+    await createRemoteRuntime(
+      "workspace-a",
+      {
+        public_bundle: {
+          identity_id: "runtime-a",
+          public_key: "yoi-ed25519-pub:v1:test",
+        },
+        display_name: null,
+        endpoint: "https://runtime.example",
+        expected_revision: null,
+      },
+      fetchImpl,
+    );
+    throw new Error("expected create to reject");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    assert(
+      message === "Runtime endpoint must use public https egress",
+      `unexpected create error: ${message}`,
+    );
+  }
 });
