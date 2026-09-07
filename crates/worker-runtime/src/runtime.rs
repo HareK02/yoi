@@ -3408,6 +3408,25 @@ fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), R
     Ok(())
 }
 
+fn worker_execution_failure_code(result: &WorkerExecutionResult) -> &'static str {
+    let message = result.message.as_deref().unwrap_or_default();
+    if message.contains("timed out waiting for durable Worker Submit acceptance") {
+        "input_commit_timeout"
+    } else if message.contains("worker adapter task did not complete within") {
+        "adapter_task_timeout"
+    } else if message.contains("failed to send Worker method") {
+        "worker_method_send_failed"
+    } else if message.contains("worker rejected Submit") {
+        "worker_submit_rejected"
+    } else if message.contains("before durable acceptance") {
+        "worker_failed_before_input_commit"
+    } else if message.contains("event stream closed") {
+        "worker_event_stream_closed"
+    } else {
+        "worker_execution_failed"
+    }
+}
+
 fn runtime_worker_create_failure_fields(
     error: &RuntimeError,
 ) -> (&'static str, Option<String>, Option<String>) {
@@ -3453,6 +3472,12 @@ fn write_runtime_worker_create_failure(
     error: &RuntimeError,
 ) {
     let (error_kind, operation, outcome) = runtime_worker_create_failure_fields(error);
+    let execution_failure_code = match error {
+        RuntimeError::WorkerExecutionRejected { result, .. } => {
+            worker_execution_failure_code(result)
+        }
+        _ => "",
+    };
     tracing::error!(
         target: "yoi::worker_create",
         event = "worker_create_failed",
@@ -3462,6 +3487,7 @@ fn write_runtime_worker_create_failure(
         error_kind,
         operation = operation.as_deref().unwrap_or(""),
         outcome = outcome.as_deref().unwrap_or(""),
+        execution_failure_code,
         "Worker creation failed"
     );
 }
@@ -3597,6 +3623,14 @@ mod tests {
         assert_eq!(error_kind, "invalid_request");
         assert_eq!(operation, None);
         assert_eq!(outcome, None);
+        let timeout = WorkerExecutionResult::errored(
+            WorkerExecutionOperation::Input,
+            "timed out waiting for durable Worker Submit acceptance; private-token",
+        );
+        assert_eq!(
+            worker_execution_failure_code(&timeout),
+            "input_commit_timeout"
+        );
     }
 
     fn test_command() -> protocol::WorkerCommandEnvelope {

@@ -89,11 +89,12 @@ use worker::{
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
 const RUNTIME_TASK_TIMEOUT: Duration = Duration::from_secs(10);
+const SPAWN_RESTORE_TASK_TIMEOUT: Duration = Duration::from_secs(60);
+const USER_INPUT_TASK_TIMEOUT: Duration = Duration::from_secs(35);
 const WORKSPACE_CONFIG_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_WORKSPACE_CONFIG_RESPONSE_BYTES: usize = 72 * 1024 * 1024;
-// Keep this below the adapter task timeout so a failed acknowledgement task
-// returns a typed execution error instead of leaving the outer waiter to time out.
-const USER_INPUT_COMMIT_TIMEOUT: Duration = Duration::from_secs(9);
+// Leave adapter cancellation margin after the durable submission deadline.
+const USER_INPUT_COMMIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct RuntimeWorkerController {
     pub handle: WorkerHandle,
@@ -1244,7 +1245,7 @@ where
             working_directory_materializer: None,
             runtime: Mutex::new(Some(runtime)),
             workers: Mutex::new(HashMap::new()),
-            spawn_restore_timeout: RUNTIME_TASK_TIMEOUT,
+            spawn_restore_timeout: SPAWN_RESTORE_TASK_TIMEOUT,
         })
     }
 
@@ -1305,12 +1306,15 @@ where
         Self::wait_for_runtime_task(rx)
     }
 
-    fn run_spawn_restore_on_adapter_runtime<T, Fut>(&self, task: Fut) -> Result<T, String>
+    fn run_cancellable_on_adapter_runtime<T, Fut>(
+        &self,
+        timeout: Duration,
+        task: Fut,
+    ) -> Result<T, String>
     where
         T: Send + 'static,
         Fut: Future<Output = Result<T, String>> + Send + 'static,
     {
-        let timeout = self.spawn_restore_timeout;
         let (tx, rx) = mpsc::sync_channel(1);
         self.spawn_on_adapter_runtime(async move {
             let mut handle = tokio::spawn(task);
@@ -1406,7 +1410,7 @@ where
         submission_request_id: String,
     ) -> WorkerExecutionResult {
         let request_id = submission_request_id.clone();
-        self.run_on_adapter_runtime(async move {
+        self.run_cancellable_on_adapter_runtime(USER_INPUT_TASK_TIMEOUT, async move {
             // Subscribe before enqueueing so a fast durable acceptance cannot
             // race the Runtime acknowledgement.
             let mut events = worker.subscribe();
@@ -1797,9 +1801,10 @@ where
         let factory = self.factory.clone();
         let bridge_context = request.context.clone();
         let worker_ref = request.worker_ref.clone();
-        let spawn_result = self.run_spawn_restore_on_adapter_runtime(async move {
-            factory.spawn_controller(request).await
-        });
+        let spawn_result = self
+            .run_cancellable_on_adapter_runtime(self.spawn_restore_timeout, async move {
+                factory.spawn_controller(request).await
+            });
 
         let controller = match spawn_result {
             Ok(controller) => controller,
@@ -1901,9 +1906,10 @@ where
         let factory = self.factory.clone();
         let bridge_context = request.context.clone();
         let worker_ref = request.worker_ref.clone();
-        let restore_result = self.run_spawn_restore_on_adapter_runtime(async move {
-            factory.restore_controller(request).await
-        });
+        let restore_result = self
+            .run_cancellable_on_adapter_runtime(self.spawn_restore_timeout, async move {
+                factory.restore_controller(request).await
+            });
 
         let controller = match restore_result {
             Ok(controller) => controller,

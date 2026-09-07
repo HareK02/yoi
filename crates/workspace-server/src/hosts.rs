@@ -69,6 +69,9 @@ const EMBEDDED_HOST_KIND: &str = "embedded-worker-runtime-host";
 const REMOTE_HOST_KIND: &str = "remote-worker-runtime-host";
 const MAX_DIAGNOSTICS: usize = 16;
 const MAX_RUNTIME_PING_RESPONSE_BYTES: usize = 8 * 1024;
+// Runtime creation can spend up to 60s bootstrapping, 35s waiting for the
+// durable initial-input acknowledgement, and 5s confirming shutdown.
+const REMOTE_WORKER_CREATE_TIMEOUT: Duration = Duration::from_secs(105);
 const MAX_HOST_SCAN: usize = 256;
 const MAX_IDENTIFIER_LEN: usize = 120;
 const ID_DIGEST_HEX_LEN: usize = 16;
@@ -3769,7 +3772,13 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             workspace_api: Some(workspace_api),
             memory_settings: request.resolved_memory_settings.clone(),
         };
-        match self.post_json::<_, RuntimeHttpWorkerResponse>("/v1/workers", &create) {
+        match self.send_json::<RuntimeHttpWorkerResponse>(
+            "/v1/workers",
+            self.http
+                .post(self.endpoint("/v1/workers"))
+                .timeout(REMOTE_WORKER_CREATE_TIMEOUT)
+                .json(&create),
+        ) {
             Ok(response) => WorkerSpawnResult {
                 state: WorkerOperationState::Accepted,
                 worker: Some(self.map_worker_detail(response.worker)),
