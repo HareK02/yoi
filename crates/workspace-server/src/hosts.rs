@@ -14,6 +14,7 @@ use std::{
     error::Error as _,
     future::Future,
     io::Read as _,
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::PathBuf,
     pin::Pin,
     sync::{Arc, RwLock},
@@ -2850,6 +2851,7 @@ pub struct RemoteRuntimeConfig {
     pub base_url: String,
     pub bearer_token: Option<String>,
     pub auth: Option<RemoteRuntimeAuthConfig>,
+    pub strict_public_egress: bool,
     pub cached_worker_creation_available: bool,
     pub cached_os: String,
     pub cached_arch: String,
@@ -2874,6 +2876,7 @@ impl std::fmt::Debug for RemoteRuntimeConfig {
                 &self.bearer_token.as_ref().map(|_| "<redacted>"),
             )
             .field("auth", &self.auth.as_ref().map(|_| "<capability-signer>"))
+            .field("strict_public_egress", &self.strict_public_egress)
             .field(
                 "cached_worker_creation_available",
                 &self.cached_worker_creation_available,
@@ -2900,6 +2903,7 @@ impl RemoteRuntimeConfig {
             base_url: base_url.into(),
             bearer_token,
             auth: None,
+            strict_public_egress: false,
             cached_worker_creation_available: false,
             cached_os: "unknown".to_string(),
             cached_arch: "unknown".to_string(),
@@ -2915,6 +2919,11 @@ impl RemoteRuntimeConfig {
 
     pub fn with_auth(mut self, auth: RemoteRuntimeAuthConfig) -> Self {
         self.auth = Some(auth);
+        self
+    }
+
+    pub fn with_strict_public_egress(mut self, strict: bool) -> Self {
+        self.strict_public_egress = strict;
         self
     }
 
@@ -2972,6 +2981,78 @@ impl WorkdirHttpAuthorization for RemoteWorkdirAuthorization {
                 "remote Runtime does not have bearer authorization configured".to_string(),
             )
         })
+    }
+}
+
+fn resolve_strict_remote_runtime_endpoint(
+    endpoint: &str,
+) -> Result<(String, Vec<SocketAddr>), String> {
+    let endpoint =
+        Url::parse(endpoint).map_err(|_| "endpoint must be an absolute https URL".to_string())?;
+    if endpoint.scheme() != "https"
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(
+            "endpoint must be an https origin without credentials, query, or fragment".to_string(),
+        );
+    }
+    let host = endpoint.host_str().expect("checked above").to_string();
+    if host.eq_ignore_ascii_case("localhost")
+        || host.ends_with(".localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(is_disallowed_remote_runtime_address)
+    {
+        return Err("endpoint host is not public".to_string());
+    }
+    let port = endpoint.port_or_known_default().unwrap_or(443);
+    let addresses = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|_| "endpoint DNS resolution failed".to_string())?
+        .collect::<Vec<_>>();
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| is_disallowed_remote_runtime_address(address.ip()))
+    {
+        return Err("endpoint DNS resolution included a non-public address".to_string());
+    }
+    Ok((host, addresses))
+}
+
+pub(crate) fn is_disallowed_remote_runtime_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_unspecified()
+                || address.is_broadcast()
+                || address.is_documentation()
+                || address.is_multicast()
+                || octets[0] == 0
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+                || octets[0] >= 240
+        }
+        IpAddr::V6(address) => {
+            let segments = address.segments();
+            address.is_loopback()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || address.to_ipv4_mapped().is_some_and(|address| {
+                    is_disallowed_remote_runtime_address(IpAddr::V4(address))
+                })
+        }
     }
 }
 
@@ -3060,13 +3141,30 @@ impl RemoteWorkerRuntime {
     ) -> Result<Self, RuntimeRegistryError> {
         validate_backend_identifier("runtime_id", &config.runtime_id)?;
         let base_url = config.base_url.trim_end_matches('/').to_string();
+        let pinned_endpoint = if config.strict_public_egress {
+            Some(
+                resolve_strict_remote_runtime_endpoint(&base_url).map_err(|message| {
+                    RuntimeRegistryError::RuntimeOperationFailed {
+                        runtime_id: config.runtime_id.clone(),
+                        code: "remote_runtime_endpoint_not_allowed".to_string(),
+                        message,
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
         let timeout = config.timeout;
+        let blocking_resolution = pinned_endpoint.clone();
         let http = run_blocking_http(move || {
-            BlockingHttpClient::builder()
+            let mut builder = BlockingHttpClient::builder()
                 .timeout(timeout)
                 .redirect(reqwest::redirect::Policy::none())
-                .no_proxy()
-                .build()
+                .no_proxy();
+            if let Some((host, addresses)) = &blocking_resolution {
+                builder = builder.resolve_to_addrs(host, addresses);
+            }
+            builder.build()
         })
         .map_err(|err| RuntimeRegistryError::RuntimeOperationFailed {
             runtime_id: config.runtime_id.clone(),
@@ -3076,16 +3174,21 @@ impl RemoteWorkerRuntime {
         // Workdir command-output waits are bounded to 20 seconds by Runtime;
         // leave transport margin while retaining a finite client timeout.
         let workdir_timeout = timeout.max(Duration::from_secs(30));
-        let async_http = AsyncHttpClient::builder()
+        let mut async_builder = AsyncHttpClient::builder()
             .timeout(workdir_timeout)
             .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .build()
-            .map_err(|err| RuntimeRegistryError::RuntimeOperationFailed {
-                runtime_id: config.runtime_id.clone(),
-                code: "remote_runtime_async_client_build_failed".to_string(),
-                message: err.to_string(),
-            })?;
+            .no_proxy();
+        if let Some((host, addresses)) = &pinned_endpoint {
+            async_builder = async_builder.resolve_to_addrs(host, addresses);
+        }
+        let async_http =
+            async_builder
+                .build()
+                .map_err(|err| RuntimeRegistryError::RuntimeOperationFailed {
+                    runtime_id: config.runtime_id.clone(),
+                    code: "remote_runtime_async_client_build_failed".to_string(),
+                    message: err.to_string(),
+                })?;
         Ok(Self {
             host_id: host_id_for_remote_runtime(&config.runtime_id),
             runtime_id: config.runtime_id,
@@ -4771,6 +4874,43 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    #[test]
+    fn strict_remote_runtime_egress_rejects_disallowed_endpoint_before_client_use() {
+        let config = RemoteRuntimeConfig::new(
+            "runtime-private",
+            "Private Runtime",
+            "https://169.254.169.254/latest/meta-data",
+            None,
+        )
+        .with_strict_public_egress(true);
+        let error = match RemoteWorkerRuntime::new(
+            config,
+            "workspace-a".to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("disallowed endpoint unexpectedly produced a Runtime client"),
+        };
+        assert!(matches!(
+            error,
+            RuntimeRegistryError::RuntimeOperationFailed { code, .. }
+                if code == "remote_runtime_endpoint_not_allowed"
+        ));
+    }
+
+    #[test]
+    fn strict_remote_runtime_egress_accepts_and_pins_public_https_address() {
+        let config =
+            RemoteRuntimeConfig::new("runtime-public", "Public Runtime", "https://8.8.8.8", None)
+                .with_strict_public_egress(true);
+        RemoteWorkerRuntime::new(
+            config,
+            "workspace-a".to_string(),
+            "http://127.0.0.1:1".to_string(),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn remote_worker_create_timeout_covers_runtime_phase_budgets() {

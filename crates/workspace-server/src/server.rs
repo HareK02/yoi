@@ -128,7 +128,8 @@ use crate::hosts::{
     WorkerLifecycleRequest, WorkerLifecycleResult, WorkerOperationState, WorkerRestoreResult,
     WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult,
     WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerTicketAssignmentRequest,
-    WorkerWorkspaceSummary, worker_spawn_create_fingerprint, workspace_worker_summary,
+    WorkerWorkspaceSummary, is_disallowed_remote_runtime_address, worker_spawn_create_fingerprint,
+    workspace_worker_summary,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
@@ -11815,6 +11816,14 @@ async fn scoped_put_runtime_trust_key(
         .store
         .get_workspace_runtime_binding(&path.workspace_id, &path.runtime_id)
         .await?;
+    if existing.as_ref().is_some_and(|binding| {
+        binding.authentication_mode == StoredRuntimeAuthenticationMode::WorkspaceIdentity
+    }) {
+        return Err(settings_bad_request(
+            "workspace_identity_runtime_key_managed_by_binding",
+            "replace a Workspace identity Runtime public bundle through the Runtime registration operation with expected_revision",
+        ));
+    }
     let source = api
         .config
         .remote_runtime_sources
@@ -16025,7 +16034,7 @@ async fn validate_runtime_connection_request(
         || host.ends_with(".localhost")
         || host
             .parse::<IpAddr>()
-            .is_ok_and(is_disallowed_runtime_address)
+            .is_ok_and(is_disallowed_remote_runtime_address)
     {
         return Err(settings_bad_request(
             "remote_runtime_endpoint_not_allowed",
@@ -16054,7 +16063,7 @@ async fn validate_runtime_connection_request(
     if addresses.is_empty()
         || addresses
             .iter()
-            .any(|address| is_disallowed_runtime_address(address.ip()))
+            .any(|address| is_disallowed_remote_runtime_address(address.ip()))
     {
         return Err(settings_bad_request(
             "remote_runtime_endpoint_not_allowed",
@@ -16072,38 +16081,6 @@ async fn validate_runtime_connection_request(
         ));
     }
     Ok(endpoint)
-}
-
-fn is_disallowed_runtime_address(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => {
-            let octets = address.octets();
-            address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_unspecified()
-                || address.is_broadcast()
-                || address.is_documentation()
-                || address.is_multicast()
-                || octets[0] == 0
-                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
-                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
-                || octets[0] >= 240
-        }
-        IpAddr::V6(address) => {
-            let segments = address.segments();
-            address.is_loopback()
-                || address.is_unspecified()
-                || address.is_multicast()
-                || (segments[0] & 0xfe00) == 0xfc00
-                || (segments[0] & 0xffc0) == 0xfe80
-                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
-                || address
-                    .to_ipv4_mapped()
-                    .is_some_and(|address| is_disallowed_runtime_address(IpAddr::V4(address)))
-        }
-    }
 }
 
 fn validate_public_runtime_id(runtime_id: &str) -> ApiResult<()> {
@@ -16136,7 +16113,10 @@ fn remote_runtime_config_from_binding(
         binding.base_url.clone(),
         None,
     )
-    .with_workspace_id(binding.workspace_id.clone());
+    .with_workspace_id(binding.workspace_id.clone())
+    .with_strict_public_egress(
+        binding.authentication_mode == StoredRuntimeAuthenticationMode::WorkspaceIdentity,
+    );
     Ok(remote)
 }
 
@@ -18270,6 +18250,7 @@ mod tests {
                 server_id: "server-test".to_owned(),
                 server_private_key: "unused".to_owned(),
             }),
+            strict_public_egress: false,
             cached_worker_creation_available: true,
             cached_os: "test".to_owned(),
             cached_arch: "test".to_owned(),
@@ -20008,6 +19989,25 @@ mod tests {
         assert!(binding.workspace_key_id.is_some());
         assert_eq!(binding.workspace_key_generation, Some(1));
         assert!(!created.runtime.worker_creation_available);
+        let replacement_identity = RuntimeIdentityMaterial::generate("configured-runtime").unwrap();
+        let generic_put = scoped_put_runtime_trust_key(
+            State(api.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id: api.config.workspace_id.clone(),
+                runtime_id: "configured-runtime".to_string(),
+            }),
+            Extension(actor.clone()),
+            Json(PutRuntimeTrustKeyRequest {
+                public_key: replacement_identity.public_key,
+                expected_revision: Some(1),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            generic_put.into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
         let configured_test = scoped_test_runtime_connection(
             State(api.clone()),
             AxumPath(ScopedRuntimePath {
@@ -24783,6 +24783,7 @@ mod tests {
                 server_id: "server-main".to_string(),
                 server_private_key: identity.private_key.clone(),
             }),
+            strict_public_egress: false,
             cached_worker_creation_available: true,
             cached_os: "test".to_string(),
             cached_arch: "test".to_string(),
@@ -26309,6 +26310,7 @@ mod tests {
                     base_url: endpoint,
                     bearer_token: Some("test-connection-token".to_string()),
                     auth: None,
+                    strict_public_egress: false,
                     cached_worker_creation_available: true,
                     cached_os: "linux".to_string(),
                     cached_arch: "x86_64".to_string(),

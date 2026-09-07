@@ -6,6 +6,7 @@
     RuntimeTrustKeyStatus,
   } from '$lib/generated/workspace-api';
   import {
+    createRemoteRuntime,
     previewRuntimePublicKeyFingerprint,
     putRuntimeTrustKey,
     revealRuntimeTrustKey,
@@ -152,7 +153,23 @@
     const operation = routeFence.capture(data.runtimeId);
     busyAction = 'save';
     try {
-      await putRuntimeTrustKey(data.workspaceId, operation.runtimeId, request);
+      const binding = data.runtimeDetail.runtime.management.binding;
+      if (binding?.authentication_mode === 'workspace_identity') {
+        if (!data.runtimeDetail.endpoint) {
+          throw new RuntimeTrustRequestError('The authoritative Runtime endpoint is unavailable.');
+        }
+        await createRemoteRuntime(data.workspaceId, {
+          public_bundle: {
+            identity_id: operation.runtimeId,
+            public_key: key,
+          },
+          display_name: data.runtimeDetail.runtime.label,
+          endpoint: data.runtimeDetail.endpoint,
+          expected_revision: binding.revision,
+        });
+      } else {
+        await putRuntimeTrustKey(data.workspaceId, operation.runtimeId, request);
+      }
       if (!isCurrentRoute(operation)) return;
       publicKey = '';
       fingerprintConfirmation = '';

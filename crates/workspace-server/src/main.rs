@@ -646,6 +646,7 @@ fn append_workspace_runtime_sources(
                         .into_iter()
                         .filter(|binding| {
                             binding.runtime_id != yoi_workspace_server::hosts::EMBEDDED_RUNTIME_ID
+                                && binding.state == WorkspaceRuntimeBindingState::Verified
                         })
                         .collect::<Vec<_>>()
                 })
@@ -674,7 +675,10 @@ fn append_workspace_runtime_sources(
             None,
         )
         .with_workspace_id(runtime.workspace_id.clone())
-        .with_auth(auth);
+        .with_auth(auth)
+        .with_strict_public_egress(
+            runtime.authentication_mode == WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity,
+        );
         remote_runtime_sources.retain(|existing| {
             existing.workspace_id.as_deref() != Some(runtime.workspace_id.as_str())
                 || existing.runtime_id != runtime.runtime_id
