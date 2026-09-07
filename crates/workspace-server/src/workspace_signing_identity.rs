@@ -451,14 +451,19 @@ impl WorkspaceSigningMaterialStore for FsWorkspaceSigningMaterialStore {
                 .and_then(|()| file.sync_all())
                 .map_err(|error| material_io_error("write", error))?;
             match fs::hard_link(&temporary, &path) {
-                Ok(()) => Ok(()),
+                Ok(()) => sync_directory(parent),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
                 Err(error) => Err(material_io_error("publish", error)),
             }
         })();
         bytes.zeroize();
-        let _ = fs::remove_file(&temporary);
+        let cleanup_result = match fs::remove_file(&temporary) {
+            Ok(()) => sync_directory(parent),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(material_io_error("remove temporary", error)),
+        };
         write_result?;
+        cleanup_result?;
         self.load(material_ref)?.ok_or_else(|| {
             identity_error(
                 "workspace_signing_identity_material_missing",
@@ -469,8 +474,16 @@ impl WorkspaceSigningMaterialStore for FsWorkspaceSigningMaterialStore {
 
     fn delete(&self, material_ref: &str) -> Result<()> {
         let path = self.material_path(material_ref)?;
-        match fs::remove_file(path) {
-            Ok(()) => Ok(()),
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                let parent = path.parent().ok_or_else(|| {
+                    identity_error(
+                        "workspace_signing_identity_material_ref_invalid",
+                        "Workspace signing private material reference has no parent",
+                    )
+                })?;
+                sync_directory(parent)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(material_io_error("delete", error)),
         }
@@ -479,6 +492,9 @@ impl WorkspaceSigningMaterialStore for FsWorkspaceSigningMaterialStore {
 
 fn ensure_private_tree(root: &Path, leaf: &Path) -> Result<()> {
     ensure_private_directory(root)?;
+    if let Some(parent) = root.parent() {
+        sync_directory(parent)?;
+    }
     let relative = leaf.strip_prefix(root).map_err(|_| {
         identity_error(
             "workspace_signing_identity_material_ref_invalid",
@@ -487,10 +503,27 @@ fn ensure_private_tree(root: &Path, leaf: &Path) -> Result<()> {
     })?;
     let mut current = root.to_path_buf();
     for component in relative.components() {
+        let parent = current.clone();
         current.push(component);
         ensure_private_directory(&current)?;
+        sync_directory(&parent)?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| material_io_error("synchronize directory", error))
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Err(identity_error(
+        "workspace_signing_identity_durable_publish_unsupported",
+        "Workspace signing private material durable publication is unsupported on this platform",
+    ))
 }
 
 fn ensure_private_directory(path: &Path) -> Result<()> {
@@ -548,14 +581,46 @@ pub fn identity_error(code: impl Into<String>, message: impl Into<String>) -> Er
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+
+    struct FailFirstMaterialWrite {
+        inner: Arc<InMemoryWorkspaceSigningMaterialStore>,
+        fail: AtomicBool,
+    }
+
+    impl WorkspaceSigningMaterialStore for FailFirstMaterialWrite {
+        fn load(&self, material_ref: &str) -> Result<Option<WorkspaceSigningPrivateMaterial>> {
+            self.inner.load(material_ref)
+        }
+
+        fn put_if_absent(
+            &self,
+            material_ref: &str,
+            material: &WorkspaceSigningPrivateMaterial,
+        ) -> Result<WorkspaceSigningPrivateMaterial> {
+            if self.fail.swap(false, Ordering::SeqCst) {
+                return Err(identity_error(
+                    "workspace_signing_identity_material_io_failed",
+                    "injected private material write failure",
+                ));
+            }
+            self.inner.put_if_absent(material_ref, material)
+        }
+
+        fn delete(&self, material_ref: &str) -> Result<()> {
+            self.inner.delete(material_ref)
+        }
+    }
 
     #[tokio::test]
     async fn existing_workspace_provisioning_is_audited_idempotent_and_fails_closed_when_missing() {
         use crate::store::{AccountRecord, SqliteWorkspaceStore, WorkspaceRecord};
 
         let temp = tempfile::tempdir().unwrap();
-        let store = Arc::new(SqliteWorkspaceStore::open(&temp.path().join("server.db")).unwrap());
+        let database_path = temp.path().join("server.db");
+        let store = Arc::new(SqliteWorkspaceStore::open(&database_path).unwrap());
         store
             .upsert_account(&AccountRecord {
                 account_id: "account-1".to_string(),
@@ -578,12 +643,38 @@ mod tests {
             .await
             .unwrap();
         let materials = Arc::new(InMemoryWorkspaceSigningMaterialStore::default());
-        let service = WorkspaceSigningIdentityService::new(store.clone(), materials.clone());
+        let failing_service = WorkspaceSigningIdentityService::new(
+            store.clone(),
+            Arc::new(FailFirstMaterialWrite {
+                inner: materials.clone(),
+                fail: AtomicBool::new(true),
+            }),
+        );
         assert_eq!(
-            service.get_validated("workspace-1").unwrap().state,
+            failing_service.get_validated("workspace-1").unwrap().state,
+            "pending_provisioning"
+        );
+        let error = failing_service
+            .provision_existing("workspace-1", "account-1")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::WorkspaceSigningIdentity { ref code, .. }
+                if code == "workspace_signing_identity_material_io_failed"
+        ));
+        assert_eq!(
+            store
+                .get_workspace_signing_identity("workspace-1")
+                .unwrap()
+                .unwrap()
+                .state,
             "pending_provisioning"
         );
 
+        drop(failing_service);
+        drop(store);
+        let store = Arc::new(SqliteWorkspaceStore::open(&database_path).unwrap());
+        let service = WorkspaceSigningIdentityService::new(store.clone(), materials.clone());
         let provisioned = service
             .provision_existing("workspace-1", "account-1")
             .unwrap();
@@ -617,8 +708,91 @@ mod tests {
             })
             .unwrap();
 
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "workspace-2".to_string(),
+                owner_account_id: "account-1".to_string(),
+                display_name: "Workspace 2".to_string(),
+                state: "active".to_string(),
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .await
+            .unwrap();
+        let pending = store
+            .get_workspace_signing_identity("workspace-2")
+            .unwrap()
+            .unwrap();
+        let operation = store
+            .reserve_workspace_signing_identity_provisioning(
+                &WorkspaceSigningIdentityProvisioningOperation {
+                    operation_key: "existing-workspace:workspace-2:revision-1".to_string(),
+                    request_fingerprint: provisioning_fingerprint(
+                        "workspace-2",
+                        &pending.key_id,
+                        pending.revision,
+                    ),
+                    operation_kind: "existing_workspace".to_string(),
+                    workspace_id: "workspace-2".to_string(),
+                    key_id: pending.key_id.clone(),
+                    private_material_ref: pending.private_material_ref.clone(),
+                    revision: pending.revision,
+                    actor_account_id: "account-1".to_string(),
+                    state: "pending".to_string(),
+                    created_at: "1".to_string(),
+                    completed_at: None,
+                },
+            )
+            .unwrap();
+        let activation = service.prepare_material(&operation).unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"CREATE TRIGGER fail_workspace_signing_identity_audit
+                       BEFORE INSERT ON workspace_signing_identity_audit
+                       BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END;"#,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            store
+                .activate_workspace_signing_identity(
+                    &activation,
+                    &operation.operation_key,
+                    "account-1",
+                )
+                .is_err()
+        );
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER fail_workspace_signing_identity_audit;")?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .get_workspace_signing_identity("workspace-2")
+                .unwrap()
+                .unwrap()
+                .state,
+            "pending_provisioning"
+        );
+        drop(service);
+        drop(store);
+        let store = Arc::new(SqliteWorkspaceStore::open(&database_path).unwrap());
+        let restarted = WorkspaceSigningIdentityService::new(store.clone(), materials.clone());
+        let recovered = restarted
+            .provision_existing("workspace-2", "account-1")
+            .unwrap();
+        assert_eq!(recovered.key_id, activation.key_id);
+        assert_eq!(
+            recovered.public_key_fingerprint.as_deref(),
+            Some(activation.public_key_fingerprint.as_str())
+        );
+
         materials.delete(&provisioned.private_material_ref).unwrap();
-        let error = service.get_validated("workspace-1").unwrap_err();
+        let error = restarted.get_validated("workspace-1").unwrap_err();
         assert!(matches!(
             error,
             Error::WorkspaceSigningIdentity { ref code, .. }
