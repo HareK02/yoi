@@ -607,6 +607,64 @@ pub struct WorkspaceMetadataMutationResponse {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Lifecycle state for a Workspace-scoped Ed25519 signing identity.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSigningIdentityState {
+    PendingProvisioning,
+    Active,
+}
+
+/// Public metadata for a Workspace signing identity. Private material and its
+/// storage reference are deliberately not part of this wire authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceSigningIdentityPublic {
+    pub workspace_id: String,
+    pub key_id: String,
+    pub algorithm: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub public_key_fingerprint: Option<String>,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub revision: u64,
+    pub state: WorkspaceSigningIdentityState,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub provisioned_at: Option<String>,
+}
+
+/// Copyable public trust bundle consumed by future Runtime enrollment work.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspacePublicIdentityBundle {
+    pub workspace_id: String,
+    pub backend_url: String,
+    pub key_id: String,
+    pub algorithm: String,
+    pub public_key: String,
+    pub public_key_fingerprint: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceSigningIdentityResponse {
+    pub identity: WorkspaceSigningIdentityPublic,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub public_bundle: Option<WorkspacePublicIdentityBundle>,
+}
+
 pub const WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES: usize = 128;
 pub const WORKSPACE_DELETION_MAX_REVISION_BYTES: usize = 128;
 pub const WORKSPACE_DELETION_MAX_CONFIRMATION_BYTES: usize = 256;
@@ -2848,6 +2906,10 @@ pub fn catalog_typescript() -> String {
         WorkspaceMetadataSettingsResponse::decl(&config),
         UpdateWorkspaceMetadataRequest::decl(&config),
         WorkspaceMetadataMutationResponse::decl(&config),
+        WorkspaceSigningIdentityState::decl(&config),
+        WorkspaceSigningIdentityPublic::decl(&config),
+        WorkspacePublicIdentityBundle::decl(&config),
+        WorkspaceSigningIdentityResponse::decl(&config),
         ProfileSettingsResponse::decl(&config),
         WorkspaceProfileSummary::decl(&config),
         WorkspaceProfileSourceSummary::decl(&config),
@@ -3874,6 +3936,45 @@ mod tests {
         assert_eq!(
             serde_json::to_value(decoded).unwrap(),
             absent_optional_fields
+        );
+    }
+
+    #[test]
+    fn workspace_signing_identity_wire_contract_omits_private_and_pending_fields() {
+        let response = WorkspaceSigningIdentityResponse {
+            identity: WorkspaceSigningIdentityPublic {
+                workspace_id: "workspace-test".to_string(),
+                key_id: "WK-test".to_string(),
+                algorithm: "ed25519".to_string(),
+                public_key: None,
+                public_key_fingerprint: None,
+                revision: 1,
+                state: WorkspaceSigningIdentityState::PendingProvisioning,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                provisioned_at: None,
+            },
+            public_bundle: None,
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "identity": {
+                    "workspace_id": "workspace-test",
+                    "key_id": "WK-test",
+                    "algorithm": "ed25519",
+                    "revision": 1,
+                    "state": "pending_provisioning",
+                    "created_at": "2026-01-01T00:00:00Z"
+                }
+            })
+        );
+        assert!(
+            serde_json::from_value::<WorkspaceSigningIdentityResponse>(serde_json::json!({
+                "identity": encoded["identity"].clone(),
+                "private_material_ref": "must-not-cross-the-wire"
+            }))
+            .is_err()
         );
     }
 

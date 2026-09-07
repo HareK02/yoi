@@ -11,6 +11,9 @@ use crate::repository_source::{parse_repository_source, repository_source_finger
 use crate::store::{
     ControlPlaneStore, RepositoryRecord, WorkspaceBootstrapRecord, WorkspaceRecord,
 };
+use crate::workspace_signing_identity::{
+    WorkspaceSigningIdentityService, WorkspaceSigningMaterialStore,
+};
 use crate::{Error, Result};
 
 const MAX_DISPLAY_NAME_BYTES: usize = 200;
@@ -45,11 +48,21 @@ pub struct WorkspaceCreateResult {
 #[derive(Clone)]
 pub struct WorkspaceCatalogService {
     store: Arc<dyn ControlPlaneStore>,
+    signing_identities: WorkspaceSigningIdentityService,
 }
 
 impl WorkspaceCatalogService {
-    pub fn new(store: Arc<dyn ControlPlaneStore>) -> Self {
-        Self { store }
+    pub fn new(
+        store: Arc<dyn ControlPlaneStore>,
+        signing_materials: Arc<dyn WorkspaceSigningMaterialStore>,
+    ) -> Self {
+        Self {
+            signing_identities: WorkspaceSigningIdentityService::new(
+                store.clone(),
+                signing_materials,
+            ),
+            store,
+        }
     }
 
     pub fn is_empty(&self) -> Result<bool> {
@@ -118,7 +131,7 @@ impl WorkspaceCatalogService {
                     .map_err(|_| Error::InvalidInput("workspace_id must be a UUID".to_string()))
             })
             .transpose()?;
-        let workspace_id = requested_workspace_id
+        let proposed_workspace_id = requested_workspace_id
             .clone()
             .unwrap_or_else(|| Uuid::now_v7().to_string());
         let fingerprint = workspace_create_fingerprint(
@@ -130,9 +143,16 @@ impl WorkspaceCatalogService {
             &default_ref,
         );
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-        let result = self
-            .store
-            .create_workspace_bootstrap(&WorkspaceBootstrapRecord {
+        let (signing_identity, identity_provisioning_operation_key) =
+            self.signing_identities.prepare_workspace_creation(
+                &operation_key,
+                &fingerprint,
+                &proposed_workspace_id,
+                &owner_account_id,
+            )?;
+        let workspace_id = signing_identity.workspace_id.clone();
+        let result = self.store.create_workspace_bootstrap(
+            &WorkspaceBootstrapRecord {
                 operation_key,
                 request_fingerprint: fingerprint.clone(),
                 workspace: WorkspaceRecord {
@@ -158,7 +178,10 @@ impl WorkspaceCatalogService {
                     created_at: now.clone(),
                     updated_at: now,
                 },
-            })?;
+            },
+            &signing_identity,
+            &identity_provisioning_operation_key,
+        )?;
         Ok(WorkspaceCreateResult {
             workspace: result.workspace,
             repository: result.repository,
@@ -243,7 +266,12 @@ mod tests {
     #[tokio::test]
     async fn create_is_atomic_and_exact_retries_converge() {
         let store = Arc::new(SqliteWorkspaceStore::in_memory().unwrap());
-        let service = WorkspaceCatalogService::new(store.clone());
+        let service = WorkspaceCatalogService::new(
+            store.clone(),
+            Arc::new(
+                crate::workspace_signing_identity::InMemoryWorkspaceSigningMaterialStore::default(),
+            ),
+        );
         let repository = git_repository();
         let request = WorkspaceCreateRequest {
             operation_key: "request-1".to_string(),
@@ -268,6 +296,14 @@ mod tests {
             replayed.workspace.workspace_id
         );
         assert_eq!(store.list_workspaces().unwrap().len(), 1);
+        let signing_identity = store
+            .get_workspace_signing_identity(&created.workspace.workspace_id)
+            .unwrap()
+            .expect("new Workspace signing identity");
+        assert_eq!(signing_identity.state, "active");
+        assert_eq!(signing_identity.algorithm, "ed25519");
+        assert!(signing_identity.public_key.is_some());
+        assert!(signing_identity.public_key_fingerprint.is_some());
         assert_eq!(
             store
                 .list_repositories(&created.workspace.workspace_id)
@@ -287,7 +323,12 @@ mod tests {
     async fn idempotency_key_reuse_with_different_payload_is_rejected() {
         let store = Arc::new(SqliteWorkspaceStore::in_memory().unwrap());
         let owner_account_id = owner_account(store.as_ref());
-        let service = WorkspaceCatalogService::new(store);
+        let service = WorkspaceCatalogService::new(
+            store,
+            Arc::new(
+                crate::workspace_signing_identity::InMemoryWorkspaceSigningMaterialStore::default(),
+            ),
+        );
         let repository = git_repository();
         let mut request = WorkspaceCreateRequest {
             operation_key: "request-1".to_string(),
@@ -338,7 +379,12 @@ mod tests {
                 updated_at: "2026-07-03T00:00:00Z".to_string(),
             })
             .unwrap();
-        let service = WorkspaceCatalogService::new(store);
+        let service = WorkspaceCatalogService::new(
+            store,
+            Arc::new(
+                crate::workspace_signing_identity::InMemoryWorkspaceSigningMaterialStore::default(),
+            ),
+        );
         let repository = git_repository();
         let error = service
             .create(
@@ -373,7 +419,12 @@ mod tests {
                 updated_at: "2026-07-03T00:00:00Z".to_string(),
             })
             .unwrap();
-        let service = WorkspaceCatalogService::new(store);
+        let service = WorkspaceCatalogService::new(
+            store,
+            Arc::new(
+                crate::workspace_signing_identity::InMemoryWorkspaceSigningMaterialStore::default(),
+            ),
+        );
         let repository_a = git_repository();
         let repository_b = git_repository();
         let created_a = service
@@ -425,7 +476,12 @@ mod tests {
     fn remote_repository_creation_persists_typed_source_without_auth_metadata() {
         let store = Arc::new(SqliteWorkspaceStore::in_memory().unwrap());
         let owner_account_id = owner_account(store.as_ref());
-        let service = WorkspaceCatalogService::new(store.clone());
+        let service = WorkspaceCatalogService::new(
+            store.clone(),
+            Arc::new(
+                crate::workspace_signing_identity::InMemoryWorkspaceSigningMaterialStore::default(),
+            ),
+        );
         let result = service
             .create(
                 WorkspaceCreateRequest {

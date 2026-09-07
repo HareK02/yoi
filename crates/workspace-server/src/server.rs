@@ -93,9 +93,11 @@ use workspace_api::{
     WorkspaceDeletionBlockerKind, WorkspaceDeletionOperationResponse,
     WorkspaceDeletionPreflightResponse, WorkspaceDeletionRequest, WorkspaceDeletionState,
     WorkspaceExtensionPointState, WorkspaceExtensionPoints, WorkspaceMetadataMutationResponse,
-    WorkspaceMetadataSettingsResponse, WorkspacePermissionSummary, WorkspaceRepositoryRecord,
-    WorkspaceResponse, WorkspaceRuntimeDetail, WorkspaceRuntimeResource, WorkspaceSummary,
-    WorkspaceWorkerDiscoveryItem, WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
+    WorkspaceMetadataSettingsResponse, WorkspacePermissionSummary, WorkspacePublicIdentityBundle,
+    WorkspaceRepositoryRecord, WorkspaceResponse, WorkspaceRuntimeDetail, WorkspaceRuntimeResource,
+    WorkspaceSigningIdentityPublic, WorkspaceSigningIdentityResponse,
+    WorkspaceSigningIdentityState, WorkspaceSummary, WorkspaceWorkerDiscoveryItem,
+    WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
 };
 
 use crate::auth::{
@@ -165,6 +167,10 @@ use crate::workdir_removal::{
 };
 use crate::workspace_catalog::{WorkspaceCatalogService, WorkspaceCreateRequest};
 use crate::workspace_deletion::WorkspaceDeletionStore;
+use crate::workspace_signing_identity::{
+    FsWorkspaceSigningMaterialStore, WorkspaceSigningIdentityService,
+    WorkspaceSigningMaterialStore, workspace_signing_material_root,
+};
 use crate::{Error, Result};
 use worker_runtime::catalog::{
     ConfigBundleRef, ProfileSelector, RepositoryMaterializationContext, RepositoryRefObservation,
@@ -583,6 +589,7 @@ pub struct WorkspaceApi {
     pub(crate) store: Arc<dyn ControlPlaneStore>,
     config_store: Arc<crate::SqliteWorkspaceStore>,
     repository_secrets: Arc<RepositorySecretService>,
+    signing_identities: WorkspaceSigningIdentityService,
     config_schema_registry: crate::config_source::WorkspaceConfigSchemaRegistry,
     prompt_projection_cache: crate::prompt_settings::WorkspacePromptProjectionCache,
     authority: SqliteWorkspaceAuthority,
@@ -1025,6 +1032,7 @@ pub struct WorkspaceServerApi {
     template: Arc<ServerConfig>,
     store: Arc<dyn ControlPlaneStore>,
     catalog: WorkspaceCatalogService,
+    signing_materials: Arc<dyn WorkspaceSigningMaterialStore>,
     routers: Arc<AsyncMutex<HashMap<String, Router>>>,
     apis: Arc<AsyncMutex<HashMap<String, WorkspaceApi>>>,
     mutation_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
@@ -1045,9 +1053,14 @@ async fn workspace_mutation_lock(
 
 impl WorkspaceServerApi {
     pub fn new(template: ServerConfig, store: Arc<dyn ControlPlaneStore>) -> Self {
+        let signing_materials: Arc<dyn WorkspaceSigningMaterialStore> =
+            Arc::new(FsWorkspaceSigningMaterialStore::new(
+                workspace_signing_material_root(&template.database_path),
+            ));
         Self {
             template: Arc::new(template),
-            catalog: WorkspaceCatalogService::new(store.clone()),
+            catalog: WorkspaceCatalogService::new(store.clone(), signing_materials.clone()),
+            signing_materials,
             store,
             routers: Arc::new(AsyncMutex::new(HashMap::new())),
             apis: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -1281,6 +1294,8 @@ impl WorkspaceServerApi {
                 None,
             );
         }
+        WorkspaceSigningIdentityService::new(self.store.clone(), self.signing_materials.clone())
+            .delete_material(&operation.workspace_id)?;
         let completed = self.store.finalize_workspace_deletion(operation_id)?;
         self.routers.lock().await.remove(&completed.workspace_id);
         if let Some(handle) = self
@@ -2220,6 +2235,13 @@ impl WorkspaceApi {
             config_store.clone(),
             &config.database_path,
         )?);
+        let signing_materials: Arc<dyn WorkspaceSigningMaterialStore> =
+            Arc::new(FsWorkspaceSigningMaterialStore::new(
+                workspace_signing_material_root(&config.database_path),
+            ));
+        let signing_identities =
+            WorkspaceSigningIdentityService::new(store.clone(), signing_materials);
+        signing_identities.get_validated(&config.workspace_id)?;
         let config_schema_registry = crate::config_source::WorkspaceConfigSchemaRegistry::default()
             .with_provider(Arc::new(
                 crate::profile_settings::ProfileConfigSchemaProvider,
@@ -2236,6 +2258,7 @@ impl WorkspaceApi {
         let api = Self {
             config_store,
             repository_secrets,
+            signing_identities,
             config_schema_registry,
             prompt_projection_cache:
                 crate::prompt_settings::WorkspacePromptProjectionCache::default(),
@@ -2800,6 +2823,14 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/settings/workspace",
             get(scoped_get_workspace_settings).put(scoped_update_workspace_settings),
+        )
+        .route(
+            "/api/w/{workspace_id}/settings/workspace/signing-identity",
+            get(scoped_get_workspace_signing_identity),
+        )
+        .route(
+            "/api/w/{workspace_id}/settings/workspace/signing-identity/provision",
+            post(scoped_provision_workspace_signing_identity),
         )
         .route(
             "/api/w/{workspace_id}/settings/memory",
@@ -3950,6 +3981,107 @@ async fn scoped_update_workspace_settings(
             message: "Workspace display metadata was updated.".to_string(),
         }],
     }))
+}
+
+async fn scoped_get_workspace_signing_identity(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Extension(actor): Extension<RequestActor>,
+) -> ApiResult<Json<WorkspaceSigningIdentityResponse>> {
+    require_workspace_owner(
+        &api,
+        &path.workspace_id,
+        &actor,
+        "Workspace public identity access",
+    )
+    .await?;
+    let identity = api.signing_identities.get_validated(&path.workspace_id)?;
+    Ok(Json(project_workspace_signing_identity(&api, identity)?))
+}
+
+async fn scoped_provision_workspace_signing_identity(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Extension(actor): Extension<RequestActor>,
+) -> ApiResult<Json<WorkspaceSigningIdentityResponse>> {
+    require_workspace_owner(
+        &api,
+        &path.workspace_id,
+        &actor,
+        "Workspace signing identity provisioning",
+    )
+    .await?;
+    let identity = api
+        .signing_identities
+        .provision_existing(&path.workspace_id, &actor.account_id)?;
+    Ok(Json(project_workspace_signing_identity(&api, identity)?))
+}
+
+fn project_workspace_signing_identity(
+    api: &WorkspaceApi,
+    identity: crate::store::WorkspaceSigningIdentityRecord,
+) -> Result<WorkspaceSigningIdentityResponse> {
+    let state = match identity.state.as_str() {
+        "pending_provisioning" => WorkspaceSigningIdentityState::PendingProvisioning,
+        "active" => WorkspaceSigningIdentityState::Active,
+        _ => {
+            return Err(crate::workspace_signing_identity::identity_error(
+                "workspace_signing_identity_state_invalid",
+                "Workspace signing identity state is invalid",
+            ));
+        }
+    };
+    let public_bundle = if state == WorkspaceSigningIdentityState::Active {
+        let public_key = identity.public_key.clone().ok_or_else(|| {
+            crate::workspace_signing_identity::identity_error(
+                "workspace_signing_identity_metadata_corrupt",
+                "Active Workspace signing identity has no public key",
+            )
+        })?;
+        let public_key_fingerprint = identity.public_key_fingerprint.clone().ok_or_else(|| {
+            crate::workspace_signing_identity::identity_error(
+                "workspace_signing_identity_metadata_corrupt",
+                "Active Workspace signing identity has no public key fingerprint",
+            )
+        })?;
+        let backend_url = api
+            .config
+            .backend_base_url
+            .as_deref()
+            .ok_or_else(|| {
+                crate::workspace_signing_identity::identity_error(
+                    "workspace_signing_identity_backend_url_unavailable",
+                    "Backend public URL is unavailable for the Workspace identity bundle",
+                )
+            })?
+            .trim_end_matches('/')
+            .to_string();
+        Some(WorkspacePublicIdentityBundle {
+            workspace_id: identity.workspace_id.clone(),
+            backend_url,
+            key_id: identity.key_id.clone(),
+            algorithm: identity.algorithm.clone(),
+            public_key,
+            public_key_fingerprint,
+            revision: identity.revision,
+        })
+    } else {
+        None
+    };
+    Ok(WorkspaceSigningIdentityResponse {
+        identity: WorkspaceSigningIdentityPublic {
+            workspace_id: identity.workspace_id,
+            key_id: identity.key_id,
+            algorithm: identity.algorithm,
+            public_key: identity.public_key,
+            public_key_fingerprint: identity.public_key_fingerprint,
+            revision: identity.revision,
+            state,
+            created_at: identity.created_at,
+            provisioned_at: identity.provisioned_at,
+        },
+        public_bundle,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -16895,6 +17027,11 @@ impl From<Error> for ApiError {
                 severity: DiagnosticSeverity::Error,
                 message: sanitize_backend_error(message),
             }],
+            Error::WorkspaceSigningIdentity { code, message } => vec![RuntimeDiagnostic {
+                code: code.clone(),
+                severity: DiagnosticSeverity::Error,
+                message: sanitize_backend_error(message),
+            }],
             Error::Ticket(ticket_error) => vec![RuntimeDiagnostic {
                 code: match ticket_error {
                     ticket::TicketError::NotFound(_) => "ticket_not_found",
@@ -17051,6 +17188,7 @@ impl IntoResponse for ApiError {
             {
                 StatusCode::SERVICE_UNAVAILABLE
             }
+            Error::WorkspaceSigningIdentity { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Error::RuntimeOperationFailed { .. } => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -19806,7 +19944,8 @@ mod tests {
     #[tokio::test]
     async fn workspace_server_router_requires_identity_for_scoped_rest() {
         let temp = tempfile::tempdir().unwrap();
-        let config = test_server_config(temp.path());
+        let mut config = test_server_config(temp.path());
+        config.backend_base_url = Some("https://backend.example.test".to_string());
         let AuthConfig::Passkey {
             origin: expected_origin,
             ..
@@ -19823,7 +19962,12 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".to_owned(),
             })
             .unwrap();
-        let catalog = WorkspaceCatalogService::new(store.clone());
+        let catalog = WorkspaceCatalogService::new(
+            store.clone(),
+            Arc::new(FsWorkspaceSigningMaterialStore::new(
+                workspace_signing_material_root(&config.database_path),
+            )),
+        );
         let repository = temp.path().join("repository");
         std::fs::create_dir_all(&repository).unwrap();
         assert!(
@@ -19881,7 +20025,10 @@ mod tests {
             })
             .unwrap();
         let non_owner_token = seed_test_api_token(store.as_ref(), "repository-access-non-owner");
-        let app = build_workspace_server_router(config, store).await.unwrap();
+        let identity_material_root = workspace_signing_material_root(&config.database_path);
+        let app = build_workspace_server_router(config, store.clone())
+            .await
+            .unwrap();
         let uri = format!("/api/w/{}/workspace", workspace.workspace.workspace_id);
 
         let anonymous = app
@@ -20210,6 +20357,109 @@ mod tests {
             .unwrap();
         assert!(String::from_utf8_lossy(&listed_body).contains("documentation"));
 
+        let identity_uri = format!(
+            "/api/w/{}/settings/workspace/signing-identity",
+            workspace.workspace.workspace_id
+        );
+        let identity_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&identity_uri)
+                    .header(
+                        axum::http::header::COOKIE,
+                        "yoi_workspace_session=browser-session-auth",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(identity_response.status(), StatusCode::OK);
+        let identity_body = axum::body::to_bytes(identity_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let identity_json: serde_json::Value = serde_json::from_slice(&identity_body).unwrap();
+        assert_eq!(identity_json["identity"]["state"], "active");
+        assert_eq!(
+            identity_json["public_bundle"]["workspace_id"],
+            workspace.workspace.workspace_id
+        );
+        let identity_text = String::from_utf8(identity_body.to_vec()).unwrap();
+        assert!(!identity_text.contains("private_key"));
+        assert!(!identity_text.contains("private_material_ref"));
+        let identity_non_owner = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&identity_uri)
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {non_owner_token}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(identity_non_owner.status(), StatusCode::FORBIDDEN);
+
+        let pending_identity = store
+            .get_workspace_signing_identity(&workspace.workspace.workspace_id)
+            .unwrap()
+            .unwrap();
+        store
+            .with_conn_mut(|conn| {
+                conn.execute(
+                    r#"UPDATE workspace_signing_identities
+                       SET public_key = NULL, public_key_fingerprint = NULL,
+                           state = 'pending_provisioning', provisioned_at = NULL
+                       WHERE workspace_id = ?1"#,
+                    rusqlite::params![workspace.workspace.workspace_id],
+                )?;
+                conn.execute(
+                    "DELETE FROM workspace_signing_identity_audit WHERE workspace_id = ?1",
+                    rusqlite::params![workspace.workspace.workspace_id],
+                )?;
+                conn.execute(
+                    "DELETE FROM workspace_signing_identity_provisioning_operations WHERE workspace_id = ?1",
+                    rusqlite::params![workspace.workspace.workspace_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        FsWorkspaceSigningMaterialStore::new(identity_material_root)
+            .delete(&pending_identity.private_material_ref)
+            .unwrap();
+        let provision_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("{identity_uri}/provision"))
+                    .header(
+                        axum::http::header::COOKIE,
+                        "yoi_workspace_session=browser-session-auth",
+                    )
+                    .header(ORIGIN, &expected_origin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(provision_response.status(), StatusCode::OK);
+        let provision_body = axum::body::to_bytes(provision_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let provision_json: serde_json::Value = serde_json::from_slice(&provision_body).unwrap();
+        assert_eq!(provision_json["identity"]["state"], "active");
+        assert_eq!(
+            provision_json["identity"]["key_id"],
+            pending_identity.key_id
+        );
+
         let settings_uri = format!(
             "/api/w/{}/settings/workspace",
             workspace.workspace.workspace_id
@@ -20430,7 +20680,12 @@ mod tests {
         template.static_assets_dir = Some(static_dir);
         let store = Arc::new(SqliteWorkspaceStore::open(&template.database_path).unwrap());
         let token = seed_test_api_token(store.as_ref(), "two-workspaces");
-        let catalog = WorkspaceCatalogService::new(store.clone());
+        let catalog = WorkspaceCatalogService::new(
+            store.clone(),
+            Arc::new(FsWorkspaceSigningMaterialStore::new(
+                workspace_signing_material_root(&template.database_path),
+            )),
+        );
         let workspace_a = catalog
             .create(
                 WorkspaceCreateRequest {
