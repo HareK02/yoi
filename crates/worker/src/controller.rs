@@ -1724,14 +1724,13 @@ async fn controller_loop<C, St>(
                     true,
                 ) {
                     Ok(acceptance) => {
+                        let _ = working_event_tx.send(Event::SubmissionAccepted {
+                            submission_request_id: acceptance.submission_request_id.clone(),
+                            submission_id: acceptance.submission_id.clone(),
+                            disposition: acceptance.disposition,
+                        });
                         if let Some(activation) = acceptance.activation {
                             pending = Some(PendingRun::Submit(activation));
-                        } else {
-                            let _ = working_event_tx.send(Event::SubmissionAccepted {
-                                submission_request_id: acceptance.submission_request_id,
-                                submission_id: acceptance.submission_id,
-                                disposition: acceptance.disposition,
-                            });
                         }
                     }
                     Err(error) => {
@@ -1758,14 +1757,13 @@ async fn controller_loop<C, St>(
                     true,
                 ) {
                     Ok(acceptance) => {
+                        let _ = working_event_tx.send(Event::SubmissionAccepted {
+                            submission_request_id: acceptance.submission_request_id.clone(),
+                            submission_id: acceptance.submission_id.clone(),
+                            disposition: acceptance.disposition,
+                        });
                         if let Some(activation) = acceptance.activation {
                             pending = Some(PendingRun::Submit(activation));
-                        } else {
-                            let _ = working_event_tx.send(Event::SubmissionAccepted {
-                                submission_request_id: acceptance.submission_request_id,
-                                submission_id: acceptance.submission_id,
-                                disposition: acceptance.disposition,
-                            });
                         }
                     }
                     Err(error) => {
@@ -2481,11 +2479,6 @@ where
                 if committed.is_ok() {
                     if let Some(submission) = submission {
                         pending_submissions.finish_activation(&submission.submission_id);
-                        let _ = working_event_tx.send(Event::SubmissionAccepted {
-                            submission_request_id: submission.submission_request_id,
-                            submission_id: submission.submission_id,
-                            disposition: protocol::SubmissionDisposition::Started,
-                        });
                         let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
                             pending: pending_submissions.snapshot(),
                         });
@@ -2506,11 +2499,6 @@ where
                     match receiver.try_recv() {
                         Ok(()) => {
                             pending_submissions.finish_activation(&submission.submission_id);
-                            let _ = working_event_tx.send(Event::SubmissionAccepted {
-                                submission_request_id: submission.submission_request_id,
-                                submission_id: submission.submission_id,
-                                disposition: protocol::SubmissionDisposition::Started,
-                            });
                             let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
                                 pending: pending_submissions.snapshot(),
                             });

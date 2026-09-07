@@ -929,15 +929,15 @@ impl Runtime {
                     result: dispatch_result,
                 });
             }
-            let has_commit_ack = dispatch_result
+            let has_durable_acceptance = dispatch_result
                 .submission
                 .as_ref()
                 .is_some_and(|ack| ack.submission_request_id == expected_submission_id);
-            if !has_commit_ack {
+            if !has_durable_acceptance {
                 self.cleanup_connected_failed_create(&backend, &worker_ref, &handle)?;
                 let result = WorkerExecutionResult::rejected(
                     WorkerExecutionOperation::Input,
-                    "execution backend accepted initial input without a durable session commit acknowledgement",
+                    "execution backend accepted initial input without a durable submission acknowledgement",
                 );
                 return Err(RuntimeError::WorkerExecutionRejected {
                     worker_id: worker_ref.worker_id.clone(),
@@ -4222,7 +4222,7 @@ mod tests {
         repository_accesses: Mutex<Vec<WorkingDirectoryRepositoryAccessRequest>>,
         repository_access_available: AtomicBool,
         working_directory_requests: Mutex<Vec<WorkingDirectoryRequest>>,
-        preserve_commit_ack_submission_id: AtomicBool,
+        preserve_submission_acknowledgement_id: AtomicBool,
         #[cfg(feature = "ws-server")]
         snapshots: Mutex<BTreeMap<WorkerId, protocol::Event>>,
     }
@@ -4236,8 +4236,8 @@ mod tests {
             *self.stop_result.lock().unwrap() = Some(result);
         }
 
-        fn preserve_commit_ack_submission_id(&self) {
-            self.preserve_commit_ack_submission_id
+        fn preserve_submission_acknowledgement_id(&self) {
+            self.preserve_submission_acknowledgement_id
                 .store(true, Ordering::SeqCst);
         }
 
@@ -4382,7 +4382,7 @@ mod tests {
                     )
                 });
             if !self
-                .preserve_commit_ack_submission_id
+                .preserve_submission_acknowledgement_id
                 .load(Ordering::SeqCst)
                 && let (Some(ack), Some(submission_id)) =
                     (result.submission.as_mut(), submission_id)
@@ -5202,7 +5202,7 @@ mod tests {
     #[test]
     fn create_worker_rejects_mismatched_submission_acknowledgement() {
         let (runtime, backend) = runtime_and_backend();
-        backend.preserve_commit_ack_submission_id();
+        backend.preserve_submission_acknowledgement_id();
         backend.set_dispatch_result(WorkerExecutionResult::accepted_submission(
             WorkerExecutionOperation::Input,
             "request-test",
@@ -5225,7 +5225,7 @@ mod tests {
     }
 
     #[test]
-    fn create_worker_rejects_initial_input_without_commit_acknowledgement() {
+    fn create_worker_rejects_initial_input_without_durable_submission_acknowledgement() {
         let (runtime, backend) = runtime_and_backend();
         backend.set_dispatch_result(WorkerExecutionResult::accepted(
             WorkerExecutionOperation::Input,

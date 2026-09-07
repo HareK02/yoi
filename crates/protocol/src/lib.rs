@@ -932,8 +932,9 @@ pub struct SessionToolAttachment {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum Event {
-    /// Durable Submit acceptance. A `Started` receipt follows the atomic
-    /// UserInput commit; a `Queued` receipt follows the durable FIFO checkpoint.
+    /// Durable Submit acceptance. A `Queued` receipt follows the durable FIFO
+    /// checkpoint. A `Started` receipt follows the pending activation checkpoint;
+    /// the corresponding [`Event::UserMessage`] marks the later history commit.
     /// Repeating the same request id and exact payload returns the same receipt
     /// without appending or activating twice.
     SubmissionAccepted {

@@ -1038,6 +1038,40 @@ permission = "write"
 }
 
 #[tokio::test]
+async fn started_submit_emits_one_durable_acceptance_receipt() {
+    let worker = make_worker(MockClient::new(simple_text_events())).await;
+    let handle = spawn_controller(worker).await;
+    let mut events = handle.subscribe();
+    let submission_request_id = protocol::new_submission_request_id();
+    handle
+        .send(Method::submit_text(submission_request_id.clone(), "start"))
+        .await
+        .unwrap();
+
+    let mut receipts = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match events.recv().await.unwrap() {
+                Event::SubmissionAccepted {
+                    submission_request_id: received_request_id,
+                    submission_id,
+                    disposition,
+                } if received_request_id == submission_request_id => {
+                    receipts.push((submission_id, disposition));
+                }
+                Event::TurnEnd { .. } => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("submitted turn completes");
+
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].1, protocol::SubmissionDisposition::Started);
+}
+
+#[tokio::test]
 async fn run_end_returns_to_idle_without_busy_status() {
     let client = MockClient::new(simple_text_events());
     let worker = make_worker(client).await;

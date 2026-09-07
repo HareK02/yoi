@@ -90,11 +90,11 @@ use worker::{
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
 const RUNTIME_TASK_TIMEOUT: Duration = Duration::from_secs(10);
 const SPAWN_RESTORE_TASK_TIMEOUT: Duration = Duration::from_secs(60);
-const USER_INPUT_TASK_TIMEOUT: Duration = Duration::from_secs(125);
+const USER_INPUT_TASK_TIMEOUT: Duration = Duration::from_secs(10);
 const WORKSPACE_CONFIG_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_WORKSPACE_CONFIG_RESPONSE_BYTES: usize = 72 * 1024 * 1024;
 // Leave adapter cancellation margin after the durable submission deadline.
-const USER_INPUT_COMMIT_TIMEOUT: Duration = Duration::from_secs(120);
+const USER_INPUT_COMMIT_TIMEOUT: Duration = Duration::from_secs(9);
 
 pub struct RuntimeWorkerController {
     pub handle: WorkerHandle,
@@ -2546,7 +2546,7 @@ mod tests {
         assert!(USER_INPUT_TASK_TIMEOUT > USER_INPUT_COMMIT_TIMEOUT);
         assert_eq!(
             USER_INPUT_TASK_TIMEOUT - USER_INPUT_COMMIT_TIMEOUT,
-            Duration::from_secs(5)
+            Duration::from_secs(1)
         );
     }
 
@@ -3562,7 +3562,7 @@ mod tests {
     }
 
     #[test]
-    fn create_with_initial_input_returns_after_session_commit() {
+    fn create_with_initial_input_returns_after_durable_submission_acceptance() {
         let client = MockClient::new(simple_text_events());
         let runtime_base = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
@@ -3586,21 +3586,32 @@ mod tests {
 
         let detail = runtime.create_worker(request).unwrap();
 
-        let entries = backend
+        let handle = backend
             .workers
             .lock()
             .unwrap()
             .get(&detail.worker_ref)
             .expect("live Worker execution")
             .handle
-            .committed_entries();
-        assert!(entries.iter().any(|entry| {
-            matches!(
-                entry,
-                LogEntry::AnnotatedUserInput { segments, .. }
-                    if segments == &vec![Segment::text("start the ticket")]
-            )
-        }));
+            .clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let entries = loop {
+            let entries = handle.committed_entries();
+            if entries.iter().any(|entry| {
+                matches!(
+                    entry,
+                    LogEntry::AnnotatedUserInput { segments, .. }
+                        if segments == &vec![Segment::text("start the ticket")]
+                )
+            }) {
+                break entries;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "durably accepted initial input must eventually commit to history"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
         let submission_id = entries
             .iter()
             .find_map(|entry| {
