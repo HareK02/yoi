@@ -90,11 +90,11 @@ use worker::{
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
 const RUNTIME_TASK_TIMEOUT: Duration = Duration::from_secs(10);
 const SPAWN_RESTORE_TASK_TIMEOUT: Duration = Duration::from_secs(60);
-const USER_INPUT_TASK_TIMEOUT: Duration = Duration::from_secs(35);
+const USER_INPUT_TASK_TIMEOUT: Duration = Duration::from_secs(125);
 const WORKSPACE_CONFIG_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_WORKSPACE_CONFIG_RESPONSE_BYTES: usize = 72 * 1024 * 1024;
 // Leave adapter cancellation margin after the durable submission deadline.
-const USER_INPUT_COMMIT_TIMEOUT: Duration = Duration::from_secs(30);
+const USER_INPUT_COMMIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct RuntimeWorkerController {
     pub handle: WorkerHandle,
@@ -2539,6 +2539,15 @@ mod tests {
     #[cfg(not(feature = "ws-server"))]
     fn test_execution_context(worker_ref: WorkerRef) -> WorkerExecutionContext {
         WorkerExecutionContext::new(worker_ref)
+    }
+
+    #[test]
+    fn input_commit_budget_leaves_adapter_cancellation_margin() {
+        assert!(USER_INPUT_TASK_TIMEOUT > USER_INPUT_COMMIT_TIMEOUT);
+        assert_eq!(
+            USER_INPUT_TASK_TIMEOUT - USER_INPUT_COMMIT_TIMEOUT,
+            Duration::from_secs(5)
+        );
     }
 
     struct DelayedFactory {

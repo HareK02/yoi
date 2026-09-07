@@ -69,9 +69,9 @@ const EMBEDDED_HOST_KIND: &str = "embedded-worker-runtime-host";
 const REMOTE_HOST_KIND: &str = "remote-worker-runtime-host";
 const MAX_DIAGNOSTICS: usize = 16;
 const MAX_RUNTIME_PING_RESPONSE_BYTES: usize = 8 * 1024;
-// Runtime creation can spend up to 60s bootstrapping, 35s waiting for the
+// Runtime creation can spend up to 60s bootstrapping, 125s waiting for the
 // durable initial-input acknowledgement, and 5s confirming shutdown.
-const REMOTE_WORKER_CREATE_TIMEOUT: Duration = Duration::from_secs(105);
+const REMOTE_WORKER_CREATE_TIMEOUT: Duration = Duration::from_secs(195);
 const MAX_HOST_SCAN: usize = 256;
 const MAX_IDENTIFIER_LEN: usize = 120;
 const ID_DIGEST_HEX_LEN: usize = 16;
@@ -4733,6 +4733,11 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    #[test]
+    fn remote_worker_create_timeout_covers_runtime_phase_budgets() {
+        assert!(REMOTE_WORKER_CREATE_TIMEOUT > Duration::from_secs(60 + 125 + 5));
+    }
 
     fn test_create_binding() -> WorkerCreateBinding {
         WorkerCreateBinding {

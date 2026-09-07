@@ -786,9 +786,15 @@ impl Runtime {
     ) -> Result<WorkerDetail, RuntimeError> {
         let worker_id = request.worker_id;
         let workspace_id = scope.map(|scope| scope.workspace_id.as_str());
+        let started_at = std::time::Instant::now();
         let result = self.create_worker_with_workspace_inner(request, scope);
         if let Err(error) = &result {
-            write_runtime_worker_create_failure(worker_id, workspace_id, error);
+            write_runtime_worker_create_failure(
+                worker_id,
+                workspace_id,
+                error,
+                started_at.elapsed(),
+            );
         }
         result
     }
@@ -3470,6 +3476,7 @@ fn write_runtime_worker_create_failure(
     worker_id: WorkerId,
     workspace_id: Option<&str>,
     error: &RuntimeError,
+    elapsed: std::time::Duration,
 ) {
     let (error_kind, operation, outcome) = runtime_worker_create_failure_fields(error);
     let execution_failure_code = match error {
@@ -3488,6 +3495,7 @@ fn write_runtime_worker_create_failure(
         operation = operation.as_deref().unwrap_or(""),
         outcome = outcome.as_deref().unwrap_or(""),
         execution_failure_code,
+        duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
         "Worker creation failed"
     );
 }
