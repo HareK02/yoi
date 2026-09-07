@@ -2984,7 +2984,33 @@ impl WorkdirHttpAuthorization for RemoteWorkdirAuthorization {
     }
 }
 
-fn resolve_strict_remote_runtime_endpoint(
+fn resolve_remote_addresses_with_timeout<F>(
+    timeout: Duration,
+    resolver: F,
+) -> Result<Vec<SocketAddr>, String>
+where
+    F: FnOnce() -> Result<Vec<SocketAddr>, String> + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("runtime-egress-dns".to_string())
+        .spawn(move || {
+            let _ = sender.send(resolver());
+        })
+        .map_err(|_| "endpoint DNS resolver could not start".to_string())?;
+    receiver
+        .recv_timeout(timeout)
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => {
+                "endpoint DNS resolution timed out".to_string()
+            }
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                "endpoint DNS resolver stopped unexpectedly".to_string()
+            }
+        })?
+}
+
+pub(crate) fn resolve_strict_remote_runtime_endpoint(
     endpoint: &str,
 ) -> Result<(String, Vec<SocketAddr>), String> {
     let endpoint =
@@ -3010,10 +3036,13 @@ fn resolve_strict_remote_runtime_endpoint(
         return Err("endpoint host is not public".to_string());
     }
     let port = endpoint.port_or_known_default().unwrap_or(443);
-    let addresses = (host.as_str(), port)
-        .to_socket_addrs()
-        .map_err(|_| "endpoint DNS resolution failed".to_string())?
-        .collect::<Vec<_>>();
+    let resolution_host = host.clone();
+    let addresses = resolve_remote_addresses_with_timeout(Duration::from_secs(3), move || {
+        (resolution_host.as_str(), port)
+            .to_socket_addrs()
+            .map(|addresses| addresses.collect::<Vec<_>>())
+            .map_err(|_| "endpoint DNS resolution failed".to_string())
+    })?;
     if addresses.is_empty()
         || addresses
             .iter()
@@ -4874,6 +4903,16 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    #[test]
+    fn strict_remote_runtime_dns_resolution_has_a_short_timeout() {
+        let error = resolve_remote_addresses_with_timeout(Duration::from_millis(1), || {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(Vec::new())
+        })
+        .unwrap_err();
+        assert_eq!(error, "endpoint DNS resolution timed out");
+    }
 
     #[test]
     fn strict_remote_runtime_egress_rejects_disallowed_endpoint_before_client_use() {
