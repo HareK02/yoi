@@ -1597,11 +1597,51 @@ pub enum WorkspaceRuntimeAuthenticationMode {
     WorkspaceIdentity,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeConnectionDisplayState {
+    Configured,
+    Verified,
+    Unavailable,
+    Revoked,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeVerificationOutcome {
+    Verified,
+    ChallengeIssued,
+    VerificationFailed,
+    ConnectivityFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeVerificationEvidenceSummary {
+    pub verified_at: Option<String>,
+    pub last_checked_at: String,
+    pub last_outcome: RuntimeVerificationOutcome,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub binding_revision: u64,
+    pub workspace_key_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub workspace_identity_revision: u64,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub workspace_trust_generation: u64,
+    pub runtime_public_key_fingerprint: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub runtime_identity_revision: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceRuntimeBindingSummary {
     pub state: WorkspaceRuntimeBindingState,
+    pub connection_state: RuntimeConnectionDisplayState,
     pub authentication_mode: WorkspaceRuntimeAuthenticationMode,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
     pub revision: u64,
@@ -1610,6 +1650,8 @@ pub struct WorkspaceRuntimeBindingSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
     pub workspace_key_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<RuntimeVerificationEvidenceSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1794,6 +1836,10 @@ pub enum RuntimeConnectionTestFailureKind {
 pub struct RuntimeConnectionTestResponse {
     pub workspace_id: String,
     pub runtime_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub binding_revision: u64,
+    pub connection_state: RuntimeConnectionDisplayState,
+    pub verification: Option<RuntimeVerificationEvidenceSummary>,
     pub checked_at: String,
     pub status: RuntimeConnectionTestStatus,
     pub failure_kind: Option<RuntimeConnectionTestFailureKind>,
@@ -2977,6 +3023,9 @@ pub fn catalog_typescript() -> String {
         RuntimeSourceSummary::decl(&config),
         RuntimeSummary::decl(&config),
         WorkspaceRuntimeBindingState::decl(&config),
+        RuntimeConnectionDisplayState::decl(&config),
+        RuntimeVerificationOutcome::decl(&config),
+        RuntimeVerificationEvidenceSummary::decl(&config),
         WorkspaceRuntimeAuthenticationMode::decl(&config),
         WorkspaceRuntimeBindingSummary::decl(&config),
         RuntimeManagementSummary::decl(&config),
@@ -3842,6 +3891,9 @@ mod tests {
         let compatible = serde_json::json!({
             "workspace_id": "workspace-test",
             "runtime_id": "runtime-test",
+            "binding_revision": 3,
+            "connection_state": "verified",
+            "verification": null,
             "checked_at": "2026-09-01T12:00:00Z",
             "status": "compatible",
             "failure_kind": null,

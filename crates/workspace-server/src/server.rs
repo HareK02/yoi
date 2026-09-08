@@ -85,13 +85,13 @@ use workspace_api::{
     PutRuntimeTrustKeyRequest, RepositoryAccessProjection, RepositoryDetailResponse,
     RepositoryListResponse, RepositoryLogResponse, RepositorySshCredential, RepositorySshHostTrust,
     RequestActor, RevokeRuntimeTrustKeyRequest, RotateRepositorySshCredentialRequest,
-    RuntimeConnectionTestFailureKind, RuntimeConnectionTestResponse, RuntimeConnectionTestStatus,
-    RuntimeManagementSummary, RuntimeTrustAuditAction, RuntimeTrustAuditEntry,
-    RuntimeTrustConflictKind, RuntimeTrustConflictResponse, RuntimeTrustKeyRevealResponse,
-    RuntimeTrustKeyState, RuntimeTrustKeyStatus, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
-    TICKET_RELATIONS_QUERY_PATH, UpdateWorkspaceMetadataRequest, WhoamiResponse,
-    WorkerLaunchOptionsResponse, WorkerLaunchProfileCandidate, WorkerLaunchRuntimeOption,
-    WorkerLaunchWorkerSummary,
+    RuntimeConnectionDisplayState, RuntimeConnectionTestFailureKind, RuntimeConnectionTestResponse,
+    RuntimeConnectionTestStatus, RuntimeManagementSummary, RuntimeTrustAuditAction,
+    RuntimeTrustAuditEntry, RuntimeTrustConflictKind, RuntimeTrustConflictResponse,
+    RuntimeTrustKeyRevealResponse, RuntimeTrustKeyState, RuntimeTrustKeyStatus,
+    TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
+    UpdateWorkspaceMetadataRequest, WhoamiResponse, WorkerLaunchOptionsResponse,
+    WorkerLaunchProfileCandidate, WorkerLaunchRuntimeOption, WorkerLaunchWorkerSummary,
     WorkingDirectoryCreateRequest as BrowserWorkingDirectoryCreateRequest,
     WorkingDirectoryCreateResponse as BrowserWorkingDirectoryCreateResponse,
     WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
@@ -12054,16 +12054,24 @@ async fn scoped_delete_remote_runtime(
 async fn scoped_test_runtime_connection(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
+    Extension(actor): Extension<RequestActor>,
 ) -> ApiResult<Json<RuntimeConnectionTestResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
+    require_workspace_owner(
+        &api,
+        &path.workspace_id,
+        &actor,
+        "Runtime connection verification",
+    )
+    .await?;
     let binding = api
         .store
         .get_workspace_runtime_binding(&path.workspace_id, &path.runtime_id)
         .await?
         .ok_or_else(|| Error::UnknownRuntime(path.runtime_id.clone()))?;
-    if binding.state != StoredRuntimeBindingState::Verified {
+    if binding.state == StoredRuntimeBindingState::Revoked || binding.revoked_at.is_some() {
         return Err(Error::RuntimeBindingConflict(format!(
-            "Runtime `{}` is not an authenticated verified connection candidate",
+            "Runtime `{}` binding is revoked",
             path.runtime_id
         ))
         .into());
@@ -13930,16 +13938,18 @@ async fn test_runtime_connection(
                     .get_workspace_runtime_verification(api.workspace_id(), &runtime_id)
                     .await
                 {
-                    evidence.state = "failed".to_string();
+                    if evidence.state != "verified" {
+                        evidence.state = "failed".to_string();
+                        evidence.verified_at = None;
+                    }
                     evidence.last_outcome = "verification_failed".to_string();
-                    evidence.verified_at = None;
                     evidence.checked_at = Utc::now().to_rfc3339();
                     let _ = api
                         .store
                         .record_workspace_runtime_verification_attempt(&evidence)
                         .await;
                 }
-                return Ok(Json(runtime_connection_test_failure(
+                let mut result = runtime_connection_test_failure(
                     api.workspace_id(),
                     &runtime_id,
                     Utc::now().to_rfc3339(),
@@ -13950,7 +13960,10 @@ async fn test_runtime_connection(
                         "error",
                         message,
                     ),
-                )));
+                );
+                result.binding_revision = binding.binding_revision;
+                result.connection_state = RuntimeConnectionDisplayState::Unavailable;
+                return Ok(Json(result));
             }
         }
     }
@@ -13966,12 +13979,41 @@ async fn test_runtime_connection(
             message: "Runtime connection test could not be completed".to_string(),
         })?;
 
-    Ok(Json(runtime_connection_test_response(
-        api.workspace_id(),
-        &runtime_id,
-        checked_at,
-        ping,
-    )))
+    if ping.is_err()
+        && binding.authentication_mode == StoredRuntimeAuthenticationMode::WorkspaceIdentity
+        && let Some(mut evidence) = api
+            .store
+            .get_workspace_runtime_verification(api.workspace_id(), &runtime_id)
+            .await?
+    {
+        evidence.last_outcome = "connectivity_failed".to_string();
+        evidence.checked_at = Utc::now().to_rfc3339();
+        api.store
+            .record_workspace_runtime_verification_attempt(&evidence)
+            .await?;
+    }
+    let current_binding = api
+        .store
+        .get_workspace_runtime_binding(api.workspace_id(), &runtime_id)
+        .await?
+        .ok_or_else(|| Error::UnknownRuntime(runtime_id.clone()))?;
+    let verification = api
+        .store
+        .get_workspace_runtime_verification(api.workspace_id(), &runtime_id)
+        .await?;
+    let summary = runtime_binding_summary(&current_binding, verification.as_ref());
+    let mut result =
+        runtime_connection_test_response(api.workspace_id(), &runtime_id, checked_at, ping);
+    result.binding_revision = current_binding.binding_revision;
+    result.connection_state = if result.status == RuntimeConnectionTestStatus::Compatible {
+        summary.connection_state
+    } else if summary.connection_state == RuntimeConnectionDisplayState::Revoked {
+        RuntimeConnectionDisplayState::Revoked
+    } else {
+        RuntimeConnectionDisplayState::Unavailable
+    };
+    result.verification = summary.verification;
+    Ok(Json(result))
 }
 
 async fn get_worker_launch_options(
@@ -16070,6 +16112,16 @@ async fn workspace_runtime_resources_response(
         .store
         .list_workspace_runtime_bindings(workspace_id, true)
         .await?;
+    let mut verifications = HashMap::new();
+    for binding in &bindings {
+        if let Some(verification) = api
+            .store
+            .get_workspace_runtime_verification(workspace_id, &binding.runtime_id)
+            .await?
+        {
+            verifications.insert(binding.runtime_id.clone(), verification);
+        }
+    }
     let mut items = runtimes
         .items
         .into_iter()
@@ -16091,7 +16143,9 @@ async fn workspace_runtime_resources_response(
                     endpoint_configured: binding
                         .is_some_and(|binding| !binding.base_url.trim().is_empty()),
                     token_ref_configured: false,
-                    binding: binding.map(runtime_binding_summary),
+                    binding: binding.map(|binding| {
+                        runtime_binding_summary(binding, verifications.get(&binding.runtime_id))
+                    }),
                 },
             }
         })
@@ -16137,7 +16191,10 @@ async fn workspace_runtime_resources_response(
                 removable: true,
                 endpoint_configured: !binding.base_url.trim().is_empty(),
                 token_ref_configured: false,
-                binding: Some(runtime_binding_summary(&binding)),
+                binding: Some(runtime_binding_summary(
+                    binding,
+                    verifications.get(&binding.runtime_id),
+                )),
             },
         });
     }
@@ -16151,13 +16208,38 @@ async fn workspace_runtime_resources_response(
     })
 }
 
-fn runtime_binding_summary(binding: &WorkspaceRuntimeBinding) -> WorkspaceRuntimeBindingSummary {
+fn runtime_binding_summary(
+    binding: &WorkspaceRuntimeBinding,
+    verification: Option<&crate::store::WorkspaceRuntimeVerificationEvidence>,
+) -> WorkspaceRuntimeBindingSummary {
+    let valid_verification = verification.filter(|verification| {
+        verification.state == "verified"
+            && verification.binding_revision == binding.binding_revision
+            && verification.runtime_public_key_fingerprint == binding.public_key_fingerprint
+            && verification.workspace_key_id
+                == binding.workspace_key_id.as_deref().unwrap_or_default()
+    });
+    let connection_state = match binding.state {
+        StoredRuntimeBindingState::Revoked => RuntimeConnectionDisplayState::Revoked,
+        _ if verification.is_some_and(|verification| verification.last_outcome != "verified") => {
+            RuntimeConnectionDisplayState::Unavailable
+        }
+        StoredRuntimeBindingState::Verified
+            if binding.authentication_mode
+                == StoredRuntimeAuthenticationMode::LegacyServerIssuer
+                || valid_verification.is_some() =>
+        {
+            RuntimeConnectionDisplayState::Verified
+        }
+        _ => RuntimeConnectionDisplayState::Configured,
+    };
     WorkspaceRuntimeBindingSummary {
         state: match binding.state {
             StoredRuntimeBindingState::Configured => WorkspaceRuntimeBindingState::Configured,
             StoredRuntimeBindingState::Verified => WorkspaceRuntimeBindingState::Verified,
             StoredRuntimeBindingState::Revoked => WorkspaceRuntimeBindingState::Revoked,
         },
+        connection_state,
         authentication_mode: match binding.authentication_mode {
             StoredRuntimeAuthenticationMode::LegacyServerIssuer => {
                 WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer
@@ -16169,7 +16251,31 @@ fn runtime_binding_summary(binding: &WorkspaceRuntimeBinding) -> WorkspaceRuntim
         revision: binding.binding_revision,
         workspace_key_id: binding.workspace_key_id.clone(),
         workspace_key_generation: binding.workspace_key_generation,
+        verification: verification.and_then(runtime_verification_summary),
     }
+}
+
+fn runtime_verification_summary(
+    verification: &crate::store::WorkspaceRuntimeVerificationEvidence,
+) -> Option<workspace_api::RuntimeVerificationEvidenceSummary> {
+    let last_outcome = match verification.last_outcome.as_str() {
+        "verified" => workspace_api::RuntimeVerificationOutcome::Verified,
+        "challenge_issued" => workspace_api::RuntimeVerificationOutcome::ChallengeIssued,
+        "verification_failed" => workspace_api::RuntimeVerificationOutcome::VerificationFailed,
+        "connectivity_failed" => workspace_api::RuntimeVerificationOutcome::ConnectivityFailed,
+        _ => return None,
+    };
+    Some(workspace_api::RuntimeVerificationEvidenceSummary {
+        verified_at: verification.verified_at.clone(),
+        last_checked_at: verification.checked_at.clone(),
+        last_outcome,
+        binding_revision: verification.binding_revision,
+        workspace_key_id: verification.workspace_key_id.clone(),
+        workspace_identity_revision: verification.workspace_identity_revision,
+        workspace_trust_generation: verification.workspace_trust_generation,
+        runtime_public_key_fingerprint: verification.runtime_public_key_fingerprint.clone(),
+        runtime_identity_revision: verification.runtime_identity_revision,
+    })
 }
 
 async fn workspace_runtime_detail(
@@ -16213,7 +16319,7 @@ async fn workspace_runtime_detail(
                 removable: false,
                 endpoint_configured: !binding.base_url.trim().is_empty(),
                 token_ref_configured: false,
-                binding: Some(runtime_binding_summary(&binding)),
+                binding: Some(runtime_binding_summary(&binding, None)),
             },
         });
     }
@@ -16463,6 +16569,9 @@ fn runtime_connection_test_response(
         Ok(ping) => RuntimeConnectionTestResponse {
             workspace_id: workspace_id.to_string(),
             runtime_id: runtime_id.to_string(),
+            binding_revision: 0,
+            connection_state: RuntimeConnectionDisplayState::Configured,
+            verification: None,
             checked_at,
             status: RuntimeConnectionTestStatus::Compatible,
             failure_kind: None,
@@ -16512,6 +16621,9 @@ fn runtime_connection_test_failure(
     RuntimeConnectionTestResponse {
         workspace_id: workspace_id.to_string(),
         runtime_id: runtime_id.to_string(),
+        binding_revision: 0,
+        connection_state: RuntimeConnectionDisplayState::Unavailable,
+        verification: None,
         checked_at,
         status: RuntimeConnectionTestStatus::Failed,
         failure_kind: Some(failure_kind),
@@ -20336,18 +20448,20 @@ mod tests {
             generic_put.into_response().status(),
             StatusCode::BAD_REQUEST
         );
-        let configured_test = scoped_test_runtime_connection(
+        let Json(configured_test) = scoped_test_runtime_connection(
             State(api.clone()),
             AxumPath(ScopedRuntimePath {
                 workspace_id: api.config.workspace_id.clone(),
                 runtime_id: "configured-runtime".to_string(),
             }),
+            Extension(actor.clone()),
         )
         .await
-        .unwrap_err();
+        .unwrap();
+        assert_eq!(configured_test.status, RuntimeConnectionTestStatus::Failed);
         assert_eq!(
-            configured_test.into_response().status(),
-            StatusCode::CONFLICT
+            configured_test.connection_state,
+            RuntimeConnectionDisplayState::Unavailable
         );
 
         let (status, Json(replayed)) = create_remote_runtime(
@@ -27991,13 +28105,34 @@ mod tests {
     ) -> serde_json::Value {
         let (endpoint, _server) = runtime_ping_stub(status, body).await;
         let dir = tempfile::tempdir().unwrap();
-        let app = test_app_with_remote_runtime(dir.path(), "probe-runtime", endpoint).await;
+        let app = test_app_with_remote_runtime(dir.path(), "probe-runtime", endpoint)
+            .await
+            .layer(Extension(test_owner_actor()));
         post_json(
             app,
             &format!("/api/w/{TEST_WORKSPACE_ID}/runtimes/probe-runtime/connection-tests"),
             serde_json::json!({}),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn runtime_connection_verification_requires_workspace_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let mut actor = test_owner_actor();
+        actor.account_id = "account-other".to_string();
+        let error = scoped_test_runtime_connection(
+            State(api),
+            AxumPath(ScopedRuntimePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                runtime_id: "probe-runtime".to_string(),
+            }),
+            Extension(actor),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -28012,6 +28147,9 @@ mod tests {
         .await;
 
         assert_eq!(response["status"], "compatible");
+        assert_eq!(response["binding_revision"], 1);
+        assert_eq!(response["connection_state"], "verified");
+        assert_eq!(response["verification"], serde_json::Value::Null);
         assert_eq!(response["failure_kind"], serde_json::Value::Null);
         assert_eq!(
             response["expected_protocol_version"],
@@ -30413,8 +30551,14 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let status = response.status();
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{uri}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
         serde_json::from_slice(&bytes).unwrap()
     }
 

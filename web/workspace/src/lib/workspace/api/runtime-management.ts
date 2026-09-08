@@ -3,6 +3,7 @@ import type {
   Diagnostic,
   PutRuntimeTrustKeyRequest,
   RevokeRuntimeTrustKeyRequest,
+  RuntimeConnectionDisplayState,
   RuntimeIdentityAuthority,
   RuntimeManagementSummary,
   RuntimeSourceKind,
@@ -15,6 +16,7 @@ import type {
   RuntimeTrustKeyRevealResponse,
   RuntimeTrustKeyState,
   RuntimeTrustKeyStatus,
+  RuntimeVerificationEvidenceSummary,
   WorkspaceRuntimeAuthenticationMode,
   WorkspaceRuntimeBindingState,
   WorkspaceRuntimeBindingSummary,
@@ -76,6 +78,13 @@ const BINDING_STATES = new Set<WorkspaceRuntimeBindingState>([
   "verified",
   "revoked",
 ]);
+const CONNECTION_STATES = new Set<RuntimeConnectionDisplayState>([
+  "configured",
+  "verified",
+  "unavailable",
+  "revoked",
+]);
+
 const AUTHENTICATION_MODES = new Set<WorkspaceRuntimeAuthenticationMode>([
   "legacy_server_issuer",
   "workspace_identity",
@@ -299,6 +308,79 @@ function runtimeSource(value: unknown, path: string): RuntimeSourceSummary {
   };
 }
 
+function runtimeVerification(
+  value: unknown,
+  path: string,
+): RuntimeVerificationEvidenceSummary {
+  const item = object(value, path);
+  exactKeys(
+    item,
+    [
+      "verified_at",
+      "last_checked_at",
+      "last_outcome",
+      "binding_revision",
+      "workspace_key_id",
+      "workspace_identity_revision",
+      "workspace_trust_generation",
+      "runtime_public_key_fingerprint",
+      "runtime_identity_revision",
+    ],
+    [],
+    path,
+  );
+  const verifiedAt = item.verified_at === null
+    ? null
+    : boundedString(item.verified_at, `${path}.verified_at`, 128);
+  const lastOutcome = enumValue(
+    item.last_outcome,
+    `${path}.last_outcome`,
+    new Set(
+      [
+        "verified",
+        "challenge_issued",
+        "verification_failed",
+        "connectivity_failed",
+      ] as const,
+    ),
+  );
+  return {
+    verified_at: verifiedAt,
+    last_checked_at: boundedString(
+      item.last_checked_at,
+      `${path}.last_checked_at`,
+      128,
+    ),
+    last_outcome: lastOutcome,
+    binding_revision: safeRevision(
+      item.binding_revision,
+      `${path}.binding_revision`,
+    ),
+    workspace_key_id: boundedString(
+      item.workspace_key_id,
+      `${path}.workspace_key_id`,
+      LIMITS.idBytes,
+    ),
+    workspace_identity_revision: safeRevision(
+      item.workspace_identity_revision,
+      `${path}.workspace_identity_revision`,
+    ),
+    workspace_trust_generation: safeRevision(
+      item.workspace_trust_generation,
+      `${path}.workspace_trust_generation`,
+    ),
+    runtime_public_key_fingerprint: boundedString(
+      item.runtime_public_key_fingerprint,
+      `${path}.runtime_public_key_fingerprint`,
+      LIMITS.fingerprintBytes,
+    ),
+    runtime_identity_revision: safeRevision(
+      item.runtime_identity_revision,
+      `${path}.runtime_identity_revision`,
+    ),
+  };
+}
+
 function runtimeBinding(
   value: unknown,
   path: string,
@@ -306,8 +388,8 @@ function runtimeBinding(
   const item = object(value, path);
   exactKeys(
     item,
-    ["state", "authentication_mode", "revision"],
-    ["workspace_key_id", "workspace_key_generation"],
+    ["state", "connection_state", "authentication_mode", "revision"],
+    ["workspace_key_id", "workspace_key_generation", "verification"],
     path,
   );
   const authenticationMode = enumValue(
@@ -339,16 +421,45 @@ function runtimeBinding(
       "must not attach Workspace key metadata to legacy authority",
     );
   }
+  const state = enumValue(item.state, `${path}.state`, BINDING_STATES);
+  const connectionState = enumValue(
+    item.connection_state,
+    `${path}.connection_state`,
+    CONNECTION_STATES,
+  );
+  const revision = safeRevision(item.revision, `${path}.revision`);
+  const verification = item.verification === undefined
+    ? undefined
+    : runtimeVerification(item.verification, `${path}.verification`);
+  if (
+    verification !== undefined && verification.binding_revision !== revision
+  ) {
+    return fail(path, "verification must match the current binding revision");
+  }
+  if (
+    authenticationMode === "workspace_identity" &&
+    connectionState === "verified" &&
+    (verification === undefined ||
+      verification.verified_at === null ||
+      verification.last_outcome !== "verified")
+  ) {
+    return fail(
+      path,
+      "verified Workspace identity binding requires verification evidence",
+    );
+  }
   return {
-    state: enumValue(item.state, `${path}.state`, BINDING_STATES),
+    state,
+    connection_state: connectionState,
     authentication_mode: authenticationMode,
-    revision: safeRevision(item.revision, `${path}.revision`),
+    revision,
     ...(workspaceKeyId === undefined
       ? {}
       : { workspace_key_id: workspaceKeyId }),
     ...(workspaceKeyGeneration === undefined
       ? {}
       : { workspace_key_generation: workspaceKeyGeneration }),
+    ...(verification === undefined ? {} : { verification }),
   };
 }
 

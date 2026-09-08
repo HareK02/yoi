@@ -349,16 +349,42 @@ export type WorkspaceRuntimeBindingState =
   | "verified"
   | "revoked";
 
+export type RuntimeConnectionDisplayState =
+  | "configured"
+  | "verified"
+  | "unavailable"
+  | "revoked";
+
+export type RuntimeVerificationOutcome =
+  | "verified"
+  | "challenge_issued"
+  | "verification_failed"
+  | "connectivity_failed";
+
+export type RuntimeVerificationEvidenceSummary = {
+  verified_at: string | null;
+  last_checked_at: string;
+  last_outcome: RuntimeVerificationOutcome;
+  binding_revision: number;
+  workspace_key_id: string;
+  workspace_identity_revision: number;
+  workspace_trust_generation: number;
+  runtime_public_key_fingerprint: string;
+  runtime_identity_revision: number;
+};
+
 export type WorkspaceRuntimeAuthenticationMode =
   | "legacy_server_issuer"
   | "workspace_identity";
 
 export type WorkspaceRuntimeBindingSummary = {
   state: WorkspaceRuntimeBindingState;
+  connection_state: RuntimeConnectionDisplayState;
   authentication_mode: WorkspaceRuntimeAuthenticationMode;
   revision: number;
   workspace_key_id?: string | null;
   workspace_key_generation?: number | null;
+  verification?: RuntimeVerificationEvidenceSummary | null;
 };
 
 export type RuntimeManagementSummary = {
@@ -464,6 +490,9 @@ export type RuntimeConnectionTestFailureKind =
 export type RuntimeConnectionTestResponse = {
   workspace_id: string;
   runtime_id: string;
+  binding_revision: number;
+  connection_state: RuntimeConnectionDisplayState;
+  verification: RuntimeVerificationEvidenceSummary | null;
   checked_at: string;
   status: RuntimeConnectionTestStatus;
   failure_kind: RuntimeConnectionTestFailureKind | null;

@@ -26,6 +26,7 @@
   let busyRuntimeId = $state<string | null>(null);
   let requestError = $state<string | null>(null);
   let testResults = $state<Record<string, RuntimeConnectionTestResponse>>({});
+  let connectionTestGeneration = 0;
 
   function runtimePlatform(runtime: WorkspaceRuntimeResource): string {
     return runtime.os && runtime.arch ? `${runtime.os} / ${runtime.arch}` : 'Unknown';
@@ -33,7 +34,9 @@
 
   function connectionTestSummary(result: RuntimeConnectionTestResponse): string {
     if (result.status === 'compatible') {
-      return `Compatible · protocol v${result.actual_protocol_version}`;
+      return result.connection_state === 'verified'
+        ? `Verified · protocol v${result.actual_protocol_version}`
+        : `Compatible · ${result.connection_state} · protocol v${result.actual_protocol_version}`;
     }
     switch (result.failure_kind) {
       case 'authentication': return 'Authentication failed';
@@ -144,16 +147,40 @@
     }
   }
 
+  function currentTestResult(
+    runtime: WorkspaceRuntimeResource,
+  ): RuntimeConnectionTestResponse | undefined {
+    const result = testResults[runtime.runtime_id];
+    return result?.binding_revision === runtime.management?.binding?.revision
+      ? result
+      : undefined;
+  }
+
   async function testRuntime(runtime: WorkspaceRuntimeResource): Promise<void> {
+    const bindingRevision = runtime.management?.binding?.revision;
+    if (typeof bindingRevision !== 'number') return;
+    const generation = ++connectionTestGeneration;
     requestError = null;
     busyRuntimeId = runtime.runtime_id;
     try {
       const result = await testRuntimeConnection(data.workspaceId, runtime.runtime_id);
+      if (
+        generation !== connectionTestGeneration ||
+        result.binding_revision !== bindingRevision
+      ) {
+        await invalidateAll();
+        return;
+      }
       testResults = { ...testResults, [runtime.runtime_id]: result };
+      await invalidateAll();
     } catch (error) {
-      requestError = error instanceof Error ? error.message : String(error);
+      if (generation === connectionTestGeneration) {
+        requestError = error instanceof Error ? error.message : String(error);
+      }
     } finally {
-      busyRuntimeId = null;
+      if (generation === connectionTestGeneration) {
+        busyRuntimeId = null;
+      }
     }
   }
 </script>
@@ -287,7 +314,7 @@
               </td>
               <td>{runtime.kind}</td>
               <td>
-                {runtime.management?.binding?.state ?? runtime.status}
+                {runtime.management?.binding?.connection_state ?? runtime.status}
               </td>
               <td>{runtimePlatform(runtime)}</td>
               <td>{managementLabel(runtime)}</td>
@@ -298,7 +325,7 @@
               </td>
               <td>
                 <div class="settings-action-row">
-                  {#if runtime.management?.config_managed && runtime.management.binding?.state === 'verified'}
+                  {#if runtime.management?.config_managed && runtime.management.binding?.connection_state !== 'revoked'}
                     <button
                       type="button"
                       disabled={busyRuntimeId !== null}
@@ -313,7 +340,8 @@
                 </div>
               </td>
             </tr>
-            {#if runtime.diagnostics.length > 0 || testResults[runtime.runtime_id]}
+            {@const currentResult = currentTestResult(runtime)}
+            {#if runtime.diagnostics.length > 0 || currentResult}
               <tr class="settings-runtime-detail-row">
                 <td colspan="7">
                   {#if runtime.diagnostics.length > 0}
@@ -326,14 +354,13 @@
                       {/each}
                     </ul>
                   {/if}
-                  {#if testResults[runtime.runtime_id]}
-                    {@const result = testResults[runtime.runtime_id]}
-                    <div class:failed={result.status === 'failed'} class="settings-test-result">
-                      <strong>Connection test: {connectionTestSummary(result)}</strong>
-                      {#if result.diagnostics[0]}
-                        <span>{result.diagnostics[0].message}</span>
+                  {#if currentResult}
+                    <div class:failed={currentResult.status === 'failed'} class="settings-test-result">
+                      <strong>Connection test: {connectionTestSummary(currentResult)}</strong>
+                      {#if currentResult.diagnostics[0]}
+                        <span>{currentResult.diagnostics[0].message}</span>
                       {/if}
-                      <small>Checked {new Date(result.checked_at).toLocaleString()}</small>
+                      <small>Checked {new Date(currentResult.checked_at).toLocaleString()}</small>
                     </div>
                   {/if}
                 </td>

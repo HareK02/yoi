@@ -332,9 +332,12 @@
         <div><dt>Kind</dt><dd>{runtime.kind}</dd></div>
         <div><dt>Endpoint</dt><dd>{detail.endpoint ?? 'Not configured'}</dd></div>
         <div><dt>Status</dt><dd>{runtime.status}</dd></div>
-        <div><dt>Relationship state</dt><dd>{runtime.management.binding?.state ?? 'Not configured'}</dd></div>
+        <div><dt>Connection state</dt><dd>{runtime.management.binding?.connection_state ?? 'Not configured'}</dd></div>
         <div><dt>Authentication mode</dt><dd>{runtime.management.binding?.authentication_mode ?? '—'}</dd></div>
         <div><dt>Workspace signing key</dt><dd><code>{runtime.management.binding?.workspace_key_id ?? '—'}</code></dd></div>
+        <div><dt>Verified</dt><dd>{formatTimestamp(runtime.management.binding?.verification?.verified_at)}</dd></div>
+        <div><dt>Verified binding revision</dt><dd>{runtime.management.binding?.verification?.binding_revision?.toString() ?? '—'}</dd></div>
+        <div><dt>Last verification check</dt><dd>{runtime.management.binding?.verification?.last_outcome ?? '—'} · {formatTimestamp(runtime.management.binding?.verification?.last_checked_at)}</dd></div>
         <div><dt>Runtime key status</dt><dd>{trust.status}</dd></div>
         <div><dt>Fingerprint</dt><dd><code>{trust.fingerprint ?? '—'}</code></dd></div>
         <div><dt>Revision</dt><dd>{trust.revision?.toString() ?? '—'}</dd></div>

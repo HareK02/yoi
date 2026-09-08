@@ -2234,6 +2234,7 @@ impl SqliteWorkspaceStore {
             return Ok(false);
         };
         Ok(evidence.state == "verified"
+            && evidence.last_outcome == "verified"
             && evidence.verified_at.is_some()
             && evidence.binding_revision == binding.binding_revision
             && evidence.workspace_key_id == binding.workspace_key_id.as_deref().unwrap_or_default()
@@ -2251,18 +2252,22 @@ impl SqliteWorkspaceStore {
         validate_identifier("workspace_id", workspace_id)?;
         validate_identifier("runtime_id", runtime_id)?;
         self.with_conn(|conn| {
-            conn.query_row(
-                r#"SELECT workspace_id, runtime_id, binding_revision, workspace_key_id,
+            let evidence = conn
+                .query_row(
+                    r#"SELECT workspace_id, runtime_id, binding_revision, workspace_key_id,
                           workspace_identity_revision, workspace_trust_generation,
                           runtime_public_key_fingerprint, runtime_identity_revision,
                           challenge_id, state, last_outcome, verified_at, checked_at
                    FROM workspace_runtime_verifications
                    WHERE workspace_id = ?1 AND runtime_id = ?2"#,
-                params![workspace_id, runtime_id],
-                read_workspace_runtime_verification,
-            )
-            .optional()
-            .map_err(Error::from)
+                    params![workspace_id, runtime_id],
+                    read_workspace_runtime_verification,
+                )
+                .optional()?;
+            if let Some(evidence) = &evidence {
+                validate_workspace_runtime_verification(evidence)?;
+            }
+            Ok(evidence)
         })
     }
 
@@ -2287,9 +2292,29 @@ impl SqliteWorkspaceStore {
                        runtime_public_key_fingerprint = excluded.runtime_public_key_fingerprint,
                        runtime_identity_revision = excluded.runtime_identity_revision,
                        challenge_id = excluded.challenge_id,
-                       state = excluded.state,
+                       state = CASE
+                           WHEN workspace_runtime_verifications.state = 'verified'
+                            AND workspace_runtime_verifications.binding_revision = excluded.binding_revision
+                            AND workspace_runtime_verifications.workspace_key_id = excluded.workspace_key_id
+                            AND workspace_runtime_verifications.workspace_identity_revision = excluded.workspace_identity_revision
+                            AND workspace_runtime_verifications.workspace_trust_generation = excluded.workspace_trust_generation
+                            AND workspace_runtime_verifications.runtime_public_key_fingerprint = excluded.runtime_public_key_fingerprint
+                            AND workspace_runtime_verifications.runtime_identity_revision = excluded.runtime_identity_revision
+                           THEN workspace_runtime_verifications.state
+                           ELSE excluded.state
+                       END,
                        last_outcome = excluded.last_outcome,
-                       verified_at = excluded.verified_at,
+                       verified_at = CASE
+                           WHEN workspace_runtime_verifications.state = 'verified'
+                            AND workspace_runtime_verifications.binding_revision = excluded.binding_revision
+                            AND workspace_runtime_verifications.workspace_key_id = excluded.workspace_key_id
+                            AND workspace_runtime_verifications.workspace_identity_revision = excluded.workspace_identity_revision
+                            AND workspace_runtime_verifications.workspace_trust_generation = excluded.workspace_trust_generation
+                            AND workspace_runtime_verifications.runtime_public_key_fingerprint = excluded.runtime_public_key_fingerprint
+                            AND workspace_runtime_verifications.runtime_identity_revision = excluded.runtime_identity_revision
+                           THEN workspace_runtime_verifications.verified_at
+                           ELSE excluded.verified_at
+                       END,
                        checked_at = excluded.checked_at"#,
                 params![
                     evidence.workspace_id,
@@ -6725,7 +6750,14 @@ fn validate_workspace_runtime_verification(
         &evidence.runtime_public_key_fingerprint,
     )?;
     validate_non_empty("verification state", &evidence.state)?;
-    validate_non_empty("verification outcome", &evidence.last_outcome)?;
+    if !matches!(
+        evidence.last_outcome.as_str(),
+        "verified" | "challenge_issued" | "verification_failed" | "connectivity_failed"
+    ) {
+        return Err(Error::InvalidInput(
+            "Runtime verification outcome is invalid".to_string(),
+        ));
+    }
     validate_non_empty("checked_at", &evidence.checked_at)?;
     Ok(())
 }
@@ -9829,6 +9861,31 @@ mod tests {
             .complete_workspace_runtime_verification(&evidence)
             .unwrap();
         assert_eq!(verified.state, WorkspaceRuntimeBindingState::Verified);
+        let pending_retry = WorkspaceRuntimeVerificationEvidence {
+            state: "pending".to_string(),
+            last_outcome: "challenge_issued".to_string(),
+            verified_at: None,
+            checked_at: "3".to_string(),
+            ..evidence.clone()
+        };
+        store
+            .record_workspace_runtime_verification_attempt(&pending_retry)
+            .unwrap();
+        let retained = store
+            .get_workspace_runtime_verification("workspace-a", "runtime-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.state, "verified");
+        assert_eq!(retained.verified_at.as_deref(), Some("2"));
+        assert_eq!(retained.last_outcome, "challenge_issued");
+        assert!(
+            !store
+                .workspace_runtime_verification_matches(&verified, 1, 1)
+                .unwrap()
+        );
+        store
+            .complete_workspace_runtime_verification(&evidence)
+            .unwrap();
         drop(store);
 
         let reopened = SqliteWorkspaceStore::open(&path).unwrap();

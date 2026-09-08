@@ -19,6 +19,9 @@ function compatibleResponse(): Record<string, unknown> {
   return {
     workspace_id: "workspace-a",
     runtime_id: "runtime-a",
+    binding_revision: 3,
+    connection_state: "verified",
+    verification: null,
     checked_at: "2026-09-01T12:00:00Z",
     status: "compatible",
     failure_kind: null,
@@ -54,6 +57,23 @@ Deno.test("runtime connection response rejects unknown fields and incoherent com
     parseRuntimeConnectionTestResponse({
       ...compatibleResponse(),
       failure_kind: "timeout",
+    }),
+    null,
+  );
+  assertEquals(
+    parseRuntimeConnectionTestResponse({
+      ...compatibleResponse(),
+      verification: {
+        verified_at: "2026-09-01T12:00:00Z",
+        last_checked_at: "2026-09-01T12:00:01Z",
+        last_outcome: "verified",
+        binding_revision: 2,
+        workspace_key_id: "WK-a",
+        workspace_identity_revision: 1,
+        workspace_trust_generation: 1,
+        runtime_public_key_fingerprint: "sha256:runtime",
+        runtime_identity_revision: 1,
+      },
     }),
     null,
   );
