@@ -6,10 +6,7 @@
 //! Runtime process directly; a backend is expected to own any browser-facing
 //! credentials, registration, and policy.
 
-use crate::auth::{
-    RuntimeAuthContext, RuntimeAuthError, RuntimeHttpAuthConfig, new_token_id, unix_now_seconds,
-    verify_capability_token,
-};
+use crate::auth::{RuntimeAuthContext, new_token_id, unix_now_seconds};
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, RepositoryRefObservationRequest, WorkerDetail,
     WorkerLifecycleAck, WorkerSummary, WorkingDirectoryRepositoryAccessRequest,
@@ -95,11 +92,9 @@ pub struct RuntimeHttpServerConfig {
     pub display_name: Option<String>,
     /// v0 store selection for the Runtime process.
     pub store: RuntimeHttpStoreSelection,
-    /// Minimal local bearer token placeholder for backend-to-Runtime calls.
+    /// Minimal local bearer token for explicitly local Runtime calls.
     /// This is not a browser-facing credential model.
     pub local_token: Option<String>,
-    /// Optional signed Server-to-Runtime capability token authority.
-    pub auth: Option<RuntimeHttpAuthConfig>,
 }
 
 impl Default for RuntimeHttpServerConfig {
@@ -109,7 +104,6 @@ impl Default for RuntimeHttpServerConfig {
             display_name: None,
             store: RuntimeHttpStoreSelection::Memory,
             local_token: None,
-            auth: None,
         }
     }
 }
@@ -152,34 +146,15 @@ pub async fn serve_runtime_http(
     Ok(())
 }
 
-/// Serve an existing Runtime on a pre-bound listener with signed capability-token auth.
-pub async fn serve_runtime_http_with_auth(
-    runtime: Runtime,
-    listener: TcpListener,
-    local_token: Option<String>,
-    auth: Option<RuntimeHttpAuthConfig>,
-) -> Result<(), RuntimeHttpServerError> {
-    if local_token.is_none() && auth.is_none() {
-        return Err(RuntimeHttpServerError::AuthRequired);
-    }
-    axum::serve(
-        listener,
-        runtime_http_router_with_optional_auth(runtime, local_token, auth, None),
-    )
-    .await?;
-    Ok(())
-}
-
 pub async fn serve_runtime_http_with_workspace_auth(
     runtime: Runtime,
     listener: TcpListener,
     local_token: Option<String>,
-    auth: Option<RuntimeHttpAuthConfig>,
     workspace_auth: WorkspaceRuntimeHttpAuth,
 ) -> Result<(), RuntimeHttpServerError> {
     axum::serve(
         listener,
-        runtime_http_router_with_optional_auth(runtime, local_token, auth, Some(workspace_auth)),
+        runtime_http_router_with_optional_auth(runtime, local_token, Some(workspace_auth)),
     )
     .await?;
     Ok(())
@@ -191,37 +166,25 @@ pub async fn serve_runtime_http_with_workspace_auth(
 /// The path contains only a Runtime-local `worker_id`; backend aliases are not
 /// accepted or forwarded as Runtime authority.
 pub fn runtime_http_router(runtime: Runtime, local_token: String) -> Router {
-    runtime_http_router_with_optional_auth(runtime, Some(local_token), None, None)
-}
-
-/// Build the REST router for an existing Runtime with signed capability-token auth.
-pub fn runtime_http_router_with_auth(
-    runtime: Runtime,
-    local_token: Option<String>,
-    auth: RuntimeHttpAuthConfig,
-) -> Router {
-    runtime_http_router_with_optional_auth(runtime, local_token, Some(auth), None)
+    runtime_http_router_with_optional_auth(runtime, Some(local_token), None)
 }
 
 pub fn runtime_http_router_with_workspace_auth(
     runtime: Runtime,
     local_token: Option<String>,
-    auth: RuntimeHttpAuthConfig,
     workspace_auth: WorkspaceRuntimeHttpAuth,
 ) -> Router {
-    runtime_http_router_with_optional_auth(runtime, local_token, Some(auth), Some(workspace_auth))
+    runtime_http_router_with_optional_auth(runtime, local_token, Some(workspace_auth))
 }
 
 fn runtime_http_router_with_optional_auth(
     runtime: Runtime,
     local_token: Option<String>,
-    auth: Option<RuntimeHttpAuthConfig>,
     workspace_auth: Option<WorkspaceRuntimeHttpAuth>,
 ) -> Router {
     let state = RuntimeHttpState {
         runtime,
         local_token: local_token.map(Arc::<str>::from),
-        auth: auth.map(Arc::new),
         workspace_auth: workspace_auth.map(Arc::new),
         workdir_sessions: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -328,7 +291,6 @@ pub const MAX_WORKER_FILE_UPLOAD_BYTES: usize =
 struct RuntimeHttpState {
     runtime: Runtime,
     local_token: Option<Arc<str>>,
-    auth: Option<Arc<RuntimeHttpAuthConfig>>,
     workspace_auth: Option<Arc<WorkspaceRuntimeHttpAuth>>,
     workdir_sessions: Arc<Mutex<HashMap<String, RuntimeHttpWorkdirSession>>>,
 }
@@ -709,9 +671,9 @@ async fn get_runtime_ping(
         ));
     }
     let runtime_id = state
-        .auth
+        .workspace_auth
         .as_ref()
-        .map(|config| config.runtime_id.trim())
+        .map(|auth| auth.signer.runtime_id().trim())
         .filter(|runtime_id| !runtime_id.is_empty())
         .ok_or_else(|| {
             RuntimeHttpRestError::new(
@@ -2110,56 +2072,6 @@ async fn require_runtime_auth(
         }
     }
 
-    if let Some(auth) = state.auth.as_deref() {
-        let Some(token) = supplied.as_deref() else {
-            return RuntimeHttpRestError::new(
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                "missing Runtime capability bearer token",
-            )
-            .into_response();
-        };
-        match verify_capability_token(
-            auth,
-            token,
-            required_runtime_permission(request.method(), request.uri().path()),
-            unix_now_seconds(),
-        ) {
-            Ok(context) => {
-                let workspace_verification_exists = match state.workspace_auth.as_deref() {
-                    Some(workspace_auth) => match workspace_auth
-                        .verifications
-                        .get(&context.workspace_id, workspace_auth.signer.runtime_id())
-                    {
-                        Ok(record) => record.is_some(),
-                        Err(error) => {
-                            return RuntimeHttpRestError::new(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "workspace_runtime_verification_unavailable",
-                                error.to_string(),
-                            )
-                            .into_response();
-                        }
-                    },
-                    None => false,
-                };
-                if workspace_verification_exists {
-                    return RuntimeHttpRestError::new(
-                        StatusCode::FORBIDDEN,
-                        "workspace_identity_required",
-                        "Legacy Server-issued capability is disabled after signed Workspace Runtime verification",
-                    )
-                    .into_response();
-                }
-                request.extensions_mut().insert(context);
-                return next.run(request).await;
-            }
-            Err(error) => {
-                return runtime_auth_error_response(error).into_response();
-            }
-        }
-    }
-
     if let Some(expected) = state.local_token.as_deref() {
         if supplied.as_deref() != Some(expected) {
             return RuntimeHttpRestError::new(
@@ -2180,32 +2092,12 @@ async fn require_runtime_auth(
     next.run(request).await
 }
 
-fn runtime_auth_error_response(error: RuntimeAuthError) -> RuntimeHttpRestError {
-    match error {
-        RuntimeAuthError::MissingPermission(permission) => RuntimeHttpRestError::new(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            format!("Runtime capability token is missing required permission `{permission}`"),
-        ),
-        RuntimeAuthError::MissingWorkspaceScope => RuntimeHttpRestError::new(
-            StatusCode::FORBIDDEN,
-            "workspace_scope_required",
-            "Runtime capability token is missing workspace scope",
-        ),
-        other => RuntimeHttpRestError::new(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            format!("invalid Runtime capability token: {other}"),
-        ),
-    }
-}
-
 fn auth_workspace_scope(
     state: &RuntimeHttpState,
     auth: Option<&Extension<RuntimeAuthContext>>,
 ) -> Result<Option<RuntimeWorkspaceScope>, RuntimeHttpRestError> {
     let Some(Extension(context)) = auth else {
-        if state.auth.is_some() || state.local_token.is_some() {
+        if state.workspace_auth.is_some() || state.local_token.is_some() {
             return Err(RuntimeHttpRestError::new(
                 StatusCode::FORBIDDEN,
                 "workspace_scope_required",
@@ -2537,7 +2429,7 @@ fn code_for_runtime_error(error: &RuntimeError) -> String {
 pub enum RuntimeHttpServerError {
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
-    #[error("Runtime HTTP server requires capability-token auth or a local bearer token")]
+    #[error("Runtime HTTP server requires Workspace issuer auth or a local bearer token")]
     AuthRequired,
     #[error("Runtime HTTP server I/O failed: {0}")]
     Io(#[from] std::io::Error),
@@ -2546,10 +2438,7 @@ pub enum RuntimeHttpServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{
-        CapabilityTokenSigner, RuntimeHttpAuthConfig, RuntimeIdentityMaterial, TrustedServerKey,
-        capability_claims,
-    };
+    use crate::auth::RuntimeIdentityMaterial;
     use crate::catalog::{ConfigBundleRef, ProfileSelector, WorkerStatus, WorkspaceApiRef};
     use crate::config_bundle::{
         ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigProfileDescriptor,
@@ -2579,7 +2468,6 @@ mod tests {
     #[tokio::test]
     async fn workspace_signed_verification_requires_exact_request_and_acknowledges_response() {
         let runtime = Runtime::new_memory();
-        let (legacy_auth, _) = auth_config_and_signer();
         let workspace_identity = RuntimeIdentityMaterial::generate("workspace-key").unwrap();
         let runtime_identity = RuntimeIdentityMaterial::generate("runtime-test").unwrap();
         let workspace_public_key =
@@ -2614,7 +2502,6 @@ mod tests {
         let app = runtime_http_router_with_workspace_auth(
             runtime,
             None,
-            legacy_auth,
             WorkspaceRuntimeHttpAuth {
                 verifier,
                 signer: RuntimeVerificationSigner::from_identity(&runtime_identity).unwrap(),
@@ -2764,82 +2651,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn ping_requires_scoped_permission_and_returns_versioned_identity() {
-        let runtime = Runtime::new_memory();
-        let (auth, signer) = auth_config_and_signer();
-        let app = runtime_http_router_with_auth(runtime, None, auth);
-        let token =
-            token_for_workspace_with_permissions(&signer, "workspace-a", [RUNTIME_PING_PERMISSION]);
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri("/v1/ping")
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(RUNTIME_WORKSPACE_SCOPE_HEADER, "workspace-a")
-            .body(Body::empty())
-            .unwrap();
-
-        let response = app.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(
-            serde_json::from_slice::<RuntimeHttpPingResponse>(&body).unwrap(),
-            RuntimeHttpPingResponse {
-                runtime_id: "runtime-test".to_string(),
-                protocol_version: RUNTIME_HTTP_PROTOCOL_VERSION,
-            }
-        );
-
-        let wrong_scope_token =
-            token_for_workspace_with_permissions(&signer, "workspace-a", [RUNTIME_PING_PERMISSION]);
-        let wrong_scope_request = Request::builder()
-            .method(Method::GET)
-            .uri("/v1/ping")
-            .header(header::AUTHORIZATION, format!("Bearer {wrong_scope_token}"))
-            .header(RUNTIME_WORKSPACE_SCOPE_HEADER, "workspace-b")
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            app.oneshot(wrong_scope_request).await.unwrap().status(),
-            StatusCode::FORBIDDEN
-        );
-    }
-
-    #[tokio::test]
-    async fn ping_rejects_token_without_ping_permission() {
-        let runtime = Runtime::new_memory();
-        let (auth, signer) = auth_config_and_signer();
-        let app = runtime_http_router_with_auth(runtime, None, auth);
-        let missing_credential = Request::builder()
-            .method(Method::GET)
-            .uri("/v1/ping")
-            .header(RUNTIME_WORKSPACE_SCOPE_HEADER, "workspace-a")
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            app.clone()
-                .oneshot(missing_credential)
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::UNAUTHORIZED
-        );
-
-        let token = token_for_workspace_with_permissions(&signer, "workspace-a", ["workers:read"]);
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri("/v1/ping")
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(RUNTIME_WORKSPACE_SCOPE_HEADER, "workspace-a")
-            .body(Body::empty())
-            .unwrap();
-
-        assert_eq!(
-            app.oneshot(request).await.unwrap().status(),
-            StatusCode::FORBIDDEN
-        );
-    }
-
     #[test]
     fn runtime_protocol_replaces_serialized_tracked_source() {
         let wire = serde_json::to_string(&protocol::Method::SubmitTracked {
@@ -2935,301 +2746,6 @@ mod tests {
             profile_source_archive_handle: None,
         }
         .with_computed_digest()
-    }
-
-    fn store_coder_test_bundle(runtime: &Runtime) {
-        runtime
-            .store_config_bundle(test_bundle(ProfileSelector::Builtin(
-                "builtin:coder".to_string(),
-            )))
-            .unwrap();
-    }
-
-    fn scoped_task_request(objective: &str, workspace_id: &str) -> CreateWorkerRequest {
-        let mut request = task_request(objective);
-        request.workspace_api = Some(WorkspaceApiRef {
-            workspace_id: workspace_id.to_string(),
-            base_url: format!("https://workspace.example/{workspace_id}"),
-        });
-        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: workspace_id.to_string(),
-            settings_revision: 1,
-            language: "English".to_string(),
-        });
-        request
-    }
-
-    fn auth_config_and_signer() -> (RuntimeHttpAuthConfig, CapabilityTokenSigner) {
-        let identity = RuntimeIdentityMaterial::generate("server-a").unwrap();
-        let signer = CapabilityTokenSigner::new(identity.identity_id.clone(), identity.private_key);
-        let auth = RuntimeHttpAuthConfig {
-            runtime_id: "runtime-test".to_string(),
-            trusted_servers: vec![TrustedServerKey {
-                server_id: identity.identity_id,
-                public_key: identity.public_key,
-                display_name: None,
-            }],
-        };
-        (auth, signer)
-    }
-
-    fn auth_config_and_two_signers() -> (
-        RuntimeHttpAuthConfig,
-        CapabilityTokenSigner,
-        CapabilityTokenSigner,
-    ) {
-        let identity_a = RuntimeIdentityMaterial::generate("server-a").unwrap();
-        let identity_b = RuntimeIdentityMaterial::generate("server-b").unwrap();
-        let signer_a =
-            CapabilityTokenSigner::new(identity_a.identity_id.clone(), identity_a.private_key);
-        let signer_b =
-            CapabilityTokenSigner::new(identity_b.identity_id.clone(), identity_b.private_key);
-        let auth = RuntimeHttpAuthConfig {
-            runtime_id: "runtime-test".to_string(),
-            trusted_servers: vec![
-                TrustedServerKey {
-                    server_id: identity_a.identity_id,
-                    public_key: identity_a.public_key,
-                    display_name: None,
-                },
-                TrustedServerKey {
-                    server_id: identity_b.identity_id,
-                    public_key: identity_b.public_key,
-                    display_name: None,
-                },
-            ],
-        };
-        (auth, signer_a, signer_b)
-    }
-
-    fn token_for_workspace(signer: &CapabilityTokenSigner, workspace_id: &str) -> String {
-        token_for_workspace_with_permissions(
-            signer,
-            workspace_id,
-            [
-                "workers:list",
-                "workers:create",
-                "workers:read",
-                "workers:input",
-                "workers:stop",
-                "workers:protocol",
-                "workers:delete",
-                "workdirs:operate",
-            ],
-        )
-    }
-
-    fn token_for_workspace_with_permissions<const N: usize>(
-        signer: &CapabilityTokenSigner,
-        workspace_id: &str,
-        permissions: [&str; N],
-    ) -> String {
-        let claims = capability_claims(
-            signer.server_id(),
-            "runtime-test",
-            workspace_id,
-            permissions.into_iter().map(str::to_string).collect(),
-            3600,
-        )
-        .unwrap();
-        signer.sign(&claims).unwrap()
-    }
-
-    fn bearer_request(
-        method: Method,
-        uri: impl AsRef<str>,
-        token: &str,
-        body: impl Into<Body>,
-    ) -> Request<Body> {
-        Request::builder()
-            .method(method)
-            .uri(uri.as_ref())
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(body.into())
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn capability_workspace_scope_filters_list_and_hides_detail() {
-        let runtime =
-            Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(AcceptingBackend))
-                .unwrap();
-        store_coder_test_bundle(&runtime);
-        let (auth, signer) = auth_config_and_signer();
-        let token_a = token_for_workspace(&signer, "workspace-a");
-        let token_b = token_for_workspace(&signer, "workspace-b");
-        let app = runtime_http_router_with_auth(runtime, None, auth);
-
-        let create_a = scoped_task_request("a", "workspace-a");
-        let response = app
-            .clone()
-            .oneshot(bearer_request(
-                Method::POST,
-                "/v1/workers",
-                &token_a,
-                serde_json::to_vec(&create_a).unwrap(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let worker_a: RuntimeHttpWorkerResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(worker_a.worker.workspace_id.as_deref(), Some("workspace-a"));
-
-        let create_b = scoped_task_request("b", "workspace-b");
-        let response = app
-            .clone()
-            .oneshot(bearer_request(
-                Method::POST,
-                "/v1/workers",
-                &token_b,
-                serde_json::to_vec(&create_b).unwrap(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let worker_b: RuntimeHttpWorkerResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(worker_b.worker.workspace_id.as_deref(), Some("workspace-b"));
-
-        let response = app
-            .clone()
-            .oneshot(bearer_request(
-                Method::GET,
-                "/v1/workers",
-                &token_a,
-                Body::empty(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let workers: RuntimeHttpWorkersResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(workers.workers.len(), 1);
-        assert_eq!(workers.workers[0].worker_ref, worker_a.worker.worker_ref);
-        assert_eq!(
-            workers.workers[0].workspace_id.as_deref(),
-            Some("workspace-a")
-        );
-
-        let response = app
-            .oneshot(bearer_request(
-                Method::GET,
-                format!("/v1/workers/{}", worker_b.worker.worker_id),
-                &token_a,
-                Body::empty(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn capability_workspace_owner_binding_rejects_other_trusted_server() {
-        let runtime =
-            Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(AcceptingBackend))
-                .unwrap();
-        store_coder_test_bundle(&runtime);
-        let (auth, signer_a, signer_b) = auth_config_and_two_signers();
-        let token_a = token_for_workspace(&signer_a, "workspace-a");
-        let token_b = token_for_workspace(&signer_b, "workspace-a");
-        let app = runtime_http_router_with_auth(runtime, None, auth);
-
-        let create_a = scoped_task_request("a", "workspace-a");
-        let response = app
-            .clone()
-            .oneshot(bearer_request(
-                Method::POST,
-                "/v1/workers",
-                &token_a,
-                serde_json::to_vec(&create_a).unwrap(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let create_b = scoped_task_request("b", "workspace-a");
-        let response = app
-            .oneshot(bearer_request(
-                Method::POST,
-                "/v1/workers",
-                &token_b,
-                serde_json::to_vec(&create_b).unwrap(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn capability_token_without_workspace_scope_is_forbidden() {
-        let runtime =
-            Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(AcceptingBackend))
-                .unwrap();
-        let (auth, signer) = auth_config_and_signer();
-        let token = token_for_workspace_with_permissions(&signer, "", ["workers:list"]);
-        let app = runtime_http_router_with_auth(runtime, None, auth);
-
-        let response = app
-            .oneshot(bearer_request(
-                Method::GET,
-                "/v1/workers",
-                &token,
-                Body::empty(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn capability_token_without_worker_permission_is_forbidden() {
-        let runtime =
-            Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(AcceptingBackend))
-                .unwrap();
-        let (auth, signer) = auth_config_and_signer();
-        let token = token_for_workspace_with_permissions(&signer, "workspace-a", ["workers:list"]);
-        let app = runtime_http_router_with_auth(runtime, None, auth);
-        let create = scoped_task_request("a", "workspace-a");
-
-        let response = app
-            .oneshot(bearer_request(
-                Method::POST,
-                "/v1/workers",
-                &token,
-                serde_json::to_vec(&create).unwrap(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn capability_token_without_workdir_permission_is_forbidden() {
-        let runtime =
-            Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(AcceptingBackend))
-                .unwrap();
-        let (auth, signer) = auth_config_and_signer();
-        let token = token_for_workspace_with_permissions(&signer, "workspace-a", ["workers:read"]);
-        let app = runtime_http_router_with_auth(runtime, None, auth);
-
-        let response = app
-            .oneshot(bearer_request(
-                Method::POST,
-                "/v1/working-directories/wd-1/sessions",
-                &token,
-                serde_json::to_vec(&OpenWorkdirSessionRequest::default()).unwrap(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     fn task_request(_objective: &str) -> CreateWorkerRequest {
@@ -3331,7 +2847,6 @@ mod tests {
             )
             .expect("runtime"),
             local_token: Some(Arc::from("token")),
-            auth: None,
             workspace_auth: None,
             workdir_sessions: Arc::new(Mutex::new(HashMap::from([(
                 "session-1".to_string(),
@@ -3705,12 +3220,6 @@ mod tests {
     async fn serve_runtime_http_rejects_missing_auth_configuration() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let error = serve_runtime_http(Runtime::new_memory(), listener, None)
-            .await
-            .unwrap_err();
-        assert!(matches!(error, RuntimeHttpServerError::AuthRequired));
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let error = serve_runtime_http_with_auth(Runtime::new_memory(), listener, None, None)
             .await
             .unwrap_err();
         assert!(matches!(error, RuntimeHttpServerError::AuthRequired));

@@ -1,14 +1,11 @@
-use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use worker_runtime::auth::{RuntimeIdentityMaterial, decode_public_key};
-use yoi_workspace_server::hosts::{RemoteRuntimeAuthConfig, RemoteRuntimeConfig};
+use yoi_workspace_server::hosts::{EMBEDDED_RUNTIME_ID, RemoteRuntimeConfig};
 use yoi_workspace_server::store::{
     SqliteWorkspaceStore, WorkspaceRuntimeAuthenticationMode, WorkspaceRuntimeBinding,
     WorkspaceRuntimeBindingState,
@@ -21,8 +18,6 @@ use yoi_workspace_server::{
 #[derive(Debug)]
 enum Command {
     Serve(ServeOptions),
-    Identity(Vec<String>),
-    TrustRuntime(Vec<String>),
     Migrate(MigrateOptions),
     Skills(SkillsCommand),
     Help,
@@ -79,8 +74,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match parse_command(&args)? {
         Command::Serve(options) => run_serve(options).await,
-        Command::Identity(args) => run_identity_command(args),
-        Command::TrustRuntime(args) => run_trust_runtime_command(args),
         Command::Migrate(options) => run_migrate(options),
         Command::Skills(command) => run_skills(command),
         Command::Help => Ok(()),
@@ -94,8 +87,6 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
     };
 
     match command.as_str() {
-        "identity" => Ok(Command::Identity(rest.to_vec())),
-        "trust-runtime" => Ok(Command::TrustRuntime(rest.to_vec())),
         "migrate" => parse_migrate_options(rest).map(Command::Migrate),
         "skills" => parse_skills_command(rest),
         "serve" => {
@@ -110,373 +101,9 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             Ok(Command::Help)
         }
         other => Err(CliError(format!(
-            "unknown command `{other}`; expected `identity`, `trust-runtime`, `migrate`, `skills`, or `serve`"
+            "unknown command `{other}`; expected `migrate`, `skills`, or `serve`"
         ))),
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct ServerIdentityFile {
-    identity: RuntimeIdentityMaterial,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct PublicIdentityView {
-    identity_id: String,
-    public_key: String,
-}
-
-fn server_identity_path() -> PathBuf {
-    ServerConfig::default_server_data_root().join("identity.toml")
-}
-
-fn read_server_identity_file(
-    path: &Path,
-) -> Result<Option<ServerIdentityFile>, Box<dyn std::error::Error>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let contents = std::fs::read_to_string(path)?;
-    Ok(Some(toml::from_str(&contents)?))
-}
-
-fn write_server_identity_file(
-    path: &Path,
-    identity: &ServerIdentityFile,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let contents = toml::to_string_pretty(identity)?;
-    write_secret_file(path, contents.as_bytes())?;
-    Ok(())
-}
-
-fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        use std::io::Write as _;
-        file.write_all(contents)?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents)?;
-    }
-    Ok(())
-}
-
-fn public_identity_view(identity: &RuntimeIdentityMaterial) -> PublicIdentityView {
-    PublicIdentityView {
-        identity_id: identity.identity_id.clone(),
-        public_key: identity.public_key.clone(),
-    }
-}
-
-fn run_identity_command(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = VecDeque::from(args);
-    let subcommand = args
-        .pop_front()
-        .ok_or_else(|| CliError("identity requires `init` or `show`".to_string()))?;
-    match subcommand.as_str() {
-        "init" => {
-            let mut server_id = None;
-            let mut replace = false;
-            while let Some(arg) = args.pop_front() {
-                let (flag, inline_value) = split_flag_value(arg)?;
-                match flag.as_str() {
-                    "--server-id" => server_id = Some(take_value(&flag, inline_value, &mut args)?),
-                    "--replace" => {
-                        ensure_no_inline_value(&flag, inline_value.as_deref())?;
-                        replace = true;
-                    }
-                    _ => {
-                        return Err(Box::new(CliError(format!(
-                            "unknown identity init argument `{flag}`"
-                        ))));
-                    }
-                }
-            }
-            let server_id = server_id
-                .ok_or_else(|| CliError("identity init requires --server-id".to_string()))?;
-            let path = server_identity_path();
-            if read_server_identity_file(&path)?.is_some() && !replace {
-                return Err(Box::new(CliError(format!(
-                    "server identity already exists at {}; pass --replace to rotate it",
-                    path.display()
-                ))));
-            }
-            let identity = RuntimeIdentityMaterial::generate(server_id)?;
-            write_server_identity_file(
-                &path,
-                &ServerIdentityFile {
-                    identity: identity.clone(),
-                },
-            )?;
-            println!("server_id={}", identity.identity_id);
-            println!("public_key={}", identity.public_key);
-            println!("identity_file={}", path.display());
-            Ok(())
-        }
-        "show" => {
-            let mut json = false;
-            while let Some(arg) = args.pop_front() {
-                let (flag, inline_value) = split_flag_value(arg)?;
-                match flag.as_str() {
-                    "--json" => {
-                        ensure_no_inline_value(&flag, inline_value.as_deref())?;
-                        json = true;
-                    }
-                    _ => {
-                        return Err(Box::new(CliError(format!(
-                            "unknown identity show argument `{flag}`"
-                        ))));
-                    }
-                }
-            }
-            let path = server_identity_path();
-            let identity = read_server_identity_file(&path)?.ok_or_else(|| {
-                CliError(format!(
-                    "server identity is not initialized at {}",
-                    path.display()
-                ))
-            })?;
-            let view = public_identity_view(&identity.identity);
-            if json {
-                println!("{}", serde_json::to_string_pretty(&view)?);
-            } else {
-                println!("server_id={}", view.identity_id);
-                println!("public_key={}", view.public_key);
-                println!("identity_file={}", path.display());
-            }
-            Ok(())
-        }
-        _ => Err(Box::new(CliError(format!(
-            "unknown identity subcommand `{subcommand}`"
-        )))),
-    }
-}
-
-fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = VecDeque::from(args);
-    let subcommand = args
-        .pop_front()
-        .ok_or_else(|| CliError("trust-runtime requires `add`, `list`, or `revoke`".to_string()))?;
-    let database_path = ServerConfig::default_server_database_path();
-    if let Some(parent) = database_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let store = SqliteWorkspaceStore::open(&database_path)?;
-    match subcommand.as_str() {
-        "add" => {
-            let mut runtime_id = None;
-            let mut workspace_id = None;
-            let mut base_url = None;
-            let mut public_key = None;
-            let mut display_name = None;
-            let mut replace = false;
-            while let Some(arg) = args.pop_front() {
-                let (flag, inline_value) = split_flag_value(arg)?;
-                match flag.as_str() {
-                    "--runtime-id" => {
-                        runtime_id = Some(take_value(&flag, inline_value, &mut args)?)
-                    }
-                    "--workspace-id" => {
-                        workspace_id = Some(take_value(&flag, inline_value, &mut args)?)
-                    }
-                    "--base-url" | "--endpoint" => {
-                        base_url = Some(take_value(&flag, inline_value, &mut args)?)
-                    }
-                    "--public-key" => {
-                        public_key = Some(take_value(&flag, inline_value, &mut args)?)
-                    }
-                    "--display-name" => {
-                        display_name = Some(take_value(&flag, inline_value, &mut args)?)
-                    }
-                    "--replace" => {
-                        ensure_no_inline_value(&flag, inline_value.as_deref())?;
-                        replace = true;
-                    }
-                    _ => {
-                        return Err(Box::new(CliError(format!(
-                            "unknown trust-runtime add argument `{flag}`"
-                        ))));
-                    }
-                }
-            }
-            let runtime_id = runtime_id
-                .ok_or_else(|| CliError("trust-runtime add requires --runtime-id".to_string()))?;
-            let workspace_id = workspace_id
-                .ok_or_else(|| CliError("trust-runtime add requires --workspace-id".to_string()))?;
-            if !store
-                .list_workspaces()?
-                .iter()
-                .any(|workspace| workspace.workspace_id == workspace_id)
-            {
-                return Err(Box::new(CliError(format!(
-                    "Workspace `{workspace_id}` is not registered"
-                ))));
-            }
-            let base_url = base_url
-                .ok_or_else(|| CliError("trust-runtime add requires --base-url".to_string()))?;
-            let public_key = public_key
-                .ok_or_else(|| CliError("trust-runtime add requires --public-key".to_string()))?;
-            decode_public_key(&public_key)?;
-            let now = Utc::now().to_rfc3339();
-            let outcome = store.upsert_workspace_runtime_binding(
-                WorkspaceRuntimeBinding {
-                    workspace_id: workspace_id.clone(),
-                    runtime_id: runtime_id.clone(),
-                    display_name: display_name.unwrap_or_else(|| runtime_id.clone()),
-                    base_url,
-                    public_key,
-                    public_key_fingerprint: String::new(),
-                    binding_revision: 1,
-                    state: WorkspaceRuntimeBindingState::Verified,
-                    authentication_mode: WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer,
-                    workspace_key_id: None,
-                    workspace_key_generation: None,
-                    created_at: now.clone(),
-                    updated_at: now,
-                    revoked_at: None,
-                },
-                replace,
-            )?;
-            println!("workspace_id={workspace_id}");
-            println!("runtime_id={runtime_id}");
-            println!(
-                "result={}",
-                match outcome {
-                    yoi_workspace_server::store::WorkspaceRuntimeBindingUpsert::Created =>
-                        "created",
-                    yoi_workspace_server::store::WorkspaceRuntimeBindingUpsert::Unchanged =>
-                        "unchanged",
-                    yoi_workspace_server::store::WorkspaceRuntimeBindingUpsert::Replaced =>
-                        "replaced",
-                }
-            );
-            println!("server_db={}", database_path.display());
-            Ok(())
-        }
-        "list" => {
-            let mut workspace_id = None;
-            let mut json = false;
-            let mut include_revoked = false;
-            while let Some(arg) = args.pop_front() {
-                let (flag, inline_value) = split_flag_value(arg)?;
-                match flag.as_str() {
-                    "--workspace-id" => {
-                        workspace_id = Some(take_value(&flag, inline_value, &mut args)?)
-                    }
-                    "--json" => {
-                        ensure_no_inline_value(&flag, inline_value.as_deref())?;
-                        json = true;
-                    }
-                    "--include-revoked" => {
-                        ensure_no_inline_value(&flag, inline_value.as_deref())?;
-                        include_revoked = true;
-                    }
-                    _ => {
-                        return Err(Box::new(CliError(format!(
-                            "unknown trust-runtime list argument `{flag}`"
-                        ))));
-                    }
-                }
-            }
-            let workspace_id = workspace_id.ok_or_else(|| {
-                CliError("trust-runtime list requires --workspace-id".to_string())
-            })?;
-            let records = store.list_workspace_runtime_bindings(&workspace_id, include_revoked)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&records)?);
-            } else {
-                for runtime in records {
-                    println!(
-                        "workspace_id={} runtime_id={} base_url={} public_key_fingerprint={} revoked_at={}",
-                        runtime.workspace_id,
-                        runtime.runtime_id,
-                        runtime.base_url,
-                        runtime.public_key_fingerprint,
-                        runtime.revoked_at.unwrap_or_default()
-                    );
-                }
-            }
-            Ok(())
-        }
-        "revoke" => {
-            let mut workspace_id = None;
-            let mut runtime_id = None;
-            while let Some(arg) = args.pop_front() {
-                let (flag, inline_value) = split_flag_value(arg)?;
-                match flag.as_str() {
-                    "--workspace-id" => {
-                        workspace_id = Some(take_value(&flag, inline_value, &mut args)?)
-                    }
-                    "--runtime-id" => {
-                        runtime_id = Some(take_value(&flag, inline_value, &mut args)?)
-                    }
-                    _ => {
-                        return Err(Box::new(CliError(format!(
-                            "unknown trust-runtime revoke argument `{flag}`"
-                        ))));
-                    }
-                }
-            }
-            let workspace_id = workspace_id.ok_or_else(|| {
-                CliError("trust-runtime revoke requires --workspace-id".to_string())
-            })?;
-            let runtime_id = runtime_id.ok_or_else(|| {
-                CliError("trust-runtime revoke requires --runtime-id".to_string())
-            })?;
-            let now = Utc::now().to_rfc3339();
-            if !store.revoke_workspace_runtime_binding(&workspace_id, &runtime_id, &now)? {
-                return Err(Box::new(CliError(format!(
-                    "trusted runtime `{runtime_id}` is not registered or is already revoked"
-                ))));
-            }
-            println!("revoked_runtime_id={runtime_id}");
-            Ok(())
-        }
-        _ => Err(Box::new(CliError(format!(
-            "unknown trust-runtime subcommand `{subcommand}`"
-        )))),
-    }
-}
-
-fn split_flag_value(arg: String) -> Result<(String, Option<String>), CliError> {
-    if let Some((flag, value)) = arg.split_once('=') {
-        if flag.is_empty() {
-            return Err(CliError("empty flag name".to_string()));
-        }
-        Ok((flag.to_string(), Some(value.to_string())))
-    } else {
-        Ok((arg, None))
-    }
-}
-
-fn take_value(
-    flag: &str,
-    inline_value: Option<String>,
-    args: &mut VecDeque<String>,
-) -> Result<String, CliError> {
-    if let Some(value) = inline_value {
-        return Ok(value);
-    }
-    args.pop_front()
-        .ok_or_else(|| CliError(format!("{flag} requires a value")))
-}
-
-fn ensure_no_inline_value(flag: &str, inline_value: Option<&str>) -> Result<(), CliError> {
-    if inline_value.is_some() {
-        return Err(CliError(format!("{flag} does not accept a value")));
-    }
-    Ok(())
 }
 
 fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn std::error::Error>> {
@@ -524,6 +151,30 @@ fn load_skill_workspace_config(
             "Workspace `{workspace_id}` has no active config revision"
         ))) as Box<dyn std::error::Error>
     })
+}
+
+fn remote_runtime_config_from_binding(
+    binding: WorkspaceRuntimeBinding,
+) -> Result<Option<RemoteRuntimeConfig>, CliError> {
+    if binding.runtime_id == EMBEDDED_RUNTIME_ID {
+        return Ok(None);
+    }
+    if binding.authentication_mode != WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity {
+        return Err(CliError(format!(
+            "Runtime binding '{}:{}' still uses removed legacy Server-issued authentication",
+            binding.workspace_id, binding.runtime_id
+        )));
+    }
+    Ok(Some(
+        RemoteRuntimeConfig::new(
+            binding.runtime_id,
+            binding.display_name,
+            binding.base_url,
+            None,
+        )
+        .with_workspace_id(binding.workspace_id)
+        .with_strict_public_egress(true),
+    ))
 }
 
 fn run_migrate(options: MigrateOptions) -> Result<(), Box<dyn std::error::Error>> {
@@ -655,33 +306,13 @@ fn append_workspace_runtime_sources(
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-    let Some(server_identity) = read_server_identity_file(&server_identity_path())? else {
-        if !bindings.is_empty() {
-            return Err(Box::new(CliError(
-                "Runtime bindings are registered but server identity is not initialized; run `yoi-server identity init`".to_string(),
-            )));
-        }
-        return Ok(());
-    };
-    for runtime in bindings {
-        let auth = RemoteRuntimeAuthConfig {
-            server_id: server_identity.identity.identity_id.clone(),
-            server_private_key: server_identity.identity.private_key.clone(),
+    for binding in bindings {
+        let Some(remote) = remote_runtime_config_from_binding(binding)? else {
+            continue;
         };
-        let remote = RemoteRuntimeConfig::new(
-            runtime.runtime_id.clone(),
-            runtime.display_name,
-            runtime.base_url,
-            None,
-        )
-        .with_workspace_id(runtime.workspace_id.clone())
-        .with_auth(auth)
-        .with_strict_public_egress(
-            runtime.authentication_mode == WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity,
-        );
         remote_runtime_sources.retain(|existing| {
-            existing.workspace_id.as_deref() != Some(runtime.workspace_id.as_str())
-                || existing.runtime_id != runtime.runtime_id
+            existing.workspace_id.as_deref() != remote.workspace_id.as_deref()
+                || existing.runtime_id != remote.runtime_id
         });
         remote_runtime_sources.push(remote);
     }
@@ -851,7 +482,7 @@ fn parse_listen(value: &str) -> Result<SocketAddr, CliError> {
 
 fn print_help() {
     println!(
-        "yoi-server\n\nUsage:\n  yoi-server identity init --server-id <SERVER_ID> [--replace]\n  yoi-server identity show [--json]\n  yoi-server trust-runtime add --runtime-id <RUNTIME_ID> --workspace-id <WORKSPACE_ID> --base-url <URL> --public-key <KEY> [--display-name <NAME>] [--replace]\n  yoi-server trust-runtime list --workspace-id <WORKSPACE_ID> [--json] [--include-revoked]\n  yoi-server trust-runtime revoke --workspace-id <WORKSPACE_ID> --runtime-id <RUNTIME_ID>\n  yoi-server migrate [--dry-run] [--database <PATH>]\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
+        "yoi-server\n\nUsage:\n  yoi-server migrate [--dry-run] [--database <PATH>]\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
     );
 }
 
@@ -963,64 +594,41 @@ mod tests {
             "unknown serve option `--frontend=/tmp/web`"
         );
     }
-
     #[test]
-    fn server_identity_init_requires_explicit_server_id() {
-        let error = run_identity_command(vec!["init".to_string()]).unwrap_err();
-        assert_eq!(error.to_string(), "identity init requires --server-id");
-    }
-
-    #[test]
-    fn runtime_binding_requires_explicit_replace_for_changed_authority() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("server.db");
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
-        rusqlite::Connection::open(&path)
-            .unwrap()
-            .execute_batch(
-                "INSERT INTO accounts(account_id, kind, handle, display_name, created_at, updated_at)
-                 VALUES ('owner', 'user', 'owner', 'Owner', '1', '1');
-                 INSERT INTO workspaces(workspace_id, owner_account_id, display_name, state, created_at, updated_at)
-                 VALUES ('workspace-a', 'owner', 'Workspace A', 'active', '1', '1');",
-            )
-            .unwrap();
-        let public_key = RuntimeIdentityMaterial::generate("runtime-a")
-            .unwrap()
-            .public_key;
+    fn runtime_startup_rejects_legacy_server_issuer_bindings() {
         let binding = WorkspaceRuntimeBinding {
-            workspace_id: "workspace-a".to_string(),
-            runtime_id: "runtime-a".to_string(),
-            display_name: "Runtime A".to_string(),
-            base_url: "http://127.0.0.1:18080".to_string(),
-            public_key,
-            public_key_fingerprint: String::new(),
+            workspace_id: "workspace-a".to_owned(),
+            runtime_id: "runtime-a".to_owned(),
+            display_name: "Runtime A".to_owned(),
+            base_url: "https://runtime.example.test".to_owned(),
+            public_key: "unused".to_owned(),
+            public_key_fingerprint: "unused".to_owned(),
             binding_revision: 1,
             state: WorkspaceRuntimeBindingState::Verified,
             authentication_mode: WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer,
             workspace_key_id: None,
             workspace_key_generation: None,
-            created_at: "2026-07-26T00:00:00Z".to_string(),
-            updated_at: "2026-07-26T00:00:00Z".to_string(),
+            created_at: "2026-09-01T00:00:00Z".to_owned(),
+            updated_at: "2026-09-01T00:00:00Z".to_owned(),
             revoked_at: None,
         };
-        store
-            .upsert_workspace_runtime_binding(binding.clone(), false)
-            .unwrap();
-        assert!(matches!(
-            store
-                .upsert_workspace_runtime_binding(binding.clone(), false)
-                .unwrap(),
-            yoi_workspace_server::store::WorkspaceRuntimeBindingUpsert::Unchanged
-        ));
-        let mut changed = binding;
-        changed.base_url = "http://127.0.0.1:18081".to_string();
-        assert!(
-            store
-                .upsert_workspace_runtime_binding(changed.clone(), false)
-                .is_err()
+        let error = remote_runtime_config_from_binding(binding)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "Runtime binding 'workspace-a:runtime-a' still uses removed legacy Server-issued authentication"
         );
-        store
-            .upsert_workspace_runtime_binding(changed, true)
-            .unwrap();
+    }
+
+    #[test]
+    fn parse_cli_rejects_removed_server_global_runtime_trust_commands() {
+        for command in ["identity", "trust-runtime"] {
+            let error = parse_command(&[command.to_owned()]).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("unknown command `{command}`; expected `migrate`, `skills`, or `serve`")
+            );
+        }
     }
 }

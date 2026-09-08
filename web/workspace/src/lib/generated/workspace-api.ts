@@ -373,14 +373,9 @@ export type RuntimeVerificationEvidenceSummary = {
   runtime_identity_revision: number;
 };
 
-export type WorkspaceRuntimeAuthenticationMode =
-  | "legacy_server_issuer"
-  | "workspace_identity";
-
 export type WorkspaceRuntimeBindingSummary = {
   state: WorkspaceRuntimeBindingState;
   connection_state: RuntimeConnectionDisplayState;
-  authentication_mode: WorkspaceRuntimeAuthenticationMode;
   revision: number;
   workspace_key_id?: string | null;
   workspace_key_generation?: number | null;
@@ -445,11 +440,6 @@ export type WorkspaceRuntimeDetail = {
 };
 
 export type RuntimeTrustKeyRevealResponse = { public_key: string };
-
-export type PutRuntimeTrustKeyRequest = {
-  public_key: string;
-  expected_revision: number | null;
-};
 
 export type RevokeRuntimeTrustKeyRequest = { expected_revision: number };
 

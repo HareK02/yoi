@@ -1,7 +1,6 @@
 import type {
   CreateRemoteRuntimeRequest,
   Diagnostic,
-  PutRuntimeTrustKeyRequest,
   RevokeRuntimeTrustKeyRequest,
   RuntimeConnectionDisplayState,
   RuntimeIdentityAuthority,
@@ -17,7 +16,6 @@ import type {
   RuntimeTrustKeyState,
   RuntimeTrustKeyStatus,
   RuntimeVerificationEvidenceSummary,
-  WorkspaceRuntimeAuthenticationMode,
   WorkspaceRuntimeBindingState,
   WorkspaceRuntimeBindingSummary,
   WorkspaceRuntimeDetail,
@@ -83,11 +81,6 @@ const CONNECTION_STATES = new Set<RuntimeConnectionDisplayState>([
   "verified",
   "unavailable",
   "revoked",
-]);
-
-const AUTHENTICATION_MODES = new Set<WorkspaceRuntimeAuthenticationMode>([
-  "legacy_server_issuer",
-  "workspace_identity",
 ]);
 
 const encoder = new TextEncoder();
@@ -388,14 +381,9 @@ function runtimeBinding(
   const item = object(value, path);
   exactKeys(
     item,
-    ["state", "connection_state", "authentication_mode", "revision"],
+    ["state", "connection_state", "revision"],
     ["workspace_key_id", "workspace_key_generation", "verification"],
     path,
-  );
-  const authenticationMode = enumValue(
-    item.authentication_mode,
-    `${path}.authentication_mode`,
-    AUTHENTICATION_MODES,
   );
   const workspaceKeyId = optionalNullableString(
     item.workspace_key_id,
@@ -406,22 +394,13 @@ function runtimeBinding(
     item.workspace_key_generation,
     `${path}.workspace_key_generation`,
   );
+  const state = enumValue(item.state, `${path}.state`, BINDING_STATES);
   if (
-    authenticationMode === "workspace_identity" &&
+    state !== "revoked" &&
     (workspaceKeyId == null || workspaceKeyGeneration == null)
   ) {
     return fail(path, "requires Workspace signing key identity metadata");
   }
-  if (
-    authenticationMode === "legacy_server_issuer" &&
-    (workspaceKeyId != null || workspaceKeyGeneration != null)
-  ) {
-    return fail(
-      path,
-      "must not attach Workspace key metadata to legacy authority",
-    );
-  }
-  const state = enumValue(item.state, `${path}.state`, BINDING_STATES);
   const connectionState = enumValue(
     item.connection_state,
     `${path}.connection_state`,
@@ -437,7 +416,6 @@ function runtimeBinding(
     return fail(path, "verification must match the current binding revision");
   }
   if (
-    authenticationMode === "workspace_identity" &&
     connectionState === "verified" &&
     (verification === undefined ||
       verification.verified_at === null ||
@@ -451,7 +429,6 @@ function runtimeBinding(
   return {
     state,
     connection_state: connectionState,
-    authentication_mode: authenticationMode,
     revision,
     ...(workspaceKeyId === undefined
       ? {}
@@ -986,29 +963,6 @@ export async function previewRuntimePublicKeyFingerprint(
   const hex = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0"))
     .join("");
   return `sha256:${hex}`;
-}
-
-export async function putRuntimeTrustKey(
-  workspaceId: string,
-  runtimeId: string,
-  request: PutRuntimeTrustKeyRequest,
-  fetchImpl: typeof fetch = fetch,
-): Promise<WorkspaceRuntimeDetail> {
-  const response = await fetchImpl(
-    workspaceApiPath(
-      workspaceId,
-      `/runtimes/${encodeURIComponent(runtimeId)}/trust-key`,
-    ),
-    {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        public_key: request.public_key,
-        expected_revision: revisionForJson(request.expected_revision),
-      }),
-    },
-  );
-  return await finishMutation(response, workspaceId, runtimeId);
 }
 
 export async function revokeRuntimeTrustKey(

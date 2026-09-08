@@ -1592,14 +1592,6 @@ pub enum WorkspaceRuntimeBindingState {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
-pub enum WorkspaceRuntimeAuthenticationMode {
-    LegacyServerIssuer,
-    WorkspaceIdentity,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
 pub enum RuntimeConnectionDisplayState {
     Configured,
     Verified,
@@ -1642,7 +1634,6 @@ pub struct RuntimeVerificationEvidenceSummary {
 pub struct WorkspaceRuntimeBindingSummary {
     pub state: WorkspaceRuntimeBindingState,
     pub connection_state: RuntimeConnectionDisplayState,
-    pub authentication_mode: WorkspaceRuntimeAuthenticationMode,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
     pub revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1745,16 +1736,6 @@ pub struct WorkspaceRuntimeDetail {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeTrustKeyRevealResponse {
     pub public_key: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct PutRuntimeTrustKeyRequest {
-    pub public_key: String,
-    #[serde(default)]
-    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
-    pub expected_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3026,7 +3007,6 @@ pub fn catalog_typescript() -> String {
         RuntimeConnectionDisplayState::decl(&config),
         RuntimeVerificationOutcome::decl(&config),
         RuntimeVerificationEvidenceSummary::decl(&config),
-        WorkspaceRuntimeAuthenticationMode::decl(&config),
         WorkspaceRuntimeBindingSummary::decl(&config),
         RuntimeManagementSummary::decl(&config),
         WorkspaceRuntimeResource::decl(&config),
@@ -3036,7 +3016,6 @@ pub fn catalog_typescript() -> String {
         RuntimeTrustAuditEntry::decl(&config),
         WorkspaceRuntimeDetail::decl(&config),
         RuntimeTrustKeyRevealResponse::decl(&config),
-        PutRuntimeTrustKeyRequest::decl(&config),
         RevokeRuntimeTrustKeyRequest::decl(&config),
         RuntimeTrustConflictKind::decl(&config),
         RuntimeTrustConflictResponse::decl(&config),
@@ -3866,14 +3845,6 @@ mod tests {
             serde_json::from_value::<RuntimeTrustKeyRevealResponse>(serde_json::json!({
                 "public_key": "yoi-ed25519-pub:v1:key",
                 "private_key": "forbidden"
-            }))
-            .is_err()
-        );
-        assert!(
-            serde_json::from_value::<PutRuntimeTrustKeyRequest>(serde_json::json!({
-                "public_key": "key",
-                "expected_revision": 1,
-                "replace": true
             }))
             .is_err()
         );

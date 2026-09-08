@@ -15,9 +15,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use worker_runtime::auth::{
-    RuntimeHttpAuthConfig, RuntimeIdentityMaterial, TrustedServerKey, decode_public_key,
-};
+use worker_runtime::auth::RuntimeIdentityMaterial;
+#[cfg(test)]
+use worker_runtime::auth::decode_public_key;
 use worker_runtime::error::RuntimeError;
 use worker_runtime::fs_store::{FsRuntimeStore, FsRuntimeStoreOptions};
 use worker_runtime::http_server::{
@@ -81,16 +81,15 @@ fn run() -> Result<(), ProcessError> {
     }
     if matches!(
         args.first().map(String::as_str),
-        Some("identity" | "trust-server" | "trust-workspace")
+        Some("identity" | "trust-workspace")
     ) {
         return run_auth_command(args);
     }
-    let Some(mut config) = parse_args(args)? else {
+    let Some(config) = parse_args(args)? else {
         println!("{}", usage());
         return Ok(());
     };
     init_serve_tracing();
-    config.http.auth = load_runtime_http_auth(&config)?;
     let workspace_http_auth = load_workspace_runtime_http_auth(&config)?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -108,16 +107,19 @@ fn run() -> Result<(), ProcessError> {
                 worker_runtime,
                 listener,
                 config.http.local_token,
-                config.http.auth,
                 workspace_auth,
             )
             .await
         } else {
-            worker_runtime::http_server::serve_runtime_http_with_auth(
+            let local_token = config.http.local_token.ok_or_else(|| {
+                ProcessError::auth(
+                    "Runtime HTTP server requires Workspace issuer auth or --local-token".to_owned(),
+                )
+            })?;
+            worker_runtime::http_server::serve_runtime_http(
                 worker_runtime,
                 listener,
-                config.http.local_token,
-                config.http.auth,
+                Some(local_token),
             )
             .await
         };
@@ -207,12 +209,7 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
         .with_runtime_store_dir(runtime_store_dir);
     let runtime_auth = read_runtime_auth_file(&runtime_auth_path(config))?;
     if let Some(identity) = runtime_auth.identity.clone() {
-        if let [trusted_server] = runtime_auth.trusted_servers.as_slice() {
-            factory =
-                factory.with_runtime_request_identity(identity, trusted_server.server_id.clone());
-        } else {
-            factory = factory.with_remote_worker_mutation_identity(identity);
-        }
+        factory = factory.with_remote_worker_mutation_identity(identity);
     }
     let mut backend_resource_client: Option<
         Arc<dyn worker_runtime::resource::BackendResourceClient>,
@@ -223,9 +220,9 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
                 "--backend-resource-endpoint requires a configured Runtime identity".to_owned(),
             )
         })?;
-        let [trusted_server] = runtime_auth.trusted_servers.as_slice() else {
+        let [workspace_issuer] = runtime_auth.workspace_issuers.as_slice() else {
             return Err(ProcessError::auth(
-                "--backend-resource-endpoint requires exactly one trusted Server identity"
+                "--backend-resource-endpoint requires exactly one trusted Workspace issuer"
                     .to_owned(),
             ));
         };
@@ -234,7 +231,7 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
                 endpoint,
                 config.backend_resource_token.clone(),
             )
-            .with_runtime_request_source(identity, trusted_server.server_id.clone()),
+            .with_runtime_request_source(identity, workspace_issuer.backend_url.clone()),
         );
         factory = factory.with_resource_client(client.clone());
         backend_resource_client = Some(client);
@@ -254,11 +251,10 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
         }
         RuntimeHttpStoreSelection::Fs { root } => {
             let mut options = FsRuntimeStoreOptions::new(root.clone()).with_runtime_id(
-                config
-                    .http
-                    .auth
+                runtime_auth
+                    .identity
                     .as_ref()
-                    .map(|auth| auth.runtime_id.as_str())
+                    .map(|identity| identity.identity_id.as_str())
                     .unwrap_or("local"),
             );
             options.display_name = config.http.display_name.clone();
@@ -548,8 +544,6 @@ struct WorkspaceIssuerTrustListPage {
 struct RuntimeAuthFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     identity: Option<RuntimeIdentityMaterial>,
-    #[serde(default)]
-    trusted_servers: Vec<TrustedServerKey>,
     #[serde(default)]
     workspace_issuers: Vec<WorkspaceIssuerTrustRecord>,
 }
@@ -924,23 +918,6 @@ fn load_workspace_runtime_http_auth(
     }))
 }
 
-fn load_runtime_http_auth(
-    config: &ProcessConfig,
-) -> Result<Option<RuntimeHttpAuthConfig>, ProcessError> {
-    let path = runtime_auth_path(config);
-    let auth = read_runtime_auth_file(&path)?;
-    let Some(identity) = auth.identity else {
-        return Ok(None);
-    };
-    if auth.trusted_servers.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(RuntimeHttpAuthConfig {
-        runtime_id: identity.identity_id,
-        trusted_servers: auth.trusted_servers,
-    }))
-}
-
 fn parse_auth_storage_flags(args: &mut VecDeque<String>) -> Result<ProcessConfig, ProcessError> {
     let mut config = ProcessConfig::default()?;
     while let Some(arg) = args.pop_front() {
@@ -967,7 +944,6 @@ fn run_auth_command(args: Vec<String>) -> Result<(), ProcessError> {
     let command = args.pop_front().unwrap_or_default();
     match command.as_str() {
         "identity" => run_identity_command(args),
-        "trust-server" => run_trust_server_command(args),
         "trust-workspace" => run_trust_workspace_command(args),
         _ => Err(ProcessError::usage(format!(
             "unknown auth command `{command}`"
@@ -1096,187 +1072,6 @@ fn run_identity_command(mut args: VecDeque<String>) -> Result<(), ProcessError> 
     }
 }
 
-fn run_trust_server_command(mut args: VecDeque<String>) -> Result<(), ProcessError> {
-    let subcommand = args.pop_front().ok_or_else(|| {
-        ProcessError::usage(
-            "trust-server requires subcommand `add`, `list`, or `revoke`".to_string(),
-        )
-    })?;
-    match subcommand.as_str() {
-        "add" => {
-            let mut server_id = None;
-            let mut public_key = None;
-            let mut display_name = None;
-            let mut replace = false;
-            let mut rest = VecDeque::new();
-            while let Some(arg) = args.pop_front() {
-                let (flag, inline_value) = split_flag_value(arg)?;
-                match flag.as_str() {
-                    "--server-id" => server_id = Some(take_value(&flag, inline_value, &mut args)?),
-                    "--public-key" => {
-                        public_key = Some(take_value(&flag, inline_value, &mut args)?)
-                    }
-                    "--display-name" => {
-                        display_name = Some(take_value(&flag, inline_value, &mut args)?)
-                    }
-                    "--replace" => {
-                        ensure_no_inline_value(&flag, inline_value.as_deref())?;
-                        replace = true;
-                    }
-                    "--fs-root" | "--fs-runtime-dir" => {
-                        rest.push_back(flag);
-                        if let Some(value) = inline_value {
-                            rest.push_back(value);
-                        } else {
-                            rest.push_back(args.pop_front().ok_or_else(|| {
-                                ProcessError::usage(format!(
-                                    "{} requires a value",
-                                    rest.back().unwrap()
-                                ))
-                            })?);
-                        }
-                    }
-                    _ => {
-                        return Err(ProcessError::usage(format!(
-                            "unknown trust-server add argument `{flag}`"
-                        )));
-                    }
-                }
-            }
-            let config = parse_auth_storage_flags(&mut rest)?;
-            let path = runtime_auth_path(&config);
-            let mut auth = read_runtime_auth_file(&path)?;
-            let server_id = server_id.ok_or_else(|| {
-                ProcessError::usage("trust-server add requires --server-id".to_string())
-            })?;
-            let public_key = public_key.ok_or_else(|| {
-                ProcessError::usage("trust-server add requires --public-key".to_string())
-            })?;
-            decode_public_key(&public_key)
-                .map_err(|error| ProcessError::usage(error.to_string()))?;
-            if auth
-                .trusted_servers
-                .iter()
-                .any(|server| server.server_id == server_id)
-                && !replace
-            {
-                return Err(ProcessError::usage(format!(
-                    "trusted server `{server_id}` already exists; pass --replace to update it"
-                )));
-            }
-            auth.trusted_servers
-                .retain(|server| server.server_id != server_id);
-            auth.trusted_servers.push(TrustedServerKey {
-                server_id: server_id.clone(),
-                public_key,
-                display_name,
-            });
-            write_runtime_auth_file(&path, &auth)?;
-            println!("trusted_server_id={server_id}");
-            println!("auth_file={}", path.display());
-            Ok(())
-        }
-        "list" => {
-            let mut json = false;
-            let mut rest = VecDeque::new();
-            while let Some(arg) = args.pop_front() {
-                let (flag, inline_value) = split_flag_value(arg)?;
-                match flag.as_str() {
-                    "--json" => {
-                        ensure_no_inline_value(&flag, inline_value.as_deref())?;
-                        json = true;
-                    }
-                    "--fs-root" | "--fs-runtime-dir" => {
-                        rest.push_back(flag);
-                        if let Some(value) = inline_value {
-                            rest.push_back(value);
-                        } else {
-                            rest.push_back(args.pop_front().ok_or_else(|| {
-                                ProcessError::usage(format!(
-                                    "{} requires a value",
-                                    rest.back().unwrap()
-                                ))
-                            })?);
-                        }
-                    }
-                    _ => {
-                        return Err(ProcessError::usage(format!(
-                            "unknown trust-server list argument `{flag}`"
-                        )));
-                    }
-                }
-            }
-            let config = parse_auth_storage_flags(&mut rest)?;
-            let auth = read_runtime_auth_file(&runtime_auth_path(&config))?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&auth.trusted_servers)
-                        .map_err(|error| ProcessError::auth(error.to_string()))?
-                );
-            } else {
-                for server in auth.trusted_servers {
-                    println!(
-                        "server_id={} public_key={} display_name={}",
-                        server.server_id,
-                        server.public_key,
-                        server.display_name.unwrap_or_default()
-                    );
-                }
-            }
-            Ok(())
-        }
-        "revoke" => {
-            let mut server_id = None;
-            let mut rest = VecDeque::new();
-            while let Some(arg) = args.pop_front() {
-                let (flag, inline_value) = split_flag_value(arg)?;
-                match flag.as_str() {
-                    "--server-id" => server_id = Some(take_value(&flag, inline_value, &mut args)?),
-                    "--fs-root" | "--fs-runtime-dir" => {
-                        rest.push_back(flag);
-                        if let Some(value) = inline_value {
-                            rest.push_back(value);
-                        } else {
-                            rest.push_back(args.pop_front().ok_or_else(|| {
-                                ProcessError::usage(format!(
-                                    "{} requires a value",
-                                    rest.back().unwrap()
-                                ))
-                            })?);
-                        }
-                    }
-                    _ => {
-                        return Err(ProcessError::usage(format!(
-                            "unknown trust-server revoke argument `{flag}`"
-                        )));
-                    }
-                }
-            }
-            let config = parse_auth_storage_flags(&mut rest)?;
-            let path = runtime_auth_path(&config);
-            let mut auth = read_runtime_auth_file(&path)?;
-            let server_id = server_id.ok_or_else(|| {
-                ProcessError::usage("trust-server revoke requires --server-id".to_string())
-            })?;
-            let before = auth.trusted_servers.len();
-            auth.trusted_servers
-                .retain(|server| server.server_id != server_id);
-            if auth.trusted_servers.len() == before {
-                return Err(ProcessError::usage(format!(
-                    "trusted server `{server_id}` is not registered"
-                )));
-            }
-            write_runtime_auth_file(&path, &auth)?;
-            println!("revoked_server_id={server_id}");
-            Ok(())
-        }
-        _ => Err(ProcessError::usage(format!(
-            "unknown trust-server subcommand `{subcommand}`"
-        ))),
-    }
-}
-
 fn usage() -> &'static str {
     r#"Usage: yoi-runtime [OPTIONS]
        yoi-runtime migrate --dry-run [--runtime-id <ID>] [OPTIONS]
@@ -1302,14 +1097,11 @@ Options:
 Auth commands:
   identity init --runtime-id ID [--replace] [--fs-root PATH] [--fs-runtime-dir PATH]
   identity show [--json] [--fs-root PATH] [--fs-runtime-dir PATH]
-  trust-server add --server-id ID --public-key KEY [--display-name NAME] [--replace] [--fs-root PATH] [--fs-runtime-dir PATH]
-  trust-server list [--json] [--fs-root PATH] [--fs-runtime-dir PATH]
   trust-workspace add --bundle PATH [--fs-root PATH] [--fs-runtime-dir PATH]
   trust-workspace list [--offset N] [--limit N] [--fs-root PATH] [--fs-runtime-dir PATH]
   trust-workspace show --workspace-id ID [--fs-root PATH] [--fs-runtime-dir PATH]
   trust-workspace replace --bundle PATH [--fs-root PATH] [--fs-runtime-dir PATH]
-  trust-workspace revoke --workspace-id ID [--fs-root PATH] [--fs-runtime-dir PATH]
-  trust-server revoke --server-id ID [--fs-root PATH] [--fs-runtime-dir PATH]"#
+  trust-workspace revoke --workspace-id ID [--fs-root PATH] [--fs-runtime-dir PATH]"#
 }
 
 #[cfg(test)]
@@ -1698,6 +1490,35 @@ mod tests {
             read_runtime_auth_file(&path).unwrap_err().to_string(),
             "runtime auth store is too large"
         );
+    }
+
+    #[test]
+    fn legacy_server_trust_entries_are_dropped_when_auth_store_is_rewritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("runtime-auth.toml");
+        let identity = RuntimeIdentityMaterial::generate("runtime-a").unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "identity = {{ identity_id = \"{}\", private_key = \"{}\", public_key = \"{}\" }}\n[[trusted_servers]]\nserver_id = \"removed\"\npublic_key = \"removed\"\n",
+                identity.identity_id, identity.private_key, identity.public_key
+            ),
+        )
+        .unwrap();
+        let auth = read_runtime_auth_file(&path).unwrap();
+        write_runtime_auth_file(&path, &auth).unwrap();
+        let rewritten = std::fs::read_to_string(path).unwrap();
+        assert!(!rewritten.contains("trusted_servers"));
+        assert!(!rewritten.contains("server_id"));
+        assert!(rewritten.contains("identity_id = \"runtime-a\""));
+    }
+
+    #[test]
+    fn removed_server_trust_command_is_rejected() {
+        let error = run_auth_command(vec!["trust-server".to_owned(), "list".to_owned()])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "unknown auth command `trust-server`");
     }
 
     #[test]

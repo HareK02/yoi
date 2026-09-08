@@ -12,10 +12,10 @@ use workspace_api::{
     BrowserCreateWorkerResponse, BrowserWorkspaceOrchestratorResponse,
     CreateWorkspaceWorkerRequest, ListResponse, MemoryDocumentResponse, MemoryStagingListResponse,
     ObjectiveCreateRequest, ObjectiveDetail, ObjectiveEditRequest, ObjectiveLinkTicketRequest,
-    ObjectiveStateRequest, ObjectiveSummary, PutRuntimeTrustKeyRequest,
-    RevokeRuntimeTrustKeyRequest, RuntimeTrustKeyRevealResponse,
-    TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
-    WorkerLaunchOptionsResponse, WorkspaceRuntimeDetail, WorkspaceRuntimeResource,
+    ObjectiveStateRequest, ObjectiveSummary, RevokeRuntimeTrustKeyRequest,
+    RuntimeTrustKeyRevealResponse, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
+    TICKET_RELATIONS_QUERY_PATH, WorkerLaunchOptionsResponse, WorkspaceRuntimeDetail,
+    WorkspaceRuntimeResource,
 };
 
 use crate::{BackendApiClient, BackendWorkspaceClientError};
@@ -264,18 +264,6 @@ impl BackendWorkspaceProductClient {
             "/runtimes/{}/trust-key",
             encode_path_segment(runtime_id)
         ))
-    }
-
-    pub fn put_runtime_trust_key(
-        &self,
-        runtime_id: &str,
-        request: &PutRuntimeTrustKeyRequest,
-    ) -> Result<WorkspaceRuntimeDetail, BackendWorkspaceClientError> {
-        self.send_json(
-            Method::PUT,
-            &format!("/runtimes/{}/trust-key", encode_path_segment(runtime_id)),
-            Some(request),
-        )
     }
 
     pub fn revoke_runtime_trust_key(

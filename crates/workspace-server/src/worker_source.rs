@@ -10,7 +10,6 @@ use worker_runtime::auth::{
 };
 use worker_runtime::worker_source::InProcessWorkerMutationProof;
 
-use crate::hosts::RemoteRuntimeConfig;
 use crate::server::{ServerConfig, WorkspaceApi};
 use crate::store::ControlPlaneStore;
 
@@ -55,7 +54,7 @@ pub async fn verify_runtime_request_source_proof_with_store(
 ) -> Result<VerifiedRuntimeRequestSource, WorkerMutationSourceProofError> {
     let unverified = decode_runtime_request_source_claims(proof)
         .map_err(|_| WorkerMutationSourceProofError::Invalid)?;
-    let audience = remote_audience(config, &unverified.iss, workspace_id)?;
+    let audience = remote_audience(config, workspace_id)?;
     let trusted = store
         .get_workspace_runtime_binding(workspace_id, &unverified.iss)
         .await
@@ -201,7 +200,7 @@ async fn verify_worker_remove_source_with(
         PresentedWorkerMutationSourceProof::Remote(token) => {
             let unverified = decode_worker_mutation_source_claims(token)
                 .map_err(|_| WorkerMutationSourceProofError::Invalid)?;
-            let audience = remote_audience(config, &unverified.iss, &config.workspace_id)?;
+            let audience = remote_audience(config, &config.workspace_id)?;
             let trusted = store
                 .get_workspace_runtime_binding(&config.workspace_id, &unverified.iss)
                 .await
@@ -357,20 +356,19 @@ impl worker_runtime::worker_source::EmbeddedWorkerMutationDispatcher
 }
 
 fn remote_audience<'a>(
-    config: &'a crate::server::ServerConfig,
-    runtime_id: &str,
+    config: &'a ServerConfig,
     workspace_id: &str,
-) -> Result<std::borrow::Cow<'a, str>, WorkerMutationSourceProofError> {
-    if runtime_id == crate::hosts::EMBEDDED_RUNTIME_ID {
-        return Ok(std::borrow::Cow::Owned(format!("embedded:{workspace_id}")));
-    }
+) -> Result<&'a str, WorkerMutationSourceProofError> {
     config
-        .remote_runtime_sources
-        .iter()
-        .find(|runtime| runtime.runtime_id == runtime_id)
-        .and_then(|runtime: &RemoteRuntimeConfig| runtime.auth.as_ref())
-        .map(|auth| std::borrow::Cow::Borrowed(auth.server_id.as_str()))
-        .ok_or(WorkerMutationSourceProofError::RevokedRuntimeTrust)
+        .backend_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|audience| !audience.is_empty())
+        .ok_or_else(|| {
+            WorkerMutationSourceProofError::Authority(format!(
+                "Backend public URL is unavailable for Workspace `{workspace_id}` source proof verification"
+            ))
+        })
 }
 
 fn validate_in_process_claims(

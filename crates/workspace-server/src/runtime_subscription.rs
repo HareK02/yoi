@@ -13,7 +13,6 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{client_async_tls_with_config, connect_async};
-use worker_runtime::auth::{CapabilityTokenSigner, capability_claims};
 
 use crate::hosts::{RemoteRuntimeConfig, resolve_strict_remote_runtime_endpoint};
 
@@ -968,7 +967,7 @@ fn runtime_endpoint(base_url: &str) -> String {
 }
 fn runtime_token(
     config: &RemoteRuntimeConfig,
-    workspace_id: &str,
+    _workspace_id: &str,
 ) -> Result<Option<String>, String> {
     if let Some(authorization) = config.workspace_authorization.as_ref() {
         return authorization
@@ -976,22 +975,7 @@ fn runtime_token(
             .map(Some)
             .map_err(|error| error.message);
     }
-    let Some(auth) = config.auth.as_ref() else {
-        return Ok(config.bearer_token.clone());
-    };
-    let signer = CapabilityTokenSigner::new(&auth.server_id, &auth.server_private_key);
-    let claims = capability_claims(
-        &auth.server_id,
-        &config.runtime_id,
-        workspace_id,
-        vec!["workers:list".into()],
-        300,
-    )
-    .map_err(|error| error.to_string())?;
-    signer
-        .sign(&claims)
-        .map(Some)
-        .map_err(|error| error.to_string())
+    Ok(config.bearer_token.clone())
 }
 fn update_status(status: &RwLock<RuntimeSubscriptionBrokerStatus>, state: &State, connected: bool) {
     *status.write().expect("broker status poisoned") = RuntimeSubscriptionBrokerStatus {

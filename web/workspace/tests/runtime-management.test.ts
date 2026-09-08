@@ -9,7 +9,6 @@ import {
   parseWorkspaceRuntimeDetail,
   parseWorkspaceRuntimeList,
   previewRuntimePublicKeyFingerprint,
-  putRuntimeTrustKey,
   revokeRuntimeTrustKey,
   RuntimeTrustConflictError,
   RuntimeTrustRouteFence,
@@ -43,7 +42,6 @@ function runtime() {
       binding: {
         state: "verified",
         connection_state: "verified",
-        authentication_mode: "workspace_identity",
         revision: 3,
         workspace_key_id: "WK-1",
         workspace_key_generation: 1,
@@ -276,52 +274,6 @@ Deno.test("Runtime public key preview matches the Server fingerprint contract", 
     fingerprint ===
       "sha256:66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
     "fingerprint preview drifted from the Server SHA-256 contract",
-  );
-});
-
-Deno.test("typed trust conflict is validated and preserves authoritative revision", async () => {
-  let sentBody: unknown = null;
-  const fetchImpl = ((_: RequestInfo | URL, init?: RequestInit) => {
-    sentBody = JSON.parse(String(init?.body)) as unknown;
-    return Promise.resolve(
-      new Response(
-        JSON.stringify({
-          error: "stale_revision",
-          message: "Runtime trust changed",
-          current_revision: 4,
-          current_fingerprint: "SHA256:new",
-        }),
-        { status: 409, headers: { "content-type": "application/json" } },
-      ),
-    );
-  }) as typeof fetch;
-
-  try {
-    await putRuntimeTrustKey(
-      "workspace-a",
-      "arcadia",
-      { public_key: "ssh-ed25519 AAAA-new", expected_revision: 3 },
-      fetchImpl,
-    );
-    throw new Error("expected mutation to reject");
-  } catch (error) {
-    assert(
-      error instanceof RuntimeTrustConflictError,
-      "expected typed conflict",
-    );
-    assert(
-      error.conflict.current_revision === 4,
-      "authoritative revision was lost",
-    );
-  }
-
-  assert(
-    JSON.stringify(sentBody) ===
-      JSON.stringify({
-        public_key: "ssh-ed25519 AAAA-new",
-        expected_revision: 3,
-      }),
-    "request should serialize the generated bigint revision as a safe JSON integer",
   );
 });
 

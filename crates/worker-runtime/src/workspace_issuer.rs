@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use workspace_api::WorkspacePublicIdentityBundle;
 
-use crate::auth::{RuntimeAuthContext, RuntimeAuthError, RuntimeHttpAuthConfig};
+use crate::auth::RuntimeAuthError;
 
 const WORKSPACE_TOKEN_PREFIX: &str = "yoi-workspace-v1";
 const WORKSPACE_SIGNING_INPUT_PREFIX: &str = "yoi.workspace.capability.v1.";
@@ -1408,68 +1408,6 @@ pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     output
 }
 
-pub enum RuntimeCapabilityVerifier {
-    LegacyServer(RuntimeHttpAuthConfig),
-    WorkspaceIssuer(WorkspaceCapabilityVerifier),
-}
-
-pub enum RuntimeCapabilityVerification<'a> {
-    LegacyServer {
-        required_permission: Option<&'a str>,
-        now_seconds: u64,
-    },
-    WorkspaceIssuer(WorkspaceCapabilityExpectation<'a>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VerifiedRuntimeCapability {
-    LegacyServer(RuntimeAuthContext),
-    WorkspaceIssuer(VerifiedWorkspaceCapability),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum RuntimeCapabilityVerificationError {
-    #[error("Runtime capability verifier mode does not match the verification request")]
-    ModeMismatch,
-    #[error(transparent)]
-    LegacyServer(#[from] RuntimeAuthError),
-    #[error(transparent)]
-    WorkspaceIssuer(#[from] WorkspaceCapabilityVerificationError),
-}
-
-impl RuntimeCapabilityVerifier {
-    pub fn verify(
-        &self,
-        token: &str,
-        verification: RuntimeCapabilityVerification<'_>,
-    ) -> Result<VerifiedRuntimeCapability, RuntimeCapabilityVerificationError> {
-        match (self, verification) {
-            (
-                Self::LegacyServer(config),
-                RuntimeCapabilityVerification::LegacyServer {
-                    required_permission,
-                    now_seconds,
-                },
-            ) => crate::auth::verify_capability_token(
-                config,
-                token,
-                required_permission,
-                now_seconds,
-            )
-            .map(VerifiedRuntimeCapability::LegacyServer)
-            .map_err(Into::into),
-            (
-                Self::WorkspaceIssuer(verifier),
-                RuntimeCapabilityVerification::WorkspaceIssuer(expectation),
-            ) => verifier
-                .verify(token, &expectation)
-                .map(VerifiedRuntimeCapability::WorkspaceIssuer)
-                .map_err(Into::into),
-            _ => Err(RuntimeCapabilityVerificationError::ModeMismatch),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1760,54 +1698,6 @@ mod tests {
                 .unwrap_err(),
             WorkspaceCapabilityVerificationError::IssuerRevoked
         );
-    }
-
-    #[test]
-    fn verifier_selection_never_falls_back_between_legacy_and_workspace_authority() {
-        assert_eq!(
-            WorkspaceCapabilityVerifier::new(
-                Vec::new(),
-                Arc::new(InMemoryWorkspaceClaimReplayProtection::default()),
-            )
-            .unwrap_err(),
-            WorkspaceCapabilityVerificationError::TrustAuthorityMissing
-        );
-        let (key, bundle) = identity("workspace-1", "WK-1", 1);
-        let record = WorkspaceIssuerTrustRecord::from_bundle(bundle, 1, 1).unwrap();
-        let workspace = RuntimeCapabilityVerifier::WorkspaceIssuer(
-            WorkspaceCapabilityVerifier::new(
-                vec![record.clone()],
-                Arc::new(InMemoryWorkspaceClaimReplayProtection::default()),
-            )
-            .unwrap(),
-        );
-        let token = issue_workspace_capability_token(&key, &claims(&record, "typed-mode")).unwrap();
-        assert!(matches!(
-            workspace.verify(
-                &token,
-                RuntimeCapabilityVerification::LegacyServer {
-                    required_permission: None,
-                    now_seconds: 1_001,
-                },
-            ),
-            Err(RuntimeCapabilityVerificationError::ModeMismatch)
-        ));
-        assert!(matches!(
-            RuntimeCapabilityVerifier::WorkspaceIssuer(
-                WorkspaceCapabilityVerifier::new(
-                    vec![record],
-                    Arc::new(InMemoryWorkspaceClaimReplayProtection::default()),
-                )
-                .unwrap(),
-            )
-            .verify(
-                &token,
-                RuntimeCapabilityVerification::WorkspaceIssuer(expectation(
-                    &workspace_request_body_digest(br#"{"content":"hello"}"#),
-                )),
-            ),
-            Ok(VerifiedRuntimeCapability::WorkspaceIssuer(_))
-        ));
     }
 
     #[test]

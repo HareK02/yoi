@@ -29,7 +29,6 @@ use workdir::{
     http::{OpenWorkdirSessionRequest, RemoteWorkdirSession, WorkdirHttpAuthorization},
 };
 use worker_runtime::RuntimeWorkspaceScope;
-use worker_runtime::auth::{CapabilityTokenSigner, capability_claims};
 use worker_runtime::catalog::{
     ConfigBundleRef, CreateWorkerRequest, ProfileSelector, ProfileSourceArchiveSource,
     RepositoryRefObservation, RepositoryRefObservationRequest,
@@ -2927,7 +2926,6 @@ pub struct RemoteRuntimeConfig {
     pub display_name: String,
     pub base_url: String,
     pub bearer_token: Option<String>,
-    pub auth: Option<RemoteRuntimeAuthConfig>,
     pub workspace_authorization: Option<WorkspaceRuntimeAuthorization>,
     pub strict_public_egress: bool,
     pub cached_worker_creation_available: bool,
@@ -3099,12 +3097,6 @@ impl WorkspaceRuntimeAuthorization {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RemoteRuntimeAuthConfig {
-    pub server_id: String,
-    pub server_private_key: String,
-}
-
 impl std::fmt::Debug for RemoteRuntimeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemoteRuntimeConfig")
@@ -3115,7 +3107,6 @@ impl std::fmt::Debug for RemoteRuntimeConfig {
                 "bearer_token",
                 &self.bearer_token.as_ref().map(|_| "<redacted>"),
             )
-            .field("auth", &self.auth.as_ref().map(|_| "<capability-signer>"))
             .field("strict_public_egress", &self.strict_public_egress)
             .field(
                 "cached_worker_creation_available",
@@ -3142,7 +3133,6 @@ impl RemoteRuntimeConfig {
             display_name: display_name.into(),
             base_url: base_url.into(),
             bearer_token,
-            auth: None,
             workspace_authorization: None,
             strict_public_egress: false,
             cached_worker_creation_available: false,
@@ -3155,11 +3145,6 @@ impl RemoteRuntimeConfig {
 
     pub fn with_workspace_id(mut self, workspace_id: impl Into<String>) -> Self {
         self.workspace_id = Some(workspace_id.into());
-        self
-    }
-
-    pub fn with_auth(mut self, auth: RemoteRuntimeAuthConfig) -> Self {
-        self.auth = Some(auth);
         self
     }
 
@@ -3181,9 +3166,6 @@ impl RemoteRuntimeConfig {
 
 #[derive(Clone)]
 struct RemoteWorkdirAuthorization {
-    runtime_id: String,
-    workspace_id: String,
-    auth: Option<RemoteRuntimeAuthConfig>,
     workspace_authorization: Option<WorkspaceRuntimeAuthorization>,
     fallback_bearer_token: Option<String>,
 }
@@ -3192,9 +3174,6 @@ impl std::fmt::Debug for RemoteWorkdirAuthorization {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RemoteWorkdirAuthorization")
-            .field("runtime_id", &self.runtime_id)
-            .field("workspace_id", &self.workspace_id)
-            .field("auth", &self.auth.as_ref().map(|_| "capability_token"))
             .field(
                 "fallback_bearer_token",
                 &self.fallback_bearer_token.as_ref().map(|_| "configured"),
@@ -3220,19 +3199,6 @@ impl WorkdirHttpAuthorization for RemoteWorkdirAuthorization {
                     body,
                 )
                 .map_err(|error| WorkdirError::Unavailable(error.message));
-        }
-        if let Some(auth) = self.auth.as_ref() {
-            let claims = capability_claims(
-                &auth.server_id,
-                &self.runtime_id,
-                &self.workspace_id,
-                all_remote_runtime_permissions(),
-                300,
-            )
-            .map_err(|error| WorkdirError::Unavailable(error.to_string()))?;
-            return CapabilityTokenSigner::new(&auth.server_id, &auth.server_private_key)
-                .sign(&claims)
-                .map_err(|error| WorkdirError::Unavailable(error.to_string()));
         }
         self.fallback_bearer_token.clone().ok_or_else(|| {
             WorkdirError::Unavailable(
@@ -3350,7 +3316,6 @@ pub struct RemoteWorkerRuntime {
     base_url: String,
     workspace_id: String,
     bearer_token: Option<String>,
-    auth: Option<RemoteRuntimeAuthConfig>,
     workspace_authorization: Option<WorkspaceRuntimeAuthorization>,
     cached_worker_creation_available: bool,
     cached_os: String,
@@ -3467,22 +3432,6 @@ fn worker_id_from_remote_path(path_and_query: &str) -> Option<String> {
     (!worker_id.is_empty()).then(|| worker_id.to_string())
 }
 
-fn all_remote_runtime_permissions() -> Vec<String> {
-    [
-        "workers:list",
-        "workers:create",
-        "workers:read",
-        "workers:delete",
-        "workers:input",
-        "workers:stop",
-        "workers:protocol",
-        "workdirs:operate",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
-}
-
 impl RemoteWorkerRuntime {
     pub fn new(
         config: RemoteRuntimeConfig,
@@ -3546,7 +3495,6 @@ impl RemoteWorkerRuntime {
             base_url,
             workspace_id,
             bearer_token: config.bearer_token,
-            auth: config.auth,
             workspace_authorization: config.workspace_authorization,
             cached_worker_creation_available: config.cached_worker_creation_available,
             cached_os: config.cached_os,
@@ -3573,9 +3521,6 @@ impl RemoteWorkerRuntime {
         let workdir_id = Workdir::new(working_directory_id).id().clone();
         let authorization: Arc<dyn WorkdirHttpAuthorization> =
             Arc::new(RemoteWorkdirAuthorization {
-                runtime_id: self.runtime_id.clone(),
-                workspace_id: self.workspace_id.clone(),
-                auth: self.auth.clone(),
                 workspace_authorization: self.workspace_authorization.clone(),
                 fallback_bearer_token: self.bearer_token.clone(),
             });
@@ -3708,44 +3653,6 @@ impl RemoteWorkerRuntime {
         self.send_json(path, "DELETE", &[], self.http.delete(self.endpoint(path)))
     }
 
-    fn runtime_capability_token_with_permissions(
-        &self,
-        path: &str,
-        permissions: Vec<String>,
-    ) -> Option<String> {
-        let auth = self.auth.as_ref()?;
-        let signer = CapabilityTokenSigner::new(&auth.server_id, &auth.server_private_key);
-        let claims = capability_claims(
-            &auth.server_id,
-            &self.runtime_id,
-            &self.workspace_id,
-            permissions,
-            300,
-        )
-        .map_err(|error| {
-            eprintln!(
-                "failed to build Runtime capability claims for {} {}: {error}",
-                self.runtime_id, path
-            );
-            error
-        })
-        .ok()?;
-        signer
-            .sign(&claims)
-            .map_err(|error| {
-                eprintln!(
-                    "failed to sign Runtime capability token for {} {}: {error}",
-                    self.runtime_id, path
-                );
-                error
-            })
-            .ok()
-    }
-
-    fn runtime_capability_token(&self, path: &str) -> Option<String> {
-        self.runtime_capability_token_with_permissions(path, all_remote_runtime_permissions())
-    }
-
     fn ping_http(&self) -> Result<RuntimeHttpPingResponse, RuntimePingFailure> {
         const PATH: &str = "/v1/ping";
         let workspace_id = self.workspace_id.clone();
@@ -3762,10 +3669,7 @@ impl RemoteWorkerRuntime {
                         )
                     })?,
             ),
-            None => self.runtime_capability_token_with_permissions(
-                PATH,
-                vec![RUNTIME_PING_PERMISSION.to_string()],
-            ),
+            None => None,
         };
         let request = self
             .http
@@ -3852,7 +3756,7 @@ impl RemoteWorkerRuntime {
                 worker_id_from_remote_path(path).as_deref(),
                 body,
             )?),
-            None => self.runtime_capability_token(path),
+            None => None,
         };
         run_blocking_http(move || {
             let request = request
@@ -4560,9 +4464,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Some(authorization) => authorization
                 .issue("GET", &path, "workers:protocol", Some(worker_id), &[])
                 .ok(),
-            None => self
-                .runtime_capability_token(&path)
-                .or_else(|| self.bearer_token.clone()),
+            None => self.bearer_token.clone(),
         };
         Some(crate::observation::RuntimeObservationSource::remote_ws(
             crate::observation::RuntimeObservationSourceConfig {
