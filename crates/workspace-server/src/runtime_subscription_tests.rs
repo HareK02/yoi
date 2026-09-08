@@ -19,6 +19,10 @@ impl WorkerExecutionBackend for TestExecutionBackend {
     fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
         WorkerExecutionSpawnResult::connected(
             WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
+            protocol::WorkerStateSnapshot {
+                execution_generation: request.run_generation,
+                ..protocol::WorkerStatus::Idle.into()
+            },
             None,
         )
     }
@@ -174,12 +178,18 @@ async fn equal_downstream_selectors_share_one_upstream_subscription() {
     .await;
     assert_eq!(status.desired_selectors, 1);
 
+    let mut running = worker
+        .worker_state
+        .clone()
+        .expect("connected test Worker must expose its initial state");
+    running.revision += 1;
+    running.state = protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+        protocol::WorkerRunState::Running,
+    ));
     runtime
         .observe_worker_event(
             &worker.worker_ref,
-            protocol::Event::WorkerState {
-                snapshot: protocol::WorkerStatus::Running.into(),
-            },
+            protocol::Event::WorkerState { snapshot: running },
         )
         .unwrap();
     for subscription in [&mut first, &mut second] {
@@ -334,12 +344,18 @@ async fn embedded_runtime_uses_in_process_subscription_source() {
         workers[0].runtime_id.as_deref(),
         Some("embedded-worker-runtime")
     );
+    let mut running = worker
+        .worker_state
+        .clone()
+        .expect("connected test Worker must expose its initial state");
+    running.revision += 1;
+    running.state = protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+        protocol::WorkerRunState::Running,
+    ));
     runtime
         .observe_worker_event(
             &worker.worker_ref,
-            protocol::Event::WorkerState {
-                snapshot: protocol::WorkerStatus::Running.into(),
-            },
+            protocol::Event::WorkerState { snapshot: running },
         )
         .unwrap();
     assert!(matches!(next_event(&mut subscription).await,

@@ -28,6 +28,11 @@ Deno.test("Runtime Settings routes validate unknown JSON through the shared Runt
     "Runtime list loader should validate unknown JSON",
   );
   assert(
+    listLoader.includes('"/settings/signing-identity"') &&
+      !listLoader.includes("/settings/workspace"),
+    "Runtime list loader should use the canonical Workspace signing identity route",
+  );
+  assert(
     detailLoader.includes("parseWorkspaceRuntimeDetail(value)"),
     "Runtime detail loader should validate unknown JSON",
   );

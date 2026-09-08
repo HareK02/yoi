@@ -377,6 +377,7 @@ function runtimeVerification(
 function runtimeBinding(
   value: unknown,
   path: string,
+  requiresWorkspaceIdentity: boolean,
 ): WorkspaceRuntimeBindingSummary {
   const item = object(value, path);
   exactKeys(
@@ -396,6 +397,7 @@ function runtimeBinding(
   );
   const state = enumValue(item.state, `${path}.state`, BINDING_STATES);
   if (
+    requiresWorkspaceIdentity &&
     state !== "revoked" &&
     (workspaceKeyId == null || workspaceKeyGeneration == null)
   ) {
@@ -416,6 +418,7 @@ function runtimeBinding(
     return fail(path, "verification must match the current binding revision");
   }
   if (
+    requiresWorkspaceIdentity &&
     connectionState === "verified" &&
     (verification === undefined ||
       verification.verified_at === null ||
@@ -457,11 +460,12 @@ function runtimeManagement(
     ["binding"],
     path,
   );
+  const builtIn = boolean(item.built_in, `${path}.built_in`);
   const binding = item.binding == null
     ? undefined
-    : runtimeBinding(item.binding, `${path}.binding`);
+    : runtimeBinding(item.binding, `${path}.binding`, !builtIn);
   return {
-    built_in: boolean(item.built_in, `${path}.built_in`),
+    built_in: builtIn,
     config_managed: boolean(item.config_managed, `${path}.config_managed`),
     removable: boolean(item.removable, `${path}.removable`),
     endpoint_configured: boolean(

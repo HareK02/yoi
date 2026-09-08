@@ -519,7 +519,7 @@ export async function fetchWorkspaceMetadata(
   workspaceId: string,
 ): Promise<WorkspaceMetadataSettingsResponse> {
   return await parseResponse(
-    await fetch(`/api/w/${encodeURIComponent(workspaceId)}/settings/workspace`),
+    await fetch(`/api/w/${encodeURIComponent(workspaceId)}/settings`),
     parseWorkspaceMetadataSettingsResponse,
   );
 }
@@ -530,7 +530,7 @@ export async function updateWorkspaceMetadata(
 ): Promise<WorkspaceMetadataMutationResponse> {
   return await parseResponse(
     await fetch(
-      `/api/w/${encodeURIComponent(workspaceId)}/settings/workspace`,
+      `/api/w/${encodeURIComponent(workspaceId)}/settings`,
       {
         method: "PUT",
         headers: { "content-type": "application/json" },
@@ -546,9 +546,7 @@ export async function fetchWorkspaceSigningIdentity(
 ): Promise<WorkspaceSigningIdentityResponse> {
   return await parseResponse(
     await fetch(
-      `/api/w/${
-        encodeURIComponent(workspaceId)
-      }/settings/workspace/signing-identity`,
+      `/api/w/${encodeURIComponent(workspaceId)}/settings/signing-identity`,
     ),
     parseWorkspaceSigningIdentityResponse,
   );
@@ -561,7 +559,7 @@ export async function provisionWorkspaceSigningIdentity(
     await fetch(
       `/api/w/${
         encodeURIComponent(workspaceId)
-      }/settings/workspace/signing-identity/provision`,
+      }/settings/signing-identity/provision`,
       { method: "POST" },
     ),
     parseWorkspaceSigningIdentityResponse,

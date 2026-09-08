@@ -24,6 +24,10 @@ Deno.test("settings section navigation stays under the settings route", () => {
     settingsSectionHref("configuration-sources") === "/settings/configuration",
     "shared configuration editor route should stay canonical",
   );
+  assert(
+    settingsSectionHref("workspace-identity") === "/settings",
+    "Workspace identity should use the settings root without a redundant workspace segment",
+  );
 
   for (const section of SETTINGS_SECTIONS) {
     const href = settingsSectionHref(section.id);
@@ -54,7 +58,9 @@ Deno.test("settings shell advertises scoped account authority", () => {
 });
 
 Deno.test("Repository settings expose the canonical list and Add route", () => {
-  const section = SETTINGS_SECTIONS.find((entry) => entry.id === "repositories");
+  const section = SETTINGS_SECTIONS.find((entry) =>
+    entry.id === "repositories"
+  );
   assert(section?.status === "editable", "Repositories should be editable");
   assert(
     settingsSectionHref("repositories") === "/settings/repositories",

@@ -3277,6 +3277,28 @@ pub(crate) fn resolve_strict_remote_runtime_endpoint(
     Ok((host, addresses))
 }
 
+/// Returns whether `endpoint` is a credential-free HTTP(S) origin on a literal
+/// IPv4 or IPv6 loopback address.
+pub fn is_loopback_runtime_origin(endpoint: &str) -> bool {
+    let Ok(endpoint) = reqwest::Url::parse(endpoint.trim()) else {
+        return false;
+    };
+    if !matches!(endpoint.scheme(), "http" | "https")
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+        || endpoint.path() != "/"
+    {
+        return false;
+    }
+    endpoint
+        .host_str()
+        .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+        .and_then(|host| host.parse::<IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback())
+}
+
 pub(crate) fn is_disallowed_remote_runtime_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
@@ -5326,6 +5348,23 @@ mod tests {
     }
 
     #[test]
+    fn loopback_runtime_origin_accepts_only_literal_clean_http_or_https_origins() {
+        assert!(is_loopback_runtime_origin("http://127.0.0.1:8788"));
+        assert!(is_loopback_runtime_origin("https://127.0.0.1"));
+        assert!(is_loopback_runtime_origin("http://[::1]:8788"));
+        for endpoint in [
+            "http://localhost:8788",
+            "http://10.0.0.1:8788",
+            "http://127.0.0.1:8788/path",
+            "http://127.0.0.1:8788/?query=1",
+            "http://user@127.0.0.1:8788",
+            "ftp://127.0.0.1:8788",
+        ] {
+            assert!(!is_loopback_runtime_origin(endpoint), "{endpoint}");
+        }
+    }
+
+    #[test]
     fn remote_worker_create_timeout_covers_runtime_phase_budgets() {
         assert!(REMOTE_WORKER_CREATE_TIMEOUT > Duration::from_secs(60 + 10 + 5));
     }
@@ -5712,6 +5751,10 @@ mod tests {
                     request.worker_ref,
                     self.backend_id(),
                 ),
+                worker_state: protocol::WorkerStateSnapshot {
+                    execution_generation: request.run_generation,
+                    ..protocol::WorkerStatus::Idle.into()
+                },
                 working_directory: request
                     .working_directory
                     .as_ref()

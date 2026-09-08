@@ -19,7 +19,7 @@ export const load: PageLoad = async ({ fetch, params }) => {
 
   const signingIdentity = await loadJson(
     fetch,
-    workspaceApiPath(params.workspaceId, "/signing-identity"),
+    workspaceApiPath(params.workspaceId, "/settings/signing-identity"),
     undefined,
     (value) => {
       const response = parseWorkspaceSigningIdentityResponse(value);

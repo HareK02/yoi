@@ -1548,6 +1548,10 @@ where
                 ));
             }
         };
+        let connected_worker_state = worker_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         workers.insert(
             worker_ref.clone(),
             RuntimeWorkerExecution {
@@ -1560,6 +1564,7 @@ where
 
         WorkerExecutionSpawnResult::Connected {
             handle: WorkerExecutionHandle::new(worker_ref, self.backend_id()),
+            worker_state: connected_worker_state,
             working_directory: working_directory.map(|binding| binding.status()),
         }
     }

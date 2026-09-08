@@ -46,6 +46,10 @@ Deno.test('Worker list state uses the authoritative live snapshot separately fro
 
   const unavailable = worker('runtime-a', 'worker-2', 1);
   assertEquals(liveWorkerState(unavailable), 'unknown');
+  assertEquals(
+    liveWorkerState({ ...unavailable, state: 'missing' }),
+    'missing',
+  );
   unavailable.state = 'stopped';
   assertEquals(liveWorkerState(unavailable), 'stopped');
 });

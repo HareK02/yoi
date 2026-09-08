@@ -18,7 +18,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 56;
+const LATEST_SCHEMA_VERSION: i64 = 57;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -28,6 +28,8 @@ const WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME: &str =
     "Workspace Runtime binding state and identity mode";
 const WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME: &str =
     "Workspace-signed Runtime verification evidence";
+const LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME: &str =
+    "convert legacy Server-issued Runtime bindings to Workspace identity";
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -59,6 +61,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 56,
         name: WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME,
         apply: migrate_workspace_runtime_verification_v55_to_v56,
+    },
+    Migration {
+        version: 57,
+        name: LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME,
+        apply: migrate_legacy_external_runtime_bindings_v56_to_v57,
     },
 ];
 
@@ -6970,7 +6977,13 @@ fn normalize_workspace_runtime_binding_key(record: &mut WorkspaceRuntimeBinding)
         WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer => {
             if record.workspace_key_id.is_some() || record.workspace_key_generation.is_some() {
                 return Err(Error::InvalidInput(
-                    "legacy Server issuer Runtime bindings must not carry Workspace key metadata"
+                    "legacy Runtime bindings must not carry Workspace key metadata".into(),
+                ));
+            }
+            #[cfg(not(test))]
+            if record.runtime_id != crate::hosts::EMBEDDED_RUNTIME_ID {
+                return Err(Error::InvalidInput(
+                    "legacy Server issuer authentication is reserved for the embedded Runtime"
                         .into(),
                 ));
             }
@@ -7789,14 +7802,11 @@ fn migrate_workspace_runtime_bindings_v50_to_v51(conn: &Connection) -> Result<()
                     ));
                 }
                 all_workspace_ids.clone()
+            } else if let Some(workspace_id) = workspace_id.filter(|value| !value.trim().is_empty())
+            {
+                vec![workspace_id]
             } else {
-                vec![workspace_id
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| {
-                        Error::Store(format!(
-                            "Runtime `{runtime_id}` has no persisted Workspace ownership; refusing to guess during schema-50 migration"
-                        ))
-                    })?]
+                continue;
             };
             let (public_key, fingerprint) = normalize_runtime_public_key(&public_key)?;
             for workspace_id in workspace_ids {
@@ -7871,11 +7881,9 @@ fn migrate_workspace_runtime_bindings_v50_to_v51(conn: &Connection) -> Result<()
         })?;
         for row in rows {
             let (runtime_id, jti, expires_at, consumed_at) = row?;
-            let workspace_ids = runtime_workspaces.get(runtime_id.as_str()).ok_or_else(|| {
-                Error::Store(format!(
-                    "consumed Worker mutation proof for Runtime `{runtime_id}` has no provable Workspace binding"
-                ))
-            })?;
+            let Some(workspace_ids) = runtime_workspaces.get(runtime_id.as_str()) else {
+                continue;
+            };
             for workspace_id in workspace_ids {
                 consumed_jtis.push((
                     (*workspace_id).to_string(),
@@ -8307,6 +8315,93 @@ fn migrate_workspace_runtime_verification_v55_to_v56(conn: &Connection) -> Resul
     Ok(())
 }
 
+fn migrate_legacy_external_runtime_bindings_v56_to_v57(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 56 {
+        return Err(Error::Store(format!(
+            "expected schema version 56 before {LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    let missing_workspace_identity_count = tx.query_row(
+        "SELECT COUNT(*)
+         FROM workspace_runtime_bindings binding
+         LEFT JOIN workspace_signing_identities identity
+           ON identity.workspace_id = binding.workspace_id
+         WHERE binding.authentication_mode = 'legacy_server_issuer'
+           AND binding.runtime_id <> ?1
+           AND identity.workspace_id IS NULL",
+        params![crate::hosts::EMBEDDED_RUNTIME_ID],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if missing_workspace_identity_count != 0 {
+        return Err(Error::Store(
+            "legacy external Runtime binding migration requires Workspace signing identity metadata"
+                .to_string(),
+        ));
+    }
+    tx.execute(
+        "DELETE FROM workspace_runtime_verifications
+         WHERE EXISTS (
+             SELECT 1 FROM workspace_runtime_bindings binding
+             WHERE binding.workspace_id = workspace_runtime_verifications.workspace_id
+               AND binding.runtime_id = workspace_runtime_verifications.runtime_id
+               AND binding.authentication_mode = 'legacy_server_issuer'
+               AND binding.runtime_id <> ?1
+         )",
+        params![crate::hosts::EMBEDDED_RUNTIME_ID],
+    )?;
+    tx.execute(
+        "UPDATE workspace_runtime_bindings
+         SET state = CASE WHEN state = 'verified' THEN 'configured' ELSE state END,
+             authentication_mode = 'workspace_identity',
+             workspace_key_id = (
+                 SELECT identity.key_id FROM workspace_signing_identities identity
+                 WHERE identity.workspace_id = workspace_runtime_bindings.workspace_id
+             ),
+             workspace_key_generation = (
+                 SELECT identity.revision FROM workspace_signing_identities identity
+                 WHERE identity.workspace_id = workspace_runtime_bindings.workspace_id
+             )
+         WHERE authentication_mode = 'legacy_server_issuer'
+           AND runtime_id <> ?1",
+        params![crate::hosts::EMBEDDED_RUNTIME_ID],
+    )?;
+    let remaining_external_legacy_bindings = tx.query_row(
+        "SELECT COUNT(*) FROM workspace_runtime_bindings
+         WHERE authentication_mode = 'legacy_server_issuer'
+           AND runtime_id <> ?1",
+        params![crate::hosts::EMBEDDED_RUNTIME_ID],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if remaining_external_legacy_bindings != 0 {
+        return Err(Error::Store(
+            "legacy Server-issued external Runtime bindings remain after schema-57 migration"
+                .to_string(),
+        ));
+    }
+    verify_workspace_runtime_binding_schema(&tx)?;
+    verify_workspace_runtime_verification_schema(&tx)?;
+    let foreign_key_violations =
+        tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+    if foreign_key_violations != 0 {
+        return Err(Error::Store(format!(
+            "schema-57 Runtime binding migration left {foreign_key_violations} foreign-key violation(s)"
+        )));
+    }
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![
+            57_i64,
+            LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn verify_workspace_runtime_verification_schema(conn: &Connection) -> Result<()> {
     let actual = table_columns(conn, "workspace_runtime_verifications")?
         .into_iter()
@@ -8496,6 +8591,8 @@ fn verify_workspace_runtime_binding_schema(conn: &Connection) -> Result<()> {
             "SELECT COUNT(*) FROM workspace_runtime_bindings
              WHERE state NOT IN ('configured', 'verified', 'revoked')
                 OR authentication_mode NOT IN ('legacy_server_issuer', 'workspace_identity')
+                OR (authentication_mode = 'legacy_server_issuer' AND
+                    (workspace_key_id IS NOT NULL OR workspace_key_generation IS NOT NULL))
                 OR (authentication_mode = 'workspace_identity' AND
                     (workspace_key_id IS NULL OR workspace_key_generation IS NULL))
                 OR (state = 'revoked' AND revoked_at IS NULL)
@@ -8633,6 +8730,22 @@ fn verify_workspace_runtime_binding_schema(conn: &Connection) -> Result<()> {
 }
 
 fn verify_canonical_workspace_runtime_binding(binding: WorkspaceRuntimeBinding) -> Result<()> {
+    if binding.authentication_mode == WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer {
+        if binding.workspace_key_id.is_some() || binding.workspace_key_generation.is_some() {
+            return Err(Error::Store(format!(
+                "legacy Runtime binding `{}/{}` carries Workspace key metadata",
+                binding.workspace_id, binding.runtime_id
+            )));
+        }
+        let (canonical_key, fingerprint) = normalize_runtime_public_key(&binding.public_key)?;
+        if canonical_key != binding.public_key || fingerprint != binding.public_key_fingerprint {
+            return Err(Error::Store(format!(
+                "Runtime binding `{}/{}` has non-canonical trust content",
+                binding.workspace_id, binding.runtime_id
+            )));
+        }
+        return Ok(());
+    }
     let mut normalized = binding.clone();
     normalize_workspace_runtime_binding_key(&mut normalized)?;
     if normalized.public_key != binding.public_key
@@ -9427,6 +9540,10 @@ mod tests {
                     version: 56,
                     name: WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 57,
+                    name: LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -9457,6 +9574,10 @@ mod tests {
                             56,
                             WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME.to_string(),
                         ),
+                        (
+                            57,
+                            LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME.to_string(),
+                        ),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -9476,17 +9597,18 @@ mod tests {
                         [],
                         |row| row.get::<_, String>(0),
                     )?,
-                    "verified:legacy_server_issuer"
+                    "configured:workspace_identity"
                 );
-                assert!(
-                    conn.execute(
-                        "UPDATE workspace_runtime_bindings
-                         SET state='configured', authentication_mode='workspace_identity'
-                         WHERE workspace_id='workspace-a' AND runtime_id='shared'",
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM workspace_runtime_bindings
+                         WHERE workspace_id='workspace-a' AND runtime_id='shared'
+                           AND workspace_key_id IS NOT NULL
+                           AND workspace_key_generation IS NOT NULL",
                         [],
-                    )
-                    .is_err(),
-                    "migrated schema must reject Workspace identity mode without key metadata"
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    1
                 );
                 assert_eq!(
                     conn.query_row(
@@ -9526,7 +9648,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![52, 53, 54, 55, 56]
+            vec![52, 53, 54, 55, 56, 57]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
@@ -9534,7 +9656,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 7);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 8);
     }
 
     #[test]
@@ -9594,23 +9716,47 @@ mod tests {
     }
 
     #[test]
-    fn schema_v50_dry_run_rejects_unscoped_external_runtime_without_mutating_source() {
+    fn schema_v50_discards_unscoped_external_runtime_without_guessing_ownership() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
         prepare_schema_v50(&path, None);
 
-        let error = SqliteWorkspaceStore::migration_plan(&path).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("has no persisted Workspace ownership; refusing to guess"),
-            "{error}"
-        );
+        let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
+        assert_eq!(plan.current_schema_version, 50);
+        assert_eq!(plan.target_schema_version, LATEST_SCHEMA_VERSION);
 
         let unchanged = Connection::open(&path).unwrap();
         assert_eq!(current_schema_version(&unchanged).unwrap(), 50);
         assert!(table_exists(&unchanged, "trusted_runtime_records").unwrap());
         assert!(!table_exists(&unchanged, "workspace_runtime_bindings").unwrap());
+        drop(unchanged);
+
+        SqliteWorkspaceStore::migrate_database(&path).unwrap();
+        let migrated = Connection::open(&path).unwrap();
+        assert_eq!(
+            current_schema_version(&migrated).unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
+        assert_eq!(
+            migrated
+                .query_row(
+                    "SELECT COUNT(*) FROM workspace_runtime_bindings WHERE runtime_id = 'shared'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            migrated
+                .query_row(
+                    "SELECT COUNT(*) FROM worker_mutation_source_proof_jtis WHERE runtime_id = 'shared'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -9803,9 +9949,9 @@ mod tests {
             public_key_fingerprint: String::new(),
             binding_revision: 1,
             state: WorkspaceRuntimeBindingState::Verified,
-            authentication_mode: WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer,
-            workspace_key_id: None,
-            workspace_key_generation: None,
+            authentication_mode: WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity,
+            workspace_key_id: Some(format!("WK-{}", &workspace_id["workspace-".len()..])),
+            workspace_key_generation: Some(1),
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
             revoked_at: None,
@@ -10080,6 +10226,171 @@ mod tests {
         configure_sqlite(&migrated).unwrap();
         assert_eq!(current_schema_version(&migrated).unwrap(), 56);
         assert!(table_exists(&migrated, "workspace_runtime_verifications").unwrap());
+    }
+
+    #[test]
+    fn schema_v56_converts_legacy_external_binding_and_preserves_embedded() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        prepare_schema_v50(&path, Some("workspace-a"));
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > 50 && migration.version <= 56)
+        {
+            (migration.apply)(&conn).unwrap();
+        }
+        assert_eq!(current_schema_version(&conn).unwrap(), 56);
+        let external_identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate("legacy-external").unwrap();
+        let embedded_identity = worker_runtime::auth::RuntimeIdentityMaterial::generate(
+            crate::hosts::EMBEDDED_RUNTIME_ID,
+        )
+        .unwrap();
+        let (_, external_fingerprint) =
+            normalize_runtime_public_key(&external_identity.public_key).unwrap();
+        let (_, embedded_fingerprint) =
+            normalize_runtime_public_key(&embedded_identity.public_key).unwrap();
+        conn.execute(
+            r#"INSERT INTO workspace_runtime_bindings(
+                   workspace_id, runtime_id, display_name, base_url, public_key,
+                   public_key_fingerprint, created_at, updated_at, revoked_at, state,
+                   authentication_mode, workspace_key_id, workspace_key_generation,
+                   binding_revision
+               ) VALUES (
+                   'workspace-a', 'legacy-external', 'Legacy External', 'https://runtime.test',
+                   ?1, ?2, '1', '1', NULL, 'verified', 'legacy_server_issuer', NULL, NULL, 1
+               )"#,
+            params![external_identity.public_key, external_fingerprint],
+        )
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO workspace_runtime_bindings(
+                   workspace_id, runtime_id, display_name, base_url, public_key,
+                   public_key_fingerprint, created_at, updated_at, revoked_at, state,
+                   authentication_mode, workspace_key_id, workspace_key_generation,
+                   binding_revision
+               ) VALUES (
+                   'workspace-a', 'embedded-worker-runtime', 'Embedded', 'embedded://runtime',
+                   ?1, ?2, '1', '1', NULL, 'verified', 'legacy_server_issuer', NULL, NULL, 1
+               )"#,
+            params![embedded_identity.public_key, embedded_fingerprint],
+        )
+        .unwrap();
+        conn.execute_batch(
+            r#"
+            INSERT INTO workspace_runtime_binding_audit(
+                workspace_id, runtime_id, actor_account_id, action,
+                old_fingerprint, new_fingerprint, binding_revision, at
+            ) VALUES
+                ('workspace-a', 'legacy-external', 'owner', 'created', NULL, 'legacy', 1, '1'),
+                ('workspace-a', 'embedded-worker-runtime', 'owner', 'created', NULL, 'embedded', 1, '1');
+            INSERT INTO worker_mutation_source_proof_jtis(
+                workspace_id, runtime_id, jti, expires_at, consumed_at
+            ) VALUES
+                ('workspace-a', 'legacy-external', 'legacy-jti', 10, '1'),
+                ('workspace-a', 'embedded-worker-runtime', 'embedded-jti', 10, '1');
+            INSERT INTO workspace_runtime_verifications(
+                workspace_id, runtime_id, binding_revision, workspace_key_id,
+                workspace_identity_revision, workspace_trust_generation,
+                runtime_public_key_fingerprint, runtime_identity_revision,
+                challenge_id, state, last_outcome, verified_at, checked_at
+            ) VALUES (
+                'workspace-a', 'legacy-external', 1, 'legacy-workspace-key',
+                1, 1, 'legacy-runtime-key', 1,
+                'legacy-challenge', 'verified', 'legacy', '1', '1'
+            );
+            "#,
+        )
+        .unwrap();
+
+        migrate_legacy_external_runtime_bindings_v56_to_v57(&conn).unwrap();
+
+        assert_eq!(current_schema_version(&conn).unwrap(), 57);
+        let workspace_identity: (String, i64) = conn
+            .query_row(
+                "SELECT key_id, revision FROM workspace_signing_identities WHERE workspace_id = 'workspace-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let external_binding: (String, String, String, i64) = conn
+            .query_row(
+                "SELECT state, authentication_mode, workspace_key_id, workspace_key_generation
+                 FROM workspace_runtime_bindings WHERE runtime_id = 'legacy-external'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            external_binding,
+            (
+                "configured".to_string(),
+                "workspace_identity".to_string(),
+                workspace_identity.0,
+                workspace_identity.1,
+            )
+        );
+        let embedded_binding: (String, String, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT state, authentication_mode, workspace_key_id, workspace_key_generation
+                 FROM workspace_runtime_bindings WHERE runtime_id = 'embedded-worker-runtime'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            embedded_binding,
+            (
+                "verified".to_string(),
+                "legacy_server_issuer".to_string(),
+                None,
+                None,
+            )
+        );
+        for table in [
+            "workspace_runtime_binding_audit",
+            "worker_mutation_source_proof_jtis",
+        ] {
+            for runtime_id in ["legacy-external", "embedded-worker-runtime"] {
+                let count: i64 = conn
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE runtime_id = ?1"),
+                        params![runtime_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 1, "{table}:{runtime_id}");
+            }
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM workspace_runtime_verifications WHERE runtime_id = 'legacy-external'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM workspace_runtime_bindings
+                 WHERE authentication_mode = 'legacy_server_issuer'
+                   AND runtime_id <> 'embedded-worker-runtime'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -11401,14 +11712,18 @@ INSERT INTO worker_registry (
     fn server_refuses_a_database_from_a_newer_schema_generation() {
         let conn = Connection::open_in_memory().unwrap();
         configure_sqlite(&conn).unwrap();
+        let future_version = LATEST_SCHEMA_VERSION + 1;
         conn.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (57, 'future')",
-            [],
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, 'future')",
+            params![future_version],
         )
         .unwrap();
 
         let error = apply_migrations(&conn).unwrap_err().to_string();
-        assert!(error.contains("schema version 57 is newer"), "{error}");
+        assert!(
+            error.contains(&format!("schema version {future_version} is newer")),
+            "{error}"
+        );
         assert!(error.contains("refusing to serve"), "{error}");
     }
 

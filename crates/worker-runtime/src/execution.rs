@@ -287,6 +287,7 @@ pub enum WorkspaceConfigFetchResult {
 pub enum WorkerExecutionSpawnResult {
     Connected {
         handle: WorkerExecutionHandle,
+        worker_state: protocol::WorkerStateSnapshot,
         working_directory: Option<WorkingDirectoryStatus>,
     },
     Rejected(WorkerExecutionResult),
@@ -296,10 +297,12 @@ pub enum WorkerExecutionSpawnResult {
 impl WorkerExecutionSpawnResult {
     pub fn connected(
         handle: WorkerExecutionHandle,
+        worker_state: protocol::WorkerStateSnapshot,
         working_directory: Option<WorkingDirectoryStatus>,
     ) -> Self {
         Self::Connected {
             handle,
+            worker_state,
             working_directory,
         }
     }

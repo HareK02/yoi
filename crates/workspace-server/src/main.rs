@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use tokio::net::TcpListener;
-use yoi_workspace_server::hosts::{EMBEDDED_RUNTIME_ID, RemoteRuntimeConfig};
+use yoi_workspace_server::hosts::{
+    EMBEDDED_RUNTIME_ID, RemoteRuntimeConfig, is_loopback_runtime_origin,
+};
 use yoi_workspace_server::store::{
     SqliteWorkspaceStore, WorkspaceRuntimeAuthenticationMode, WorkspaceRuntimeBinding,
     WorkspaceRuntimeBindingState,
@@ -165,6 +167,7 @@ fn remote_runtime_config_from_binding(
             binding.workspace_id, binding.runtime_id
         )));
     }
+    let strict_public_egress = !is_loopback_runtime_origin(&binding.base_url);
     Ok(Some(
         RemoteRuntimeConfig::new(
             binding.runtime_id,
@@ -173,7 +176,7 @@ fn remote_runtime_config_from_binding(
             None,
         )
         .with_workspace_id(binding.workspace_id)
-        .with_strict_public_egress(true),
+        .with_strict_public_egress(strict_public_egress),
     ))
 }
 
@@ -619,6 +622,33 @@ mod tests {
             error,
             "Runtime binding 'workspace-a:runtime-a' still uses removed legacy Server-issued authentication"
         );
+    }
+
+    #[test]
+    fn runtime_startup_uses_non_strict_transport_for_literal_loopback_origin() {
+        let binding = WorkspaceRuntimeBinding {
+            workspace_id: "workspace-a".to_owned(),
+            runtime_id: "arcadia".to_owned(),
+            display_name: "Arcadia".to_owned(),
+            base_url: "http://127.0.0.1:8788".to_owned(),
+            public_key: "unused".to_owned(),
+            public_key_fingerprint: "unused".to_owned(),
+            binding_revision: 1,
+            state: WorkspaceRuntimeBindingState::Verified,
+            authentication_mode: WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity,
+            workspace_key_id: Some("WK-test".to_owned()),
+            workspace_key_generation: Some(1),
+            created_at: "2026-09-01T00:00:00Z".to_owned(),
+            updated_at: "2026-09-01T00:00:00Z".to_owned(),
+            revoked_at: None,
+        };
+
+        let config = remote_runtime_config_from_binding(binding)
+            .unwrap()
+            .expect("remote Runtime config");
+
+        assert_eq!(config.base_url, "http://127.0.0.1:8788");
+        assert!(!config.strict_public_egress);
     }
 
     #[test]

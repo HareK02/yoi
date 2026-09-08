@@ -890,11 +890,12 @@ impl Runtime {
         };
 
         let spawn_result = backend.spawn_worker(spawn_request);
-        let (handle, working_directory) = match spawn_result {
+        let (handle, initial_worker_state, working_directory) = match spawn_result {
             WorkerExecutionSpawnResult::Connected {
                 handle,
+                worker_state,
                 working_directory,
-            } => (handle, working_directory),
+            } => (handle, worker_state, working_directory),
             WorkerExecutionSpawnResult::Rejected(result)
             | WorkerExecutionSpawnResult::Errored(result) => {
                 self.rollback_failed_create(&worker_ref)?;
@@ -950,6 +951,7 @@ impl Runtime {
             let detail = match self.commit_created_worker(
                 &worker_ref,
                 handle.clone(),
+                initial_worker_state.clone(),
                 working_directory,
                 dispatch_result,
             ) {
@@ -968,6 +970,7 @@ impl Runtime {
             match self.commit_created_worker(
                 &worker_ref,
                 handle.clone(),
+                initial_worker_state,
                 working_directory,
                 WorkerExecutionResult::accepted(WorkerExecutionOperation::Spawn),
             ) {
@@ -1260,11 +1263,13 @@ impl Runtime {
         match backend.restore_worker(request) {
             WorkerExecutionSpawnResult::Connected {
                 handle,
+                worker_state,
                 working_directory,
             } => {
                 self.commit_restored_worker_execution(
                     worker_ref,
                     handle,
+                    worker_state,
                     WorkerStatus::Idle,
                     working_directory,
                 )?;
@@ -1656,6 +1661,7 @@ impl Runtime {
         &self,
         worker_ref: &WorkerRef,
         handle: WorkerExecutionHandle,
+        initial_worker_state: protocol::WorkerStateSnapshot,
         working_directory: Option<CatalogWorkingDirectoryStatus>,
         result: WorkerExecutionResult,
     ) -> Result<WorkerDetail, RuntimeError> {
@@ -1665,7 +1671,7 @@ impl Runtime {
             worker.execution_handle = Some(handle);
             worker.execution_bound = true;
             worker.status = WorkerStatus::Idle;
-            worker.worker_state = None;
+            let _ = worker.apply_worker_state(&initial_worker_state);
             if let Some(snapshot) = result.worker_state.as_ref() {
                 let _ = worker.apply_worker_state(snapshot);
             }
@@ -2192,10 +2198,12 @@ impl Runtime {
             match backend.restore_worker(request) {
                 WorkerExecutionSpawnResult::Connected {
                     handle,
+                    worker_state,
                     working_directory,
                 } => self.commit_restored_worker_execution(
                     &candidate.worker_ref,
                     handle,
+                    worker_state,
                     WorkerStatus::Idle,
                     working_directory,
                 )?,
@@ -2213,6 +2221,7 @@ impl Runtime {
         &self,
         worker_ref: &WorkerRef,
         handle: WorkerExecutionHandle,
+        worker_state: protocol::WorkerStateSnapshot,
         status: WorkerStatus,
         working_directory: Option<CatalogWorkingDirectoryStatus>,
     ) -> Result<(), RuntimeError> {
@@ -2223,6 +2232,7 @@ impl Runtime {
             worker.execution_handle = Some(handle);
             worker.execution_bound = true;
             worker.status = status;
+            let _ = worker.apply_worker_state(&worker_state);
             worker.restore_intent = restore_intent_for_status(worker.status);
             worker.working_directory = working_directory;
         }
@@ -4325,6 +4335,10 @@ mod tests {
                 .insert(request.worker_ref.worker_id.clone(), request.context);
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
+                worker_state: protocol::WorkerStateSnapshot {
+                    execution_generation: request.run_generation,
+                    ..protocol::WorkerStatus::Idle.into()
+                },
                 working_directory: request
                     .working_directory
                     .as_ref()
@@ -4354,6 +4368,10 @@ mod tests {
                 .insert(request.worker_ref.worker_id.clone(), request.context);
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
+                worker_state: protocol::WorkerStateSnapshot {
+                    execution_generation: request.run_generation,
+                    ..protocol::WorkerStatus::Idle.into()
+                },
                 working_directory: request
                     .working_directory
                     .as_ref()
@@ -5135,7 +5153,27 @@ mod tests {
         let detail = runtime.create_worker(request).unwrap();
 
         assert_eq!(detail.status, WorkerStatus::Idle);
-        assert_eq!(detail.worker_state, None);
+        assert_eq!(
+            detail.worker_state.as_ref().map(|snapshot| &snapshot.state),
+            Some(&protocol::WorkerState::Idle)
+        );
+    }
+
+    #[test]
+    fn restored_worker_exposes_the_backend_initial_state_snapshot() {
+        let (runtime, _) = runtime_and_backend();
+        let created = runtime
+            .create_worker(task_request("restore initial state"))
+            .unwrap();
+        runtime.stop_worker(&created.worker_ref, None).unwrap();
+
+        let restored = runtime.restore_worker(&created.worker_ref).unwrap();
+
+        let worker_state = restored
+            .worker_state
+            .expect("restored Worker must expose its initial state");
+        assert_eq!(worker_state.execution_generation, 2);
+        assert_eq!(worker_state.state, protocol::WorkerState::Idle);
     }
 
     #[test]
@@ -5414,6 +5452,10 @@ mod tests {
         fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
+                worker_state: protocol::WorkerStateSnapshot {
+                    execution_generation: request.run_generation,
+                    ..protocol::WorkerStatus::Idle.into()
+                },
                 working_directory: request
                     .working_directory
                     .as_ref()
@@ -5513,7 +5555,13 @@ mod tests {
         assert_eq!(*backend.run_generations.lock().unwrap(), vec![1, 2]);
         let restored = runtime.worker_detail(&detail.worker_ref).unwrap();
         assert_eq!(restored.status, WorkerStatus::Idle);
-        assert_eq!(restored.worker_state, None);
+        assert_eq!(
+            restored
+                .worker_state
+                .as_ref()
+                .map(|snapshot| (snapshot.execution_generation, &snapshot.state)),
+            Some((2, &protocol::WorkerState::Idle))
+        );
     }
 
     #[test]

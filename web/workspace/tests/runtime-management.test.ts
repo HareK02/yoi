@@ -129,6 +129,33 @@ Deno.test("Runtime list and detail parsers return generated Runtime DTO shapes",
   );
 });
 
+Deno.test("Runtime list parser accepts the built-in Runtime's internal binding", () => {
+  const embedded = runtime();
+  embedded.runtime_id = "embedded";
+  embedded.label = "Embedded Runtime";
+  embedded.kind = "embedded";
+  embedded.management.built_in = true;
+  embedded.management.endpoint_configured = false;
+  const binding = embedded.management.binding as Partial<
+    typeof embedded.management.binding
+  >;
+  delete binding.workspace_key_id;
+  delete binding.workspace_key_generation;
+  delete binding.verification;
+
+  const list = parseWorkspaceRuntimeList({
+    workspace_id: "workspace-a",
+    limit: 200,
+    items: [embedded],
+    source: "workspace-control-plane",
+    diagnostics: [],
+  });
+  assert(
+    list.items[0]?.management.binding?.connection_state === "verified",
+    "built-in Runtime binding was not preserved",
+  );
+});
+
 Deno.test("Runtime management parser rejects Workspace identity bindings without key metadata", () => {
   const payload = detail();
   const binding = payload.runtime.management.binding as Partial<

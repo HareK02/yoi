@@ -134,7 +134,7 @@ export function settingsSectionHref(id: SettingsSectionId): string {
     case "profile-sources":
       return `${SETTINGS_ROUTE}/profiles`;
     case "workspace-identity":
-      return `${SETTINGS_ROUTE}/workspace`;
+      return SETTINGS_ROUTE;
   }
 }
 

@@ -2992,6 +2992,10 @@ mod tests {
         fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
+                worker_state: protocol::WorkerStateSnapshot {
+                    execution_generation: request.run_generation,
+                    ..protocol::WorkerStatus::Idle.into()
+                },
                 working_directory: request
                     .working_directory
                     .as_ref()
@@ -3005,6 +3009,10 @@ mod tests {
         ) -> WorkerExecutionSpawnResult {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
+                worker_state: protocol::WorkerStateSnapshot {
+                    execution_generation: request.run_generation,
+                    ..protocol::WorkerStatus::Idle.into()
+                },
                 working_directory: request.previous_working_directory,
             }
         }
@@ -3313,6 +3321,10 @@ mod ws_tests {
         fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
+                worker_state: protocol::WorkerStateSnapshot {
+                    execution_generation: request.run_generation,
+                    ..protocol::WorkerStatus::Idle.into()
+                },
                 working_directory: request
                     .working_directory
                     .as_ref()
@@ -3575,11 +3587,23 @@ mod ws_tests {
             worker_ref.worker_id.to_string()
         );
 
+        let running_snapshot = |worker_ref: &WorkerRef| {
+            let mut snapshot = runtime
+                .worker_detail(worker_ref)
+                .unwrap()
+                .worker_state
+                .expect("connected test Worker must expose its initial state");
+            snapshot.revision += 1;
+            snapshot.state = protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                protocol::WorkerRunState::Running,
+            ));
+            snapshot
+        };
         runtime
             .observe_worker_event(
                 &other.worker_ref,
                 protocol::Event::WorkerState {
-                    snapshot: protocol::WorkerStatus::Running.into(),
+                    snapshot: running_snapshot(&other.worker_ref),
                 },
             )
             .unwrap();
@@ -3587,7 +3611,7 @@ mod ws_tests {
             .observe_worker_event(
                 &worker_ref,
                 protocol::Event::WorkerState {
-                    snapshot: protocol::WorkerStatus::Running.into(),
+                    snapshot: running_snapshot(&worker_ref),
                 },
             )
             .unwrap();

@@ -135,7 +135,7 @@ use crate::hosts::{
     WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult,
     WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerTicketAssignmentRequest,
     WorkerWorkspaceSummary, WorkspaceRuntimeAuthorization, is_disallowed_remote_runtime_address,
-    worker_spawn_create_fingerprint, workspace_worker_summary,
+    is_loopback_runtime_origin, worker_spawn_create_fingerprint, workspace_worker_summary,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
@@ -3014,15 +3014,15 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         .route("/api/workspace", get(get_workspace))
         .route("/api/w/{workspace_id}/workspace", get(scoped_get_workspace))
         .route(
-            "/api/w/{workspace_id}/settings/workspace",
+            "/api/w/{workspace_id}/settings",
             get(scoped_get_workspace_settings).put(scoped_update_workspace_settings),
         )
         .route(
-            "/api/w/{workspace_id}/settings/workspace/signing-identity",
+            "/api/w/{workspace_id}/settings/signing-identity",
             get(scoped_get_workspace_signing_identity),
         )
         .route(
-            "/api/w/{workspace_id}/settings/workspace/signing-identity/provision",
+            "/api/w/{workspace_id}/settings/signing-identity/provision",
             post(scoped_provision_workspace_signing_identity),
         )
         .route(
@@ -16312,61 +16312,65 @@ async fn validate_runtime_connection_request(
     let endpoint = Url::parse(request.endpoint.trim()).map_err(|_| {
         settings_bad_request(
             "invalid_remote_runtime_endpoint",
-            "endpoint must be an absolute https URL",
+            "endpoint must be an absolute HTTP or HTTPS URL",
         )
     })?;
-    if endpoint.scheme() != "https"
-        || endpoint.host_str().is_none()
+    let local_loopback = is_loopback_runtime_origin(endpoint.as_str());
+    if endpoint.host_str().is_none()
         || !endpoint.username().is_empty()
         || endpoint.password().is_some()
         || endpoint.query().is_some()
         || endpoint.fragment().is_some()
+        || endpoint.path() != "/"
+        || (!local_loopback && endpoint.scheme() != "https")
     {
         return Err(settings_bad_request(
             "remote_runtime_endpoint_not_allowed",
-            "Runtime endpoint must be an https origin without credentials, query, or fragment",
+            "Runtime endpoint must be a public HTTPS origin or a loopback HTTP origin without credentials, path, query, or fragment",
         ));
     }
-    let host = endpoint.host_str().expect("checked above");
-    if host.eq_ignore_ascii_case("localhost")
-        || host.ends_with(".localhost")
-        || host
-            .parse::<IpAddr>()
-            .is_ok_and(is_disallowed_remote_runtime_address)
-    {
-        return Err(settings_bad_request(
-            "remote_runtime_endpoint_not_allowed",
-            "Runtime endpoint resolves to a loopback, private, link-local, metadata, or otherwise non-public address",
-        ));
-    }
-    let port = endpoint.port_or_known_default().unwrap_or(443);
-    let addresses = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        tokio::net::lookup_host((host, port)),
-    )
-    .await
-    .map_err(|_| {
-        settings_bad_request(
-            "remote_runtime_endpoint_dns_timeout",
-            "Runtime endpoint DNS resolution timed out",
+    if !local_loopback {
+        let host = endpoint.host_str().expect("checked above");
+        if host.eq_ignore_ascii_case("localhost")
+            || host.ends_with(".localhost")
+            || host
+                .parse::<IpAddr>()
+                .is_ok_and(is_disallowed_remote_runtime_address)
+        {
+            return Err(settings_bad_request(
+                "remote_runtime_endpoint_not_allowed",
+                "Runtime endpoint resolves to a loopback, private, link-local, metadata, or otherwise non-public address",
+            ));
+        }
+        let port = endpoint.port_or_known_default().unwrap_or(443);
+        let addresses = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::net::lookup_host((host, port)),
         )
-    })?
-    .map_err(|_| {
-        settings_bad_request(
-            "remote_runtime_endpoint_dns_failed",
-            "Runtime endpoint DNS resolution failed",
-        )
-    })?
-    .collect::<Vec<_>>();
-    if addresses.is_empty()
-        || addresses
-            .iter()
-            .any(|address| is_disallowed_remote_runtime_address(address.ip()))
-    {
-        return Err(settings_bad_request(
-            "remote_runtime_endpoint_not_allowed",
-            "Runtime endpoint resolves to a loopback, private, link-local, metadata, or otherwise non-public address",
-        ));
+        .await
+        .map_err(|_| {
+            settings_bad_request(
+                "remote_runtime_endpoint_dns_timeout",
+                "Runtime endpoint DNS resolution timed out",
+            )
+        })?
+        .map_err(|_| {
+            settings_bad_request(
+                "remote_runtime_endpoint_dns_failed",
+                "Runtime endpoint DNS resolution failed",
+            )
+        })?
+        .collect::<Vec<_>>();
+        if addresses.is_empty()
+            || addresses
+                .iter()
+                .any(|address| is_disallowed_remote_runtime_address(address.ip()))
+        {
+            return Err(settings_bad_request(
+                "remote_runtime_endpoint_not_allowed",
+                "Runtime endpoint resolves to a loopback, private, link-local, metadata, or otherwise non-public address",
+            ));
+        }
     }
     if request
         .display_name
@@ -16412,7 +16416,8 @@ fn remote_runtime_config_from_binding(
     )
     .with_workspace_id(binding.workspace_id.clone())
     .with_strict_public_egress(
-        binding.authentication_mode == StoredRuntimeAuthenticationMode::WorkspaceIdentity,
+        binding.authentication_mode == StoredRuntimeAuthenticationMode::WorkspaceIdentity
+            && !is_loopback_runtime_origin(&binding.base_url),
     );
     Ok(remote)
 }
@@ -20505,15 +20510,29 @@ mod tests {
         };
         assert!(validate_runtime_connection_request(&ok).await.is_ok());
 
-        let bad_endpoint = CreateRemoteRuntimeRequest {
-            endpoint: "http://169.254.169.254/latest/meta-data".to_string(),
-            ..ok
+        let loopback = CreateRemoteRuntimeRequest {
+            endpoint: "http://127.0.0.1:8788".to_string(),
+            ..ok.clone()
         };
-        assert!(
-            validate_runtime_connection_request(&bad_endpoint)
-                .await
-                .is_err()
-        );
+        assert!(validate_runtime_connection_request(&loopback).await.is_ok());
+
+        for endpoint in [
+            "http://10.0.0.1:8788",
+            "http://localhost:8788",
+            "http://127.0.0.1:8788/runtime",
+            "http://169.254.169.254/latest/meta-data",
+        ] {
+            let bad_endpoint = CreateRemoteRuntimeRequest {
+                endpoint: endpoint.to_string(),
+                ..ok.clone()
+            };
+            assert!(
+                validate_runtime_connection_request(&bad_endpoint)
+                    .await
+                    .is_err(),
+                "{endpoint}"
+            );
+        }
     }
 
     #[test]
@@ -20683,6 +20702,10 @@ mod tests {
                     request.worker_ref,
                     self.backend_id(),
                 ),
+                worker_state: protocol::WorkerStateSnapshot {
+                    execution_generation: request.run_generation,
+                    ..protocol::WorkerStatus::Idle.into()
+                },
                 working_directory,
             }
         }
@@ -21480,7 +21503,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&listed_body).contains("documentation"));
 
         let identity_uri = format!(
-            "/api/w/{}/settings/workspace/signing-identity",
+            "/api/w/{}/settings/signing-identity",
             workspace.workspace.workspace_id
         );
         let identity_response = app
@@ -21511,6 +21534,33 @@ mod tests {
         let identity_text = String::from_utf8(identity_body.to_vec()).unwrap();
         assert!(!identity_text.contains("private_key"));
         assert!(!identity_text.contains("private_material_ref"));
+        for legacy_uri in [
+            format!(
+                "/api/w/{}/settings/workspace",
+                workspace.workspace.workspace_id
+            ),
+            format!(
+                "/api/w/{}/settings/workspace/signing-identity",
+                workspace.workspace.workspace_id
+            ),
+        ] {
+            let legacy_response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(legacy_uri)
+                        .header(
+                            axum::http::header::COOKIE,
+                            "yoi_workspace_session=browser-session-auth",
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(legacy_response.status(), StatusCode::NOT_FOUND);
+        }
         let identity_non_owner = app
             .clone()
             .oneshot(
@@ -21582,10 +21632,7 @@ mod tests {
             pending_identity.key_id
         );
 
-        let settings_uri = format!(
-            "/api/w/{}/settings/workspace",
-            workspace.workspace.workspace_id
-        );
+        let settings_uri = format!("/api/w/{}/settings", workspace.workspace.workspace_id);
         let csrf_rejected = app
             .clone()
             .oneshot(

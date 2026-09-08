@@ -26,10 +26,12 @@ function assertThrows<T extends Error>(
 import {
   fetchProfileSettings,
   fetchWorkspaceMetadata,
+  fetchWorkspaceSigningIdentity,
   parseProfileSettingsResponse,
   parseWorkspaceMetadataSettingsResponse,
   parseWorkspaceSigningIdentityResponse,
   ProfileApiError,
+  provisionWorkspaceSigningIdentity,
   updateWorkspaceMetadata,
 } from "../src/lib/workspace/settings/profile-api.ts";
 
@@ -127,14 +129,45 @@ Deno.test("workspace metadata requests use generated DTO shapes", async () => {
       "workspace 1",
     );
     assertEquals(requests.map((request) => request.url), [
-      "/api/w/workspace%201/settings/workspace",
-      "/api/w/workspace%201/settings/workspace",
+      "/api/w/workspace%201/settings",
+      "/api/w/workspace%201/settings",
     ]);
     assertEquals(requests[1].init?.method, "PUT");
     assertEquals(
       requests[1].init?.body,
       JSON.stringify({ display_name: "Renamed", revision: "sha256:metadata" }),
     );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+Deno.test("Workspace signing identity requests use flat settings routes", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  globalThis.fetch = (input: string | URL | Request, init?: RequestInit) => {
+    requests.push({ url: String(input), init });
+    return Promise.resolve(Response.json({
+      identity: {
+        workspace_id: "workspace 1",
+        key_id: "workspace-signing-key",
+        algorithm: "ed25519",
+        revision: 1,
+        state: "pending_provisioning",
+        created_at: "2026-01-01T00:00:00Z",
+      },
+    }));
+  };
+
+  try {
+    await fetchWorkspaceSigningIdentity("workspace 1");
+    await provisionWorkspaceSigningIdentity("workspace 1");
+    assertEquals(requests.map((request) => request.url), [
+      "/api/w/workspace%201/settings/signing-identity",
+      "/api/w/workspace%201/settings/signing-identity/provision",
+    ]);
+    assertEquals(requests[0].init, undefined);
+    assertEquals(requests[1].init?.method, "POST");
   } finally {
     globalThis.fetch = originalFetch;
   }

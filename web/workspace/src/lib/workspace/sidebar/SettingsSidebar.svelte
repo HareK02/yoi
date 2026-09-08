@@ -1,6 +1,7 @@
 <script lang="ts">
   import { workspaceRoute } from '$lib/workspace/api/http';
   import { SETTINGS_SECTIONS, settingsSectionHref } from '$lib/workspace/settings/model';
+  import type { SettingsSectionId } from '$lib/workspace/settings/model';
   import type { SidebarSnippet } from './context';
 
   let {
@@ -17,8 +18,9 @@
     return workspaceId ? workspaceRoute(workspaceId, path) : path;
   }
 
-  function isActive(href: string): boolean {
-    return currentPath === href || currentPath.startsWith(`${href}/`);
+  function isActive(href: string, sectionId: SettingsSectionId): boolean {
+    return currentPath === href ||
+      (sectionId !== 'workspace-identity' && currentPath.startsWith(`${href}/`));
   }
 </script>
 
@@ -32,10 +34,10 @@
           {#each SETTINGS_SECTIONS as section}
             {@const href = sectionHref(settingsSectionHref(section.id))}
             <a
-              class:active={isActive(href)}
+              class:active={isActive(href, section.id)}
               class="sidebar-link"
               href={href}
-              aria-current={isActive(href) ? 'page' : undefined}
+              aria-current={isActive(href, section.id) ? 'page' : undefined}
             >
               <span class="sidebar-link-label">{section.label}</span>
             </a>
