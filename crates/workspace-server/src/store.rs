@@ -771,6 +771,13 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         &self,
         evidence: &WorkspaceRuntimeVerificationEvidence,
     ) -> Result<()>;
+    async fn record_workspace_runtime_verification_outcome_if_current(
+        &self,
+        expected: &WorkspaceRuntimeVerificationEvidence,
+        state: &str,
+        outcome: &str,
+        checked_at: &str,
+    ) -> Result<bool>;
     async fn complete_workspace_runtime_verification(
         &self,
         evidence: &WorkspaceRuntimeVerificationEvidence,
@@ -2336,6 +2343,65 @@ impl SqliteWorkspaceStore {
         })
     }
 
+    pub fn record_workspace_runtime_verification_outcome_if_current(
+        &self,
+        expected: &WorkspaceRuntimeVerificationEvidence,
+        state: &str,
+        outcome: &str,
+        checked_at: &str,
+    ) -> Result<bool> {
+        validate_workspace_runtime_verification(expected)?;
+        if !matches!(state, "pending" | "verified" | "failed") {
+            return Err(Error::Store(
+                "invalid Workspace Runtime verification state".to_string(),
+            ));
+        }
+        if !matches!(
+            outcome,
+            "challenge_issued" | "verified" | "verification_failed" | "connectivity_failed"
+        ) {
+            return Err(Error::Store(
+                "invalid Workspace Runtime verification outcome".to_string(),
+            ));
+        }
+        if checked_at.is_empty() || checked_at.len() > 128 {
+            return Err(Error::Store(
+                "invalid Workspace Runtime verification checked_at".to_string(),
+            ));
+        }
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                r#"UPDATE workspace_runtime_verifications
+                   SET state = CASE WHEN state = 'verified' THEN state ELSE ?10 END,
+                       last_outcome = ?11,
+                       checked_at = ?12
+                   WHERE workspace_id = ?1 AND runtime_id = ?2
+                     AND binding_revision = ?3
+                     AND workspace_key_id = ?4
+                     AND workspace_identity_revision = ?5
+                     AND workspace_trust_generation = ?6
+                     AND runtime_public_key_fingerprint = ?7
+                     AND runtime_identity_revision = ?8
+                     AND challenge_id = ?9"#,
+                params![
+                    expected.workspace_id,
+                    expected.runtime_id,
+                    expected.binding_revision,
+                    expected.workspace_key_id,
+                    expected.workspace_identity_revision,
+                    expected.workspace_trust_generation,
+                    expected.runtime_public_key_fingerprint,
+                    expected.runtime_identity_revision,
+                    expected.challenge_id,
+                    state,
+                    outcome,
+                    checked_at,
+                ],
+            )?;
+            Ok(changed == 1)
+        })
+    }
+
     pub fn complete_workspace_runtime_verification(
         &self,
         evidence: &WorkspaceRuntimeVerificationEvidence,
@@ -2348,6 +2414,36 @@ impl SqliteWorkspaceStore {
         }
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current_attempt = tx.query_row(
+                r#"SELECT EXISTS(
+                       SELECT 1 FROM workspace_runtime_verifications
+                       WHERE workspace_id = ?1 AND runtime_id = ?2
+                         AND binding_revision = ?3
+                         AND workspace_key_id = ?4
+                         AND workspace_identity_revision = ?5
+                         AND workspace_trust_generation = ?6
+                         AND runtime_public_key_fingerprint = ?7
+                         AND runtime_identity_revision = ?8
+                         AND challenge_id = ?9
+                   )"#,
+                params![
+                    evidence.workspace_id,
+                    evidence.runtime_id,
+                    evidence.binding_revision,
+                    evidence.workspace_key_id,
+                    evidence.workspace_identity_revision,
+                    evidence.workspace_trust_generation,
+                    evidence.runtime_public_key_fingerprint,
+                    evidence.runtime_identity_revision,
+                    evidence.challenge_id,
+                ],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !current_attempt {
+                return Err(Error::RuntimeBindingConflict(
+                    "Runtime verification attempt was superseded".to_string(),
+                ));
+            }
             let changed = tx.execute(
                 r#"UPDATE workspace_runtime_bindings
                    SET state = 'verified', updated_at = ?7
@@ -3191,6 +3287,18 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         evidence: &WorkspaceRuntimeVerificationEvidence,
     ) -> Result<()> {
         SqliteWorkspaceStore::record_workspace_runtime_verification_attempt(self, evidence)
+    }
+
+    async fn record_workspace_runtime_verification_outcome_if_current(
+        &self,
+        expected: &WorkspaceRuntimeVerificationEvidence,
+        state: &str,
+        outcome: &str,
+        checked_at: &str,
+    ) -> Result<bool> {
+        SqliteWorkspaceStore::record_workspace_runtime_verification_outcome_if_current(
+            self, expected, state, outcome, checked_at,
+        )
     }
 
     async fn complete_workspace_runtime_verification(
@@ -9857,6 +9965,9 @@ mod tests {
             verified_at: Some("2".to_string()),
             checked_at: "2".to_string(),
         };
+        store
+            .record_workspace_runtime_verification_attempt(&evidence)
+            .unwrap();
         let verified = store
             .complete_workspace_runtime_verification(&evidence)
             .unwrap();
@@ -9886,6 +9997,43 @@ mod tests {
         store
             .complete_workspace_runtime_verification(&evidence)
             .unwrap();
+        let newer_pending = WorkspaceRuntimeVerificationEvidence {
+            challenge_id: "challenge-b".to_string(),
+            state: "pending".to_string(),
+            last_outcome: "challenge_issued".to_string(),
+            verified_at: None,
+            checked_at: "4".to_string(),
+            ..evidence.clone()
+        };
+        store
+            .record_workspace_runtime_verification_attempt(&newer_pending)
+            .unwrap();
+        let newer_verified = WorkspaceRuntimeVerificationEvidence {
+            state: "verified".to_string(),
+            last_outcome: "verified".to_string(),
+            verified_at: Some("5".to_string()),
+            checked_at: "5".to_string(),
+            ..newer_pending
+        };
+        store
+            .complete_workspace_runtime_verification(&newer_verified)
+            .unwrap();
+        assert!(
+            !store
+                .record_workspace_runtime_verification_outcome_if_current(
+                    &pending_retry,
+                    "failed",
+                    "verification_failed",
+                    "6",
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_workspace_runtime_verification("workspace-a", "runtime-a")
+                .unwrap(),
+            Some(newer_verified.clone())
+        );
         drop(store);
 
         let reopened = SqliteWorkspaceStore::open(&path).unwrap();
@@ -9893,7 +10041,7 @@ mod tests {
             reopened
                 .get_workspace_runtime_verification("workspace-a", "runtime-a")
                 .unwrap(),
-            Some(evidence)
+            Some(newer_verified)
         );
         assert_eq!(
             reopened

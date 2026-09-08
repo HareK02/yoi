@@ -3433,11 +3433,10 @@ fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static s
     {
         return "workers:create";
     }
-    if path.ends_with("/input")
-        || path.ends_with("/restore")
-        || path.ends_with("/workspace-api")
-        || path.contains("/attachments")
-    {
+    if path.ends_with("/workspace-api") {
+        return "workers:create";
+    }
+    if path.ends_with("/input") || path.ends_with("/restore") || path.contains("/attachments") {
         return "workers:input";
     }
     if path.ends_with("/stop") || path.ends_with("/cancel") {
@@ -4556,13 +4555,20 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         &self,
         worker_id: &str,
     ) -> Option<crate::observation::RuntimeObservationSource> {
+        let path = format!("/v1/workers/{worker_id}/protocol/ws");
+        let bearer_token = match &self.workspace_authorization {
+            Some(authorization) => authorization
+                .issue("GET", &path, "workers:protocol", Some(worker_id), &[])
+                .ok(),
+            None => self
+                .runtime_capability_token(&path)
+                .or_else(|| self.bearer_token.clone()),
+        };
         Some(crate::observation::RuntimeObservationSource::remote_ws(
             crate::observation::RuntimeObservationSourceConfig {
                 worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
                 endpoint: self.ws_endpoint(worker_id),
-                bearer_token: self
-                    .runtime_capability_token(&format!("/v1/workers/{worker_id}/protocol"))
-                    .or_else(|| self.bearer_token.clone()),
+                bearer_token,
             },
         ))
     }
@@ -6629,6 +6635,19 @@ mod tests {
         assert_eq!(failure.diagnostic.code, "runtime_ping_network_unreachable");
         assert!(!failure.diagnostic.message.contains(&endpoint));
         assert!(!format!("{failure:?}").contains("secret-token"));
+    }
+
+    #[test]
+    fn workspace_runtime_operation_matches_runtime_permission_classifier() {
+        let worker_id = EmbeddedWorkerId::from_legacy_u64(1).to_string();
+        assert_eq!(
+            workspace_runtime_operation("POST", &format!("/v1/workers/{worker_id}/workspace-api")),
+            "workers:create"
+        );
+        assert_eq!(
+            workspace_runtime_operation("GET", &format!("/v1/workers/{worker_id}/protocol/ws")),
+            "workers:protocol"
+        );
     }
 
     #[test]

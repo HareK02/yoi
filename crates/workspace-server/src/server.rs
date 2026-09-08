@@ -2123,23 +2123,12 @@ impl WorkspaceApi {
             ))
         })?;
         let runtime_binding_store = store.clone();
-        let configured_runtime_endpoints = config
-            .remote_runtime_sources
-            .iter()
-            .filter_map(|source| {
-                (source.workspace_id.as_deref() == Some(config.workspace_id.as_str()))
-                    .then(|| (source.runtime_id.clone(), source.base_url.clone()))
-            })
-            .collect::<HashMap<_, _>>();
         let expected_runtime_bindings = store
             .list_workspace_runtime_bindings(&config.workspace_id, false)
             .await?
             .into_iter()
             .filter(|binding| binding.runtime_id != EMBEDDED_RUNTIME_ID)
-            .filter(|binding| binding.state == StoredRuntimeBindingState::Verified)
-            .filter(|binding| {
-                configured_runtime_endpoints.get(&binding.runtime_id) == Some(&binding.base_url)
-            })
+            .filter(|binding| binding.state != StoredRuntimeBindingState::Revoked)
             .map(|binding| {
                 (
                     (binding.workspace_id.clone(), binding.runtime_id.clone()),
@@ -2171,19 +2160,34 @@ impl WorkspaceApi {
                         .unwrap_or(false)
                 })
         });
-        let active_expectations = api
-            .runtime_binding_expectations
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for source in &api.config.remote_runtime_sources {
-            if !active_expectations
-                .contains_key(&(api.config.workspace_id.clone(), source.runtime_id.clone()))
-            {
-                api.runtime_subscription_broker
-                    .unregister_runtime(&source.runtime_id);
+        {
+            let active_expectations = api
+                .runtime_binding_expectations
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for source in &api.config.remote_runtime_sources {
+                if !active_expectations
+                    .contains_key(&(api.config.workspace_id.clone(), source.runtime_id.clone()))
+                {
+                    api.runtime_subscription_broker
+                        .unregister_runtime(&source.runtime_id);
+                }
             }
         }
-        drop(active_expectations);
+        for binding in api
+            .store
+            .list_workspace_runtime_bindings(&api.config.workspace_id, false)
+            .await?
+            .into_iter()
+            .filter(|binding| {
+                binding.authentication_mode
+                    == crate::store::WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity
+            })
+            .filter(|binding| binding.state != StoredRuntimeBindingState::Revoked)
+        {
+            let activate = binding.state == StoredRuntimeBindingState::Verified;
+            api.register_workspace_runtime_binding(binding, activate)?;
+        }
         Ok(api)
     }
 
@@ -2340,6 +2344,37 @@ impl WorkspaceApi {
 
     pub fn workspace_id(&self) -> &str {
         self.config.workspace_id.as_str()
+    }
+
+    fn register_workspace_runtime_binding(
+        &self,
+        binding: WorkspaceRuntimeBinding,
+        activate: bool,
+    ) -> Result<()> {
+        let backend_url = self
+            .config
+            .backend_base_url
+            .clone()
+            .unwrap_or_else(|| "http://127.0.0.1:8787".to_string());
+        let mut remote_config = remote_runtime_config_from_binding(&binding)
+            .map_err(|diagnostic| Error::Store(diagnostic.message))?;
+        remote_config.workspace_authorization = Some(WorkspaceRuntimeAuthorization::new(
+            self.store.clone(),
+            self.signing_identities.clone(),
+            backend_url.clone(),
+            activate.then_some(binding),
+        ));
+        let remote_runtime = RemoteWorkerRuntime::new(
+            remote_config.clone(),
+            self.config.workspace_id.clone(),
+            backend_url,
+        )
+        .map(|runtime| runtime.with_resource_broker(self.resource_broker.clone()))
+        .map_err(|error| error.into_error())?;
+        self.runtime.register_or_replace(remote_runtime);
+        self.runtime_subscription_broker
+            .register_remote_runtime(remote_config);
+        Ok(())
     }
 
     pub fn runtime_subscription_broker(&self) -> &RuntimeSubscriptionBroker {
@@ -13629,16 +13664,20 @@ async fn create_remote_runtime(
         updated_at: now,
         revoked_at: None,
     };
-    let (mutation, _) = api
+    let (mutation, binding) = api
         .store
         .put_workspace_runtime_binding_key(record, request.expected_revision, &actor.account_id)
         .await?;
     api.runtime_binding_expectations
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&(api.config.workspace_id.clone(), runtime_id.clone()));
+        .insert(
+            (api.config.workspace_id.clone(), runtime_id.clone()),
+            binding.clone(),
+        );
     api.runtime_subscription_broker
         .unregister_runtime(&runtime_id);
+    api.register_workspace_runtime_binding(binding, false)?;
     let resource = workspace_runtime_resources_response(&api, &api.config.workspace_id)
         .await?
         .items
@@ -13778,122 +13817,138 @@ async fn perform_workspace_runtime_verification(
         .await
         .map_err(|error| error.to_string())?;
 
-    let challenge_body = serde_json::to_vec(&challenge).map_err(|error| error.to_string())?;
-    let challenge_claims = WorkspaceCapabilityClaims {
-        issuer: backend_url.to_string(),
-        issuer_workspace_id: binding.workspace_id.clone(),
-        issuer_key_id: identity.key_id.clone(),
-        issuer_identity_revision: identity.revision,
-        trust_generation: workspace_trust_generation,
-        binding_revision: binding.binding_revision,
-        runtime_id: binding.runtime_id.clone(),
-        worker_id: None,
-        operation: WORKSPACE_VERIFICATION_OPERATION.to_string(),
-        method: "POST".to_string(),
-        path_and_query: WORKSPACE_VERIFICATION_CHALLENGE_PATH.to_string(),
-        body_digest: workspace_request_body_digest(&challenge_body),
-        iat: now.timestamp(),
-        exp: expires_at,
-        jti: Uuid::now_v7().to_string(),
-    };
-    let challenge_token = api
-        .signing_identities
-        .issue_workspace_capability(&binding.workspace_id, &challenge_claims)
-        .map_err(|error| error.to_string())?;
-    let challenge_runtime = runtime.clone();
-    let challenge_runtime_id = binding.runtime_id.clone();
-    let challenge_request = challenge.clone();
-    let response = tokio::task::spawn_blocking(move || {
-        challenge_runtime.send_workspace_verification_challenge(
-            &challenge_runtime_id,
-            &challenge_request,
-            &challenge_token,
-        )
-    })
-    .await
-    .map_err(|_| "Runtime verification challenge task failed".to_string())?
-    .map_err(|failure| failure.diagnostic.message)?;
-    verify_runtime_verification_response(
-        &response,
-        &challenge,
-        &binding.public_key,
-        Utc::now().timestamp(),
-    )
-    .map_err(|error| error.to_string())?;
-
-    let response_bytes = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
-    let acknowledgement = WorkspaceRuntimeVerificationAcknowledgement {
-        challenge_id: response.challenge_id.clone(),
-        workspace_id: response.workspace_id.clone(),
-        runtime_id: response.runtime_id.clone(),
-        binding_revision: response.binding_revision,
-        workspace_key_id: response.workspace_key_id.clone(),
-        workspace_identity_revision: response.workspace_identity_revision,
-        workspace_trust_generation: response.workspace_trust_generation,
-        runtime_public_key_fingerprint: response.runtime_public_key_fingerprint.clone(),
-        runtime_identity_revision: response.runtime_identity_revision,
-        workspace_nonce: response.workspace_nonce.clone(),
-        runtime_nonce: response.runtime_nonce.clone(),
-        response_digest: workspace_request_body_digest(&response_bytes),
-        response: response.clone(),
-        expires_at: response.expires_at,
-    };
-    let acknowledgement_body =
-        serde_json::to_vec(&acknowledgement).map_err(|error| error.to_string())?;
-    let acknowledgement_claims = WorkspaceCapabilityClaims {
-        issuer: backend_url.to_string(),
-        issuer_workspace_id: binding.workspace_id.clone(),
-        issuer_key_id: identity.key_id.clone(),
-        issuer_identity_revision: identity.revision,
-        trust_generation: workspace_trust_generation,
-        binding_revision: binding.binding_revision,
-        runtime_id: binding.runtime_id.clone(),
-        worker_id: None,
-        operation: WORKSPACE_VERIFICATION_OPERATION.to_string(),
-        method: "POST".to_string(),
-        path_and_query: WORKSPACE_VERIFICATION_ACK_PATH.to_string(),
-        body_digest: workspace_request_body_digest(&acknowledgement_body),
-        iat: Utc::now().timestamp(),
-        exp: expires_at,
-        jti: Uuid::now_v7().to_string(),
-    };
-    let acknowledgement_token = api
-        .signing_identities
-        .issue_workspace_capability(&binding.workspace_id, &acknowledgement_claims)
-        .map_err(|error| error.to_string())?;
-    let acknowledgement_runtime = runtime;
-    let acknowledgement_runtime_id = binding.runtime_id.clone();
-    let acknowledgement_request = acknowledgement.clone();
-    let receipt = tokio::task::spawn_blocking(move || {
-        acknowledgement_runtime.send_workspace_verification_acknowledgement(
-            &acknowledgement_runtime_id,
-            &acknowledgement_request,
-            &acknowledgement_token,
-        )
-    })
-    .await
-    .map_err(|_| "Runtime verification acknowledgement task failed".to_string())?
-    .map_err(|failure| failure.diagnostic.message)?;
-    if receipt.challenge_id != challenge.challenge_id
-        || receipt.workspace_id != binding.workspace_id
-        || receipt.runtime_id != binding.runtime_id
-        || receipt.binding_revision != binding.binding_revision
-    {
-        return Err("Runtime verification acknowledgement receipt mismatched".to_string());
-    }
-
-    let verified_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-    let verified = crate::store::WorkspaceRuntimeVerificationEvidence {
-        state: "verified".to_string(),
-        last_outcome: "verified".to_string(),
-        verified_at: Some(verified_at.clone()),
-        checked_at: verified_at,
-        ..pending
-    };
-    api.store
-        .complete_workspace_runtime_verification(&verified)
+    let result = async {
+        let challenge_body = serde_json::to_vec(&challenge).map_err(|error| error.to_string())?;
+        let challenge_claims = WorkspaceCapabilityClaims {
+            issuer: backend_url.to_string(),
+            issuer_workspace_id: binding.workspace_id.clone(),
+            issuer_key_id: identity.key_id.clone(),
+            issuer_identity_revision: identity.revision,
+            trust_generation: workspace_trust_generation,
+            binding_revision: binding.binding_revision,
+            runtime_id: binding.runtime_id.clone(),
+            worker_id: None,
+            operation: WORKSPACE_VERIFICATION_OPERATION.to_string(),
+            method: "POST".to_string(),
+            path_and_query: WORKSPACE_VERIFICATION_CHALLENGE_PATH.to_string(),
+            body_digest: workspace_request_body_digest(&challenge_body),
+            iat: now.timestamp(),
+            exp: expires_at,
+            jti: Uuid::now_v7().to_string(),
+        };
+        let challenge_token = api
+            .signing_identities
+            .issue_workspace_capability(&binding.workspace_id, &challenge_claims)
+            .map_err(|error| error.to_string())?;
+        let challenge_runtime = runtime.clone();
+        let challenge_runtime_id = binding.runtime_id.clone();
+        let challenge_request = challenge.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            challenge_runtime.send_workspace_verification_challenge(
+                &challenge_runtime_id,
+                &challenge_request,
+                &challenge_token,
+            )
+        })
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|_| "Runtime verification challenge task failed".to_string())?
+        .map_err(|failure| failure.diagnostic.message)?;
+        verify_runtime_verification_response(
+            &response,
+            &challenge,
+            &binding.public_key,
+            Utc::now().timestamp(),
+        )
+        .map_err(|error| error.to_string())?;
+
+        let response_bytes = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
+        let acknowledgement = WorkspaceRuntimeVerificationAcknowledgement {
+            challenge_id: response.challenge_id.clone(),
+            workspace_id: response.workspace_id.clone(),
+            runtime_id: response.runtime_id.clone(),
+            binding_revision: response.binding_revision,
+            workspace_key_id: response.workspace_key_id.clone(),
+            workspace_identity_revision: response.workspace_identity_revision,
+            workspace_trust_generation: response.workspace_trust_generation,
+            runtime_public_key_fingerprint: response.runtime_public_key_fingerprint.clone(),
+            runtime_identity_revision: response.runtime_identity_revision,
+            workspace_nonce: response.workspace_nonce.clone(),
+            runtime_nonce: response.runtime_nonce.clone(),
+            response_digest: workspace_request_body_digest(&response_bytes),
+            response: response.clone(),
+            expires_at: response.expires_at,
+        };
+        let acknowledgement_body =
+            serde_json::to_vec(&acknowledgement).map_err(|error| error.to_string())?;
+        let acknowledgement_claims = WorkspaceCapabilityClaims {
+            issuer: backend_url.to_string(),
+            issuer_workspace_id: binding.workspace_id.clone(),
+            issuer_key_id: identity.key_id.clone(),
+            issuer_identity_revision: identity.revision,
+            trust_generation: workspace_trust_generation,
+            binding_revision: binding.binding_revision,
+            runtime_id: binding.runtime_id.clone(),
+            worker_id: None,
+            operation: WORKSPACE_VERIFICATION_OPERATION.to_string(),
+            method: "POST".to_string(),
+            path_and_query: WORKSPACE_VERIFICATION_ACK_PATH.to_string(),
+            body_digest: workspace_request_body_digest(&acknowledgement_body),
+            iat: Utc::now().timestamp(),
+            exp: expires_at,
+            jti: Uuid::now_v7().to_string(),
+        };
+        let acknowledgement_token = api
+            .signing_identities
+            .issue_workspace_capability(&binding.workspace_id, &acknowledgement_claims)
+            .map_err(|error| error.to_string())?;
+        let acknowledgement_runtime = runtime;
+        let acknowledgement_runtime_id = binding.runtime_id.clone();
+        let acknowledgement_request = acknowledgement.clone();
+        let receipt = tokio::task::spawn_blocking(move || {
+            acknowledgement_runtime.send_workspace_verification_acknowledgement(
+                &acknowledgement_runtime_id,
+                &acknowledgement_request,
+                &acknowledgement_token,
+            )
+        })
+        .await
+        .map_err(|_| "Runtime verification acknowledgement task failed".to_string())?
+        .map_err(|failure| failure.diagnostic.message)?;
+        if receipt.challenge_id != challenge.challenge_id
+            || receipt.workspace_id != binding.workspace_id
+            || receipt.runtime_id != binding.runtime_id
+            || receipt.binding_revision != binding.binding_revision
+        {
+            return Err("Runtime verification acknowledgement receipt mismatched".to_string());
+        }
+
+        let verified_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let verified = crate::store::WorkspaceRuntimeVerificationEvidence {
+            state: "verified".to_string(),
+            last_outcome: "verified".to_string(),
+            verified_at: Some(verified_at.clone()),
+            checked_at: verified_at,
+            ..pending.clone()
+        };
+        api.store
+            .complete_workspace_runtime_verification(&verified)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    .await;
+    if result.is_err() {
+        let checked_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let _ = api
+            .store
+            .record_workspace_runtime_verification_outcome_if_current(
+                &pending,
+                "failed",
+                "verification_failed",
+                &checked_at,
+            )
+            .await;
+    }
+    result
 }
 
 async fn test_runtime_connection(
@@ -13918,6 +13973,7 @@ async fn test_runtime_connection(
     if binding.authentication_mode == StoredRuntimeAuthenticationMode::WorkspaceIdentity {
         match perform_workspace_runtime_verification(&api, api.runtime.clone(), &binding).await {
             Ok(verified_binding) => {
+                api.register_workspace_runtime_binding(verified_binding.clone(), true)?;
                 api.runtime_binding_expectations
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -13933,22 +13989,6 @@ async fn test_runtime_connection(
                     .map_err(|error| Error::Store(format!("{error:?}")))?;
             }
             Err(message) => {
-                if let Ok(Some(mut evidence)) = api
-                    .store
-                    .get_workspace_runtime_verification(api.workspace_id(), &runtime_id)
-                    .await
-                {
-                    if evidence.state != "verified" {
-                        evidence.state = "failed".to_string();
-                        evidence.verified_at = None;
-                    }
-                    evidence.last_outcome = "verification_failed".to_string();
-                    evidence.checked_at = Utc::now().to_rfc3339();
-                    let _ = api
-                        .store
-                        .record_workspace_runtime_verification_attempt(&evidence)
-                        .await;
-                }
                 let mut result = runtime_connection_test_failure(
                     api.workspace_id(),
                     &runtime_id,
@@ -13981,15 +14021,19 @@ async fn test_runtime_connection(
 
     if ping.is_err()
         && binding.authentication_mode == StoredRuntimeAuthenticationMode::WorkspaceIdentity
-        && let Some(mut evidence) = api
+        && let Some(evidence) = api
             .store
             .get_workspace_runtime_verification(api.workspace_id(), &runtime_id)
             .await?
     {
-        evidence.last_outcome = "connectivity_failed".to_string();
-        evidence.checked_at = Utc::now().to_rfc3339();
+        let checked_at = Utc::now().to_rfc3339();
         api.store
-            .record_workspace_runtime_verification_attempt(&evidence)
+            .record_workspace_runtime_verification_outcome_if_current(
+                &evidence,
+                "failed",
+                "connectivity_failed",
+                &checked_at,
+            )
             .await?;
     }
     let current_binding = api
@@ -16505,7 +16549,6 @@ fn validate_public_runtime_id(runtime_id: &str) -> ApiResult<()> {
     Ok(())
 }
 
-#[cfg(test)]
 fn remote_runtime_config_from_binding(
     binding: &crate::store::WorkspaceRuntimeBinding,
 ) -> std::result::Result<RemoteRuntimeConfig, RuntimeDiagnostic> {
@@ -20350,6 +20393,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verified_workspace_runtime_binding_is_restored_into_live_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let api = test_api(&root).await;
+        let actor = test_owner_actor();
+        let identity = api
+            .signing_identities
+            .provision_existing(&api.config.workspace_id, &actor.account_id)
+            .unwrap();
+        let runtime_identity = RuntimeIdentityMaterial::generate("restored-runtime").unwrap();
+        api.store
+            .upsert_workspace_runtime_binding_record(
+                WorkspaceRuntimeBinding {
+                    workspace_id: api.config.workspace_id.clone(),
+                    runtime_id: "restored-runtime".to_string(),
+                    display_name: "Restored Runtime".to_string(),
+                    base_url: "https://8.8.8.8".to_string(),
+                    public_key: runtime_identity.public_key,
+                    public_key_fingerprint: String::new(),
+                    binding_revision: 1,
+                    state: StoredRuntimeBindingState::Configured,
+                    authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
+                    workspace_key_id: Some(identity.key_id.clone()),
+                    workspace_key_generation: Some(identity.revision),
+                    created_at: "1".to_string(),
+                    updated_at: "1".to_string(),
+                    revoked_at: None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let configured = api
+            .store
+            .get_workspace_runtime_binding(&api.config.workspace_id, "restored-runtime")
+            .await
+            .unwrap()
+            .unwrap();
+        let evidence = crate::store::WorkspaceRuntimeVerificationEvidence {
+            workspace_id: configured.workspace_id.clone(),
+            runtime_id: configured.runtime_id.clone(),
+            binding_revision: configured.binding_revision,
+            workspace_key_id: identity.key_id,
+            workspace_identity_revision: identity.revision,
+            workspace_trust_generation: identity.revision,
+            runtime_public_key_fingerprint: configured.public_key_fingerprint.clone(),
+            runtime_identity_revision: 1,
+            challenge_id: "restart-challenge".to_string(),
+            state: "verified".to_string(),
+            last_outcome: "verified".to_string(),
+            verified_at: Some("2".to_string()),
+            checked_at: "2".to_string(),
+        };
+        api.store
+            .record_workspace_runtime_verification_attempt(&evidence)
+            .await
+            .unwrap();
+        api.store
+            .complete_workspace_runtime_verification(&evidence)
+            .await
+            .unwrap();
+        drop(api);
+
+        let restored_config = test_server_config(&root);
+        let restored_store =
+            SqliteWorkspaceStore::open(restored_config.database_path.clone()).unwrap();
+        let restored = WorkspaceApi::new(restored_config, Arc::new(restored_store))
+            .await
+            .unwrap();
+        assert!(
+            restored
+                .runtime
+                .list_runtimes(100)
+                .items
+                .iter()
+                .any(|runtime| runtime.runtime_id == "restored-runtime"),
+            "verified persisted Runtime binding must return to the live registry"
+        );
+        assert!(
+            restored
+                .runtime_binding_expectations
+                .read()
+                .unwrap()
+                .contains_key(&(
+                    restored.config.workspace_id.clone(),
+                    "restored-runtime".to_string(),
+                )),
+            "restored Runtime must retain its revision-fenced binding expectation"
+        );
+    }
+
+    #[tokio::test]
     async fn remote_runtime_registration_is_workspace_scoped_revisioned_and_configured() {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
@@ -20416,18 +20551,18 @@ mod tests {
                 .list_runtimes(100)
                 .items
                 .iter()
-                .all(|runtime| runtime.runtime_id != "configured-runtime"),
-            "configured binding must remove a stale active Runtime projection"
+                .any(|runtime| runtime.runtime_id == "configured-runtime"),
+            "configured binding must remain registered so verification can reach it"
         );
         assert!(
-            !api.runtime_binding_expectations
+            api.runtime_binding_expectations
                 .read()
                 .unwrap()
                 .contains_key(&(
                     api.config.workspace_id.clone(),
                     "configured-runtime".to_string(),
                 )),
-            "configured binding must not remain a control expectation"
+            "configured binding must remain fenced by its current binding revision"
         );
         let replacement_identity = RuntimeIdentityMaterial::generate("configured-runtime").unwrap();
         let generic_put = scoped_put_runtime_trust_key(

@@ -2126,15 +2126,28 @@ async fn require_runtime_auth(
             unix_now_seconds(),
         ) {
             Ok(context) => {
-                if state.workspace_auth.as_ref().is_some_and(|workspace_auth| {
-                    workspace_auth
-                        .verifier
-                        .has_active_workspace_issuer(&context.workspace_id)
-                }) {
+                let workspace_verification_exists = match state.workspace_auth.as_deref() {
+                    Some(workspace_auth) => match workspace_auth
+                        .verifications
+                        .get(&context.workspace_id, workspace_auth.signer.runtime_id())
+                    {
+                        Ok(record) => record.is_some(),
+                        Err(error) => {
+                            return RuntimeHttpRestError::new(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "workspace_runtime_verification_unavailable",
+                                error.to_string(),
+                            )
+                            .into_response();
+                        }
+                    },
+                    None => false,
+                };
+                if workspace_verification_exists {
                     return RuntimeHttpRestError::new(
                         StatusCode::FORBIDDEN,
                         "workspace_identity_required",
-                        "Legacy Server-issued capability is disabled for this Workspace",
+                        "Legacy Server-issued capability is disabled after signed Workspace Runtime verification",
                     )
                     .into_response();
                 }
