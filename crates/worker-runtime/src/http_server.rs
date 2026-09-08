@@ -2072,6 +2072,26 @@ async fn require_runtime_auth(
         }
     }
 
+    let workspace_bootstrap_request = request.method() == Method::POST
+        && matches!(
+            request.uri().path(),
+            WORKSPACE_VERIFICATION_CHALLENGE_PATH | WORKSPACE_VERIFICATION_ACK_PATH
+        );
+    if state.workspace_auth.is_some() && !workspace_bootstrap_request {
+        let local_token_matches = state
+            .local_token
+            .as_deref()
+            .is_some_and(|expected| supplied.as_deref() == Some(expected));
+        if !local_token_matches {
+            return RuntimeHttpRestError::new(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "missing or invalid Workspace capability bearer token",
+            )
+            .into_response();
+        }
+    }
+
     if let Some(expected) = state.local_token.as_deref() {
         if supplied.as_deref() != Some(expected) {
             return RuntimeHttpRestError::new(
@@ -2622,6 +2642,21 @@ mod tests {
         let status = response.status();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        for authorization in [None, Some("Bearer malformed")] {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/v1/config-bundles");
+            if let Some(authorization) = authorization {
+                request = request.header(header::AUTHORIZATION, authorization);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
 
         let ping_claims = WorkspaceCapabilityClaims {
             operation: RUNTIME_PING_PERMISSION.to_string(),
