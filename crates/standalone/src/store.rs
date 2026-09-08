@@ -191,8 +191,7 @@ impl StandaloneWorkerStore {
                 StandaloneStoreError::Io(error)
             }
         })?;
-        let record: StandaloneWorkerRecord = serde_json::from_slice(&bytes)
-            .map_err(|source| StandaloneStoreError::CorruptRecord { id, source })?;
+        let record = decode_worker_record(id, &bytes)?;
         if record.schema_version > SCHEMA_VERSION {
             return Err(StandaloneStoreError::NewerSchema {
                 id,
@@ -408,7 +407,7 @@ impl StandaloneWorkerStore {
                 .create_new(true)
                 .open(&temporary)
                 .map_err(StandaloneStoreError::Io)?;
-            serde_json::to_writer_pretty(&mut file, next).map_err(StandaloneStoreError::Json)?;
+            write_worker_record(&mut file, next)?;
             file.write_all(b"\n").map_err(StandaloneStoreError::Io)?;
             file.sync_all().map_err(StandaloneStoreError::Io)?;
             fs::rename(&temporary, dir.join(RECORD_FILE)).map_err(StandaloneStoreError::Io)?;
@@ -428,8 +427,7 @@ impl StandaloneWorkerStore {
     ) -> Result<StandaloneWorkerRecord, StandaloneStoreError> {
         let bytes =
             fs::read(self.worker_dir(id).join(RECORD_FILE)).map_err(StandaloneStoreError::Io)?;
-        serde_json::from_slice(&bytes)
-            .map_err(|source| StandaloneStoreError::CorruptRecord { id, source })
+        decode_worker_record(id, &bytes)
     }
 
     fn worker_dir(&self, id: WorkerId) -> PathBuf {
@@ -634,6 +632,50 @@ fn observe_process(pid: u32) -> ProcessObservation {
     }
 }
 
+fn decode_worker_record(
+    id: WorkerId,
+    bytes: &[u8],
+) -> Result<StandaloneWorkerRecord, StandaloneStoreError> {
+    let decode = || -> Result<StandaloneWorkerRecord, serde_json::Error> {
+        let mut snapshot: serde_json::Value = serde_json::from_slice(bytes)?;
+        let object = snapshot.as_object_mut().ok_or_else(|| {
+            serde_json::Error::io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "standalone Worker record must be an object",
+            ))
+        })?;
+        let persisted_manifest = object.remove("manifest").ok_or_else(|| {
+            serde_json::Error::io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "standalone Worker record is missing manifest",
+            ))
+        })?;
+        let manifest = manifest::read_persisted_worker_manifest_snapshot(persisted_manifest)?;
+        object.insert("manifest".to_string(), serde_json::to_value(manifest)?);
+        serde_json::from_value(snapshot)
+    };
+    decode().map_err(|source| StandaloneStoreError::CorruptRecord { id, source })
+}
+
+fn write_worker_record(
+    writer: &mut impl Write,
+    record: &StandaloneWorkerRecord,
+) -> Result<(), StandaloneStoreError> {
+    let mut snapshot = serde_json::to_value(record).map_err(StandaloneStoreError::Json)?;
+    let object = snapshot.as_object_mut().ok_or_else(|| {
+        StandaloneStoreError::Json(serde_json::Error::io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "standalone Worker record must be an object",
+        )))
+    })?;
+    object.insert(
+        "manifest".to_string(),
+        manifest::write_persisted_worker_manifest_snapshot(&record.manifest)
+            .map_err(StandaloneStoreError::Json)?,
+    );
+    serde_json::to_writer_pretty(writer, &snapshot).map_err(StandaloneStoreError::Json)
+}
+
 fn now_unix_ms() -> Result<u64, StandaloneStoreError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -709,7 +751,70 @@ pub enum StandaloneStoreError {
 
 #[cfg(test)]
 mod tests {
-    use super::{LeaseLiveness, ProcessObservation, classify_lease_liveness};
+    use super::*;
+
+    fn test_manifest() -> WorkerManifest {
+        WorkerManifest::from_toml(
+            r#"
+[worker]
+name = "standalone-test"
+
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
+
+[engine]
+
+[[scope.allow]]
+target = "/tmp"
+permission = "write"
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn standalone_record_uses_versioned_manifest_adapter_for_legacy_memory() {
+        let worker_id = "01a05782-d5dd-78f1-b9cd-ce37535bdb9d".parse().unwrap();
+        let manifest = test_manifest();
+        let record = StandaloneWorkerRecord {
+            schema_version: SCHEMA_VERSION,
+            revision: 6,
+            worker_id,
+            worker_name: manifest.worker.name.clone(),
+            storage_key: "standalone-test".to_string(),
+            cwd: StandaloneCwdIdentity {
+                canonical_path: PathBuf::from("/tmp"),
+                device: None,
+                inode: None,
+            },
+            manifest,
+            active_session_id: "01a05782-d5dd-78f1-b9cd-ce37535bdb9e".parse().unwrap(),
+            active_segment_id: None,
+            status: StandaloneWorkerStatus::Stopped,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+            shutdown_reason: None,
+        };
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy["manifest"]["feature"]["memory"] = serde_json::json!({
+            "enabled": false,
+            "staging": false,
+        });
+
+        let decoded =
+            decode_worker_record(worker_id, &serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(!decoded.manifest.feature.memory.profile.enabled);
+
+        let mut persisted = Vec::new();
+        write_worker_record(&mut persisted, &decoded).unwrap();
+        let persisted: serde_json::Value = serde_json::from_slice(&persisted).unwrap();
+        assert_eq!(persisted["manifest"]["schema_version"], 2);
+        assert_eq!(
+            persisted["manifest"]["manifest"]["feature"]["memory"]["profile"]["enabled"],
+            false
+        );
+    }
 
     #[test]
     fn lease_liveness_requires_positive_live_or_stale_evidence() {
