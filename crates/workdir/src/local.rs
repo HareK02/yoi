@@ -1635,7 +1635,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn read_bytes_reports_symlink_target_outside_scope() {
+    fn read_bytes_allows_logical_symlink_path_with_target_outside_scope() {
         use std::os::unix::fs::symlink;
 
         let dir = TempDir::new().unwrap();
@@ -1646,15 +1646,7 @@ mod tests {
         symlink(&target, &link).unwrap();
 
         let fs = make_fs(&dir);
-        let err = fs.read_bytes(&link).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                WorkdirError::SymlinkOutOfScope { ref path, target: ref err_target, required_permission: "read" }
-                    if path == &link && err_target == &target.canonicalize().unwrap()
-            ),
-            "expected symlink out-of-scope diagnostic, got {err:?}"
-        );
+        assert_eq!(fs.read_bytes(&link).unwrap(), b"secret");
     }
 
     #[cfg(unix)]
@@ -1746,7 +1738,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn write_reports_symlink_target_outside_scope() {
+    fn write_allows_logical_symlink_path_with_target_outside_scope() {
         use std::os::unix::fs::symlink;
 
         let dir = TempDir::new().unwrap();
@@ -1757,14 +1749,13 @@ mod tests {
         symlink(&target, &link).unwrap();
 
         let fs = make_fs(&dir);
-        let err = fs.write(&link, b"new").unwrap_err();
+        fs.write(&link, b"new").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new");
         assert!(
-            matches!(
-                err,
-                WorkdirError::SymlinkOutOfScope { ref path, target: ref err_target, required_permission: "write" }
-                    if path == &link && err_target == &target.canonicalize().unwrap()
-            ),
-            "expected write symlink out-of-scope diagnostic, got {err:?}"
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 
@@ -1940,6 +1931,70 @@ mod tests {
             fs2.write(&target, b"x").unwrap_err(),
             WorkdirError::ReadOnly(_)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_uses_logical_paths_through_symlinked_directories() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("worker.json"), "scope-needle\n").unwrap();
+        symlink(outside.path(), dir.path().join("yoi.local")).unwrap();
+        let workdir = make_fs(&dir);
+
+        let read = WorkdirSession::read(
+            &workdir,
+            ReadRequest {
+                path: WorkdirPath::new("yoi.local/worker.json").unwrap(),
+                offset: 0,
+                limit: 100,
+                max_bytes: 1024,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(read.bytes, b"scope-needle\n");
+        let glob = WorkdirSession::glob(
+            &workdir,
+            GlobRequest {
+                pattern: "**/*.json".into(),
+                path: WorkdirPath::new("yoi.local").unwrap(),
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            glob.paths,
+            [WorkdirPath::new("yoi.local/worker.json").unwrap()]
+        );
+        let grep = WorkdirSession::grep(
+            &workdir,
+            GrepRequest {
+                pattern: "scope-needle".into(),
+                path: WorkdirPath::new("yoi.local").unwrap(),
+                glob: Some("*.json".into()),
+                file_type: None,
+                case_insensitive: false,
+                before_context: 0,
+                after_context: 0,
+                multiline: false,
+                output_mode: crate::GrepOutputMode::Content,
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(grep.match_count, 1);
+        assert!(grep.output.contains("yoi.local/worker.json"));
+        assert!(
+            !workdir
+                .scope()
+                .is_readable(&outside.path().join("worker.json"))
+        );
     }
 
     #[tokio::test]

@@ -259,16 +259,6 @@ pub fn run_grep(
             base.display()
         )));
     }
-    if base_meta.is_dir()
-        && let Some(info) = symlink.as_ref()
-    {
-        return Err(FsError::SymlinkDirectoryNotTraversed {
-            tool: "Grep",
-            path: base.clone(),
-            target: info.resolved_path.clone(),
-        });
-    }
-
     let filter_base = if base_meta.is_file() { root } else { &base };
     let types = build_types(p.file_type.as_deref())?;
     let overrides = build_overrides(filter_base, p.glob.as_deref())?;

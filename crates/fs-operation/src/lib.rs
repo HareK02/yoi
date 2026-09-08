@@ -477,13 +477,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn grep_keeps_direct_symlink_directory_and_broken_path_guards() {
+    fn grep_traverses_a_direct_symlink_directory_and_rejects_a_broken_path() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let readable = RootAccess(root.clone());
         std::fs::create_dir(root.join("target-dir")).unwrap();
+        std::fs::write(root.join("target-dir/nested.rs"), "needle nested\n").unwrap();
         std::fs::write(root.join("target-file.rs"), "needle file\n").unwrap();
         symlink(root.join("target-file.rs"), root.join("file-link.rs")).unwrap();
         symlink(root.join("target-dir"), root.join("directory-link")).unwrap();
@@ -501,18 +502,35 @@ mod tests {
         assert_eq!(file_result.match_count, 1);
         assert!(file_result.output.starts_with("file-link.rs\n"));
 
-        let directory_error = run_grep(
+        let directory_result = run_grep(
             &root,
             root.join("directory-link"),
             request("directory-link"),
             &readable,
         )
-        .unwrap_err();
-        assert!(matches!(
-            directory_error,
-            FsError::SymlinkDirectoryNotTraversed { tool: "Grep", path, .. }
-                if path == root.join("directory-link")
-        ));
+        .unwrap();
+        assert_eq!(directory_result.match_count, 1);
+        assert!(
+            directory_result
+                .output
+                .starts_with("directory-link/nested.rs\n")
+        );
+
+        let glob_result = run_glob(
+            &root,
+            &root.join("directory-link"),
+            GlobRequest {
+                pattern: "**/*.rs".to_string(),
+                path: FsPath::new("directory-link").unwrap(),
+                limit: 10,
+            },
+            &readable,
+        )
+        .unwrap();
+        assert_eq!(
+            glob_result.paths,
+            vec![FsPath::new("directory-link/nested.rs").unwrap()]
+        );
 
         let broken_error = run_grep(
             &root,

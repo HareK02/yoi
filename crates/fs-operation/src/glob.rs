@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use globset::Glob;
 use ignore::WalkBuilder;
 
-use crate::{FsAccessPolicy, FsError, FsPath, GlobRequest, GlobResult, direct_symlink};
+use crate::{FsAccessPolicy, FsError, FsPath, GlobRequest, GlobResult};
 
 /// Execute a bounded glob entirely inside the provider process.
 pub fn run_glob(
@@ -18,21 +18,13 @@ pub fn run_glob(
     if !access.is_readable(base) {
         return Err(FsError::OutOfScope(PathBuf::from(request.path.as_str())));
     }
-    if let Some(info) = direct_symlink(base)
-        && info.target_exists
-        && info.resolved_path.is_dir()
-    {
-        return Err(FsError::SymlinkDirectoryNotTraversed {
-            tool: "Glob",
-            path: PathBuf::from(request.path.as_str()),
-            target: PathBuf::from("<provider-internal target>"),
-        });
-    }
     let matcher = Glob::new(&request.pattern)
         .map_err(|error| FsError::InvalidGlob(error.to_string()))?
         .compile_matcher();
     let mut matches = Vec::new();
-    for entry in WalkBuilder::new(base).hidden(false).build().flatten() {
+    let mut walker = WalkBuilder::new(base);
+    walker.hidden(false).follow_links(false);
+    for entry in walker.build().flatten() {
         let path = entry.path();
         if !path.is_file() || !access.is_readable(path) {
             continue;

@@ -3,11 +3,11 @@
 //! Built from [`crate::ScopeConfig`] via [`Scope::from_config`]. Every
 //! rule `target` must already be an absolute path — per-layer path
 //! resolution runs earlier, inside [`crate::WorkerManifestConfig::resolve_paths`].
-//! All rule `target` paths inside the [`Scope`] are canonicalised (where
-//! possible) so access checks are pure path comparisons.
+//! All rule `target` paths inside the [`Scope`] are normalized lexically so
+//! access authority follows the path presented through the Workdir, not a
+//! symbolic-link target outside that logical tree.
 
-use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::{ArcSwap, Guard};
@@ -26,7 +26,7 @@ pub struct Scope {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedRule {
-    /// Absolute, canonicalized-or-normalized target directory/file.
+    /// Absolute, lexically normalized target directory/file.
     target: PathBuf,
     permission: Permission,
     recursive: bool,
@@ -201,9 +201,14 @@ impl Scope {
     }
 
     /// Convenience constructor for tests and simple setups: a single
-    /// recursive `allow(Write)` rule rooted at `root`.
+    /// recursive `allow(Write)` rule rooted at the lexical path `root`.
     pub fn writable(root: impl AsRef<Path>) -> std::io::Result<Self> {
-        let root = root.as_ref().canonicalize()?;
+        let root = normalize_path(root.as_ref()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "scope root must be an absolute path without root traversal",
+            )
+        })?;
         Ok(Self {
             allow: vec![ResolvedRule {
                 target: root,
@@ -214,8 +219,7 @@ impl Scope {
         })
     }
 
-    /// Resolve one rule target with the same symlink and missing-tail semantics
-    /// used by scope matching.
+    /// Return one rule's lexically normalized target without resolving symlinks.
     pub fn resolved_target(rule: &ScopeRule) -> Result<PathBuf, ScopeError> {
         Ok(resolve_rule(rule)?.target)
     }
@@ -244,7 +248,7 @@ impl Scope {
     /// Returns `None` when `path` is outside every allow rule, or when
     /// deny rules have knocked it below `Read`.
     pub fn permission_at(&self, path: &Path) -> Option<Permission> {
-        let resolved = resolve_path(path)?;
+        let resolved = normalize_path(path)?;
         let mut effective: Option<Permission> = None;
         for rule in &self.allow {
             if rule.matches(&resolved) {
@@ -523,7 +527,7 @@ fn resolve_rule(rule: &ScopeRule) -> Result<ResolvedRule, ScopeError> {
     if !rule.target.is_absolute() {
         return Err(ScopeError::RelativeTarget(rule.target.clone()));
     }
-    let target = resolve_path(&rule.target).ok_or_else(|| ScopeError::ResolveTarget {
+    let target = normalize_path(&rule.target).ok_or_else(|| ScopeError::ResolveTarget {
         path: rule.target.clone(),
         source: std::io::Error::new(std::io::ErrorKind::Other, "could not absolutize target"),
     })?;
@@ -534,37 +538,27 @@ fn resolve_rule(rule: &ScopeRule) -> Result<ResolvedRule, ScopeError> {
     })
 }
 
-/// Convert `path` to an absolute form suitable for prefix comparison.
-///
-/// Tries `canonicalize` on the full path first (resolves symlinks). If
-/// the path doesn't exist yet, climbs to the closest existing ancestor,
-/// canonicalizes it, then rejoins the missing tail. Returns `None` for
-/// relative inputs that have no existing ancestor to anchor against.
-fn resolve_path(path: &Path) -> Option<PathBuf> {
+/// Normalize an absolute path for lexical scope comparison without consulting
+/// filesystem metadata or resolving symbolic links.
+fn normalize_path(path: &Path) -> Option<PathBuf> {
     if !path.is_absolute() {
         return None;
     }
-    if let Ok(canonical) = path.canonicalize() {
-        return Some(canonical);
-    }
-    let mut tail: Vec<OsString> = Vec::new();
-    let mut cur = path.to_path_buf();
-    loop {
-        if let Ok(canonical) = cur.canonicalize() {
-            let mut out = canonical;
-            for segment in tail.iter().rev() {
-                out.push(segment);
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
             }
-            return Some(out);
+            Component::Normal(part) => normalized.push(part),
         }
-        let name = cur.file_name()?.to_os_string();
-        tail.push(name);
-        let parent = cur.parent()?.to_path_buf();
-        if parent == cur {
-            return None;
-        }
-        cur = parent;
     }
+    normalized.is_absolute().then_some(normalized)
 }
 
 #[cfg(test)]
@@ -803,6 +797,23 @@ mod tests {
         let scope = Scope::writable(dir.path()).unwrap();
         let traversal = dir.path().join("../../../etc/passwd");
         assert!(!scope.is_readable(&traversal));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scope_authorizes_symlink_paths_lexically_without_authorizing_targets() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("outside.txt"), "visible through link").unwrap();
+        symlink(outside.path(), dir.path().join("external")).unwrap();
+        let scope = Scope::writable(dir.path()).unwrap();
+
+        assert!(scope.is_readable(&dir.path().join("external/outside.txt")));
+        assert!(scope.is_writable(&dir.path().join("external/new.txt")));
+        assert!(!scope.is_readable(&outside.path().join("outside.txt")));
+        assert!(!scope.is_writable(&outside.path().join("new.txt")));
     }
 
     #[test]

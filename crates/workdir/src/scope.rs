@@ -492,51 +492,9 @@ impl ScopedWorkdirSession {
         }
     }
 
-    async fn ensure_source_path_has_no_symlink(&self, path: &FsPath) -> Result<(), WorkdirError> {
-        let mut current = String::new();
-        for component in Path::new(path.as_str()).components() {
-            let component = component.as_os_str().to_string_lossy();
-            if component.is_empty() || component == "." {
-                continue;
-            }
-            if !current.is_empty() {
-                current.push('/');
-            }
-            current.push_str(&component);
-            let current = FsPath::new(&current).map_err(|error| {
-                WorkdirError::Denied(format!("invalid scoped Workdir path: {error}"))
-            })?;
-            match self.source.stat(StatRequest { path: current }).await {
-                Ok(result) if result.kind == fs_operation::EntryKind::Symlink => {
-                    return Err(WorkdirError::Denied(format!(
-                        "scoped Workdir path `{path}` traverses a symlink"
-                    )));
-                }
-                Ok(_) => {}
-                Err(WorkdirError::NotFound(_)) => break,
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(())
-    }
-
-    async fn ensure_scope_targets_do_not_traverse_symlinks(
-        &self,
-        rules: &[WorkdirToolScopeRule],
-    ) -> Result<(), WorkdirError> {
-        for rule in rules {
-            self.ensure_source_path_has_no_symlink(&rule.target).await?;
-        }
-        Ok(())
-    }
-
-    async fn resolve_operation_path(&self, path: &FsPath) -> Result<FsPath, WorkdirError> {
+    fn resolve_operation_path(&self, path: &FsPath) -> Result<FsPath, WorkdirError> {
         self.ensure_active()?;
-        let resolved = self.resolve_path(path)?;
-        if self.scope.is_some() {
-            self.ensure_source_path_has_no_symlink(&resolved).await?;
-        }
-        Ok(resolved)
+        self.resolve_path(path)
     }
 
     fn validate_scope(
@@ -624,8 +582,6 @@ impl ScopedWorkdirSession {
                 request.cwd
             )));
         }
-        self.ensure_scope_targets_do_not_traverse_symlinks(&request.rules)
-            .await?;
         let validity = SessionValidity::child(self.validity.clone());
         let cleanup_pending = Arc::new(AtomicBool::new(true));
         let id = self.next_lease_id.fetch_add(1, Ordering::Relaxed);
@@ -736,49 +692,49 @@ impl WorkdirSession for ScopedWorkdirSession {
     }
 
     async fn stat(&self, mut request: StatRequest) -> Result<StatResult, WorkdirError> {
-        let path = self.resolve_operation_path(&request.path).await?;
+        let path = self.resolve_operation_path(&request.path)?;
         self.ensure_read(&path, WorkdirSessionCapability::Read)?;
         request.path = path;
         self.source.stat(request).await
     }
 
     async fn read(&self, mut request: ReadRequest) -> Result<ReadResult, WorkdirError> {
-        let path = self.resolve_operation_path(&request.path).await?;
+        let path = self.resolve_operation_path(&request.path)?;
         self.ensure_read(&path, WorkdirSessionCapability::Read)?;
         request.path = path;
         self.source.read(request).await
     }
 
     async fn write(&self, mut request: WriteRequest) -> Result<WriteResult, WorkdirError> {
-        let path = self.resolve_operation_path(&request.path).await?;
+        let path = self.resolve_operation_path(&request.path)?;
         self.ensure_write(&path, WorkdirSessionCapability::Write)?;
         request.path = path;
         self.source.write(request).await
     }
 
     async fn edit(&self, mut request: EditRequest) -> Result<EditResult, WorkdirError> {
-        let path = self.resolve_operation_path(&request.path).await?;
+        let path = self.resolve_operation_path(&request.path)?;
         self.ensure_write(&path, WorkdirSessionCapability::Edit)?;
         request.path = path;
         self.source.edit(request).await
     }
 
     async fn list(&self, mut request: ListRequest) -> Result<ListResult, WorkdirError> {
-        let path = self.resolve_operation_path(&request.path).await?;
+        let path = self.resolve_operation_path(&request.path)?;
         self.ensure_read(&path, WorkdirSessionCapability::Read)?;
         request.path = path;
         self.source.list(request).await
     }
 
     async fn glob(&self, mut request: GlobRequest) -> Result<GlobResult, WorkdirError> {
-        let path = self.resolve_operation_path(&request.path).await?;
+        let path = self.resolve_operation_path(&request.path)?;
         self.ensure_read(&path, WorkdirSessionCapability::Glob)?;
         request.path = path;
         self.source.glob(request).await
     }
 
     async fn grep(&self, mut request: GrepRequest) -> Result<GrepResult, WorkdirError> {
-        let path = self.resolve_operation_path(&request.path).await?;
+        let path = self.resolve_operation_path(&request.path)?;
         self.ensure_read(&path, WorkdirSessionCapability::Grep)?;
         request.path = path;
         self.source.grep(request).await
@@ -1487,7 +1443,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn provider_scope_denies_read_through_symlink_outside_grant() {
+    async fn provider_scope_allows_read_through_its_logical_symlink_path() {
         use std::os::unix::fs::symlink;
 
         let root = TempDir::new().unwrap();
@@ -1501,16 +1457,12 @@ mod tests {
             .await
             .unwrap();
 
-        let result = child.read(read("link")).await;
-        assert!(
-            result.is_err(),
-            "symlink read escaped provider scope: {result:?}"
-        );
+        assert_eq!(child.read(read("link")).await.unwrap().bytes, b"hidden");
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn provider_scope_denies_write_through_symlink_outside_grant() {
+    async fn provider_scope_allows_write_through_its_logical_symlink_path() {
         use std::os::unix::fs::symlink;
 
         let root = TempDir::new().unwrap();
@@ -1523,17 +1475,19 @@ mod tests {
             .await
             .unwrap();
 
-        let result = child.write(write("outside/new", "forbidden")).await;
-        assert!(
-            result.is_err(),
-            "symlink write escaped provider scope: {result:?}"
+        child
+            .write(write("outside/new", "through-logical-path"))
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.path().join("secret/new")).unwrap(),
+            "through-logical-path"
         );
-        assert!(!root.path().join("secret/new").exists());
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn write_delegation_rejects_symlink_target_before_lease() {
+    async fn write_delegation_leases_the_logical_symlink_path() {
         use std::os::unix::fs::symlink;
 
         let root = TempDir::new().unwrap();
@@ -1542,19 +1496,25 @@ mod tests {
         symlink("../secret", root.path().join("granted/outside")).unwrap();
         let parent = session(root.path());
 
-        assert!(matches!(
-            parent
-                .scope(request(
-                    "granted/outside",
-                    WorkdirToolScopePermission::Write
-                ))
-                .await,
-            Err(WorkdirError::Denied(_))
-        ));
+        let child = parent
+            .scope(request(
+                "granted/outside",
+                WorkdirToolScopePermission::Write,
+            ))
+            .await
+            .unwrap();
+        child
+            .write(write("from-child", "child-authoritative"))
+            .await
+            .unwrap();
         parent
             .write(write("secret/parent", "still-authoritative"))
             .await
             .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.path().join("secret/from-child")).unwrap(),
+            "child-authoritative"
+        );
     }
 
     #[tokio::test]

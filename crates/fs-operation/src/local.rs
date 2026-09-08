@@ -45,7 +45,7 @@ pub fn run_read(
 ) -> Result<ReadResult, FsError> {
     let logical = request.path;
     let path = resolve(root, &logical)?;
-    let path = require_access(&path, &logical, access, false)?;
+    let path = require_access(&path, &logical, access, false, false)?;
     let metadata = fs::metadata(&path).map_err(|error| map_io(&logical, error))?;
     if metadata.is_dir() {
         return Err(FsError::IsDirectory(PathBuf::from(logical.as_str())));
@@ -99,7 +99,7 @@ pub fn run_write(
     let path = resolve(root, &logical)?;
     let created = !path.exists();
     if path.exists() {
-        let target = require_access(&path, &logical, access, true)?;
+        let target = require_access(&path, &logical, access, true, false)?;
         let metadata = fs::metadata(&target).map_err(|error| map_io(&logical, error))?;
         if metadata.is_dir() {
             return Err(FsError::IsDirectory(PathBuf::from(logical.as_str())));
@@ -117,7 +117,7 @@ pub fn run_write(
             FsError::InvalidArgument(format!("{} has no parent", logical.as_str()))
         })?;
         let parent_logical = logical_parent(&logical);
-        require_access(parent, &parent_logical, access, true)?;
+        require_access(parent, &parent_logical, access, true, true)?;
         atomic_write(&path, &request.content, &logical)?;
     }
     Ok(WriteResult {
@@ -133,7 +133,7 @@ pub fn run_edit(
 ) -> Result<EditResult, FsError> {
     let logical = request.path;
     let path = resolve(root, &logical)?;
-    let target = require_access(&path, &logical, access, true)?;
+    let target = require_access(&path, &logical, access, true, false)?;
     let bytes = fs::read(&target).map_err(|error| map_io(&logical, error))?;
     let actual_hash = hash_bytes(&bytes);
     if actual_hash != request.expected_hash {
@@ -173,7 +173,7 @@ pub fn run_list(
 ) -> Result<ListResult, FsError> {
     let logical = request.path;
     let path = resolve(root, &logical)?;
-    let path = require_access(&path, &logical, access, false)?;
+    let path = require_access(&path, &logical, access, false, true)?;
     let metadata = fs::metadata(&path).map_err(|error| map_io(&logical, error))?;
     if !metadata.is_dir() {
         return Err(FsError::NotDirectory(PathBuf::from(logical.as_str())));
@@ -247,6 +247,7 @@ fn require_access(
     logical: &FsPath,
     access: &dyn FsAccessPolicy,
     write: bool,
+    allow_symlink_directory: bool,
 ) -> Result<PathBuf, FsError> {
     if let Some(info) = direct_symlink(path) {
         if !info.target_exists {
@@ -257,9 +258,9 @@ fn require_access(
             });
         }
         let allowed = if write {
-            access.is_writable(&info.resolved_path)
+            access.is_writable(path)
         } else {
-            access.is_readable(&info.resolved_path)
+            access.is_readable(path)
         };
         if !allowed {
             return Err(FsError::SymlinkOutOfScope {
@@ -268,7 +269,7 @@ fn require_access(
                 required_permission: if write { "write" } else { "read" },
             });
         }
-        if write && info.resolved_path.is_dir() {
+        if !allow_symlink_directory && info.resolved_path.is_dir() {
             return Err(FsError::SymlinkTargetIsDirectory {
                 path: PathBuf::from(logical.as_str()),
                 target: PathBuf::from("<provider-internal target>"),
