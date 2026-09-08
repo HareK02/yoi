@@ -28,6 +28,7 @@ mod runtime;
 pub mod worker_backend;
 pub mod worker_source;
 pub mod working_directory;
+pub mod workspace_issuer;
 
 #[cfg(feature = "fs-store")]
 pub use fs_store::{FsRuntimeStore, FsRuntimeStoreOptions};

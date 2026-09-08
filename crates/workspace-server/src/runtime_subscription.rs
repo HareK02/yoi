@@ -10,12 +10,11 @@ use protocol::subscription::{
     SubscriptionRequestId, SubscriptionResponse, SubscriptionSnapshot, SubscriptionTerminationCode,
 };
 use tokio::sync::mpsc;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use worker_runtime::auth::{CapabilityTokenSigner, capability_claims};
+use tokio_tungstenite::{client_async_tls_with_config, connect_async};
 
-use crate::hosts::RemoteRuntimeConfig;
+use crate::hosts::{RemoteRuntimeConfig, resolve_strict_remote_runtime_endpoint};
 
 const DOWNSTREAM_QUEUE_CAPACITY: usize = 256;
 const RECONNECT_DELAY: Duration = Duration::from_millis(100);
@@ -918,10 +917,43 @@ async fn connect_runtime(
                 .map_err(|error| format!("invalid Runtime authorization header: {error}"))?,
         );
     }
-    connect_async(request)
+    if config.strict_public_egress {
+        let base_url = config.base_url.clone();
+        let (_, addresses) =
+            tokio::task::spawn_blocking(move || resolve_strict_remote_runtime_endpoint(&base_url))
+                .await
+                .map_err(|_| {
+                    "Runtime subscription endpoint resolution task failed".to_string()
+                })??;
+        let stream = tokio::time::timeout(config.timeout, async move {
+            let mut last_error = None;
+            for address in addresses {
+                match tokio::net::TcpStream::connect(address).await {
+                    Ok(stream) => return Ok(stream),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "no validated Runtime address was available".to_string()))
+        })
         .await
+        .map_err(|_| "Runtime subscription TCP connection timed out".to_string())??;
+        tokio::time::timeout(
+            config.timeout,
+            client_async_tls_with_config(request, stream, None, None),
+        )
+        .await
+        .map_err(|_| "Runtime subscription TLS/WebSocket handshake timed out".to_string())?
         .map(|(socket, _)| socket)
         .map_err(|error| format!("failed to connect Runtime subscription endpoint: {error}"))
+    } else {
+        tokio::time::timeout(config.timeout, connect_async(request))
+            .await
+            .map_err(|_| "Runtime subscription connection timed out".to_string())?
+            .map(|(socket, _)| socket)
+            .map_err(|error| format!("failed to connect Runtime subscription endpoint: {error}"))
+    }
 }
 fn runtime_endpoint(base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
@@ -935,24 +967,15 @@ fn runtime_endpoint(base_url: &str) -> String {
 }
 fn runtime_token(
     config: &RemoteRuntimeConfig,
-    workspace_id: &str,
+    _workspace_id: &str,
 ) -> Result<Option<String>, String> {
-    let Some(auth) = config.auth.as_ref() else {
-        return Ok(config.bearer_token.clone());
-    };
-    let signer = CapabilityTokenSigner::new(&auth.server_id, &auth.server_private_key);
-    let claims = capability_claims(
-        &auth.server_id,
-        &config.runtime_id,
-        workspace_id,
-        vec!["workers:list".into()],
-        300,
-    )
-    .map_err(|error| error.to_string())?;
-    signer
-        .sign(&claims)
-        .map(Some)
-        .map_err(|error| error.to_string())
+    if let Some(authorization) = config.workspace_authorization.as_ref() {
+        return authorization
+            .issue("GET", "/v1/protocol/ws", "workers:list", None, &[])
+            .map(Some)
+            .map_err(|error| error.message);
+    }
+    Ok(config.bearer_token.clone())
 }
 fn update_status(status: &RwLock<RuntimeSubscriptionBrokerStatus>, state: &State, connected: bool) {
     *status.write().expect("broker status poisoned") = RuntimeSubscriptionBrokerStatus {

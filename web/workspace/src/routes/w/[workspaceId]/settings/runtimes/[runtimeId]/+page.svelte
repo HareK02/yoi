@@ -1,13 +1,12 @@
 <script lang="ts">
   import { invalidateAll } from '$app/navigation';
   import type {
-    PutRuntimeTrustKeyRequest,
     RevokeRuntimeTrustKeyRequest,
     RuntimeTrustKeyStatus,
   } from '$lib/generated/workspace-api';
   import {
+    createRemoteRuntime,
     previewRuntimePublicKeyFingerprint,
-    putRuntimeTrustKey,
     revealRuntimeTrustKey,
     revokeRuntimeTrustKey,
     RuntimeTrustConflictError,
@@ -144,15 +143,24 @@
       }
     }
 
-    const request: PutRuntimeTrustKeyRequest = {
-      public_key: key,
-      expected_revision: trust.revision ?? null,
-    };
-
     const operation = routeFence.capture(data.runtimeId);
     busyAction = 'save';
     try {
-      await putRuntimeTrustKey(data.workspaceId, operation.runtimeId, request);
+      const binding = data.runtimeDetail.runtime.management.binding;
+      if (!binding || !data.runtimeDetail.endpoint) {
+        throw new RuntimeTrustRequestError(
+          'The Workspace identity binding and authoritative Runtime endpoint are required.',
+        );
+      }
+      await createRemoteRuntime(data.workspaceId, {
+        public_bundle: {
+          identity_id: operation.runtimeId,
+          public_key: key,
+        },
+        display_name: data.runtimeDetail.runtime.label,
+        endpoint: data.runtimeDetail.endpoint,
+        expected_revision: binding.revision,
+      });
       if (!isCurrentRoute(operation)) return;
       publicKey = '';
       fingerprintConfirmation = '';
@@ -315,7 +323,12 @@
         <div><dt>Kind</dt><dd>{runtime.kind}</dd></div>
         <div><dt>Endpoint</dt><dd>{detail.endpoint ?? 'Not configured'}</dd></div>
         <div><dt>Status</dt><dd>{runtime.status}</dd></div>
-        <div><dt>Binding status</dt><dd>{trust.status}</dd></div>
+        <div><dt>Connection state</dt><dd>{runtime.management.binding?.connection_state ?? 'Not configured'}</dd></div>
+        <div><dt>Workspace signing key</dt><dd><code>{runtime.management.binding?.workspace_key_id ?? '—'}</code></dd></div>
+        <div><dt>Verified</dt><dd>{formatTimestamp(runtime.management.binding?.verification?.verified_at)}</dd></div>
+        <div><dt>Verified binding revision</dt><dd>{runtime.management.binding?.verification?.binding_revision?.toString() ?? '—'}</dd></div>
+        <div><dt>Last verification check</dt><dd>{runtime.management.binding?.verification?.last_outcome ?? '—'} · {formatTimestamp(runtime.management.binding?.verification?.last_checked_at)}</dd></div>
+        <div><dt>Runtime key status</dt><dd>{trust.status}</dd></div>
         <div><dt>Fingerprint</dt><dd><code>{trust.fingerprint ?? '—'}</code></dd></div>
         <div><dt>Revision</dt><dd>{trust.revision?.toString() ?? '—'}</dd></div>
         <div><dt>Created</dt><dd>{formatTimestamp(trust.created_at)}</dd></div>

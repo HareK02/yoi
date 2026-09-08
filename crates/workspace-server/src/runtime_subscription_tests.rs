@@ -416,3 +416,19 @@ async fn embedded_runtime_uses_in_process_subscription_source() {
     ));
     server.abort();
 }
+
+#[tokio::test]
+async fn strict_runtime_subscription_rejects_private_endpoint_before_websocket_connect() {
+    let config = RemoteRuntimeConfig::new(
+        "runtime-private",
+        "Private Runtime",
+        "https://169.254.169.254",
+        None,
+    )
+    .with_strict_public_egress(true);
+    let error = match connect_runtime(&config, "workspace-a").await {
+        Err(error) => error,
+        Ok(_) => panic!("private endpoint unexpectedly produced a WebSocket"),
+    };
+    assert!(error.contains("endpoint host is not public"), "{error}");
+}

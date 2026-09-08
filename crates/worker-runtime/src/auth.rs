@@ -2,6 +2,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -9,8 +10,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const PUBLIC_KEY_PREFIX: &str = "yoi-ed25519-pub:v1:";
 const PRIVATE_KEY_PREFIX: &str = "yoi-ed25519-pkcs8:v1:";
-const TOKEN_PREFIX: &str = "yoi-cap-v1";
-const SIGNING_INPUT_PREFIX: &str = "yoi-cap-v1.";
 pub const WORKER_MUTATION_SOURCE_PROOF_HEADER: &str = "x-yoi-worker-mutation-proof";
 const WORKER_MUTATION_SOURCE_PROOF_PREFIX: &str = "yoi-worker-source-v1";
 const WORKER_MUTATION_SOURCE_SIGNING_INPUT_PREFIX: &str = "yoi-worker-source-v1.";
@@ -68,6 +67,74 @@ pub enum RuntimeAuthError {
     WrongMutationTarget,
 }
 
+pub(crate) struct SignedJsonToken<T> {
+    pub payload: String,
+    pub signature: Vec<u8>,
+    pub claims: T,
+}
+
+pub(crate) fn sign_json_token<T: Serialize>(
+    token_prefix: &str,
+    signing_input_prefix: &str,
+    signing_key: &Ed25519KeyPair,
+    claims: &T,
+) -> Result<String, RuntimeAuthError> {
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims)?);
+    let signing_input = format!("{signing_input_prefix}{payload}");
+    let signature = signing_key.sign(signing_input.as_bytes());
+    Ok(format!(
+        "{token_prefix}.{payload}.{}",
+        URL_SAFE_NO_PAD.encode(signature.as_ref())
+    ))
+}
+
+pub(crate) fn decode_signed_json_token<T: DeserializeOwned>(
+    token: &str,
+    expected_prefix: &str,
+) -> Result<SignedJsonToken<T>, RuntimeAuthError> {
+    let (prefix, payload, signature) = split_three_part_token(token)?;
+    if prefix != expected_prefix {
+        return Err(RuntimeAuthError::InvalidTokenFormat);
+    }
+    let signature = URL_SAFE_NO_PAD.decode(signature)?;
+    let claims = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload)?)?;
+    Ok(SignedJsonToken {
+        payload: payload.to_string(),
+        signature,
+        claims,
+    })
+}
+
+pub(crate) fn verify_signed_json_token(
+    signing_input_prefix: &str,
+    payload: &str,
+    signature: &[u8],
+    public_key: &str,
+) -> Result<(), RuntimeAuthError> {
+    let public_key = decode_public_key(public_key)?;
+    let signing_input = format!("{signing_input_prefix}{payload}");
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(signing_input.as_bytes(), signature)
+        .map_err(|_| RuntimeAuthError::InvalidSignature)
+}
+
+fn split_three_part_token(token: &str) -> Result<(&str, &str, &str), RuntimeAuthError> {
+    let mut parts = token.split('.');
+    let prefix = parts.next().unwrap_or_default();
+    let payload = parts.next().unwrap_or_default();
+    let signature = parts.next().unwrap_or_default();
+    if prefix.is_empty() || payload.is_empty() || signature.is_empty() || parts.next().is_some() {
+        return Err(RuntimeAuthError::InvalidTokenFormat);
+    }
+    Ok((prefix, payload, signature))
+}
+
+pub(crate) fn is_request_body_digest(value: &str) -> bool {
+    URL_SAFE_NO_PAD
+        .decode(value)
+        .is_ok_and(|decoded| decoded.len() == 32 && URL_SAFE_NO_PAD.encode(decoded) == value)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeIdentityMaterial {
     pub identity_id: String,
@@ -96,143 +163,12 @@ impl RuntimeIdentityMaterial {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TrustedServerKey {
-    pub server_id: String,
-    pub public_key: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeHttpAuthConfig {
-    pub runtime_id: String,
-    #[serde(default)]
-    pub trusted_servers: Vec<TrustedServerKey>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeAuthContext {
     pub server_id: String,
     pub workspace_id: String,
     pub permissions: Vec<String>,
     pub token_id: String,
     pub expires_at: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapabilityClaims {
-    pub iss: String,
-    pub aud: String,
-    pub workspace_id: String,
-    pub permissions: Vec<String>,
-    pub exp: u64,
-    pub jti: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CapabilityTokenSigner {
-    server_id: String,
-    private_key: String,
-}
-
-impl CapabilityTokenSigner {
-    pub fn new(server_id: impl Into<String>, private_key: impl Into<String>) -> Self {
-        Self {
-            server_id: server_id.into(),
-            private_key: private_key.into(),
-        }
-    }
-
-    pub fn server_id(&self) -> &str {
-        &self.server_id
-    }
-
-    pub fn sign(&self, claims: &CapabilityClaims) -> Result<String, RuntimeAuthError> {
-        if claims.iss != self.server_id {
-            return Err(RuntimeAuthError::UnknownIssuer(claims.iss.clone()));
-        }
-        let private = decode_private_key(&self.private_key)?;
-        let pair = Ed25519KeyPair::from_pkcs8(&private)
-            .map_err(|_| RuntimeAuthError::InvalidPrivateKey)?;
-        let payload = serde_json::to_vec(claims)?;
-        let payload = URL_SAFE_NO_PAD.encode(payload);
-        let signing_input = format!("{SIGNING_INPUT_PREFIX}{payload}");
-        let signature = pair.sign(signing_input.as_bytes());
-        Ok(format!(
-            "{TOKEN_PREFIX}.{payload}.{}",
-            URL_SAFE_NO_PAD.encode(signature.as_ref())
-        ))
-    }
-}
-
-pub fn capability_claims(
-    server_id: impl Into<String>,
-    runtime_id: impl Into<String>,
-    workspace_id: impl Into<String>,
-    permissions: Vec<String>,
-    ttl_seconds: u64,
-) -> Result<CapabilityClaims, RuntimeAuthError> {
-    let exp = unix_now_seconds().saturating_add(ttl_seconds);
-    Ok(CapabilityClaims {
-        iss: server_id.into(),
-        aud: runtime_id.into(),
-        workspace_id: workspace_id.into(),
-        permissions,
-        exp,
-        jti: new_token_id()?,
-    })
-}
-
-pub fn verify_capability_token(
-    config: &RuntimeHttpAuthConfig,
-    token: &str,
-    required_permission: Option<&str>,
-    now_seconds: u64,
-) -> Result<RuntimeAuthContext, RuntimeAuthError> {
-    let (payload, signature) = split_token(token)?;
-    let claims_json = URL_SAFE_NO_PAD.decode(payload)?;
-    let claims: CapabilityClaims = serde_json::from_slice(&claims_json)?;
-    let Some(server) = config
-        .trusted_servers
-        .iter()
-        .find(|server| server.server_id == claims.iss)
-    else {
-        return Err(RuntimeAuthError::UnknownIssuer(claims.iss));
-    };
-    let public_key = decode_public_key(&server.public_key)?;
-    let signing_input = format!("{SIGNING_INPUT_PREFIX}{payload}");
-    UnparsedPublicKey::new(&ED25519, public_key)
-        .verify(signing_input.as_bytes(), &signature)
-        .map_err(|_| RuntimeAuthError::InvalidSignature)?;
-
-    if claims.aud != config.runtime_id {
-        return Err(RuntimeAuthError::WrongAudience {
-            expected: config.runtime_id.clone(),
-            actual: claims.aud,
-        });
-    }
-    if claims.exp < now_seconds {
-        return Err(RuntimeAuthError::Expired);
-    }
-    if claims.workspace_id.trim().is_empty() {
-        return Err(RuntimeAuthError::MissingWorkspaceScope);
-    }
-    if let Some(required) = required_permission {
-        if !claims
-            .permissions
-            .iter()
-            .any(|permission| permission == required)
-        {
-            return Err(RuntimeAuthError::MissingPermission(required.to_string()));
-        }
-    }
-    Ok(RuntimeAuthContext {
-        server_id: claims.iss,
-        workspace_id: claims.workspace_id,
-        permissions: claims.permissions,
-        token_id: claims.jti,
-        expires_at: claims.exp,
-    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,28 +259,22 @@ impl RuntimeRequestSourceSigner {
             exp: now_unix.saturating_add(ttl_seconds),
             jti: new_token_id()?,
         };
-        let payload = serde_json::to_vec(&claims)?;
-        let payload = URL_SAFE_NO_PAD.encode(payload);
-        let signing_input = format!("{RUNTIME_REQUEST_SOURCE_SIGNING_INPUT_PREFIX}{payload}");
         let private = decode_private_key(&self.private_key)?;
         let key_pair = Ed25519KeyPair::from_pkcs8(&private)
             .map_err(|_| RuntimeAuthError::InvalidPrivateKey)?;
-        let signature = URL_SAFE_NO_PAD.encode(key_pair.sign(signing_input.as_bytes()).as_ref());
-        Ok(format!(
-            "{RUNTIME_REQUEST_SOURCE_PROOF_PREFIX}.{payload}.{signature}"
-        ))
+        sign_json_token(
+            RUNTIME_REQUEST_SOURCE_PROOF_PREFIX,
+            RUNTIME_REQUEST_SOURCE_SIGNING_INPUT_PREFIX,
+            &key_pair,
+            &claims,
+        )
     }
 }
 
 pub fn decode_runtime_request_source_claims(
     proof: &str,
 ) -> Result<RuntimeRequestSourceClaims, RuntimeAuthError> {
-    let (prefix, payload, _signature) = split_runtime_request_source_proof(proof)?;
-    if prefix != RUNTIME_REQUEST_SOURCE_PROOF_PREFIX {
-        return Err(RuntimeAuthError::InvalidTokenFormat);
-    }
-    let payload = URL_SAFE_NO_PAD.decode(payload)?;
-    serde_json::from_slice(&payload).map_err(RuntimeAuthError::from)
+    Ok(decode_signed_json_token(proof, RUNTIME_REQUEST_SOURCE_PROOF_PREFIX)?.claims)
 }
 
 pub fn verify_runtime_request_source(
@@ -352,17 +282,17 @@ pub fn verify_runtime_request_source(
     public_key: &str,
     expected: &RuntimeRequestSourceExpectation<'_>,
 ) -> Result<RuntimeRequestSourceClaims, RuntimeAuthError> {
-    let (prefix, payload, signature) = split_runtime_request_source_proof(proof)?;
-    if prefix != RUNTIME_REQUEST_SOURCE_PROOF_PREFIX {
-        return Err(RuntimeAuthError::InvalidTokenFormat);
-    }
-    let signature = URL_SAFE_NO_PAD.decode(signature)?;
-    let signing_input = format!("{RUNTIME_REQUEST_SOURCE_SIGNING_INPUT_PREFIX}{payload}");
-    let public_key = decode_public_key(public_key)?;
-    UnparsedPublicKey::new(&ED25519, public_key)
-        .verify(signing_input.as_bytes(), &signature)
-        .map_err(|_| RuntimeAuthError::InvalidSignature)?;
-    let claims = decode_runtime_request_source_claims(proof)?;
+    let signed = decode_signed_json_token::<RuntimeRequestSourceClaims>(
+        proof,
+        RUNTIME_REQUEST_SOURCE_PROOF_PREFIX,
+    )?;
+    verify_signed_json_token(
+        RUNTIME_REQUEST_SOURCE_SIGNING_INPUT_PREFIX,
+        &signed.payload,
+        &signed.signature,
+        public_key,
+    )?;
+    let claims = signed.claims;
     if claims.iss != expected.identity_id
         || claims.aud != expected.audience
         || claims.workspace_id != expected.workspace_id
@@ -378,17 +308,6 @@ pub fn verify_runtime_request_source(
         return Err(RuntimeAuthError::Expired);
     }
     Ok(claims)
-}
-
-fn split_runtime_request_source_proof(proof: &str) -> Result<(&str, &str, &str), RuntimeAuthError> {
-    let mut parts = proof.split('.');
-    let prefix = parts.next().unwrap_or_default();
-    let payload = parts.next().unwrap_or_default();
-    let signature = parts.next().unwrap_or_default();
-    if prefix.is_empty() || payload.is_empty() || signature.is_empty() || parts.next().is_some() {
-        return Err(RuntimeAuthError::InvalidTokenFormat);
-    }
-    Ok((prefix, payload, signature))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -580,16 +499,6 @@ fn split_worker_mutation_source_proof(token: &str) -> Result<(&str, Vec<u8>), Ru
         (Some(prefix), Some(payload), Some(signature), None)
             if prefix == WORKER_MUTATION_SOURCE_PROOF_PREFIX =>
         {
-            Ok((payload, URL_SAFE_NO_PAD.decode(signature)?))
-        }
-        _ => Err(RuntimeAuthError::InvalidTokenFormat),
-    }
-}
-
-fn split_token(token: &str) -> Result<(&str, Vec<u8>), RuntimeAuthError> {
-    let mut parts = token.split('.');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(prefix), Some(payload), Some(signature), None) if prefix == TOKEN_PREFIX => {
             Ok((payload, URL_SAFE_NO_PAD.decode(signature)?))
         }
         _ => Err(RuntimeAuthError::InvalidTokenFormat),
@@ -849,48 +758,6 @@ mod tests {
         assert!(matches!(
             verify_runtime_request_source(&proof, &runtime.public_key, &expired),
             Err(RuntimeAuthError::Expired)
-        ));
-    }
-
-    #[test]
-    fn capability_token_verifies_signature_audience_expiry_and_permission() {
-        let server = RuntimeIdentityMaterial::generate("server-main").unwrap();
-        let signer = CapabilityTokenSigner::new(&server.identity_id, &server.private_key);
-        let claims = CapabilityClaims {
-            iss: "server-main".to_string(),
-            aud: "runtime-main".to_string(),
-            workspace_id: "workspace-a".to_string(),
-            permissions: vec!["workers:list".to_string()],
-            exp: 100,
-            jti: "token-1".to_string(),
-        };
-        let token = signer.sign(&claims).unwrap();
-        let auth = RuntimeHttpAuthConfig {
-            runtime_id: "runtime-main".to_string(),
-            trusted_servers: vec![TrustedServerKey {
-                server_id: "server-main".to_string(),
-                public_key: server.public_key.clone(),
-                display_name: None,
-            }],
-        };
-
-        let context = verify_capability_token(&auth, &token, Some("workers:list"), 99).unwrap();
-        assert_eq!(context.workspace_id, "workspace-a");
-        assert!(matches!(
-            verify_capability_token(&auth, &token, Some("workers:create"), 99),
-            Err(RuntimeAuthError::MissingPermission(permission)) if permission == "workers:create"
-        ));
-        assert!(matches!(
-            verify_capability_token(&auth, &token, Some("workers:list"), 101),
-            Err(RuntimeAuthError::Expired)
-        ));
-        let wrong_audience = RuntimeHttpAuthConfig {
-            runtime_id: "other-runtime".to_string(),
-            trusted_servers: auth.trusted_servers.clone(),
-        };
-        assert!(matches!(
-            verify_capability_token(&wrong_audience, &token, Some("workers:list"), 99),
-            Err(RuntimeAuthError::WrongAudience { .. })
         ));
     }
 }

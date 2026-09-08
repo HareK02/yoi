@@ -18,11 +18,16 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 53;
+const LATEST_SCHEMA_VERSION: i64 = 56;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
 const WORKSPACE_DELETION_MIGRATION_NAME: &str = "durable Workspace deletion operations";
+const WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME: &str = "Workspace signing identity authority";
+const WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME: &str =
+    "Workspace Runtime binding state and identity mode";
+const WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME: &str =
+    "Workspace-signed Runtime verification evidence";
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -39,6 +44,21 @@ const MIGRATIONS: &[Migration] = &[
         version: 53,
         name: WORKSPACE_DELETION_MIGRATION_NAME,
         apply: migrate_workspace_deletion_v52_to_v53,
+    },
+    Migration {
+        version: 54,
+        name: WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME,
+        apply: migrate_workspace_signing_identity_v53_to_v54,
+    },
+    Migration {
+        version: 55,
+        name: WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME,
+        apply: migrate_workspace_runtime_binding_state_v54_to_v55,
+    },
+    Migration {
+        version: 56,
+        name: WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME,
+        apply: migrate_workspace_runtime_verification_v55_to_v56,
     },
 ];
 
@@ -135,6 +155,83 @@ pub struct WorkspaceBootstrapResult {
     pub replayed: bool,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct WorkspaceSigningIdentityRecord {
+    pub workspace_id: String,
+    pub key_id: String,
+    pub algorithm: String,
+    pub public_key: Option<String>,
+    pub public_key_fingerprint: Option<String>,
+    pub private_material_ref: String,
+    pub revision: u64,
+    pub state: String,
+    pub created_at: String,
+    pub provisioned_at: Option<String>,
+    pub updated_at: String,
+}
+
+impl std::fmt::Debug for WorkspaceSigningIdentityRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkspaceSigningIdentityRecord")
+            .field("workspace_id", &self.workspace_id)
+            .field("key_id", &self.key_id)
+            .field("algorithm", &self.algorithm)
+            .field("public_key", &self.public_key)
+            .field("public_key_fingerprint", &self.public_key_fingerprint)
+            .field("private_material_ref", &"[REDACTED]")
+            .field("revision", &self.revision)
+            .field("state", &self.state)
+            .field("created_at", &self.created_at)
+            .field("provisioned_at", &self.provisioned_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSigningIdentityActivation {
+    pub workspace_id: String,
+    pub key_id: String,
+    pub public_key: String,
+    pub public_key_fingerprint: String,
+    pub private_material_ref: String,
+    pub revision: u64,
+    pub provisioned_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSigningIdentityProvisioningOperation {
+    pub operation_key: String,
+    pub request_fingerprint: String,
+    pub operation_kind: String,
+    pub workspace_id: String,
+    pub key_id: String,
+    pub private_material_ref: String,
+    pub revision: u64,
+    pub actor_account_id: String,
+    pub state: String,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceRuntimeVerificationEvidence {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub binding_revision: u64,
+    pub workspace_key_id: String,
+    pub workspace_identity_revision: u64,
+    pub workspace_trust_generation: u64,
+    pub runtime_public_key_fingerprint: String,
+    pub runtime_identity_revision: u64,
+    pub challenge_id: String,
+    pub state: String,
+    pub last_outcome: String,
+    pub verified_at: Option<String>,
+    pub checked_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceRuntimeBinding {
     pub workspace_id: String,
@@ -144,9 +241,47 @@ pub struct WorkspaceRuntimeBinding {
     pub public_key: String,
     pub public_key_fingerprint: String,
     pub binding_revision: u64,
+    pub state: WorkspaceRuntimeBindingState,
+    pub authentication_mode: WorkspaceRuntimeAuthenticationMode,
+    pub workspace_key_id: Option<String>,
+    pub workspace_key_generation: Option<u64>,
     pub created_at: String,
     pub updated_at: String,
     pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceRuntimeBindingState {
+    Configured,
+    Verified,
+    Revoked,
+}
+
+impl WorkspaceRuntimeBindingState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Verified => "verified",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceRuntimeAuthenticationMode {
+    LegacyServerIssuer,
+    WorkspaceIdentity,
+}
+
+impl WorkspaceRuntimeAuthenticationMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyServerIssuer => "legacy_server_issuer",
+            Self::WorkspaceIdentity => "workspace_identity",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -602,9 +737,51 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     fn create_workspace_bootstrap(
         &self,
         record: &WorkspaceBootstrapRecord,
+        signing_identity: &WorkspaceSigningIdentityActivation,
+        identity_provisioning_operation_key: &str,
     ) -> Result<WorkspaceBootstrapResult>;
+    fn reserve_workspace_signing_identity_provisioning(
+        &self,
+        operation: &WorkspaceSigningIdentityProvisioningOperation,
+    ) -> Result<WorkspaceSigningIdentityProvisioningOperation>;
+    fn get_workspace_signing_identity(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<WorkspaceSigningIdentityRecord>>;
+    fn activate_workspace_signing_identity(
+        &self,
+        activation: &WorkspaceSigningIdentityActivation,
+        identity_provisioning_operation_key: &str,
+        actor_account_id: &str,
+    ) -> Result<WorkspaceSigningIdentityRecord>;
     fn workspace_runtime_binding_matches(&self, expected: &WorkspaceRuntimeBinding)
     -> Result<bool>;
+    fn workspace_runtime_verification_matches(
+        &self,
+        binding: &WorkspaceRuntimeBinding,
+        workspace_identity_revision: u64,
+        workspace_trust_generation: u64,
+    ) -> Result<bool>;
+    async fn get_workspace_runtime_verification(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Result<Option<WorkspaceRuntimeVerificationEvidence>>;
+    async fn record_workspace_runtime_verification_attempt(
+        &self,
+        evidence: &WorkspaceRuntimeVerificationEvidence,
+    ) -> Result<()>;
+    async fn record_workspace_runtime_verification_outcome_if_current(
+        &self,
+        expected: &WorkspaceRuntimeVerificationEvidence,
+        state: &str,
+        outcome: &str,
+        checked_at: &str,
+    ) -> Result<bool>;
+    async fn complete_workspace_runtime_verification(
+        &self,
+        evidence: &WorkspaceRuntimeVerificationEvidence,
+    ) -> Result<WorkspaceRuntimeBinding>;
     async fn get_workspace_runtime_binding(
         &self,
         workspace_id: &str,
@@ -1634,13 +1811,15 @@ impl SqliteWorkspaceStore {
         self.with_conn(|conn| {
             let sql = if include_revoked {
                 r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                          public_key_fingerprint, binding_revision, created_at, updated_at, revoked_at
+                          public_key_fingerprint, binding_revision, state, authentication_mode,
+                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
                    FROM workspace_runtime_bindings
                    WHERE workspace_id = ?1
                    ORDER BY runtime_id ASC"#
             } else {
                 r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                          public_key_fingerprint, binding_revision, created_at, updated_at, revoked_at
+                          public_key_fingerprint, binding_revision, state, authentication_mode,
+                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
                    FROM workspace_runtime_bindings
                    WHERE workspace_id = ?1 AND revoked_at IS NULL
                    ORDER BY runtime_id ASC"#
@@ -1662,7 +1841,8 @@ impl SqliteWorkspaceStore {
         self.with_conn(|conn| {
             conn.query_row(
                 r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                          public_key_fingerprint, binding_revision, created_at, updated_at, revoked_at
+                          public_key_fingerprint, binding_revision, state, authentication_mode,
+                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
                    FROM workspace_runtime_bindings
                    WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                 params![workspace_id, runtime_id],
@@ -1688,7 +1868,8 @@ impl SqliteWorkspaceStore {
             let existing = tx
                 .query_row(
                     r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                              public_key_fingerprint, binding_revision, created_at, updated_at, revoked_at
+                              public_key_fingerprint, binding_revision, state, authentication_mode,
+                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
                        FROM workspace_runtime_bindings
                        WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                     params![record.workspace_id, record.runtime_id],
@@ -1701,7 +1882,11 @@ impl SqliteWorkspaceStore {
                     && existing.display_name == record.display_name
                     && existing.base_url == record.base_url
                     && existing.public_key == record.public_key
-                    && existing.public_key_fingerprint == record.public_key_fingerprint;
+                    && existing.public_key_fingerprint == record.public_key_fingerprint
+                    && existing.state == record.state
+                    && existing.authentication_mode == record.authentication_mode
+                    && existing.workspace_key_id == record.workspace_key_id
+                    && existing.workspace_key_generation == record.workspace_key_generation;
                 if exact_active_match {
                     tx.commit()?;
                     return Ok(WorkspaceRuntimeBindingUpsert::Unchanged);
@@ -1716,7 +1901,9 @@ impl SqliteWorkspaceStore {
                     r#"UPDATE workspace_runtime_bindings
                        SET display_name = ?3, base_url = ?4, public_key = ?5,
                            public_key_fingerprint = ?6, binding_revision = binding_revision + 1,
-                           updated_at = ?7, revoked_at = ?8
+                           state = ?7, authentication_mode = ?8,
+                           workspace_key_id = ?9, workspace_key_generation = ?10,
+                           updated_at = ?11, revoked_at = ?12
                        WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                     params![
                         record.workspace_id,
@@ -1725,6 +1912,10 @@ impl SqliteWorkspaceStore {
                         record.base_url,
                         record.public_key,
                         record.public_key_fingerprint,
+                        record.state.as_str(),
+                        record.authentication_mode.as_str(),
+                        record.workspace_key_id,
+                        record.workspace_key_generation,
                         record.updated_at,
                         record.revoked_at,
                     ],
@@ -1736,8 +1927,9 @@ impl SqliteWorkspaceStore {
             tx.execute(
                 r#"INSERT INTO workspace_runtime_bindings (
                        workspace_id, runtime_id, display_name, base_url, public_key,
-                       public_key_fingerprint, binding_revision, created_at, updated_at, revoked_at
-                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9)"#,
+                       public_key_fingerprint, binding_revision, state, authentication_mode,
+                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
                 params![
                     record.workspace_id,
                     record.runtime_id,
@@ -1745,6 +1937,10 @@ impl SqliteWorkspaceStore {
                     record.base_url,
                     record.public_key,
                     record.public_key_fingerprint,
+                    record.state.as_str(),
+                    record.authentication_mode.as_str(),
+                    record.workspace_key_id,
+                    record.workspace_key_generation,
                     record.created_at,
                     record.updated_at,
                     record.revoked_at,
@@ -1768,7 +1964,7 @@ impl SqliteWorkspaceStore {
         self.with_conn(|conn| {
             let changed = conn.execute(
                 r#"UPDATE workspace_runtime_bindings
-                   SET revoked_at = ?3, updated_at = ?3,
+                   SET state = 'revoked', revoked_at = ?3, updated_at = ?3,
                        binding_revision = binding_revision + 1
                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND revoked_at IS NULL"#,
                 params![workspace_id, runtime_id, revoked_at],
@@ -1795,7 +1991,8 @@ impl SqliteWorkspaceStore {
             let existing = tx
                 .query_row(
                     r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                              public_key_fingerprint, binding_revision, created_at, updated_at, revoked_at
+                              public_key_fingerprint, binding_revision, state, authentication_mode,
+                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
                        FROM workspace_runtime_bindings
                        WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                     params![record.workspace_id, record.runtime_id],
@@ -1805,8 +2002,14 @@ impl SqliteWorkspaceStore {
 
             if let Some(existing) = existing {
                 if existing.revoked_at.is_none()
+                    && existing.display_name == record.display_name
+                    && existing.base_url == record.base_url
                     && existing.public_key == record.public_key
                     && existing.public_key_fingerprint == record.public_key_fingerprint
+                    && existing.state == record.state
+                    && existing.authentication_mode == record.authentication_mode
+                    && existing.workspace_key_id == record.workspace_key_id
+                    && existing.workspace_key_generation == record.workspace_key_generation
                 {
                     tx.commit()?;
                     return Ok((WorkspaceRuntimeBindingMutation::Unchanged, existing));
@@ -1850,14 +2053,23 @@ impl SqliteWorkspaceStore {
                 })?;
                 tx.execute(
                     r#"UPDATE workspace_runtime_bindings
-                       SET public_key = ?3, public_key_fingerprint = ?4,
-                           binding_revision = ?5, updated_at = ?6, revoked_at = NULL
+                       SET display_name = ?3, base_url = ?4,
+                           public_key = ?5, public_key_fingerprint = ?6,
+                           state = ?7, authentication_mode = ?8,
+                           workspace_key_id = ?9, workspace_key_generation = ?10,
+                           binding_revision = ?11, updated_at = ?12, revoked_at = NULL
                        WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                     params![
                         record.workspace_id,
                         record.runtime_id,
+                        record.display_name,
+                        record.base_url,
                         record.public_key,
                         record.public_key_fingerprint,
+                        record.state.as_str(),
+                        record.authentication_mode.as_str(),
+                        record.workspace_key_id,
+                        record.workspace_key_generation,
                         next_revision,
                         record.updated_at,
                     ],
@@ -1875,7 +2087,8 @@ impl SqliteWorkspaceStore {
                 )?;
                 let updated = tx.query_row(
                     r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                              public_key_fingerprint, binding_revision, created_at, updated_at, revoked_at
+                              public_key_fingerprint, binding_revision, state, authentication_mode,
+                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
                        FROM workspace_runtime_bindings
                        WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                     params![record.workspace_id, record.runtime_id],
@@ -1909,8 +2122,9 @@ impl SqliteWorkspaceStore {
             tx.execute(
                 r#"INSERT INTO workspace_runtime_bindings (
                        workspace_id, runtime_id, display_name, base_url, public_key,
-                       public_key_fingerprint, binding_revision, created_at, updated_at, revoked_at
-                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, NULL)"#,
+                       public_key_fingerprint, binding_revision, state, authentication_mode,
+                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9, ?10, ?11, ?12, NULL)"#,
                 params![
                     record.workspace_id,
                     record.runtime_id,
@@ -1918,6 +2132,10 @@ impl SqliteWorkspaceStore {
                     record.base_url,
                     record.public_key,
                     record.public_key_fingerprint,
+                    record.state.as_str(),
+                    record.authentication_mode.as_str(),
+                    record.workspace_key_id,
+                    record.workspace_key_generation,
                     record.created_at,
                     record.updated_at,
                 ],
@@ -1955,7 +2173,8 @@ impl SqliteWorkspaceStore {
             let existing = tx
                 .query_row(
                     r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                              public_key_fingerprint, binding_revision, created_at, updated_at, revoked_at
+                              public_key_fingerprint, binding_revision, state, authentication_mode,
+                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
                        FROM workspace_runtime_bindings
                        WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                     params![workspace_id, runtime_id],
@@ -1981,7 +2200,7 @@ impl SqliteWorkspaceStore {
                 .ok_or_else(|| Error::Store("Runtime binding revision overflow".to_string()))?;
             tx.execute(
                 r#"UPDATE workspace_runtime_bindings
-                   SET revoked_at = ?3, updated_at = ?3, binding_revision = ?4
+                   SET state = 'revoked', revoked_at = ?3, updated_at = ?3, binding_revision = ?4
                    WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                 params![workspace_id, runtime_id, revoked_at, next_revision],
             )?;
@@ -1998,7 +2217,8 @@ impl SqliteWorkspaceStore {
             )?;
             let updated = tx.query_row(
                 r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                          public_key_fingerprint, binding_revision, created_at, updated_at, revoked_at
+                          public_key_fingerprint, binding_revision, state, authentication_mode,
+                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
                    FROM workspace_runtime_bindings
                    WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                 params![workspace_id, runtime_id],
@@ -2006,6 +2226,297 @@ impl SqliteWorkspaceStore {
             )?;
             tx.commit()?;
             Ok((WorkspaceRuntimeBindingMutation::Revoked, updated))
+        })
+    }
+
+    pub fn workspace_runtime_verification_matches(
+        &self,
+        binding: &WorkspaceRuntimeBinding,
+        workspace_identity_revision: u64,
+        workspace_trust_generation: u64,
+    ) -> Result<bool> {
+        let Some(evidence) =
+            self.get_workspace_runtime_verification(&binding.workspace_id, &binding.runtime_id)?
+        else {
+            return Ok(false);
+        };
+        Ok(evidence.state == "verified"
+            && evidence.last_outcome == "verified"
+            && evidence.verified_at.is_some()
+            && evidence.binding_revision == binding.binding_revision
+            && evidence.workspace_key_id == binding.workspace_key_id.as_deref().unwrap_or_default()
+            && evidence.workspace_identity_revision == workspace_identity_revision
+            && evidence.workspace_trust_generation == workspace_trust_generation
+            && evidence.runtime_public_key_fingerprint == binding.public_key_fingerprint
+            && evidence.runtime_identity_revision > 0)
+    }
+
+    pub fn get_workspace_runtime_verification(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Result<Option<WorkspaceRuntimeVerificationEvidence>> {
+        validate_identifier("workspace_id", workspace_id)?;
+        validate_identifier("runtime_id", runtime_id)?;
+        self.with_conn(|conn| {
+            let evidence = conn
+                .query_row(
+                    r#"SELECT workspace_id, runtime_id, binding_revision, workspace_key_id,
+                          workspace_identity_revision, workspace_trust_generation,
+                          runtime_public_key_fingerprint, runtime_identity_revision,
+                          challenge_id, state, last_outcome, verified_at, checked_at
+                   FROM workspace_runtime_verifications
+                   WHERE workspace_id = ?1 AND runtime_id = ?2"#,
+                    params![workspace_id, runtime_id],
+                    read_workspace_runtime_verification,
+                )
+                .optional()?;
+            if let Some(evidence) = &evidence {
+                validate_workspace_runtime_verification(evidence)?;
+            }
+            Ok(evidence)
+        })
+    }
+
+    pub fn record_workspace_runtime_verification_attempt(
+        &self,
+        evidence: &WorkspaceRuntimeVerificationEvidence,
+    ) -> Result<()> {
+        validate_workspace_runtime_verification(evidence)?;
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO workspace_runtime_verifications (
+                       workspace_id, runtime_id, binding_revision, workspace_key_id,
+                       workspace_identity_revision, workspace_trust_generation,
+                       runtime_public_key_fingerprint, runtime_identity_revision,
+                       challenge_id, state, last_outcome, verified_at, checked_at
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                   ON CONFLICT(workspace_id, runtime_id) DO UPDATE SET
+                       binding_revision = excluded.binding_revision,
+                       workspace_key_id = excluded.workspace_key_id,
+                       workspace_identity_revision = excluded.workspace_identity_revision,
+                       workspace_trust_generation = excluded.workspace_trust_generation,
+                       runtime_public_key_fingerprint = excluded.runtime_public_key_fingerprint,
+                       runtime_identity_revision = excluded.runtime_identity_revision,
+                       challenge_id = excluded.challenge_id,
+                       state = CASE
+                           WHEN workspace_runtime_verifications.state = 'verified'
+                            AND workspace_runtime_verifications.binding_revision = excluded.binding_revision
+                            AND workspace_runtime_verifications.workspace_key_id = excluded.workspace_key_id
+                            AND workspace_runtime_verifications.workspace_identity_revision = excluded.workspace_identity_revision
+                            AND workspace_runtime_verifications.workspace_trust_generation = excluded.workspace_trust_generation
+                            AND workspace_runtime_verifications.runtime_public_key_fingerprint = excluded.runtime_public_key_fingerprint
+                            AND workspace_runtime_verifications.runtime_identity_revision = excluded.runtime_identity_revision
+                           THEN workspace_runtime_verifications.state
+                           ELSE excluded.state
+                       END,
+                       last_outcome = excluded.last_outcome,
+                       verified_at = CASE
+                           WHEN workspace_runtime_verifications.state = 'verified'
+                            AND workspace_runtime_verifications.binding_revision = excluded.binding_revision
+                            AND workspace_runtime_verifications.workspace_key_id = excluded.workspace_key_id
+                            AND workspace_runtime_verifications.workspace_identity_revision = excluded.workspace_identity_revision
+                            AND workspace_runtime_verifications.workspace_trust_generation = excluded.workspace_trust_generation
+                            AND workspace_runtime_verifications.runtime_public_key_fingerprint = excluded.runtime_public_key_fingerprint
+                            AND workspace_runtime_verifications.runtime_identity_revision = excluded.runtime_identity_revision
+                           THEN workspace_runtime_verifications.verified_at
+                           ELSE excluded.verified_at
+                       END,
+                       checked_at = excluded.checked_at"#,
+                params![
+                    evidence.workspace_id,
+                    evidence.runtime_id,
+                    evidence.binding_revision,
+                    evidence.workspace_key_id,
+                    evidence.workspace_identity_revision,
+                    evidence.workspace_trust_generation,
+                    evidence.runtime_public_key_fingerprint,
+                    evidence.runtime_identity_revision,
+                    evidence.challenge_id,
+                    evidence.state,
+                    evidence.last_outcome,
+                    evidence.verified_at,
+                    evidence.checked_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn record_workspace_runtime_verification_outcome_if_current(
+        &self,
+        expected: &WorkspaceRuntimeVerificationEvidence,
+        state: &str,
+        outcome: &str,
+        checked_at: &str,
+    ) -> Result<bool> {
+        validate_workspace_runtime_verification(expected)?;
+        if !matches!(state, "pending" | "verified" | "failed") {
+            return Err(Error::Store(
+                "invalid Workspace Runtime verification state".to_string(),
+            ));
+        }
+        if !matches!(
+            outcome,
+            "challenge_issued" | "verified" | "verification_failed" | "connectivity_failed"
+        ) {
+            return Err(Error::Store(
+                "invalid Workspace Runtime verification outcome".to_string(),
+            ));
+        }
+        if checked_at.is_empty() || checked_at.len() > 128 {
+            return Err(Error::Store(
+                "invalid Workspace Runtime verification checked_at".to_string(),
+            ));
+        }
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                r#"UPDATE workspace_runtime_verifications
+                   SET state = CASE WHEN state = 'verified' THEN state ELSE ?10 END,
+                       last_outcome = ?11,
+                       checked_at = ?12
+                   WHERE workspace_id = ?1 AND runtime_id = ?2
+                     AND binding_revision = ?3
+                     AND workspace_key_id = ?4
+                     AND workspace_identity_revision = ?5
+                     AND workspace_trust_generation = ?6
+                     AND runtime_public_key_fingerprint = ?7
+                     AND runtime_identity_revision = ?8
+                     AND challenge_id = ?9"#,
+                params![
+                    expected.workspace_id,
+                    expected.runtime_id,
+                    expected.binding_revision,
+                    expected.workspace_key_id,
+                    expected.workspace_identity_revision,
+                    expected.workspace_trust_generation,
+                    expected.runtime_public_key_fingerprint,
+                    expected.runtime_identity_revision,
+                    expected.challenge_id,
+                    state,
+                    outcome,
+                    checked_at,
+                ],
+            )?;
+            Ok(changed == 1)
+        })
+    }
+
+    pub fn complete_workspace_runtime_verification(
+        &self,
+        evidence: &WorkspaceRuntimeVerificationEvidence,
+    ) -> Result<WorkspaceRuntimeBinding> {
+        validate_workspace_runtime_verification(evidence)?;
+        if evidence.state != "verified" || evidence.verified_at.is_none() {
+            return Err(Error::Store(
+                "completed Runtime verification evidence must be verified".to_string(),
+            ));
+        }
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current_attempt = tx.query_row(
+                r#"SELECT EXISTS(
+                       SELECT 1 FROM workspace_runtime_verifications
+                       WHERE workspace_id = ?1 AND runtime_id = ?2
+                         AND binding_revision = ?3
+                         AND workspace_key_id = ?4
+                         AND workspace_identity_revision = ?5
+                         AND workspace_trust_generation = ?6
+                         AND runtime_public_key_fingerprint = ?7
+                         AND runtime_identity_revision = ?8
+                         AND challenge_id = ?9
+                   )"#,
+                params![
+                    evidence.workspace_id,
+                    evidence.runtime_id,
+                    evidence.binding_revision,
+                    evidence.workspace_key_id,
+                    evidence.workspace_identity_revision,
+                    evidence.workspace_trust_generation,
+                    evidence.runtime_public_key_fingerprint,
+                    evidence.runtime_identity_revision,
+                    evidence.challenge_id,
+                ],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !current_attempt {
+                return Err(Error::RuntimeBindingConflict(
+                    "Runtime verification attempt was superseded".to_string(),
+                ));
+            }
+            let changed = tx.execute(
+                r#"UPDATE workspace_runtime_bindings
+                   SET state = 'verified', updated_at = ?7
+                   WHERE workspace_id = ?1 AND runtime_id = ?2
+                     AND binding_revision = ?3
+                     AND state IN ('configured', 'verified')
+                     AND authentication_mode = 'workspace_identity'
+                     AND workspace_key_id = ?4
+                     AND workspace_key_generation = ?5
+                     AND public_key_fingerprint = ?6
+                     AND revoked_at IS NULL"#,
+                params![
+                    evidence.workspace_id,
+                    evidence.runtime_id,
+                    evidence.binding_revision,
+                    evidence.workspace_key_id,
+                    evidence.workspace_trust_generation,
+                    evidence.runtime_public_key_fingerprint,
+                    evidence.checked_at,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(Error::RuntimeBindingConflict(
+                    "Runtime verification evidence no longer matches the configured binding"
+                        .to_string(),
+                ));
+            }
+            tx.execute(
+                r#"INSERT INTO workspace_runtime_verifications (
+                       workspace_id, runtime_id, binding_revision, workspace_key_id,
+                       workspace_identity_revision, workspace_trust_generation,
+                       runtime_public_key_fingerprint, runtime_identity_revision,
+                       challenge_id, state, last_outcome, verified_at, checked_at
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                   ON CONFLICT(workspace_id, runtime_id) DO UPDATE SET
+                       binding_revision = excluded.binding_revision,
+                       workspace_key_id = excluded.workspace_key_id,
+                       workspace_identity_revision = excluded.workspace_identity_revision,
+                       workspace_trust_generation = excluded.workspace_trust_generation,
+                       runtime_public_key_fingerprint = excluded.runtime_public_key_fingerprint,
+                       runtime_identity_revision = excluded.runtime_identity_revision,
+                       challenge_id = excluded.challenge_id,
+                       state = excluded.state,
+                       last_outcome = excluded.last_outcome,
+                       verified_at = excluded.verified_at,
+                       checked_at = excluded.checked_at"#,
+                params![
+                    evidence.workspace_id,
+                    evidence.runtime_id,
+                    evidence.binding_revision,
+                    evidence.workspace_key_id,
+                    evidence.workspace_identity_revision,
+                    evidence.workspace_trust_generation,
+                    evidence.runtime_public_key_fingerprint,
+                    evidence.runtime_identity_revision,
+                    evidence.challenge_id,
+                    evidence.state,
+                    evidence.last_outcome,
+                    evidence.verified_at,
+                    evidence.checked_at,
+                ],
+            )?;
+            let binding = tx.query_row(
+                r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
+                          public_key_fingerprint, binding_revision, state, authentication_mode,
+                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+                   FROM workspace_runtime_bindings
+                   WHERE workspace_id = ?1 AND runtime_id = ?2"#,
+                params![evidence.workspace_id, evidence.runtime_id],
+                read_workspace_runtime_binding,
+            )?;
+            tx.commit()?;
+            Ok(binding)
         })
     }
 
@@ -2205,6 +2716,17 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ) VALUES (?1, 1, 'English', ?2, ?3)"#,
                 params![record.workspace_id, record.created_at, record.updated_at],
             )?;
+            tx.execute(
+                r#"INSERT OR IGNORE INTO workspace_signing_identities (
+                    workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
+                    private_material_ref, revision, state, created_at, provisioned_at, updated_at
+                ) VALUES (
+                    ?1, 'WK-' || lower(hex(randomblob(16))), 'ed25519', NULL, NULL,
+                    'workspace-signing/' || ?1 || '/ed25519-v1', 1,
+                    'pending_provisioning', ?2, NULL, ?3
+                )"#,
+                params![record.workspace_id, record.created_at, record.updated_at],
+            )?;
             tx.commit()?;
             Ok(())
         })?;
@@ -2227,8 +2749,15 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn create_workspace_bootstrap(
         &self,
         record: &WorkspaceBootstrapRecord,
+        signing_identity: &WorkspaceSigningIdentityActivation,
+        identity_provisioning_operation_key: &str,
     ) -> Result<WorkspaceBootstrapResult> {
         validate_repository_record_identity(&record.repository)?;
+        if signing_identity.workspace_id != record.workspace.workspace_id {
+            return Err(Error::Store(
+                "Workspace signing identity does not belong to the Workspace bootstrap".to_string(),
+            ));
+        }
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let owner_kind = tx
@@ -2272,6 +2801,43 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     params![workspace.workspace_id, record.repository.repository_key],
                     read_repository_record,
                 )?;
+                let persisted_identity = tx.query_row(
+                    r#"SELECT workspace_id, key_id, algorithm, public_key,
+                              public_key_fingerprint, private_material_ref, revision, state,
+                              created_at, provisioned_at, updated_at
+                       FROM workspace_signing_identities WHERE workspace_id = ?1"#,
+                    params![workspace.workspace_id],
+                    read_workspace_signing_identity,
+                )?;
+                if persisted_identity.workspace_id != signing_identity.workspace_id
+                    || persisted_identity.key_id != signing_identity.key_id
+                    || persisted_identity.public_key.as_deref()
+                        != Some(signing_identity.public_key.as_str())
+                    || persisted_identity.public_key_fingerprint.as_deref()
+                        != Some(signing_identity.public_key_fingerprint.as_str())
+                    || persisted_identity.private_material_ref
+                        != signing_identity.private_material_ref
+                    || persisted_identity.revision != signing_identity.revision
+                    || persisted_identity.state != "active"
+                {
+                    return Err(Error::Store(
+                        "Workspace create replay signing identity does not match persisted authority"
+                            .to_string(),
+                    ));
+                }
+                let provisioning_state: Option<String> = tx
+                    .query_row(
+                        "SELECT state FROM workspace_signing_identity_provisioning_operations WHERE operation_key = ?1",
+                        params![identity_provisioning_operation_key],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if provisioning_state.as_deref() != Some("completed") {
+                    return Err(Error::Store(
+                        "Workspace create replay lacks completed signing identity provisioning evidence"
+                            .to_string(),
+                    ));
+                }
                 let config_revision = crate::config_source::load_state(&tx, &workspace.workspace_id)?
                     .ok_or_else(|| Error::Store("Workspace config is missing".to_string()))?
                     .snapshot
@@ -2371,6 +2937,58 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             .snapshot
             .revision;
             tx.execute(
+                r#"INSERT INTO workspace_signing_identities (
+                    workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
+                    private_material_ref, revision, state, created_at, provisioned_at, updated_at
+                ) VALUES (?1, ?2, 'ed25519', ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?8)"#,
+                params![
+                    signing_identity.workspace_id,
+                    signing_identity.key_id,
+                    signing_identity.public_key,
+                    signing_identity.public_key_fingerprint,
+                    signing_identity.private_material_ref,
+                    signing_identity.revision,
+                    record.workspace.created_at,
+                    signing_identity.provisioned_at,
+                ],
+            )?;
+            tx.execute(
+                r#"INSERT INTO workspace_signing_identity_audit (
+                    event_id, workspace_id, key_id, action, revision,
+                    public_key_fingerprint, actor_account_id, created_at
+                ) VALUES (?1, ?2, ?3, 'provisioned', ?4, ?5, ?6, ?7)"#,
+                params![
+                    uuid::Uuid::now_v7().to_string(),
+                    signing_identity.workspace_id,
+                    signing_identity.key_id,
+                    signing_identity.revision,
+                    signing_identity.public_key_fingerprint,
+                    record.workspace.owner_account_id,
+                    signing_identity.provisioned_at,
+                ],
+            )?;
+            let completed = tx.execute(
+                r#"UPDATE workspace_signing_identity_provisioning_operations
+                   SET state = 'completed', completed_at = ?2
+                   WHERE operation_key = ?1 AND state = 'pending'
+                     AND workspace_id = ?3 AND key_id = ?4
+                     AND private_material_ref = ?5 AND revision = ?6"#,
+                params![
+                    identity_provisioning_operation_key,
+                    signing_identity.provisioned_at,
+                    signing_identity.workspace_id,
+                    signing_identity.key_id,
+                    signing_identity.private_material_ref,
+                    signing_identity.revision,
+                ],
+            )?;
+            if completed != 1 {
+                return Err(Error::Store(
+                    "Workspace signing identity provisioning reservation is missing or inconsistent"
+                        .to_string(),
+                ));
+            }
+            tx.execute(
                 r#"INSERT INTO workspace_create_operations (
                     operation_key, request_fingerprint, workspace_id, created_at
                 ) VALUES (?1, ?2, ?3, ?4)"#,
@@ -2391,6 +3009,245 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn reserve_workspace_signing_identity_provisioning(
+        &self,
+        operation: &WorkspaceSigningIdentityProvisioningOperation,
+    ) -> Result<WorkspaceSigningIdentityProvisioningOperation> {
+        for (label, value) in [
+            ("operation_key", operation.operation_key.as_str()),
+            (
+                "request_fingerprint",
+                operation.request_fingerprint.as_str(),
+            ),
+            ("workspace_id", operation.workspace_id.as_str()),
+            ("key_id", operation.key_id.as_str()),
+            (
+                "private_material_ref",
+                operation.private_material_ref.as_str(),
+            ),
+            ("actor_account_id", operation.actor_account_id.as_str()),
+        ] {
+            validate_non_empty(label, value)?;
+        }
+        if !matches!(
+            operation.operation_kind.as_str(),
+            "workspace_create" | "existing_workspace"
+        ) || operation.revision == 0
+        {
+            return Err(Error::Store(
+                "Workspace signing identity provisioning reservation is invalid".to_string(),
+            ));
+        }
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(existing) = tx
+                .query_row(
+                    r#"SELECT operation_key, request_fingerprint, operation_kind, workspace_id,
+                              key_id, private_material_ref, revision, actor_account_id, state,
+                              created_at, completed_at
+                       FROM workspace_signing_identity_provisioning_operations
+                       WHERE operation_key = ?1"#,
+                    params![operation.operation_key],
+                    read_workspace_signing_identity_provisioning_operation,
+                )
+                .optional()?
+            {
+                if existing.request_fingerprint != operation.request_fingerprint
+                    || existing.operation_kind != operation.operation_kind
+                {
+                    return Err(Error::WorkspaceConfigConflict(
+                        "Workspace signing identity operation key was already used with different input"
+                            .to_string(),
+                    ));
+                }
+                tx.commit()?;
+                return Ok(existing);
+            }
+            tx.execute(
+                r#"INSERT INTO workspace_signing_identity_provisioning_operations (
+                    operation_key, request_fingerprint, operation_kind, workspace_id,
+                    key_id, private_material_ref, revision, actor_account_id, state,
+                    created_at, completed_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, NULL)"#,
+                params![
+                    operation.operation_key,
+                    operation.request_fingerprint,
+                    operation.operation_kind,
+                    operation.workspace_id,
+                    operation.key_id,
+                    operation.private_material_ref,
+                    operation.revision,
+                    operation.actor_account_id,
+                    operation.created_at,
+                ],
+            )
+            .map_err(|error| {
+                if matches!(error, rusqlite::Error::SqliteFailure(_, _)) {
+                    Error::WorkspaceConfigConflict(
+                        "Workspace already has a signing identity provisioning operation"
+                            .to_string(),
+                    )
+                } else {
+                    Error::from(error)
+                }
+            })?;
+            tx.commit()?;
+            Ok(operation.clone())
+        })
+    }
+
+    fn get_workspace_signing_identity(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<WorkspaceSigningIdentityRecord>> {
+        validate_identifier("workspace_id", workspace_id)?;
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT workspace_id, key_id, algorithm, public_key,
+                          public_key_fingerprint, private_material_ref, revision, state,
+                          created_at, provisioned_at, updated_at
+                   FROM workspace_signing_identities WHERE workspace_id = ?1"#,
+                params![workspace_id],
+                read_workspace_signing_identity,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn activate_workspace_signing_identity(
+        &self,
+        activation: &WorkspaceSigningIdentityActivation,
+        identity_provisioning_operation_key: &str,
+        actor_account_id: &str,
+    ) -> Result<WorkspaceSigningIdentityRecord> {
+        validate_identifier("workspace_id", &activation.workspace_id)?;
+        validate_non_empty(
+            "identity_provisioning_operation_key",
+            identity_provisioning_operation_key,
+        )?;
+        validate_identifier("actor_account_id", actor_account_id)?;
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let operation = tx
+                .query_row(
+                    r#"SELECT operation_key, request_fingerprint, operation_kind, workspace_id,
+                              key_id, private_material_ref, revision, actor_account_id, state,
+                              created_at, completed_at
+                       FROM workspace_signing_identity_provisioning_operations
+                       WHERE operation_key = ?1"#,
+                    params![identity_provisioning_operation_key],
+                    read_workspace_signing_identity_provisioning_operation,
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    Error::Store(
+                        "Workspace signing identity provisioning operation is missing".to_string(),
+                    )
+                })?;
+            if operation.workspace_id != activation.workspace_id
+                || operation.key_id != activation.key_id
+                || operation.private_material_ref != activation.private_material_ref
+                || operation.revision != activation.revision
+                || operation.actor_account_id != actor_account_id
+            {
+                return Err(Error::Store(
+                    "Workspace signing identity provisioning operation is inconsistent".to_string(),
+                ));
+            }
+            let existing = tx.query_row(
+                r#"SELECT workspace_id, key_id, algorithm, public_key,
+                          public_key_fingerprint, private_material_ref, revision, state,
+                          created_at, provisioned_at, updated_at
+                   FROM workspace_signing_identities WHERE workspace_id = ?1"#,
+                params![activation.workspace_id],
+                read_workspace_signing_identity,
+            )?;
+            if existing.key_id != activation.key_id
+                || existing.private_material_ref != activation.private_material_ref
+                || existing.revision != activation.revision
+            {
+                return Err(Error::Store(
+                    "Workspace signing identity activation does not match persisted metadata"
+                        .to_string(),
+                ));
+            }
+            if existing.state == "active" {
+                if existing.public_key.as_deref() != Some(activation.public_key.as_str())
+                    || existing.public_key_fingerprint.as_deref()
+                        != Some(activation.public_key_fingerprint.as_str())
+                {
+                    return Err(Error::Store(
+                        "Workspace signing identity replay does not match active authority"
+                            .to_string(),
+                    ));
+                }
+                tx.execute(
+                    r#"UPDATE workspace_signing_identity_provisioning_operations
+                       SET state = 'completed', completed_at = COALESCE(completed_at, ?2)
+                       WHERE operation_key = ?1"#,
+                    params![
+                        identity_provisioning_operation_key,
+                        activation.provisioned_at
+                    ],
+                )?;
+                tx.commit()?;
+                return Ok(existing);
+            }
+            if existing.state != "pending_provisioning" {
+                return Err(Error::Store(
+                    "Workspace signing identity has an unknown lifecycle state".to_string(),
+                ));
+            }
+            tx.execute(
+                r#"UPDATE workspace_signing_identities
+                   SET public_key = ?2, public_key_fingerprint = ?3, state = 'active',
+                       provisioned_at = ?4, updated_at = ?4
+                   WHERE workspace_id = ?1 AND state = 'pending_provisioning'"#,
+                params![
+                    activation.workspace_id,
+                    activation.public_key,
+                    activation.public_key_fingerprint,
+                    activation.provisioned_at,
+                ],
+            )?;
+            tx.execute(
+                r#"INSERT INTO workspace_signing_identity_audit (
+                    event_id, workspace_id, key_id, action, revision,
+                    public_key_fingerprint, actor_account_id, created_at
+                ) VALUES (?1, ?2, ?3, 'provisioned', ?4, ?5, ?6, ?7)"#,
+                params![
+                    uuid::Uuid::now_v7().to_string(),
+                    activation.workspace_id,
+                    activation.key_id,
+                    activation.revision,
+                    activation.public_key_fingerprint,
+                    actor_account_id,
+                    activation.provisioned_at,
+                ],
+            )?;
+            tx.execute(
+                r#"UPDATE workspace_signing_identity_provisioning_operations
+                   SET state = 'completed', completed_at = ?2
+                   WHERE operation_key = ?1"#,
+                params![
+                    identity_provisioning_operation_key,
+                    activation.provisioned_at
+                ],
+            )?;
+            let activated = tx.query_row(
+                r#"SELECT workspace_id, key_id, algorithm, public_key,
+                          public_key_fingerprint, private_material_ref, revision, state,
+                          created_at, provisioned_at, updated_at
+                   FROM workspace_signing_identities WHERE workspace_id = ?1"#,
+                params![activation.workspace_id],
+                read_workspace_signing_identity,
+            )?;
+            tx.commit()?;
+            Ok(activated)
+        })
+    }
+
     fn workspace_runtime_binding_matches(
         &self,
         expected: &WorkspaceRuntimeBinding,
@@ -2401,6 +3258,54 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             &expected.runtime_id,
         )?
         .is_some_and(|binding| binding == *expected && binding.revoked_at.is_none()))
+    }
+
+    fn workspace_runtime_verification_matches(
+        &self,
+        binding: &WorkspaceRuntimeBinding,
+        workspace_identity_revision: u64,
+        workspace_trust_generation: u64,
+    ) -> Result<bool> {
+        SqliteWorkspaceStore::workspace_runtime_verification_matches(
+            self,
+            binding,
+            workspace_identity_revision,
+            workspace_trust_generation,
+        )
+    }
+
+    async fn get_workspace_runtime_verification(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Result<Option<WorkspaceRuntimeVerificationEvidence>> {
+        SqliteWorkspaceStore::get_workspace_runtime_verification(self, workspace_id, runtime_id)
+    }
+
+    async fn record_workspace_runtime_verification_attempt(
+        &self,
+        evidence: &WorkspaceRuntimeVerificationEvidence,
+    ) -> Result<()> {
+        SqliteWorkspaceStore::record_workspace_runtime_verification_attempt(self, evidence)
+    }
+
+    async fn record_workspace_runtime_verification_outcome_if_current(
+        &self,
+        expected: &WorkspaceRuntimeVerificationEvidence,
+        state: &str,
+        outcome: &str,
+        checked_at: &str,
+    ) -> Result<bool> {
+        SqliteWorkspaceStore::record_workspace_runtime_verification_outcome_if_current(
+            self, expected, state, outcome, checked_at,
+        )
+    }
+
+    async fn complete_workspace_runtime_verification(
+        &self,
+        evidence: &WorkspaceRuntimeVerificationEvidence,
+    ) -> Result<WorkspaceRuntimeBinding> {
+        SqliteWorkspaceStore::complete_workspace_runtime_verification(self, evidence)
     }
 
     async fn get_workspace_runtime_binding(
@@ -5806,6 +6711,46 @@ fn read_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceR
     })
 }
 
+fn read_workspace_signing_identity(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkspaceSigningIdentityRecord> {
+    let revision: i64 = row.get(6)?;
+    Ok(WorkspaceSigningIdentityRecord {
+        workspace_id: row.get(0)?,
+        key_id: row.get(1)?,
+        algorithm: row.get(2)?,
+        public_key: row.get(3)?,
+        public_key_fingerprint: row.get(4)?,
+        private_material_ref: row.get(5)?,
+        revision: u64::try_from(revision)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, revision))?,
+        state: row.get(7)?,
+        created_at: row.get(8)?,
+        provisioned_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+fn read_workspace_signing_identity_provisioning_operation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkspaceSigningIdentityProvisioningOperation> {
+    let revision: i64 = row.get(6)?;
+    Ok(WorkspaceSigningIdentityProvisioningOperation {
+        operation_key: row.get(0)?,
+        request_fingerprint: row.get(1)?,
+        operation_kind: row.get(2)?,
+        workspace_id: row.get(3)?,
+        key_id: row.get(4)?,
+        private_material_ref: row.get(5)?,
+        revision: u64::try_from(revision)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, revision))?,
+        actor_account_id: row.get(7)?,
+        state: row.get(8)?,
+        created_at: row.get(9)?,
+        completed_at: row.get(10)?,
+    })
+}
+
 fn repository_registration_intent_matches(
     existing: &RepositoryRecord,
     requested: &RepositoryRecord,
@@ -5868,9 +6813,89 @@ fn account_select_sql(where_clause: &str) -> String {
     )
 }
 
+fn read_workspace_runtime_verification(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkspaceRuntimeVerificationEvidence> {
+    Ok(WorkspaceRuntimeVerificationEvidence {
+        workspace_id: row.get(0)?,
+        runtime_id: row.get(1)?,
+        binding_revision: row.get(2)?,
+        workspace_key_id: row.get(3)?,
+        workspace_identity_revision: row.get(4)?,
+        workspace_trust_generation: row.get(5)?,
+        runtime_public_key_fingerprint: row.get(6)?,
+        runtime_identity_revision: row.get(7)?,
+        challenge_id: row.get(8)?,
+        state: row.get(9)?,
+        last_outcome: row.get(10)?,
+        verified_at: row.get(11)?,
+        checked_at: row.get(12)?,
+    })
+}
+
+fn validate_workspace_runtime_verification(
+    evidence: &WorkspaceRuntimeVerificationEvidence,
+) -> Result<()> {
+    for (field, value) in [
+        ("workspace_id", evidence.workspace_id.as_str()),
+        ("runtime_id", evidence.runtime_id.as_str()),
+        ("workspace_key_id", evidence.workspace_key_id.as_str()),
+        ("challenge_id", evidence.challenge_id.as_str()),
+    ] {
+        validate_identifier(field, value)?;
+    }
+    if evidence.binding_revision == 0
+        || evidence.workspace_identity_revision == 0
+        || evidence.workspace_trust_generation == 0
+        || evidence.runtime_identity_revision == 0
+    {
+        return Err(Error::InvalidInput(
+            "Runtime verification revisions and generations must be positive".to_string(),
+        ));
+    }
+    validate_non_empty(
+        "runtime_public_key_fingerprint",
+        &evidence.runtime_public_key_fingerprint,
+    )?;
+    validate_non_empty("verification state", &evidence.state)?;
+    if !matches!(
+        evidence.last_outcome.as_str(),
+        "verified" | "challenge_issued" | "verification_failed" | "connectivity_failed"
+    ) {
+        return Err(Error::InvalidInput(
+            "Runtime verification outcome is invalid".to_string(),
+        ));
+    }
+    validate_non_empty("checked_at", &evidence.checked_at)?;
+    Ok(())
+}
+
 fn read_workspace_runtime_binding(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<WorkspaceRuntimeBinding> {
+    let state = match row.get::<_, String>(7)?.as_str() {
+        "configured" => WorkspaceRuntimeBindingState::Configured,
+        "verified" => WorkspaceRuntimeBindingState::Verified,
+        "revoked" => WorkspaceRuntimeBindingState::Revoked,
+        value => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Text,
+                format!("unknown Workspace Runtime binding state {value}").into(),
+            ));
+        }
+    };
+    let authentication_mode = match row.get::<_, String>(8)?.as_str() {
+        "legacy_server_issuer" => WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer,
+        "workspace_identity" => WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity,
+        value => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                8,
+                rusqlite::types::Type::Text,
+                format!("unknown Workspace Runtime authentication mode {value}").into(),
+            ));
+        }
+    };
     Ok(WorkspaceRuntimeBinding {
         workspace_id: row.get(0)?,
         runtime_id: row.get(1)?,
@@ -5879,9 +6904,13 @@ fn read_workspace_runtime_binding(
         public_key: row.get(4)?,
         public_key_fingerprint: row.get(5)?,
         binding_revision: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
-        revoked_at: row.get(9)?,
+        state,
+        authentication_mode,
+        workspace_key_id: row.get(9)?,
+        workspace_key_generation: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+        revoked_at: row.get(13)?,
     })
 }
 
@@ -5937,6 +6966,39 @@ fn normalize_workspace_runtime_binding_key(record: &mut WorkspaceRuntimeBinding)
     }
     record.public_key = canonical;
     record.public_key_fingerprint = fingerprint;
+    match record.authentication_mode {
+        WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer => {
+            if record.workspace_key_id.is_some() || record.workspace_key_generation.is_some() {
+                return Err(Error::InvalidInput(
+                    "legacy Server issuer Runtime bindings must not carry Workspace key metadata"
+                        .into(),
+                ));
+            }
+        }
+        WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity => {
+            let key_id = record.workspace_key_id.as_deref().ok_or_else(|| {
+                Error::InvalidInput(
+                    "Workspace identity Runtime bindings require workspace_key_id".into(),
+                )
+            })?;
+            validate_identifier("workspace_key_id", key_id)?;
+            if record
+                .workspace_key_generation
+                .is_none_or(|generation| generation == 0)
+            {
+                return Err(Error::InvalidInput(
+                    "Workspace identity Runtime bindings require a positive workspace_key_generation"
+                        .into(),
+                ));
+            }
+        }
+    }
+    let revoked = record.revoked_at.is_some();
+    if (record.state == WorkspaceRuntimeBindingState::Revoked) != revoked {
+        return Err(Error::InvalidInput(
+            "Runtime binding state and revoked_at must agree".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -7036,9 +8098,317 @@ fn migrate_workspace_deletion_v52_to_v53(conn: &Connection) -> Result<()> {
     verify_workspace_deletion_schema(&tx)?;
     tx.execute(
         "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![LATEST_SCHEMA_VERSION, WORKSPACE_DELETION_MIGRATION_NAME],
+        params![53_i64, WORKSPACE_DELETION_MIGRATION_NAME],
     )?;
     tx.commit()?;
+    Ok(())
+}
+
+fn migrate_workspace_signing_identity_v53_to_v54(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 53 {
+        return Err(Error::Store(format!(
+            "expected schema version 53 before {WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch(
+        r#"
+        CREATE TABLE workspace_signing_identities (
+            workspace_id TEXT PRIMARY KEY,
+            key_id TEXT NOT NULL UNIQUE,
+            algorithm TEXT NOT NULL CHECK (algorithm = 'ed25519'),
+            public_key TEXT,
+            public_key_fingerprint TEXT,
+            private_material_ref TEXT NOT NULL UNIQUE,
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            state TEXT NOT NULL CHECK (state IN ('pending_provisioning', 'active')),
+            created_at TEXT NOT NULL,
+            provisioned_at TEXT,
+            updated_at TEXT NOT NULL,
+            CHECK (
+                (state = 'pending_provisioning' AND public_key IS NULL AND public_key_fingerprint IS NULL AND provisioned_at IS NULL)
+                OR
+                (state = 'active' AND public_key IS NOT NULL AND public_key_fingerprint IS NOT NULL AND provisioned_at IS NOT NULL)
+            ),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+        CREATE TABLE workspace_signing_identity_provisioning_operations (
+            operation_key TEXT PRIMARY KEY,
+            request_fingerprint TEXT NOT NULL,
+            operation_kind TEXT NOT NULL CHECK (operation_kind IN ('workspace_create', 'existing_workspace')),
+            workspace_id TEXT NOT NULL UNIQUE,
+            key_id TEXT NOT NULL UNIQUE,
+            private_material_ref TEXT NOT NULL UNIQUE,
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            actor_account_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
+            created_at TEXT NOT NULL,
+            completed_at TEXT
+        );
+        CREATE TABLE workspace_signing_identity_audit (
+            event_id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            key_id TEXT NOT NULL,
+            action TEXT NOT NULL CHECK (action IN ('provisioned')),
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            public_key_fingerprint TEXT NOT NULL,
+            actor_account_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+        CREATE INDEX workspace_signing_identity_audit_workspace_idx
+            ON workspace_signing_identity_audit(workspace_id, created_at DESC);
+        INSERT INTO workspace_signing_identities (
+            workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
+            private_material_ref, revision, state, created_at, provisioned_at, updated_at
+        )
+        SELECT workspace_id,
+               'WK-' || lower(hex(randomblob(16))),
+               'ed25519', NULL, NULL,
+               'workspace-signing/' || workspace_id || '/ed25519-v1',
+               1, 'pending_provisioning', created_at, NULL, updated_at
+        FROM workspaces;
+        "#,
+    )?;
+    verify_workspace_signing_identity_schema(&tx)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![54_i64, WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_workspace_runtime_binding_state_v54_to_v55(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 54 {
+        return Err(Error::Store(format!(
+            "expected schema version 54 before {WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    let columns = table_columns(&tx, "workspace_runtime_bindings")?;
+    let lifecycle_columns = [
+        "state",
+        "authentication_mode",
+        "workspace_key_id",
+        "workspace_key_generation",
+    ];
+    let present = lifecycle_columns
+        .iter()
+        .filter(|column| columns.iter().any(|existing| existing == **column))
+        .count();
+    if present == 0 {
+        tx.execute_batch(
+            r#"
+            CREATE TABLE workspace_runtime_bindings_v55 (
+                workspace_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                public_key TEXT NOT NULL,
+                public_key_fingerprint TEXT NOT NULL,
+                binding_revision INTEGER NOT NULL DEFAULT 1 CHECK (binding_revision > 0),
+                state TEXT NOT NULL CHECK (state IN ('configured', 'verified', 'revoked')),
+                authentication_mode TEXT NOT NULL CHECK (authentication_mode IN ('legacy_server_issuer', 'workspace_identity')),
+                workspace_key_id TEXT,
+                workspace_key_generation INTEGER CHECK (workspace_key_generation > 0),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                revoked_at TEXT,
+                PRIMARY KEY (workspace_id, runtime_id),
+                UNIQUE (workspace_id, public_key_fingerprint),
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
+                CHECK (
+                    (authentication_mode = 'legacy_server_issuer' AND workspace_key_id IS NULL AND workspace_key_generation IS NULL)
+                    OR
+                    (authentication_mode = 'workspace_identity' AND workspace_key_id IS NOT NULL AND workspace_key_generation IS NOT NULL)
+                ),
+                CHECK (
+                    (state = 'revoked' AND revoked_at IS NOT NULL)
+                    OR
+                    (state != 'revoked' AND revoked_at IS NULL)
+                )
+            );
+            INSERT INTO workspace_runtime_bindings_v55 (
+                workspace_id, runtime_id, display_name, base_url, public_key,
+                public_key_fingerprint, binding_revision, state, authentication_mode,
+                workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+            )
+            SELECT workspace_id, runtime_id, display_name, base_url, public_key,
+                   public_key_fingerprint, binding_revision,
+                   CASE WHEN revoked_at IS NULL THEN 'verified' ELSE 'revoked' END,
+                   'legacy_server_issuer', NULL, NULL, created_at, updated_at, revoked_at
+            FROM workspace_runtime_bindings;
+            DROP TABLE workspace_runtime_bindings;
+            ALTER TABLE workspace_runtime_bindings_v55 RENAME TO workspace_runtime_bindings;
+            CREATE INDEX idx_workspace_runtime_bindings_workspace
+                ON workspace_runtime_bindings(workspace_id, revoked_at, runtime_id);
+            "#,
+        )?;
+    } else if present != lifecycle_columns.len() {
+        return Err(Error::Store(
+            "workspace_runtime_bindings has a partially applied lifecycle schema".to_string(),
+        ));
+    }
+    verify_workspace_runtime_binding_schema(&tx)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![55_i64, WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_workspace_runtime_verification_v55_to_v56(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 55 {
+        return Err(Error::Store(format!(
+            "expected schema version 55 before {WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS workspace_runtime_verifications (
+            workspace_id TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            binding_revision INTEGER NOT NULL CHECK(binding_revision > 0),
+            workspace_key_id TEXT NOT NULL,
+            workspace_identity_revision INTEGER NOT NULL CHECK(workspace_identity_revision > 0),
+            workspace_trust_generation INTEGER NOT NULL CHECK(workspace_trust_generation > 0),
+            runtime_public_key_fingerprint TEXT NOT NULL,
+            runtime_identity_revision INTEGER NOT NULL CHECK(runtime_identity_revision > 0),
+            challenge_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('pending', 'verified', 'failed')),
+            last_outcome TEXT NOT NULL,
+            verified_at TEXT,
+            checked_at TEXT NOT NULL,
+            PRIMARY KEY(workspace_id, runtime_id),
+            FOREIGN KEY(workspace_id, runtime_id)
+                REFERENCES workspace_runtime_bindings(workspace_id, runtime_id)
+                ON DELETE CASCADE,
+            CHECK((state = 'verified' AND verified_at IS NOT NULL)
+               OR (state != 'verified' AND verified_at IS NULL))
+        );
+        CREATE INDEX IF NOT EXISTS workspace_runtime_verifications_state_idx
+            ON workspace_runtime_verifications(workspace_id, state, checked_at DESC);
+        "#,
+    )?;
+    verify_workspace_runtime_verification_schema(&tx)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![56_i64, WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn verify_workspace_runtime_verification_schema(conn: &Connection) -> Result<()> {
+    let actual = table_columns(conn, "workspace_runtime_verifications")?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let expected = [
+        "workspace_id",
+        "runtime_id",
+        "binding_revision",
+        "workspace_key_id",
+        "workspace_identity_revision",
+        "workspace_trust_generation",
+        "runtime_public_key_fingerprint",
+        "runtime_identity_revision",
+        "challenge_id",
+        "state",
+        "last_outcome",
+        "verified_at",
+        "checked_at",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(Error::Store(format!(
+            "workspace_runtime_verifications schema does not match schema-56: {actual:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_workspace_signing_identity_schema(conn: &Connection) -> Result<()> {
+    for (table, expected) in [
+        (
+            "workspace_signing_identities",
+            vec![
+                "workspace_id",
+                "key_id",
+                "algorithm",
+                "public_key",
+                "public_key_fingerprint",
+                "private_material_ref",
+                "revision",
+                "state",
+                "created_at",
+                "provisioned_at",
+                "updated_at",
+            ],
+        ),
+        (
+            "workspace_signing_identity_provisioning_operations",
+            vec![
+                "operation_key",
+                "request_fingerprint",
+                "operation_kind",
+                "workspace_id",
+                "key_id",
+                "private_material_ref",
+                "revision",
+                "actor_account_id",
+                "state",
+                "created_at",
+                "completed_at",
+            ],
+        ),
+        (
+            "workspace_signing_identity_audit",
+            vec![
+                "event_id",
+                "workspace_id",
+                "key_id",
+                "action",
+                "revision",
+                "public_key_fingerprint",
+                "actor_account_id",
+                "created_at",
+            ],
+        ),
+    ] {
+        let actual = table_columns(conn, table)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let expected = expected
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        if actual != expected {
+            return Err(Error::Store(format!(
+                "{table} schema does not match schema-54"
+            )));
+        }
+    }
+    let pending_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM workspaces w LEFT JOIN workspace_signing_identities i ON i.workspace_id = w.workspace_id WHERE i.workspace_id IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if pending_count != 0 {
+        return Err(Error::Store(
+            "schema-54 failed to initialize every existing Workspace signing identity as pending"
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -7088,7 +8458,8 @@ fn verify_workspace_runtime_binding_schema(conn: &Connection) -> Result<()> {
     let columns = table_columns(conn, "workspace_runtime_bindings")?
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let expected = [
+    let has_binding_state = columns.contains("state");
+    let mut expected = [
         "workspace_id",
         "runtime_id",
         "display_name",
@@ -7103,10 +8474,41 @@ fn verify_workspace_runtime_binding_schema(conn: &Connection) -> Result<()> {
     .into_iter()
     .map(str::to_string)
     .collect::<BTreeSet<_>>();
+    if has_binding_state {
+        expected.extend(
+            [
+                "state",
+                "authentication_mode",
+                "workspace_key_id",
+                "workspace_key_generation",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+    }
     if columns != expected {
         return Err(Error::Store(
-            "workspace_runtime_bindings schema does not match schema-52".to_string(),
+            "workspace_runtime_bindings schema does not match the supported schema".to_string(),
         ));
+    }
+    if has_binding_state {
+        let invalid_lifecycle_count = conn.query_row(
+            "SELECT COUNT(*) FROM workspace_runtime_bindings
+             WHERE state NOT IN ('configured', 'verified', 'revoked')
+                OR authentication_mode NOT IN ('legacy_server_issuer', 'workspace_identity')
+                OR (authentication_mode = 'workspace_identity' AND
+                    (workspace_key_id IS NULL OR workspace_key_generation IS NULL))
+                OR (state = 'revoked' AND revoked_at IS NULL)
+                OR (state <> 'revoked' AND revoked_at IS NOT NULL)",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if invalid_lifecycle_count != 0 {
+            return Err(Error::Store(
+                "workspace_runtime_bindings contains invalid binding lifecycle metadata"
+                    .to_string(),
+            ));
+        }
     }
     let revision_default = conn.query_row(
         "SELECT dflt_value FROM pragma_table_info('workspace_runtime_bindings') WHERE name = 'binding_revision'",
@@ -7184,24 +8586,62 @@ fn verify_workspace_runtime_binding_schema(conn: &Connection) -> Result<()> {
                 .to_string(),
         ));
     }
-    let mut stmt = conn.prepare(
-        r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                  public_key_fingerprint, binding_revision, created_at, updated_at, revoked_at
-           FROM workspace_runtime_bindings"#,
-    )?;
-    let rows = stmt.query_map([], read_workspace_runtime_binding)?;
-    for row in rows {
-        let binding = row?;
-        let mut normalized = binding.clone();
-        normalize_workspace_runtime_binding_key(&mut normalized)?;
-        if normalized.public_key != binding.public_key
-            || normalized.public_key_fingerprint != binding.public_key_fingerprint
-        {
-            return Err(Error::Store(format!(
-                "Runtime binding `{}/{}` has non-canonical trust content",
-                binding.workspace_id, binding.runtime_id
-            )));
+    if has_binding_state {
+        let mut stmt = conn.prepare(
+            r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
+                      public_key_fingerprint, binding_revision, state, authentication_mode,
+                      workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+               FROM workspace_runtime_bindings"#,
+        )?;
+        let rows = stmt.query_map([], read_workspace_runtime_binding)?;
+        for row in rows {
+            verify_canonical_workspace_runtime_binding(row?)?;
         }
+    } else {
+        let mut stmt = conn.prepare(
+            r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
+                      public_key_fingerprint, binding_revision, created_at, updated_at, revoked_at
+               FROM workspace_runtime_bindings"#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(WorkspaceRuntimeBinding {
+                workspace_id: row.get(0)?,
+                runtime_id: row.get(1)?,
+                display_name: row.get(2)?,
+                base_url: row.get(3)?,
+                public_key: row.get(4)?,
+                public_key_fingerprint: row.get(5)?,
+                binding_revision: row.get(6)?,
+                state: if row.get::<_, Option<String>>(9)?.is_some() {
+                    WorkspaceRuntimeBindingState::Revoked
+                } else {
+                    WorkspaceRuntimeBindingState::Verified
+                },
+                authentication_mode: WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer,
+                workspace_key_id: None,
+                workspace_key_generation: None,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+                revoked_at: row.get(9)?,
+            })
+        })?;
+        for row in rows {
+            verify_canonical_workspace_runtime_binding(row?)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_canonical_workspace_runtime_binding(binding: WorkspaceRuntimeBinding) -> Result<()> {
+    let mut normalized = binding.clone();
+    normalize_workspace_runtime_binding_key(&mut normalized)?;
+    if normalized.public_key != binding.public_key
+        || normalized.public_key_fingerprint != binding.public_key_fingerprint
+    {
+        return Err(Error::Store(format!(
+            "Runtime binding `{}/{}` has non-canonical trust content",
+            binding.workspace_id, binding.runtime_id
+        )));
     }
     Ok(())
 }
@@ -7759,7 +9199,9 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
 
     verify_schema_history(conn, LATEST_SCHEMA_VERSION)?;
     verify_workspace_runtime_binding_schema(conn)?;
-    verify_workspace_deletion_schema(conn)
+    verify_workspace_runtime_verification_schema(conn)?;
+    verify_workspace_deletion_schema(conn)?;
+    verify_workspace_signing_identity_schema(conn)
 }
 
 fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
@@ -7852,6 +9294,10 @@ mod tests {
         create_latest_workspace_schema(&conn).unwrap();
         conn.execute_batch(
             r#"
+            DROP INDEX workspace_signing_identity_audit_workspace_idx;
+            DROP TABLE workspace_signing_identity_audit;
+            DROP TABLE workspace_signing_identity_provisioning_operations;
+            DROP TABLE workspace_signing_identities;
             DROP INDEX workspace_deletion_operations_workspace_recent;
             DROP TABLE workspace_deletion_operations;
             CREATE TABLE worker_create_reservations_v52 (
@@ -7969,6 +9415,18 @@ mod tests {
                     version: 53,
                     name: WORKSPACE_DELETION_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 54,
+                    name: WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME.to_string(),
+                },
+                WorkspaceSchemaMigrationStep {
+                    version: 55,
+                    name: WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME.to_string(),
+                },
+                WorkspaceSchemaMigrationStep {
+                    version: 56,
+                    name: WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -7990,6 +9448,15 @@ mod tests {
                         (51, WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME.to_string()),
                         (52, RUNTIME_BINDING_AUDIT_MIGRATION_NAME.to_string()),
                         (53, WORKSPACE_DELETION_MIGRATION_NAME.to_string()),
+                        (54, WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME.to_string()),
+                        (
+                            55,
+                            WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME.to_string(),
+                        ),
+                        (
+                            56,
+                            WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME.to_string(),
+                        ),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -8003,11 +9470,39 @@ mod tests {
                 );
                 assert_eq!(
                     conn.query_row(
+                        "SELECT state || ':' || authentication_mode
+                         FROM workspace_runtime_bindings
+                         WHERE workspace_id='workspace-a' AND runtime_id='shared'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    "verified:legacy_server_issuer"
+                );
+                assert!(
+                    conn.execute(
+                        "UPDATE workspace_runtime_bindings
+                         SET state='configured', authentication_mode='workspace_identity'
+                         WHERE workspace_id='workspace-a' AND runtime_id='shared'",
+                        [],
+                    )
+                    .is_err(),
+                    "migrated schema must reject Workspace identity mode without key metadata"
+                );
+                assert_eq!(
+                    conn.query_row(
                         "SELECT COUNT(*) FROM worker_mutation_source_proof_jtis WHERE workspace_id='workspace-a' AND runtime_id='shared' AND jti='jti-1'",
                         [],
                         |row| row.get::<_, i64>(0),
                     )?,
                     1
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT state FROM workspace_signing_identities WHERE workspace_id='workspace-a'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    "pending_provisioning"
                 );
                 Ok(())
             })
@@ -8031,7 +9526,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![52, 53]
+            vec![52, 53, 54, 55, 56]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
@@ -8039,7 +9534,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 4);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 7);
     }
 
     #[test]
@@ -8204,6 +9699,42 @@ mod tests {
     }
 
     #[test]
+    fn schema_v53_signing_identity_migration_rolls_back_on_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        prepare_schema_v52(&path);
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        migrate_workspace_deletion_v52_to_v53(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE workspace_signing_identity_audit (unexpected TEXT NOT NULL);",
+        )
+        .unwrap();
+        let before = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='workspace_signing_identity_audit'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+
+        assert!(migrate_workspace_signing_identity_v53_to_v54(&conn).is_err());
+        assert_eq!(current_schema_version(&conn).unwrap(), 53);
+        assert!(!table_exists(&conn, "workspace_signing_identities").unwrap());
+        assert!(
+            !table_exists(&conn, "workspace_signing_identity_provisioning_operations").unwrap()
+        );
+        let after = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='workspace_signing_identity_audit'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
     fn schema_v52_workspace_deletion_migration_rolls_back_on_failure() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
@@ -8251,6 +9782,12 @@ mod tests {
                     VALUES
                         ('workspace-a', 'owner', 'Workspace A', 'active', '1', '1'),
                         ('workspace-b', 'owner', 'Workspace B', 'active', '1', '1');
+                    INSERT INTO workspace_signing_identities(
+                        workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
+                        private_material_ref, revision, state, created_at, provisioned_at, updated_at
+                    ) VALUES
+                        ('workspace-a', 'WK-a', 'ed25519', NULL, NULL, 'workspace-signing/workspace-a/ed25519-v1', 1, 'pending_provisioning', '1', NULL, '1'),
+                        ('workspace-b', 'WK-b', 'ed25519', NULL, NULL, 'workspace-signing/workspace-b/ed25519-v1', 1, 'pending_provisioning', '1', NULL, '1');
                     "#,
                 )?;
                 Ok(())
@@ -8265,6 +9802,10 @@ mod tests {
             public_key: identity.public_key.clone(),
             public_key_fingerprint: String::new(),
             binding_revision: 1,
+            state: WorkspaceRuntimeBindingState::Verified,
+            authentication_mode: WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer,
+            workspace_key_id: None,
+            workspace_key_generation: None,
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
             revoked_at: None,
@@ -8360,6 +9901,188 @@ mod tests {
     }
 
     #[test]
+    fn workspace_runtime_verification_is_revision_bound_and_restart_safe() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO accounts(account_id, kind, handle, display_name, created_at, updated_at)
+                    VALUES ('owner', 'user', 'owner', 'Owner', '1', '1');
+                    INSERT INTO workspaces(workspace_id, owner_account_id, display_name, state, created_at, updated_at)
+                    VALUES ('workspace-a', 'owner', 'Workspace A', 'active', '1', '1');
+                    INSERT INTO workspace_signing_identities(
+                        workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
+                        private_material_ref, revision, state, created_at, provisioned_at, updated_at
+                    ) VALUES ('workspace-a', 'WK-a', 'ed25519', 'key', 'sha256:key',
+                              'workspace-signing/workspace-a/ed25519-v1', 1, 'active', '1', '1', '1');
+                    "#,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let runtime_identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-a").unwrap();
+        store
+            .upsert_workspace_runtime_binding(
+                WorkspaceRuntimeBinding {
+                    workspace_id: "workspace-a".to_string(),
+                    runtime_id: "runtime-a".to_string(),
+                    display_name: "runtime-a".to_string(),
+                    base_url: "https://runtime.test".to_string(),
+                    public_key: runtime_identity.public_key,
+                    public_key_fingerprint: String::new(),
+                    binding_revision: 1,
+                    state: WorkspaceRuntimeBindingState::Configured,
+                    authentication_mode: WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity,
+                    workspace_key_id: Some("WK-a".to_string()),
+                    workspace_key_generation: Some(1),
+                    created_at: "1".to_string(),
+                    updated_at: "1".to_string(),
+                    revoked_at: None,
+                },
+                false,
+            )
+            .unwrap();
+        let persisted = store
+            .get_workspace_runtime_binding("workspace-a", "runtime-a")
+            .unwrap()
+            .unwrap();
+        let evidence = WorkspaceRuntimeVerificationEvidence {
+            workspace_id: "workspace-a".to_string(),
+            runtime_id: "runtime-a".to_string(),
+            binding_revision: persisted.binding_revision,
+            workspace_key_id: "WK-a".to_string(),
+            workspace_identity_revision: 1,
+            workspace_trust_generation: 1,
+            runtime_public_key_fingerprint: persisted.public_key_fingerprint.clone(),
+            runtime_identity_revision: 1,
+            challenge_id: "challenge-a".to_string(),
+            state: "verified".to_string(),
+            last_outcome: "verified".to_string(),
+            verified_at: Some("2".to_string()),
+            checked_at: "2".to_string(),
+        };
+        store
+            .record_workspace_runtime_verification_attempt(&evidence)
+            .unwrap();
+        let verified = store
+            .complete_workspace_runtime_verification(&evidence)
+            .unwrap();
+        assert_eq!(verified.state, WorkspaceRuntimeBindingState::Verified);
+        let pending_retry = WorkspaceRuntimeVerificationEvidence {
+            state: "pending".to_string(),
+            last_outcome: "challenge_issued".to_string(),
+            verified_at: None,
+            checked_at: "3".to_string(),
+            ..evidence.clone()
+        };
+        store
+            .record_workspace_runtime_verification_attempt(&pending_retry)
+            .unwrap();
+        let retained = store
+            .get_workspace_runtime_verification("workspace-a", "runtime-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.state, "verified");
+        assert_eq!(retained.verified_at.as_deref(), Some("2"));
+        assert_eq!(retained.last_outcome, "challenge_issued");
+        assert!(
+            !store
+                .workspace_runtime_verification_matches(&verified, 1, 1)
+                .unwrap()
+        );
+        store
+            .complete_workspace_runtime_verification(&evidence)
+            .unwrap();
+        let newer_pending = WorkspaceRuntimeVerificationEvidence {
+            challenge_id: "challenge-b".to_string(),
+            state: "pending".to_string(),
+            last_outcome: "challenge_issued".to_string(),
+            verified_at: None,
+            checked_at: "4".to_string(),
+            ..evidence.clone()
+        };
+        store
+            .record_workspace_runtime_verification_attempt(&newer_pending)
+            .unwrap();
+        let newer_verified = WorkspaceRuntimeVerificationEvidence {
+            state: "verified".to_string(),
+            last_outcome: "verified".to_string(),
+            verified_at: Some("5".to_string()),
+            checked_at: "5".to_string(),
+            ..newer_pending
+        };
+        store
+            .complete_workspace_runtime_verification(&newer_verified)
+            .unwrap();
+        assert!(
+            !store
+                .record_workspace_runtime_verification_outcome_if_current(
+                    &pending_retry,
+                    "failed",
+                    "verification_failed",
+                    "6",
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_workspace_runtime_verification("workspace-a", "runtime-a")
+                .unwrap(),
+            Some(newer_verified.clone())
+        );
+        drop(store);
+
+        let reopened = SqliteWorkspaceStore::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .get_workspace_runtime_verification("workspace-a", "runtime-a")
+                .unwrap(),
+            Some(newer_verified)
+        );
+        assert_eq!(
+            reopened
+                .get_workspace_runtime_binding("workspace-a", "runtime-a")
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkspaceRuntimeBindingState::Verified
+        );
+    }
+
+    #[test]
+    fn schema_v55_migrates_runtime_verification_table_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "DROP TABLE workspace_runtime_verifications;
+                     DELETE FROM __yoi_schema_migrations;
+                     INSERT INTO __yoi_schema_migrations(version, name)
+                     VALUES (55, 'Workspace Runtime binding state and identity mode');",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 55);
+        migrate_workspace_runtime_verification_v55_to_v56(&conn).unwrap();
+        drop(conn);
+        let migrated = Connection::open(&path).unwrap();
+        configure_sqlite(&migrated).unwrap();
+        assert_eq!(current_schema_version(&migrated).unwrap(), 56);
+        assert!(table_exists(&migrated, "workspace_runtime_verifications").unwrap());
+    }
+
+    #[test]
     fn runtime_binding_key_mutations_are_revisioned_idempotent_and_audited() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
         store
@@ -8385,6 +10108,10 @@ mod tests {
             public_key,
             public_key_fingerprint: String::new(),
             binding_revision: 1,
+            state: WorkspaceRuntimeBindingState::Configured,
+            authentication_mode: WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity,
+            workspace_key_id: Some("WK-a".to_string()),
+            workspace_key_generation: Some(1),
             created_at: at.to_string(),
             updated_at: at.to_string(),
             revoked_at: None,
@@ -8399,11 +10126,30 @@ mod tests {
             .unwrap();
         assert_eq!(created, WorkspaceRuntimeBindingMutation::Created);
         assert_eq!(created_binding.binding_revision, 1);
+        assert_eq!(
+            created_binding.state,
+            WorkspaceRuntimeBindingState::Configured
+        );
+        assert_eq!(
+            created_binding.authentication_mode,
+            WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity
+        );
+        assert_eq!(created_binding.workspace_key_id.as_deref(), Some("WK-a"));
+        assert_eq!(created_binding.workspace_key_generation, Some(1));
         let (replayed, replayed_binding) = store
             .put_workspace_runtime_binding_key(binding(first.public_key, "2"), None, "owner")
             .unwrap();
         assert_eq!(replayed, WorkspaceRuntimeBindingMutation::Unchanged);
         assert_eq!(replayed_binding.binding_revision, 1);
+        let mut mismatched_replay = binding(replayed_binding.public_key.clone(), "2");
+        mismatched_replay.base_url = "https://different.runtime.test".to_string();
+        assert!(matches!(
+            store.put_workspace_runtime_binding_key(mismatched_replay, None, "owner"),
+            Err(Error::RuntimeBindingRevisionConflict {
+                expected: None,
+                actual: Some(1)
+            })
+        ));
 
         let stale = store
             .put_workspace_runtime_binding_key(
@@ -8434,6 +10180,7 @@ mod tests {
         assert_eq!(revoked, WorkspaceRuntimeBindingMutation::Revoked);
         assert_eq!(revoked_binding.binding_revision, 3);
         assert_eq!(revoked_binding.revoked_at.as_deref(), Some("4"));
+        assert_eq!(revoked_binding.state, WorkspaceRuntimeBindingState::Revoked);
         let (reactivated, reactivated_binding) = store
             .put_workspace_runtime_binding_key(
                 binding(second.public_key.clone(), "5"),
@@ -8443,6 +10190,10 @@ mod tests {
             .unwrap();
         assert_eq!(reactivated, WorkspaceRuntimeBindingMutation::Reactivated);
         assert_eq!(reactivated_binding.binding_revision, 4);
+        assert_eq!(
+            reactivated_binding.state,
+            WorkspaceRuntimeBindingState::Configured
+        );
 
         let mut duplicate = binding(second.public_key, "6");
         duplicate.runtime_id = "runtime-b".to_string();
@@ -8493,6 +10244,10 @@ mod tests {
             public_key,
             public_key_fingerprint: String::new(),
             binding_revision: 1,
+            state: WorkspaceRuntimeBindingState::Verified,
+            authentication_mode: WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer,
+            workspace_key_id: None,
+            workspace_key_generation: None,
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
             revoked_at: None,
@@ -9647,13 +11402,13 @@ INSERT INTO worker_registry (
         let conn = Connection::open_in_memory().unwrap();
         configure_sqlite(&conn).unwrap();
         conn.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (54, 'future')",
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (57, 'future')",
             [],
         )
         .unwrap();
 
         let error = apply_migrations(&conn).unwrap_err().to_string();
-        assert!(error.contains("schema version 54 is newer"), "{error}");
+        assert!(error.contains("schema version 57 is newer"), "{error}");
         assert!(error.contains("refusing to serve"), "{error}");
     }
 
@@ -9695,6 +11450,14 @@ INSERT INTO accounts (account_id, kind, handle, display_name, created_at, update
 VALUES ('owner-account', 'user', 'owner-account', 'Owner Account', '2026-01-01', '2026-01-01');
 INSERT INTO workspaces (workspace_id, owner_account_id, display_name, state, created_at, updated_at)
 VALUES ('workspace-a', 'owner-account', 'A', 'active', '2026-01-01', '2026-01-01');
+INSERT INTO workspace_signing_identities (
+    workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
+    private_material_ref, revision, state, created_at, provisioned_at, updated_at
+) VALUES (
+    'workspace-a', 'WK-a', 'ed25519', NULL, NULL,
+    'workspace-signing/workspace-a/ed25519-v1', 1, 'pending_provisioning',
+    '2026-01-01', NULL, '2026-01-01'
+);
 INSERT INTO typed_tickets (
     workspace_id, ticket_id, slug, title, status, kind, priority, body,
     workflow_state, workflow_state_explicit
@@ -9717,6 +11480,14 @@ DELETE FROM typed_tickets
 WHERE workspace_id = 'workspace-a' AND ticket_id = 'ticket-a';
 INSERT INTO workspaces (workspace_id, owner_account_id, display_name, state, created_at, updated_at)
 VALUES ('workspace-b', 'owner-account', 'B', 'active', '2026-01-01', '2026-01-01');
+INSERT INTO workspace_signing_identities (
+    workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
+    private_material_ref, revision, state, created_at, provisioned_at, updated_at
+) VALUES (
+    'workspace-b', 'WK-b', 'ed25519', NULL, NULL,
+    'workspace-signing/workspace-b/ed25519-v1', 1, 'pending_provisioning',
+    '2026-01-01', NULL, '2026-01-01'
+);
 INSERT INTO typed_tickets (
     workspace_id, ticket_id, slug, title, status, kind, priority, body,
     workflow_state, workflow_state_explicit
@@ -9800,13 +11571,26 @@ INSERT INTO worker_registry (
             updated_at: "1".to_string(),
         };
 
+        let signing_identity = WorkspaceSigningIdentityActivation {
+            workspace_id: workspace.workspace_id.clone(),
+            key_id: "WK-store-test".to_string(),
+            public_key: "test-public-key".to_string(),
+            public_key_fingerprint: "sha256:test-public-key".to_string(),
+            private_material_ref: "workspace-signing/store-test/ed25519-v1".to_string(),
+            revision: 1,
+            provisioned_at: "1".to_string(),
+        };
         let error = store
-            .create_workspace_bootstrap(&WorkspaceBootstrapRecord {
-                operation_key: "invalid-key".to_string(),
-                request_fingerprint: "sha256:invalid-key".to_string(),
-                workspace: workspace.clone(),
-                repository,
-            })
+            .create_workspace_bootstrap(
+                &WorkspaceBootstrapRecord {
+                    operation_key: "invalid-key".to_string(),
+                    request_fingerprint: "sha256:invalid-key".to_string(),
+                    workspace: workspace.clone(),
+                    repository,
+                },
+                &signing_identity,
+                "identity-store-test",
+            )
             .unwrap_err()
             .to_string();
 
@@ -9843,12 +11627,34 @@ INSERT INTO worker_registry (
             workspace,
             repository: valid_repository,
         };
-        assert!(!store.create_workspace_bootstrap(&first).unwrap().replayed);
+        store
+            .reserve_workspace_signing_identity_provisioning(
+                &WorkspaceSigningIdentityProvisioningOperation {
+                    operation_key: "identity-store-test".to_string(),
+                    request_fingerprint: "sha256:create-workspace".to_string(),
+                    operation_kind: "workspace_create".to_string(),
+                    workspace_id: first.workspace.workspace_id.clone(),
+                    key_id: signing_identity.key_id.clone(),
+                    private_material_ref: signing_identity.private_material_ref.clone(),
+                    revision: signing_identity.revision,
+                    actor_account_id: first.workspace.owner_account_id.clone(),
+                    state: "pending".to_string(),
+                    created_at: "1".to_string(),
+                    completed_at: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            !store
+                .create_workspace_bootstrap(&first, &signing_identity, "identity-store-test")
+                .unwrap()
+                .replayed
+        );
         let mut duplicate = first;
         duplicate.operation_key = "duplicate-workspace".to_string();
         duplicate.repository.repository_id = Uuid::now_v7().to_string();
         let error = store
-            .create_workspace_bootstrap(&duplicate)
+            .create_workspace_bootstrap(&duplicate, &signing_identity, "identity-store-test")
             .unwrap_err()
             .to_string();
         assert!(

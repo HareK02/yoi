@@ -607,6 +607,64 @@ pub struct WorkspaceMetadataMutationResponse {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Lifecycle state for a Workspace-scoped Ed25519 signing identity.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSigningIdentityState {
+    PendingProvisioning,
+    Active,
+}
+
+/// Public metadata for a Workspace signing identity. Private material and its
+/// storage reference are deliberately not part of this wire authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceSigningIdentityPublic {
+    pub workspace_id: String,
+    pub key_id: String,
+    pub algorithm: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub public_key_fingerprint: Option<String>,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub revision: u64,
+    pub state: WorkspaceSigningIdentityState,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub provisioned_at: Option<String>,
+}
+
+/// Copyable public trust bundle consumed by future Runtime enrollment work.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspacePublicIdentityBundle {
+    pub workspace_id: String,
+    pub backend_url: String,
+    pub key_id: String,
+    pub algorithm: String,
+    pub public_key: String,
+    pub public_key_fingerprint: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceSigningIdentityResponse {
+    pub identity: WorkspaceSigningIdentityPublic,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub public_bundle: Option<WorkspacePublicIdentityBundle>,
+}
+
 pub const WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES: usize = 128;
 pub const WORKSPACE_DELETION_MAX_REVISION_BYTES: usize = 128;
 pub const WORKSPACE_DELETION_MAX_CONFIRMATION_BYTES: usize = 256;
@@ -1522,6 +1580,71 @@ pub struct RuntimeSummary {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceRuntimeBindingState {
+    Configured,
+    Verified,
+    Revoked,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeConnectionDisplayState {
+    Configured,
+    Verified,
+    Unavailable,
+    Revoked,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeVerificationOutcome {
+    Verified,
+    ChallengeIssued,
+    VerificationFailed,
+    ConnectivityFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeVerificationEvidenceSummary {
+    pub verified_at: Option<String>,
+    pub last_checked_at: String,
+    pub last_outcome: RuntimeVerificationOutcome,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub binding_revision: u64,
+    pub workspace_key_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub workspace_identity_revision: u64,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub workspace_trust_generation: u64,
+    pub runtime_public_key_fingerprint: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub runtime_identity_revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRuntimeBindingSummary {
+    pub state: WorkspaceRuntimeBindingState,
+    pub connection_state: RuntimeConnectionDisplayState,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
+    pub workspace_key_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<RuntimeVerificationEvidenceSummary>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
@@ -1531,6 +1654,8 @@ pub struct RuntimeManagementSummary {
     pub removable: bool,
     pub endpoint_configured: bool,
     pub token_ref_configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<WorkspaceRuntimeBindingSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1616,16 +1741,6 @@ pub struct RuntimeTrustKeyRevealResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
-pub struct PutRuntimeTrustKeyRequest {
-    pub public_key: String,
-    #[serde(default)]
-    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
-    pub expected_revision: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
 pub struct RevokeRuntimeTrustKeyRequest {
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
     pub expected_revision: u64,
@@ -1653,12 +1768,24 @@ pub struct RuntimeTrustConflictResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RuntimePublicIdentityBundle {
+    pub identity_id: String,
+    pub public_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct CreateRemoteRuntimeRequest {
-    pub runtime_id: String,
+    pub public_bundle: RuntimePublicIdentityBundle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub endpoint: String,
-    pub token_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
+    pub expected_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1690,6 +1817,10 @@ pub enum RuntimeConnectionTestFailureKind {
 pub struct RuntimeConnectionTestResponse {
     pub workspace_id: String,
     pub runtime_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub binding_revision: u64,
+    pub connection_state: RuntimeConnectionDisplayState,
+    pub verification: Option<RuntimeVerificationEvidenceSummary>,
     pub checked_at: String,
     pub status: RuntimeConnectionTestStatus,
     pub failure_kind: Option<RuntimeConnectionTestFailureKind>,
@@ -2848,6 +2979,10 @@ pub fn catalog_typescript() -> String {
         WorkspaceMetadataSettingsResponse::decl(&config),
         UpdateWorkspaceMetadataRequest::decl(&config),
         WorkspaceMetadataMutationResponse::decl(&config),
+        WorkspaceSigningIdentityState::decl(&config),
+        WorkspaceSigningIdentityPublic::decl(&config),
+        WorkspacePublicIdentityBundle::decl(&config),
+        WorkspaceSigningIdentityResponse::decl(&config),
         ProfileSettingsResponse::decl(&config),
         WorkspaceProfileSummary::decl(&config),
         WorkspaceProfileSourceSummary::decl(&config),
@@ -2868,6 +3003,11 @@ pub fn catalog_typescript() -> String {
         RuntimeIdentityAuthority::decl(&config),
         RuntimeSourceSummary::decl(&config),
         RuntimeSummary::decl(&config),
+        WorkspaceRuntimeBindingState::decl(&config),
+        RuntimeConnectionDisplayState::decl(&config),
+        RuntimeVerificationOutcome::decl(&config),
+        RuntimeVerificationEvidenceSummary::decl(&config),
+        WorkspaceRuntimeBindingSummary::decl(&config),
         RuntimeManagementSummary::decl(&config),
         WorkspaceRuntimeResource::decl(&config),
         RuntimeTrustKeyStatus::decl(&config),
@@ -2876,10 +3016,11 @@ pub fn catalog_typescript() -> String {
         RuntimeTrustAuditEntry::decl(&config),
         WorkspaceRuntimeDetail::decl(&config),
         RuntimeTrustKeyRevealResponse::decl(&config),
-        PutRuntimeTrustKeyRequest::decl(&config),
         RevokeRuntimeTrustKeyRequest::decl(&config),
         RuntimeTrustConflictKind::decl(&config),
         RuntimeTrustConflictResponse::decl(&config),
+        RuntimePublicIdentityBundle::decl(&config),
+        CreateRemoteRuntimeRequest::decl(&config),
         RuntimeConnectionTestStatus::decl(&config),
         RuntimeConnectionTestFailureKind::decl(&config),
         RuntimeConnectionTestResponse::decl(&config),
@@ -3708,14 +3849,6 @@ mod tests {
             .is_err()
         );
         assert!(
-            serde_json::from_value::<PutRuntimeTrustKeyRequest>(serde_json::json!({
-                "public_key": "key",
-                "expected_revision": 1,
-                "replace": true
-            }))
-            .is_err()
-        );
-        assert!(
             serde_json::from_value::<RevokeRuntimeTrustKeyRequest>(serde_json::json!({
                 "expected_revision": 1,
                 "delete_runtime": true
@@ -3729,6 +3862,9 @@ mod tests {
         let compatible = serde_json::json!({
             "workspace_id": "workspace-test",
             "runtime_id": "runtime-test",
+            "binding_revision": 3,
+            "connection_state": "verified",
+            "verification": null,
             "checked_at": "2026-09-01T12:00:00Z",
             "status": "compatible",
             "failure_kind": null,
@@ -3874,6 +4010,45 @@ mod tests {
         assert_eq!(
             serde_json::to_value(decoded).unwrap(),
             absent_optional_fields
+        );
+    }
+
+    #[test]
+    fn workspace_signing_identity_wire_contract_omits_private_and_pending_fields() {
+        let response = WorkspaceSigningIdentityResponse {
+            identity: WorkspaceSigningIdentityPublic {
+                workspace_id: "workspace-test".to_string(),
+                key_id: "WK-test".to_string(),
+                algorithm: "ed25519".to_string(),
+                public_key: None,
+                public_key_fingerprint: None,
+                revision: 1,
+                state: WorkspaceSigningIdentityState::PendingProvisioning,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                provisioned_at: None,
+            },
+            public_bundle: None,
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "identity": {
+                    "workspace_id": "workspace-test",
+                    "key_id": "WK-test",
+                    "algorithm": "ed25519",
+                    "revision": 1,
+                    "state": "pending_provisioning",
+                    "created_at": "2026-01-01T00:00:00Z"
+                }
+            })
+        );
+        assert!(
+            serde_json::from_value::<WorkspaceSigningIdentityResponse>(serde_json::json!({
+                "identity": encoded["identity"].clone(),
+                "private_material_ref": "must-not-cross-the-wire"
+            }))
+            .is_err()
         );
     }
 

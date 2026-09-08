@@ -24,6 +24,8 @@ Responsibilities are split as follows:
 
 The Backend can project Runtime and Worker state, but it should not become a hidden filesystem/runtime implementation. Runtime observations should be reconstructable from Runtime APIs and committed Backend records.
 
+Remote Runtime authentication follows the same Workspace boundary. The Server signs each Runtime request with the target Workspace signing identity, and the Runtime verifies it against the installed Workspace issuer bundle. Runtime-to-Server source proof is signed by the Runtime identity and uses the bundle's Backend URL as audience. Server-global signing identities, Runtime-side global Server trust, and static bearer fallback are not Remote Workspace authority. Provisioning and rotation are described in [Workspace ↔ Runtime authentication](../development/server-runtime-auth.md).
+
 ## Docker image layout
 
 Docker images are built through Nix `dockerTools.buildImage`, not through a root Dockerfile.

@@ -3,12 +3,12 @@ declare const Deno: {
 };
 
 import {
+  createRemoteRuntime,
   parseRuntimeTrustConflict,
   parseRuntimeTrustKeyRevealResponse,
   parseWorkspaceRuntimeDetail,
   parseWorkspaceRuntimeList,
   previewRuntimePublicKeyFingerprint,
-  putRuntimeTrustKey,
   revokeRuntimeTrustKey,
   RuntimeTrustConflictError,
   RuntimeTrustRouteFence,
@@ -39,6 +39,24 @@ function runtime() {
       removable: false,
       endpoint_configured: true,
       token_ref_configured: false,
+      binding: {
+        state: "verified",
+        connection_state: "verified",
+        revision: 3,
+        workspace_key_id: "WK-1",
+        workspace_key_generation: 1,
+        verification: {
+          verified_at: "2026-09-01T13:00:00Z",
+          last_checked_at: "2026-09-01T13:00:00Z",
+          last_outcome: "verified",
+          binding_revision: 3,
+          workspace_key_id: "WK-1",
+          workspace_identity_revision: 1,
+          workspace_trust_generation: 1,
+          runtime_public_key_fingerprint: "SHA256:current",
+          runtime_identity_revision: 1,
+        },
+      },
     },
     runtime_id: "arcadia",
     label: "Arcadia",
@@ -95,6 +113,11 @@ Deno.test("Runtime list and detail parsers return generated Runtime DTO shapes",
     "Runtime ID was not preserved",
   );
 
+  assert(
+    list.items[0]?.management.binding?.state === "verified",
+    "binding state was not preserved",
+  );
+
   const parsed = parseWorkspaceRuntimeDetail(detail());
   assert(
     parsed.trust_key.revision === 3,
@@ -103,6 +126,20 @@ Deno.test("Runtime list and detail parsers return generated Runtime DTO shapes",
   assert(
     parsed.recent_audit[0]?.revision === 3,
     "audit revision was not normalized",
+  );
+});
+
+Deno.test("Runtime management parser rejects Workspace identity bindings without key metadata", () => {
+  const payload = detail();
+  const binding = payload.runtime.management.binding as Partial<
+    typeof payload.runtime.management.binding
+  >;
+  delete binding.workspace_key_id;
+  delete binding.workspace_key_generation;
+  binding.state = "configured";
+  assertThrows(
+    () => parseWorkspaceRuntimeDetail(payload),
+    "requires Workspace signing key identity metadata",
   );
 });
 
@@ -240,48 +277,38 @@ Deno.test("Runtime public key preview matches the Server fingerprint contract", 
   );
 });
 
-Deno.test("typed trust conflict is validated and preserves authoritative revision", async () => {
-  let sentBody: unknown = null;
-  const fetchImpl = ((_: RequestInfo | URL, init?: RequestInit) => {
-    sentBody = JSON.parse(String(init?.body)) as unknown;
-    return Promise.resolve(
+Deno.test("Runtime create surfaces bounded Settings error details", async () => {
+  const fetchImpl = (() =>
+    Promise.resolve(
       new Response(
         JSON.stringify({
-          error: "stale_revision",
-          message: "Runtime trust changed",
-          current_revision: 4,
-          current_fingerprint: "SHA256:new",
+          error: "remote_runtime_endpoint_not_allowed",
+          details: "Runtime endpoint must use public https egress",
         }),
-        { status: 409, headers: { "content-type": "application/json" } },
+        { status: 400, headers: { "content-type": "application/json" } },
       ),
-    );
-  }) as typeof fetch;
+    )) as typeof fetch;
 
   try {
-    await putRuntimeTrustKey(
+    await createRemoteRuntime(
       "workspace-a",
-      "arcadia",
-      { public_key: "ssh-ed25519 AAAA-new", expected_revision: 3 },
+      {
+        public_bundle: {
+          identity_id: "runtime-a",
+          public_key: "yoi-ed25519-pub:v1:test",
+        },
+        display_name: null,
+        endpoint: "https://runtime.example",
+        expected_revision: null,
+      },
       fetchImpl,
     );
-    throw new Error("expected mutation to reject");
+    throw new Error("expected create to reject");
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     assert(
-      error instanceof RuntimeTrustConflictError,
-      "expected typed conflict",
-    );
-    assert(
-      error.conflict.current_revision === 4,
-      "authoritative revision was lost",
+      message === "Runtime endpoint must use public https egress",
+      `unexpected create error: ${message}`,
     );
   }
-
-  assert(
-    JSON.stringify(sentBody) ===
-      JSON.stringify({
-        public_key: "ssh-ed25519 AAAA-new",
-        expected_revision: 3,
-      }),
-    "request should serialize the generated bigint revision as a safe JSON integer",
-  );
 });

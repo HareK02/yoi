@@ -1,266 +1,76 @@
-# Server / Runtime manual auth setup
+# Workspace ↔ Runtime 認証
 
-Workspace Server and Worker Runtime authenticate remote Runtime control traffic with manually exchanged Ed25519 public keys and short-lived Server-signed capability tokens.
+Yoi の Remote Runtime 認証は Workspace ごとの署名 identity を authority とする。
+Server-global な署名鍵や Runtime 側の trusted-Server catalog は使わない。
 
-This is a non-interactive bootstrap flow. Commands fail when required flags are missing, and existing identity/trust records are not overwritten unless `--replace` is passed explicitly.
+## Authority
 
-## Authority boundary
+- Server DB は Workspace ごとの signing identity と Runtime binding を保持する。
+- Runtime は `trust-workspace` で受理した `WorkspaceIssuerAuthorizationBundle` を保持する。
+- bundle は `workspace_id`、Workspace key id/generation、Workspace public key、Backend URL、許可された Runtime identity を固定する。
+- Server → Runtime の各 HTTP / WebSocket request は、対象 Workspace の signing identity で短命な capability token を発行する。
+- Runtime は request method、`path_and_query`、body digest、permission、Workspace、Runtime、key generation、expiry、JTI を検証する。
+- Runtime → Server の source proof は Runtime identity で署名し、対象 Workspace と bundle の Backend URL を audience に固定する。
+- Server は現在の Workspace Runtime binding、Runtime public key、Backend public URL、request target、body digest、permission、expiry、replay state を検証する。
 
-- Workspace Server is the workspace control plane. It owns trusted Runtime records in the Server DB and signs per-request Runtime capability tokens.
-- Runtime owns Worker execution. It does not own a workspace registry or workspace list.
-- Runtime API paths remain worker-centric; workspace scope is carried in the signed auth context and enforced by Runtime-side authorization/filtering code.
-- Browser/Web clients should talk to Workspace Server, not directly to Runtime.
+旧 Server identity/trust 管理 command と旧 Runtime-side Server trust command、旧 Runtime auth key flags は廃止済みである。これらに相当する Server-global trust を fallback として使ってはならない。
 
-## Identifiers used in examples
+## Provisioning
 
-Replace these values for the deployment:
+1. Runtime identity を初期化する。
 
-```text
-SERVER_ID=server-main
-RUNTIME_ID=runtime-main
-RUNTIME_BASE_URL=http://127.0.0.1:38800
-```
+   ```sh
+   yoi-runtime identity init --runtime-id <runtime-id>
+   yoi-runtime identity show
+   ```
 
-`SERVER_ID` is the issuer id in Server-signed tokens. `RUNTIME_ID` is the token audience and must match the Runtime identity.
+2. Workspace owner が Settings → Runtimes から Runtime public bundle と endpoint を登録する。
+3. Server が Workspace issuer bundle と challenge を発行する。
+4. operator が bundle を Runtime に追加する。
 
-## 1. Create and show the Server identity
+   ```sh
+   yoi-runtime trust-workspace add --bundle <workspace-issuer-bundle.json>
+   yoi-runtime trust-workspace show --workspace-id <workspace-id>
+   ```
 
-From the Workspace Server host:
+5. Runtime が challenge proof を生成し、Workspace owner が Server に submit する。
+6. Server が verified binding を commit した後、通常の Workspace-signed request が利用可能になる。
 
-```bash
-yoi-server identity init --server-id server-main
-```
+同じ Runtime identity は異なる Workspace から独立して信頼できる。trust record、replay protection、binding、失効はすべて Workspace scope で評価する。
 
-Show the public identity and copy the `public_key` value:
+## Runtime auth file
 
-```bash
-yoi-server identity show --json
-```
+`runtime-auth.toml` は Runtime identity と Workspace issuer records のみを authority とする。
+旧 Server trust entry は読み飛ばされ、以後の identity / `trust-workspace` 更新時に書き戻されない。旧 entry を残しても認証には使用されない。
 
-The Server private identity is stored in the Yoi data directory under the Server data root, currently:
+`trust-workspace` の file store は次を fail closed で検証する。
 
-```text
-<data_dir>/server/identity.toml
-```
+- 最大 8 MiB
+- 最大 4,096 records
+- exact Workspace / Runtime identity
+- key id/generation と public key fingerprint
+- normalized Backend URL
+- replace 時の expected current generation
+- list は `offset` / `limit` 必須で、1 page 最大 100 records
 
-On Unix this file is written with `0600` permissions. Do not copy the private key to Runtime or commit it to the repository.
+## Local token
 
-## 2. Create and show the Runtime identity
+`--local-token` は明示的な local Runtime 呼び出し専用であり、Remote Workspace binding の代替ではない。Workspace issuer auth が有効な Remote Runtime request は Workspace capability token を使う。
 
-From the Runtime host, using the same Runtime storage flags that the Runtime server process will use:
+## Rotation と失効
 
-```bash
-yoi-runtime identity init --runtime-id runtime-main
-```
+Workspace signing key または Runtime key の変更は、現在 binding を置き換える明示的な provisioning 操作として行う。古い generation、古い Runtime key、revoked binding、失効済み token、replayed JTI は即時拒否する。
 
-Show the public identity and copy the `public_key` value:
+Server の Runtime cache は現在の persisted binding 全体と照合する。endpoint、Runtime public key/fingerprint、binding revision、Workspace key generation の変更を検知した場合、stale client を利用しない。
 
-```bash
-yoi-runtime identity show --json
-```
+## 運用確認
 
-By default, Runtime auth state is stored at:
+Remote Runtime を有効化した後は次を確認する。
 
-```text
-<data_dir>/runtime/auth.toml
-```
+1. `yoi-runtime trust-workspace show --workspace-id <workspace-id>` が期待する bundle を表示する。
+2. Workspace Settings の Runtime binding が `verified` で、現在の key id/generation と verification evidence を表示する。
+3. Runtime ping、Worker list/create、`worker.protocol` subscription が Workspace-signed token で成功する。
+4. wrong Workspace、wrong Runtime、wrong target/body、expired token、revoked/replaced binding、replayed JTI が拒否される。
+5. Runtime → Server source proof が configured Backend public URL audience と一致し、spoofed headers だけでは認証されない。
 
-If the Runtime process is launched with `--fs-root` or `--fs-runtime-dir`, pass the same flags to every `identity` and `trust-server` command. Otherwise the setup command may write an auth file that the server process never reads.
-
-Example with explicit Runtime storage:
-
-```bash
-yoi-runtime identity init \
-  --runtime-id runtime-main \
-  --fs-root /var/lib/yoi-runtime
-
-yoi-runtime identity show \
-  --json \
-  --fs-root /var/lib/yoi-runtime
-```
-
-## 3. Register the Server public key on Runtime
-
-On the Runtime host, register the Server public key copied from `yoi-server identity show --json`:
-
-```bash
-yoi-runtime trust-server add \
-  --server-id server-main \
-  --public-key '<SERVER_PUBLIC_KEY>'
-```
-
-With explicit Runtime storage, keep using the same storage flags:
-
-```bash
-yoi-runtime trust-server add \
-  --server-id server-main \
-  --public-key '<SERVER_PUBLIC_KEY>' \
-  --fs-root /var/lib/yoi-runtime
-```
-
-Verify:
-
-```bash
-yoi-runtime trust-server list --json
-```
-
-## 4. Register the Runtime public key and endpoint on Server
-
-On the Workspace Server host, register the Runtime public key copied from `yoi-runtime identity show --json`:
-
-```bash
-yoi-server trust-runtime add \
-  --workspace-id '<WORKSPACE_ID>' \
-  --runtime-id runtime-main \
-  --base-url http://127.0.0.1:38800 \
-  --public-key '<RUNTIME_PUBLIC_KEY>' \
-  --display-name 'Runtime main'
-```
-
-This writes a Workspace-scoped Runtime binding and trust fingerprint to the Server DB. During `yoi-server serve`, active bindings are loaded as remote Runtime sources and receive signed capability tokens. Repository-external Runtime files are not registration or trust authority.
-
-Verify:
-
-```bash
-yoi-server trust-runtime list --workspace-id '<WORKSPACE_ID>' --json
-```
-
-## 5. Start Runtime and Workspace Server
-
-Start Runtime with the same storage flags used during Runtime identity/trust setup:
-
-```bash
-yoi-runtime \
-  --bind 127.0.0.1:38800
-```
-
-For repository builds, the equivalent cargo command is:
-
-```bash
-cargo run -p worker-runtime \
-  --bin yoi-runtime \
-  -- --bind 127.0.0.1:38800
-```
-
-Start Workspace Server:
-
-```bash
-yoi-server serve --listen 127.0.0.1:8787
-```
-
-For repository builds:
-
-```bash
-cargo run -p yoi-workspace-server --bin yoi-server -- serve --listen 127.0.0.1:8787
-```
-
-An empty Server DB is valid. Open the Web UI, create or authenticate the Account, and register the first Workspace through the normal Workspace creation flow. Server startup does not create a Workspace from its current working directory or repository-local configuration.
-
-## Smoke checks
-
-Check both trust stores:
-
-```bash
-yoi-server trust-runtime list --workspace-id '<WORKSPACE_ID>' --json
-yoi-runtime trust-server list --json
-```
-
-Check that Workspace Server can see Runtime workers through the authenticated path. From the CLI:
-
-```bash
-yoi workers \
-  --backend http://127.0.0.1:8787 \
-  --runtime-id runtime-main
-```
-
-In Web, open the Workspace UI through Workspace Server and verify that Runtime worker listing, worker creation, and Console protocol input work. The protocol WebSocket uses the same Server-signed Runtime auth path as REST control calls.
-
-## Rotation and replacement
-
-Identity and trust records are intentionally not overwritten by default.
-
-Rotate Server identity:
-
-```bash
-yoi-server identity init --server-id server-main --replace
-```
-
-After Server identity rotation, every Runtime that trusts that Server must be updated with the new Server public key:
-
-```bash
-yoi-runtime trust-server add \
-  --server-id server-main \
-  --public-key '<NEW_SERVER_PUBLIC_KEY>' \
-  --replace
-```
-
-Rotate Runtime identity:
-
-```bash
-yoi-runtime identity init --runtime-id runtime-main --replace
-```
-
-After Runtime identity rotation, Server must be updated with the new Runtime public key:
-
-```bash
-yoi-server trust-runtime add \
-  --workspace-id '<WORKSPACE_ID>' \
-  --runtime-id runtime-main \
-  --base-url http://127.0.0.1:38800 \
-  --public-key '<NEW_RUNTIME_PUBLIC_KEY>' \
-  --replace
-```
-
-## Revocation
-
-Revoke a trusted Runtime on Server:
-
-```bash
-yoi-server trust-runtime revoke \
-  --workspace-id '<WORKSPACE_ID>' \
-  --runtime-id runtime-main
-```
-
-Remove a trusted Server from Runtime:
-
-```bash
-yoi-runtime trust-server revoke --server-id server-main
-```
-
-## Troubleshooting
-
-### `trusted runtimes are registered but server identity is not initialized`
-
-The Server DB contains trusted Runtime records, but the Server signing identity file does not exist. Run:
-
-```bash
-yoi-server identity init --server-id server-main
-```
-
-If the identity was created in another environment, ensure the Server process is using the same Yoi data directory.
-
-### Runtime accepts unauthenticated requests
-
-Runtime only enables signed capability-token auth when both a Runtime identity and at least one trusted Server are present in its auth file. Check:
-
-```bash
-yoi-runtime identity show --json
-yoi-runtime trust-server list --json
-```
-
-Also confirm the Runtime process was started with the same `--fs-root` / `--fs-runtime-dir` used for setup.
-
-### Wrong audience or unauthorized Runtime response
-
-Confirm the `--runtime-id` registered on Server exactly matches the Runtime identity id:
-
-```bash
-yoi-runtime identity show --json
-yoi-server trust-runtime list --workspace-id '<WORKSPACE_ID>' --json
-```
-
-`RUNTIME_ID` is the token audience; mismatches are rejected by Runtime.
-
-### Duplicate registration fails
-
-This is expected. Use `--replace` only when intentionally rotating or updating trust material.
+Server / Runtime の再起動は live reload ではない authority 変更を反映するときだけ、通常の運用権限と migration gate に従って行う。実行中プロセスを開発 Worker が無断で停止してはならない。

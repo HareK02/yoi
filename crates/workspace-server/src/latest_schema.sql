@@ -441,13 +441,49 @@ CREATE TABLE workspace_runtime_bindings (
     public_key TEXT NOT NULL,
     public_key_fingerprint TEXT NOT NULL,
     binding_revision INTEGER NOT NULL DEFAULT 1 CHECK (binding_revision > 0),
+    state TEXT NOT NULL CHECK (state IN ('configured', 'verified', 'revoked')),
+    authentication_mode TEXT NOT NULL CHECK (authentication_mode IN ('legacy_server_issuer', 'workspace_identity')),
+    workspace_key_id TEXT,
+    workspace_key_generation INTEGER CHECK (workspace_key_generation > 0),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     revoked_at TEXT,
     PRIMARY KEY (workspace_id, runtime_id),
     UNIQUE (workspace_id, public_key_fingerprint),
-    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT
+    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
+    CHECK (
+        (authentication_mode = 'legacy_server_issuer' AND workspace_key_id IS NULL AND workspace_key_generation IS NULL)
+        OR
+        (authentication_mode = 'workspace_identity' AND workspace_key_id IS NOT NULL AND workspace_key_generation IS NOT NULL)
+    ),
+    CHECK (
+        (state = 'revoked' AND revoked_at IS NOT NULL)
+        OR
+        (state != 'revoked' AND revoked_at IS NULL)
+    )
 );
+CREATE TABLE workspace_runtime_verifications (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    binding_revision INTEGER NOT NULL CHECK(binding_revision > 0),
+    workspace_key_id TEXT NOT NULL,
+    workspace_identity_revision INTEGER NOT NULL CHECK(workspace_identity_revision > 0),
+    workspace_trust_generation INTEGER NOT NULL CHECK(workspace_trust_generation > 0),
+    runtime_public_key_fingerprint TEXT NOT NULL,
+    runtime_identity_revision INTEGER NOT NULL CHECK(runtime_identity_revision > 0),
+    challenge_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending', 'verified', 'failed')),
+    last_outcome TEXT NOT NULL,
+    verified_at TEXT,
+    checked_at TEXT NOT NULL,
+    PRIMARY KEY(workspace_id, runtime_id),
+    FOREIGN KEY(workspace_id, runtime_id)
+        REFERENCES workspace_runtime_bindings(workspace_id, runtime_id) ON DELETE CASCADE,
+    CHECK((state = 'verified' AND verified_at IS NOT NULL)
+       OR (state != 'verified' AND verified_at IS NULL))
+);
+CREATE INDEX workspace_runtime_verifications_state_idx
+    ON workspace_runtime_verifications(workspace_id, state, checked_at DESC);
 CREATE TABLE workspace_runtime_binding_audit (
     workspace_id TEXT NOT NULL,
     runtime_id TEXT NOT NULL,
@@ -795,6 +831,51 @@ CREATE TABLE workspace_create_operations (
             created_at TEXT NOT NULL,
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
         );
+CREATE TABLE workspace_signing_identities (
+            workspace_id TEXT PRIMARY KEY,
+            key_id TEXT NOT NULL UNIQUE,
+            algorithm TEXT NOT NULL CHECK (algorithm = 'ed25519'),
+            public_key TEXT,
+            public_key_fingerprint TEXT,
+            private_material_ref TEXT NOT NULL UNIQUE,
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            state TEXT NOT NULL CHECK (state IN ('pending_provisioning', 'active')),
+            created_at TEXT NOT NULL,
+            provisioned_at TEXT,
+            updated_at TEXT NOT NULL,
+            CHECK (
+                (state = 'pending_provisioning' AND public_key IS NULL AND public_key_fingerprint IS NULL AND provisioned_at IS NULL)
+                OR
+                (state = 'active' AND public_key IS NOT NULL AND public_key_fingerprint IS NOT NULL AND provisioned_at IS NOT NULL)
+            ),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+CREATE TABLE workspace_signing_identity_provisioning_operations (
+            operation_key TEXT PRIMARY KEY,
+            request_fingerprint TEXT NOT NULL,
+            operation_kind TEXT NOT NULL CHECK (operation_kind IN ('workspace_create', 'existing_workspace')),
+            workspace_id TEXT NOT NULL UNIQUE,
+            key_id TEXT NOT NULL UNIQUE,
+            private_material_ref TEXT NOT NULL UNIQUE,
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            actor_account_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
+            created_at TEXT NOT NULL,
+            completed_at TEXT
+        );
+CREATE TABLE workspace_signing_identity_audit (
+            event_id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            key_id TEXT NOT NULL,
+            action TEXT NOT NULL CHECK (action IN ('provisioned')),
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            public_key_fingerprint TEXT NOT NULL,
+            actor_account_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+CREATE INDEX workspace_signing_identity_audit_workspace_idx
+            ON workspace_signing_identity_audit(workspace_id, created_at DESC);
 CREATE TABLE workspace_memory_documents (
     workspace_id TEXT PRIMARY KEY REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
     body_md TEXT NOT NULL,

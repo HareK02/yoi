@@ -8,6 +8,10 @@ import type {
   WorkspaceProfileSourceProvenance,
   WorkspaceProfileSourceSummary,
   WorkspaceProfileSummary,
+  WorkspacePublicIdentityBundle,
+  WorkspaceSigningIdentityPublic,
+  WorkspaceSigningIdentityResponse,
+  WorkspaceSigningIdentityState,
 } from "$lib/generated/workspace-api";
 
 export class ProfileApiError extends Error {
@@ -51,6 +55,18 @@ function stringValue(value: unknown, context: string): string {
   return value;
 }
 
+function boundedStringValue(
+  value: unknown,
+  context: string,
+  maxBytes: number,
+): string {
+  const text = stringValue(value, context);
+  if (new TextEncoder().encode(text).byteLength > maxBytes) {
+    throw new ProfileApiError(`${context} returned an invalid response.`, 502);
+  }
+  return text;
+}
+
 function booleanValue(value: unknown, context: string): boolean {
   if (typeof value !== "boolean") {
     throw new ProfileApiError(`${context} returned an invalid response.`, 502);
@@ -64,6 +80,15 @@ function optionalString(
 ): string | null | undefined {
   if (value === undefined || value === null) return value;
   return stringValue(value, context);
+}
+
+function optionalBoundedString(
+  value: unknown,
+  context: string,
+  maxBytes: number,
+): string | null | undefined {
+  if (value === undefined || value === null) return value;
+  return boundedStringValue(value, context, maxBytes);
 }
 
 function optionalRevision(
@@ -286,6 +311,197 @@ export function parseProfileSettingsResponse(
   };
 }
 
+export function parseWorkspaceSigningIdentityResponse(
+  value: unknown,
+): WorkspaceSigningIdentityResponse {
+  const item = record(value, "Workspace signing identity");
+  exactKeys(
+    item,
+    ["identity"],
+    ["public_bundle"],
+    "Workspace signing identity",
+  );
+  const identityItem = record(item.identity, "Workspace signing identity");
+  exactKeys(
+    identityItem,
+    ["workspace_id", "key_id", "algorithm", "revision", "state", "created_at"],
+    ["public_key", "public_key_fingerprint", "provisioned_at"],
+    "Workspace signing identity",
+  );
+  const state = boundedStringValue(
+    identityItem.state,
+    "Workspace signing identity",
+    32,
+  );
+  if (state !== "pending_provisioning" && state !== "active") {
+    throw new ProfileApiError(
+      "Workspace signing identity returned an invalid response.",
+      502,
+    );
+  }
+  const revision = optionalRevision(
+    identityItem.revision,
+    "Workspace signing identity",
+  );
+  if (revision === undefined || revision === null || revision < 1) {
+    throw new ProfileApiError(
+      "Workspace signing identity returned an invalid response.",
+      502,
+    );
+  }
+  const publicKey = optionalBoundedString(
+    identityItem.public_key,
+    "Workspace signing identity",
+    256,
+  );
+  const fingerprint = optionalBoundedString(
+    identityItem.public_key_fingerprint,
+    "Workspace signing identity",
+    128,
+  );
+  const provisionedAt = optionalBoundedString(
+    identityItem.provisioned_at,
+    "Workspace signing identity",
+    128,
+  );
+  const identity: WorkspaceSigningIdentityPublic = {
+    workspace_id: boundedStringValue(
+      identityItem.workspace_id,
+      "Workspace signing identity",
+      128,
+    ),
+    key_id: boundedStringValue(
+      identityItem.key_id,
+      "Workspace signing identity",
+      128,
+    ),
+    algorithm: boundedStringValue(
+      identityItem.algorithm,
+      "Workspace signing identity",
+      32,
+    ),
+    ...(publicKey === undefined || publicKey === null
+      ? {}
+      : { public_key: publicKey }),
+    ...(fingerprint === undefined || fingerprint === null
+      ? {}
+      : { public_key_fingerprint: fingerprint }),
+    revision,
+    state: state as WorkspaceSigningIdentityState,
+    created_at: boundedStringValue(
+      identityItem.created_at,
+      "Workspace signing identity",
+      128,
+    ),
+    ...(provisionedAt === undefined || provisionedAt === null
+      ? {}
+      : { provisioned_at: provisionedAt }),
+  };
+
+  let publicBundle: WorkspacePublicIdentityBundle | undefined;
+  if (item.public_bundle !== undefined) {
+    const bundle = record(
+      item.public_bundle,
+      "Workspace public identity bundle",
+    );
+    exactKeys(
+      bundle,
+      [
+        "workspace_id",
+        "backend_url",
+        "key_id",
+        "algorithm",
+        "public_key",
+        "public_key_fingerprint",
+        "revision",
+      ],
+      [],
+      "Workspace public identity bundle",
+    );
+    const bundleRevision = optionalRevision(
+      bundle.revision,
+      "Workspace public identity bundle",
+    );
+    if (
+      bundleRevision === undefined || bundleRevision === null ||
+      bundleRevision < 1
+    ) {
+      throw new ProfileApiError(
+        "Workspace public identity bundle returned an invalid response.",
+        502,
+      );
+    }
+    publicBundle = {
+      workspace_id: boundedStringValue(
+        bundle.workspace_id,
+        "Workspace public identity bundle",
+        128,
+      ),
+      backend_url: boundedStringValue(
+        bundle.backend_url,
+        "Workspace public identity bundle",
+        2048,
+      ),
+      key_id: boundedStringValue(
+        bundle.key_id,
+        "Workspace public identity bundle",
+        128,
+      ),
+      algorithm: boundedStringValue(
+        bundle.algorithm,
+        "Workspace public identity bundle",
+        32,
+      ),
+      public_key: boundedStringValue(
+        bundle.public_key,
+        "Workspace public identity bundle",
+        256,
+      ),
+      public_key_fingerprint: boundedStringValue(
+        bundle.public_key_fingerprint,
+        "Workspace public identity bundle",
+        128,
+      ),
+      revision: bundleRevision,
+    };
+  }
+  if (
+    publicBundle !== undefined &&
+    (
+      publicBundle.workspace_id !== identity.workspace_id ||
+      publicBundle.key_id !== identity.key_id ||
+      publicBundle.algorithm !== identity.algorithm ||
+      publicBundle.public_key !== identity.public_key ||
+      publicBundle.public_key_fingerprint !== identity.public_key_fingerprint ||
+      publicBundle.revision !== identity.revision
+    )
+  ) {
+    throw new ProfileApiError(
+      "Workspace public identity bundle does not match identity metadata.",
+      502,
+    );
+  }
+  if (
+    (state === "active" &&
+      (publicBundle === undefined || identity.public_key === undefined ||
+        identity.public_key_fingerprint === undefined ||
+        identity.provisioned_at === undefined)) ||
+    (state === "pending_provisioning" &&
+      (publicBundle !== undefined || identity.public_key !== undefined ||
+        identity.public_key_fingerprint !== undefined ||
+        identity.provisioned_at !== undefined))
+  ) {
+    throw new ProfileApiError(
+      "Workspace signing identity returned an invalid response.",
+      502,
+    );
+  }
+  return {
+    identity,
+    ...(publicBundle === undefined ? {} : { public_bundle: publicBundle }),
+  };
+}
+
 async function parseResponse<T>(
   response: Response,
   parser: (value: unknown) => T,
@@ -322,6 +538,33 @@ export async function updateWorkspaceMetadata(
       },
     ),
     parseWorkspaceMetadataMutationResponse,
+  );
+}
+
+export async function fetchWorkspaceSigningIdentity(
+  workspaceId: string,
+): Promise<WorkspaceSigningIdentityResponse> {
+  return await parseResponse(
+    await fetch(
+      `/api/w/${
+        encodeURIComponent(workspaceId)
+      }/settings/workspace/signing-identity`,
+    ),
+    parseWorkspaceSigningIdentityResponse,
+  );
+}
+
+export async function provisionWorkspaceSigningIdentity(
+  workspaceId: string,
+): Promise<WorkspaceSigningIdentityResponse> {
+  return await parseResponse(
+    await fetch(
+      `/api/w/${
+        encodeURIComponent(workspaceId)
+      }/settings/workspace/signing-identity/provision`,
+      { method: "POST" },
+    ),
+    parseWorkspaceSigningIdentityResponse,
   );
 }
 

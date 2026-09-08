@@ -165,6 +165,35 @@ export type WorkspaceMetadataMutationResponse = {
   diagnostics: Array<Diagnostic>;
 };
 
+export type WorkspaceSigningIdentityState = "pending_provisioning" | "active";
+
+export type WorkspaceSigningIdentityPublic = {
+  workspace_id: string;
+  key_id: string;
+  algorithm: string;
+  public_key?: string;
+  public_key_fingerprint?: string;
+  revision: number;
+  state: WorkspaceSigningIdentityState;
+  created_at: string;
+  provisioned_at?: string;
+};
+
+export type WorkspacePublicIdentityBundle = {
+  workspace_id: string;
+  backend_url: string;
+  key_id: string;
+  algorithm: string;
+  public_key: string;
+  public_key_fingerprint: string;
+  revision: number;
+};
+
+export type WorkspaceSigningIdentityResponse = {
+  identity: WorkspaceSigningIdentityPublic;
+  public_bundle?: WorkspacePublicIdentityBundle;
+};
+
 export type ProfileSettingsResponse = {
   workspace_id: string;
   registry_revision: string;
@@ -315,12 +344,51 @@ export type RuntimeSummary = {
   diagnostics: Array<Diagnostic>;
 };
 
+export type WorkspaceRuntimeBindingState =
+  | "configured"
+  | "verified"
+  | "revoked";
+
+export type RuntimeConnectionDisplayState =
+  | "configured"
+  | "verified"
+  | "unavailable"
+  | "revoked";
+
+export type RuntimeVerificationOutcome =
+  | "verified"
+  | "challenge_issued"
+  | "verification_failed"
+  | "connectivity_failed";
+
+export type RuntimeVerificationEvidenceSummary = {
+  verified_at: string | null;
+  last_checked_at: string;
+  last_outcome: RuntimeVerificationOutcome;
+  binding_revision: number;
+  workspace_key_id: string;
+  workspace_identity_revision: number;
+  workspace_trust_generation: number;
+  runtime_public_key_fingerprint: string;
+  runtime_identity_revision: number;
+};
+
+export type WorkspaceRuntimeBindingSummary = {
+  state: WorkspaceRuntimeBindingState;
+  connection_state: RuntimeConnectionDisplayState;
+  revision: number;
+  workspace_key_id?: string | null;
+  workspace_key_generation?: number | null;
+  verification?: RuntimeVerificationEvidenceSummary | null;
+};
+
 export type RuntimeManagementSummary = {
   built_in: boolean;
   config_managed: boolean;
   removable: boolean;
   endpoint_configured: boolean;
   token_ref_configured: boolean;
+  binding?: WorkspaceRuntimeBindingSummary | null;
 };
 
 export type WorkspaceRuntimeResource = {
@@ -373,11 +441,6 @@ export type WorkspaceRuntimeDetail = {
 
 export type RuntimeTrustKeyRevealResponse = { public_key: string };
 
-export type PutRuntimeTrustKeyRequest = {
-  public_key: string;
-  expected_revision: number | null;
-};
-
 export type RevokeRuntimeTrustKeyRequest = { expected_revision: number };
 
 export type RuntimeTrustConflictKind = "stale_revision" | "fingerprint_in_use";
@@ -387,6 +450,18 @@ export type RuntimeTrustConflictResponse = {
   message: string;
   current_revision?: number;
   current_fingerprint?: string | null;
+};
+
+export type RuntimePublicIdentityBundle = {
+  identity_id: string;
+  public_key: string;
+};
+
+export type CreateRemoteRuntimeRequest = {
+  public_bundle: RuntimePublicIdentityBundle;
+  display_name?: string | null;
+  endpoint: string;
+  expected_revision?: number | null;
 };
 
 export type RuntimeConnectionTestStatus = "compatible" | "failed";
@@ -405,6 +480,9 @@ export type RuntimeConnectionTestFailureKind =
 export type RuntimeConnectionTestResponse = {
   workspace_id: string;
   runtime_id: string;
+  binding_revision: number;
+  connection_state: RuntimeConnectionDisplayState;
+  verification: RuntimeVerificationEvidenceSummary | null;
   checked_at: string;
   status: RuntimeConnectionTestStatus;
   failure_kind: RuntimeConnectionTestFailureKind | null;

@@ -1,7 +1,8 @@
 import type {
+  CreateRemoteRuntimeRequest,
   Diagnostic,
-  PutRuntimeTrustKeyRequest,
   RevokeRuntimeTrustKeyRequest,
+  RuntimeConnectionDisplayState,
   RuntimeIdentityAuthority,
   RuntimeManagementSummary,
   RuntimeSourceKind,
@@ -14,6 +15,9 @@ import type {
   RuntimeTrustKeyRevealResponse,
   RuntimeTrustKeyState,
   RuntimeTrustKeyStatus,
+  RuntimeVerificationEvidenceSummary,
+  WorkspaceRuntimeBindingState,
+  WorkspaceRuntimeBindingSummary,
   WorkspaceRuntimeDetail,
   WorkspaceRuntimeResource,
 } from "$lib/generated/workspace-api.ts";
@@ -66,6 +70,17 @@ const AUDIT_ACTIONS = new Set<RuntimeTrustAuditAction>([
 const CONFLICT_KINDS = new Set<RuntimeTrustConflictKind>([
   "stale_revision",
   "fingerprint_in_use",
+]);
+const BINDING_STATES = new Set<WorkspaceRuntimeBindingState>([
+  "configured",
+  "verified",
+  "revoked",
+]);
+const CONNECTION_STATES = new Set<RuntimeConnectionDisplayState>([
+  "configured",
+  "verified",
+  "unavailable",
+  "revoked",
 ]);
 
 const encoder = new TextEncoder();
@@ -286,6 +301,145 @@ function runtimeSource(value: unknown, path: string): RuntimeSourceSummary {
   };
 }
 
+function runtimeVerification(
+  value: unknown,
+  path: string,
+): RuntimeVerificationEvidenceSummary {
+  const item = object(value, path);
+  exactKeys(
+    item,
+    [
+      "verified_at",
+      "last_checked_at",
+      "last_outcome",
+      "binding_revision",
+      "workspace_key_id",
+      "workspace_identity_revision",
+      "workspace_trust_generation",
+      "runtime_public_key_fingerprint",
+      "runtime_identity_revision",
+    ],
+    [],
+    path,
+  );
+  const verifiedAt = item.verified_at === null
+    ? null
+    : boundedString(item.verified_at, `${path}.verified_at`, 128);
+  const lastOutcome = enumValue(
+    item.last_outcome,
+    `${path}.last_outcome`,
+    new Set(
+      [
+        "verified",
+        "challenge_issued",
+        "verification_failed",
+        "connectivity_failed",
+      ] as const,
+    ),
+  );
+  return {
+    verified_at: verifiedAt,
+    last_checked_at: boundedString(
+      item.last_checked_at,
+      `${path}.last_checked_at`,
+      128,
+    ),
+    last_outcome: lastOutcome,
+    binding_revision: safeRevision(
+      item.binding_revision,
+      `${path}.binding_revision`,
+    ),
+    workspace_key_id: boundedString(
+      item.workspace_key_id,
+      `${path}.workspace_key_id`,
+      LIMITS.idBytes,
+    ),
+    workspace_identity_revision: safeRevision(
+      item.workspace_identity_revision,
+      `${path}.workspace_identity_revision`,
+    ),
+    workspace_trust_generation: safeRevision(
+      item.workspace_trust_generation,
+      `${path}.workspace_trust_generation`,
+    ),
+    runtime_public_key_fingerprint: boundedString(
+      item.runtime_public_key_fingerprint,
+      `${path}.runtime_public_key_fingerprint`,
+      LIMITS.fingerprintBytes,
+    ),
+    runtime_identity_revision: safeRevision(
+      item.runtime_identity_revision,
+      `${path}.runtime_identity_revision`,
+    ),
+  };
+}
+
+function runtimeBinding(
+  value: unknown,
+  path: string,
+): WorkspaceRuntimeBindingSummary {
+  const item = object(value, path);
+  exactKeys(
+    item,
+    ["state", "connection_state", "revision"],
+    ["workspace_key_id", "workspace_key_generation", "verification"],
+    path,
+  );
+  const workspaceKeyId = optionalNullableString(
+    item.workspace_key_id,
+    `${path}.workspace_key_id`,
+    LIMITS.idBytes,
+  );
+  const workspaceKeyGeneration = optionalNullableRevision(
+    item.workspace_key_generation,
+    `${path}.workspace_key_generation`,
+  );
+  const state = enumValue(item.state, `${path}.state`, BINDING_STATES);
+  if (
+    state !== "revoked" &&
+    (workspaceKeyId == null || workspaceKeyGeneration == null)
+  ) {
+    return fail(path, "requires Workspace signing key identity metadata");
+  }
+  const connectionState = enumValue(
+    item.connection_state,
+    `${path}.connection_state`,
+    CONNECTION_STATES,
+  );
+  const revision = safeRevision(item.revision, `${path}.revision`);
+  const verification = item.verification === undefined
+    ? undefined
+    : runtimeVerification(item.verification, `${path}.verification`);
+  if (
+    verification !== undefined && verification.binding_revision !== revision
+  ) {
+    return fail(path, "verification must match the current binding revision");
+  }
+  if (
+    connectionState === "verified" &&
+    (verification === undefined ||
+      verification.verified_at === null ||
+      verification.last_outcome !== "verified")
+  ) {
+    return fail(
+      path,
+      "verified Workspace identity binding requires verification evidence",
+    );
+  }
+  return {
+    state,
+    connection_state: connectionState,
+    revision,
+    ...(workspaceKeyId === undefined
+      ? {}
+      : { workspace_key_id: workspaceKeyId }),
+    ...(workspaceKeyGeneration === undefined
+      ? {}
+      : { workspace_key_generation: workspaceKeyGeneration }),
+    ...(verification === undefined ? {} : { verification }),
+  };
+}
+
 function runtimeManagement(
   value: unknown,
   path: string,
@@ -300,9 +454,12 @@ function runtimeManagement(
       "endpoint_configured",
       "token_ref_configured",
     ],
-    [],
+    ["binding"],
     path,
   );
+  const binding = item.binding == null
+    ? undefined
+    : runtimeBinding(item.binding, `${path}.binding`);
   return {
     built_in: boolean(item.built_in, `${path}.built_in`),
     config_managed: boolean(item.config_managed, `${path}.config_managed`),
@@ -315,6 +472,7 @@ function runtimeManagement(
       item.token_ref_configured,
       `${path}.token_ref_configured`,
     ),
+    ...(binding === undefined ? {} : { binding }),
   };
 }
 
@@ -648,6 +806,26 @@ function requestErrorFrom(
 ): RuntimeTrustRequestError {
   try {
     const response = object(value, "Runtime trust error");
+    if ("details" in response) {
+      exactKeys(
+        response,
+        ["error", "details"],
+        [],
+        "Runtime trust error",
+      );
+      boundedString(
+        response.error,
+        "Runtime trust error.error",
+        LIMITS.idBytes,
+      );
+      return new RuntimeTrustRequestError(
+        boundedString(
+          response.details,
+          "Runtime trust error.details",
+          LIMITS.conflictMessageBytes,
+        ),
+      );
+    }
     exactKeys(
       response,
       ["error", "message", "diagnostics"],
@@ -713,6 +891,30 @@ async function finishMutation(
   return detail;
 }
 
+export async function createRemoteRuntime(
+  workspaceId: string,
+  request: CreateRemoteRuntimeRequest,
+  fetchImpl: typeof fetch = fetch,
+): Promise<WorkspaceRuntimeResource> {
+  const response = await fetchImpl(
+    workspaceApiPath(workspaceId, "/runtimes"),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request),
+    },
+  );
+  const payload = await readBoundedJson(response);
+  if (!response.ok) throw requestErrorFrom(payload, response.status);
+  const runtime = runtimeResource(payload, "Runtime create response");
+  if (runtime.runtime_id !== request.public_bundle.identity_id) {
+    throw new RuntimeTrustRequestError(
+      "Runtime create response did not match the submitted public bundle",
+    );
+  }
+  return runtime;
+}
+
 export async function revealRuntimeTrustKey(
   workspaceId: string,
   runtimeId: string,
@@ -761,29 +963,6 @@ export async function previewRuntimePublicKeyFingerprint(
   const hex = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0"))
     .join("");
   return `sha256:${hex}`;
-}
-
-export async function putRuntimeTrustKey(
-  workspaceId: string,
-  runtimeId: string,
-  request: PutRuntimeTrustKeyRequest,
-  fetchImpl: typeof fetch = fetch,
-): Promise<WorkspaceRuntimeDetail> {
-  const response = await fetchImpl(
-    workspaceApiPath(
-      workspaceId,
-      `/runtimes/${encodeURIComponent(runtimeId)}/trust-key`,
-    ),
-    {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        public_key: request.public_key,
-        expected_revision: revisionForJson(request.expected_revision),
-      }),
-    },
-  );
-  return await finishMutation(response, workspaceId, runtimeId);
 }
 
 export async function revokeRuntimeTrustKey(

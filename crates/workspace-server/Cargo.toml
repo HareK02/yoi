@@ -38,7 +38,7 @@ memory.workspace = true
 merge-request.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tower.workspace = true
-tokio-tungstenite.workspace = true
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 worker.workspace = true
 workspace-api.workspace = true
 workdir = { workspace = true, features = ["http-client"] }

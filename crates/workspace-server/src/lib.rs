@@ -34,6 +34,7 @@ mod workdir_removal;
 pub mod worker_source;
 pub mod workspace_catalog;
 mod workspace_deletion;
+pub mod workspace_signing_identity;
 mod workspace_subscription;
 
 pub use authority::{
@@ -138,6 +139,8 @@ pub enum Error {
     WorkerSourceIdentity(String),
     #[error("workspace identity error: {0}")]
     WorkspaceIdentity(String),
+    #[error("Workspace signing identity error ({code}): {message}")]
+    WorkspaceSigningIdentity { code: String, message: String },
     #[error("store error: {0}")]
     Store(String),
 }

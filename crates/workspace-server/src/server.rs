@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -60,6 +61,12 @@ use worker_runtime::http_server::{
 };
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
+use worker_runtime::workspace_issuer::{
+    WORKSPACE_VERIFICATION_ACK_PATH, WORKSPACE_VERIFICATION_CHALLENGE_PATH,
+    WORKSPACE_VERIFICATION_OPERATION, WorkspaceCapabilityClaims,
+    WorkspaceRuntimeVerificationAcknowledgement, WorkspaceRuntimeVerificationChallenge,
+    verify_runtime_verification_response, workspace_request_body_digest,
+};
 use workspace_api::{
     ActorAuthMethod, AuthBootstrapUserRequest, AuthPublicConfig, AuthUserResponse,
     AuthenticatedUser, BrowserCreateWorkerResponse, BrowserWorkspaceOrchestratorResponse,
@@ -75,16 +82,16 @@ use workspace_api::{
     PasskeyLoginCompleteRequest, PasskeyLoginOptionsRequest, PasskeyLoginOptionsResponse,
     PasskeyRegistrationCompleteRequest, PasskeyRegistrationOptionsRequest,
     PasskeyRegistrationOptionsResponse, ProfileSettingsResponse, PutRepositorySshHostTrustRequest,
-    PutRuntimeTrustKeyRequest, RepositoryAccessProjection, RepositoryDetailResponse,
-    RepositoryListResponse, RepositoryLogResponse, RepositorySshCredential, RepositorySshHostTrust,
-    RequestActor, RevokeRuntimeTrustKeyRequest, RotateRepositorySshCredentialRequest,
-    RuntimeConnectionTestFailureKind, RuntimeConnectionTestResponse, RuntimeConnectionTestStatus,
-    RuntimeManagementSummary, RuntimeTrustAuditAction, RuntimeTrustAuditEntry,
-    RuntimeTrustConflictKind, RuntimeTrustConflictResponse, RuntimeTrustKeyRevealResponse,
-    RuntimeTrustKeyState, RuntimeTrustKeyStatus, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
-    TICKET_RELATIONS_QUERY_PATH, UpdateWorkspaceMetadataRequest, WhoamiResponse,
-    WorkerLaunchOptionsResponse, WorkerLaunchProfileCandidate, WorkerLaunchRuntimeOption,
-    WorkerLaunchWorkerSummary,
+    RepositoryAccessProjection, RepositoryDetailResponse, RepositoryListResponse,
+    RepositoryLogResponse, RepositorySshCredential, RepositorySshHostTrust, RequestActor,
+    RevokeRuntimeTrustKeyRequest, RotateRepositorySshCredentialRequest,
+    RuntimeConnectionDisplayState, RuntimeConnectionTestFailureKind, RuntimeConnectionTestResponse,
+    RuntimeConnectionTestStatus, RuntimeManagementSummary, RuntimeTrustAuditAction,
+    RuntimeTrustAuditEntry, RuntimeTrustConflictKind, RuntimeTrustConflictResponse,
+    RuntimeTrustKeyRevealResponse, RuntimeTrustKeyState, RuntimeTrustKeyStatus,
+    TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
+    UpdateWorkspaceMetadataRequest, WhoamiResponse, WorkerLaunchOptionsResponse,
+    WorkerLaunchProfileCandidate, WorkerLaunchRuntimeOption, WorkerLaunchWorkerSummary,
     WorkingDirectoryCreateRequest as BrowserWorkingDirectoryCreateRequest,
     WorkingDirectoryCreateResponse as BrowserWorkingDirectoryCreateResponse,
     WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
@@ -95,9 +102,12 @@ use workspace_api::{
     WorkspaceDeletionBlockerKind, WorkspaceDeletionOperationResponse,
     WorkspaceDeletionPreflightResponse, WorkspaceDeletionRequest, WorkspaceDeletionState,
     WorkspaceExtensionPointState, WorkspaceExtensionPoints, WorkspaceMetadataMutationResponse,
-    WorkspaceMetadataSettingsResponse, WorkspacePermissionSummary, WorkspaceRepositoryRecord,
-    WorkspaceResponse, WorkspaceRuntimeDetail, WorkspaceRuntimeResource, WorkspaceSummary,
-    WorkspaceWorkerDiscoveryItem, WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
+    WorkspaceMetadataSettingsResponse, WorkspacePermissionSummary, WorkspacePublicIdentityBundle,
+    WorkspaceRepositoryRecord, WorkspaceResponse, WorkspaceRuntimeBindingState,
+    WorkspaceRuntimeBindingSummary, WorkspaceRuntimeDetail, WorkspaceRuntimeResource,
+    WorkspaceSigningIdentityPublic, WorkspaceSigningIdentityResponse,
+    WorkspaceSigningIdentityState, WorkspaceSummary, WorkspaceWorkerDiscoveryItem,
+    WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
 };
 
 use crate::auth::{
@@ -124,7 +134,8 @@ use crate::hosts::{
     WorkerLifecycleRequest, WorkerLifecycleResult, WorkerOperationState, WorkerRestoreResult,
     WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult,
     WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerTicketAssignmentRequest,
-    WorkerWorkspaceSummary, worker_spawn_create_fingerprint, workspace_worker_summary,
+    WorkerWorkspaceSummary, WorkspaceRuntimeAuthorization, is_disallowed_remote_runtime_address,
+    worker_spawn_create_fingerprint, workspace_worker_summary,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
@@ -159,7 +170,9 @@ use crate::store::{
     RepositoryRecord, TicketAssignmentPrincipal, TicketAssignmentRole, TicketCoderAssignmentRecord,
     TicketRoleAssignmentRecord, UserRecord, WorkdirCreateOperationRecord, WorkdirRegistryRecord,
     WorkerControlGrantRecord, WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord,
-    WorkspaceResourceKind, WorkspaceRuntimeBinding, WorkspaceRuntimeBindingAuditRecord,
+    WorkspaceResourceKind, WorkspaceRuntimeAuthenticationMode as StoredRuntimeAuthenticationMode,
+    WorkspaceRuntimeBinding, WorkspaceRuntimeBindingAuditRecord, WorkspaceRuntimeBindingMutation,
+    WorkspaceRuntimeBindingState as StoredRuntimeBindingState,
 };
 use crate::workdir_removal::{
     WorkdirRemovalAttemptOwner, WorkdirRemovalDisposition, WorkdirRemovalOperation,
@@ -167,6 +180,10 @@ use crate::workdir_removal::{
 };
 use crate::workspace_catalog::{WorkspaceCatalogService, WorkspaceCreateRequest};
 use crate::workspace_deletion::WorkspaceDeletionStore;
+use crate::workspace_signing_identity::{
+    FsWorkspaceSigningMaterialStore, WorkspaceSigningIdentityService,
+    WorkspaceSigningMaterialStore, workspace_signing_material_root,
+};
 use crate::{Error, Result};
 use worker_runtime::catalog::{
     ConfigBundleRef, ProfileSelector, RepositoryMaterializationContext, RepositoryRefObservation,
@@ -585,6 +602,7 @@ pub struct WorkspaceApi {
     pub(crate) store: Arc<dyn ControlPlaneStore>,
     config_store: Arc<crate::SqliteWorkspaceStore>,
     repository_secrets: Arc<RepositorySecretService>,
+    signing_identities: WorkspaceSigningIdentityService,
     config_schema_registry: crate::config_source::WorkspaceConfigSchemaRegistry,
     prompt_projection_cache: crate::prompt_settings::WorkspacePromptProjectionCache,
     authority: SqliteWorkspaceAuthority,
@@ -1027,6 +1045,7 @@ pub struct WorkspaceServerApi {
     template: Arc<ServerConfig>,
     store: Arc<dyn ControlPlaneStore>,
     catalog: WorkspaceCatalogService,
+    signing_materials: Arc<dyn WorkspaceSigningMaterialStore>,
     routers: Arc<AsyncMutex<HashMap<String, Router>>>,
     apis: Arc<AsyncMutex<HashMap<String, WorkspaceApi>>>,
     mutation_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
@@ -1047,9 +1066,14 @@ async fn workspace_mutation_lock(
 
 impl WorkspaceServerApi {
     pub fn new(template: ServerConfig, store: Arc<dyn ControlPlaneStore>) -> Self {
+        let signing_materials: Arc<dyn WorkspaceSigningMaterialStore> =
+            Arc::new(FsWorkspaceSigningMaterialStore::new(
+                workspace_signing_material_root(&template.database_path),
+            ));
         Self {
             template: Arc::new(template),
-            catalog: WorkspaceCatalogService::new(store.clone()),
+            catalog: WorkspaceCatalogService::new(store.clone(), signing_materials.clone()),
+            signing_materials,
             store,
             routers: Arc::new(AsyncMutex::new(HashMap::new())),
             apis: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -1283,6 +1307,8 @@ impl WorkspaceServerApi {
                 None,
             );
         }
+        WorkspaceSigningIdentityService::new(self.store.clone(), self.signing_materials.clone())
+            .delete_material(&operation.workspace_id)?;
         let completed = self.store.finalize_workspace_deletion(operation_id)?;
         self.routers.lock().await.remove(&completed.workspace_id);
         if let Some(handle) = self
@@ -2062,6 +2088,10 @@ impl WorkspaceApi {
                     public_key: embedded_identity.public_key.clone(),
                     public_key_fingerprint: String::new(),
                     binding_revision: 1,
+                    state: StoredRuntimeBindingState::Verified,
+                    authentication_mode: StoredRuntimeAuthenticationMode::LegacyServerIssuer,
+                    workspace_key_id: None,
+                    workspace_key_generation: None,
                     created_at: config.workspace_created_at.clone(),
                     updated_at: config.workspace_created_at.clone(),
                     revoked_at: None,
@@ -2093,22 +2123,12 @@ impl WorkspaceApi {
             ))
         })?;
         let runtime_binding_store = store.clone();
-        let configured_runtime_endpoints = config
-            .remote_runtime_sources
-            .iter()
-            .filter_map(|source| {
-                (source.workspace_id.as_deref() == Some(config.workspace_id.as_str()))
-                    .then(|| (source.runtime_id.clone(), source.base_url.clone()))
-            })
-            .collect::<HashMap<_, _>>();
         let expected_runtime_bindings = store
             .list_workspace_runtime_bindings(&config.workspace_id, false)
             .await?
             .into_iter()
             .filter(|binding| binding.runtime_id != EMBEDDED_RUNTIME_ID)
-            .filter(|binding| {
-                configured_runtime_endpoints.get(&binding.runtime_id) == Some(&binding.base_url)
-            })
+            .filter(|binding| binding.state != StoredRuntimeBindingState::Revoked)
             .map(|binding| {
                 (
                     (binding.workspace_id.clone(), binding.runtime_id.clone()),
@@ -2140,19 +2160,34 @@ impl WorkspaceApi {
                         .unwrap_or(false)
                 })
         });
-        let active_expectations = api
-            .runtime_binding_expectations
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for source in &api.config.remote_runtime_sources {
-            if !active_expectations
-                .contains_key(&(api.config.workspace_id.clone(), source.runtime_id.clone()))
-            {
-                api.runtime_subscription_broker
-                    .unregister_runtime(&source.runtime_id);
+        {
+            let active_expectations = api
+                .runtime_binding_expectations
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for source in &api.config.remote_runtime_sources {
+                if !active_expectations
+                    .contains_key(&(api.config.workspace_id.clone(), source.runtime_id.clone()))
+                {
+                    api.runtime_subscription_broker
+                        .unregister_runtime(&source.runtime_id);
+                }
             }
         }
-        drop(active_expectations);
+        for binding in api
+            .store
+            .list_workspace_runtime_bindings(&api.config.workspace_id, false)
+            .await?
+            .into_iter()
+            .filter(|binding| {
+                binding.authentication_mode
+                    == crate::store::WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity
+            })
+            .filter(|binding| binding.state != StoredRuntimeBindingState::Revoked)
+        {
+            let activate = binding.state == StoredRuntimeBindingState::Verified;
+            api.register_workspace_runtime_binding(binding, activate)?;
+        }
         Ok(api)
     }
 
@@ -2204,14 +2239,45 @@ impl WorkspaceApi {
             RuntimeSubscriptionBroker::new(config.workspace_id.clone());
         runtime_subscription_broker
             .register_embedded_runtime(embedded_runtime_id, embedded_subscription_runtime);
-        for remote_config in config.remote_runtime_sources.iter().cloned() {
+        let config_store = Arc::new(crate::SqliteWorkspaceStore::open(
+            config.database_path.clone(),
+        )?);
+        let repository_secrets = Arc::new(RepositorySecretService::open(
+            config_store.clone(),
+            &config.database_path,
+        )?);
+        let signing_materials: Arc<dyn WorkspaceSigningMaterialStore> =
+            Arc::new(FsWorkspaceSigningMaterialStore::new(
+                workspace_signing_material_root(&config.database_path),
+            ));
+        let signing_identities =
+            WorkspaceSigningIdentityService::new(store.clone(), signing_materials);
+        signing_identities.get_validated(&config.workspace_id)?;
+        let backend_url = config
+            .backend_base_url
+            .clone()
+            .unwrap_or_else(|| "http://127.0.0.1:8787".to_string());
+        for mut remote_config in config.remote_runtime_sources.iter().cloned() {
+            let current_binding = store
+                .get_workspace_runtime_binding(&config.workspace_id, &remote_config.runtime_id)
+                .await?;
+            if current_binding.as_ref().is_some_and(|binding| {
+                binding.authentication_mode == StoredRuntimeAuthenticationMode::WorkspaceIdentity
+                    && binding.revoked_at.is_none()
+            }) {
+                let verified_binding = current_binding
+                    .filter(|binding| binding.state == StoredRuntimeBindingState::Verified);
+                remote_config.workspace_authorization = Some(WorkspaceRuntimeAuthorization::new(
+                    store.clone(),
+                    signing_identities.clone(),
+                    backend_url.clone(),
+                    verified_binding,
+                ));
+            }
             let remote_runtime = RemoteWorkerRuntime::new(
                 remote_config.clone(),
                 config.workspace_id.clone(),
-                config
-                    .backend_base_url
-                    .clone()
-                    .unwrap_or_else(|| "http://127.0.0.1:8787".to_string()),
+                backend_url.clone(),
             )
             .map(|host| host.with_resource_broker(resource_broker.clone()))
             .map_err(|err| err.into_error())?;
@@ -2221,13 +2287,6 @@ impl WorkspaceApi {
         let runtime = Arc::new(runtime);
         let companion = Arc::new(CompanionConsole::disabled());
         let observation_proxy = BackendObservationProxy::new(config.runtime_event_sources.clone());
-        let config_store = Arc::new(crate::SqliteWorkspaceStore::open(
-            config.database_path.clone(),
-        )?);
-        let repository_secrets = Arc::new(RepositorySecretService::open(
-            config_store.clone(),
-            &config.database_path,
-        )?);
         let config_schema_registry = crate::config_source::WorkspaceConfigSchemaRegistry::default()
             .with_provider(Arc::new(
                 crate::profile_settings::ProfileConfigSchemaProvider,
@@ -2244,6 +2303,7 @@ impl WorkspaceApi {
         let api = Self {
             config_store,
             repository_secrets,
+            signing_identities,
             config_schema_registry,
             prompt_projection_cache:
                 crate::prompt_settings::WorkspacePromptProjectionCache::default(),
@@ -2284,6 +2344,37 @@ impl WorkspaceApi {
 
     pub fn workspace_id(&self) -> &str {
         self.config.workspace_id.as_str()
+    }
+
+    fn register_workspace_runtime_binding(
+        &self,
+        binding: WorkspaceRuntimeBinding,
+        activate: bool,
+    ) -> Result<()> {
+        let backend_url = self
+            .config
+            .backend_base_url
+            .clone()
+            .unwrap_or_else(|| "http://127.0.0.1:8787".to_string());
+        let mut remote_config = remote_runtime_config_from_binding(&binding)
+            .map_err(|diagnostic| Error::Store(diagnostic.message))?;
+        remote_config.workspace_authorization = Some(WorkspaceRuntimeAuthorization::new(
+            self.store.clone(),
+            self.signing_identities.clone(),
+            backend_url.clone(),
+            activate.then_some(binding),
+        ));
+        let remote_runtime = RemoteWorkerRuntime::new(
+            remote_config.clone(),
+            self.config.workspace_id.clone(),
+            backend_url,
+        )
+        .map(|runtime| runtime.with_resource_broker(self.resource_broker.clone()))
+        .map_err(|error| error.into_error())?;
+        self.runtime.register_or_replace(remote_runtime);
+        self.runtime_subscription_broker
+            .register_remote_runtime(remote_config);
+        Ok(())
     }
 
     pub fn runtime_subscription_broker(&self) -> &RuntimeSubscriptionBroker {
@@ -2927,6 +3018,14 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
             get(scoped_get_workspace_settings).put(scoped_update_workspace_settings),
         )
         .route(
+            "/api/w/{workspace_id}/settings/workspace/signing-identity",
+            get(scoped_get_workspace_signing_identity),
+        )
+        .route(
+            "/api/w/{workspace_id}/settings/workspace/signing-identity/provision",
+            post(scoped_provision_workspace_signing_identity),
+        )
+        .route(
             "/api/w/{workspace_id}/settings/memory",
             get(scoped_get_workspace_memory_settings)
                 .put(scoped_update_workspace_memory_settings),
@@ -3276,9 +3375,7 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         )
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/trust-key",
-            get(scoped_reveal_runtime_trust_key)
-                .put(scoped_put_runtime_trust_key)
-                .delete(scoped_revoke_runtime_trust_key),
+            get(scoped_reveal_runtime_trust_key).delete(scoped_revoke_runtime_trust_key),
         )
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/connection-tests",
@@ -4085,6 +4182,107 @@ async fn scoped_update_workspace_settings(
             message: "Workspace display metadata was updated.".to_string(),
         }],
     }))
+}
+
+async fn scoped_get_workspace_signing_identity(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Extension(actor): Extension<RequestActor>,
+) -> ApiResult<Json<WorkspaceSigningIdentityResponse>> {
+    require_workspace_owner(
+        &api,
+        &path.workspace_id,
+        &actor,
+        "Workspace public identity access",
+    )
+    .await?;
+    let identity = api.signing_identities.get_validated(&path.workspace_id)?;
+    Ok(Json(project_workspace_signing_identity(&api, identity)?))
+}
+
+async fn scoped_provision_workspace_signing_identity(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Extension(actor): Extension<RequestActor>,
+) -> ApiResult<Json<WorkspaceSigningIdentityResponse>> {
+    require_workspace_owner(
+        &api,
+        &path.workspace_id,
+        &actor,
+        "Workspace signing identity provisioning",
+    )
+    .await?;
+    let identity = api
+        .signing_identities
+        .provision_existing(&path.workspace_id, &actor.account_id)?;
+    Ok(Json(project_workspace_signing_identity(&api, identity)?))
+}
+
+fn project_workspace_signing_identity(
+    api: &WorkspaceApi,
+    identity: crate::store::WorkspaceSigningIdentityRecord,
+) -> Result<WorkspaceSigningIdentityResponse> {
+    let state = match identity.state.as_str() {
+        "pending_provisioning" => WorkspaceSigningIdentityState::PendingProvisioning,
+        "active" => WorkspaceSigningIdentityState::Active,
+        _ => {
+            return Err(crate::workspace_signing_identity::identity_error(
+                "workspace_signing_identity_state_invalid",
+                "Workspace signing identity state is invalid",
+            ));
+        }
+    };
+    let public_bundle = if state == WorkspaceSigningIdentityState::Active {
+        let public_key = identity.public_key.clone().ok_or_else(|| {
+            crate::workspace_signing_identity::identity_error(
+                "workspace_signing_identity_metadata_corrupt",
+                "Active Workspace signing identity has no public key",
+            )
+        })?;
+        let public_key_fingerprint = identity.public_key_fingerprint.clone().ok_or_else(|| {
+            crate::workspace_signing_identity::identity_error(
+                "workspace_signing_identity_metadata_corrupt",
+                "Active Workspace signing identity has no public key fingerprint",
+            )
+        })?;
+        let backend_url = api
+            .config
+            .backend_base_url
+            .as_deref()
+            .ok_or_else(|| {
+                crate::workspace_signing_identity::identity_error(
+                    "workspace_signing_identity_backend_url_unavailable",
+                    "Backend public URL is unavailable for the Workspace identity bundle",
+                )
+            })?
+            .trim_end_matches('/')
+            .to_string();
+        Some(WorkspacePublicIdentityBundle {
+            workspace_id: identity.workspace_id.clone(),
+            backend_url,
+            key_id: identity.key_id.clone(),
+            algorithm: identity.algorithm.clone(),
+            public_key,
+            public_key_fingerprint,
+            revision: identity.revision,
+        })
+    } else {
+        None
+    };
+    Ok(WorkspaceSigningIdentityResponse {
+        identity: WorkspaceSigningIdentityPublic {
+            workspace_id: identity.workspace_id,
+            key_id: identity.key_id,
+            algorithm: identity.algorithm,
+            public_key: identity.public_key,
+            public_key_fingerprint: identity.public_key_fingerprint,
+            revision: identity.revision,
+            state,
+            created_at: identity.created_at,
+            provisioned_at: identity.provisioned_at,
+        },
+        public_bundle,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -11595,10 +11793,11 @@ fn cleanup_api_error(runtime_id: &str, code: &str, message: &str) -> ApiError {
 async fn scoped_create_remote_runtime(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Extension(actor): Extension<RequestActor>,
     Json(request): Json<CreateRemoteRuntimeRequest>,
 ) -> ApiResult<(StatusCode, Json<WorkspaceRuntimeResource>)> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    create_remote_runtime(State(api), Json(request)).await
+    create_remote_runtime(State(api), Extension(actor), Json(request)).await
 }
 
 async fn scoped_get_runtime_detail(
@@ -11627,7 +11826,7 @@ async fn scoped_reveal_runtime_trust_key(
     if path.runtime_id == EMBEDDED_WORKER_RUNTIME_ID {
         return Err(settings_bad_request(
             "embedded_runtime_trust_managed_internally",
-            "the embedded Runtime trust key is managed by Server identity authority",
+            "the embedded Runtime trust key is managed by the embedded Runtime authority",
         ));
     }
     let binding = api
@@ -11642,106 +11841,6 @@ async fn scoped_reveal_runtime_trust_key(
     }))
 }
 
-async fn scoped_put_runtime_trust_key(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRuntimePath>,
-    Extension(actor): Extension<RequestActor>,
-    Json(request): Json<PutRuntimeTrustKeyRequest>,
-) -> std::result::Result<Response, ApiError> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    require_workspace_owner(&api, &path.workspace_id, &actor, "Runtime trust changes").await?;
-    let actor_account_id = actor.account_id.clone();
-    if path.runtime_id == EMBEDDED_WORKER_RUNTIME_ID {
-        return Err(settings_bad_request(
-            "embedded_runtime_trust_managed_internally",
-            "the embedded Runtime trust key is managed by Server identity authority",
-        ));
-    }
-    if request.expected_revision == Some(0) {
-        return Err(settings_bad_request(
-            "invalid_runtime_binding_revision",
-            "expected_revision must be greater than zero when provided",
-        ));
-    }
-    if request.public_key.len() > 16 * 1024 {
-        return Err(settings_bad_request(
-            "runtime_public_key_too_large",
-            "public_key must be at most 16384 bytes",
-        ));
-    }
-    let existing = api
-        .store
-        .get_workspace_runtime_binding(&path.workspace_id, &path.runtime_id)
-        .await?;
-    let source = api
-        .config
-        .remote_runtime_sources
-        .iter()
-        .find(|source| {
-            source.runtime_id == path.runtime_id
-                && source.workspace_id.as_deref() == Some(path.workspace_id.as_str())
-        })
-        .cloned();
-    if let (Some(binding), Some(source)) = (&existing, &source)
-        && binding.base_url != source.base_url
-    {
-        return Err(settings_bad_request(
-            "runtime_endpoint_mismatch",
-            "the persisted Runtime endpoint no longer matches Server Runtime configuration; reconcile the endpoint before changing trust",
-        ));
-    }
-    let (display_name, base_url) = if let Some(binding) = &existing {
-        (binding.display_name.clone(), binding.base_url.clone())
-    } else if let Some(source) = &source {
-        (source.display_name.clone(), source.base_url.clone())
-    } else {
-        return Err(Error::UnknownRuntime(path.runtime_id.clone()).into());
-    };
-    let now = Utc::now().to_rfc3339();
-    let record = WorkspaceRuntimeBinding {
-        workspace_id: path.workspace_id.clone(),
-        runtime_id: path.runtime_id.clone(),
-        display_name,
-        base_url,
-        public_key: request.public_key,
-        public_key_fingerprint: String::new(),
-        binding_revision: 1,
-        created_at: existing
-            .as_ref()
-            .map_or_else(|| now.clone(), |binding| binding.created_at.clone()),
-        updated_at: now,
-        revoked_at: None,
-    };
-    let mutation = api
-        .store
-        .put_workspace_runtime_binding_key(record, request.expected_revision, &actor_account_id)
-        .await;
-    let (_, binding) = match mutation {
-        Ok(result) => result,
-        Err(error) => {
-            if let Some(response) = runtime_trust_conflict_response(&api, &path, &error).await {
-                return Ok(response);
-            }
-            return Err(error.into());
-        }
-    };
-    api.runtime_binding_expectations
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            (path.workspace_id.clone(), path.runtime_id.clone()),
-            binding,
-        );
-    if let Some(source) = source {
-        api.runtime_subscription_broker
-            .register_remote_runtime(source);
-    }
-    Ok(
-        Json(workspace_runtime_detail(&api, &path.workspace_id, &path.runtime_id).await?)
-            .into_response(),
-    )
-}
-
 async fn scoped_revoke_runtime_trust_key(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
@@ -11754,7 +11853,7 @@ async fn scoped_revoke_runtime_trust_key(
     if path.runtime_id == EMBEDDED_WORKER_RUNTIME_ID {
         return Err(settings_bad_request(
             "embedded_runtime_trust_managed_internally",
-            "the embedded Runtime trust key is managed by Server identity authority",
+            "the embedded Runtime trust key is managed by the embedded Runtime authority",
         ));
     }
     if request.expected_revision == 0 {
@@ -11850,8 +11949,40 @@ async fn scoped_delete_remote_runtime(
 async fn scoped_test_runtime_connection(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
+    Extension(actor): Extension<RequestActor>,
 ) -> ApiResult<Json<RuntimeConnectionTestResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
+    require_workspace_owner(
+        &api,
+        &path.workspace_id,
+        &actor,
+        "Runtime connection verification",
+    )
+    .await?;
+    let binding = api
+        .store
+        .get_workspace_runtime_binding(&path.workspace_id, &path.runtime_id)
+        .await?
+        .ok_or_else(|| Error::UnknownRuntime(path.runtime_id.clone()))?;
+    if binding.state == StoredRuntimeBindingState::Revoked || binding.revoked_at.is_some() {
+        return Err(Error::RuntimeBindingConflict(format!(
+            "Runtime `{}` binding is revoked",
+            path.runtime_id
+        ))
+        .into());
+    }
+    if binding.authentication_mode == StoredRuntimeAuthenticationMode::WorkspaceIdentity {
+        validate_runtime_connection_request(&CreateRemoteRuntimeRequest {
+            public_bundle: workspace_api::RuntimePublicIdentityBundle {
+                identity_id: binding.runtime_id.clone(),
+                public_key: binding.public_key.clone(),
+            },
+            display_name: Some(binding.display_name.clone()),
+            endpoint: binding.base_url.clone(),
+            expected_revision: Some(binding.binding_revision),
+        })
+        .await?;
+    }
     test_runtime_connection(State(api), AxumPath(path.runtime_id)).await
 }
 
@@ -13315,31 +13446,110 @@ async fn list_workers(
 }
 
 async fn create_remote_runtime(
-    State(_api): State<WorkspaceApi>,
+    State(api): State<WorkspaceApi>,
+    Extension(actor): Extension<RequestActor>,
     Json(request): Json<CreateRemoteRuntimeRequest>,
 ) -> ApiResult<(StatusCode, Json<WorkspaceRuntimeResource>)> {
-    validate_runtime_connection_request(&request)?;
-    let id = request.runtime_id.trim().to_string();
-    if id == EMBEDDED_WORKER_RUNTIME_ID {
+    require_workspace_owner(
+        &api,
+        &api.config.workspace_id,
+        &actor,
+        "manage Workspace Runtimes",
+    )
+    .await?;
+    let endpoint = validate_runtime_connection_request(&request).await?;
+    let runtime_id = request.public_bundle.identity_id.trim().to_string();
+    if runtime_id == EMBEDDED_WORKER_RUNTIME_ID {
         return Err(settings_bad_request(
             "embedded_runtime_not_config_managed",
             "the embedded Runtime is built in and cannot be managed as a remote Runtime",
         ));
     }
-    if request
-        .token_ref
-        .as_ref()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
+    let identity = api
+        .signing_identities
+        .get_validated(&api.config.workspace_id)?;
+    if identity.state != "active" {
         return Err(settings_bad_request(
-            "remote_runtime_token_ref_unsupported",
-            "remote Runtime token_ref persistence is not supported",
+            "workspace_signing_identity_unavailable",
+            "an active Workspace signing identity is required before registering a Runtime",
         ));
     }
-    Err(settings_bad_request(
-        "runtime_public_key_required",
-        "remote Runtime registration requires an authenticated public key; configure it from the Runtime detail page after the Runtime endpoint is registered",
-    ))
+    let existing = api
+        .store
+        .get_workspace_runtime_binding(&api.config.workspace_id, &runtime_id)
+        .await?;
+    if existing
+        .as_ref()
+        .is_some_and(|binding| binding.state == StoredRuntimeBindingState::Verified)
+    {
+        return Err(Error::RuntimeBindingConflict(
+            "a verified Runtime binding must be revoked before it can be replaced as configured"
+                .to_string(),
+        )
+        .into());
+    }
+    match api
+        .runtime
+        .unregister_if_idle(&runtime_id, api.config.max_records.min(200))
+        .map_err(|err| err.into_error())?
+    {
+        RuntimeRegistryUnregisterResult::Removed | RuntimeRegistryUnregisterResult::NotFound => {}
+        RuntimeRegistryUnregisterResult::BlockedByWorkers { worker_count, .. } => {
+            return Err(Error::RuntimeBindingConflict(format!(
+                "Runtime `{runtime_id}` still has {worker_count} active worker(s) and cannot become a configured-only binding"
+            ))
+            .into());
+        }
+    }
+    let now = Utc::now().to_rfc3339();
+    let record = WorkspaceRuntimeBinding {
+        workspace_id: api.config.workspace_id.clone(),
+        runtime_id: runtime_id.clone(),
+        display_name: request
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&runtime_id)
+            .to_string(),
+        base_url: endpoint.to_string().trim_end_matches('/').to_string(),
+        public_key: request.public_bundle.public_key.trim().to_string(),
+        public_key_fingerprint: String::new(),
+        binding_revision: request.expected_revision.unwrap_or(0),
+        state: StoredRuntimeBindingState::Configured,
+        authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
+        workspace_key_id: Some(identity.key_id.clone()),
+        workspace_key_generation: Some(identity.revision),
+        created_at: now.clone(),
+        updated_at: now,
+        revoked_at: None,
+    };
+    let (mutation, binding) = api
+        .store
+        .put_workspace_runtime_binding_key(record, request.expected_revision, &actor.account_id)
+        .await?;
+    api.runtime_binding_expectations
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            (api.config.workspace_id.clone(), runtime_id.clone()),
+            binding.clone(),
+        );
+    api.runtime_subscription_broker
+        .unregister_runtime(&runtime_id);
+    api.register_workspace_runtime_binding(binding, false)?;
+    let resource = workspace_runtime_resources_response(&api, &api.config.workspace_id)
+        .await?
+        .items
+        .into_iter()
+        .find(|resource| resource.runtime.runtime_id == runtime_id)
+        .ok_or_else(|| Error::UnknownRuntime(runtime_id.clone()))?;
+    let status = if mutation == WorkspaceRuntimeBindingMutation::Created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(resource)))
 }
 
 async fn delete_remote_runtime(
@@ -13394,6 +13604,213 @@ async fn delete_remote_runtime(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn perform_workspace_runtime_verification(
+    api: &WorkspaceApi,
+    runtime: Arc<RuntimeRegistry>,
+    binding: &WorkspaceRuntimeBinding,
+) -> std::result::Result<WorkspaceRuntimeBinding, String> {
+    if binding.authentication_mode != StoredRuntimeAuthenticationMode::WorkspaceIdentity {
+        return Ok(binding.clone());
+    }
+    if binding.state == crate::store::WorkspaceRuntimeBindingState::Revoked
+        || binding.revoked_at.is_some()
+    {
+        return Err("Runtime binding is revoked".to_string());
+    }
+    let backend_url = api.config.backend_base_url.as_deref().ok_or_else(|| {
+        "Workspace identity verification requires configured backend_base_url".to_string()
+    })?;
+    let identity = api
+        .signing_identities
+        .get_validated(&binding.workspace_id)
+        .map_err(|error| error.to_string())?;
+    if identity.state != "active" {
+        return Err("Workspace signing identity is not active".to_string());
+    }
+    let workspace_key_id = binding
+        .workspace_key_id
+        .as_deref()
+        .ok_or_else(|| "Runtime binding is missing the Workspace key identity".to_string())?;
+    let workspace_trust_generation = binding
+        .workspace_key_generation
+        .ok_or_else(|| "Runtime binding is missing the Workspace trust generation".to_string())?;
+    if identity.key_id != workspace_key_id || identity.revision != workspace_trust_generation {
+        return Err(
+            "Runtime binding no longer matches the active Workspace or Runtime identity"
+                .to_string(),
+        );
+    }
+
+    let now = Utc::now();
+    let expires_at = (now + Duration::seconds(60)).timestamp();
+    let challenge = WorkspaceRuntimeVerificationChallenge {
+        challenge_id: Uuid::now_v7().to_string(),
+        workspace_id: binding.workspace_id.clone(),
+        runtime_id: binding.runtime_id.clone(),
+        binding_revision: binding.binding_revision,
+        workspace_key_id: workspace_key_id.to_string(),
+        workspace_identity_revision: identity.revision,
+        workspace_trust_generation,
+        runtime_public_key_fingerprint: binding.public_key_fingerprint.clone(),
+        runtime_identity_revision: 1,
+        workspace_nonce: Uuid::now_v7().to_string(),
+        expires_at,
+    };
+    let checked_at = now.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let pending = crate::store::WorkspaceRuntimeVerificationEvidence {
+        workspace_id: binding.workspace_id.clone(),
+        runtime_id: binding.runtime_id.clone(),
+        binding_revision: binding.binding_revision,
+        workspace_key_id: workspace_key_id.to_string(),
+        workspace_identity_revision: identity.revision,
+        workspace_trust_generation,
+        runtime_public_key_fingerprint: binding.public_key_fingerprint.clone(),
+        runtime_identity_revision: 1,
+        challenge_id: challenge.challenge_id.clone(),
+        state: "pending".to_string(),
+        last_outcome: "challenge_issued".to_string(),
+        verified_at: None,
+        checked_at: checked_at.clone(),
+    };
+    api.store
+        .record_workspace_runtime_verification_attempt(&pending)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let result = async {
+        let challenge_body = serde_json::to_vec(&challenge).map_err(|error| error.to_string())?;
+        let challenge_claims = WorkspaceCapabilityClaims {
+            issuer: backend_url.to_string(),
+            issuer_workspace_id: binding.workspace_id.clone(),
+            issuer_key_id: identity.key_id.clone(),
+            issuer_identity_revision: identity.revision,
+            trust_generation: workspace_trust_generation,
+            binding_revision: binding.binding_revision,
+            runtime_id: binding.runtime_id.clone(),
+            worker_id: None,
+            operation: WORKSPACE_VERIFICATION_OPERATION.to_string(),
+            method: "POST".to_string(),
+            path_and_query: WORKSPACE_VERIFICATION_CHALLENGE_PATH.to_string(),
+            body_digest: workspace_request_body_digest(&challenge_body),
+            iat: now.timestamp(),
+            exp: expires_at,
+            jti: Uuid::now_v7().to_string(),
+        };
+        let challenge_token = api
+            .signing_identities
+            .issue_workspace_capability(&binding.workspace_id, &challenge_claims)
+            .map_err(|error| error.to_string())?;
+        let challenge_runtime = runtime.clone();
+        let challenge_runtime_id = binding.runtime_id.clone();
+        let challenge_request = challenge.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            challenge_runtime.send_workspace_verification_challenge(
+                &challenge_runtime_id,
+                &challenge_request,
+                &challenge_token,
+            )
+        })
+        .await
+        .map_err(|_| "Runtime verification challenge task failed".to_string())?
+        .map_err(|failure| failure.diagnostic.message)?;
+        verify_runtime_verification_response(
+            &response,
+            &challenge,
+            &binding.public_key,
+            Utc::now().timestamp(),
+        )
+        .map_err(|error| error.to_string())?;
+
+        let response_bytes = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
+        let acknowledgement = WorkspaceRuntimeVerificationAcknowledgement {
+            challenge_id: response.challenge_id.clone(),
+            workspace_id: response.workspace_id.clone(),
+            runtime_id: response.runtime_id.clone(),
+            binding_revision: response.binding_revision,
+            workspace_key_id: response.workspace_key_id.clone(),
+            workspace_identity_revision: response.workspace_identity_revision,
+            workspace_trust_generation: response.workspace_trust_generation,
+            runtime_public_key_fingerprint: response.runtime_public_key_fingerprint.clone(),
+            runtime_identity_revision: response.runtime_identity_revision,
+            workspace_nonce: response.workspace_nonce.clone(),
+            runtime_nonce: response.runtime_nonce.clone(),
+            response_digest: workspace_request_body_digest(&response_bytes),
+            response: response.clone(),
+            expires_at: response.expires_at,
+        };
+        let acknowledgement_body =
+            serde_json::to_vec(&acknowledgement).map_err(|error| error.to_string())?;
+        let acknowledgement_claims = WorkspaceCapabilityClaims {
+            issuer: backend_url.to_string(),
+            issuer_workspace_id: binding.workspace_id.clone(),
+            issuer_key_id: identity.key_id.clone(),
+            issuer_identity_revision: identity.revision,
+            trust_generation: workspace_trust_generation,
+            binding_revision: binding.binding_revision,
+            runtime_id: binding.runtime_id.clone(),
+            worker_id: None,
+            operation: WORKSPACE_VERIFICATION_OPERATION.to_string(),
+            method: "POST".to_string(),
+            path_and_query: WORKSPACE_VERIFICATION_ACK_PATH.to_string(),
+            body_digest: workspace_request_body_digest(&acknowledgement_body),
+            iat: Utc::now().timestamp(),
+            exp: expires_at,
+            jti: Uuid::now_v7().to_string(),
+        };
+        let acknowledgement_token = api
+            .signing_identities
+            .issue_workspace_capability(&binding.workspace_id, &acknowledgement_claims)
+            .map_err(|error| error.to_string())?;
+        let acknowledgement_runtime = runtime;
+        let acknowledgement_runtime_id = binding.runtime_id.clone();
+        let acknowledgement_request = acknowledgement.clone();
+        let receipt = tokio::task::spawn_blocking(move || {
+            acknowledgement_runtime.send_workspace_verification_acknowledgement(
+                &acknowledgement_runtime_id,
+                &acknowledgement_request,
+                &acknowledgement_token,
+            )
+        })
+        .await
+        .map_err(|_| "Runtime verification acknowledgement task failed".to_string())?
+        .map_err(|failure| failure.diagnostic.message)?;
+        if receipt.challenge_id != challenge.challenge_id
+            || receipt.workspace_id != binding.workspace_id
+            || receipt.runtime_id != binding.runtime_id
+            || receipt.binding_revision != binding.binding_revision
+        {
+            return Err("Runtime verification acknowledgement receipt mismatched".to_string());
+        }
+
+        let verified_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let verified = crate::store::WorkspaceRuntimeVerificationEvidence {
+            state: "verified".to_string(),
+            last_outcome: "verified".to_string(),
+            verified_at: Some(verified_at.clone()),
+            checked_at: verified_at,
+            ..pending.clone()
+        };
+        api.store
+            .complete_workspace_runtime_verification(&verified)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    .await;
+    if result.is_err() {
+        let checked_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let _ = api
+            .store
+            .record_workspace_runtime_verification_outcome_if_current(
+                &pending,
+                "failed",
+                "verification_failed",
+                &checked_at,
+            )
+            .await;
+    }
+    result
+}
+
 async fn test_runtime_connection(
     State(api): State<WorkspaceApi>,
     AxumPath(runtime_id): AxumPath<String>,
@@ -13406,11 +13823,50 @@ async fn test_runtime_connection(
         }
         .into());
     }
-    api.store
+    let binding = api
+        .store
         .get_workspace_runtime_binding(api.workspace_id(), &runtime_id)
         .await?
         .filter(|binding| binding.revoked_at.is_none())
         .ok_or_else(|| Error::UnknownRuntime(runtime_id.clone()))?;
+
+    if binding.authentication_mode == StoredRuntimeAuthenticationMode::WorkspaceIdentity {
+        match perform_workspace_runtime_verification(&api, api.runtime.clone(), &binding).await {
+            Ok(verified_binding) => {
+                api.register_workspace_runtime_binding(verified_binding.clone(), true)?;
+                api.runtime_binding_expectations
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        (
+                            verified_binding.workspace_id.clone(),
+                            verified_binding.runtime_id.clone(),
+                        ),
+                        verified_binding.clone(),
+                    );
+                api.runtime
+                    .activate_workspace_authorization(&runtime_id, verified_binding.clone())
+                    .map_err(|error| Error::Store(format!("{error:?}")))?;
+            }
+            Err(message) => {
+                let mut result = runtime_connection_test_failure(
+                    api.workspace_id(),
+                    &runtime_id,
+                    Utc::now().to_rfc3339(),
+                    RuntimeConnectionTestFailureKind::Authentication,
+                    None,
+                    RuntimeDiagnostic::new(
+                        "runtime_workspace_verification_failed",
+                        "error",
+                        message,
+                    ),
+                );
+                result.binding_revision = binding.binding_revision;
+                result.connection_state = RuntimeConnectionDisplayState::Unavailable;
+                return Ok(Json(result));
+            }
+        }
+    }
 
     let checked_at = Utc::now().to_rfc3339();
     let runtime = api.runtime.clone();
@@ -13423,12 +13879,45 @@ async fn test_runtime_connection(
             message: "Runtime connection test could not be completed".to_string(),
         })?;
 
-    Ok(Json(runtime_connection_test_response(
-        api.workspace_id(),
-        &runtime_id,
-        checked_at,
-        ping,
-    )))
+    if ping.is_err()
+        && binding.authentication_mode == StoredRuntimeAuthenticationMode::WorkspaceIdentity
+        && let Some(evidence) = api
+            .store
+            .get_workspace_runtime_verification(api.workspace_id(), &runtime_id)
+            .await?
+    {
+        let checked_at = Utc::now().to_rfc3339();
+        api.store
+            .record_workspace_runtime_verification_outcome_if_current(
+                &evidence,
+                "failed",
+                "connectivity_failed",
+                &checked_at,
+            )
+            .await?;
+    }
+    let current_binding = api
+        .store
+        .get_workspace_runtime_binding(api.workspace_id(), &runtime_id)
+        .await?
+        .ok_or_else(|| Error::UnknownRuntime(runtime_id.clone()))?;
+    let verification = api
+        .store
+        .get_workspace_runtime_verification(api.workspace_id(), &runtime_id)
+        .await?;
+    let summary = runtime_binding_summary(&current_binding, verification.as_ref());
+    let mut result =
+        runtime_connection_test_response(api.workspace_id(), &runtime_id, checked_at, ping);
+    result.binding_revision = current_binding.binding_revision;
+    result.connection_state = if result.status == RuntimeConnectionTestStatus::Compatible {
+        summary.connection_state
+    } else if summary.connection_state == RuntimeConnectionDisplayState::Revoked {
+        RuntimeConnectionDisplayState::Revoked
+    } else {
+        RuntimeConnectionDisplayState::Unavailable
+    };
+    result.verification = summary.verification;
+    Ok(Json(result))
 }
 
 async fn get_worker_launch_options(
@@ -15527,6 +16016,16 @@ async fn workspace_runtime_resources_response(
         .store
         .list_workspace_runtime_bindings(workspace_id, true)
         .await?;
+    let mut verifications = HashMap::new();
+    for binding in &bindings {
+        if let Some(verification) = api
+            .store
+            .get_workspace_runtime_verification(workspace_id, &binding.runtime_id)
+            .await?
+        {
+            verifications.insert(binding.runtime_id.clone(), verification);
+        }
+    }
     let mut items = runtimes
         .items
         .into_iter()
@@ -15535,8 +16034,12 @@ async fn workspace_runtime_resources_response(
                 .iter()
                 .find(|binding| binding.runtime_id == runtime.runtime_id);
             let built_in = runtime.runtime_id == EMBEDDED_WORKER_RUNTIME_ID;
+            let mut runtime: workspace_api::RuntimeSummary = runtime.into();
+            if binding.is_some_and(|binding| binding.state != StoredRuntimeBindingState::Verified) {
+                runtime.worker_creation_available = false;
+            }
             WorkspaceRuntimeResource {
-                runtime: runtime.into(),
+                runtime,
                 management: RuntimeManagementSummary {
                     built_in,
                     config_managed: binding.is_some(),
@@ -15544,6 +16047,9 @@ async fn workspace_runtime_resources_response(
                     endpoint_configured: binding
                         .is_some_and(|binding| !binding.base_url.trim().is_empty()),
                     token_ref_configured: false,
+                    binding: binding.map(|binding| {
+                        runtime_binding_summary(binding, verifications.get(&binding.runtime_id))
+                    }),
                 },
             }
         })
@@ -15589,6 +16095,10 @@ async fn workspace_runtime_resources_response(
                 removable: true,
                 endpoint_configured: !binding.base_url.trim().is_empty(),
                 token_ref_configured: false,
+                binding: Some(runtime_binding_summary(
+                    binding,
+                    verifications.get(&binding.runtime_id),
+                )),
             },
         });
     }
@@ -15599,6 +16109,68 @@ async fn workspace_runtime_resources_response(
         items,
         source: "workspace-runtime-bindings".to_string(),
         diagnostics: runtimes.diagnostics.into_iter().map(Into::into).collect(),
+    })
+}
+
+fn runtime_binding_summary(
+    binding: &WorkspaceRuntimeBinding,
+    verification: Option<&crate::store::WorkspaceRuntimeVerificationEvidence>,
+) -> WorkspaceRuntimeBindingSummary {
+    let valid_verification = verification.filter(|verification| {
+        verification.state == "verified"
+            && verification.binding_revision == binding.binding_revision
+            && verification.runtime_public_key_fingerprint == binding.public_key_fingerprint
+            && verification.workspace_key_id
+                == binding.workspace_key_id.as_deref().unwrap_or_default()
+    });
+    let connection_state = match binding.state {
+        StoredRuntimeBindingState::Revoked => RuntimeConnectionDisplayState::Revoked,
+        _ if verification.is_some_and(|verification| verification.last_outcome != "verified") => {
+            RuntimeConnectionDisplayState::Unavailable
+        }
+        StoredRuntimeBindingState::Verified
+            if binding.authentication_mode
+                == StoredRuntimeAuthenticationMode::LegacyServerIssuer
+                || valid_verification.is_some() =>
+        {
+            RuntimeConnectionDisplayState::Verified
+        }
+        _ => RuntimeConnectionDisplayState::Configured,
+    };
+    WorkspaceRuntimeBindingSummary {
+        state: match binding.state {
+            StoredRuntimeBindingState::Configured => WorkspaceRuntimeBindingState::Configured,
+            StoredRuntimeBindingState::Verified => WorkspaceRuntimeBindingState::Verified,
+            StoredRuntimeBindingState::Revoked => WorkspaceRuntimeBindingState::Revoked,
+        },
+        connection_state,
+        revision: binding.binding_revision,
+        workspace_key_id: binding.workspace_key_id.clone(),
+        workspace_key_generation: binding.workspace_key_generation,
+        verification: verification.and_then(runtime_verification_summary),
+    }
+}
+
+fn runtime_verification_summary(
+    verification: &crate::store::WorkspaceRuntimeVerificationEvidence,
+) -> Option<workspace_api::RuntimeVerificationEvidenceSummary> {
+    let last_outcome = match verification.last_outcome.as_str() {
+        "verified" => workspace_api::RuntimeVerificationOutcome::Verified,
+        "challenge_issued" => workspace_api::RuntimeVerificationOutcome::ChallengeIssued,
+        "verification_failed" => workspace_api::RuntimeVerificationOutcome::VerificationFailed,
+        "connectivity_failed" => workspace_api::RuntimeVerificationOutcome::ConnectivityFailed,
+        _ => return None,
+    };
+    Some(workspace_api::RuntimeVerificationEvidenceSummary {
+        verified_at: verification.verified_at.clone(),
+        last_checked_at: verification.checked_at.clone(),
+        last_outcome,
+        binding_revision: verification.binding_revision,
+        workspace_key_id: verification.workspace_key_id.clone(),
+        workspace_identity_revision: verification.workspace_identity_revision,
+        workspace_trust_generation: verification.workspace_trust_generation,
+        runtime_public_key_fingerprint: verification.runtime_public_key_fingerprint.clone(),
+        runtime_identity_revision: verification.runtime_identity_revision,
     })
 }
 
@@ -15643,6 +16215,7 @@ async fn workspace_runtime_detail(
                 removable: false,
                 endpoint_configured: !binding.base_url.trim().is_empty(),
                 token_ref_configured: false,
+                binding: Some(runtime_binding_summary(&binding, None)),
             },
         });
     }
@@ -15726,27 +16299,86 @@ fn project_runtime_trust_audit(
     })
 }
 
-fn validate_runtime_connection_request(request: &CreateRemoteRuntimeRequest) -> ApiResult<()> {
-    validate_public_runtime_id(request.runtime_id.trim())?;
-    let endpoint = request.endpoint.trim();
-    if endpoint.is_empty() || !(endpoint.starts_with("http://") || endpoint.starts_with("https://"))
+async fn validate_runtime_connection_request(
+    request: &CreateRemoteRuntimeRequest,
+) -> ApiResult<Url> {
+    validate_public_runtime_id(request.public_bundle.identity_id.trim())?;
+    if request.public_bundle.public_key.trim().is_empty() {
+        return Err(settings_bad_request(
+            "runtime_public_key_required",
+            "Runtime public bundle must contain a public key",
+        ));
+    }
+    let endpoint = Url::parse(request.endpoint.trim()).map_err(|_| {
+        settings_bad_request(
+            "invalid_remote_runtime_endpoint",
+            "endpoint must be an absolute https URL",
+        )
+    })?;
+    if endpoint.scheme() != "https"
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
     {
         return Err(settings_bad_request(
-            "invalid_remote_runtime_endpoint",
-            "endpoint must be an absolute http or https URL",
+            "remote_runtime_endpoint_not_allowed",
+            "Runtime endpoint must be an https origin without credentials, query, or fragment",
+        ));
+    }
+    let host = endpoint.host_str().expect("checked above");
+    if host.eq_ignore_ascii_case("localhost")
+        || host.ends_with(".localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(is_disallowed_remote_runtime_address)
+    {
+        return Err(settings_bad_request(
+            "remote_runtime_endpoint_not_allowed",
+            "Runtime endpoint resolves to a loopback, private, link-local, metadata, or otherwise non-public address",
+        ));
+    }
+    let port = endpoint.port_or_known_default().unwrap_or(443);
+    let addresses = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| {
+        settings_bad_request(
+            "remote_runtime_endpoint_dns_timeout",
+            "Runtime endpoint DNS resolution timed out",
+        )
+    })?
+    .map_err(|_| {
+        settings_bad_request(
+            "remote_runtime_endpoint_dns_failed",
+            "Runtime endpoint DNS resolution failed",
+        )
+    })?
+    .collect::<Vec<_>>();
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| is_disallowed_remote_runtime_address(address.ip()))
+    {
+        return Err(settings_bad_request(
+            "remote_runtime_endpoint_not_allowed",
+            "Runtime endpoint resolves to a loopback, private, link-local, metadata, or otherwise non-public address",
         ));
     }
     if request
         .display_name
         .as_deref()
-        .is_some_and(|value| value.chars().any(char::is_control))
+        .is_some_and(|value| value.is_empty() || value.chars().any(char::is_control))
     {
         return Err(settings_bad_request(
             "invalid_remote_runtime_display_name",
-            "display_name cannot contain control characters",
+            "display_name must be non-empty when supplied and cannot contain control characters",
         ));
     }
-    Ok(())
+    Ok(endpoint)
 }
 
 fn validate_public_runtime_id(runtime_id: &str) -> ApiResult<()> {
@@ -15769,7 +16401,6 @@ fn validate_public_runtime_id(runtime_id: &str) -> ApiResult<()> {
     Ok(())
 }
 
-#[cfg(test)]
 fn remote_runtime_config_from_binding(
     binding: &crate::store::WorkspaceRuntimeBinding,
 ) -> std::result::Result<RemoteRuntimeConfig, RuntimeDiagnostic> {
@@ -15779,7 +16410,10 @@ fn remote_runtime_config_from_binding(
         binding.base_url.clone(),
         None,
     )
-    .with_workspace_id(binding.workspace_id.clone());
+    .with_workspace_id(binding.workspace_id.clone())
+    .with_strict_public_egress(
+        binding.authentication_mode == StoredRuntimeAuthenticationMode::WorkspaceIdentity,
+    );
     Ok(remote)
 }
 
@@ -15830,6 +16464,9 @@ fn runtime_connection_test_response(
         Ok(ping) => RuntimeConnectionTestResponse {
             workspace_id: workspace_id.to_string(),
             runtime_id: runtime_id.to_string(),
+            binding_revision: 0,
+            connection_state: RuntimeConnectionDisplayState::Configured,
+            verification: None,
             checked_at,
             status: RuntimeConnectionTestStatus::Compatible,
             failure_kind: None,
@@ -15879,6 +16516,9 @@ fn runtime_connection_test_failure(
     RuntimeConnectionTestResponse {
         workspace_id: workspace_id.to_string(),
         runtime_id: runtime_id.to_string(),
+        binding_revision: 0,
+        connection_state: RuntimeConnectionDisplayState::Unavailable,
+        verification: None,
         checked_at,
         status: RuntimeConnectionTestStatus::Failed,
         failure_kind: Some(failure_kind),
@@ -17222,6 +17862,11 @@ impl From<Error> for ApiError {
                 severity: DiagnosticSeverity::Error,
                 message: sanitize_backend_error(message),
             }],
+            Error::WorkspaceSigningIdentity { code, message } => vec![RuntimeDiagnostic {
+                code: code.clone(),
+                severity: DiagnosticSeverity::Error,
+                message: sanitize_backend_error(message),
+            }],
             Error::Ticket(ticket_error) => vec![RuntimeDiagnostic {
                 code: match ticket_error {
                     ticket::TicketError::NotFound(_) => "ticket_not_found",
@@ -17378,6 +18023,7 @@ impl IntoResponse for ApiError {
             {
                 StatusCode::SERVICE_UNAVAILABLE
             }
+            Error::WorkspaceSigningIdentity { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Error::RuntimeOperationFailed { .. } => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -17440,8 +18086,8 @@ mod tests {
     use worker_runtime::working_directory::WorkingDirectoryMaterializer;
 
     use crate::hosts::{
-        RemoteRuntimeAuthConfig, TicketWorkerRole, WorkerInputKind, WorkerOperationState,
-        WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent,
+        TicketWorkerRole, WorkerInputKind, WorkerOperationState, WorkerSpawnAcceptanceRequirement,
+        WorkerSpawnIntent,
     };
     use crate::store::{
         AccountRecord, ApiTokenRecord, BrowserSessionRecord, MemoryDocumentRecord,
@@ -17897,16 +18543,15 @@ mod tests {
         identity: &worker_runtime::auth::RuntimeIdentityMaterial,
         runtime_id: &str,
     ) {
+        api.config.backend_base_url = Some("server-test".to_owned());
         api.config.remote_runtime_sources.push(RemoteRuntimeConfig {
             runtime_id: runtime_id.to_owned(),
             workspace_id: Some(api.workspace_id().to_owned()),
             display_name: runtime_id.to_owned(),
             base_url: "https://runtime.test".to_owned(),
             bearer_token: None,
-            auth: Some(RemoteRuntimeAuthConfig {
-                server_id: "server-test".to_owned(),
-                server_private_key: "unused".to_owned(),
-            }),
+            workspace_authorization: None,
+            strict_public_egress: false,
             cached_worker_creation_available: true,
             cached_os: "test".to_owned(),
             cached_arch: "test".to_owned(),
@@ -17924,6 +18569,10 @@ mod tests {
                     public_key: identity.public_key.clone(),
                     public_key_fingerprint: String::new(),
                     binding_revision: 1,
+                    state: StoredRuntimeBindingState::Verified,
+                    authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
+                    workspace_key_id: Some("WK-test".to_owned()),
+                    workspace_key_generation: Some(1),
                     created_at: "2026-01-01T00:00:00Z".to_owned(),
                     updated_at: "2026-01-01T00:00:00Z".to_owned(),
                     revoked_at: None,
@@ -19592,21 +20241,279 @@ mod tests {
         assert!(!serialized.contains("materialized_path"));
     }
 
-    #[test]
-    fn runtime_connection_request_validation_bounds_browser_input() {
-        let ok = CreateRemoteRuntimeRequest {
-            runtime_id: "team-runtime_1".to_string(),
-            display_name: Some("Team Runtime".to_string()),
-            endpoint: "https://runtime.example".to_string(),
-            token_ref: None,
+    #[tokio::test]
+    async fn verified_workspace_runtime_binding_is_restored_into_live_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let api = test_api(&root).await;
+        let actor = test_owner_actor();
+        let identity = api
+            .signing_identities
+            .provision_existing(&api.config.workspace_id, &actor.account_id)
+            .unwrap();
+        let runtime_identity = RuntimeIdentityMaterial::generate("restored-runtime").unwrap();
+        api.store
+            .upsert_workspace_runtime_binding_record(
+                WorkspaceRuntimeBinding {
+                    workspace_id: api.config.workspace_id.clone(),
+                    runtime_id: "restored-runtime".to_string(),
+                    display_name: "Restored Runtime".to_string(),
+                    base_url: "https://8.8.8.8".to_string(),
+                    public_key: runtime_identity.public_key,
+                    public_key_fingerprint: String::new(),
+                    binding_revision: 1,
+                    state: StoredRuntimeBindingState::Configured,
+                    authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
+                    workspace_key_id: Some(identity.key_id.clone()),
+                    workspace_key_generation: Some(identity.revision),
+                    created_at: "1".to_string(),
+                    updated_at: "1".to_string(),
+                    revoked_at: None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let configured = api
+            .store
+            .get_workspace_runtime_binding(&api.config.workspace_id, "restored-runtime")
+            .await
+            .unwrap()
+            .unwrap();
+        let evidence = crate::store::WorkspaceRuntimeVerificationEvidence {
+            workspace_id: configured.workspace_id.clone(),
+            runtime_id: configured.runtime_id.clone(),
+            binding_revision: configured.binding_revision,
+            workspace_key_id: identity.key_id,
+            workspace_identity_revision: identity.revision,
+            workspace_trust_generation: identity.revision,
+            runtime_public_key_fingerprint: configured.public_key_fingerprint.clone(),
+            runtime_identity_revision: 1,
+            challenge_id: "restart-challenge".to_string(),
+            state: "verified".to_string(),
+            last_outcome: "verified".to_string(),
+            verified_at: Some("2".to_string()),
+            checked_at: "2".to_string(),
         };
-        assert!(validate_runtime_connection_request(&ok).is_ok());
+        api.store
+            .record_workspace_runtime_verification_attempt(&evidence)
+            .await
+            .unwrap();
+        api.store
+            .complete_workspace_runtime_verification(&evidence)
+            .await
+            .unwrap();
+        drop(api);
+
+        let restored_config = test_server_config(&root);
+        let restored_store =
+            SqliteWorkspaceStore::open(restored_config.database_path.clone()).unwrap();
+        let restored = WorkspaceApi::new(restored_config, Arc::new(restored_store))
+            .await
+            .unwrap();
+        assert!(
+            restored
+                .runtime
+                .list_runtimes(100)
+                .items
+                .iter()
+                .any(|runtime| runtime.runtime_id == "restored-runtime"),
+            "verified persisted Runtime binding must return to the live registry"
+        );
+        assert!(
+            restored
+                .runtime_binding_expectations
+                .read()
+                .unwrap()
+                .contains_key(&(
+                    restored.config.workspace_id.clone(),
+                    "restored-runtime".to_string(),
+                )),
+            "restored Runtime must retain its revision-fenced binding expectation"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_runtime_registration_is_workspace_scoped_revisioned_and_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let actor = test_owner_actor();
+        api.signing_identities
+            .provision_existing(&api.config.workspace_id, &actor.account_id)
+            .unwrap();
+        api.runtime.register_or_replace(
+            RemoteWorkerRuntime::new(
+                RemoteRuntimeConfig::new(
+                    "configured-runtime",
+                    "Stale Runtime",
+                    "https://8.8.8.8",
+                    None,
+                ),
+                api.config.workspace_id.clone(),
+                "http://127.0.0.1:1".to_string(),
+            )
+            .unwrap(),
+        );
+        let runtime_identity = RuntimeIdentityMaterial::generate("configured-runtime").unwrap();
+        let request = CreateRemoteRuntimeRequest {
+            public_bundle: workspace_api::RuntimePublicIdentityBundle {
+                identity_id: "configured-runtime".to_string(),
+                public_key: runtime_identity.public_key,
+            },
+            display_name: Some("Configured Runtime".to_string()),
+            endpoint: "https://8.8.8.8".to_string(),
+            expected_revision: None,
+        };
+        let mut non_owner = actor.clone();
+        non_owner.user_id = "other-user".to_string();
+        non_owner.account_id = "other-account".to_string();
+        non_owner.handle = "other".to_string();
+        let denied = create_remote_runtime(
+            State(api.clone()),
+            Extension(non_owner),
+            Json(request.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.into_response().status(), StatusCode::FORBIDDEN);
+
+        let (status, Json(created)) = create_remote_runtime(
+            State(api.clone()),
+            Extension(actor.clone()),
+            Json(request.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        let binding = created.management.binding.as_ref().unwrap();
+        assert_eq!(binding.state, WorkspaceRuntimeBindingState::Configured);
+        assert_eq!(binding.revision, 1);
+        assert!(binding.workspace_key_id.is_some());
+        assert_eq!(binding.workspace_key_generation, Some(1));
+        assert!(!created.runtime.worker_creation_available);
+        assert!(
+            api.runtime
+                .list_runtimes(100)
+                .items
+                .iter()
+                .any(|runtime| runtime.runtime_id == "configured-runtime"),
+            "configured binding must remain registered so verification can reach it"
+        );
+        assert!(
+            api.runtime_binding_expectations
+                .read()
+                .unwrap()
+                .contains_key(&(
+                    api.config.workspace_id.clone(),
+                    "configured-runtime".to_string(),
+                )),
+            "configured binding must remain fenced by its current binding revision"
+        );
+        let Json(configured_test) = scoped_test_runtime_connection(
+            State(api.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id: api.config.workspace_id.clone(),
+                runtime_id: "configured-runtime".to_string(),
+            }),
+            Extension(actor.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(configured_test.status, RuntimeConnectionTestStatus::Failed);
+        assert_eq!(
+            configured_test.connection_state,
+            RuntimeConnectionDisplayState::Unavailable
+        );
+
+        let (status, Json(replayed)) = create_remote_runtime(
+            State(api.clone()),
+            Extension(actor.clone()),
+            Json(request.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replayed.management.binding.unwrap().revision, 1);
+
+        let mut mismatched = request.clone();
+        mismatched.display_name = Some("Different Runtime".to_string());
+        let error = create_remote_runtime(
+            State(api.clone()),
+            Extension(actor.clone()),
+            Json(mismatched.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
+
+        mismatched.expected_revision = Some(1);
+        let (status, Json(replaced)) =
+            create_remote_runtime(State(api.clone()), Extension(actor), Json(mismatched))
+                .await
+                .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replaced.management.binding.unwrap().revision, 2);
+
+        let unknown_identity = RuntimeIdentityMaterial::generate("unknown-runtime").unwrap();
+        let unknown_revision = create_remote_runtime(
+            State(api.clone()),
+            Extension(test_owner_actor()),
+            Json(CreateRemoteRuntimeRequest {
+                public_bundle: workspace_api::RuntimePublicIdentityBundle {
+                    identity_id: "unknown-runtime".to_string(),
+                    public_key: unknown_identity.public_key,
+                },
+                display_name: None,
+                endpoint: "https://8.8.4.4".to_string(),
+                expected_revision: Some(9),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            unknown_revision.into_response().status(),
+            StatusCode::CONFLICT
+        );
+
+        let cross_workspace = scoped_create_remote_runtime(
+            State(api),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: "another-workspace".to_string(),
+            }),
+            Extension(test_owner_actor()),
+            Json(request),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            cross_workspace.into_response().status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_connection_request_validation_bounds_browser_input() {
+        let identity = RuntimeIdentityMaterial::generate("team-runtime_1").unwrap();
+        let ok = CreateRemoteRuntimeRequest {
+            public_bundle: workspace_api::RuntimePublicIdentityBundle {
+                identity_id: "team-runtime_1".to_string(),
+                public_key: identity.public_key,
+            },
+            display_name: Some("Team Runtime".to_string()),
+            endpoint: "https://8.8.8.8".to_string(),
+            expected_revision: None,
+        };
+        assert!(validate_runtime_connection_request(&ok).await.is_ok());
 
         let bad_endpoint = CreateRemoteRuntimeRequest {
-            endpoint: "/tmp/socket".to_string(),
+            endpoint: "http://169.254.169.254/latest/meta-data".to_string(),
             ..ok
         };
-        assert!(validate_runtime_connection_request(&bad_endpoint).is_err());
+        assert!(
+            validate_runtime_connection_request(&bad_endpoint)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -20159,7 +21066,8 @@ mod tests {
     #[tokio::test]
     async fn workspace_server_router_requires_identity_for_scoped_rest() {
         let temp = tempfile::tempdir().unwrap();
-        let config = test_server_config(temp.path());
+        let mut config = test_server_config(temp.path());
+        config.backend_base_url = Some("https://backend.example.test".to_string());
         let AuthConfig::Passkey {
             origin: expected_origin,
             ..
@@ -20176,7 +21084,12 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".to_owned(),
             })
             .unwrap();
-        let catalog = WorkspaceCatalogService::new(store.clone());
+        let catalog = WorkspaceCatalogService::new(
+            store.clone(),
+            Arc::new(FsWorkspaceSigningMaterialStore::new(
+                workspace_signing_material_root(&config.database_path),
+            )),
+        );
         let repository = temp.path().join("repository");
         std::fs::create_dir_all(&repository).unwrap();
         assert!(
@@ -20234,7 +21147,10 @@ mod tests {
             })
             .unwrap();
         let non_owner_token = seed_test_api_token(store.as_ref(), "repository-access-non-owner");
-        let app = build_workspace_server_router(config, store).await.unwrap();
+        let identity_material_root = workspace_signing_material_root(&config.database_path);
+        let app = build_workspace_server_router(config, store.clone())
+            .await
+            .unwrap();
         let uri = format!("/api/w/{}/workspace", workspace.workspace.workspace_id);
 
         let anonymous = app
@@ -20563,6 +21479,109 @@ mod tests {
             .unwrap();
         assert!(String::from_utf8_lossy(&listed_body).contains("documentation"));
 
+        let identity_uri = format!(
+            "/api/w/{}/settings/workspace/signing-identity",
+            workspace.workspace.workspace_id
+        );
+        let identity_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&identity_uri)
+                    .header(
+                        axum::http::header::COOKIE,
+                        "yoi_workspace_session=browser-session-auth",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(identity_response.status(), StatusCode::OK);
+        let identity_body = axum::body::to_bytes(identity_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let identity_json: serde_json::Value = serde_json::from_slice(&identity_body).unwrap();
+        assert_eq!(identity_json["identity"]["state"], "active");
+        assert_eq!(
+            identity_json["public_bundle"]["workspace_id"],
+            workspace.workspace.workspace_id
+        );
+        let identity_text = String::from_utf8(identity_body.to_vec()).unwrap();
+        assert!(!identity_text.contains("private_key"));
+        assert!(!identity_text.contains("private_material_ref"));
+        let identity_non_owner = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&identity_uri)
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {non_owner_token}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(identity_non_owner.status(), StatusCode::FORBIDDEN);
+
+        let pending_identity = store
+            .get_workspace_signing_identity(&workspace.workspace.workspace_id)
+            .unwrap()
+            .unwrap();
+        store
+            .with_conn_mut(|conn| {
+                conn.execute(
+                    r#"UPDATE workspace_signing_identities
+                       SET public_key = NULL, public_key_fingerprint = NULL,
+                           state = 'pending_provisioning', provisioned_at = NULL
+                       WHERE workspace_id = ?1"#,
+                    rusqlite::params![workspace.workspace.workspace_id],
+                )?;
+                conn.execute(
+                    "DELETE FROM workspace_signing_identity_audit WHERE workspace_id = ?1",
+                    rusqlite::params![workspace.workspace.workspace_id],
+                )?;
+                conn.execute(
+                    "DELETE FROM workspace_signing_identity_provisioning_operations WHERE workspace_id = ?1",
+                    rusqlite::params![workspace.workspace.workspace_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        FsWorkspaceSigningMaterialStore::new(identity_material_root)
+            .delete(&pending_identity.private_material_ref)
+            .unwrap();
+        let provision_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("{identity_uri}/provision"))
+                    .header(
+                        axum::http::header::COOKIE,
+                        "yoi_workspace_session=browser-session-auth",
+                    )
+                    .header(ORIGIN, &expected_origin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(provision_response.status(), StatusCode::OK);
+        let provision_body = axum::body::to_bytes(provision_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let provision_json: serde_json::Value = serde_json::from_slice(&provision_body).unwrap();
+        assert_eq!(provision_json["identity"]["state"], "active");
+        assert_eq!(
+            provision_json["identity"]["key_id"],
+            pending_identity.key_id
+        );
+
         let settings_uri = format!(
             "/api/w/{}/settings/workspace",
             workspace.workspace.workspace_id
@@ -20783,7 +21802,12 @@ mod tests {
         template.static_assets_dir = Some(static_dir);
         let store = Arc::new(SqliteWorkspaceStore::open(&template.database_path).unwrap());
         let token = seed_test_api_token(store.as_ref(), "two-workspaces");
-        let catalog = WorkspaceCatalogService::new(store.clone());
+        let catalog = WorkspaceCatalogService::new(
+            store.clone(),
+            Arc::new(FsWorkspaceSigningMaterialStore::new(
+                workspace_signing_material_root(&template.database_path),
+            )),
+        );
         let workspace_a = catalog
             .create(
                 WorkspaceCreateRequest {
@@ -23465,38 +24489,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_trust_management_is_owner_only_revisioned_and_redacted() {
+    async fn workspace_runtime_trust_reveal_and_revoke_are_owner_only() {
         let temp = tempfile::tempdir().unwrap();
         let api = test_api(temp.path()).await;
         let owner_account_id = format!("account-{TEST_WORKSPACE_ID}");
         let owner = RequestActor {
-            user_id: "owner-user".to_string(),
+            user_id: "owner-user".to_owned(),
             account_id: owner_account_id.clone(),
-            handle: "owner".to_string(),
-            display_name: "Owner".to_string(),
+            handle: "owner".to_owned(),
+            display_name: "Owner".to_owned(),
             auth_method: ActorAuthMethod::BrowserSession,
         };
         let non_owner = RequestActor {
-            user_id: "other-user".to_string(),
-            account_id: "other-account".to_string(),
-            handle: "other".to_string(),
-            display_name: "Other".to_string(),
+            user_id: "other-user".to_owned(),
+            account_id: "other-account".to_owned(),
+            handle: "other".to_owned(),
+            display_name: "Other".to_owned(),
             auth_method: ActorAuthMethod::ApiToken,
         };
-        let first = worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-a").unwrap();
-        let second = worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-a").unwrap();
-        let third = worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-a").unwrap();
+        let identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-a").unwrap();
         let now = Utc::now().to_rfc3339();
         api.store
             .put_workspace_runtime_binding_key(
                 WorkspaceRuntimeBinding {
-                    workspace_id: TEST_WORKSPACE_ID.to_string(),
-                    runtime_id: "runtime-a".to_string(),
-                    display_name: "Runtime A".to_string(),
-                    base_url: "https://runtime.example".to_string(),
-                    public_key: first.public_key,
+                    workspace_id: TEST_WORKSPACE_ID.to_owned(),
+                    runtime_id: "runtime-a".to_owned(),
+                    display_name: "Runtime A".to_owned(),
+                    base_url: "https://runtime.example".to_owned(),
+                    public_key: identity.public_key,
                     public_key_fingerprint: String::new(),
                     binding_revision: 1,
+                    state: StoredRuntimeBindingState::Verified,
+                    authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
+                    workspace_key_id: Some("WK-test".to_owned()),
+                    workspace_key_generation: Some(1),
                     created_at: now.clone(),
                     updated_at: now,
                     revoked_at: None,
@@ -23507,147 +24534,65 @@ mod tests {
             .await
             .unwrap();
 
-        let Json(detail) = scoped_get_runtime_detail(
-            State(api.clone()),
-            AxumPath(ScopedRuntimePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: "runtime-a".to_string(),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(detail.trust_key.revision, Some(1));
-        assert!(detail.trust_key.fingerprint.is_some());
         let Json(revealed) = scoped_reveal_runtime_trust_key(
             State(api.clone()),
             AxumPath(ScopedRuntimePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: "runtime-a".to_string(),
+                workspace_id: TEST_WORKSPACE_ID.to_owned(),
+                runtime_id: "runtime-a".to_owned(),
             }),
             Extension(owner.clone()),
         )
         .await
         .unwrap();
         assert!(revealed.public_key.starts_with("yoi-ed25519-pub:v1:"));
-        let denied_reveal = scoped_reveal_runtime_trust_key(
+        let denied = scoped_reveal_runtime_trust_key(
             State(api.clone()),
             AxumPath(ScopedRuntimePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: "runtime-a".to_string(),
+                workspace_id: TEST_WORKSPACE_ID.to_owned(),
+                runtime_id: "runtime-a".to_owned(),
             }),
             Extension(non_owner.clone()),
         )
         .await
         .unwrap_err();
-        assert_eq!(
-            denied_reveal.into_response().status(),
-            StatusCode::FORBIDDEN
-        );
-
-        let response = scoped_put_runtime_trust_key(
-            State(api.clone()),
-            AxumPath(ScopedRuntimePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: "runtime-a".to_string(),
-            }),
-            Extension(owner.clone()),
-            Json(PutRuntimeTrustKeyRequest {
-                public_key: second.public_key,
-                expected_revision: Some(1),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let detail: WorkspaceRuntimeDetail = serde_json::from_slice(&body).unwrap();
-        assert_eq!(detail.trust_key.revision, Some(2));
-        assert_eq!(
-            detail.recent_audit[0].action,
-            RuntimeTrustAuditAction::Replaced
-        );
-
-        let stale = scoped_put_runtime_trust_key(
-            State(api.clone()),
-            AxumPath(ScopedRuntimePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: "runtime-a".to_string(),
-            }),
-            Extension(owner.clone()),
-            Json(PutRuntimeTrustKeyRequest {
-                public_key: third.public_key,
-                expected_revision: Some(1),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(stale.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(stale.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let conflict: RuntimeTrustConflictResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(conflict.error, RuntimeTrustConflictKind::StaleRevision);
-        assert_eq!(conflict.current_revision, Some(2));
+        assert_eq!(denied.into_response().status(), StatusCode::FORBIDDEN);
 
         let denied = scoped_revoke_runtime_trust_key(
             State(api.clone()),
             AxumPath(ScopedRuntimePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: "runtime-a".to_string(),
+                workspace_id: TEST_WORKSPACE_ID.to_owned(),
+                runtime_id: "runtime-a".to_owned(),
             }),
             Extension(non_owner),
             Json(RevokeRuntimeTrustKeyRequest {
-                expected_revision: 2,
+                expected_revision: 1,
             }),
         )
         .await
         .unwrap_err();
         assert_eq!(denied.into_response().status(), StatusCode::FORBIDDEN);
-
-        let revoked = scoped_revoke_runtime_trust_key(
+        let response = scoped_revoke_runtime_trust_key(
             State(api.clone()),
             AxumPath(ScopedRuntimePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: "runtime-a".to_string(),
+                workspace_id: TEST_WORKSPACE_ID.to_owned(),
+                runtime_id: "runtime-a".to_owned(),
             }),
             Extension(owner),
             Json(RevokeRuntimeTrustKeyRequest {
-                expected_revision: 2,
+                expected_revision: 1,
             }),
         )
         .await
         .unwrap();
-        assert_eq!(revoked.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::OK);
         let binding = api
             .store
             .get_workspace_runtime_binding(TEST_WORKSPACE_ID, "runtime-a")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(binding.binding_revision, 3);
+        assert_eq!(binding.binding_revision, 2);
         assert!(binding.revoked_at.is_some());
-        let listed = workspace_runtime_resources_response(&api, TEST_WORKSPACE_ID)
-            .await
-            .unwrap();
-        let listed_runtime = listed
-            .items
-            .iter()
-            .find(|resource| resource.runtime.runtime_id == "runtime-a")
-            .expect("revoked binding must remain listed");
-        assert!(listed_runtime.management.config_managed);
-        let detail = workspace_runtime_detail(&api, TEST_WORKSPACE_ID, "runtime-a")
-            .await
-            .unwrap();
-        assert_eq!(detail.trust_key.status, RuntimeTrustKeyStatus::Revoked);
-        assert!(detail.runtime.management.config_managed);
-        assert!(
-            !api.runtime_binding_expectations
-                .read()
-                .unwrap()
-                .contains_key(&(TEST_WORKSPACE_ID.to_string(), "runtime-a".to_string()))
-        );
     }
 
     #[tokio::test]
@@ -24148,16 +25093,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let identity = RuntimeIdentityMaterial::generate("runtime-remote").unwrap();
         let mut config = test_server_config(temp.path());
+        config.backend_base_url = Some("server-main".to_owned());
         config.remote_runtime_sources.push(RemoteRuntimeConfig {
             runtime_id: "runtime-remote".to_string(),
             workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
             display_name: "Remote Runtime".to_string(),
             base_url: "https://runtime.invalid".to_string(),
             bearer_token: None,
-            auth: Some(RemoteRuntimeAuthConfig {
-                server_id: "server-main".to_string(),
-                server_private_key: identity.private_key.clone(),
-            }),
+            workspace_authorization: None,
+            strict_public_egress: false,
             cached_worker_creation_available: true,
             cached_os: "test".to_string(),
             cached_arch: "test".to_string(),
@@ -24195,6 +25139,10 @@ mod tests {
             public_key: identity.public_key.clone(),
             public_key_fingerprint: String::new(),
             binding_revision: 1,
+            state: StoredRuntimeBindingState::Verified,
+            authentication_mode: StoredRuntimeAuthenticationMode::LegacyServerIssuer,
+            workspace_key_id: None,
+            workspace_key_generation: None,
             created_at: "2026-08-11T00:00:00Z".to_string(),
             updated_at: "2026-08-11T00:00:00Z".to_string(),
             revoked_at: None,
@@ -24462,6 +25410,7 @@ mod tests {
         assert_eq!(missing_mutation_response.status(), StatusCode::UNAUTHORIZED);
 
         let mut revoked = trust;
+        revoked.state = StoredRuntimeBindingState::Revoked;
         revoked.revoked_at = Some("2026-08-11T00:01:00Z".to_string());
         let authority = SqliteWorkspaceStore::open(api.config.database_path.clone()).unwrap();
         authority
@@ -25658,6 +26607,10 @@ mod tests {
                         .public_key,
                     public_key_fingerprint: String::new(),
                     binding_revision: 1,
+                    state: StoredRuntimeBindingState::Verified,
+                    authentication_mode: StoredRuntimeAuthenticationMode::LegacyServerIssuer,
+                    workspace_key_id: None,
+                    workspace_key_generation: None,
                     created_at: "1".to_string(),
                     updated_at: "1".to_string(),
                     revoked_at: None,
@@ -25674,7 +26627,8 @@ mod tests {
                     display_name: "Probe Runtime".to_string(),
                     base_url: endpoint,
                     bearer_token: Some("test-connection-token".to_string()),
-                    auth: None,
+                    workspace_authorization: None,
+                    strict_public_egress: false,
                     cached_worker_creation_available: true,
                     cached_os: "linux".to_string(),
                     cached_arch: "x86_64".to_string(),
@@ -26788,6 +27742,10 @@ mod tests {
             public_key: identity.public_key,
             public_key_fingerprint: String::new(),
             binding_revision: 1,
+            state: StoredRuntimeBindingState::Verified,
+            authentication_mode: StoredRuntimeAuthenticationMode::LegacyServerIssuer,
+            workspace_key_id: None,
+            workspace_key_generation: None,
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
             revoked_at: None,
@@ -26839,9 +27797,12 @@ mod tests {
             "POST",
             &runtimes_uri,
             Some(serde_json::json!({
-                "runtime_id": "keyless-runtime",
+                "public_bundle": {
+                    "identity_id": "keyless-runtime",
+                    "public_key": ""
+                },
                 "display_name": "Keyless Runtime",
-                "endpoint": "https://keyless.runtime.invalid"
+                "endpoint": "https://8.8.8.8"
             })),
             StatusCode::BAD_REQUEST,
         )
@@ -26948,6 +27909,10 @@ mod tests {
                 .public_key,
             public_key_fingerprint: String::new(),
             binding_revision: 1,
+            state: StoredRuntimeBindingState::Verified,
+            authentication_mode: StoredRuntimeAuthenticationMode::LegacyServerIssuer,
+            workspace_key_id: None,
+            workspace_key_generation: None,
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
             revoked_at: None,
@@ -27014,13 +27979,34 @@ mod tests {
     ) -> serde_json::Value {
         let (endpoint, _server) = runtime_ping_stub(status, body).await;
         let dir = tempfile::tempdir().unwrap();
-        let app = test_app_with_remote_runtime(dir.path(), "probe-runtime", endpoint).await;
+        let app = test_app_with_remote_runtime(dir.path(), "probe-runtime", endpoint)
+            .await
+            .layer(Extension(test_owner_actor()));
         post_json(
             app,
             &format!("/api/w/{TEST_WORKSPACE_ID}/runtimes/probe-runtime/connection-tests"),
             serde_json::json!({}),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn runtime_connection_verification_requires_workspace_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let mut actor = test_owner_actor();
+        actor.account_id = "account-other".to_string();
+        let error = scoped_test_runtime_connection(
+            State(api),
+            AxumPath(ScopedRuntimePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                runtime_id: "probe-runtime".to_string(),
+            }),
+            Extension(actor),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -27035,6 +28021,9 @@ mod tests {
         .await;
 
         assert_eq!(response["status"], "compatible");
+        assert_eq!(response["binding_revision"], 1);
+        assert_eq!(response["connection_state"], "verified");
+        assert_eq!(response["verification"], serde_json::Value::Null);
         assert_eq!(response["failure_kind"], serde_json::Value::Null);
         assert_eq!(
             response["expected_protocol_version"],
@@ -29436,8 +30425,14 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let status = response.status();
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{uri}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
         serde_json::from_slice(&bytes).unwrap()
     }
 

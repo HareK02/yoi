@@ -80,6 +80,10 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "workspace_resource_keys",
     "workspace_runtime_binding_audit",
     "workspace_runtime_bindings",
+    "workspace_runtime_verifications",
+    "workspace_signing_identities",
+    "workspace_signing_identity_audit",
+    "workspace_signing_identity_provisioning_operations",
     "workspace_worker_retention_policies",
     "workspace_worker_retention_policy_revisions",
 ];
