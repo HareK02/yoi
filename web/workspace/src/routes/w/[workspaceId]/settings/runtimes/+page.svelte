@@ -11,6 +11,7 @@
     RuntimeTrustRequestError,
   } from '$lib/workspace/api/runtime-management';
   import { testRuntimeConnection } from '$lib/workspace/api/runtime-connection';
+  import { provisionWorkspaceSigningIdentity } from '$lib/workspace/settings/profile-api';
   import type { PageProps } from './$types';
 
   const runtimeBundlePlaceholder =
@@ -21,10 +22,10 @@
   let displayName = $state('');
   let endpoint = $state('');
   let runtimeFingerprint = $state<string | null>(null);
-  let fingerprintConfirmation = $state('');
   let showAddRuntime = $state(false);
   let busyRuntimeId = $state<string | null>(null);
   let requestError = $state<string | null>(null);
+  let requestNotice = $state<string | null>(null);
   let testResults = $state<Record<string, RuntimeConnectionTestResponse>>({});
   let connectionTestGeneration = 0;
 
@@ -88,6 +89,25 @@
       : '';
   }
 
+  function workspaceBundleFilename(): string {
+    return `workspace-${data.workspaceId}-public-bundle.json`;
+  }
+
+  async function provisionSigningIdentity(): Promise<void> {
+    requestError = null;
+    requestNotice = null;
+    busyRuntimeId = 'provision-workspace-identity';
+    try {
+      await provisionWorkspaceSigningIdentity(data.workspaceId);
+      await invalidateAll();
+      requestNotice = 'Workspace identity provisioned. Copy its public bundle to the Runtime host.';
+    } catch (error) {
+      requestError = error instanceof Error ? error.message : String(error);
+    } finally {
+      busyRuntimeId = null;
+    }
+  }
+
   async function copyWorkspaceBundle(): Promise<void> {
     requestError = null;
     try {
@@ -100,7 +120,6 @@
   async function previewRuntimeFingerprint(): Promise<void> {
     requestError = null;
     runtimeFingerprint = null;
-    fingerprintConfirmation = '';
     busyRuntimeId = 'preview';
     try {
       const bundle = parseRuntimePublicBundle(runtimePublicBundle);
@@ -115,15 +134,13 @@
   async function addRuntime(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     requestError = null;
+    requestNotice = null;
     busyRuntimeId = 'create';
     try {
       const publicBundle = parseRuntimePublicBundle(runtimePublicBundle);
       const currentFingerprint = await previewRuntimePublicKeyFingerprint(publicBundle.public_key);
-      if (
-        runtimeFingerprint !== currentFingerprint ||
-        fingerprintConfirmation.trim() !== currentFingerprint
-      ) {
-        throw new Error('Preview and confirm the exact Runtime public key fingerprint before registration');
+      if (runtimeFingerprint !== currentFingerprint) {
+        throw new Error('Preview the Runtime public key fingerprint before registration');
       }
       await createRemoteRuntime(data.workspaceId, {
         public_bundle: publicBundle,
@@ -133,10 +150,10 @@
       });
       runtimePublicBundle = '';
       runtimeFingerprint = null;
-      fingerprintConfirmation = '';
       displayName = '';
       endpoint = '';
       showAddRuntime = false;
+      requestNotice = 'Runtime registered for this Workspace. Run Test to complete authenticated verification.';
       await invalidateAll();
     } catch (error) {
       requestError = error instanceof RuntimeTrustRequestError || error instanceof Error
@@ -205,71 +222,107 @@
 
   {#if showAddRuntime && data.workspace.permissions.manage_runtimes}
     <form class="settings-runtime-form" onsubmit={addRuntime}>
-      <h2>Add remote Runtime</h2>
-      <div class="settings-form-grid">
-        <label class="settings-form-wide">
-          Runtime public bundle
-          <small>Run <code>yoi-runtime identity show --json</code> on the Runtime host and paste the result.</small>
-          <textarea
-            bind:value={runtimePublicBundle}
-            oninput={() => {
-              runtimeFingerprint = null;
-              fingerprintConfirmation = '';
-            }}
-            required
-            rows="5"
-            spellcheck="false"
-            placeholder={runtimeBundlePlaceholder}
-          ></textarea>
-          <button type="button" disabled={busyRuntimeId !== null} onclick={previewRuntimeFingerprint}>
-            Preview fingerprint
-          </button>
-        </label>
-        {#if runtimeFingerprint}
-          <label>
-            Runtime key fingerprint
-            <code>{runtimeFingerprint}</code>
-            <input
-              bind:value={fingerprintConfirmation}
-              required
-              autocomplete="off"
-              placeholder="Enter the fingerprint exactly"
-            />
-          </label>
-        {/if}
-        <label>
-          Display name
-          <input bind:value={displayName} autocomplete="off" />
-        </label>
-        <label>
-          Endpoint
-          <input bind:value={endpoint} type="url" required placeholder="https://runtime.example" />
-        </label>
-      </div>
-      <section class="settings-runtime-trust-instructions" aria-labelledby="runtime-trust-heading">
-        <h3 id="runtime-trust-heading">Trust this Workspace on the Runtime</h3>
+      <header>
+        <h2>Connect a remote Runtime</h2>
+        <p>
+          This creates a binding for this Workspace. The Runtime can remain connected to other Workspaces;
+          their trust entries are not replaced.
+        </p>
+      </header>
+
+      <section class="settings-runtime-trust-instructions" aria-labelledby="workspace-to-runtime-heading">
+        <h3 id="workspace-to-runtime-heading">1. Trust this Workspace on the Runtime</h3>
+        <p>
+          Each Workspace has its own signing identity. Add this Workspace public bundle to the same store used
+          when starting the Runtime.
+        </p>
         {#if data.signingIdentityError}
           <p class="section-state error">{data.signingIdentityError}</p>
+        {:else if data.signingIdentity?.identity.state === 'pending_provisioning'}
+          <p>This Workspace does not have an active signing identity yet.</p>
+          <button
+            type="button"
+            disabled={busyRuntimeId !== null}
+            onclick={() => void provisionSigningIdentity()}
+          >
+            {busyRuntimeId === 'provision-workspace-identity' ? 'Provisioning…' : 'Provision Workspace identity'}
+          </button>
         {:else if data.signingIdentity?.public_bundle}
           <p>
-            Save this public bundle as <code>workspace-public-bundle.json</code> on the Runtime host.
-            It contains no private key material.
+            Save the bundle as <code>{workspaceBundleFilename()}</code> on the Runtime host. It contains no
+            private key material.
           </p>
           <pre>{workspacePublicBundle()}</pre>
-          <button type="button" onclick={copyWorkspaceBundle}>Copy Workspace public bundle</button>
-          <pre>yoi-runtime trust-workspace add --bundle workspace-public-bundle.json</pre>
-          <p>
-            Runtime registration remains <code>configured</code> until authenticated verification is completed.
-          </p>
+          <button type="button" disabled={busyRuntimeId !== null} onclick={copyWorkspaceBundle}>
+            Copy Workspace public bundle
+          </button>
+          <pre>yoi-runtime trust-workspace add --bundle {workspaceBundleFilename()}</pre>
+          <small>
+            Pass the same <code>--fs-root</code> and <code>--fs-runtime-dir</code> options used by the Runtime
+            service. Existing Workspace trust entries are preserved.
+          </small>
         {:else}
           <p class="section-state">Loading Workspace public identity…</p>
         {/if}
       </section>
+
+      <section class="settings-runtime-trust-instructions" aria-labelledby="runtime-to-workspace-heading">
+        <h3 id="runtime-to-workspace-heading">2. Verify the Runtime identity</h3>
+        <p>
+          On the Runtime host, run <code>yoi-runtime identity show --json</code> with the same Runtime storage
+          options, then paste the public bundle below.
+        </p>
+        <div class="settings-form-grid">
+          <label class="settings-form-wide">
+            Runtime public bundle
+            <textarea
+              bind:value={runtimePublicBundle}
+              oninput={() => {
+                runtimeFingerprint = null;
+              }}
+              required
+              rows="5"
+              spellcheck="false"
+              placeholder={runtimeBundlePlaceholder}
+            ></textarea>
+            <button type="button" disabled={busyRuntimeId !== null} onclick={previewRuntimeFingerprint}>
+              Preview fingerprint
+            </button>
+          </label>
+          {#if runtimeFingerprint}
+            <dl class="runtime-facts">
+              <div>
+                <dt>Runtime fingerprint</dt>
+                <dd><code>{runtimeFingerprint}</code></dd>
+              </div>
+            </dl>
+          {/if}
+        </div>
+      </section>
+
+      <section class="settings-runtime-trust-instructions" aria-labelledby="runtime-connection-heading">
+        <h3 id="runtime-connection-heading">3. Register the connection</h3>
+        <div class="settings-form-grid">
+          <label>
+            Display name
+            <input bind:value={displayName} autocomplete="off" />
+          </label>
+          <label>
+            Endpoint
+            <input bind:value={endpoint} type="url" required placeholder="https://runtime.example" />
+          </label>
+        </div>
+        <p>
+          Registration stores this Workspace-scoped binding. After it appears in the list, run
+          <strong>Test</strong> to complete authenticated verification.
+        </p>
+      </section>
+
       <div class="settings-action-row">
         <button
           type="submit"
-          disabled={busyRuntimeId !== null || !runtimeFingerprint || fingerprintConfirmation.trim() !== runtimeFingerprint}
-        >Add Runtime</button>
+          disabled={busyRuntimeId !== null || !data.signingIdentity?.public_bundle || !runtimeFingerprint}
+        >Register Runtime</button>
         <button type="button" disabled={busyRuntimeId !== null} onclick={() => showAddRuntime = false}>
           Cancel
         </button>
@@ -279,6 +332,9 @@
 
   {#if requestError}
     <p class="section-state error">{requestError}</p>
+  {/if}
+  {#if requestNotice}
+    <p class="section-state">{requestNotice}</p>
   {/if}
 
   {#if data.runtimesError}

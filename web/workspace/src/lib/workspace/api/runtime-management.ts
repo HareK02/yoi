@@ -919,6 +919,30 @@ export async function createRemoteRuntime(
   return runtime;
 }
 
+export async function deleteRemoteRuntime(
+  workspaceId: string,
+  runtimeId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  const response = await fetchImpl(
+    workspaceApiPath(
+      workspaceId,
+      `/runtimes/${encodeURIComponent(runtimeId)}`,
+    ),
+    { method: "DELETE" },
+  );
+  if (response.ok) return;
+  let payload: unknown;
+  try {
+    payload = await readBoundedJson(response);
+  } catch {
+    throw new RuntimeTrustRequestError(
+      `Runtime registration delete failed (${response.status})`,
+    );
+  }
+  throw requestErrorFrom(payload, response.status);
+}
+
 export async function revealRuntimeTrustKey(
   workspaceId: string,
   runtimeId: string,

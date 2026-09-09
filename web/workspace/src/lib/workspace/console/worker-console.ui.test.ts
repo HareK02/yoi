@@ -678,7 +678,7 @@ Deno.test("workspace Runtime inventory lives under Settings admin routes", async
     "Runtimes should be admin Settings navigation, not primary workspace sidebar navigation",
   );
   assert(
-    runtimesPage.includes("Add remote Runtime") &&
+    runtimesPage.includes("Connect a remote Runtime") &&
       runtimesPage.includes("Open workdirs") &&
       runtimesPage.includes("settings-runtime-table") &&
       runtimesPage.includes("testRuntimeConnection") &&

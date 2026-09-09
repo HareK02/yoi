@@ -44,6 +44,48 @@ Deno.test("Runtime Settings routes validate unknown JSON through the shared Runt
   }
 });
 
+Deno.test("Runtime registration presents the complete multi-Workspace trust sequence", async () => {
+  const page = await Deno.readTextFile(
+    new URL(
+      "../src/routes/w/[workspaceId]/settings/runtimes/+page.svelte",
+      import.meta.url,
+    ),
+  );
+
+  for (
+    const token of [
+      "1. Trust this Workspace on the Runtime",
+      "Provision Workspace identity",
+      "provisionWorkspaceSigningIdentity(data.workspaceId)",
+      "Existing Workspace trust entries are preserved.",
+      "--fs-root",
+      "--fs-runtime-dir",
+      "2. Verify the Runtime identity",
+      "yoi-runtime identity show --json",
+      "3. Register the connection",
+      "Register Runtime",
+      "Run Test to complete authenticated verification.",
+    ]
+  ) {
+    assert(
+      page.includes(token),
+      `Runtime registration should include ${token}`,
+    );
+  }
+  assert(
+    page.includes(
+      "data.signingIdentity?.identity.state === 'pending_provisioning'",
+    ) &&
+      page.includes("Loading Workspace public identity…"),
+    "pending identity must have a dedicated provisioning state before loading fallback",
+  );
+  assert(
+    !page.includes("fingerprintConfirmation") &&
+      !page.includes("Confirm Runtime fingerprint"),
+    "Runtime registration must not require retyping a fingerprint",
+  );
+});
+
 Deno.test("Runtime list links to canonical detail and has no inline delete action", async () => {
   const page = await Deno.readTextFile(
     new URL(
@@ -111,22 +153,26 @@ Deno.test("Runtime detail keeps trust controls owner-only and conflict-safe", as
       "Create Workspace trust",
       "Replace trusted key",
       "Reactivate with this key",
-      "Confirm current fingerprint",
       "Revoke Workspace trust",
       "Workspace trust only; this does not delete the Runtime process, Workers, or Workdirs.",
+      "await revokeRuntimeTrustKey(",
+      "deleteRemoteRuntime(data.workspaceId, operation.runtimeId)",
+      "Revoke trust and delete registration",
+      "trust.status !== 'revoked'",
+      "deleteRuntimeConfirmation.trim() !== data.runtimeId",
+      "Delete Runtime registration",
+      "Delete registration",
+      "This does not stop the Runtime process",
       "RuntimeTrustConflictError",
       "RuntimeTrustRouteFence",
       "routeFence.enter(data.runtimeId)",
       "showPublicKey = false",
       "revealedPublicKey = null",
       "publicKey = ''",
-      "fingerprintConfirmation = ''",
-      "revokeFingerprintConfirmation = ''",
       "requestError = null",
       "successMessage = null",
       "isCurrentRoute(operation)",
       "revealRuntimeTrustKey",
-      "revokeFingerprintConfirmation.trim() !== trust.fingerprint",
       "await reloadAuthority()",
       "busyAction !== null",
       "Workdirs",
@@ -134,6 +180,15 @@ Deno.test("Runtime detail keeps trust controls owner-only and conflict-safe", as
     ]
   ) {
     assert(page.includes(token), `Runtime detail should include ${token}`);
+  }
+  for (
+    const token of [
+      "fingerprintConfirmation",
+      "revokeFingerprintConfirmation",
+      "Confirm current fingerprint",
+    ]
+  ) {
+    assert(!page.includes(token), `Runtime detail must not require ${token}`);
   }
 });
 

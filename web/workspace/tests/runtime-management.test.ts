@@ -4,6 +4,7 @@ declare const Deno: {
 
 import {
   createRemoteRuntime,
+  deleteRemoteRuntime,
   parseRuntimeTrustConflict,
   parseRuntimeTrustKeyRevealResponse,
   parseWorkspaceRuntimeDetail,
@@ -270,6 +271,24 @@ Deno.test("mismatched revoke fingerprint never sends a request", async () => {
   }
   assert(rejected, "mismatched fingerprint should be rejected locally");
   assert(requests === 0, "mismatched fingerprint sent a revoke request");
+});
+
+Deno.test("Runtime registration delete uses the Workspace-scoped resource route", async () => {
+  let requestedUrl = "";
+  let requestedMethod = "";
+  const fetchImpl = ((input: string | URL | Request, init?: RequestInit) => {
+    requestedUrl = String(input);
+    requestedMethod = init?.method ?? "GET";
+    return Promise.resolve(new Response(null, { status: 204 }));
+  }) as typeof fetch;
+
+  await deleteRemoteRuntime("workspace a", "runtime/a", fetchImpl);
+
+  assert(
+    requestedUrl === "/api/w/workspace%20a/runtimes/runtime%2Fa",
+    `unexpected delete URL: ${requestedUrl}`,
+  );
+  assert(requestedMethod === "DELETE", "Runtime delete must use DELETE");
 });
 
 Deno.test("Runtime route fence rejects a delayed reveal from the prior Runtime", async () => {

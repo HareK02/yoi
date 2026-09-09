@@ -1,11 +1,12 @@
 <script lang="ts">
-  import { invalidateAll } from '$app/navigation';
+  import { goto, invalidateAll } from '$app/navigation';
   import type {
     RevokeRuntimeTrustKeyRequest,
     RuntimeTrustKeyStatus,
   } from '$lib/generated/workspace-api';
   import {
     createRemoteRuntime,
+    deleteRemoteRuntime,
     previewRuntimePublicKeyFingerprint,
     revealRuntimeTrustKey,
     revokeRuntimeTrustKey,
@@ -22,10 +23,10 @@
   let showPublicKey = $state(false);
   let revealedPublicKey = $state<string | null>(null);
   let publicKey = $state('');
-  let fingerprintConfirmation = $state('');
-  let revokeFingerprintConfirmation = $state('');
-  let busyAction = $state<'save' | 'revoke' | 'reveal' | 'copy' | null>(null);
+  let deleteRuntimeConfirmation = $state('');
+  let busyAction = $state<'save' | 'revoke' | 'reveal' | 'copy' | 'delete' | null>(null);
   let fieldError = $state<string | null>(null);
+  let deleteRuntimeError = $state<string | null>(null);
   let requestError = $state<string | null>(null);
   let successMessage = $state<string | null>(null);
   let replacementFingerprint = $state<string | null>(null);
@@ -42,10 +43,10 @@
     showPublicKey = false;
     revealedPublicKey = null;
     publicKey = '';
-    fingerprintConfirmation = '';
-    revokeFingerprintConfirmation = '';
+    deleteRuntimeConfirmation = '';
     busyAction = null;
     fieldError = null;
+    deleteRuntimeError = null;
     requestError = null;
     successMessage = null;
     replacementFingerprint = null;
@@ -132,16 +133,6 @@
 
     const trust = data.runtimeDetail.trust_key;
     const action = trustAction(trust.status);
-    if (action !== 'create') {
-      if (!trust.fingerprint) {
-        requestError = 'The authoritative fingerprint is unavailable. Reload before changing trust.';
-        return;
-      }
-      if (fingerprintConfirmation.trim() !== trust.fingerprint) {
-        fieldError = 'Enter the current fingerprint exactly to confirm this change.';
-        return;
-      }
-    }
 
     const operation = routeFence.capture(data.runtimeId);
     busyAction = 'save';
@@ -163,8 +154,6 @@
       });
       if (!isCurrentRoute(operation)) return;
       publicKey = '';
-      fingerprintConfirmation = '';
-      revokeFingerprintConfirmation = '';
       showPublicKey = false;
       revealedPublicKey = null;
       successMessage = action === 'create'
@@ -175,7 +164,6 @@
       await reloadAuthority();
     } catch (error) {
       if (!isCurrentRoute(operation)) return;
-      fingerprintConfirmation = '';
       if (error instanceof RuntimeTrustConflictError) {
         requestError = `${error.message} Authoritative Runtime trust has been reloaded.`;
         await reloadAuthority();
@@ -196,11 +184,8 @@
       requestError = 'Only active Workspace trust can be revoked.';
       return;
     }
-    if (
-      !trust.fingerprint ||
-      revokeFingerprintConfirmation.trim() !== trust.fingerprint
-    ) {
-      fieldError = 'Enter the current fingerprint exactly before revoking Workspace trust.';
+    if (!trust.fingerprint) {
+      requestError = 'The authoritative fingerprint is unavailable. Reload before revoking trust.';
       return;
     }
 
@@ -219,12 +204,10 @@
         operation.runtimeId,
         request,
         trust.fingerprint,
-        revokeFingerprintConfirmation,
+        trust.fingerprint,
       );
       if (!isCurrentRoute(operation)) return;
       publicKey = '';
-      fingerprintConfirmation = '';
-      revokeFingerprintConfirmation = '';
       showPublicKey = false;
       revealedPublicKey = null;
       successMessage = 'Workspace trust was revoked.';
@@ -237,6 +220,48 @@
       } else {
         requestError = error instanceof Error ? error.message : 'Runtime trust revoke failed.';
       }
+    } finally {
+      if (isCurrentRoute(operation)) busyAction = null;
+    }
+  }
+
+  async function deleteRegistration(): Promise<void> {
+    if (busyAction !== null || !data.runtimeDetail) return;
+    const runtime = data.runtimeDetail.runtime;
+    if (runtime.management.built_in) return;
+    if (deleteRuntimeConfirmation.trim() !== data.runtimeId) {
+      deleteRuntimeError = 'Enter the Runtime ID exactly to confirm deletion.';
+      return;
+    }
+
+    const operation = routeFence.capture(data.runtimeId);
+    busyAction = 'delete';
+    deleteRuntimeError = null;
+    try {
+      if (data.runtimeDetail.trust_key.status !== 'revoked') {
+        const trust = data.runtimeDetail.trust_key;
+        if (trust.revision == null || !trust.fingerprint) {
+          throw new Error('Runtime trust revision and fingerprint are required before deletion.');
+        }
+        await revokeRuntimeTrustKey(
+          data.workspaceId,
+          operation.runtimeId,
+          { expected_revision: trust.revision },
+          trust.fingerprint,
+          trust.fingerprint,
+        );
+        if (!isCurrentRoute(operation)) return;
+      }
+      await deleteRemoteRuntime(data.workspaceId, operation.runtimeId);
+      if (!isCurrentRoute(operation)) return;
+      await goto(`/w/${encodeURIComponent(data.workspaceId)}/settings/runtimes`, {
+        replaceState: true,
+      });
+    } catch (error) {
+      if (!isCurrentRoute(operation)) return;
+      deleteRuntimeError = error instanceof Error
+        ? error.message
+        : 'Runtime registration deletion failed.';
     } finally {
       if (isCurrentRoute(operation)) busyAction = null;
     }
@@ -397,18 +422,6 @@
             <p class="field-error">{replacementFingerprintError}</p>
           {/if}
 
-          {#if currentAction !== 'create'}
-            <label for="runtime-fingerprint-confirmation">Confirm current fingerprint</label>
-            <input
-              id="runtime-fingerprint-confirmation"
-              bind:value={fingerprintConfirmation}
-              autocomplete="off"
-              spellcheck="false"
-              placeholder={trust.fingerprint ?? ''}
-            />
-            <small>Enter <code>{trust.fingerprint ?? 'the current fingerprint'}</code> exactly.</small>
-          {/if}
-
           {#if fieldError}
             <p id="runtime-public-key-error" class="field-error">{fieldError}</p>
           {/if}
@@ -423,25 +436,11 @@
           <div>
             <strong>Revoke Workspace trust</strong>
             <p>Workspace trust only; this does not delete the Runtime process, Workers, or Workdirs.</p>
-            <label>
-              Confirm current fingerprint
-              <input
-                bind:value={revokeFingerprintConfirmation}
-                autocomplete="off"
-                spellcheck="false"
-                disabled={trust.status !== 'active' || busyAction !== null}
-              />
-              <small>Enter <code>{trust.fingerprint ?? 'the current fingerprint'}</code> exactly before revocation.</small>
-            </label>
           </div>
           <button
             type="button"
             class="danger"
-            disabled={
-              busyAction !== null ||
-              trust.status !== 'active' ||
-              revokeFingerprintConfirmation.trim() !== trust.fingerprint
-            }
+            disabled={busyAction !== null || trust.status !== 'active'}
             onclick={revokeTrust}
           >{busyAction === 'revoke' ? 'Revoking…' : 'Revoke trust'}</button>
         </div>
@@ -480,5 +479,45 @@
         </div>
       {/if}
     </section>
+
+    {#if data.workspace.permissions.manage_runtimes && !runtime.management.built_in}
+      <section class="runtime-detail-section runtime-danger-zone" aria-labelledby="runtime-delete-heading">
+        <h2 id="runtime-delete-heading">Delete Runtime registration</h2>
+        <p>
+          Remove this Runtime binding from the current Workspace. This does not stop the Runtime process,
+          delete its Workers or Workdirs, or revoke this Workspace on the Runtime host.
+        </p>
+        {#if trust.status !== 'revoked'}
+          <p class="section-state warning">
+            Deletion will revoke this Workspace trust first. Stop or move active Workers before continuing.
+          </p>
+        {/if}
+        <label for="runtime-delete-confirmation">Confirm Runtime ID</label>
+        <input
+          id="runtime-delete-confirmation"
+          bind:value={deleteRuntimeConfirmation}
+          autocomplete="off"
+          spellcheck="false"
+          disabled={busyAction !== null}
+          placeholder={data.runtimeId}
+        />
+        <small>Enter <code>{data.runtimeId}</code> exactly.</small>
+        {#if deleteRuntimeError}
+          <p class="section-state error" role="alert">{deleteRuntimeError}</p>
+        {/if}
+        <div class="settings-action-row">
+          <button
+            type="button"
+            class="danger"
+            disabled={busyAction !== null || deleteRuntimeConfirmation.trim() !== data.runtimeId}
+            onclick={deleteRegistration}
+          >{busyAction === 'delete'
+              ? 'Deleting…'
+              : trust.status === 'revoked'
+              ? 'Delete registration'
+              : 'Revoke trust and delete registration'}</button>
+        </div>
+      </section>
+    {/if}
   {/if}
 </section>
