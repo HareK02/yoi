@@ -2060,6 +2060,20 @@ fn take_new_workdir_repository_access(
     Ok(Some(access))
 }
 
+fn embedded_runtime_request_audience(config: &ServerConfig) -> crate::Result<String> {
+    config
+        .backend_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|audience| !audience.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            crate::Error::Store(
+                "embedded Runtime request source requires Backend public URL authority".to_string(),
+            )
+        })
+}
+
 impl WorkspaceApi {
     pub fn with_config_schema_provider(
         mut self,
@@ -2099,7 +2113,7 @@ impl WorkspaceApi {
                 true,
             )
             .await?;
-        let embedded_audience = format!("embedded:{}", config.workspace_id);
+        let embedded_request_audience = embedded_runtime_request_audience(&config)?;
         let worker_remove_dispatcher = Arc::new(
             crate::worker_source::EmbeddedServerWorkerMutationDispatcher::new(
                 config.clone(),
@@ -2112,7 +2126,7 @@ impl WorkspaceApi {
                     EMBEDDED_RUNTIME_ID,
                     worker_remove_dispatcher.clone(),
                 )
-                .with_runtime_request_identity(embedded_identity, embedded_audience)
+                .with_runtime_request_identity(embedded_identity, embedded_request_audience)
                 .with_runtime_store_dir(config.embedded_runtime_store_root.clone())
                 .with_controller_transport(worker::WorkerControllerTransport::InProcess)
                 .with_resource_client(Arc::new(resource_broker.clone())),
@@ -20923,6 +20937,7 @@ mod tests {
         let mut config = ServerConfig::local_dev(workspace_root.clone(), test_identity())
             .with_embedded_runtime_store_root(store_root);
         config.database_path = workspace_root.join(".test-yoi-server.db");
+        config.backend_base_url = Some("http://127.0.0.1:8787".to_string());
         let source = workspace_api::RepositorySource {
             kind: workspace_api::RepositorySourceKind::LocalPath,
             uri: workspace_root.display().to_string(),
@@ -20940,6 +20955,21 @@ mod tests {
             default_selector: Some("HEAD".to_string()),
         }];
         config
+    }
+
+    #[test]
+    fn embedded_runtime_request_source_uses_backend_public_url_audience() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = test_server_config(temp.path());
+        config.backend_base_url = Some("https://backend.example.test/".to_string());
+
+        assert_eq!(
+            embedded_runtime_request_audience(&config).unwrap(),
+            "https://backend.example.test/"
+        );
+
+        config.backend_base_url = None;
+        assert!(embedded_runtime_request_audience(&config).is_err());
     }
 
     fn test_control_store(config: &ServerConfig) -> SqliteWorkspaceStore {
