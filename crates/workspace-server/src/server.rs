@@ -10331,11 +10331,27 @@ fn working_directory_diagnostics(
         .collect()
 }
 
+async fn require_active_workspace_runtime_binding(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+) -> ApiResult<()> {
+    let binding = api
+        .store
+        .get_workspace_runtime_binding(&api.config.workspace_id, runtime_id)
+        .await?
+        .ok_or_else(|| Error::UnknownRuntime(runtime_id.to_string()))?;
+    if binding.revoked_at.is_some() {
+        return Err(Error::UnknownRuntime(runtime_id.to_string()).into());
+    }
+    Ok(())
+}
+
 async fn scoped_list_runtime_working_directories(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
 ) -> ApiResult<Json<BrowserWorkingDirectoryListResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
+    require_active_workspace_runtime_binding(&api, &path.runtime_id).await?;
     let (items, diagnostics) = runtime_working_directory_summaries(&api, &path.runtime_id)?;
     Ok(Json(BrowserWorkingDirectoryListResponse {
         workspace_id: api.config.workspace_id.clone(),
@@ -10349,6 +10365,7 @@ async fn scoped_create_runtime_working_directory(
     AxumPath(path): AxumPath<ScopedRuntimePath>,
     Json(request): Json<BrowserWorkingDirectoryCreateRequest>,
 ) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryCreateResponse>)> {
+    require_active_workspace_runtime_binding(&api, &path.runtime_id).await?;
     create_workspace_working_directory(
         &api,
         &path.workspace_id,
@@ -10363,6 +10380,7 @@ async fn scoped_runtime_working_directory_detail(
     AxumPath(path): AxumPath<ScopedRuntimeWorkingDirectoryPath>,
 ) -> ApiResult<Json<BrowserWorkingDirectoryDetailResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
+    require_active_workspace_runtime_binding(&api, &path.runtime_id).await?;
     working_directory_detail_for_runtime(api, &path.runtime_id, &path.working_directory_id)
 }
 
@@ -10374,6 +10392,7 @@ async fn scoped_cleanup_runtime_working_directory(
     Json(request): Json<WorkingDirectoryRemovalRequest>,
 ) -> ApiResult<Json<WorkingDirectoryRemovalResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
+    require_active_workspace_runtime_binding(&api, &path.runtime_id).await?;
     let registered_runtime = registered_workdir_runtime_id(&api, &path.working_directory_id)?;
     if registered_runtime != path.runtime_id {
         return Err(ApiError::from(Error::WorkspacePermissionDenied(
@@ -13587,33 +13606,47 @@ async fn delete_remote_runtime(
         )
         .into());
     }
-    match api
-        .runtime
-        .unregister_if_idle(&runtime_id, api.config.max_records.min(200))
-        .map_err(|err| err.into_error())?
-    {
-        RuntimeRegistryUnregisterResult::Removed | RuntimeRegistryUnregisterResult::NotFound => {}
-        RuntimeRegistryUnregisterResult::BlockedByWorkers {
-            worker_count,
-            diagnostics,
-        } => {
-            let mut diagnostics = diagnostics;
-            diagnostics.push(settings_diagnostic(
-                "remote_runtime_delete_blocked",
-                DiagnosticSeverity::Error,
-                format!(
-                    "Remote Runtime '{runtime_id}' has {worker_count} active worker(s); stop or move them before deleting it."
-                ),
-            ));
-            return Err(ApiError::with_diagnostics(
-                Error::RuntimeOperationFailed {
-                    runtime_id,
-                    code: "remote_runtime_delete_blocked".to_string(),
-                    message: "Remote Runtime has active workers".to_string(),
-                },
+    let has_other_active_binding = api
+        .store
+        .has_other_active_workspace_runtime_binding(&api.config.workspace_id, &runtime_id)
+        .await?;
+    if !has_other_active_binding {
+        match api
+            .runtime
+            .unregister_if_idle(&runtime_id, api.config.max_records.min(200))
+            .map_err(|err| err.into_error())?
+        {
+            RuntimeRegistryUnregisterResult::Removed
+            | RuntimeRegistryUnregisterResult::NotFound => {}
+            RuntimeRegistryUnregisterResult::BlockedByWorkers {
+                worker_count,
                 diagnostics,
-            ));
+            } => {
+                let mut diagnostics = diagnostics;
+                diagnostics.push(settings_diagnostic(
+                    "remote_runtime_delete_blocked",
+                    DiagnosticSeverity::Error,
+                    format!(
+                        "Remote Runtime '{runtime_id}' has {worker_count} active worker(s); stop or move them before deleting its final Workspace registration."
+                    ),
+                ));
+                return Err(ApiError::with_diagnostics(
+                    Error::RuntimeOperationFailed {
+                        runtime_id,
+                        code: "remote_runtime_delete_blocked".to_string(),
+                        message: "Remote Runtime has active workers".to_string(),
+                    },
+                    diagnostics,
+                ));
+            }
         }
+    }
+    if !api
+        .store
+        .delete_workspace_runtime_binding(&api.config.workspace_id, &runtime_id)
+        .await?
+    {
+        return Err(Error::UnknownRuntime(runtime_id).into());
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -16130,16 +16163,20 @@ fn runtime_binding_summary(
     binding: &WorkspaceRuntimeBinding,
     verification: Option<&crate::store::WorkspaceRuntimeVerificationEvidence>,
 ) -> WorkspaceRuntimeBindingSummary {
-    let valid_verification = verification.filter(|verification| {
-        verification.state == "verified"
-            && verification.binding_revision == binding.binding_revision
+    let current_verification = verification.filter(|verification| {
+        verification.binding_revision == binding.binding_revision
             && verification.runtime_public_key_fingerprint == binding.public_key_fingerprint
             && verification.workspace_key_id
                 == binding.workspace_key_id.as_deref().unwrap_or_default()
     });
+    let valid_verification = current_verification.filter(|verification| {
+        verification.state == "verified" && verification.last_outcome == "verified"
+    });
     let connection_state = match binding.state {
         StoredRuntimeBindingState::Revoked => RuntimeConnectionDisplayState::Revoked,
-        _ if verification.is_some_and(|verification| verification.last_outcome != "verified") => {
+        _ if current_verification
+            .is_some_and(|verification| verification.last_outcome != "verified") =>
+        {
             RuntimeConnectionDisplayState::Unavailable
         }
         StoredRuntimeBindingState::Verified
@@ -16161,7 +16198,7 @@ fn runtime_binding_summary(
         revision: binding.binding_revision,
         workspace_key_id: binding.workspace_key_id.clone(),
         workspace_key_generation: binding.workspace_key_generation,
-        verification: verification.and_then(runtime_verification_summary),
+        verification: current_verification.and_then(runtime_verification_summary),
     }
 }
 
@@ -20955,6 +20992,59 @@ mod tests {
             default_selector: Some("HEAD".to_string()),
         }];
         config
+    }
+
+    #[tokio::test]
+    async fn scoped_runtime_workdir_access_requires_workspace_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+
+        let response = require_active_workspace_runtime_binding(&api, "unregistered-runtime")
+            .await
+            .unwrap_err()
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn runtime_binding_summary_omits_stale_verification_revision() {
+        let binding = WorkspaceRuntimeBinding {
+            workspace_id: "workspace-a".to_string(),
+            runtime_id: "runtime-a".to_string(),
+            display_name: "Runtime A".to_string(),
+            base_url: "https://runtime.example.test".to_string(),
+            public_key: "runtime-public-key".to_string(),
+            public_key_fingerprint: "sha256:runtime".to_string(),
+            binding_revision: 2,
+            state: crate::store::WorkspaceRuntimeBindingState::Revoked,
+            authentication_mode:
+                crate::store::WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity,
+            workspace_key_id: Some("WK-a".to_string()),
+            workspace_key_generation: Some(1),
+            created_at: "1".to_string(),
+            updated_at: "2".to_string(),
+            revoked_at: Some("2".to_string()),
+        };
+        let stale = crate::store::WorkspaceRuntimeVerificationEvidence {
+            workspace_id: "workspace-a".to_string(),
+            runtime_id: "runtime-a".to_string(),
+            binding_revision: 1,
+            workspace_key_id: "WK-a".to_string(),
+            workspace_identity_revision: 1,
+            workspace_trust_generation: 1,
+            runtime_public_key_fingerprint: "sha256:runtime".to_string(),
+            runtime_identity_revision: 1,
+            challenge_id: "challenge-a".to_string(),
+            state: "failed".to_string(),
+            last_outcome: "connectivity_failed".to_string(),
+            verified_at: None,
+            checked_at: "1".to_string(),
+        };
+
+        let summary = runtime_binding_summary(&binding, Some(&stale));
+
+        assert_eq!(summary.verification, None);
     }
 
     #[test]
@@ -27954,9 +28044,8 @@ mod tests {
         let persisted = store
             .get_workspace_runtime_binding(TEST_WORKSPACE_ID, "team-runtime")
             .await
-            .unwrap()
             .unwrap();
-        assert!(persisted.revoked_at.is_some());
+        assert!(persisted.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]

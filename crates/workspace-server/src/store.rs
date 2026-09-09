@@ -799,6 +799,16 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         workspace_id: &str,
         include_revoked: bool,
     ) -> Result<Vec<WorkspaceRuntimeBinding>>;
+    async fn has_other_active_workspace_runtime_binding(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Result<bool>;
+    async fn delete_workspace_runtime_binding(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Result<bool>;
     async fn upsert_workspace_runtime_binding_record(
         &self,
         record: WorkspaceRuntimeBinding,
@@ -1860,6 +1870,88 @@ impl SqliteWorkspaceStore {
         })
     }
 
+    pub fn has_other_active_workspace_runtime_binding(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Result<bool> {
+        validate_identifier("workspace_id", workspace_id)?;
+        validate_identifier("runtime_id", runtime_id)?;
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM workspace_runtime_bindings
+                    WHERE runtime_id = ?1 AND workspace_id <> ?2 AND revoked_at IS NULL
+                )",
+                params![runtime_id, workspace_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn delete_workspace_runtime_binding(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Result<bool> {
+        validate_identifier("workspace_id", workspace_id)?;
+        validate_identifier("runtime_id", runtime_id)?;
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let revoked_at = tx
+                .query_row(
+                    "SELECT revoked_at FROM workspace_runtime_bindings WHERE workspace_id = ?1 AND runtime_id = ?2",
+                    params![workspace_id, runtime_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?;
+            let Some(revoked_at) = revoked_at else {
+                tx.commit()?;
+                return Ok(false);
+            };
+            if revoked_at.is_none() {
+                return Err(crate::Error::RuntimeBindingConflict(format!(
+                    "Runtime binding `{runtime_id}` must be revoked before deletion"
+                )));
+            }
+            let worker_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM worker_registry WHERE workspace_id = ?1 AND runtime_id = ?2",
+                params![workspace_id, runtime_id],
+                |row| row.get(0),
+            )?;
+            if worker_count > 0 {
+                return Err(crate::Error::RuntimeBindingConflict(format!(
+                    "Runtime binding `{runtime_id}` still has {worker_count} registered Worker(s) in Workspace `{workspace_id}`"
+                )));
+            }
+            let workdir_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM workdir_registry WHERE workspace_id = ?1 AND runtime_id = ?2",
+                params![workspace_id, runtime_id],
+                |row| row.get(0),
+            )?;
+            if workdir_count > 0 {
+                return Err(crate::Error::RuntimeBindingConflict(format!(
+                    "Runtime binding `{runtime_id}` still has {workdir_count} registered Workdir(s) in Workspace `{workspace_id}`"
+                )));
+            }
+            tx.execute(
+                "DELETE FROM worker_mutation_source_proof_jtis WHERE workspace_id = ?1 AND runtime_id = ?2",
+                params![workspace_id, runtime_id],
+            )?;
+            tx.execute(
+                "DELETE FROM workspace_runtime_binding_audit WHERE workspace_id = ?1 AND runtime_id = ?2",
+                params![workspace_id, runtime_id],
+            )?;
+            let deleted = tx.execute(
+                "DELETE FROM workspace_runtime_bindings WHERE workspace_id = ?1 AND runtime_id = ?2",
+                params![workspace_id, runtime_id],
+            )?;
+            tx.commit()?;
+            Ok(deleted == 1)
+        })
+    }
+
     pub fn upsert_workspace_runtime_binding(
         &self,
         mut record: WorkspaceRuntimeBinding,
@@ -1928,6 +2020,10 @@ impl SqliteWorkspaceStore {
                     ],
                 )
                 .map_err(map_runtime_binding_write_error)?;
+                tx.execute(
+                    "DELETE FROM workspace_runtime_verifications WHERE workspace_id = ?1 AND runtime_id = ?2",
+                    params![record.workspace_id, record.runtime_id],
+                )?;
                 tx.commit()?;
                 return Ok(WorkspaceRuntimeBindingUpsert::Replaced);
             }
@@ -1968,14 +2064,22 @@ impl SqliteWorkspaceStore {
         validate_identifier("workspace_id", workspace_id)?;
         validate_identifier("runtime_id", runtime_id)?;
         validate_non_empty("revoked_at", revoked_at)?;
-        self.with_conn(|conn| {
-            let changed = conn.execute(
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
                 r#"UPDATE workspace_runtime_bindings
                    SET state = 'revoked', revoked_at = ?3, updated_at = ?3,
                        binding_revision = binding_revision + 1
                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND revoked_at IS NULL"#,
                 params![workspace_id, runtime_id, revoked_at],
             )?;
+            if changed > 0 {
+                tx.execute(
+                    "DELETE FROM workspace_runtime_verifications WHERE workspace_id = ?1 AND runtime_id = ?2",
+                    params![workspace_id, runtime_id],
+                )?;
+            }
+            tx.commit()?;
             Ok(changed > 0)
         })
     }
@@ -2080,6 +2184,10 @@ impl SqliteWorkspaceStore {
                         next_revision,
                         record.updated_at,
                     ],
+                )?;
+                tx.execute(
+                    "DELETE FROM workspace_runtime_verifications WHERE workspace_id = ?1 AND runtime_id = ?2",
+                    params![record.workspace_id, record.runtime_id],
                 )?;
                 insert_workspace_runtime_binding_audit(
                     &tx,
@@ -2210,6 +2318,10 @@ impl SqliteWorkspaceStore {
                    SET state = 'revoked', revoked_at = ?3, updated_at = ?3, binding_revision = ?4
                    WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                 params![workspace_id, runtime_id, revoked_at, next_revision],
+            )?;
+            tx.execute(
+                "DELETE FROM workspace_runtime_verifications WHERE workspace_id = ?1 AND runtime_id = ?2",
+                params![workspace_id, runtime_id],
             )?;
             insert_workspace_runtime_binding_audit(
                 &tx,
@@ -3329,6 +3441,26 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         include_revoked: bool,
     ) -> Result<Vec<WorkspaceRuntimeBinding>> {
         SqliteWorkspaceStore::list_workspace_runtime_bindings(self, workspace_id, include_revoked)
+    }
+
+    async fn has_other_active_workspace_runtime_binding(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Result<bool> {
+        SqliteWorkspaceStore::has_other_active_workspace_runtime_binding(
+            self,
+            workspace_id,
+            runtime_id,
+        )
+    }
+
+    async fn delete_workspace_runtime_binding(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Result<bool> {
+        SqliteWorkspaceStore::delete_workspace_runtime_binding(self, workspace_id, runtime_id)
     }
 
     async fn upsert_workspace_runtime_binding_record(
@@ -10044,6 +10176,28 @@ mod tests {
                 .revoked_at
                 .is_some()
         );
+        assert!(
+            reopened
+                .has_other_active_workspace_runtime_binding("workspace-a", "shared")
+                .unwrap()
+        );
+        assert!(
+            reopened
+                .delete_workspace_runtime_binding("workspace-a", "shared")
+                .unwrap()
+        );
+        assert!(
+            reopened
+                .get_workspace_runtime_binding("workspace-a", "shared")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reopened
+                .get_workspace_runtime_binding("workspace-b", "shared")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -10485,6 +10639,29 @@ mod tests {
             .unwrap();
         assert_eq!(replaced, WorkspaceRuntimeBindingMutation::Replaced);
         assert_eq!(replaced_binding.binding_revision, 2);
+        store
+            .record_workspace_runtime_verification_attempt(&WorkspaceRuntimeVerificationEvidence {
+                workspace_id: "workspace-a".to_string(),
+                runtime_id: "runtime-a".to_string(),
+                binding_revision: 2,
+                workspace_key_id: "WK-a".to_string(),
+                workspace_identity_revision: 1,
+                workspace_trust_generation: 1,
+                runtime_public_key_fingerprint: replaced_binding.public_key_fingerprint.clone(),
+                runtime_identity_revision: 1,
+                challenge_id: "challenge-a".to_string(),
+                state: "failed".to_string(),
+                last_outcome: "connectivity_failed".to_string(),
+                verified_at: None,
+                checked_at: "3".to_string(),
+            })
+            .unwrap();
+        assert!(
+            store
+                .get_workspace_runtime_verification("workspace-a", "runtime-a")
+                .unwrap()
+                .is_some()
+        );
         let (revoked, revoked_binding) = store
             .revoke_workspace_runtime_binding_key("workspace-a", "runtime-a", 2, "owner", "4")
             .unwrap();
@@ -10492,6 +10669,12 @@ mod tests {
         assert_eq!(revoked_binding.binding_revision, 3);
         assert_eq!(revoked_binding.revoked_at.as_deref(), Some("4"));
         assert_eq!(revoked_binding.state, WorkspaceRuntimeBindingState::Revoked);
+        assert_eq!(
+            store
+                .get_workspace_runtime_verification("workspace-a", "runtime-a")
+                .unwrap(),
+            None
+        );
         let (reactivated, reactivated_binding) = store
             .put_workspace_runtime_binding_key(
                 binding(second.public_key.clone(), "5"),
