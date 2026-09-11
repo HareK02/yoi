@@ -3986,6 +3986,27 @@ mod tests {
     }
 
     #[test]
+    fn corrupted_working_directory_record_can_be_removed() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitMaterializer::new(runtime_root.path());
+        let working_directory_id = "workdir-corrupted";
+        let root = materializer.working_directory_root(working_directory_id);
+        fs::create_dir_all(root.join(CHECKOUT_DIR)).unwrap();
+        fs::write(root.join(MATERIALIZATION_RECORD), b"not-json").unwrap();
+
+        let status = materializer
+            .working_directory_status(working_directory_id)
+            .unwrap();
+        assert_eq!(status.summary.status, WorkingDirectoryStatusKind::Corrupted);
+
+        let removed = materializer
+            .cleanup_working_directory(working_directory_id)
+            .unwrap();
+        assert_eq!(removed.summary.status, WorkingDirectoryStatusKind::NotFound);
+        assert!(!root.exists());
+    }
+
+    #[test]
     fn cleanup_working_directory_removes_clone_and_record() {
         let repo = create_clean_repo();
         let runtime_root = tempfile::tempdir().unwrap();

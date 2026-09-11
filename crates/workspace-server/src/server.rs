@@ -11425,8 +11425,10 @@ fn execute_reserved_workdir_removal_with_provider(
             true,
         );
     };
-    if status.summary.cleanliness.as_deref() != Some("clean")
-        || status.summary.status != WorkingDirectoryStatusKind::Active
+    let corrupted = status.summary.status == WorkingDirectoryStatusKind::Corrupted;
+    if !corrupted
+        && (status.summary.cleanliness.as_deref() != Some("clean")
+            || status.summary.status != WorkingDirectoryStatusKind::Active)
     {
         return api.config_store.complete_workdir_removal_retained(
             &operation,
@@ -26683,6 +26685,31 @@ mod tests {
         .unwrap();
         assert_eq!(dirty.disposition, Some(WorkdirRemovalDisposition::Retained));
         assert_eq!(dirty_provider.cleanup_calls(), 0);
+
+        let (corrupted_operation, mut corrupted_summary) =
+            reserve_removal_fixture(&api, "provider-corrupted");
+        corrupted_summary.status = WorkingDirectoryStatusKind::Corrupted;
+        corrupted_summary.cleanliness = Some("unknown".to_string());
+        let corrupted_provider = FakeWorkdirRemovalProvider::new(
+            workdir_removal_result(
+                WorkerOperationState::Accepted,
+                Some(corrupted_summary),
+                Vec::new(),
+            ),
+            workdir_removal_result(WorkerOperationState::Accepted, None, Vec::new()),
+        );
+        let corrupted = execute_reserved_workdir_removal_with_provider(
+            &api,
+            corrupted_operation,
+            false,
+            &corrupted_provider,
+        )
+        .unwrap();
+        assert_eq!(
+            corrupted.disposition,
+            Some(WorkdirRemovalDisposition::Removed)
+        );
+        assert_eq!(corrupted_provider.cleanup_calls(), 1);
 
         let (unsupported_operation, unsupported_summary) =
             reserve_removal_fixture(&api, "provider-unsupported");
