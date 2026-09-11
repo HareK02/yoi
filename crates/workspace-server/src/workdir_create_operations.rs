@@ -172,7 +172,6 @@ impl SqliteWorkspaceStore {
         host_trust_id: &str,
         host_trust_revision: u64,
         repository_access_mode: &str,
-        cache_generation: u64,
         now: &str,
     ) -> Result<WorkdirCreateOperationRecord> {
         self.with_conn_mut(|conn| {
@@ -194,7 +193,6 @@ impl SqliteWorkspaceStore {
                     || operation.host_trust_revision != Some(host_trust_revision)
                     || operation.repository_access_mode.as_deref()
                         != Some(repository_access_mode)
-                    || operation.cache_generation != cache_generation
                 {
                     return Err(Error::InvalidInput(format!(
                         "Workdir create operation `{operation_id}` Repository access evidence changed"
@@ -206,8 +204,7 @@ impl SqliteWorkspaceStore {
                 r#"UPDATE workdir_create_operations
                    SET credential_id = ?4, credential_revision = ?5,
                        host_trust_id = ?6, host_trust_revision = ?7,
-                       repository_access_mode = ?8, cache_generation = ?9,
-                       updated_at = ?10
+                       repository_access_mode = ?8, updated_at = ?9
                    WHERE workspace_id = ?1 AND operation_id = ?2
                      AND request_fingerprint = ?3 AND credential_id IS NULL"#,
                 params![
@@ -223,9 +220,6 @@ impl SqliteWorkspaceStore {
                         "host-trust revision is out of range".to_string()
                     ))?,
                     repository_access_mode,
-                    i64::try_from(cache_generation).map_err(|_| Error::InvalidInput(
-                        "cache generation is out of range".to_string()
-                    ))?,
                     now,
                 ],
             )?;
@@ -294,7 +288,7 @@ fn read_workdir_create_operation(
                   config_projection_digest, source_kind, source_uri, source_revision,
                   source_fingerprint, credential_id, credential_revision,
                   host_trust_id, host_trust_revision, repository_access_mode,
-                  cache_generation, working_directory_id, state, failure,
+                  working_directory_id, state, failure,
                   created_at, updated_at
            FROM workdir_create_operations
            WHERE workspace_id = ?1 AND operation_id = ?2"#,
@@ -319,12 +313,11 @@ fn read_workdir_create_operation(
                 host_trust_id: row.get(15)?,
                 host_trust_revision: row.get::<_, Option<i64>>(16)?.map(|value| value as u64),
                 repository_access_mode: row.get(17)?,
-                cache_generation: row.get::<_, i64>(18)? as u64,
-                working_directory_id: row.get(19)?,
-                state: row.get(20)?,
-                failure: row.get(21)?,
-                created_at: row.get(22)?,
-                updated_at: row.get(23)?,
+                working_directory_id: row.get(18)?,
+                state: row.get(19)?,
+                failure: row.get(20)?,
+                created_at: row.get(21)?,
+                updated_at: row.get(22)?,
             })
         },
     )
@@ -410,7 +403,6 @@ mod tests {
             host_trust_id: None,
             host_trust_revision: None,
             repository_access_mode: None,
-            cache_generation: 0,
             working_directory_id: "wd-1".to_string(),
             state: "pending".to_string(),
             failure: None,
@@ -431,14 +423,12 @@ mod tests {
                 "trust-1",
                 5,
                 "read_only",
-                2,
                 "2026-08-24T00:00:01Z",
             )
             .unwrap();
         assert_eq!(bound.credential_id.as_deref(), Some("credential-1"));
         assert_eq!(bound.credential_revision, Some(3));
         assert_eq!(bound.host_trust_revision, Some(5));
-        assert_eq!(bound.cache_generation, 2);
         assert!(
             store
                 .bind_workdir_create_repository_access(
@@ -450,7 +440,6 @@ mod tests {
                     "trust-1",
                     5,
                     "read_only",
-                    2,
                     "2026-08-24T00:00:02Z",
                 )
                 .is_err()

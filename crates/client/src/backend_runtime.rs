@@ -913,7 +913,7 @@ mod tests {
             "working_directory": {
                 "working_directory_id": "wd-1",
                 "repository_key": "main",
-                "materializer_kind": "local_git_worktree",
+                "materializer_kind": "runtime_git_clone",
                 "status": "active",
                 "occupied_by": {
                     "runtime_id": "arcadia",

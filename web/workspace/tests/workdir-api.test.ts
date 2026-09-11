@@ -11,7 +11,7 @@ import {
 const summary = {
   working_directory_id: "workdir-1",
   repository_key: "main",
-  materializer_kind: "runtime_git_cache",
+  materializer_kind: "runtime_git_clone",
   status: "active",
   occupied_by: {
     runtime_id: "arcadia",

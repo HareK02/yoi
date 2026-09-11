@@ -863,9 +863,9 @@ mod tests {
             "repository_key": "main",
             "creation_selector": "refs/heads/main",
             "creation_ref": "0123456789abcdef",
-            "materializer_kind": "local_git_worktree",
+            "materializer_kind": "runtime_git_clone",
             "cleanup_target": {
-                "kind": "git_worktree",
+                "kind": "runtime_git_clone",
                 "working_directory_id": id,
                 "repository_key": "main"
             },
@@ -1242,16 +1242,10 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_broker_operations_carry_no_child_context() {
-        let client = Arc::new(RecordingWorkspaceClient::new(vec![
-            response(json!({
-                "operation": "stat",
-                "result": {"path": "visible.txt", "kind": "file", "size": 8}
-            })),
-            response(json!({
-                "operation": "stat",
-                "result": {"path": "visible.txt", "kind": "file", "size": 8}
-            })),
-        ]));
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
+            "operation": "stat",
+            "result": {"path": "visible.txt", "kind": "file", "size": 8}
+        }))]));
         let broker = workdir::WorkdirToolBroker::new(WorkspaceAttachedWorkdirSession::handle(
             client.clone(),
         ));
@@ -1275,7 +1269,7 @@ mod tests {
             .unwrap();
 
         let requests = client.requests();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 1);
         for request in requests {
             assert_eq!(
                 request.path,

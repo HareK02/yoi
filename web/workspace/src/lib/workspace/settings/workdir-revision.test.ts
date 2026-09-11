@@ -20,10 +20,10 @@ function workdir(
     repository_key: "repository-1",
     current_selector,
     current_ref,
-    materializer_kind: "local_git_worktree",
+    materializer_kind: "runtime_git_clone",
     status: "active",
     cleanup_target: {
-      kind: "local_git_worktree",
+      kind: "runtime_git_clone",
       working_directory_id: "workdir-1",
       repository_key: "repository-1",
     },

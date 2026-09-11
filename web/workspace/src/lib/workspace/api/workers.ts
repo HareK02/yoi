@@ -282,10 +282,7 @@ function runtimeWorkingDirectory(
     item.materializer_kind,
     `${label}.materializer_kind`,
   );
-  if (
-    materializerKind !== "runtime_git_cache" &&
-    materializerKind !== "local_git_worktree"
-  ) {
+  if (materializerKind !== "runtime_git_clone") {
     throw new Error(`${label}.materializer_kind is invalid`);
   }
   const status = string(item.status, `${label}.status`);

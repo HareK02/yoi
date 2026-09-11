@@ -148,8 +148,6 @@ pub struct RepositoryMaterializationContext {
     pub operation_id: String,
     pub config_revision: u64,
     pub config_projection_digest: String,
-    #[serde(default)]
-    pub cache_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<RepositorySshMaterializationAccess>,
 }

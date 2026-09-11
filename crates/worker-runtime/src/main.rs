@@ -25,7 +25,7 @@ use worker_runtime::http_server::{
     WorkspaceRuntimeHttpAuth,
 };
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
-use worker_runtime::working_directory::RuntimeGitCacheMaterializer;
+use worker_runtime::working_directory::RuntimeGitMaterializer;
 use worker_runtime::workspace_issuer::{
     FileWorkspaceClaimReplayProtection, FileWorkspaceRuntimeVerificationAuthority,
     MAX_WORKSPACE_ISSUER_TRUST_RECORDS, RuntimeVerificationSigner, WorkspaceCapabilityVerifier,
@@ -266,7 +266,7 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
     let backend = Arc::new(
         WorkerRuntimeExecutionBackend::new(factory)
             .map_err(ProcessError::WorkerAdapter)?
-            .with_working_directory_materializer(RuntimeGitCacheMaterializer::new(
+            .with_working_directory_materializer(RuntimeGitMaterializer::new(
                 fs_paths.workdir_target.clone(),
             )),
     );

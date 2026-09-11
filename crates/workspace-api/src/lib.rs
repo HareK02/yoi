@@ -1248,8 +1248,7 @@ pub struct Diagnostic {
 #[serde(rename_all = "snake_case")]
 pub enum WorkingDirectoryMaterializerKind {
     #[default]
-    RuntimeGitCache,
-    LocalGitWorktree,
+    RuntimeGitClone,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -4557,7 +4556,7 @@ mod tests {
             current_ref: None,
             current_tree: None,
             observed_at_epoch_seconds: None,
-            materializer_kind: WorkingDirectoryMaterializerKind::RuntimeGitCache,
+            materializer_kind: WorkingDirectoryMaterializerKind::RuntimeGitClone,
             cleanup_target: None,
             status: WorkingDirectoryStatusKind::Active,
             cleanliness: None,
@@ -4594,7 +4593,7 @@ mod tests {
             "items": [{
                 "working_directory_id": "workdir-1",
                 "repository_key": "main",
-                "materializer_kind": "runtime_git_cache",
+                "materializer_kind": "runtime_git_clone",
                 "status": "active",
                 "occupied_by": {
                     "runtime_worker_id": "worker-1",

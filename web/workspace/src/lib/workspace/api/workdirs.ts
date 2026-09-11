@@ -114,8 +114,7 @@ export function parseWorkingDirectorySummary(
     working_directory_id: stringField(record, "working_directory_id"),
     repository_key: stringField(record, "repository_key"),
     materializer_kind: enumField(record, "materializer_kind", [
-      "runtime_git_cache",
-      "local_git_worktree",
+      "runtime_git_clone",
     ]),
     status: enumField(record, "status", [
       "active",

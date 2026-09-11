@@ -4020,7 +4020,7 @@ mod tests {
                 source_fingerprint: "sha256:source".to_string(),
                 selector: None,
             },
-            materializer: MaterializerKind::RuntimeGitCache,
+            materializer: MaterializerKind::RuntimeGitClone,
             backend_workdir_id: Some("working-directory-1".to_string()),
             materialization: Some(RepositoryMaterializationContext {
                 workspace_id: "workspace-1".to_string(),
@@ -4028,7 +4028,6 @@ mod tests {
                 operation_id: "operation-1".to_string(),
                 config_revision: 1,
                 config_projection_digest: "sha256:projection".to_string(),
-                cache_generation: 0,
                 ssh: Some(RepositorySshMaterializationAccess {
                     credential_candidates: vec![RepositorySshCredentialCandidate {
                         credential_id: "credential-1".to_string(),
@@ -4140,7 +4139,6 @@ mod tests {
                 operation_id: "operation-1".to_string(),
                 config_revision: 1,
                 config_projection_digest: "sha256:projection".to_string(),
-                cache_generation: 0,
                 ssh: Some(RepositorySshMaterializationAccess {
                     credential_candidates: vec![
                         RepositorySshCredentialCandidate {
@@ -4253,7 +4251,7 @@ mod tests {
                 source_fingerprint: "sha256:source".to_string(),
                 selector: None,
             },
-            materializer: MaterializerKind::RuntimeGitCache,
+            materializer: MaterializerKind::RuntimeGitClone,
             backend_workdir_id: Some("working-directory-1".to_string()),
             materialization: Some(RepositoryMaterializationContext {
                 workspace_id: "workspace-1".to_string(),
@@ -4261,7 +4259,6 @@ mod tests {
                 operation_id: "operation-create".to_string(),
                 config_revision: 1,
                 config_projection_digest: "sha256:projection".to_string(),
-                cache_generation: 0,
                 ssh: Some(RepositorySshMaterializationAccess {
                     credential_candidates: vec![
                         RepositorySshCredentialCandidate {

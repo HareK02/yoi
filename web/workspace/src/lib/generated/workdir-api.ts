@@ -9,9 +9,7 @@ export type Diagnostic = {
   message: string;
 };
 
-export type WorkingDirectoryMaterializerKind =
-  | "runtime_git_cache"
-  | "local_git_worktree";
+export type WorkingDirectoryMaterializerKind = "runtime_git_clone";
 
 export type WorkingDirectoryStatusKind =
   | "active"

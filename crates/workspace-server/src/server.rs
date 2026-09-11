@@ -10910,7 +10910,6 @@ async fn create_workspace_working_directory(
                 host_trust_id: None,
                 host_trust_revision: None,
                 repository_access_mode: None,
-                cache_generation: 0,
                 working_directory_id: next_backend_workdir_id(&request.repository_key),
                 state: "pending".to_string(),
                 failure: None,
@@ -14216,7 +14215,7 @@ fn working_directory_request_from_repository(
                 })
                 .or_else(|| Some(RuntimeRepositorySelector::from("HEAD"))),
         },
-        materializer: MaterializerKind::RuntimeGitCache,
+        materializer: MaterializerKind::RuntimeGitClone,
         backend_workdir_id: None,
         materialization: None,
     }
@@ -17381,9 +17380,9 @@ fn runtime_workdir_summary_from_record(
         current_ref: record.current_ref.clone(),
         current_tree: record.current_tree.clone(),
         observed_at_epoch_seconds: record.observed_at_epoch_seconds,
-        materializer_kind: MaterializerKind::RuntimeGitCache,
+        materializer_kind: MaterializerKind::RuntimeGitClone,
         cleanup_target: Some(worker_runtime::catalog::WorkingDirectoryCleanupTarget {
-            kind: "runtime_git_cache_worktree".to_string(),
+            kind: "runtime_git_clone".to_string(),
             working_directory_id: record.workdir_id.clone(),
             repository_id: record.repository_id.clone(),
         }),
@@ -17416,9 +17415,9 @@ fn workdir_summary_from_record(
         current_ref: record.current_ref.clone(),
         current_tree: record.current_tree.clone(),
         observed_at_epoch_seconds: record.observed_at_epoch_seconds,
-        materializer_kind: MaterializerKind::RuntimeGitCache,
+        materializer_kind: MaterializerKind::RuntimeGitClone,
         cleanup_target: Some(WorkingDirectoryCleanupTarget {
-            kind: "runtime_git_cache_worktree".to_string(),
+            kind: "runtime_git_clone".to_string(),
             working_directory_id: record.workdir_id.clone(),
             repository_key: repository_key.to_string(),
         }),
@@ -17647,7 +17646,6 @@ fn authorize_repository_materialization_operation(
                 operation_id: operation.operation_id.clone(),
                 config_revision: operation.config_revision,
                 config_projection_digest: operation.config_projection_digest.clone(),
-                cache_generation: operation.cache_generation,
                 ssh: Some(RepositorySshMaterializationAccess {
                     credential_candidates: leases
                         .into_iter()
@@ -17715,7 +17713,6 @@ fn authorize_repository_materialization_operation(
                     workspace_api::RepositoryAccessMode::ReadOnly => "read_only",
                     workspace_api::RepositoryAccessMode::ReadWrite => "read_write",
                 },
-                context.cache_generation,
                 &now_registry_timestamp(),
             )?;
             context
@@ -17727,7 +17724,6 @@ fn authorize_repository_materialization_operation(
             operation_id: operation.operation_id.clone(),
             config_revision: operation.config_revision,
             config_projection_digest: operation.config_projection_digest.clone(),
-            cache_generation: operation.cache_generation,
             ssh: None,
         }
     };
@@ -17870,7 +17866,6 @@ fn authorize_repository_materialization(
         operation_id: operation_id.to_string(),
         config_revision: projection.config_revision,
         config_projection_digest: projection.projection_digest.clone(),
-        cache_generation: 0,
         ssh,
     });
     Ok(())
@@ -17935,7 +17930,7 @@ fn working_directory_request_for_browser(
             source_fingerprint: repository.source_fingerprint.clone(),
             selector: selector.map(RuntimeRepositorySelector),
         },
-        materializer: MaterializerKind::RuntimeGitCache,
+        materializer: MaterializerKind::RuntimeGitClone,
         backend_workdir_id: None,
         materialization: None,
     })
@@ -18707,7 +18702,7 @@ mod tests {
             current_ref: Some("abc123".to_string()),
             current_tree: None,
             observed_at_epoch_seconds: Some(1_767_225_600),
-            materializer_kind: workspace_api::WorkingDirectoryMaterializerKind::RuntimeGitCache,
+            materializer_kind: workspace_api::WorkingDirectoryMaterializerKind::RuntimeGitClone,
             cleanup_target: None,
             status: worker_runtime::catalog::WorkingDirectoryStatusKind::Active,
             cleanliness: Some("clean".to_string()),
@@ -19758,7 +19753,6 @@ mod tests {
                 operation_id: "operation-1".to_string(),
                 config_revision: 1,
                 config_projection_digest: "sha256:projection".to_string(),
-                cache_generation: 0,
                 ssh: Some(
                     worker_runtime::catalog::RepositorySshMaterializationAccess {
                         credential_candidates: vec![
@@ -21096,7 +21090,7 @@ mod tests {
                 worker_runtime::execution::WorkerExecutionContext,
             >,
         >,
-        materializer: worker_runtime::working_directory::RuntimeGitCacheMaterializer,
+        materializer: worker_runtime::working_directory::RuntimeGitMaterializer,
         spawn_failure: std::sync::Mutex<Option<String>>,
         input_failure: std::sync::Mutex<Option<String>>,
         inputs: std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, String)>>,
@@ -21116,7 +21110,7 @@ mod tests {
             );
             Self {
                 contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
-                materializer: worker_runtime::working_directory::RuntimeGitCacheMaterializer::new(
+                materializer: worker_runtime::working_directory::RuntimeGitMaterializer::new(
                     std::env::temp_dir().join(unique),
                 ),
                 spawn_failure: std::sync::Mutex::new(None),
@@ -28115,7 +28109,6 @@ mod tests {
                 host_trust_id: None,
                 host_trust_revision: None,
                 repository_access_mode: None,
-                cache_generation: 0,
                 working_directory_id: "workdir-provider-rejection".to_string(),
                 state: "pending".to_string(),
                 failure: None,
@@ -30989,7 +30982,7 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
                 current_ref: Some("abc123".to_string()),
                 current_tree: Some("tree123".to_string()),
                 observed_at_epoch_seconds: Some(1_777_777_777),
-                materializer_kind: MaterializerKind::LocalGitWorktree,
+                materializer_kind: MaterializerKind::RuntimeGitClone,
                 cleanup_target: None,
                 status: WorkingDirectoryStatusKind::Active,
                 cleanliness: Some("clean".to_string()),

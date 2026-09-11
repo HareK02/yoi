@@ -18,7 +18,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 57;
+const LATEST_SCHEMA_VERSION: i64 = 58;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -30,6 +30,8 @@ const WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME: &str =
     "Workspace-signed Runtime verification evidence";
 const LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME: &str =
     "convert legacy Server-issued Runtime bindings to Workspace identity";
+const REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME: &str =
+    "remove obsolete Workdir Repository cache generation";
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -66,6 +68,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 57,
         name: LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME,
         apply: migrate_legacy_external_runtime_bindings_v56_to_v57,
+    },
+    Migration {
+        version: 58,
+        name: REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME,
+        apply: migrate_workdir_cache_generation_v57_to_v58,
     },
 ];
 
@@ -566,7 +573,6 @@ pub struct WorkdirCreateOperationRecord {
     pub host_trust_id: Option<String>,
     pub host_trust_revision: Option<u64>,
     pub repository_access_mode: Option<String>,
-    pub cache_generation: u64,
     pub working_directory_id: String,
     pub state: String,
     pub failure: Option<String>,
@@ -8534,6 +8540,33 @@ fn migrate_legacy_external_runtime_bindings_v56_to_v57(conn: &Connection) -> Res
     Ok(())
 }
 
+fn migrate_workdir_cache_generation_v57_to_v58(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 57 {
+        return Err(Error::Store(format!(
+            "expected schema version 57 before {REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    if table_columns(&tx, "workdir_create_operations")?.contains(&"cache_generation".to_string()) {
+        tx.execute(
+            "ALTER TABLE workdir_create_operations DROP COLUMN cache_generation",
+            [],
+        )?;
+    }
+    if table_columns(&tx, "workdir_create_operations")?.contains(&"cache_generation".to_string()) {
+        return Err(Error::Store(
+            "obsolete Workdir cache generation remains after schema-58 migration".to_string(),
+        ));
+    }
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![58_i64, REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn verify_workspace_runtime_verification_schema(conn: &Connection) -> Result<()> {
     let actual = table_columns(conn, "workspace_runtime_verifications")?
         .into_iter()
@@ -9676,6 +9709,10 @@ mod tests {
                     version: 57,
                     name: LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 58,
+                    name: REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -9709,6 +9746,10 @@ mod tests {
                         (
                             57,
                             LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME.to_string(),
+                        ),
+                        (
+                            58,
+                            REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME.to_string(),
                         ),
                     ]
                 );
@@ -9780,7 +9821,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![52, 53, 54, 55, 56, 57]
+            vec![52, 53, 54, 55, 56, 57, 58]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
@@ -9788,7 +9829,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 8);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 9);
     }
 
     #[test]
@@ -10544,6 +10585,35 @@ mod tests {
             )
             .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn schema_v58_removes_obsolete_workdir_cache_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        prepare_schema_v50(&path, Some("workspace-a"));
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 57)
+        {
+            (migration.apply)(&conn).unwrap();
+        }
+        conn.execute(
+            "ALTER TABLE workdir_create_operations ADD COLUMN cache_generation INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .unwrap();
+
+        migrate_workdir_cache_generation_v57_to_v58(&conn).unwrap();
+
+        assert_eq!(current_schema_version(&conn).unwrap(), 58);
+        assert!(
+            !table_columns(&conn, "workdir_create_operations")
+                .unwrap()
+                .contains(&"cache_generation".to_string())
         );
     }
 

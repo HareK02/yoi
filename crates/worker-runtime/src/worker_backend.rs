@@ -2248,7 +2248,7 @@ mod tests {
     use crate::identity::WorkerRef;
     use crate::management::RuntimeOptions;
     use crate::observation::WorkerObservationCursor;
-    use crate::working_directory::RuntimeGitCacheMaterializer;
+    use crate::working_directory::RuntimeGitMaterializer;
     use agen::Engine;
     use agen::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
     use agen::llm_client::{ClientError, LlmClient, Request};
@@ -2992,13 +2992,13 @@ mod tests {
                 source_fingerprint: "sha256:test".to_string(),
                 selector: Some(RepositorySelector::from("HEAD")),
             },
-            materializer: MaterializerKind::RuntimeGitCache,
+            materializer: MaterializerKind::RuntimeGitClone,
             backend_workdir_id: None,
             materialization: None,
         }
     }
 
-    fn materialized_worktree_root(
+    fn materialized_clone_root(
         runtime_base: &std::path::Path,
         working_directory_id: &str,
     ) -> PathBuf {
@@ -3734,9 +3734,7 @@ mod tests {
         };
         let backend = WorkerRuntimeExecutionBackend::new(factory)
             .unwrap()
-            .with_working_directory_materializer(RuntimeGitCacheMaterializer::new(
-                runtime_base.path(),
-            ));
+            .with_working_directory_materializer(RuntimeGitMaterializer::new(runtime_base.path()));
         let runtime =
             EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), Arc::new(backend))
                 .unwrap();
@@ -3973,9 +3971,7 @@ mod tests {
         };
         let backend = WorkerRuntimeExecutionBackend::new(factory)
             .unwrap()
-            .with_working_directory_materializer(RuntimeGitCacheMaterializer::new(
-                runtime_base.path(),
-            ));
+            .with_working_directory_materializer(RuntimeGitMaterializer::new(runtime_base.path()));
         let runtime =
             EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), Arc::new(backend))
                 .unwrap();
@@ -3990,13 +3986,13 @@ mod tests {
             .summary
             .working_directory_id
             .clone();
-        let worktree_root = materialized_worktree_root(runtime_base.path(), &workdir_id);
-        assert!(worktree_root.join("README.md").exists());
+        let clone_root = materialized_clone_root(runtime_base.path(), &workdir_id);
+        assert!(clone_root.join("README.md").exists());
 
         runtime.stop_worker(&detail.worker_ref, None).unwrap();
         runtime.delete_worker(&detail.worker_ref).unwrap();
 
-        assert!(worktree_root.join("README.md").exists());
+        assert!(clone_root.join("README.md").exists());
         let status = runtime.working_directory(&workdir_id).unwrap();
         assert_eq!(
             status.summary.status,
@@ -4012,9 +4008,7 @@ mod tests {
         let repo = create_clean_repo();
         let backend = WorkerRuntimeExecutionBackend::new(FailingFactory)
             .unwrap()
-            .with_working_directory_materializer(RuntimeGitCacheMaterializer::new(
-                runtime_base.path(),
-            ));
+            .with_working_directory_materializer(RuntimeGitMaterializer::new(runtime_base.path()));
         let runtime =
             EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), Arc::new(backend))
                 .unwrap();
@@ -4023,8 +4017,8 @@ mod tests {
             .create_working_directory(working_directory_request(repo.path()))
             .unwrap();
         let workdir_id = status.summary.working_directory_id.clone();
-        let worktree_root = materialized_worktree_root(runtime_base.path(), &workdir_id);
-        assert!(worktree_root.join("README.md").exists());
+        let clone_root = materialized_clone_root(runtime_base.path(), &workdir_id);
+        assert!(clone_root.join("README.md").exists());
         let mut request = create_request("chat");
         request.working_directory = Some(WorkingDirectoryClaim {
             working_directory_id: workdir_id.clone(),
@@ -4034,7 +4028,7 @@ mod tests {
         let error = runtime.create_worker(request).unwrap_err();
 
         assert!(format!("{error:?}").contains("spawn failed"));
-        assert!(worktree_root.join("README.md").exists());
+        assert!(clone_root.join("README.md").exists());
         let status = runtime.working_directory(&workdir_id).unwrap();
         assert_eq!(
             status.summary.status,
@@ -4048,9 +4042,7 @@ mod tests {
         let repo = create_clean_repo();
         let backend = WorkerRuntimeExecutionBackend::new(FailingFactory)
             .unwrap()
-            .with_working_directory_materializer(RuntimeGitCacheMaterializer::new(
-                runtime_base.path(),
-            ));
+            .with_working_directory_materializer(RuntimeGitMaterializer::new(runtime_base.path()));
         let runtime =
             EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), Arc::new(backend))
                 .unwrap();
@@ -4071,6 +4063,6 @@ mod tests {
             })
             .unwrap_or(0);
         assert_eq!(remaining_workdirs, 0);
-        assert!(working_directories_root.join(".repository-cache").is_dir());
+        assert!(!working_directories_root.join(".repository-cache").exists());
     }
 }

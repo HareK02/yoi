@@ -475,7 +475,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "working_directory_id": "001a06a9f0202000000",
                 "repository_key": "main",
-                "materializer_kind": "local_git_worktree",
+                "materializer_kind": "runtime_git_clone",
                 "status": "active",
                 "cleanliness": "clean"
             }))
@@ -518,7 +518,7 @@ mod tests {
                 serde_json::from_value(serde_json::json!({
                     "working_directory_id": "workdir-1",
                     "repository_key": "main",
-                    "materializer_kind": "local_git_worktree",
+                    "materializer_kind": "runtime_git_clone",
                     "status": "active"
                 }))
                 .unwrap(),

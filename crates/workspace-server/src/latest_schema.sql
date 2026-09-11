@@ -624,7 +624,7 @@ CREATE TABLE workdir_create_operations (
             state TEXT NOT NULL CHECK (state IN ('pending', 'succeeded', 'failed')),
             failure TEXT,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL, source_kind TEXT, source_uri TEXT, source_revision INTEGER, source_fingerprint TEXT, credential_id TEXT, credential_revision INTEGER, host_trust_id TEXT, host_trust_revision INTEGER, repository_access_mode TEXT, cache_generation INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL, source_kind TEXT, source_uri TEXT, source_revision INTEGER, source_fingerprint TEXT, credential_id TEXT, credential_revision INTEGER, host_trust_id TEXT, host_trust_revision INTEGER, repository_access_mode TEXT,
             PRIMARY KEY (workspace_id, operation_id),
             UNIQUE (workspace_id, working_directory_id)
         );
