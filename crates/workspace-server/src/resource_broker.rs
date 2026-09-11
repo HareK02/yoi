@@ -397,7 +397,13 @@ mod tests {
                 "1",
                 i64::MAX,
                 RepositorySshAccessSecret {
-                    private_key: "private-key-bytes".to_string(),
+                    credential_candidates: vec![
+                        worker_runtime::resource::RepositorySshAccessSecretCandidate {
+                            credential_id: "credential-test".to_string(),
+                            credential_revision: 1,
+                            private_key: "private-key-bytes".to_string(),
+                        },
+                    ],
                     known_hosts_entry: "known-hosts-entry".to_string(),
                 },
             )
@@ -419,7 +425,10 @@ mod tests {
         assert!(!debug.contains("private-key-bytes"));
         assert!(debug.contains("REDACTED"));
         let secret: RepositorySshAccessSecret = serde_json::from_slice(&response.bytes).unwrap();
-        assert_eq!(secret.private_key, "private-key-bytes");
+        assert_eq!(
+            secret.credential_candidates[0].private_key,
+            "private-key-bytes"
+        );
         assert!(matches!(
             broker.fetch_resource(request(handle, "runtime-test", None)),
             Err(BackendResourceError::MissingResource)

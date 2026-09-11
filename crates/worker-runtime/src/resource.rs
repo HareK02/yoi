@@ -13,16 +13,41 @@ pub const REPOSITORY_SSH_ACCESS_CONTENT_TYPE: &str =
     "application/vnd.yoi.repository-ssh-access+json";
 pub const DEFAULT_PROFILE_SOURCE_ARCHIVE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 pub const DEFAULT_REPOSITORY_SSH_ACCESS_MAX_BYTES: u64 = 64 * 1024;
+pub const DEFAULT_BACKEND_RESOURCE_FETCH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RepositorySshAccessSecretCandidate {
+    pub credential_id: String,
+    pub credential_revision: u64,
+    pub private_key: String,
+}
+
+impl Drop for RepositorySshAccessSecretCandidate {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.private_key);
+    }
+}
+
+impl std::fmt::Debug for RepositorySshAccessSecretCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RepositorySshAccessSecretCandidate")
+            .field("credential_id", &self.credential_id)
+            .field("credential_revision", &self.credential_revision)
+            .field("private_key", &"[REDACTED]")
+            .finish()
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RepositorySshAccessSecret {
-    pub private_key: String,
+    pub credential_candidates: Vec<RepositorySshAccessSecretCandidate>,
     pub known_hosts_entry: String,
 }
 
 impl Drop for RepositorySshAccessSecret {
     fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut self.private_key);
         zeroize::Zeroize::zeroize(&mut self.known_hosts_entry);
     }
 }
@@ -31,7 +56,7 @@ impl std::fmt::Debug for RepositorySshAccessSecret {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RepositorySshAccessSecret")
-            .field("private_key", &"[REDACTED]")
+            .field("credential_candidates", &self.credential_candidates)
             .field("known_hosts_entry", &"[REDACTED]")
             .finish()
     }
@@ -142,6 +167,8 @@ pub enum BackendResourceError {
     Oversized { max_bytes: u64, actual_bytes: u64 },
     #[error("backend resource content type mismatch: expected {expected}, got {actual}")]
     ContentTypeMismatch { expected: String, actual: String },
+    #[error("backend resource fetch timed out")]
+    Timeout,
     #[error("backend resource transport failed: {message}")]
     Transport { message: String },
     #[error("backend resource response is invalid: {message}")]
@@ -163,6 +190,7 @@ pub struct HttpBackendResourceClient {
     bearer_token: Option<String>,
     request_source_signer: Option<RuntimeRequestSourceSigner>,
     request_source_audience: Option<String>,
+    request_timeout: std::time::Duration,
     client: reqwest::Client,
 }
 
@@ -174,8 +202,14 @@ impl HttpBackendResourceClient {
             bearer_token,
             request_source_signer: None,
             request_source_audience: None,
+            request_timeout: DEFAULT_BACKEND_RESOURCE_FETCH_TIMEOUT,
             client: reqwest::Client::new(),
         }
+    }
+
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 
     pub fn with_runtime_request_source(
@@ -209,6 +243,7 @@ impl BackendResourceClient for HttpBackendResourceClient {
         let mut builder = self
             .client
             .post(endpoint.clone())
+            .timeout(self.request_timeout)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body.clone());
         if let Some(signer) = self.request_source_signer.as_ref() {
@@ -239,12 +274,15 @@ impl BackendResourceClient for HttpBackendResourceClient {
         } else {
             builder
         };
-        let response = builder
-            .send()
-            .await
-            .map_err(|err| BackendResourceError::Transport {
-                message: err.to_string(),
-            })?;
+        let response = builder.send().await.map_err(|error| {
+            if error.is_timeout() {
+                BackendResourceError::Timeout
+            } else {
+                BackendResourceError::Transport {
+                    message: error.to_string(),
+                }
+            }
+        })?;
         if response.status().is_success() {
             response
                 .json::<BackendResourceFetchResponse>()
@@ -380,6 +418,54 @@ mod tests {
             audit_correlation_id: "audit-test".to_string(),
             profile_source_graph: Some(graph()),
         }
+    }
+
+    #[cfg(feature = "http-server")]
+    #[tokio::test]
+    async fn http_backend_resource_fetch_has_a_bounded_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            futures::future::pending::<()>().await;
+            drop(stream);
+        });
+        let base_url = format!("http://{address}");
+        let identity = RuntimeIdentityMaterial::generate("runtime-test").unwrap();
+        let handle = handle_for(b"archive-bytes");
+        let client = HttpBackendResourceClient::new(format!("{base_url}/fetch"), None)
+            .with_request_timeout(std::time::Duration::from_millis(25))
+            .with_runtime_request_source(&identity, base_url);
+
+        let error = client
+            .fetch_resource(BackendResourceFetchRequest {
+                audit_correlation_id: handle.audit_correlation_id.clone(),
+                handle,
+                runtime_id: "runtime-test".to_string(),
+                worker_id: None,
+            })
+            .await
+            .unwrap_err();
+
+        server.abort();
+        assert_eq!(error, BackendResourceError::Timeout);
+    }
+
+    #[test]
+    fn repository_ssh_access_secret_debug_redacts_all_secret_values() {
+        let secret = RepositorySshAccessSecret {
+            credential_candidates: vec![RepositorySshAccessSecretCandidate {
+                credential_id: "credential-1".to_string(),
+                credential_revision: 2,
+                private_key: "PRIVATE KEY secret bytes".to_string(),
+            }],
+            known_hosts_entry: "host key secret bytes".to_string(),
+        };
+
+        let debug = format!("{secret:?}");
+        assert!(debug.contains("credential-1"));
+        assert!(!debug.contains("secret bytes"));
+        assert_eq!(debug.matches("[REDACTED]").count(), 2);
     }
 
     #[test]

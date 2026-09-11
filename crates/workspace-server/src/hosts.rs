@@ -67,6 +67,10 @@ use worker_runtime::profile_archive::ProfileSourceArchive;
 use worker_runtime::retention::{
     WorkerRetentionExecutionRequest, WorkerRetentionExecutionResult, WorkerRetentionInventory,
 };
+use worker_runtime::ssh_host_key_probe::{
+    SSH_HOST_KEY_PROBE_OPERATION, SSH_HOST_KEY_PROBE_PATH, SshHostKeyProbeRequest,
+    SshHostKeyProbeResponse,
+};
 use worker_runtime::workspace_issuer::{
     WorkspaceCapabilityClaims, WorkspaceRuntimeVerificationAcknowledgement,
     WorkspaceRuntimeVerificationChallenge, WorkspaceRuntimeVerificationReceipt,
@@ -82,6 +86,9 @@ const MAX_REMOTE_RUNTIME_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 // Runtime creation can spend up to 60s bootstrapping; durable Submit
 // acceptance is acknowledged before the potentially long run preparation.
 const REMOTE_WORKER_CREATE_TIMEOUT: Duration = Duration::from_secs(80);
+// Repository materialization can spend up to 300s in Git. Keep the HTTP
+// caller alive long enough for Runtime to return its bounded result.
+const REMOTE_WORKING_DIRECTORY_CREATE_TIMEOUT: Duration = Duration::from_secs(330);
 const MAX_HOST_SCAN: usize = 256;
 const MAX_IDENTIFIER_LEN: usize = 120;
 const ID_DIGEST_HEX_LEN: usize = 16;
@@ -826,6 +833,17 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         ))
     }
 
+    fn probe_ssh_host_keys(
+        &self,
+        _request: SshHostKeyProbeRequest,
+    ) -> std::result::Result<SshHostKeyProbeResponse, Error> {
+        Err(Error::RuntimeOperationFailed {
+            runtime_id: self.runtime_id().to_string(),
+            code: "ssh_host_key_probe_unsupported".to_string(),
+            message: "Runtime does not support SSH host key probing".to_string(),
+        })
+    }
+
     fn activate_workspace_authorization(&self, _binding: crate::store::WorkspaceRuntimeBinding) {}
 
     fn send_workspace_verification_challenge(
@@ -1566,6 +1584,31 @@ impl RuntimeRegistry {
                 runtime_id: runtime_id.to_string(),
                 code: "working_directory_repository_access_failed".to_string(),
                 message: error.to_string(),
+            })
+    }
+
+    pub fn probe_ssh_host_keys(
+        &self,
+        runtime_id: &str,
+        request: SshHostKeyProbeRequest,
+    ) -> Result<SshHostKeyProbeResponse, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        runtime
+            .probe_ssh_host_keys(request)
+            .map_err(|error| match error {
+                Error::RuntimeOperationFailed { code, message, .. } => {
+                    RuntimeRegistryError::RuntimeOperationFailed {
+                        runtime_id: runtime_id.to_string(),
+                        code,
+                        message,
+                    }
+                }
+                other => RuntimeRegistryError::RuntimeOperationFailed {
+                    runtime_id: runtime_id.to_string(),
+                    code: "ssh_host_key_probe_failed".to_string(),
+                    message: other.to_string(),
+                },
             })
     }
 
@@ -3404,10 +3447,11 @@ fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static s
         return "workers:create";
     }
     if (path == "/v1/working-directories/repository-access"
-        || path == "/v1/repository-refs/observe")
+        || path == "/v1/repository-refs/observe"
+        || path == SSH_HOST_KEY_PROBE_PATH)
         && method == "POST"
     {
-        return "workdirs:operate";
+        return SSH_HOST_KEY_PROBE_OPERATION;
     }
     if path.starts_with("/v1/workdir-sessions")
         || (path.starts_with("/v1/working-directories/") && path.ends_with("/sessions"))
@@ -3635,6 +3679,19 @@ impl RemoteWorkerRuntime {
         B: Serialize + ?Sized,
         T: DeserializeOwned + Send + 'static,
     {
+        self.post_json_with_timeout(path, body, None)
+    }
+
+    fn post_json_with_timeout<B, T>(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Option<Duration>,
+    ) -> Result<T, RuntimeDiagnostic>
+    where
+        B: Serialize + ?Sized,
+        T: DeserializeOwned + Send + 'static,
+    {
         let body = serde_json::to_vec(body).map_err(|error| {
             diagnostic(
                 "remote_runtime_request_encode_failed",
@@ -3642,15 +3699,15 @@ impl RemoteWorkerRuntime {
                 error.to_string(),
             )
         })?;
-        self.send_json(
-            path,
-            "POST",
-            &body,
-            self.http
-                .post(self.endpoint(path))
-                .header(CONTENT_TYPE, "application/json")
-                .body(body.clone()),
-        )
+        let mut request = self
+            .http
+            .post(self.endpoint(path))
+            .header(CONTENT_TYPE, "application/json")
+            .body(body.clone());
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        self.send_json(path, "POST", &body, request)
     }
 
     fn post_bytes<T>(&self, path: &str, body: &[u8]) -> Result<T, RuntimeDiagnostic>
@@ -4140,9 +4197,10 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         &self,
         request: WorkingDirectoryRequest,
     ) -> RuntimeWorkingDirectoryResult {
-        match self.post_json::<_, RuntimeHttpWorkingDirectoryResponse>(
+        match self.post_json_with_timeout::<_, RuntimeHttpWorkingDirectoryResponse>(
             "/v1/working-directories",
             &request,
+            Some(REMOTE_WORKING_DIRECTORY_CREATE_TIMEOUT),
         ) {
             Ok(response) => RuntimeWorkingDirectoryResult {
                 state: WorkerOperationState::Accepted,
@@ -4167,6 +4225,18 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         )
         .map(|_| ())
         .map_err(|diagnostic| Error::RegistryInconsistency(diagnostic.message))
+    }
+
+    fn probe_ssh_host_keys(
+        &self,
+        request: SshHostKeyProbeRequest,
+    ) -> std::result::Result<SshHostKeyProbeResponse, Error> {
+        self.post_json::<_, SshHostKeyProbeResponse>(SSH_HOST_KEY_PROBE_PATH, &request)
+            .map_err(|diagnostic| Error::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+            })
     }
 
     fn observe_repository_ref(
@@ -5367,6 +5437,15 @@ mod tests {
     #[test]
     fn remote_worker_create_timeout_covers_runtime_phase_budgets() {
         assert!(REMOTE_WORKER_CREATE_TIMEOUT > Duration::from_secs(60 + 10 + 5));
+    }
+
+    #[test]
+    fn remote_working_directory_create_timeout_covers_git_budget() {
+        assert!(REMOTE_WORKING_DIRECTORY_CREATE_TIMEOUT > Duration::from_secs(300));
+        assert!(
+            REMOTE_WORKING_DIRECTORY_CREATE_TIMEOUT
+                > worker_runtime::resource::DEFAULT_BACKEND_RESOURCE_FETCH_TIMEOUT
+        );
     }
 
     fn test_create_binding() -> WorkerCreateBinding {
@@ -6592,6 +6671,10 @@ mod tests {
         assert_eq!(
             workspace_runtime_operation("GET", &format!("/v1/workers/{worker_id}/protocol/ws")),
             "workers:protocol"
+        );
+        assert_eq!(
+            workspace_runtime_operation("POST", SSH_HOST_KEY_PROBE_PATH),
+            SSH_HOST_KEY_PROBE_OPERATION
         );
     }
 

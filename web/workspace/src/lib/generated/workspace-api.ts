@@ -307,6 +307,38 @@ export type RepositoryDetailResponse = {
   source: string;
 };
 
+export type RepositorySshConnectionProbeRequest = { runtime_id: string };
+
+export type RepositorySshHostKeyCandidate = {
+  algorithm: string;
+  host_key: string;
+  fingerprint: string;
+};
+
+export type RepositorySshConnectionTrustState =
+  | "untrusted"
+  | "verified"
+  | "changed";
+
+export type RepositorySshConnectionProbeResponse = {
+  workspace_id: string;
+  repository_key: string;
+  runtime_id: string;
+  hostname: string;
+  port: number;
+  trust_state: RepositorySshConnectionTrustState;
+  host_trust_id: string;
+  expected_host_trust_revision: number | null;
+  candidates: Array<RepositorySshHostKeyCandidate>;
+};
+
+export type ConfirmRepositorySshHostTrustRequest = {
+  operation_id: string;
+  runtime_id: string;
+  host_key: string;
+  expected_host_trust_revision: number | null;
+};
+
 export type RepositoryLogResponse = {
   workspace_id: string;
   repository_key: string;

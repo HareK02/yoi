@@ -30,8 +30,8 @@ use worker_runtime::workspace_issuer::{
     FileWorkspaceClaimReplayProtection, FileWorkspaceRuntimeVerificationAuthority,
     MAX_WORKSPACE_ISSUER_TRUST_RECORDS, RuntimeVerificationSigner, WorkspaceCapabilityVerifier,
     WorkspaceIssuerTrustError, WorkspaceIssuerTrustMutation, WorkspaceIssuerTrustRecord,
-    add_workspace_issuer_trust, replace_workspace_issuer_trust, revoke_workspace_issuer_trust,
-    validate_workspace_issuer_trust_records,
+    WorkspaceIssuerTrustState, add_workspace_issuer_trust, replace_workspace_issuer_trust,
+    revoke_workspace_issuer_trust, validate_workspace_issuer_trust_records,
 };
 use worker_runtime::{Runtime, RuntimeOptions};
 
@@ -236,6 +236,33 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
         factory = factory.with_resource_client(client.clone());
         backend_resource_client = Some(client);
     }
+    let mut workspace_backend_resource_clients: Vec<(
+        String,
+        Arc<dyn worker_runtime::resource::BackendResourceClient>,
+    )> = Vec::new();
+    if config.backend_resource_endpoint.is_none()
+        && let Some(identity) = runtime_auth.identity.as_ref()
+    {
+        for workspace_issuer in runtime_auth
+            .workspace_issuers
+            .iter()
+            .filter(|issuer| issuer.state == WorkspaceIssuerTrustState::Active)
+        {
+            let endpoint = workspace_backend_resource_endpoint(
+                &workspace_issuer.backend_url,
+                &workspace_issuer.workspace_id,
+            );
+            let client = Arc::new(
+                worker_runtime::resource::HttpBackendResourceClient::new(
+                    endpoint,
+                    config.backend_resource_token.clone(),
+                )
+                .with_runtime_request_source(identity, workspace_issuer.backend_url.clone()),
+            );
+            workspace_backend_resource_clients
+                .push((workspace_issuer.workspace_id.clone(), client));
+        }
+    }
     let backend = Arc::new(
         WorkerRuntimeExecutionBackend::new(factory)
             .map_err(ProcessError::WorkerAdapter)?
@@ -267,12 +294,29 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
             ));
         }
     };
+    if let Some(identity) = runtime_auth.identity.as_ref() {
+        runtime
+            .bind_runtime_identity(&identity.identity_id)
+            .map_err(ProcessError::Runtime)?;
+    }
     if let Some(client) = backend_resource_client {
         runtime
             .install_backend_resource_client(client)
             .map_err(ProcessError::Runtime)?;
     }
+    for (workspace_id, client) in workspace_backend_resource_clients {
+        runtime
+            .install_workspace_backend_resource_client(workspace_id, client)
+            .map_err(ProcessError::Runtime)?;
+    }
     Ok(runtime)
+}
+
+fn workspace_backend_resource_endpoint(backend_url: &str, workspace_id: &str) -> String {
+    format!(
+        "{}/api/runtime/v1/workspaces/{workspace_id}/resources/fetch",
+        backend_url.trim_end_matches('/'),
+    )
 }
 
 fn runtime_options_from_http(config: &RuntimeHttpServerConfig) -> RuntimeOptions {
@@ -1519,6 +1563,42 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(error, "unknown auth command `trust-server`");
+    }
+
+    #[test]
+    fn runtime_startup_binds_auth_identity_before_resource_use() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = ProcessConfig {
+            fs_root: Some(temp.path().to_path_buf()),
+            ..ProcessConfig::default().unwrap()
+        };
+        config.http.store = RuntimeHttpStoreSelection::Memory;
+        let identity = RuntimeIdentityMaterial::generate("runtime-startup").unwrap();
+        write_runtime_auth_file(
+            &runtime_auth_path(&config),
+            &RuntimeAuthFile {
+                identity: Some(identity),
+                workspace_issuers: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let runtime = build_runtime(&config).unwrap();
+
+        runtime.bind_runtime_identity("runtime-startup").unwrap();
+        assert!(runtime.bind_runtime_identity("other-runtime").is_err());
+    }
+
+    #[test]
+    fn workspace_resource_endpoints_are_derived_per_issuer() {
+        assert_eq!(
+            workspace_backend_resource_endpoint("https://backend.example/", "workspace-a"),
+            "https://backend.example/api/runtime/v1/workspaces/workspace-a/resources/fetch"
+        );
+        assert_ne!(
+            workspace_backend_resource_endpoint("https://backend.example", "workspace-a"),
+            workspace_backend_resource_endpoint("https://backend.example", "workspace-b")
+        );
     }
 
     #[test]

@@ -27,6 +27,9 @@ const MATERIALIZATION_RECORD: &str = "materialization.json";
 const REPOSITORY_CACHE_DIR: &str = ".repository-cache";
 const REPOSITORY_ACCESS_DIR: &str = ".repository-access";
 const REPOSITORY_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+const REPOSITORY_SSH_CONNECT_TIMEOUT_SECONDS: &str = "10";
+const REPOSITORY_SSH_SERVER_ALIVE_INTERVAL_SECONDS: &str = "15";
+const REPOSITORY_SSH_SERVER_ALIVE_COUNT_MAX: &str = "2";
 const REPOSITORY_MAX_OBJECTS: u64 = 5_000_000;
 const REPOSITORY_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 static NEXT_WORKING_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -408,7 +411,16 @@ impl RuntimeGitCacheMaterializer {
     ) -> Result<(), WorkingDirectoryDiagnostic> {
         validate_ssh_materialization_access(ssh)?;
         let working_directory_id = working_directory_id.to_string();
-        let credential_revision = ssh.credential_revision;
+        let credential_candidates = ssh
+            .credential_candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.credential_id.clone(),
+                    candidate.credential_revision,
+                )
+            })
+            .collect::<Vec<_>>();
         let expires_at = ssh.expires_at_epoch_seconds;
         self.repository_access
             .lock()
@@ -429,9 +441,18 @@ impl RuntimeGitCacheMaterializer {
                 std::thread::sleep(Duration::from_secs(expires_at - now));
             }
             if let Ok(mut access) = repository_access.lock()
-                && access
-                    .get(&working_directory_id)
-                    .is_some_and(|access| access.credential_revision == credential_revision)
+                && access.get(&working_directory_id).is_some_and(|access| {
+                    access
+                        .credential_candidates
+                        .iter()
+                        .map(|candidate| {
+                            (
+                                candidate.credential_id.clone(),
+                                candidate.credential_revision,
+                            )
+                        })
+                        .eq(credential_candidates.iter().cloned())
+                })
             {
                 access.remove(&working_directory_id);
             }
@@ -837,7 +858,8 @@ impl RuntimeGitCacheMaterializer {
                 operation_id: context.map(|value| value.operation_id.clone()),
                 credential_revision: context
                     .and_then(|value| value.ssh.as_ref())
-                    .map(|value| value.credential_revision),
+                    .and_then(|value| value.credential_candidates.first())
+                    .map(|candidate| candidate.credential_revision),
                 host_trust_revision: context
                     .and_then(|value| value.ssh.as_ref())
                     .map(|value| value.host_trust_revision),
@@ -943,7 +965,12 @@ impl WorkingDirectoryMaterializer for RuntimeGitCacheMaterializer {
         )?;
         binding.working_directory.evidence.operation_id =
             Some(request.materialization.operation_id.clone());
-        binding.working_directory.evidence.credential_revision = Some(ssh.credential_revision);
+        binding.working_directory.evidence.credential_revision = Some(
+            ssh.credential_candidates
+                .first()
+                .expect("validated SSH credential candidate")
+                .credential_revision,
+        );
         binding.working_directory.evidence.host_trust_revision = Some(ssh.host_trust_revision);
         self.write_record(&binding)?;
         self.cache_repository_access(&request.working_directory_id, ssh)
@@ -1263,35 +1290,37 @@ impl RepositorySshAgent {
             socket,
             child: Mutex::new(Some(child)),
         };
-        let mut add = match Command::new("ssh-add")
-            .arg("-")
-            .env("SSH_AUTH_SOCK", &agent.socket)
-            .env("SSH_ASKPASS", "/bin/false")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(add) => add,
-            Err(_) => {
+        for candidate in &access.credential_candidates {
+            let mut add = match Command::new("ssh-add")
+                .arg("-")
+                .env("SSH_AUTH_SOCK", &agent.socket)
+                .env("SSH_ASKPASS", "/bin/false")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(add) => add,
+                Err(_) => {
+                    drop(agent);
+                    return Err(WorkingDirectoryDiagnostic::new(
+                        "working_directory_repository_agent_unavailable",
+                        "Runtime-managed Repository SSH agent is unavailable",
+                    ));
+                }
+            };
+            let write_result = add.stdin.as_mut().map_or_else(
+                || Err(std::io::Error::other("ssh-add stdin unavailable")),
+                |stdin| stdin.write_all(candidate.private_key.expose().as_bytes()),
+            );
+            let status = add.wait();
+            if write_result.is_err() || !matches!(status, Ok(status) if status.success()) {
                 drop(agent);
                 return Err(WorkingDirectoryDiagnostic::new(
-                    "working_directory_repository_agent_unavailable",
-                    "Runtime-managed Repository SSH agent is unavailable",
+                    "working_directory_repository_agent_failed",
+                    "Runtime-managed Repository SSH agent rejected credential material",
                 ));
             }
-        };
-        let write_result = add.stdin.as_mut().map_or_else(
-            || Err(std::io::Error::other("ssh-add stdin unavailable")),
-            |stdin| stdin.write_all(access.private_key.expose().as_bytes()),
-        );
-        let status = add.wait();
-        if write_result.is_err() || !matches!(status, Ok(status) if status.success()) {
-            drop(agent);
-            return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_agent_failed",
-                "Runtime-managed Repository SSH agent rejected credential material",
-            ));
         }
         Ok(agent)
     }
@@ -1505,6 +1534,14 @@ fn run_brokered_repository_ssh(
         .take()
         .expect("complete broker request status");
     let status = if !validate_repository_ssh_args(&args, policy) {
+        tracing::warn!(
+            target: "yoi::repository_access",
+            event = "repository_ssh_broker_request_rejected",
+            host = %policy.host,
+            port = policy.port.unwrap_or(22),
+            argument_count = args.len(),
+            "Repository SSH broker rejected command arguments"
+        );
         let _ = stderr_stream.write_all(b"Repository SSH operation denied\n");
         let _ = stderr_stream.shutdown(Shutdown::Write);
         let _ = data.shutdown(Shutdown::Both);
@@ -1514,10 +1551,30 @@ fn run_brokered_repository_ssh(
         let _ = data.shutdown(Shutdown::Both);
         0
     } else {
+        tracing::info!(
+            target: "yoi::repository_access",
+            event = "repository_ssh_process_started",
+            host = %policy.host,
+            port = policy.port.unwrap_or(22),
+            "starting brokered Repository SSH process"
+        );
         let mut command = Command::new("ssh");
         command
             .args(["-F", "/dev/null"])
             .args(["-o", "BatchMode=yes"])
+            .args([
+                "-o",
+                &format!("ConnectTimeout={REPOSITORY_SSH_CONNECT_TIMEOUT_SECONDS}"),
+            ])
+            .args(["-o", "ConnectionAttempts=1"])
+            .args([
+                "-o",
+                &format!("ServerAliveInterval={REPOSITORY_SSH_SERVER_ALIVE_INTERVAL_SECONDS}"),
+            ])
+            .args([
+                "-o",
+                &format!("ServerAliveCountMax={REPOSITORY_SSH_SERVER_ALIVE_COUNT_MAX}"),
+            ])
             .args(["-o", "IdentitiesOnly=no"])
             .args(["-o", "IdentityFile=/dev/null"])
             .args(["-o", "IdentityAgent=SSH_AUTH_SOCK"])
@@ -1539,11 +1596,11 @@ fn run_brokered_repository_ssh(
                 let mut child_stdin = child.stdin.take().expect("piped ssh stdin");
                 let mut input = data.try_clone().expect("clone broker data stream");
                 let input_thread = std::thread::spawn(move || {
-                    let _ = std::io::copy(&mut input, &mut child_stdin);
+                    let _ = copy_streaming(&mut input, &mut child_stdin, "git_to_ssh");
                 });
                 let mut child_stdout = child.stdout.take().expect("piped ssh stdout");
                 let output_thread = std::thread::spawn(move || {
-                    let _ = std::io::copy(&mut child_stdout, &mut data);
+                    let _ = copy_streaming(&mut child_stdout, &mut data, "ssh_to_git");
                     let _ = data.shutdown(Shutdown::Write);
                 });
                 let mut child_stderr = child.stderr.take().expect("piped ssh stderr");
@@ -1556,6 +1613,14 @@ fn run_brokered_repository_ssh(
                     .ok()
                     .and_then(|status| status.code())
                     .unwrap_or(1);
+                tracing::info!(
+                    target: "yoi::repository_access",
+                    event = "repository_ssh_process_completed",
+                    host = %policy.host,
+                    port = policy.port.unwrap_or(22),
+                    exit_status = status,
+                    "brokered Repository SSH process completed"
+                );
                 let _ = input_thread.join();
                 let _ = output_thread.join();
                 let _ = error_thread.join();
@@ -1566,6 +1631,72 @@ fn run_brokered_repository_ssh(
     };
     let _ = writeln!(status_stream, "{status}");
     let _ = status_stream.shutdown(Shutdown::Write);
+}
+
+#[derive(Clone, Debug)]
+struct ParsedRepositorySshSource {
+    host: String,
+    username: Option<String>,
+    port: Option<u16>,
+    repository_path: String,
+}
+
+fn parse_repository_ssh_source(value: &str) -> Option<ParsedRepositorySshSource> {
+    if let Ok(uri) = url::Url::parse(value) {
+        if uri.scheme() != "ssh"
+            || uri.password().is_some()
+            || uri.query().is_some()
+            || uri.fragment().is_some()
+        {
+            return None;
+        }
+        let host = uri.host_str()?.to_string();
+        let username = (!uri.username().is_empty()).then(|| uri.username().to_string());
+        if username
+            .as_deref()
+            .is_some_and(|username| !is_safe_ssh_destination(username))
+            || uri.path().is_empty()
+            || uri.path() == "/"
+            || !is_safe_repository_path(uri.path())
+        {
+            return None;
+        }
+        return Some(ParsedRepositorySshSource {
+            host,
+            username,
+            port: uri.port(),
+            repository_path: uri.path().to_string(),
+        });
+    }
+
+    if value.contains("://")
+        || value.contains('?')
+        || value.contains('#')
+        || value.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    let (identity, repository_path) = value.split_once(':')?;
+    let (username, host) = identity.split_once('@')?;
+    if username.is_empty()
+        || host.is_empty()
+        || repository_path.is_empty()
+        || username.contains('@')
+        || username.contains(':')
+        || host.contains('@')
+        || repository_path.starts_with('-')
+        || !is_safe_ssh_destination(username)
+        || !is_safe_ssh_destination(host)
+        || !is_safe_repository_path(repository_path)
+    {
+        return None;
+    }
+    Some(ParsedRepositorySshSource {
+        host: host.to_ascii_lowercase(),
+        username: Some(username.to_string()),
+        port: None,
+        repository_path: repository_path.to_string(),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -1581,48 +1712,17 @@ impl RepositorySshCommandPolicy {
     fn from_access(
         access: &RepositorySshMaterializationAccess,
     ) -> Result<Self, WorkingDirectoryDiagnostic> {
-        let uri = url::Url::parse(&access.repository_uri).map_err(|_| {
+        let source = parse_repository_ssh_source(&access.repository_uri).ok_or_else(|| {
             WorkingDirectoryDiagnostic::new(
                 "working_directory_repository_access_binding_mismatch",
                 "Repository SSH access URI is invalid",
             )
         })?;
-        if uri.scheme() != "ssh"
-            || uri.password().is_some()
-            || uri.query().is_some()
-            || uri.fragment().is_some()
-        {
-            return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_access_binding_mismatch",
-                "Repository SSH access URI is not an authorized SSH endpoint",
-            ));
-        }
-        let host = uri
-            .host_str()
-            .filter(|host| !host.is_empty())
-            .ok_or_else(|| {
-                WorkingDirectoryDiagnostic::new(
-                    "working_directory_repository_access_binding_mismatch",
-                    "Repository SSH access host is missing",
-                )
-            })?;
-        let username = (!uri.username().is_empty()).then(|| uri.username().to_string());
-        if username
-            .as_deref()
-            .is_some_and(|username| !is_safe_ssh_destination(username))
-            || uri.path().is_empty()
-            || !is_safe_repository_path(uri.path())
-        {
-            return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_access_binding_mismatch",
-                "Repository SSH access endpoint or path is invalid",
-            ));
-        }
         Ok(Self {
-            host: host.to_string(),
-            username,
-            port: uri.port(),
-            repository_path: uri.path().to_string(),
+            host: source.host,
+            username: source.username,
+            port: source.port,
+            repository_path: source.repository_path,
             access: access.access,
         })
     }
@@ -1784,7 +1884,7 @@ pub fn run_repository_ssh_client(arguments: &[String]) -> Result<i32, String> {
             request_id: request_id.clone(),
         },
     )?;
-    let mut status_stream = connect_repository_ssh_broker_channel(
+    let status_stream = connect_repository_ssh_broker_channel(
         socket,
         &RepositorySshBrokerHeader::Status { request_id },
     )?;
@@ -1792,15 +1892,67 @@ pub fn run_repository_ssh_client(arguments: &[String]) -> Result<i32, String> {
         .try_clone()
         .map_err(|_| "Repository SSH broker input failed".to_string())?;
     let input_thread = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut std::io::stdin(), &mut input);
+        let _ = copy_streaming(&mut std::io::stdin(), &mut input, "git_to_broker");
         let _ = input.shutdown(Shutdown::Write);
     });
     let error_thread = std::thread::spawn(move || {
         let _ = std::io::copy(&mut stderr_stream, &mut std::io::stderr());
     });
-    std::io::copy(&mut data, &mut std::io::stdout())
+    let mut stdout = std::io::stdout();
+    copy_streaming(&mut data, &mut stdout, "broker_to_git")
         .map_err(|_| "Repository SSH broker output failed".to_string())?;
-    let _ = input_thread.join();
+    complete_repository_ssh_client(data, input_thread, error_thread, status_stream)
+}
+
+fn copy_streaming<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    direction: &'static str,
+) -> std::io::Result<u64> {
+    let mut copied = 0u64;
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => {
+                tracing::info!(
+                    target: "yoi::repository_access",
+                    event = "repository_ssh_stream_completed",
+                    direction,
+                    bytes = copied,
+                    "Repository SSH byte stream completed"
+                );
+                return Ok(copied);
+            }
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if copied == 0 {
+            tracing::info!(
+                target: "yoi::repository_access",
+                event = "repository_ssh_stream_first_chunk",
+                direction,
+                bytes = read,
+                "Repository SSH byte stream received its first chunk"
+            );
+        }
+        writer.write_all(&buffer[..read])?;
+        writer.flush()?;
+        copied = copied.saturating_add(read as u64);
+    }
+}
+
+fn complete_repository_ssh_client(
+    data: UnixStream,
+    input_thread: std::thread::JoinHandle<()>,
+    error_thread: std::thread::JoinHandle<()>,
+    mut status_stream: UnixStream,
+) -> Result<i32, String> {
+    // The parent Git process keeps this client's stdin open until the client exits. Do not join
+    // the stdin pump here: that would wait for Git while Git waits for the broker status. Closing
+    // the data channel is enough to release the broker-side stdin pump.
+    let _ = data.shutdown(Shutdown::Both);
+    drop(input_thread);
     let _ = error_thread.join();
     let mut status = String::new();
     status_stream
@@ -1824,6 +1976,27 @@ fn connect_repository_ssh_broker_channel(
         .write_all(b"\n")
         .map_err(|_| "Repository SSH broker request failed".to_string())?;
     Ok(stream)
+}
+
+fn repository_command_access_root(
+    runtime_root: &Path,
+    operation_id: &str,
+    repository_id: &str,
+) -> PathBuf {
+    let mut digest = Sha256::new();
+    digest.update(operation_id.as_bytes());
+    digest.update([0]);
+    digest.update(repository_id.as_bytes());
+    digest.update([0]);
+    digest.update(next_working_directory_id("access").as_bytes());
+    let access_id = digest
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    // Keep operation-scoped Unix socket paths below sockaddr_un::sun_path on deep runtime roots.
+    runtime_root.join(REPOSITORY_ACCESS_DIR).join(access_id)
 }
 
 #[derive(Debug)]
@@ -1854,12 +2027,60 @@ impl RepositoryCommandAccess {
             .as_ref()
             .map(|materialization| materialization.operation_id.as_str())
             .unwrap_or("operation");
-        Ok(Some(Self::prepare_ssh(
+        Ok(Some(Self::prepare_materialization_ssh(
             runtime_root,
             operation_id,
             &request.repository.id,
             ssh,
         )?))
+    }
+
+    fn prepare_materialization_ssh(
+        runtime_root: &Path,
+        operation_id: &str,
+        repository_id: &str,
+        ssh: &RepositorySshMaterializationAccess,
+    ) -> Result<Self, WorkingDirectoryDiagnostic> {
+        let root = repository_command_access_root(runtime_root, operation_id, repository_id);
+        fs::create_dir_all(&root).map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_setup_failed",
+                "operation-scoped Repository access could not be prepared",
+            )
+        })?;
+        set_directory_owner_only(&root)?;
+        let known_hosts = root.join("known_hosts");
+        let ssh_command = root.join("ssh-command");
+        write_owner_only(&known_hosts, ssh.known_hosts_entry.expose().as_bytes())?;
+        let agent = Arc::new(RepositorySshAgent::start(runtime_root, operation_id, ssh)?);
+        let policy = RepositorySshCommandPolicy::from_access(ssh)?;
+        let destination = match policy.username.as_deref() {
+            Some(username) => format!("{username}@{}", policy.host),
+            None => policy.host.clone(),
+        };
+        let port = policy
+            .port
+            .map(|port| format!("-p {} ", shell_quote(&port.to_string())))
+            .unwrap_or_default();
+        let remote_command = format!("git-upload-pack {}", shell_quote(&policy.repository_path));
+        let script = format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do [ \"$arg\" = -G ] && exit 0; done\nexec ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout={} -o ConnectionAttempts=1 -o ServerAliveInterval={} -o ServerAliveCountMax={} -o IdentitiesOnly=no -o IdentityFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes -o UserKnownHostsFile={} -o ClearAllForwardings=yes -o PermitLocalCommand=no {}-- {} {}\n",
+            REPOSITORY_SSH_CONNECT_TIMEOUT_SECONDS,
+            REPOSITORY_SSH_SERVER_ALIVE_INTERVAL_SECONDS,
+            REPOSITORY_SSH_SERVER_ALIVE_COUNT_MAX,
+            shell_quote_path(&known_hosts)?,
+            port,
+            shell_quote(&destination),
+            shell_quote(&remote_command),
+        );
+        write_owner_only(&ssh_command, script.as_bytes())?;
+        set_file_owner_executable(&ssh_command)?;
+        Ok(Self {
+            root,
+            ssh_command,
+            agent,
+            ssh_broker: None,
+        })
     }
 
     fn prepare_ssh(
@@ -1868,20 +2089,7 @@ impl RepositoryCommandAccess {
         repository_id: &str,
         ssh: &RepositorySshMaterializationAccess,
     ) -> Result<Self, WorkingDirectoryDiagnostic> {
-        let mut digest = Sha256::new();
-        digest.update(operation_id.as_bytes());
-        digest.update([0]);
-        digest.update(repository_id.as_bytes());
-        digest.update([0]);
-        digest.update(next_working_directory_id("access").as_bytes());
-        let access_id = digest
-            .finalize()
-            .iter()
-            .take(8)
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        // Keep operation-scoped Unix socket paths below sockaddr_un::sun_path on deep runtime roots.
-        let root = runtime_root.join(REPOSITORY_ACCESS_DIR).join(access_id);
+        let root = repository_command_access_root(runtime_root, operation_id, repository_id);
         fs::create_dir_all(&root).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
                 "working_directory_repository_access_setup_failed",
@@ -1968,11 +2176,14 @@ fn validate_ssh_materialization_access(
             "operation-scoped SSH credential and host-trust authority has expired",
         ));
     }
-    if access.credential_id.trim().is_empty()
-        || access.credential_revision == 0
+    if access.credential_candidates.is_empty()
+        || access.credential_candidates.iter().any(|candidate| {
+            candidate.credential_id.trim().is_empty()
+                || candidate.credential_revision == 0
+                || !candidate.private_key.expose().contains("PRIVATE KEY")
+        })
         || access.host_trust_id.trim().is_empty()
         || access.host_trust_revision == 0
-        || !access.private_key.expose().contains("PRIVATE KEY")
         || access.known_hosts_entry.expose().trim().is_empty()
     {
         return Err(WorkingDirectoryDiagnostic::new(
@@ -1990,31 +2201,14 @@ fn repository_transport_warning(kind: workspace_api::RepositorySourceKind) -> Op
 fn validate_remote_source_uri(
     request: &WorkingDirectoryRequest,
 ) -> Result<(), WorkingDirectoryDiagnostic> {
-    let url = url::Url::parse(&request.repository.source.uri).map_err(|_| {
-        WorkingDirectoryDiagnostic::new(
-            "working_directory_repository_source_invalid",
-            "remote Repository source URI is invalid",
-        )
-    })?;
-    let expected_scheme = match request.repository.source.kind {
-        workspace_api::RepositorySourceKind::Https => "https",
-        workspace_api::RepositorySourceKind::Http => "http",
-        workspace_api::RepositorySourceKind::Ssh => "ssh",
-        _ => return Ok(()),
-    };
-    if url.scheme() != expected_scheme
-        || url.host_str().is_none()
-        || url.password().is_some()
-        || !url.query().is_none()
-        || !url.fragment().is_none()
-        || (matches!(expected_scheme, "https" | "http") && !url.username().is_empty())
-    {
-        return Err(WorkingDirectoryDiagnostic::new(
-            "working_directory_repository_source_invalid",
-            "remote Repository source URI is invalid or contains forbidden credentials",
-        ));
-    }
-    if expected_scheme == "ssh" {
+    if request.repository.source.kind == workspace_api::RepositorySourceKind::Ssh {
+        let source =
+            parse_repository_ssh_source(&request.repository.source.uri).ok_or_else(|| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_source_invalid",
+                    "remote Repository source URI is invalid",
+                )
+            })?;
         let access = request
             .materialization
             .as_ref()
@@ -2025,11 +2219,10 @@ fn validate_remote_source_uri(
                     "SSH Repository materialization requires operation-scoped credential and host-trust authority",
                 )
             })?;
-        let host = url.host_str().unwrap_or_default();
-        let known_host = if url.port().unwrap_or(22) == 22 {
-            format!("{host} ")
+        let known_host = if source.port.unwrap_or(22) == 22 {
+            format!("{} ", source.host)
         } else {
-            format!("[{host}]:{} ", url.port().unwrap_or(22))
+            format!("[{}]:{} ", source.host, source.port.unwrap_or(22))
         };
         if !access.known_hosts_entry.expose().starts_with(&known_host) {
             return Err(WorkingDirectoryDiagnostic::new(
@@ -2037,6 +2230,31 @@ fn validate_remote_source_uri(
                 "SSH Repository source does not match the operation-scoped host-trust authority",
             ));
         }
+        return Ok(());
+    }
+
+    let url = url::Url::parse(&request.repository.source.uri).map_err(|_| {
+        WorkingDirectoryDiagnostic::new(
+            "working_directory_repository_source_invalid",
+            "remote Repository source URI is invalid",
+        )
+    })?;
+    let expected_scheme = match request.repository.source.kind {
+        workspace_api::RepositorySourceKind::Https => "https",
+        workspace_api::RepositorySourceKind::Http => "http",
+        _ => return Ok(()),
+    };
+    if url.scheme() != expected_scheme
+        || url.host_str().is_none()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+    {
+        return Err(WorkingDirectoryDiagnostic::new(
+            "working_directory_repository_source_invalid",
+            "remote Repository source URI is invalid or contains forbidden credentials",
+        ));
     }
     Ok(())
 }
@@ -2253,10 +2471,17 @@ fn run_repository_git(
     mut command: Command,
     code: &'static str,
 ) -> Result<(), WorkingDirectoryDiagnostic> {
+    tracing::info!(
+        target: "yoi::repository_access",
+        event = "repository_git_operation_started",
+        stage = code,
+        "starting Git Repository operation"
+    );
+    let started = Instant::now();
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|_| {
             WorkingDirectoryDiagnostic::new(
@@ -2264,7 +2489,8 @@ fn run_repository_git(
                 "Git command could not be executed; backend-private path details were omitted",
             )
         })?;
-    let started = Instant::now();
+    let mut stderr = child.stderr.take().expect("piped Git stderr");
+    let stderr_reader = std::thread::spawn(move || read_bounded_command_output(&mut stderr));
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|_| {
             WorkingDirectoryDiagnostic::new(
@@ -2277,6 +2503,13 @@ fn run_repository_git(
         if started.elapsed() >= REPOSITORY_COMMAND_TIMEOUT {
             let _ = child.kill();
             let _ = child.wait();
+            tracing::warn!(
+                target: "yoi::repository_access",
+                event = "repository_git_operation_timed_out",
+                stage = code,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Git Repository operation exceeded the Runtime time limit"
+            );
             return Err(WorkingDirectoryDiagnostic::new(
                 "working_directory_repository_timeout",
                 "Git Repository operation exceeded the Runtime time limit",
@@ -2284,14 +2517,76 @@ fn run_repository_git(
         }
         std::thread::sleep(Duration::from_millis(25));
     };
+    let stderr = stderr_reader.join().unwrap_or_default();
     if status.success() {
+        tracing::info!(
+            target: "yoi::repository_access",
+            event = "repository_git_operation_succeeded",
+            stage = code,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Git Repository operation succeeded"
+        );
         Ok(())
     } else {
-        Err(WorkingDirectoryDiagnostic::new(
-            code,
-            "Git Repository operation failed; credentials and backend-private path details were omitted",
-        ))
+        let diagnostic = repository_git_failure_diagnostic(code, &stderr);
+        tracing::warn!(
+            target: "yoi::repository_access",
+            event = "repository_git_operation_failed",
+            stage = code,
+            diagnostic_code = %diagnostic.code,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            exit_status = %status,
+            "Git Repository operation failed"
+        );
+        Err(diagnostic)
     }
+}
+
+fn repository_git_failure_diagnostic(
+    default_code: &'static str,
+    stderr: &[u8],
+) -> WorkingDirectoryDiagnostic {
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    let (code, message) = if stderr.contains("repository ssh operation denied") {
+        (
+            "working_directory_repository_access_denied",
+            "Git SSH command was rejected by the operation-scoped Repository access policy",
+        )
+    } else if stderr.contains("host key verification failed")
+        || stderr.contains("no ed25519 host key is known")
+    {
+        (
+            "working_directory_repository_host_trust_failed",
+            "Git SSH host key verification failed",
+        )
+    } else if stderr.contains("permission denied") || stderr.contains("publickey") {
+        (
+            "working_directory_repository_authentication_failed",
+            "Git SSH authentication failed for every operation-scoped credential candidate",
+        )
+    } else if stderr.contains("connection timed out")
+        || stderr.contains("connection refused")
+        || stderr.contains("network is unreachable")
+        || stderr.contains("no route to host")
+        || stderr.contains("could not resolve hostname")
+        || stderr.contains("name or service not known")
+    {
+        (
+            "working_directory_repository_connection_failed",
+            "Git SSH connection to the Repository host failed",
+        )
+    } else if stderr.contains("repository not found") {
+        (
+            "working_directory_repository_not_found",
+            "Git Repository was not found or is not accessible",
+        )
+    } else {
+        (
+            default_code,
+            "Git Repository operation failed; credentials and backend-private path details were omitted",
+        )
+    };
+    WorkingDirectoryDiagnostic::new(code, message)
 }
 
 fn resolve_cached_commit(
@@ -2507,9 +2802,12 @@ fn set_file_owner_executable(path: &Path) -> Result<(), WorkingDirectoryDiagnost
     Ok(())
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn shell_quote_path(path: &Path) -> Result<String, WorkingDirectoryDiagnostic> {
-    let value = path_str(path)?;
-    Ok(format!("'{}'", value.replace('\'', "'\\''")))
+    Ok(shell_quote(&path_str(path)?))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2670,6 +2968,25 @@ mod tests {
             redaction: crate::resource::ResourceRedactionPolicy::RuntimeInternalOnly,
             audit_correlation_id: "repository-access-1".to_string(),
             profile_source_graph: None,
+        }
+    }
+
+    fn repository_ssh_access() -> crate::catalog::RepositorySshMaterializationAccess {
+        crate::catalog::RepositorySshMaterializationAccess {
+            credential_candidates: vec![crate::catalog::RepositorySshCredentialCandidate {
+                credential_id: "credential-1".to_string(),
+                credential_revision: 2,
+                private_key: crate::catalog::SensitiveString::new("PRIVATE KEY secret bytes"),
+            }],
+            host_trust_id: "trust-1".to_string(),
+            host_trust_revision: 4,
+            access: workspace_api::RepositoryAccessMode::ReadOnly,
+            expires_at_epoch_seconds: u64::MAX,
+            repository_id: "repo-main".to_string(),
+            repository_source_fingerprint: "sha256:test".to_string(),
+            repository_uri: "ssh://git@example.test/repo.git".to_string(),
+            secret_resource: repository_resource_handle(),
+            known_hosts_entry: crate::catalog::SensitiveString::new("host key secret bytes"),
         }
     }
 
@@ -3054,24 +3371,48 @@ mod tests {
 
     #[test]
     fn sensitive_repository_access_debug_output_is_redacted() {
-        let access = crate::catalog::RepositorySshMaterializationAccess {
-            credential_id: "credential-1".to_string(),
-            credential_revision: 2,
-            host_trust_id: "trust-1".to_string(),
-            host_trust_revision: 4,
-            access: workspace_api::RepositoryAccessMode::ReadOnly,
-            expires_at_epoch_seconds: u64::MAX,
-            repository_id: "repo-main".to_string(),
-            repository_source_fingerprint: "sha256:test".to_string(),
-            repository_uri: "ssh://git@example.test/repo.git".to_string(),
-            secret_resource: repository_resource_handle(),
-            private_key: crate::catalog::SensitiveString::new("PRIVATE KEY secret bytes"),
-            known_hosts_entry: crate::catalog::SensitiveString::new("host key secret bytes"),
-        };
+        let access = repository_ssh_access();
 
         let debug = format!("{access:?}");
         assert!(!debug.contains("secret bytes"));
         assert!(debug.contains("[REDACTED]"));
+
+        let serialized = serde_json::to_value(&access).unwrap();
+        assert_eq!(
+            serialized["credential_candidates"][0]["credential_id"],
+            "credential-1"
+        );
+        assert_eq!(
+            serialized["credential_candidates"][0]["credential_revision"],
+            2
+        );
+        assert!(
+            serialized["credential_candidates"][0]
+                .get("private_key")
+                .is_none()
+        );
+        assert!(serialized.get("known_hosts_entry").is_none());
+        let decoded: crate::catalog::RepositorySshMaterializationAccess =
+            serde_json::from_value(serialized).unwrap();
+        assert!(
+            decoded.credential_candidates[0]
+                .private_key
+                .expose()
+                .is_empty()
+        );
+        assert!(decoded.known_hosts_entry.expose().is_empty());
+    }
+
+    #[test]
+    fn repository_ssh_access_rejects_empty_credential_candidates() {
+        let mut access = repository_ssh_access();
+        access.credential_candidates.clear();
+
+        let error = validate_ssh_materialization_access(&access).unwrap_err();
+        assert_eq!(
+            error.code,
+            "working_directory_remote_repository_access_invalid"
+        );
     }
 
     #[test]
@@ -3080,12 +3421,15 @@ mod tests {
         let runtime_root = tempfile::tempdir().unwrap();
         let key_root = tempfile::tempdir().unwrap();
         let key_path = key_root.path().join("id_ed25519");
-        let status = Command::new("ssh-keygen")
-            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
-            .arg(&key_path)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        let fallback_key_path = key_root.path().join("id_ed25519_fallback");
+        for path in [&key_path, &fallback_key_path] {
+            let status = Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
         let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
         let mut request = request(repo.path());
         request.materialization = Some(crate::catalog::RepositoryMaterializationContext {
@@ -3096,8 +3440,22 @@ mod tests {
             config_projection_digest: "sha256:projection".to_string(),
             cache_generation: 0,
             ssh: Some(crate::catalog::RepositorySshMaterializationAccess {
-                credential_id: "credential-1".to_string(),
-                credential_revision: 1,
+                credential_candidates: vec![
+                    crate::catalog::RepositorySshCredentialCandidate {
+                        credential_id: "credential-1".to_string(),
+                        credential_revision: 1,
+                        private_key: crate::catalog::SensitiveString::new(
+                            fs::read_to_string(&key_path).unwrap(),
+                        ),
+                    },
+                    crate::catalog::RepositorySshCredentialCandidate {
+                        credential_id: "credential-2".to_string(),
+                        credential_revision: 3,
+                        private_key: crate::catalog::SensitiveString::new(
+                            fs::read_to_string(&fallback_key_path).unwrap(),
+                        ),
+                    },
+                ],
                 host_trust_id: "trust-1".to_string(),
                 host_trust_revision: 1,
                 access: workspace_api::RepositoryAccessMode::ReadWrite,
@@ -3106,9 +3464,6 @@ mod tests {
                 repository_source_fingerprint: "sha256:test".to_string(),
                 repository_uri: "ssh://git@example.test/repo.git".to_string(),
                 secret_resource: repository_resource_handle(),
-                private_key: crate::catalog::SensitiveString::new(
-                    fs::read_to_string(&key_path).unwrap(),
-                ),
                 known_hosts_entry: crate::catalog::SensitiveString::new(
                     "example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample",
                 ),
@@ -3123,7 +3478,58 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!command_access.root.join("identity").exists());
+        assert!(command_access.ssh_broker.is_none());
+        let materialization_ssh_command = fs::read_to_string(&command_access.ssh_command).unwrap();
+        assert!(materialization_ssh_command.contains("exec ssh -F /dev/null"));
+        assert!(materialization_ssh_command.contains("git-upload-pack"));
+        assert!(!materialization_ssh_command.contains("__repository-ssh"));
+        assert!(!materialization_ssh_command.contains("PRIVATE KEY"));
+        let fake_bin = command_access.root.join("fake-bin");
+        fs::create_dir(&fake_bin).unwrap();
+        let fake_ssh = fake_bin.join("ssh");
+        write_owner_only(
+            &fake_ssh,
+            b"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAPTURE\"\n",
+        )
+        .unwrap();
+        set_file_owner_executable(&fake_ssh).unwrap();
+        let captured = command_access.root.join("captured-ssh-args");
+        let wrapper_status = Command::new(&command_access.ssh_command)
+            .args(["attacker@example.invalid", "arbitrary-command"])
+            .env("PATH", &fake_bin)
+            .env("CAPTURE", &captured)
+            .status()
+            .unwrap();
+        assert!(wrapper_status.success());
+        let captured = fs::read_to_string(captured).unwrap();
+        assert!(captured.contains("git@example.test"));
+        assert!(captured.contains("git-upload-pack '/repo.git'"));
+        assert!(!captured.contains("attacker@example.invalid"));
+        assert!(!captured.contains("arbitrary-command"));
         assert!(command_access.agent.socket.exists());
+        let identities = Command::new("ssh-add")
+            .arg("-L")
+            .env("SSH_AUTH_SOCK", &command_access.agent.socket)
+            .output()
+            .unwrap();
+        assert!(identities.status.success());
+        let identity_blobs = String::from_utf8(identities.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| line.split_whitespace().nth(1).unwrap().to_string())
+            .collect::<Vec<_>>();
+        let expected_blobs = [&key_path, &fallback_key_path]
+            .into_iter()
+            .map(|path| {
+                fs::read_to_string(path.with_extension("pub"))
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(identity_blobs, expected_blobs);
         let operation_socket = command_access.agent.socket.clone();
         drop(command_access);
         assert!(!operation_socket.exists());
@@ -3238,7 +3644,7 @@ mod tests {
         );
         let mut rotated = initial_materialization.clone();
         rotated.operation_id = "operation-agent-rotated".to_string();
-        rotated.ssh.as_mut().unwrap().credential_revision = 2;
+        rotated.ssh.as_mut().unwrap().credential_candidates[0].credential_revision = 2;
         rotated.ssh.as_mut().unwrap().access = workspace_api::RepositoryAccessMode::ReadOnly;
         materializer
             .authorize_repository_access(&WorkingDirectoryRepositoryAccessRequest {
@@ -3360,7 +3766,7 @@ mod tests {
 
         let mut read_write = rotated;
         read_write.operation_id = "operation-agent-read-write".to_string();
-        read_write.ssh.as_mut().unwrap().credential_revision = 3;
+        read_write.ssh.as_mut().unwrap().credential_candidates[0].credential_revision = 3;
         read_write.ssh.as_mut().unwrap().access = workspace_api::RepositoryAccessMode::ReadWrite;
         let read_write_command_policy =
             RepositorySshCommandPolicy::from_access(read_write.ssh.as_ref().unwrap()).unwrap();
@@ -3432,8 +3838,11 @@ mod tests {
             config_projection_digest: "sha256:projection".to_string(),
             cache_generation: 0,
             ssh: Some(crate::catalog::RepositorySshMaterializationAccess {
-                credential_id: "credential-1".to_string(),
-                credential_revision: 1,
+                credential_candidates: vec![crate::catalog::RepositorySshCredentialCandidate {
+                    credential_id: "credential-1".to_string(),
+                    credential_revision: 1,
+                    private_key: crate::catalog::SensitiveString::new("PRIVATE KEY placeholder"),
+                }],
                 host_trust_id: "trust-1".to_string(),
                 host_trust_revision: 1,
                 access: workspace_api::RepositoryAccessMode::ReadOnly,
@@ -3442,7 +3851,6 @@ mod tests {
                 repository_source_fingerprint: "sha256:test".to_string(),
                 repository_uri: "ssh://git@example.test/repo.git".to_string(),
                 secret_resource: repository_resource_handle(),
-                private_key: crate::catalog::SensitiveString::new("PRIVATE KEY placeholder"),
                 known_hosts_entry: crate::catalog::SensitiveString::new(
                     "example.test ssh-ed25519 placeholder",
                 ),
@@ -3474,6 +3882,150 @@ mod tests {
                     .unwrap_err()
                     .code,
                 "working_directory_repository_selector_invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_ssh_output_flushes_every_protocol_chunk() {
+        struct ChunkReader {
+            chunks: std::collections::VecDeque<&'static [u8]>,
+        }
+        impl Read for ChunkReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let Some(chunk) = self.chunks.pop_front() else {
+                    return Ok(0);
+                };
+                buffer[..chunk.len()].copy_from_slice(chunk);
+                Ok(chunk.len())
+            }
+        }
+        #[derive(Default)]
+        struct FlushRecorder {
+            pending: Vec<u8>,
+            flushed: Vec<Vec<u8>>,
+        }
+        impl Write for FlushRecorder {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.pending.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushed.push(std::mem::take(&mut self.pending));
+                Ok(())
+            }
+        }
+
+        let mut reader = ChunkReader {
+            chunks: std::collections::VecDeque::from([&b"0008"[..], &b"NAK\n"[..]]),
+        };
+        let mut writer = FlushRecorder::default();
+        assert_eq!(
+            copy_streaming(&mut reader, &mut writer, "test_protocol").unwrap(),
+            8
+        );
+        assert_eq!(writer.flushed, [b"0008".to_vec(), b"NAK\n".to_vec()]);
+    }
+
+    #[test]
+    fn repository_git_stderr_is_classified_without_exposing_raw_output() {
+        let cases: &[(&[u8], &str)] = &[
+            (
+                b"git@example.test: Permission denied (publickey).\n",
+                "working_directory_repository_authentication_failed",
+            ),
+            (
+                b"Host key verification failed.\n",
+                "working_directory_repository_host_trust_failed",
+            ),
+            (
+                b"ssh: connect to host example.test port 22: Connection timed out\n",
+                "working_directory_repository_connection_failed",
+            ),
+            (
+                b"Repository SSH operation denied\n",
+                "working_directory_repository_access_denied",
+            ),
+        ];
+        for (stderr, expected_code) in cases {
+            let diagnostic = repository_git_failure_diagnostic(
+                "working_directory_repository_fetch_failed",
+                stderr,
+            );
+            assert_eq!(&diagnostic.code, expected_code);
+            assert!(!diagnostic.message.contains("example.test"));
+        }
+    }
+
+    #[test]
+    fn repository_ssh_client_completion_does_not_wait_for_parent_stdin() {
+        let (data, _broker_data) = UnixStream::pair().unwrap();
+        let (status, mut broker_status) = UnixStream::pair().unwrap();
+        broker_status.write_all(b"0\n").unwrap();
+        broker_status.shutdown(Shutdown::Write).unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let input_thread = std::thread::spawn(move || {
+            release_rx.recv().unwrap();
+            finished_tx.send(()).unwrap();
+        });
+        let error_thread = std::thread::spawn(|| {});
+
+        assert_eq!(
+            complete_repository_ssh_client(data, input_thread, error_thread, status).unwrap(),
+            0
+        );
+        release_tx.send(()).unwrap();
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached stdin pump exits after its input closes");
+    }
+
+    #[test]
+    fn scp_like_ssh_source_is_validated_and_authorized() {
+        let uri = "git@example.test:team/repo.git";
+        let source = parse_repository_ssh_source(uri).expect("SCP-like source parses");
+        assert_eq!(source.host, "example.test");
+        assert_eq!(source.username.as_deref(), Some("git"));
+        assert_eq!(source.port, None);
+        assert_eq!(source.repository_path, "team/repo.git");
+
+        let mut access = repository_ssh_access();
+        access.repository_uri = uri.to_string();
+        access.known_hosts_entry =
+            crate::catalog::SensitiveString::new("example.test ssh-ed25519 placeholder");
+        let policy = RepositorySshCommandPolicy::from_access(&access).unwrap();
+        assert_eq!(policy.host, "example.test");
+        assert_eq!(policy.username.as_deref(), Some("git"));
+        assert_eq!(policy.repository_path, "team/repo.git");
+
+        let mut request = request(Path::new("."));
+        request.repository.source = workspace_api::RepositorySource {
+            kind: workspace_api::RepositorySourceKind::Ssh,
+            uri: uri.to_string(),
+        };
+        request.materialization = Some(crate::catalog::RepositoryMaterializationContext {
+            workspace_id: "workspace-1".to_string(),
+            runtime_id: "runtime-1".to_string(),
+            operation_id: "operation-1".to_string(),
+            config_revision: 1,
+            config_projection_digest: "sha256:projection".to_string(),
+            cache_generation: 0,
+            ssh: Some(access),
+        });
+        validate_remote_source_uri(&request).unwrap();
+
+        for invalid in [
+            "git@example.test:",
+            "@example.test:team/repo.git",
+            "git@:team/repo.git",
+            "git@example.test:-upload-pack",
+            "git@example.test:team/repo.git?ref=main",
+        ] {
+            assert!(
+                parse_repository_ssh_source(invalid).is_none(),
+                "invalid SCP-like source was accepted: {invalid}"
             );
         }
     }
@@ -3526,8 +4078,11 @@ mod tests {
         };
         ssh.materialization = Some(context(Some(
             crate::catalog::RepositorySshMaterializationAccess {
-                credential_id: "credential-1".to_string(),
-                credential_revision: 1,
+                credential_candidates: vec![crate::catalog::RepositorySshCredentialCandidate {
+                    credential_id: "credential-1".to_string(),
+                    credential_revision: 1,
+                    private_key: crate::catalog::SensitiveString::new("PRIVATE KEY placeholder"),
+                }],
                 host_trust_id: "trust-1".to_string(),
                 host_trust_revision: 1,
                 access: workspace_api::RepositoryAccessMode::ReadOnly,
@@ -3536,7 +4091,6 @@ mod tests {
                 repository_source_fingerprint: "sha256:test".to_string(),
                 repository_uri: "ssh://git@example.test/repo.git".to_string(),
                 secret_resource: repository_resource_handle(),
-                private_key: crate::catalog::SensitiveString::new("PRIVATE KEY placeholder"),
                 known_hosts_entry: crate::catalog::SensitiveString::new(
                     "other.test ssh-ed25519 placeholder",
                 ),

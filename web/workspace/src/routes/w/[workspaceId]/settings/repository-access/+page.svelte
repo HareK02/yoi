@@ -4,24 +4,33 @@
     CreateRepositorySshCredentialRequest,
     DeleteRepositorySshCredentialRequest,
     DeleteRepositorySshHostTrustRequest,
+    GenerateRepositorySshCredentialRequest,
     PutRepositorySshHostTrustRequest,
     RepositorySshCredential,
     RepositorySshHostTrust,
+    RepositorySshPublicKey,
     RotateRepositorySshCredentialRequest,
   } from '$lib/generated/repository-access-api';
   import {
     parseRepositorySshCredential,
     parseRepositorySshHostTrust,
+    parseRepositorySshPublicKey,
   } from '$lib/workspace/api/repository-access';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
   let credentials = $state<RepositorySshCredential[]>(untrack(() => data.credentials));
+  let publicKeys = $state<Record<string, RepositorySshPublicKey>>(
+    Object.fromEntries(untrack(() => data.publicKeys).map((key) => [key.credential_id, key]))
+  );
   let hostTrusts = $state<RepositorySshHostTrust[]>(untrack(() => data.hostTrusts));
   const accessProjection = untrack(() => data.accessProjection);
   let message = $state<string | null>(null);
   let pending = $state(false);
+  let copiedCredentialId = $state<string | null>(null);
 
+  let generateCredentialId = $state('');
+  let generateCredentialName = $state('');
   let credentialId = $state('');
   let credentialName = $state('');
   let privateKey = $state('');
@@ -37,6 +46,7 @@
   let hostExpectedRevision = $state<number | null>(null);
 
   const base = $derived(`/api/w/${encodeURIComponent(data.workspaceId)}/settings/repository-access`);
+  const workspaceDefaultCredentialId = 'workspace-default';
 
   function operationId(prefix: string): string {
     return `${prefix}-${crypto.randomUUID()}`;
@@ -71,6 +81,55 @@
     return parse(payload);
   }
 
+  async function loadPublicKey(credentialId: string): Promise<RepositorySshPublicKey> {
+    const response = await fetch(
+      `${base}/credentials/${encodeURIComponent(credentialId)}/public-key`,
+      { headers: { accept: 'application/json' } }
+    );
+    const body = await response.json();
+    if (!response.ok) {
+      throw new Error(`Repository Access request failed with status ${response.status}.`);
+    }
+    return parseRepositorySshPublicKey(body);
+  }
+
+  async function generateCredential() {
+    pending = true;
+    message = null;
+    try {
+      const body: GenerateRepositorySshCredentialRequest = {
+        operation_id: operationId('credential-generate'),
+        credential_id: generateCredentialId,
+        name: generateCredentialName
+      };
+      const created = await request('/credentials/generate', 'POST', body, parseRepositorySshCredential);
+      const publicKey = await loadPublicKey(created.credential_id);
+      credentials = [...credentials.filter((item) => item.credential_id !== created.credential_id), created];
+      publicKeys = { ...publicKeys, [created.credential_id]: publicKey };
+      generateCredentialId = '';
+      generateCredentialName = '';
+      message = `Generated SSH credential ${created.credential_id}`;
+    } catch (error) {
+      message = error instanceof Error ? error.message : 'Failed to generate SSH credential';
+    } finally {
+      pending = false;
+    }
+  }
+
+  async function copyPublicKey(credentialId: string) {
+    const publicKey = publicKeys[credentialId]?.public_key;
+    if (!publicKey) return;
+    try {
+      await navigator.clipboard.writeText(publicKey);
+      copiedCredentialId = credentialId;
+      window.setTimeout(() => {
+        if (copiedCredentialId === credentialId) copiedCredentialId = null;
+      }, 1500);
+    } catch {
+      message = 'Failed to copy the public key';
+    }
+  }
+
   async function createCredential() {
     pending = true;
     message = null;
@@ -88,7 +147,9 @@
         body,
         parseRepositorySshCredential
       );
+      const publicKey = await loadPublicKey(created.credential_id);
       credentials = [...credentials, created].sort((a, b) => a.credential_id.localeCompare(b.credential_id));
+      publicKeys = { ...publicKeys, [created.credential_id]: publicKey };
       credentialId = '';
       credentialName = '';
       message = `Credential ${created.credential_id} created. Pasted secret fields were cleared.`;
@@ -117,7 +178,9 @@
         body,
         parseRepositorySshCredential
       );
+      const publicKey = await loadPublicKey(rotated.credential_id);
       credentials = credentials.map((entry) => entry.credential_id === rotated.credential_id ? rotated : entry);
+      publicKeys = { ...publicKeys, [rotated.credential_id]: publicKey };
       rotateCredentialId = null;
       message = `Credential ${rotated.credential_id} rotated to revision ${rotated.current_revision}. Pasted secret fields were cleared.`;
     } catch (error) {
@@ -145,6 +208,9 @@
         null
       );
       credentials = credentials.filter((entry) => entry.credential_id !== credential.credential_id);
+      const remainingPublicKeys = { ...publicKeys };
+      delete remainingPublicKeys[credential.credential_id];
+      publicKeys = remainingPublicKeys;
       message = `Credential ${credential.credential_id} deleted.`;
     } catch (error) {
       message = error instanceof Error ? error.message : 'Credential deletion failed';
@@ -227,7 +293,7 @@
     <div><p class="eyebrow">owner only</p><h2>Repository Access</h2></div>
     <span class="badge success">encrypted</span>
   </header>
-  <p>Manage Workspace-scoped SSH credentials and pinned host keys. Private keys and passphrases are write-only and never returned by this page.</p>
+  <p>The Workspace default SSH key is generated separately from the Runtime authentication identity and is always offered during SSH clone. Without an explicit Repository binding, a unique pinned host trust matching the Repository URI is used with this default key. A binding can add one dedicated credential; OpenSSH receives both candidates and tries them through one operation-scoped agent. Private keys and passphrases remain write-only.</p>
   {#if message}<p class="status-message">{message}</p>{/if}
 
   <div class="settings-runtime-list">
@@ -237,7 +303,7 @@
     {#each accessProjection.bindings as binding (binding.repository_key)}
       <div class="card">
         <strong>{binding.repository_key}</strong>
-        <p>{binding.access} · credential <code>{binding.credential_id}</code> · host trust <code>{binding.host_trust_id}</code></p>
+        <p>{binding.access} · additional credential <code>{binding.credential_id}</code> · always includes <code>{workspaceDefaultCredentialId}</code> · host trust <code>{binding.host_trust_id}</code></p>
       </div>
     {/each}
   </div>
@@ -248,12 +314,19 @@
     {#each credentials as credential (credential.credential_id)}
       <div class="card">
         <strong>{credential.name}</strong> <code>{credential.credential_id}</code>
+        {#if credential.credential_id === workspaceDefaultCredentialId}<span class="badge success">Workspace default</span>{/if}
         <p>{credential.public_key_algorithm} · {credential.public_key_fingerprint} · revision {credential.current_revision}</p>
-        <p>References: {credential.referenced_repositories.join(', ') || 'none'}</p>
-        <div class="settings-action-row">
-          <button type="button" onclick={() => (rotateCredentialId = rotateCredentialId === credential.credential_id ? null : credential.credential_id)}>Rotate</button>
-          <button type="button" class="danger" disabled={pending || credential.referenced_repositories.length > 0} onclick={() => void deleteCredential(credential)}>Delete</button>
-        </div>
+        {#if publicKeys[credential.credential_id]}
+          <label><span>Public key</span><textarea readonly rows="3" value={publicKeys[credential.credential_id].public_key}></textarea></label>
+          <button type="button" onclick={() => void copyPublicKey(credential.credential_id)}>{copiedCredentialId === credential.credential_id ? 'Copied' : 'Copy public key'}</button>
+        {/if}
+        <p>References: {credential.credential_id === workspaceDefaultCredentialId ? 'all SSH repository operations' : credential.referenced_repositories.join(', ') || 'none'}</p>
+        {#if credential.credential_id !== workspaceDefaultCredentialId}
+          <div class="settings-action-row">
+            <button type="button" onclick={() => (rotateCredentialId = rotateCredentialId === credential.credential_id ? null : credential.credential_id)}>Rotate</button>
+            <button type="button" class="danger" disabled={pending || credential.referenced_repositories.length > 0} onclick={() => void deleteCredential(credential)}>Delete</button>
+          </div>
+        {/if}
         {#if rotateCredentialId === credential.credential_id}
           <form class="settings-runtime-form" onsubmit={(event) => { event.preventDefault(); void rotateCredential(credential); }}>
             <label><span>New private key</span><textarea bind:value={rotatePrivateKey} required rows="8" autocomplete="off"></textarea></label>
@@ -264,8 +337,16 @@
       </div>
     {/each}
 
+    <form class="settings-runtime-form" onsubmit={(event) => { event.preventDefault(); void generateCredential(); }}>
+      <h3>Generate Repository SSH credential</h3>
+      <p>Create an additional Ed25519 key for a Repository binding. The Workspace default SSH key is already generated automatically and is included separately.</p>
+      <label><span>Credential id</span><input bind:value={generateCredentialId} placeholder="repository-deploy" required pattern="[A-Za-z0-9_.-]+" maxlength="128" /></label>
+      <label><span>Name</span><input bind:value={generateCredentialName} placeholder="Repository deploy key" required maxlength="200" /></label>
+      <button type="submit" disabled={pending}>Generate credential</button>
+    </form>
+
     <form class="settings-runtime-form" onsubmit={(event) => { event.preventDefault(); void createCredential(); }}>
-      <h3>Add SSH credential</h3>
+      <h3>Import existing SSH credential</h3>
       <label><span>Credential id</span><input bind:value={credentialId} required pattern="[A-Za-z0-9_.-]+" maxlength="128" /></label>
       <label><span>Name</span><input bind:value={credentialName} required maxlength="200" /></label>
       <label><span>OpenSSH private key (ssh-ed25519)</span><textarea bind:value={privateKey} required rows="10" autocomplete="off"></textarea></label>

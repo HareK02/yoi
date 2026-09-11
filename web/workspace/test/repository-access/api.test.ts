@@ -2,6 +2,7 @@ import {
   parseRepositoryAccessProjection,
   parseRepositorySshCredentials,
   parseRepositorySshHostTrusts,
+  parseRepositorySshPublicKey,
   RepositoryAccessSchemaError,
 } from "../../src/lib/workspace/api/repository-access.ts";
 
@@ -59,6 +60,22 @@ const hostTrust = {
 
 Deno.test("Repository Access parsers accept generated response contracts", () => {
   assertEquals(parseRepositorySshCredentials([credential]), [credential]);
+  assertEquals(
+    parseRepositorySshPublicKey({
+      credential_id: "deploy-key",
+      current_revision: 2,
+      public_key_algorithm: "ssh-ed25519",
+      public_key_fingerprint: "SHA256:credential",
+      public_key: "ssh-ed25519 AAAA",
+    }),
+    {
+      credential_id: "deploy-key",
+      current_revision: 2,
+      public_key_algorithm: "ssh-ed25519",
+      public_key_fingerprint: "SHA256:credential",
+      public_key: "ssh-ed25519 AAAA",
+    },
+  );
   assertEquals(parseRepositorySshHostTrusts([hostTrust]), [hostTrust]);
   assertEquals(
     parseRepositoryAccessProjection({

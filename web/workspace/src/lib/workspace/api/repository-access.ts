@@ -2,6 +2,7 @@ import type {
   RepositoryAccessProjection,
   RepositorySshCredential,
   RepositorySshHostTrust,
+  RepositorySshPublicKey,
 } from "../../generated/repository-access-api.ts";
 
 export class RepositoryAccessSchemaError extends Error {
@@ -48,6 +49,25 @@ export function parseRepositorySshCredential(
   readNullableString(record, "rotated_at", path);
   readStringArray(record, "referenced_repositories", path);
   return record as RepositorySshCredential;
+}
+
+export function parseRepositorySshPublicKey(
+  value: unknown,
+  path = "public_key",
+): RepositorySshPublicKey {
+  const record = readRecord(value, path, [
+    "credential_id",
+    "current_revision",
+    "public_key_algorithm",
+    "public_key_fingerprint",
+    "public_key",
+  ]);
+  readString(record, "credential_id", path);
+  readRevision(record, "current_revision", path);
+  readString(record, "public_key_algorithm", path);
+  readString(record, "public_key_fingerprint", path);
+  readString(record, "public_key", path);
+  return record as RepositorySshPublicKey;
 }
 
 export function parseRepositorySshHostTrusts(

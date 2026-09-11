@@ -7,16 +7,19 @@ use std::sync::Arc;
 use chrono::{SecondsFormat, Utc};
 use config_source::ConfigSchemaContribution;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use ssh_key::private::Ed25519Keypair;
 use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, PublicKey};
 use workspace_api::{
     CreateRepositorySshCredentialRequest, DeleteRepositorySshCredentialRequest,
-    DeleteRepositorySshHostTrustRequest, PutRepositorySshHostTrustRequest, RepositoryAccessMode,
-    RepositoryAccessProjection, RepositorySshAccessBinding, RepositorySshCredential,
-    RepositorySshHostTrust, RotateRepositorySshCredentialRequest,
+    DeleteRepositorySshHostTrustRequest, GenerateRepositorySshCredentialRequest,
+    PutRepositorySshHostTrustRequest, RepositoryAccessMode, RepositoryAccessProjection,
+    RepositorySshAccessBinding, RepositorySshCredential, RepositorySshHostTrust,
+    RepositorySshPublicKey, RotateRepositorySshCredentialRequest,
 };
 
 use crate::config_source::{
@@ -42,6 +45,9 @@ const MAX_NAME_BYTES: usize = 200;
 const MAX_IDENTIFIER_BYTES: usize = 128;
 const MASTER_KEY_BYTES: usize = 32;
 const NONCE_BYTES: usize = 12;
+pub const WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID: &str = "workspace-default";
+const WORKSPACE_DEFAULT_REPOSITORY_SSH_OPERATION_ID: &str = "workspace-default-repository-ssh-v1";
+const WORKSPACE_DEFAULT_REPOSITORY_SSH_NAME: &str = "Workspace default SSH key";
 
 #[derive(Debug, Default)]
 pub struct RepositoryAccessConfigSchemaProvider;
@@ -130,6 +136,43 @@ pub fn project_repository_access_state(
     )
 }
 
+pub(crate) fn repository_ssh_endpoint(
+    repository_key: &str,
+    repository_uri: &str,
+) -> Result<Option<(String, u16)>> {
+    if !repository_uri.contains("://") {
+        if let Some((identity, path)) = repository_uri.split_once(':')
+            && !path.is_empty()
+            && let Some((_, hostname)) = identity.rsplit_once('@')
+            && !hostname.is_empty()
+        {
+            return Ok(Some((hostname.to_ascii_lowercase(), 22)));
+        }
+    }
+    let parsed = url::Url::parse(repository_uri).map_err(|error| {
+        Error::InvalidInput(format!(
+            "Repository `{repository_key}` has invalid SSH URI: {error}"
+        ))
+    })?;
+    if parsed.scheme() != "ssh" {
+        return Ok(None);
+    }
+    if parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(Error::InvalidInput(format!(
+            "Repository `{repository_key}` must use ssh://user@host[:port]/path without embedded credentials"
+        )));
+    }
+    let hostname = parsed.host_str().ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "Repository `{repository_key}` SSH URI has no hostname"
+        ))
+    })?;
+    Ok(Some((
+        hostname.to_ascii_lowercase(),
+        parsed.port().unwrap_or(22),
+    )))
+}
+
 fn project_repository_access_evaluation(
     store: &dyn ControlPlaneStore,
     secrets: &RepositorySecretService,
@@ -145,6 +188,9 @@ fn project_repository_access_evaluation(
         .map_err(|error| {
             Error::InvalidInput(format!("invalid Repository access config: {error}"))
         })?;
+    if !config.repository_access.is_empty() {
+        secrets.ensure_workspace_default_credential(workspace_id)?;
+    }
     let mut bindings = Vec::with_capacity(config.repository_access.len());
     for (repository_key, access) in config.repository_access {
         workspace_api::validate_repository_key(&repository_key)
@@ -181,22 +227,14 @@ fn project_repository_access_evaluation(
                     access.ssh.host_trust
                 ))
             })?;
-        let uri = url::Url::parse(&repository.source.uri).map_err(|_| {
-            Error::InvalidInput(format!(
-                "Repository `{repository_key}` has an invalid SSH URI"
-            ))
-        })?;
-        if uri.scheme() != "ssh" || uri.username().is_empty() || uri.password().is_some() {
-            return Err(Error::InvalidInput(format!(
-                "Repository `{repository_key}` must use ssh://user@host[:port]/path without credentials"
-            )));
-        }
-        let hostname = uri.host_str().ok_or_else(|| {
-            Error::InvalidInput(format!(
-                "Repository `{repository_key}` SSH URI has no hostname"
-            ))
-        })?;
-        let port = uri.port().unwrap_or(22);
+        let (hostname, port) =
+            repository_ssh_endpoint(repository_key.as_str(), &repository.source.uri)?.ok_or_else(
+                || {
+                    Error::InvalidInput(format!(
+                        "Repository `{repository_key}` must use an SSH source"
+                    ))
+                },
+            )?;
         if hostname != host_trust.hostname || port != host_trust.port {
             return Err(Error::InvalidInput(format!(
                 "Repository `{repository_key}` SSH host does not match host trust `{}`",
@@ -243,6 +281,152 @@ impl RepositorySecretService {
             store,
             master_key: Some(Arc::new(key)),
         })
+    }
+
+    fn generated_ed25519_private_key(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        credential_id: &str,
+        intent: &str,
+    ) -> Result<String> {
+        let master_key = self.master_key.as_ref().ok_or_else(|| {
+            Error::Store("Repository secret encryption authority is unavailable".to_string())
+        })?;
+        let key = hmac::Key::new(hmac::HMAC_SHA256, master_key.as_slice());
+        let context = format!(
+            "yoi/repository-ssh-key/v1\0{workspace_id}\0{operation_id}\0{credential_id}\0{intent}"
+        );
+        let seed = hmac::sign(&key, context.as_bytes());
+        PrivateKey::from(Ed25519Keypair::from_seed(
+            seed.as_ref().try_into().map_err(|_| {
+                Error::Store("generated SSH Ed25519 seed had an invalid length".to_string())
+            })?,
+        ))
+        .to_openssh(LineEnding::LF)
+        .map(|key| key.to_string())
+        .map_err(|err| Error::Store(format!("failed to encode generated SSH key: {err}")))
+    }
+
+    pub fn generate_credential(
+        &self,
+        workspace_id: &str,
+        request: GenerateRepositorySshCredentialRequest,
+        actor_account_id: &str,
+    ) -> Result<RepositorySshCredential> {
+        let operation_id = validate_identifier("operation_id", &request.operation_id)?;
+        let credential_id = validate_identifier("credential_id", &request.credential_id)?;
+        let name = normalize_name(&request.name)?;
+        let private_key = self.generated_ed25519_private_key(
+            workspace_id,
+            &operation_id,
+            &credential_id,
+            &format!("create\0{name}"),
+        )?;
+        self.create_credential(
+            workspace_id,
+            CreateRepositorySshCredentialRequest {
+                operation_id,
+                credential_id,
+                name,
+                private_key,
+                passphrase: None,
+            },
+            actor_account_id,
+        )
+    }
+
+    pub fn ensure_workspace_default_credential(
+        &self,
+        workspace_id: &str,
+    ) -> Result<RepositorySshCredential> {
+        if let Some(credential) = self.store.with_conn(|conn| {
+            read_credential(
+                conn,
+                workspace_id,
+                WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID,
+            )
+        })? {
+            return Ok(credential);
+        }
+        self.generate_credential(
+            workspace_id,
+            GenerateRepositorySshCredentialRequest {
+                operation_id: WORKSPACE_DEFAULT_REPOSITORY_SSH_OPERATION_ID.to_string(),
+                credential_id: WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID.to_string(),
+                name: WORKSPACE_DEFAULT_REPOSITORY_SSH_NAME.to_string(),
+            },
+            "workspace-system",
+        )
+    }
+
+    pub fn credential_public_key(
+        &self,
+        workspace_id: &str,
+        credential_id: &str,
+    ) -> Result<Option<RepositorySshPublicKey>> {
+        let credential_id = validate_identifier("credential_id", credential_id)?;
+        let Some((credential, private_secret, passphrase_secret)) =
+            self.store.with_conn(|conn| {
+                let Some(credential) = read_credential(conn, workspace_id, &credential_id)? else {
+                    return Ok(None);
+                };
+                let private_secret = read_sealed_secret(
+                    conn,
+                    workspace_id,
+                    &credential_id,
+                    credential.current_revision,
+                    "private_key",
+                )?
+                .ok_or_else(|| Error::Store("credential private key is missing".to_string()))?;
+                let passphrase_secret = read_sealed_secret(
+                    conn,
+                    workspace_id,
+                    &credential_id,
+                    credential.current_revision,
+                    "passphrase",
+                )?;
+                Ok(Some((credential, private_secret, passphrase_secret)))
+            })?
+        else {
+            return Ok(None);
+        };
+        let private_key = zeroize::Zeroizing::new(self.unseal(
+            workspace_id,
+            &credential_id,
+            credential.current_revision,
+            "private_key",
+            private_secret,
+        )?);
+        let passphrase = passphrase_secret
+            .map(|secret| {
+                self.unseal(
+                    workspace_id,
+                    &credential_id,
+                    credential.current_revision,
+                    "passphrase",
+                    secret,
+                )
+                .map(zeroize::Zeroizing::new)
+            })
+            .transpose()?;
+        let private_key = std::str::from_utf8(private_key.as_slice())
+            .map_err(|_| Error::Store("credential private key is not UTF-8".to_string()))?;
+        let passphrase = passphrase
+            .as_deref()
+            .map(|value| std::str::from_utf8(value.as_slice()))
+            .transpose()
+            .map_err(|_| Error::Store("credential passphrase is not UTF-8".to_string()))?;
+        let parsed = parse_private_key(private_key, passphrase).map_err(|err| {
+            Error::Store(format!("stored credential private key is invalid: {err}"))
+        })?;
+        Ok(Some(RepositorySshPublicKey {
+            credential_id,
+            current_revision: credential.current_revision,
+            public_key_algorithm: parsed.algorithm,
+            public_key_fingerprint: parsed.fingerprint,
+            public_key: parsed.public_key,
+        }))
     }
 
     pub fn create_credential(
@@ -384,6 +568,11 @@ impl RepositorySecretService {
         actor_account_id: &str,
     ) -> Result<RepositorySshCredential> {
         let credential_id = validate_identifier("credential_id", credential_id)?;
+        if credential_id == WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID {
+            return Err(Error::WorkspaceConfigConflict(
+                "Workspace default SSH credential is immutable".to_string(),
+            ));
+        }
         let operation_id = validate_identifier("operation_id", &request.operation_id)?;
         let parsed = parse_private_key(&request.private_key, request.passphrase.as_deref())?;
         let next_revision = request
@@ -529,6 +718,11 @@ impl RepositorySecretService {
         projection: &RepositoryAccessProjection,
     ) -> Result<()> {
         let credential_id = validate_identifier("credential_id", credential_id)?;
+        if credential_id == WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID {
+            return Err(Error::WorkspaceConfigConflict(
+                "Workspace default SSH credential is immutable".to_string(),
+            ));
+        }
         let operation_id = validate_identifier("operation_id", &request.operation_id)?;
         let references = credential_references(projection, &credential_id);
         if !references.is_empty() {
@@ -839,6 +1033,73 @@ impl RepositorySecretService {
         })
     }
 
+    pub fn host_trusts_for_endpoint(
+        &self,
+        workspace_id: &str,
+        hostname: &str,
+        port: u16,
+    ) -> Result<Vec<RepositorySshHostTrust>> {
+        self.store.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                r#"SELECT workspace_id, host_trust_id, hostname, port, key_algorithm,
+                          host_key, fingerprint, current_revision, created_at, updated_at
+                   FROM repository_ssh_host_trusts
+                   WHERE workspace_id = ?1 AND lower(hostname) = lower(?2) AND port = ?3
+                   ORDER BY host_trust_id"#,
+            )?;
+            statement
+                .query_map(
+                    params![workspace_id, hostname, i64::from(port)],
+                    read_host_trust_row,
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+
+    pub fn automatic_host_trust_id(hostname: &str, port: u16) -> String {
+        let normalized = hostname
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                    character.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .take(96)
+            .collect::<String>();
+        format!("tofu-{normalized}-{port}")
+    }
+
+    pub fn default_ssh_binding_for_repository(
+        &self,
+        workspace_id: &str,
+        repository_key: &str,
+        repository_uri: &str,
+    ) -> Result<Option<RepositorySshAccessBinding>> {
+        let Some((hostname, port)) = repository_ssh_endpoint(repository_key, repository_uri)?
+        else {
+            return Ok(None);
+        };
+        let matches = self.host_trusts_for_endpoint(workspace_id, &hostname, port)?;
+        let Some(host_trust) = matches.first() else {
+            return Ok(None);
+        };
+        if matches.len() > 1 {
+            return Err(Error::InvalidInput(format!(
+                "Repository `{repository_key}` matches multiple SSH host trusts for {hostname}:{port}; configure an explicit Repository access binding"
+            )));
+        }
+        self.ensure_workspace_default_credential(workspace_id)?;
+        Ok(Some(RepositorySshAccessBinding {
+            repository_key: repository_key.to_string(),
+            credential_id: WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID.to_string(),
+            host_trust_id: host_trust.host_trust_id.clone(),
+            access: RepositoryAccessMode::ReadOnly,
+        }))
+    }
+
     pub fn lease_ssh_materialization_access(
         &self,
         workspace_id: &str,
@@ -1056,6 +1317,7 @@ impl RepositorySecretService {
 struct ParsedKey {
     algorithm: String,
     fingerprint: String,
+    public_key: String,
 }
 
 fn parse_private_key(private_key: &str, passphrase: Option<&str>) -> Result<ParsedKey> {
@@ -1092,6 +1354,9 @@ fn parse_private_key(private_key: &str, passphrase: Option<&str>) -> Result<Pars
     Ok(ParsedKey {
         algorithm: public_key.algorithm().to_string(),
         fingerprint: public_key.fingerprint(HashAlg::Sha256).to_string(),
+        public_key: public_key.to_openssh().map_err(|err| {
+            Error::Store(format!("failed to encode Repository SSH public key: {err}"))
+        })?,
     })
 }
 
@@ -1709,6 +1974,102 @@ mod tests {
     }
 
     #[test]
+    fn workspace_default_credential_is_generated_once_and_immutable() {
+        let (_dir, _store, service) = test_service();
+
+        let created = service
+            .ensure_workspace_default_credential("workspace-a")
+            .unwrap();
+        let replayed = service
+            .ensure_workspace_default_credential("workspace-a")
+            .unwrap();
+        let public_key = service
+            .credential_public_key(
+                "workspace-a",
+                WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(created, replayed);
+        assert_eq!(created.current_revision, 1);
+        assert_eq!(
+            public_key.public_key_fingerprint,
+            created.public_key_fingerprint
+        );
+        assert!(
+            service
+                .rotate_credential(
+                    "workspace-a",
+                    WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID,
+                    RotateRepositorySshCredentialRequest {
+                        operation_id: "rotate-default".to_string(),
+                        expected_revision: 1,
+                        private_key: test_private_key(12).0,
+                        passphrase: None,
+                    },
+                    "owner-a",
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .delete_credential(
+                    "workspace-a",
+                    WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID,
+                    DeleteRepositorySshCredentialRequest {
+                        operation_id: "delete-default".to_string(),
+                        expected_revision: 1,
+                    },
+                    "owner-a",
+                    &RepositoryAccessProjection {
+                        workspace_id: "workspace-a".to_string(),
+                        config_revision: 1,
+                        projection_digest: "sha256:empty".to_string(),
+                        bindings: Vec::new(),
+                    },
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn generated_credential_is_replayable_and_exposes_only_its_public_key() {
+        let (_dir, _store, service) = test_service();
+        let request = GenerateRepositorySshCredentialRequest {
+            operation_id: "generate-one".to_string(),
+            credential_id: "workspace-key".to_string(),
+            name: "Workspace key".to_string(),
+        };
+
+        let created = service
+            .generate_credential("workspace-a", request.clone(), "owner-a")
+            .unwrap();
+        let replayed = service
+            .generate_credential("workspace-a", request, "owner-a")
+            .unwrap();
+        let public_key = service
+            .credential_public_key("workspace-a", "workspace-key")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(replayed, created);
+        assert_eq!(public_key.current_revision, created.current_revision);
+        assert_eq!(
+            public_key.public_key_fingerprint,
+            created.public_key_fingerprint
+        );
+        assert!(public_key.public_key.starts_with("ssh-ed25519 "));
+        assert!(!public_key.public_key.contains("PRIVATE KEY"));
+        assert!(
+            service
+                .credential_public_key("workspace-b", "workspace-key")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn credential_create_rotate_replay_and_cross_workspace_scope_keep_secrets_write_only() {
         let (_dir, store, service) = test_service();
         let (private_key, _) = test_private_key(7);
@@ -1961,6 +2322,86 @@ mod tests {
             error
                 .to_string()
                 .contains("unknown Repository SSH credential")
+        );
+    }
+
+    #[test]
+    fn default_binding_resolves_unique_host_trust_for_url_and_scp_ssh_sources() {
+        let (_dir, _store, service) = test_service();
+        assert!(
+            service
+                .default_ssh_binding_for_repository(
+                    "workspace-a",
+                    "main",
+                    "git@example.test:org/main.git",
+                )
+                .unwrap()
+                .is_none()
+        );
+        let (_, host_key) = test_private_key(10);
+        service
+            .put_host_trust(
+                "workspace-a",
+                PutRepositorySshHostTrustRequest {
+                    operation_id: "host-default".to_string(),
+                    host_trust_id: "example".to_string(),
+                    hostname: "example.test".to_string(),
+                    port: 22,
+                    host_key,
+                    expected_revision: None,
+                },
+                "owner-a",
+            )
+            .unwrap();
+
+        for uri in [
+            "ssh://git@example.test/org/main.git",
+            "git@example.test:org/main.git",
+        ] {
+            let binding = service
+                .default_ssh_binding_for_repository("workspace-a", "main", uri)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                binding.credential_id,
+                WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID
+            );
+            assert_eq!(binding.host_trust_id, "example");
+            assert_eq!(binding.access, RepositoryAccessMode::ReadOnly);
+        }
+        assert!(
+            service
+                .credential_public_key(
+                    "workspace-a",
+                    WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID,
+                )
+                .unwrap()
+                .is_some()
+        );
+
+        let (_, second_host_key) = test_private_key(11);
+        service
+            .put_host_trust(
+                "workspace-a",
+                PutRepositorySshHostTrustRequest {
+                    operation_id: "host-default-second".to_string(),
+                    host_trust_id: "example-second".to_string(),
+                    hostname: "example.test".to_string(),
+                    port: 22,
+                    host_key: second_host_key,
+                    expected_revision: None,
+                },
+                "owner-a",
+            )
+            .unwrap();
+        assert!(
+            service
+                .default_ssh_binding_for_repository(
+                    "workspace-a",
+                    "main",
+                    "git@example.test:org/main.git",
+                )
+                .is_err()
         );
     }
 

@@ -189,6 +189,23 @@ impl Runtime {
         Ok(())
     }
 
+    pub fn install_workspace_backend_resource_client(
+        &self,
+        workspace_id: impl Into<String>,
+        client: Arc<dyn BackendResourceClient>,
+    ) -> Result<(), RuntimeError> {
+        let workspace_id = workspace_id.into();
+        if workspace_id.trim().is_empty() {
+            return Err(RuntimeError::InvalidRequest(
+                "Backend resource client Workspace id is empty".to_string(),
+            ));
+        }
+        self.lock()?
+            .workspace_backend_resource_clients
+            .insert(workspace_id, BackendResourceClientRef(client));
+        Ok(())
+    }
+
     /// Create or restore a filesystem-backed Runtime.
     ///
     /// The store is scoped by `options.root`; if the directory already exists,
@@ -439,26 +456,51 @@ impl Runtime {
         &self,
         ssh: &mut crate::catalog::RepositorySshMaterializationAccess,
     ) -> Result<(), RuntimeError> {
-        if !ssh.private_key.expose().is_empty() && !ssh.known_hosts_entry.expose().is_empty() {
+        if ssh.credential_candidates.is_empty() {
+            return Err(RuntimeError::InvalidRequest(
+                "Repository SSH access requires at least one credential candidate".to_string(),
+            ));
+        }
+        if ssh
+            .credential_candidates
+            .iter()
+            .all(|candidate| !candidate.private_key.expose().is_empty())
+            && !ssh.known_hosts_entry.expose().is_empty()
+        {
             return Ok(());
         }
         let (client, runtime_id) = {
             let state = self.lock()?;
-            let client = state.backend_resource_client.clone().ok_or_else(|| {
-                RuntimeError::InvalidRequest(
-                    "Backend Repository access resource client is unavailable".to_string(),
-                )
-            })?;
+            let client = state
+                .workspace_backend_resource_clients
+                .get(&ssh.secret_resource.workspace_id)
+                .cloned()
+                .or_else(|| state.backend_resource_client.clone())
+                .ok_or_else(|| {
+                    RuntimeError::InvalidRequest(format!(
+                        "Backend Repository access resource client is unavailable for Workspace `{}`",
+                        ssh.secret_resource.workspace_id
+                    ))
+                })?;
             let runtime_id = state.runtime_identity.clone().ok_or_else(|| {
                 RuntimeError::InvalidRequest("Runtime identity is unavailable".to_string())
             })?;
             (client, runtime_id)
         };
+        tracing::info!(
+            target: "yoi::repository_access",
+            event = "repository_access_resource_fetch_started",
+            workspace_id = %ssh.secret_resource.workspace_id,
+            resource_id = %ssh.secret_resource.resource_id,
+            runtime_id = %runtime_id,
+            credential_candidate_count = ssh.credential_candidates.len(),
+            "fetching Repository SSH access resource from Workspace Backend"
+        );
         let mut response = client
             .0
             .fetch_resource(BackendResourceFetchRequest {
                 handle: ssh.secret_resource.clone(),
-                runtime_id,
+                runtime_id: runtime_id.clone(),
                 worker_id: None,
                 audit_correlation_id: ssh.secret_resource.audit_correlation_id.clone(),
             })
@@ -481,10 +523,40 @@ impl Runtime {
                 "Backend Repository SSH access resource payload was invalid".to_string(),
             )
         })?;
-        ssh.private_key =
-            crate::catalog::SensitiveString::new(std::mem::take(&mut secret.private_key));
+        if secret.credential_candidates.len() != ssh.credential_candidates.len()
+            || secret
+                .credential_candidates
+                .iter()
+                .zip(&ssh.credential_candidates)
+                .any(|(secret, metadata)| {
+                    secret.credential_id != metadata.credential_id
+                        || secret.credential_revision != metadata.credential_revision
+                })
+        {
+            return Err(RuntimeError::InvalidRequest(
+                "Backend Repository SSH access resource credential metadata was invalid"
+                    .to_string(),
+            ));
+        }
+        for (candidate, secret) in ssh
+            .credential_candidates
+            .iter_mut()
+            .zip(&mut secret.credential_candidates)
+        {
+            candidate.private_key =
+                crate::catalog::SensitiveString::new(std::mem::take(&mut secret.private_key));
+        }
         ssh.known_hosts_entry =
             crate::catalog::SensitiveString::new(std::mem::take(&mut secret.known_hosts_entry));
+        tracing::info!(
+            target: "yoi::repository_access",
+            event = "repository_access_resource_fetch_succeeded",
+            workspace_id = %ssh.secret_resource.workspace_id,
+            resource_id = %ssh.secret_resource.resource_id,
+            runtime_id = %runtime_id,
+            credential_candidate_count = ssh.credential_candidates.len(),
+            "fetched Repository SSH access resource from Workspace Backend"
+        );
         Ok(())
     }
 
@@ -492,10 +564,22 @@ impl Runtime {
         &self,
         mut request: WorkingDirectoryRepositoryAccessRequest,
     ) -> Result<(), RuntimeError> {
+        let materialization_runtime_id = request.materialization.runtime_id.clone();
         let ssh = request.materialization.ssh.as_mut().ok_or_else(|| {
             RuntimeError::InvalidRequest("Repository SSH access metadata is missing".to_string())
         })?;
-        self.resolve_repository_access_resource(ssh).await?;
+        if let Err(error) = self.resolve_repository_access_resource(ssh).await {
+            tracing::warn!(
+                target: "yoi::repository_access",
+                event = "repository_access_resource_fetch_failed",
+                workspace_id = %ssh.secret_resource.workspace_id,
+                resource_id = %ssh.secret_resource.resource_id,
+                runtime_id = %materialization_runtime_id,
+                error = %error,
+                "failed to fetch Repository SSH access resource from Workspace Backend"
+            );
+            return Err(error);
+        }
         self.authorize_working_directory_repository_access(request)
     }
 
@@ -2428,6 +2512,7 @@ struct RuntimeState {
     status: RuntimeStatus,
     execution_backend: Option<WorkerExecutionBackendRef>,
     backend_resource_client: Option<BackendResourceClientRef>,
+    workspace_backend_resource_clients: BTreeMap<String, BackendResourceClientRef>,
     #[cfg(feature = "fs-store")]
     next_diagnostic_id: u64,
     workers: BTreeMap<WorkerId, WorkerRecord>,
@@ -2458,6 +2543,7 @@ impl RuntimeState {
             status: RuntimeStatus::Running,
             execution_backend: None,
             backend_resource_client: None,
+            workspace_backend_resource_clients: BTreeMap::new(),
             #[cfg(feature = "fs-store")]
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
@@ -2489,6 +2575,7 @@ impl RuntimeState {
             status: RuntimeStatus::Running,
             execution_backend: None,
             backend_resource_client: None,
+            workspace_backend_resource_clients: BTreeMap::new(),
             #[cfg(feature = "fs-store")]
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
@@ -2552,6 +2639,7 @@ impl RuntimeState {
             status: persisted.status,
             execution_backend: None,
             backend_resource_client: None,
+            workspace_backend_resource_clients: BTreeMap::new(),
             next_diagnostic_id,
             workers,
             config_bundles: BTreeMap::new(),
@@ -3344,6 +3432,10 @@ fn repository_resource_error(error: BackendResourceError) -> RuntimeError {
             "repository_access_credential_unavailable",
             "Repository access credential lease is unavailable or already consumed",
         ),
+        BackendResourceError::Timeout => (
+            "repository_access_resource_fetch_timeout",
+            "Timed out while fetching Repository SSH access from Workspace Backend",
+        ),
         BackendResourceError::Transport { .. } => (
             "repository_access_provider_unavailable",
             "Repository access credential provider is unavailable",
@@ -3615,8 +3707,9 @@ mod tests {
     use super::*;
     use crate::catalog::{
         ConfigBundleRef, MaterializerKind, ProfileSelector, RepositoryMaterializationContext,
-        RepositorySshMaterializationAccess, SensitiveString, WorkingDirectoryClaim,
-        WorkingDirectoryRepository, WorkingDirectoryRequest, WorkspaceApiRef,
+        RepositorySshCredentialCandidate, RepositorySshMaterializationAccess, SensitiveString,
+        WorkingDirectoryClaim, WorkingDirectoryRepository, WorkingDirectoryRequest,
+        WorkspaceApiRef,
     };
     use crate::config_bundle::{
         ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigDeclaration,
@@ -3669,6 +3762,10 @@ mod tests {
             (
                 BackendResourceError::MissingResource,
                 "repository_access_credential_unavailable",
+            ),
+            (
+                BackendResourceError::Timeout,
+                "repository_access_resource_fetch_timeout",
             ),
             (
                 BackendResourceError::Unauthorized {
@@ -3933,8 +4030,11 @@ mod tests {
                 config_projection_digest: "sha256:projection".to_string(),
                 cache_generation: 0,
                 ssh: Some(RepositorySshMaterializationAccess {
-                    credential_id: "credential-1".to_string(),
-                    credential_revision: 1,
+                    credential_candidates: vec![RepositorySshCredentialCandidate {
+                        credential_id: "credential-1".to_string(),
+                        credential_revision: 1,
+                        private_key: SensitiveString::new("private-key-bytes"),
+                    }],
                     host_trust_id: "host-trust-1".to_string(),
                     host_trust_revision: 1,
                     access: workspace_api::RepositoryAccessMode::ReadOnly,
@@ -3943,7 +4043,6 @@ mod tests {
                     repository_source_fingerprint: "sha256:source".to_string(),
                     repository_uri: "ssh://git@example.test/repo.git".to_string(),
                     secret_resource: repository_resource_handle(),
-                    private_key: SensitiveString::new("private-key-bytes"),
                     known_hosts_entry: SensitiveString::new("known-hosts-entry"),
                 }),
             }),
@@ -4003,20 +4102,35 @@ mod tests {
         runtime.bind_runtime_identity("runtime-1").unwrap();
         let handle = repository_resource_handle();
         runtime
-            .install_backend_resource_client(Arc::new(TestRepositoryResourceClient {
-                response: Mutex::new(Some(crate::resource::BackendResourceFetchResponse {
-                    kind: crate::resource::BackendResourceKind::RepositorySshAccess,
-                    resource_id: handle.resource_id.clone(),
-                    digest: handle.digest.clone(),
-                    content_type: crate::resource::REPOSITORY_SSH_ACCESS_CONTENT_TYPE.to_string(),
-                    bytes: serde_json::to_vec(&RepositorySshAccessSecret {
-                        private_key: "private-key-bytes".to_string(),
-                        known_hosts_entry: "known-hosts-entry".to_string(),
-                    })
-                    .unwrap(),
-                    audit_correlation_id: handle.audit_correlation_id.clone(),
-                })),
-            }))
+            .install_workspace_backend_resource_client(
+                "workspace-1",
+                Arc::new(TestRepositoryResourceClient {
+                    response: Mutex::new(Some(crate::resource::BackendResourceFetchResponse {
+                        kind: crate::resource::BackendResourceKind::RepositorySshAccess,
+                        resource_id: handle.resource_id.clone(),
+                        digest: handle.digest.clone(),
+                        content_type: crate::resource::REPOSITORY_SSH_ACCESS_CONTENT_TYPE
+                            .to_string(),
+                        bytes: serde_json::to_vec(&RepositorySshAccessSecret {
+                            credential_candidates: vec![
+                                crate::resource::RepositorySshAccessSecretCandidate {
+                                    credential_id: "credential-1".to_string(),
+                                    credential_revision: 1,
+                                    private_key: "private-key-bytes-1".to_string(),
+                                },
+                                crate::resource::RepositorySshAccessSecretCandidate {
+                                    credential_id: "credential-2".to_string(),
+                                    credential_revision: 3,
+                                    private_key: "private-key-bytes-2".to_string(),
+                                },
+                            ],
+                            known_hosts_entry: "known-hosts-entry".to_string(),
+                        })
+                        .unwrap(),
+                        audit_correlation_id: handle.audit_correlation_id.clone(),
+                    })),
+                }),
+            )
             .unwrap();
         let request = WorkingDirectoryRepositoryAccessRequest {
             working_directory_id: "working-directory-1".to_string(),
@@ -4028,8 +4142,18 @@ mod tests {
                 config_projection_digest: "sha256:projection".to_string(),
                 cache_generation: 0,
                 ssh: Some(RepositorySshMaterializationAccess {
-                    credential_id: "credential-1".to_string(),
-                    credential_revision: 1,
+                    credential_candidates: vec![
+                        RepositorySshCredentialCandidate {
+                            credential_id: "credential-1".to_string(),
+                            credential_revision: 1,
+                            private_key: SensitiveString::default(),
+                        },
+                        RepositorySshCredentialCandidate {
+                            credential_id: "credential-2".to_string(),
+                            credential_revision: 3,
+                            private_key: SensitiveString::default(),
+                        },
+                    ],
                     host_trust_id: "host-trust-1".to_string(),
                     host_trust_revision: 1,
                     access: workspace_api::RepositoryAccessMode::ReadOnly,
@@ -4038,7 +4162,6 @@ mod tests {
                     repository_source_fingerprint: "sha256:source".to_string(),
                     repository_uri: "ssh://git@example.test/repo.git".to_string(),
                     secret_resource: handle,
-                    private_key: SensitiveString::default(),
                     known_hosts_entry: SensitiveString::default(),
                 }),
             },
@@ -4059,7 +4182,23 @@ mod tests {
         let accesses = backend.repository_accesses.lock().unwrap();
         assert_eq!(accesses.len(), 1);
         let access = accesses[0].materialization.ssh.as_ref().unwrap();
-        assert_eq!(access.private_key.expose(), "private-key-bytes");
+        assert_eq!(access.credential_candidates.len(), 2);
+        assert_eq!(
+            access.credential_candidates[0].credential_id,
+            "credential-1"
+        );
+        assert_eq!(
+            access.credential_candidates[1].credential_id,
+            "credential-2"
+        );
+        assert_eq!(
+            access.credential_candidates[0].private_key.expose(),
+            "private-key-bytes-1"
+        );
+        assert_eq!(
+            access.credential_candidates[1].private_key.expose(),
+            "private-key-bytes-2"
+        );
         assert_eq!(access.known_hosts_entry.expose(), "known-hosts-entry");
     }
 
@@ -4072,20 +4211,35 @@ mod tests {
         runtime.bind_runtime_identity("runtime-1").unwrap();
         let handle = repository_resource_handle();
         runtime
-            .install_backend_resource_client(Arc::new(TestRepositoryResourceClient {
-                response: Mutex::new(Some(crate::resource::BackendResourceFetchResponse {
-                    kind: crate::resource::BackendResourceKind::RepositorySshAccess,
-                    resource_id: handle.resource_id.clone(),
-                    digest: handle.digest.clone(),
-                    content_type: crate::resource::REPOSITORY_SSH_ACCESS_CONTENT_TYPE.to_string(),
-                    bytes: serde_json::to_vec(&RepositorySshAccessSecret {
-                        private_key: "create-private-key-bytes".to_string(),
-                        known_hosts_entry: "create-known-hosts-entry".to_string(),
-                    })
-                    .unwrap(),
-                    audit_correlation_id: handle.audit_correlation_id.clone(),
-                })),
-            }))
+            .install_workspace_backend_resource_client(
+                "workspace-1",
+                Arc::new(TestRepositoryResourceClient {
+                    response: Mutex::new(Some(crate::resource::BackendResourceFetchResponse {
+                        kind: crate::resource::BackendResourceKind::RepositorySshAccess,
+                        resource_id: handle.resource_id.clone(),
+                        digest: handle.digest.clone(),
+                        content_type: crate::resource::REPOSITORY_SSH_ACCESS_CONTENT_TYPE
+                            .to_string(),
+                        bytes: serde_json::to_vec(&RepositorySshAccessSecret {
+                            credential_candidates: vec![
+                                crate::resource::RepositorySshAccessSecretCandidate {
+                                    credential_id: "credential-1".to_string(),
+                                    credential_revision: 1,
+                                    private_key: "create-private-key-bytes-1".to_string(),
+                                },
+                                crate::resource::RepositorySshAccessSecretCandidate {
+                                    credential_id: "credential-2".to_string(),
+                                    credential_revision: 3,
+                                    private_key: "create-private-key-bytes-2".to_string(),
+                                },
+                            ],
+                            known_hosts_entry: "create-known-hosts-entry".to_string(),
+                        })
+                        .unwrap(),
+                        audit_correlation_id: handle.audit_correlation_id.clone(),
+                    })),
+                }),
+            )
             .unwrap();
         let request = WorkingDirectoryRequest {
             repository: WorkingDirectoryRepository {
@@ -4109,8 +4263,18 @@ mod tests {
                 config_projection_digest: "sha256:projection".to_string(),
                 cache_generation: 0,
                 ssh: Some(RepositorySshMaterializationAccess {
-                    credential_id: "credential-1".to_string(),
-                    credential_revision: 1,
+                    credential_candidates: vec![
+                        RepositorySshCredentialCandidate {
+                            credential_id: "credential-1".to_string(),
+                            credential_revision: 1,
+                            private_key: SensitiveString::default(),
+                        },
+                        RepositorySshCredentialCandidate {
+                            credential_id: "credential-2".to_string(),
+                            credential_revision: 3,
+                            private_key: SensitiveString::default(),
+                        },
+                    ],
                     host_trust_id: "host-trust-1".to_string(),
                     host_trust_revision: 1,
                     access: workspace_api::RepositoryAccessMode::ReadOnly,
@@ -4119,7 +4283,6 @@ mod tests {
                     repository_source_fingerprint: "sha256:source".to_string(),
                     repository_uri: "ssh://git@example.test/repo.git".to_string(),
                     secret_resource: handle,
-                    private_key: SensitiveString::default(),
                     known_hosts_entry: SensitiveString::default(),
                 }),
             }),
@@ -4138,7 +4301,14 @@ mod tests {
             .as_ref()
             .and_then(|materialization| materialization.ssh.as_ref())
             .unwrap();
-        assert_eq!(access.private_key.expose(), "create-private-key-bytes");
+        assert_eq!(
+            access.credential_candidates[0].private_key.expose(),
+            "create-private-key-bytes-1"
+        );
+        assert_eq!(
+            access.credential_candidates[1].private_key.expose(),
+            "create-private-key-bytes-2"
+        );
         assert_eq!(
             access.known_hosts_entry.expose(),
             "create-known-hosts-entry"

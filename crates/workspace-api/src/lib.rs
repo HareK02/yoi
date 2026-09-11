@@ -1155,6 +1155,58 @@ pub struct RepositoryDetailResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
+pub struct RepositorySshConnectionProbeRequest {
+    pub runtime_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RepositorySshHostKeyCandidate {
+    pub algorithm: String,
+    pub host_key: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum RepositorySshConnectionTrustState {
+    Untrusted,
+    Verified,
+    Changed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RepositorySshConnectionProbeResponse {
+    pub workspace_id: String,
+    pub repository_key: String,
+    pub runtime_id: String,
+    pub hostname: String,
+    pub port: u16,
+    pub trust_state: RepositorySshConnectionTrustState,
+    pub host_trust_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
+    pub expected_host_trust_revision: Option<u64>,
+    pub candidates: Vec<RepositorySshHostKeyCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmRepositorySshHostTrustRequest {
+    pub operation_id: String,
+    pub runtime_id: String,
+    pub host_key: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
+    pub expected_host_trust_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct RepositoryLogResponse {
     pub workspace_id: String,
     pub repository_key: String,
@@ -2458,6 +2510,27 @@ pub struct CreateRepositorySshCredentialRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
+pub struct GenerateRepositorySshCredentialRequest {
+    pub operation_id: String,
+    pub credential_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RepositorySshPublicKey {
+    pub credential_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub current_revision: u64,
+    pub public_key_algorithm: String,
+    pub public_key_fingerprint: String,
+    pub public_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct RotateRepositorySshCredentialRequest {
     pub operation_id: String,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
@@ -2997,6 +3070,11 @@ pub fn catalog_typescript() -> String {
         GitCommitSummary::decl(&config),
         RepositoryListResponse::decl(&config),
         RepositoryDetailResponse::decl(&config),
+        RepositorySshConnectionProbeRequest::decl(&config),
+        RepositorySshHostKeyCandidate::decl(&config),
+        RepositorySshConnectionTrustState::decl(&config),
+        RepositorySshConnectionProbeResponse::decl(&config),
+        ConfirmRepositorySshHostTrustRequest::decl(&config),
         RepositoryLogResponse::decl(&config),
         RuntimeSourceKind::decl(&config),
         RuntimeSourceStatus::decl(&config),
@@ -3041,6 +3119,8 @@ pub fn repository_access_api_typescript() -> String {
     let declarations = [
         RepositorySshCredential::decl(&config),
         CreateRepositorySshCredentialRequest::decl(&config),
+        GenerateRepositorySshCredentialRequest::decl(&config),
+        RepositorySshPublicKey::decl(&config),
         RotateRepositorySshCredentialRequest::decl(&config),
         DeleteRepositorySshCredentialRequest::decl(&config),
         RepositorySshHostTrust::decl(&config),

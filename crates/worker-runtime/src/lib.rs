@@ -25,6 +25,7 @@ pub mod resource;
 #[cfg(feature = "fs-store")]
 pub mod retention;
 mod runtime;
+pub mod ssh_host_key_probe;
 pub mod worker_backend;
 pub mod worker_source;
 pub mod working_directory;

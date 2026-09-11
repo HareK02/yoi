@@ -22,6 +22,20 @@ export type CreateRepositorySshCredentialRequest = {
   passphrase: string | null;
 };
 
+export type GenerateRepositorySshCredentialRequest = {
+  operation_id: string;
+  credential_id: string;
+  name: string;
+};
+
+export type RepositorySshPublicKey = {
+  credential_id: string;
+  current_revision: number;
+  public_key_algorithm: string;
+  public_key_fingerprint: string;
+  public_key: string;
+};
+
 export type RotateRepositorySshCredentialRequest = {
   operation_id: string;
   expected_revision: number;

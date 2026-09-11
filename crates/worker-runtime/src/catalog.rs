@@ -119,9 +119,16 @@ impl std::fmt::Debug for SensitiveString {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepositorySshMaterializationAccess {
+pub struct RepositorySshCredentialCandidate {
     pub credential_id: String,
     pub credential_revision: u64,
+    #[serde(skip, default)]
+    pub private_key: SensitiveString,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositorySshMaterializationAccess {
+    pub credential_candidates: Vec<RepositorySshCredentialCandidate>,
     pub host_trust_id: String,
     pub host_trust_revision: u64,
     pub access: workspace_api::RepositoryAccessMode,
@@ -130,8 +137,6 @@ pub struct RepositorySshMaterializationAccess {
     pub repository_source_fingerprint: String,
     pub repository_uri: String,
     pub secret_resource: crate::resource::BackendResourceHandle,
-    #[serde(skip, default)]
-    pub private_key: SensitiveString,
     #[serde(skip, default)]
     pub known_hosts_entry: SensitiveString,
 }

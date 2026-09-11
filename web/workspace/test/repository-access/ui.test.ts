@@ -28,6 +28,7 @@ test("Repository Access Web code consumes workspace-api generated DTOs", () => {
   assert(
     loaderSource.includes("parseRepositorySshCredentials") &&
       loaderSource.includes("parseRepositorySshHostTrusts") &&
+      loaderSource.includes("parseRepositorySshPublicKey") &&
       loaderSource.includes("parseRepositoryAccessProjection"),
     "loader should validate unknown JSON before exposing generated DTOs to Svelte",
   );
@@ -64,6 +65,29 @@ test("Repository Access renders the shared access projection fields", () => {
   ) {
     assert(source.includes(field), `missing access projection field ${field}`);
   }
+});
+
+test("Repository Access generates and copies selectable public keys", () => {
+  for (
+    const token of [
+      "/credentials/generate",
+      "/public-key",
+      "Generate Repository SSH credential",
+      "navigator.clipboard.writeText",
+      "publicKeys[credential.credential_id]",
+      "workspace-default",
+      "always offered during SSH clone",
+    ]
+  ) {
+    assert(
+      source.includes(token),
+      `missing generated public key flow ${token}`,
+    );
+  }
+  assert(
+    source.includes("binding.credential_id"),
+    "Repository bindings should identify the selected credential",
+  );
 });
 
 test("Repository credential submissions clear write-only fields in finally blocks", () => {

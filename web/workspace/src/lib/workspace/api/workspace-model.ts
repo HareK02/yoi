@@ -10,6 +10,9 @@ import type {
   RepositoryLogResponse,
   RepositorySource,
   RepositorySourceKind,
+  RepositorySshConnectionProbeResponse,
+  RepositorySshConnectionTrustState,
+  RepositorySshHostKeyCandidate,
   RepositorySummary,
   WorkspaceAuthConfig,
   WorkspaceCatalogListResponse,
@@ -35,6 +38,8 @@ export type {
   RepositoryDetailResponse,
   RepositoryListResponse,
   RepositoryLogResponse,
+  RepositorySshConnectionProbeResponse,
+  RepositorySshHostKeyCandidate,
   RepositorySummary,
   WorkspaceCatalogListResponse,
   WorkspaceCreateResponse,
@@ -580,6 +585,98 @@ export function parseRepositoryDetailResponse(
     ),
     item: repositorySummary(response.item, "repository detail response.item"),
     source: string(response.source, "repository detail response.source"),
+  };
+}
+
+const SSH_CONNECTION_TRUST_STATES = new Set<RepositorySshConnectionTrustState>([
+  "untrusted",
+  "verified",
+  "changed",
+]);
+
+function repositorySshHostKeyCandidate(
+  value: unknown,
+  path: string,
+): RepositorySshHostKeyCandidate {
+  const candidate = object(value, path);
+  exactKeys(candidate, ["algorithm", "host_key", "fingerprint"], path);
+  return {
+    algorithm: string(candidate.algorithm, `${path}.algorithm`),
+    host_key: string(candidate.host_key, `${path}.host_key`),
+    fingerprint: string(candidate.fingerprint, `${path}.fingerprint`),
+  };
+}
+
+export function parseRepositorySshConnectionProbeResponse(
+  value: unknown,
+): RepositorySshConnectionProbeResponse {
+  const response = object(value, "repository SSH connection probe response");
+  exactKeys(
+    response,
+    [
+      "workspace_id",
+      "repository_key",
+      "runtime_id",
+      "hostname",
+      "port",
+      "trust_state",
+      "host_trust_id",
+      "expected_host_trust_revision",
+      "candidates",
+    ],
+    "repository SSH connection probe response",
+  );
+  const trustState = string(
+    response.trust_state,
+    "repository SSH connection probe response.trust_state",
+  ) as RepositorySshConnectionTrustState;
+  if (!SSH_CONNECTION_TRUST_STATES.has(trustState)) {
+    throw new Error(
+      "repository SSH connection probe response.trust_state is invalid",
+    );
+  }
+  return {
+    workspace_id: string(
+      response.workspace_id,
+      "repository SSH connection probe response.workspace_id",
+    ),
+    repository_key: string(
+      response.repository_key,
+      "repository SSH connection probe response.repository_key",
+    ),
+    runtime_id: string(
+      response.runtime_id,
+      "repository SSH connection probe response.runtime_id",
+    ),
+    hostname: string(
+      response.hostname,
+      "repository SSH connection probe response.hostname",
+    ),
+    port: integer(
+      response.port,
+      "repository SSH connection probe response.port",
+    ),
+    trust_state: trustState,
+    host_trust_id: string(
+      response.host_trust_id,
+      "repository SSH connection probe response.host_trust_id",
+    ),
+    expected_host_trust_revision: response.expected_host_trust_revision === null
+      ? null
+      : integer(
+        response.expected_host_trust_revision,
+        "repository SSH connection probe response.expected_host_trust_revision",
+      ),
+    candidates: array(
+      response.candidates,
+      "repository SSH connection probe response.candidates",
+    ).map(
+      (candidate, index) =>
+        repositorySshHostKeyCandidate(
+          candidate,
+          `repository SSH connection probe response.candidates[${index}]`,
+        ),
+    ),
   };
 }
 

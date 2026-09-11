@@ -70,28 +70,32 @@ use worker_runtime::workspace_issuer::{
 use workspace_api::{
     ActorAuthMethod, AuthBootstrapUserRequest, AuthPublicConfig, AuthUserResponse,
     AuthenticatedUser, BrowserCreateWorkerResponse, BrowserWorkspaceOrchestratorResponse,
-    CreateRemoteRuntimeRequest, CreateRepositorySshCredentialRequest,
-    CreateWorkspaceRepositoryRequest, CreateWorkspaceRepositoryResponse,
-    CreateWorkspaceWorkerRequest, CreateWorkspaceWorkerTicketAssignmentRequest,
-    DeleteRepositorySshCredentialRequest, DeleteRepositorySshHostTrustRequest,
-    DeviceAccessTokenType, DeviceLoginApprovalStatus, DeviceLoginApproveRequest,
-    DeviceLoginApproveResponse, DeviceLoginPollRequest, DeviceLoginPollResponse,
-    DeviceLoginPollStatus, DeviceLoginStartRequest, DeviceLoginStartResponse, LogoutResponse,
-    LogoutStatus, MemoryDocumentResponse, MemoryStagingListResponse, ObjectiveCreateRequest,
+    ConfirmRepositorySshHostTrustRequest, CreateRemoteRuntimeRequest,
+    CreateRepositorySshCredentialRequest, CreateWorkspaceRepositoryRequest,
+    CreateWorkspaceRepositoryResponse, CreateWorkspaceWorkerRequest,
+    CreateWorkspaceWorkerTicketAssignmentRequest, DeleteRepositorySshCredentialRequest,
+    DeleteRepositorySshHostTrustRequest, DeviceAccessTokenType, DeviceLoginApprovalStatus,
+    DeviceLoginApproveRequest, DeviceLoginApproveResponse, DeviceLoginPollRequest,
+    DeviceLoginPollResponse, DeviceLoginPollStatus, DeviceLoginStartRequest,
+    DeviceLoginStartResponse, GenerateRepositorySshCredentialRequest, LogoutResponse, LogoutStatus,
+    MemoryDocumentResponse, MemoryStagingListResponse, ObjectiveCreateRequest,
     ObjectiveEditRequest, ObjectiveLinkTicketRequest, ObjectiveStateRequest,
     PasskeyLoginCompleteRequest, PasskeyLoginOptionsRequest, PasskeyLoginOptionsResponse,
     PasskeyRegistrationCompleteRequest, PasskeyRegistrationOptionsRequest,
     PasskeyRegistrationOptionsResponse, ProfileSettingsResponse, PutRepositorySshHostTrustRequest,
     RepositoryAccessProjection, RepositoryDetailResponse, RepositoryListResponse,
-    RepositoryLogResponse, RepositorySshCredential, RepositorySshHostTrust, RequestActor,
-    RevokeRuntimeTrustKeyRequest, RotateRepositorySshCredentialRequest,
-    RuntimeConnectionDisplayState, RuntimeConnectionTestFailureKind, RuntimeConnectionTestResponse,
-    RuntimeConnectionTestStatus, RuntimeManagementSummary, RuntimeTrustAuditAction,
-    RuntimeTrustAuditEntry, RuntimeTrustConflictKind, RuntimeTrustConflictResponse,
-    RuntimeTrustKeyRevealResponse, RuntimeTrustKeyState, RuntimeTrustKeyStatus,
-    TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
-    UpdateWorkspaceMetadataRequest, WhoamiResponse, WorkerLaunchOptionsResponse,
-    WorkerLaunchProfileCandidate, WorkerLaunchRuntimeOption, WorkerLaunchWorkerSummary,
+    RepositoryLogResponse, RepositorySshConnectionProbeRequest,
+    RepositorySshConnectionProbeResponse, RepositorySshConnectionTrustState,
+    RepositorySshCredential, RepositorySshHostKeyCandidate, RepositorySshHostTrust,
+    RepositorySshPublicKey, RequestActor, RevokeRuntimeTrustKeyRequest,
+    RotateRepositorySshCredentialRequest, RuntimeConnectionDisplayState,
+    RuntimeConnectionTestFailureKind, RuntimeConnectionTestResponse, RuntimeConnectionTestStatus,
+    RuntimeManagementSummary, RuntimeTrustAuditAction, RuntimeTrustAuditEntry,
+    RuntimeTrustConflictKind, RuntimeTrustConflictResponse, RuntimeTrustKeyRevealResponse,
+    RuntimeTrustKeyState, RuntimeTrustKeyStatus, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
+    TICKET_RELATIONS_QUERY_PATH, UpdateWorkspaceMetadataRequest, WhoamiResponse,
+    WorkerLaunchOptionsResponse, WorkerLaunchProfileCandidate, WorkerLaunchRuntimeOption,
+    WorkerLaunchWorkerSummary,
     WorkingDirectoryCreateRequest as BrowserWorkingDirectoryCreateRequest,
     WorkingDirectoryCreateResponse as BrowserWorkingDirectoryCreateResponse,
     WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
@@ -188,8 +192,8 @@ use crate::{Error, Result};
 use worker_runtime::catalog::{
     ConfigBundleRef, ProfileSelector, RepositoryMaterializationContext, RepositoryRefObservation,
     RepositoryRefObservationRequest, RepositorySelector as RuntimeRepositorySelector,
-    RepositorySshMaterializationAccess, SensitiveString, WorkingDirectoryClaim,
-    WorkingDirectoryRepository, WorkingDirectoryRequest, WorkspaceApiRef,
+    RepositorySshCredentialCandidate, RepositorySshMaterializationAccess, SensitiveString,
+    WorkingDirectoryClaim, WorkingDirectoryRepository, WorkingDirectoryRequest, WorkspaceApiRef,
 };
 use worker_runtime::config_bundle::ConfigBundle;
 use worker_runtime::http_server::MAX_WORKER_FILE_UPLOAD_BYTES;
@@ -1860,6 +1864,19 @@ async fn enforce_server_cookie_mutation_origin(
     next.run(request).await
 }
 
+fn workspace_request_requires_mutation_lock(
+    method: &Method,
+    path: &str,
+    workspace_id: &str,
+) -> bool {
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return false;
+    }
+    // Fetching a one-time Runtime resource consumes only an in-memory broker handle. It is a
+    // callback required to finish an already-gated mutation, not a Workspace state mutation.
+    path != format!("/api/runtime/v1/workspaces/{workspace_id}/resources/fetch")
+}
+
 async fn dispatch_workspace_request(
     State(api): State<WorkspaceServerApi>,
     mut request: Request,
@@ -1867,10 +1884,8 @@ async fn dispatch_workspace_request(
     let path = request.uri().path().to_owned();
     let workspace_id = scoped_workspace_id(&path);
     let _mutation_guard = if let Some(workspace_id) = workspace_id
-        && !matches!(
-            *request.method(),
-            Method::GET | Method::HEAD | Method::OPTIONS
-        ) {
+        && workspace_request_requires_mutation_lock(request.method(), &path, workspace_id)
+    {
         Some(api.mutation_lock(workspace_id).await.lock_owned().await)
     } else {
         None
@@ -3054,9 +3069,17 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
                 .post(scoped_create_repository_ssh_credential),
         )
         .route(
+            "/api/w/{workspace_id}/settings/repository-access/credentials/generate",
+            post(scoped_generate_repository_ssh_credential),
+        )
+        .route(
             "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}",
             get(scoped_get_repository_ssh_credential)
                 .delete(scoped_delete_repository_ssh_credential),
+        )
+        .route(
+            "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}/public-key",
+            get(scoped_get_repository_ssh_public_key),
         )
         .route(
             "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}/rotate",
@@ -3341,6 +3364,11 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/repositories/{repository_key}",
             get(scoped_repository_detail),
+        )
+        .route(
+            "/api/w/{workspace_id}/repositories/{repository_key}/ssh-connection-test",
+            post(scoped_probe_repository_ssh_connection)
+                .put(scoped_confirm_repository_ssh_host_trust),
         )
         .route("/api/repositories/{repository_key}/log", get(repository_log))
         .route(
@@ -4449,6 +4477,8 @@ async fn scoped_list_repository_ssh_credentials(
     Extension(actor): Extension<RequestActor>,
 ) -> ApiResult<Json<Vec<RepositorySshCredential>>> {
     require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
+    api.repository_secrets
+        .ensure_workspace_default_credential(&path.workspace_id)?;
     let projection = active_repository_access_projection(&api, &path.workspace_id)?;
     Ok(Json(
         api.repository_secrets
@@ -4472,6 +4502,19 @@ async fn scoped_get_repository_ssh_credential(
     Ok(Json(credential))
 }
 
+async fn scoped_get_repository_ssh_public_key(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRepositoryCredentialPath>,
+    Extension(actor): Extension<RequestActor>,
+) -> ApiResult<Json<RepositorySshPublicKey>> {
+    require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
+    let public_key = api
+        .repository_secrets
+        .credential_public_key(&path.workspace_id, &path.credential_id)?
+        .ok_or_else(|| Error::InvalidRecordId(path.credential_id.clone()))?;
+    Ok(Json(public_key))
+}
+
 async fn scoped_create_repository_ssh_credential(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -4479,9 +4522,40 @@ async fn scoped_create_repository_ssh_credential(
     Json(request): Json<CreateRepositorySshCredentialRequest>,
 ) -> ApiResult<(StatusCode, Json<RepositorySshCredential>)> {
     require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
+    if request.credential_id
+        == crate::repository_access::WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID
+    {
+        return Err(Error::InvalidInput(
+            "Workspace default SSH credential id is reserved".to_string(),
+        )
+        .into());
+    }
     let credential =
         api.repository_secrets
             .create_credential(&path.workspace_id, request, &actor.account_id)?;
+    Ok((StatusCode::CREATED, Json(credential)))
+}
+
+async fn scoped_generate_repository_ssh_credential(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Extension(actor): Extension<RequestActor>,
+    Json(request): Json<GenerateRepositorySshCredentialRequest>,
+) -> ApiResult<(StatusCode, Json<RepositorySshCredential>)> {
+    require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
+    if request.credential_id
+        == crate::repository_access::WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID
+    {
+        return Err(Error::InvalidInput(
+            "Workspace default SSH credential id is reserved".to_string(),
+        )
+        .into());
+    }
+    let credential = api.repository_secrets.generate_credential(
+        &path.workspace_id,
+        request,
+        &actor.account_id,
+    )?;
     Ok((StatusCode::CREATED, Json(credential)))
 }
 
@@ -9270,6 +9344,148 @@ async fn scoped_repository_detail(
     repository_detail(State(api), AxumPath(path.repository_key)).await
 }
 
+async fn scoped_probe_repository_ssh_connection(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRepositoryPath>,
+    Extension(actor): Extension<RequestActor>,
+    Json(request): Json<RepositorySshConnectionProbeRequest>,
+) -> ApiResult<Json<RepositorySshConnectionProbeResponse>> {
+    require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
+    require_active_workspace_runtime_binding(&api, &request.runtime_id).await?;
+    probe_repository_ssh_connection(&api, &path, &request.runtime_id).map(Json)
+}
+
+async fn scoped_confirm_repository_ssh_host_trust(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRepositoryPath>,
+    Extension(actor): Extension<RequestActor>,
+    Json(request): Json<ConfirmRepositorySshHostTrustRequest>,
+) -> ApiResult<Json<RepositorySshHostTrust>> {
+    require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
+    require_active_workspace_runtime_binding(&api, &request.runtime_id).await?;
+    let probe = probe_repository_ssh_connection(&api, &path, &request.runtime_id)?;
+    let candidate = probe
+        .candidates
+        .iter()
+        .find(|candidate| candidate.host_key == request.host_key)
+        .ok_or_else(|| {
+            settings_bad_request(
+                "repository_ssh_host_key_not_observed",
+                "Selected SSH host key was not presented by the target Runtime",
+            )
+        })?;
+    if request.expected_host_trust_revision != probe.expected_host_trust_revision {
+        return Err(ApiError::from(Error::WorkspaceConfigConflict(
+            "SSH host trust revision changed after the connection test".to_string(),
+        )));
+    }
+    let host_trust = api.repository_secrets.put_host_trust(
+        &path.workspace_id,
+        PutRepositorySshHostTrustRequest {
+            operation_id: request.operation_id,
+            host_trust_id: probe.host_trust_id,
+            hostname: probe.hostname,
+            port: probe.port,
+            host_key: candidate.host_key.clone(),
+            expected_revision: probe.expected_host_trust_revision,
+        },
+        &actor.account_id,
+    )?;
+    Ok(Json(host_trust))
+}
+
+fn repository_ssh_connection_trust_state(
+    candidates: &[RepositorySshHostKeyCandidate],
+    existing_fingerprint: Option<&str>,
+) -> RepositorySshConnectionTrustState {
+    match existing_fingerprint {
+        None => RepositorySshConnectionTrustState::Untrusted,
+        Some(fingerprint)
+            if candidates
+                .iter()
+                .any(|candidate| candidate.fingerprint == fingerprint) =>
+        {
+            RepositorySshConnectionTrustState::Verified
+        }
+        Some(_) => RepositorySshConnectionTrustState::Changed,
+    }
+}
+
+fn probe_repository_ssh_connection(
+    api: &WorkspaceApi,
+    path: &ScopedRepositoryPath,
+    runtime_id: &str,
+) -> ApiResult<RepositorySshConnectionProbeResponse> {
+    validate_workspace_scope(api, &path.workspace_id)?;
+    let repository = api.require_configured_workspace_repository_by_key(&path.repository_key)?;
+    let (hostname, port) = crate::repository_access::repository_ssh_endpoint(
+        &path.repository_key,
+        &repository.source.uri,
+    )?
+    .ok_or_else(|| {
+        settings_bad_request(
+            "repository_ssh_connection_test_not_applicable",
+            "Repository does not use an SSH source",
+        )
+    })?;
+    let observed = api
+        .runtime
+        .probe_ssh_host_keys(
+            runtime_id,
+            worker_runtime::ssh_host_key_probe::SshHostKeyProbeRequest {
+                hostname: hostname.clone(),
+                port,
+            },
+        )
+        .map_err(|error| error.into_error())?;
+    let candidates = observed
+        .candidates
+        .into_iter()
+        .map(|candidate| RepositorySshHostKeyCandidate {
+            algorithm: candidate.algorithm,
+            host_key: candidate.public_key,
+            fingerprint: candidate.fingerprint,
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Err(settings_bad_request(
+            "repository_ssh_host_key_not_observed",
+            "Target Runtime did not observe an SSH Ed25519 host key",
+        ));
+    }
+    let matches =
+        api.repository_secrets
+            .host_trusts_for_endpoint(&path.workspace_id, &hostname, port)?;
+    if matches.len() > 1 {
+        return Err(ApiError::from(Error::WorkspaceConfigConflict(
+            "Multiple SSH host trust records match this Repository endpoint".to_string(),
+        )));
+    }
+    let existing = matches.first();
+    let trust_state = repository_ssh_connection_trust_state(
+        &candidates,
+        existing.map(|host_trust| host_trust.fingerprint.as_str()),
+    );
+    Ok(RepositorySshConnectionProbeResponse {
+        workspace_id: path.workspace_id.clone(),
+        repository_key: path.repository_key.clone(),
+        runtime_id: runtime_id.to_string(),
+        hostname: hostname.clone(),
+        port,
+        trust_state,
+        host_trust_id: existing.map_or_else(
+            || {
+                crate::repository_access::RepositorySecretService::automatic_host_trust_id(
+                    &hostname, port,
+                )
+            },
+            |host_trust| host_trust.host_trust_id.clone(),
+        ),
+        expected_host_trust_revision: existing.map(|host_trust| host_trust.current_revision),
+        candidates,
+    })
+}
+
 async fn scoped_repository_log(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRepositoryPath>,
@@ -10921,12 +11137,31 @@ fn working_directory_detail_for_runtime(
     runtime_id: &str,
     working_directory_id: &str,
 ) -> ApiResult<Json<BrowserWorkingDirectoryDetailResponse>> {
+    let existing = api
+        .store
+        .get_workdir_registry(&api.config.workspace_id, working_directory_id)?
+        .ok_or_else(|| {
+            ApiError::with_diagnostics(
+                Error::RuntimeOperationFailed {
+                    runtime_id: "workspace-backend".to_string(),
+                    code: "working_directory_not_found".to_string(),
+                    message: format!("Unknown Workdir `{working_directory_id}`"),
+                },
+                Vec::new(),
+            )
+        })?;
+    if existing.runtime_id != runtime_id {
+        return Err(ApiError::from(Error::WorkspacePermissionDenied(
+            "Workdir does not belong to the requested Runtime".to_string(),
+        )));
+    }
     let result = api
         .runtime
         .working_directory(runtime_id, working_directory_id)
         .map_err(|err| err.into_error())?;
     if let Some(working_directory) = result.working_directory {
-        let record = workdir_record_from_summary(&api, runtime_id, &working_directory.summary);
+        let mut record = workdir_record_from_summary(&api, runtime_id, &working_directory.summary);
+        preserve_workdir_identity_for_corrupted_summary(&mut record, Some(&existing));
         api.store.upsert_workdir_registry(&record)?;
         let summary = projected_workdir_summary_from_record(&api, &record)?;
         return Ok(Json(BrowserWorkingDirectoryDetailResponse {
@@ -10936,25 +11171,12 @@ fn working_directory_detail_for_runtime(
             diagnostics: working_directory_diagnostics(result.diagnostics),
         }));
     }
-    if let Some(record) = api
-        .store
-        .get_workdir_registry(&api.config.workspace_id, working_directory_id)?
-    {
-        return Ok(Json(BrowserWorkingDirectoryDetailResponse {
-            workspace_id: api.config.workspace_id.clone(),
-            runtime_id: runtime_id.to_string(),
-            item: projected_workdir_summary_from_record(&api, &record)?,
-            diagnostics: working_directory_diagnostics(result.diagnostics),
-        }));
-    }
-    Err(ApiError::with_diagnostics(
-        Error::RuntimeOperationFailed {
-            runtime_id: runtime_id.to_string(),
-            code: "workspace_working_directory_lookup_failed".to_string(),
-            message: "Runtime did not return working directory".to_string(),
-        },
-        result.diagnostics,
-    ))
+    Ok(Json(BrowserWorkingDirectoryDetailResponse {
+        workspace_id: api.config.workspace_id.clone(),
+        runtime_id: runtime_id.to_string(),
+        item: projected_workdir_summary_from_record(&api, &existing)?,
+        diagnostics: working_directory_diagnostics(result.diagnostics),
+    }))
 }
 
 fn workdir_removal_response(
@@ -14555,6 +14777,7 @@ fn backend_resource_error_status(error: &BackendResourceError) -> StatusCode {
         | BackendResourceError::Oversized { .. }
         | BackendResourceError::ContentTypeMismatch { .. }
         | BackendResourceError::InvalidResponse { .. } => StatusCode::BAD_REQUEST,
+        BackendResourceError::Timeout => StatusCode::GATEWAY_TIMEOUT,
         BackendResourceError::Transport { .. } => StatusCode::BAD_GATEWAY,
     }
 }
@@ -16904,6 +17127,35 @@ fn upsert_pending_backend_workdir(
     Ok(workdir_id)
 }
 
+fn reconcile_runtime_workdir_observations(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    items: &[worker_runtime::catalog::WorkingDirectoryStatus],
+) -> ApiResult<std::collections::BTreeSet<String>> {
+    let mut observed = std::collections::BTreeSet::new();
+    for status in items {
+        let Some(existing) = api.store.get_workdir_registry(
+            &api.config.workspace_id,
+            &status.summary.working_directory_id,
+        )?
+        else {
+            continue;
+        };
+        if existing.runtime_id != runtime_id {
+            continue;
+        }
+        observed.insert(status.summary.working_directory_id.clone());
+        if status.summary.status == WorkingDirectoryStatusKind::NotFound {
+            persist_workdir_not_found(api, existing)?;
+            continue;
+        }
+        let mut record = workdir_record_from_summary(api, runtime_id, &status.summary);
+        preserve_workdir_identity_for_corrupted_summary(&mut record, Some(&existing));
+        api.store.upsert_workdir_registry(&record)?;
+    }
+    Ok(observed)
+}
+
 fn sync_runtime_workdir_observations(
     api: &WorkspaceApi,
     runtime_id: &str,
@@ -16912,26 +17164,7 @@ fn sync_runtime_workdir_observations(
         .runtime
         .list_working_directories(runtime_id)
         .map_err(|err| err.into_error())?;
-    let mut observed = std::collections::BTreeSet::new();
-    for status in &response.items {
-        observed.insert(status.summary.working_directory_id.clone());
-        if status.summary.status == WorkingDirectoryStatusKind::NotFound {
-            if let Some(record) = api.store.get_workdir_registry(
-                &api.config.workspace_id,
-                &status.summary.working_directory_id,
-            )? {
-                persist_workdir_not_found(api, record)?;
-            }
-            continue;
-        }
-        let existing = api.store.get_workdir_registry(
-            &api.config.workspace_id,
-            &status.summary.working_directory_id,
-        )?;
-        let mut record = workdir_record_from_summary(api, runtime_id, &status.summary);
-        preserve_workdir_identity_for_corrupted_summary(&mut record, existing.as_ref());
-        api.store.upsert_workdir_registry(&record)?;
-    }
+    let observed = reconcile_runtime_workdir_observations(api, runtime_id, &response.items)?;
     for mut record in api
         .store
         .list_workdir_registry(&api.config.workspace_id, 500)?
@@ -17295,6 +17528,30 @@ fn validate_working_directory_claim_for_browser(
     Ok(())
 }
 
+fn repository_ssh_lease_candidates(
+    api: &WorkspaceApi,
+    primary: crate::repository_access::LeasedRepositorySshAccess,
+) -> ApiResult<Vec<crate::repository_access::LeasedRepositorySshAccess>> {
+    let workspace_default = api
+        .repository_secrets
+        .ensure_workspace_default_credential(&api.config.workspace_id)?;
+    if primary.credential_id
+        == crate::repository_access::WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID
+    {
+        return Ok(vec![primary]);
+    }
+    let workspace_default = api
+        .repository_secrets
+        .lease_ssh_materialization_access_revision(
+            &api.config.workspace_id,
+            crate::repository_access::WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID,
+            workspace_default.current_revision,
+            &primary.host_trust_id,
+            primary.host_trust_revision,
+        )?;
+    Ok(vec![primary, workspace_default])
+}
+
 fn authorize_repository_materialization_operation(
     api: &WorkspaceApi,
     operation: &WorkdirCreateOperationRecord,
@@ -17324,6 +17581,16 @@ fn authorize_repository_materialization_operation(
                     host_trust_id,
                     host_trust_revision,
                 )?;
+            let leases = repository_ssh_lease_candidates(api, lease)?;
+            let primary_lease = leases.first().ok_or_else(|| {
+                settings_bad_request(
+                    "working_directory_repository_access_invalid",
+                    "Repository SSH access has no credential candidates",
+                )
+            })?;
+            let primary_host_trust_id = primary_lease.host_trust_id.clone();
+            let primary_host_trust_revision = primary_lease.host_trust_revision;
+            let known_hosts_entry = primary_lease.known_hosts_entry.clone();
             let access = match access_mode {
                 "read_only" => workspace_api::RepositoryAccessMode::ReadOnly,
                 "read_write" => workspace_api::RepositoryAccessMode::ReadWrite,
@@ -17342,13 +17609,30 @@ fn authorize_repository_materialization_operation(
                     &operation.resolved_runtime_id,
                     format!("repository-ssh-access:{}", operation.operation_id),
                     format!(
-                        "credential:{}:host-trust:{}",
-                        lease.credential_revision, lease.host_trust_revision
+                        "credentials:{}:host-trust:{}",
+                        leases
+                            .iter()
+                            .map(|lease| format!(
+                                "{}:{}",
+                                lease.credential_id, lease.credential_revision
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        primary_host_trust_revision
                     ),
                     i64::try_from(expires_at_epoch_seconds).unwrap_or(i64::MAX),
                     worker_runtime::resource::RepositorySshAccessSecret {
-                        private_key: lease.private_key.as_str().to_string(),
-                        known_hosts_entry: lease.known_hosts_entry.clone(),
+                        credential_candidates: leases
+                            .iter()
+                            .map(|lease| {
+                                worker_runtime::resource::RepositorySshAccessSecretCandidate {
+                                    credential_id: lease.credential_id.clone(),
+                                    credential_revision: lease.credential_revision,
+                                    private_key: lease.private_key.as_str().to_string(),
+                                }
+                            })
+                            .collect(),
+                        known_hosts_entry: known_hosts_entry.clone(),
                     },
                 )
                 .map_err(|_| {
@@ -17365,17 +17649,22 @@ fn authorize_repository_materialization_operation(
                 config_projection_digest: operation.config_projection_digest.clone(),
                 cache_generation: operation.cache_generation,
                 ssh: Some(RepositorySshMaterializationAccess {
-                    credential_id: lease.credential_id,
-                    credential_revision: lease.credential_revision,
-                    host_trust_id: lease.host_trust_id,
-                    host_trust_revision: lease.host_trust_revision,
+                    credential_candidates: leases
+                        .into_iter()
+                        .map(|lease| RepositorySshCredentialCandidate {
+                            credential_id: lease.credential_id,
+                            credential_revision: lease.credential_revision,
+                            private_key: SensitiveString::default(),
+                        })
+                        .collect(),
+                    host_trust_id: primary_host_trust_id,
+                    host_trust_revision: primary_host_trust_revision,
                     access,
                     expires_at_epoch_seconds,
                     repository_id: request.repository.id.clone(),
                     repository_source_fingerprint: request.repository.source_fingerprint.clone(),
                     repository_uri: request.repository.source.uri.clone(),
                     secret_resource,
-                    private_key: SensitiveString::default(),
                     known_hosts_entry: SensitiveString::default(),
                 }),
             }
@@ -17408,12 +17697,18 @@ fn authorize_repository_materialization_operation(
                     "SSH Repository access authority is unavailable",
                 )
             })?;
+            let primary_credential = ssh.credential_candidates.first().ok_or_else(|| {
+                settings_bad_request(
+                    "working_directory_repository_access_invalid",
+                    "Repository SSH access has no credential candidates",
+                )
+            })?;
             api.config_store.bind_workdir_create_repository_access(
                 &api.config.workspace_id,
                 &operation.operation_id,
                 request_fingerprint,
-                &ssh.credential_id,
-                ssh.credential_revision,
+                &primary_credential.credential_id,
+                primary_credential.credential_revision,
                 &ssh.host_trust_id,
                 ssh.host_trust_revision,
                 match ssh.access {
@@ -17473,19 +17768,40 @@ fn authorize_repository_materialization(
         .map(|repository| repository.repository_key.as_str())
         .ok_or_else(|| Error::UnknownRepository(request.repository.id.clone()))?;
     let ssh = if request.repository.source.kind == workspace_api::RepositorySourceKind::Ssh {
-        let binding = projection
+        let binding = match projection
             .bindings
             .iter()
             .find(|binding| binding.repository_key == repository_key)
-            .ok_or_else(|| {
-                settings_bad_request(
-                    "working_directory_remote_repository_access_required",
-                    "SSH Repository has no active Workspace credential and host-trust binding",
-                )
-            })?;
+            .cloned()
+        {
+            Some(binding) => binding,
+            None => api
+                .repository_secrets
+                .default_ssh_binding_for_repository(
+                    &api.config.workspace_id,
+                    repository_key,
+                    &request.repository.source.uri,
+                )?
+                .ok_or_else(|| {
+                    settings_bad_request(
+                        "working_directory_remote_repository_host_trust_required",
+                        "SSH Repository has no pinned host trust matching its URI",
+                    )
+                })?,
+        };
         let lease = api
             .repository_secrets
-            .lease_ssh_materialization_access(&api.config.workspace_id, binding)?;
+            .lease_ssh_materialization_access(&api.config.workspace_id, &binding)?;
+        let leases = repository_ssh_lease_candidates(api, lease)?;
+        let primary_lease = leases.first().ok_or_else(|| {
+            settings_bad_request(
+                "working_directory_repository_access_invalid",
+                "Repository SSH access has no credential candidates",
+            )
+        })?;
+        let primary_host_trust_id = primary_lease.host_trust_id.clone();
+        let primary_host_trust_revision = primary_lease.host_trust_revision;
+        let known_hosts_entry = primary_lease.known_hosts_entry.clone();
         let expires_at_epoch_seconds = repository_access_expiry();
         let secret_resource = api
             .resource_broker
@@ -17494,13 +17810,30 @@ fn authorize_repository_materialization(
                 runtime_id,
                 format!("repository-ssh-access:{operation_id}"),
                 format!(
-                    "credential:{}:host-trust:{}",
-                    lease.credential_revision, lease.host_trust_revision
+                    "credentials:{}:host-trust:{}",
+                    leases
+                        .iter()
+                        .map(|lease| format!(
+                            "{}:{}",
+                            lease.credential_id, lease.credential_revision
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    primary_host_trust_revision
                 ),
                 i64::try_from(expires_at_epoch_seconds).unwrap_or(i64::MAX),
                 worker_runtime::resource::RepositorySshAccessSecret {
-                    private_key: lease.private_key.as_str().to_string(),
-                    known_hosts_entry: lease.known_hosts_entry.clone(),
+                    credential_candidates: leases
+                        .iter()
+                        .map(
+                            |lease| worker_runtime::resource::RepositorySshAccessSecretCandidate {
+                                credential_id: lease.credential_id.clone(),
+                                credential_revision: lease.credential_revision,
+                                private_key: lease.private_key.as_str().to_string(),
+                            },
+                        )
+                        .collect(),
+                    known_hosts_entry: known_hosts_entry.clone(),
                 },
             )
             .map_err(|_| {
@@ -17510,17 +17843,22 @@ fn authorize_repository_materialization(
                 )
             })?;
         Some(RepositorySshMaterializationAccess {
-            credential_id: lease.credential_id,
-            credential_revision: lease.credential_revision,
-            host_trust_id: lease.host_trust_id,
-            host_trust_revision: lease.host_trust_revision,
+            credential_candidates: leases
+                .into_iter()
+                .map(|lease| RepositorySshCredentialCandidate {
+                    credential_id: lease.credential_id,
+                    credential_revision: lease.credential_revision,
+                    private_key: SensitiveString::default(),
+                })
+                .collect(),
+            host_trust_id: primary_host_trust_id,
+            host_trust_revision: primary_host_trust_revision,
             access: binding.access,
             expires_at_epoch_seconds,
             repository_id: request.repository.id.clone(),
             repository_source_fingerprint: request.repository.source_fingerprint.clone(),
             repository_uri: request.repository.source.uri.clone(),
             secret_resource,
-            private_key: SensitiveString::default(),
             known_hosts_entry: SensitiveString::default(),
         })
     } else {
@@ -18152,10 +18490,37 @@ mod tests {
     };
 
     #[test]
+    fn backend_resource_timeout_maps_to_gateway_timeout() {
+        assert_eq!(
+            backend_resource_error_status(&BackendResourceError::Timeout),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+    }
+
+    #[test]
     fn browser_worker_console_href_uses_logical_worker_route() {
         let href = browser_worker_console_href("workspace/one", "W-7");
         assert_eq!(href, "/w/workspace%2Fone/workers/W-7/console");
         assert!(!href.contains("/runtimes/"));
+    }
+
+    #[test]
+    fn runtime_resource_fetch_bypasses_workspace_mutation_lock() {
+        assert!(!workspace_request_requires_mutation_lock(
+            &Method::POST,
+            "/api/runtime/v1/workspaces/workspace-a/resources/fetch",
+            "workspace-a"
+        ));
+        assert!(workspace_request_requires_mutation_lock(
+            &Method::POST,
+            "/api/w/workspace-a/working-directories",
+            "workspace-a"
+        ));
+        assert!(!workspace_request_requires_mutation_lock(
+            &Method::GET,
+            "/api/w/workspace-a/working-directories",
+            "workspace-a"
+        ));
     }
 
     #[tokio::test]
@@ -19161,6 +19526,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn repository_ssh_probe_distinguishes_untrusted_verified_and_changed_keys() {
+        let candidates = vec![RepositorySshHostKeyCandidate {
+            algorithm: "ssh-ed25519".to_string(),
+            host_key: "ssh-ed25519 AAAA".to_string(),
+            fingerprint: "SHA256:observed".to_string(),
+        }];
+
+        assert_eq!(
+            repository_ssh_connection_trust_state(&candidates, None),
+            RepositorySshConnectionTrustState::Untrusted
+        );
+        assert_eq!(
+            repository_ssh_connection_trust_state(&candidates, Some("SHA256:observed")),
+            RepositorySshConnectionTrustState::Verified
+        );
+        assert_eq!(
+            repository_ssh_connection_trust_state(&candidates, Some("SHA256:old")),
+            RepositorySshConnectionTrustState::Changed
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_ssh_clone_leases_specific_then_workspace_default_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let specific = api
+            .repository_secrets
+            .generate_credential(
+                &api.config.workspace_id,
+                GenerateRepositorySshCredentialRequest {
+                    operation_id: "generate-repository-specific".to_string(),
+                    credential_id: "repository-specific".to_string(),
+                    name: "Repository specific".to_string(),
+                },
+                "owner-account",
+            )
+            .unwrap();
+        let host_public_key = api
+            .repository_secrets
+            .credential_public_key(&api.config.workspace_id, &specific.credential_id)
+            .unwrap()
+            .unwrap()
+            .public_key;
+        let host_trust = api
+            .repository_secrets
+            .put_host_trust(
+                &api.config.workspace_id,
+                PutRepositorySshHostTrustRequest {
+                    operation_id: "trust-example-host".to_string(),
+                    host_trust_id: "example-host".to_string(),
+                    hostname: "example.test".to_string(),
+                    port: 22,
+                    host_key: host_public_key,
+                    expected_revision: None,
+                },
+                "owner-account",
+            )
+            .unwrap();
+        let binding = workspace_api::RepositorySshAccessBinding {
+            repository_key: "test-repository".to_string(),
+            credential_id: specific.credential_id.clone(),
+            host_trust_id: host_trust.host_trust_id,
+            access: workspace_api::RepositoryAccessMode::ReadOnly,
+        };
+        let primary = api
+            .repository_secrets
+            .lease_ssh_materialization_access(&api.config.workspace_id, &binding)
+            .unwrap();
+
+        let candidates = repository_ssh_lease_candidates(&api, primary).unwrap();
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].credential_id, "repository-specific");
+        assert_eq!(
+            candidates[1].credential_id,
+            crate::repository_access::WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID
+        );
+        assert_ne!(
+            candidates[0].private_key.as_str(),
+            candidates[1].private_key.as_str()
+        );
+        assert_eq!(
+            candidates[0].known_hosts_entry,
+            candidates[1].known_hosts_entry
+        );
+
+        let default_binding = workspace_api::RepositorySshAccessBinding {
+            credential_id: crate::repository_access::WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID
+                .to_string(),
+            ..binding
+        };
+        let primary_default = api
+            .repository_secrets
+            .lease_ssh_materialization_access(&api.config.workspace_id, &default_binding)
+            .unwrap();
+        let default_only = repository_ssh_lease_candidates(&api, primary_default).unwrap();
+        assert_eq!(default_only.len(), 1);
+    }
+
     #[tokio::test]
     async fn repository_bound_ticket_flow_and_workdir_launches_fail_closed_across_workspaces() {
         let dir = tempfile::tempdir().unwrap();
@@ -19270,7 +19735,13 @@ mod tests {
                 "1",
                 i64::MAX,
                 worker_runtime::resource::RepositorySshAccessSecret {
-                    private_key: "private-key-bytes".to_string(),
+                    credential_candidates: vec![
+                        worker_runtime::resource::RepositorySshAccessSecretCandidate {
+                            credential_id: "credential-1".to_string(),
+                            credential_revision: 1,
+                            private_key: "private-key-bytes".to_string(),
+                        },
+                    ],
                     known_hosts_entry: "known-hosts-entry".to_string(),
                 },
             )
@@ -19290,8 +19761,13 @@ mod tests {
                 cache_generation: 0,
                 ssh: Some(
                     worker_runtime::catalog::RepositorySshMaterializationAccess {
-                        credential_id: "credential-1".to_string(),
-                        credential_revision: 1,
+                        credential_candidates: vec![
+                            worker_runtime::catalog::RepositorySshCredentialCandidate {
+                                credential_id: "credential-1".to_string(),
+                                credential_revision: 1,
+                                private_key: worker_runtime::catalog::SensitiveString::default(),
+                            },
+                        ],
                         host_trust_id: "host-trust-1".to_string(),
                         host_trust_revision: 1,
                         access: workspace_api::RepositoryAccessMode::ReadOnly,
@@ -19303,7 +19779,6 @@ mod tests {
                             .clone(),
                         repository_uri: working_directory.repository.source.uri.clone(),
                         secret_resource,
-                        private_key: worker_runtime::catalog::SensitiveString::default(),
                         known_hosts_entry: worker_runtime::catalog::SensitiveString::default(),
                     },
                 ),
@@ -21005,6 +21480,60 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn runtime_workdir_inventory_does_not_adopt_unknown_workspace_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let foreign = WorkdirRegistryRecord {
+            workspace_id: "other-workspace".to_string(),
+            workdir_id: "foreign-workdir".to_string(),
+            runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+            repository_id: "foreign-repository".to_string(),
+            creation_selector: None,
+            creation_ref: None,
+            creation_tree: None,
+            current_selector: None,
+            current_ref: None,
+            current_tree: None,
+            observed_at_epoch_seconds: None,
+            materialization_status: "present".to_string(),
+            cleanliness: "clean".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        let items = [worker_runtime::catalog::WorkingDirectoryStatus {
+            summary: runtime_workdir_summary_from_record(&foreign),
+        }];
+
+        let observed =
+            reconcile_runtime_workdir_observations(&api, EMBEDDED_WORKER_RUNTIME_ID, &items)
+                .unwrap();
+
+        assert!(observed.is_empty());
+        assert!(
+            api.store
+                .get_workdir_registry(TEST_WORKSPACE_ID, "foreign-workdir")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_workdir_detail_rejects_unknown_workspace_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+
+        let response = working_directory_detail_for_runtime(
+            api,
+            EMBEDDED_WORKER_RUNTIME_ID,
+            "foreign-workdir",
+        )
+        .unwrap_err()
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

@@ -24,6 +24,11 @@ use crate::retention::{
 };
 #[cfg(feature = "ws-server")]
 use crate::runtime::RuntimeSubscriptionRecvError;
+use crate::ssh_host_key_probe::{
+    SSH_HOST_KEY_PROBE_OPERATION, SSH_HOST_KEY_PROBE_PATH, SSH_KEYSCAN_TIMEOUT,
+    SshHostKeyProbeError, SshHostKeyProbeRequest, SshHostKeyProbeResponse,
+    probe_ssh_host_keys_with_program,
+};
 use crate::workspace_issuer::{
     RuntimeVerificationSigner, VerifiedWorkspaceCapability, WORKSPACE_VERIFICATION_ACK_PATH,
     WORKSPACE_VERIFICATION_CHALLENGE_PATH, WORKSPACE_VERIFICATION_OPERATION,
@@ -58,7 +63,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
-#[cfg(feature = "fs-store")]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
@@ -182,11 +186,26 @@ fn runtime_http_router_with_optional_auth(
     local_token: Option<String>,
     workspace_auth: Option<WorkspaceRuntimeHttpAuth>,
 ) -> Router {
+    runtime_http_router_with_auth_and_ssh_keyscan_program(
+        runtime,
+        local_token,
+        workspace_auth,
+        PathBuf::from("ssh-keyscan"),
+    )
+}
+
+fn runtime_http_router_with_auth_and_ssh_keyscan_program(
+    runtime: Runtime,
+    local_token: Option<String>,
+    workspace_auth: Option<WorkspaceRuntimeHttpAuth>,
+    ssh_keyscan_program: PathBuf,
+) -> Router {
     let state = RuntimeHttpState {
         runtime,
         local_token: local_token.map(Arc::<str>::from),
         workspace_auth: workspace_auth.map(Arc::new),
         workdir_sessions: Arc::new(Mutex::new(HashMap::new())),
+        ssh_keyscan_program: Arc::new(ssh_keyscan_program),
     };
 
     let router = Router::new()
@@ -219,6 +238,10 @@ fn runtime_http_router_with_optional_auth(
         .route(
             "/v1/working-directories/repository-access",
             post(authorize_working_directory_repository_access),
+        )
+        .route(
+            SSH_HOST_KEY_PROBE_PATH,
+            post(probe_repository_ssh_host_keys),
         )
         .route("/v1/repository-refs/observe", post(observe_repository_ref))
         .route(
@@ -293,6 +316,7 @@ struct RuntimeHttpState {
     local_token: Option<Arc<str>>,
     workspace_auth: Option<Arc<WorkspaceRuntimeHttpAuth>>,
     workdir_sessions: Arc<Mutex<HashMap<String, RuntimeHttpWorkdirSession>>>,
+    ssh_keyscan_program: Arc<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -809,6 +833,45 @@ async fn authorize_working_directory_repository_access(
     Ok(Json(RuntimeHttpRepositoryAccessResponse {
         authorized: true,
     }))
+}
+
+async fn probe_repository_ssh_host_keys(
+    State(state): State<RuntimeHttpState>,
+    Extension(_auth): Extension<RuntimeAuthContext>,
+    body: Result<Json<SshHostKeyProbeRequest>, JsonRejection>,
+) -> RestResult<SshHostKeyProbeResponse> {
+    let Json(request) = body.map_err(RuntimeHttpRestError::json_rejection)?;
+    let response = probe_ssh_host_keys_with_program(
+        &request,
+        state.ssh_keyscan_program.as_path(),
+        SSH_KEYSCAN_TIMEOUT,
+    )
+    .await
+    .map_err(|error| match error {
+        SshHostKeyProbeError::InvalidHostname | SshHostKeyProbeError::InvalidPort => {
+            RuntimeHttpRestError::new(
+                StatusCode::BAD_REQUEST,
+                "ssh_host_key_probe_invalid_request",
+                error.to_string(),
+            )
+        }
+        SshHostKeyProbeError::Unavailable => RuntimeHttpRestError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ssh_host_key_probe_unavailable",
+            error.to_string(),
+        ),
+        SshHostKeyProbeError::Timeout => RuntimeHttpRestError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "ssh_host_key_probe_timeout",
+            error.to_string(),
+        ),
+        SshHostKeyProbeError::Failed { .. } => RuntimeHttpRestError::new(
+            StatusCode::BAD_GATEWAY,
+            "ssh_host_key_probe_failed",
+            error.to_string(),
+        ),
+    })?;
+    Ok(Json(response))
 }
 
 async fn observe_repository_ref(
@@ -2174,10 +2237,11 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
         return Some("workers:create");
     }
     if (path == "/v1/working-directories/repository-access"
-        || path == "/v1/repository-refs/observe")
+        || path == "/v1/repository-refs/observe"
+        || path == SSH_HOST_KEY_PROBE_PATH)
         && *method == Method::POST
     {
-        return Some("workdirs:operate");
+        return Some(SSH_HOST_KEY_PROBE_OPERATION);
     }
     if path.starts_with("/v1/workdir-sessions")
         || (path.starts_with("/v1/working-directories/") && path.ends_with("/sessions"))
@@ -2849,6 +2913,10 @@ mod tests {
             Some("workdirs:operate")
         );
         assert_eq!(
+            required_runtime_permission(&Method::POST, SSH_HOST_KEY_PROBE_PATH),
+            Some(SSH_HOST_KEY_PROBE_OPERATION)
+        );
+        assert_eq!(
             required_runtime_permission(&Method::POST, "/v1/working-directories/wd-1/sessions"),
             Some("workdirs:operate")
         );
@@ -2890,6 +2958,7 @@ mod tests {
                     session: session.clone(),
                 },
             )]))),
+            ssh_keyscan_program: Arc::new(PathBuf::from("ssh-keyscan")),
         };
         let auth = RuntimeAuthContext {
             server_id: "server-a".to_string(),
@@ -3243,6 +3312,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn ssh_probe_uses_workdir_operation_capability() {
+        assert_eq!(
+            required_runtime_permission(&Method::POST, SSH_HOST_KEY_PROBE_PATH),
+            Some(SSH_HOST_KEY_PROBE_OPERATION)
+        );
+        assert_eq!(
+            workspace_runtime_operation(&Method::POST, SSH_HOST_KEY_PROBE_PATH),
+            SSH_HOST_KEY_PROBE_OPERATION
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_host_key_probe_rejects_invalid_hostname_before_execution() {
+        let token = "local-token";
+        let app = runtime_http_router_with_auth_and_ssh_keyscan_program(
+            Runtime::new_memory(),
+            Some(token.to_string()),
+            None,
+            PathBuf::from("/definitely/missing/ssh-keyscan"),
+        );
+        let response = authed_json_request(
+            app,
+            Method::POST,
+            SSH_HOST_KEY_PROBE_PATH,
+            token,
+            &SshHostKeyProbeRequest {
+                hostname: "-oProxyCommand=malicious".to_string(),
+                port: 22,
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: RuntimeHttpErrorResponse = read_json(response).await;
+        assert_eq!(error.error.code, "ssh_host_key_probe_invalid_request");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authenticated_ssh_host_key_probe_returns_deduplicated_candidates() {
+        use base64::Engine as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&11_u32.to_be_bytes());
+        blob.extend_from_slice(b"ssh-ed25519");
+        blob.extend_from_slice(&32_u32.to_be_bytes());
+        blob.extend_from_slice(&[9_u8; 32]);
+        let key = base64::engine::general_purpose::STANDARD.encode(blob);
+        let temp = tempfile::tempdir().unwrap();
+        let program = temp.path().join("ssh-keyscan");
+        let recorded_arguments = temp.path().join("arguments");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'private diagnostic' >&2\nprintf '%s\\n' 'example.test ssh-ed25519 {key}' '[example.test]:2222 ssh-ed25519 {key}'\n",
+                recorded_arguments.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let token = "local-token";
+        let app = runtime_http_router_with_auth_and_ssh_keyscan_program(
+            Runtime::new_memory(),
+            Some(token.to_string()),
+            None,
+            program,
+        );
+        let body = SshHostKeyProbeRequest {
+            hostname: "example.test".to_string(),
+            port: 2222,
+        };
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/repositories/ssh/probe")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let response =
+            authed_json_request(app, Method::POST, SSH_HOST_KEY_PROBE_PATH, token, &body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read_to_string(recorded_arguments).unwrap(),
+            "-T\n5\n-p\n2222\n-t\ned25519\nexample.test\n"
+        );
+        let response: SshHostKeyProbeResponse = read_json(response).await;
+        assert_eq!(response.candidates.len(), 1);
+        assert_eq!(response.candidates[0].algorithm, "ssh-ed25519");
+        assert_eq!(
+            response.candidates[0].public_key,
+            format!("ssh-ed25519 {key}")
+        );
+        assert!(response.candidates[0].fingerprint.starts_with("SHA256:"));
     }
 
     #[tokio::test]

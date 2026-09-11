@@ -1,4 +1,5 @@
 import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
+import { parseWorkspaceRuntimeList } from "$lib/workspace/api/runtime-management";
 import {
   parseRepositoryDetailResponse,
   parseRepositoryLogResponse,
@@ -8,7 +9,7 @@ import type { PageLoad } from "./$types";
 export const load: PageLoad = async ({ fetch, params }) => {
   const workspaceId = params.workspaceId;
   const repositoryKey = params.repositoryKey;
-  const [repositoryResult, logResult] = await Promise.all([
+  const [repositoryResult, logResult, runtimesResult] = await Promise.all([
     loadJson<unknown>(
       fetch,
       workspaceApiPath(
@@ -22,6 +23,10 @@ export const load: PageLoad = async ({ fetch, params }) => {
         workspaceId,
         `/repositories/${encodeURIComponent(repositoryKey)}/log`,
       ),
+    ),
+    loadJson<unknown>(
+      fetch,
+      workspaceApiPath(workspaceId, "/runtimes"),
     ),
   ]);
 
@@ -49,11 +54,25 @@ export const load: PageLoad = async ({ fetch, params }) => {
     }
   }
 
+  let runtimes = null;
+  let runtimesError = runtimesResult.error;
+  if (runtimesResult.data !== null) {
+    try {
+      runtimes = parseWorkspaceRuntimeList(runtimesResult.data);
+    } catch (cause) {
+      runtimesError = cause instanceof Error
+        ? cause.message
+        : "invalid Runtime summary response";
+    }
+  }
+
   return {
     repositoryKey,
     repository,
     repositoryError,
     repositoryLog: log,
     repositoryLogError: logError,
+    runtimes,
+    runtimesError,
   };
 };
