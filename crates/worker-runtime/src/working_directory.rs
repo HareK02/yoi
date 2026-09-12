@@ -16,8 +16,8 @@ use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use workdir::WorkdirSessionResource;
@@ -257,17 +257,449 @@ fn binding_cleanliness(binding: &WorkingDirectoryBinding) -> String {
     }
 }
 
+#[derive(Debug)]
+struct PendingRepositoryAccessLease {
+    generation: u64,
+    access: RepositorySshMaterializationAccess,
+}
+
+#[derive(Debug)]
+struct ActiveRepositoryAccessLease {
+    generation: u64,
+    expires_at_epoch_seconds: u64,
+    access: Weak<RepositoryCommandAccess>,
+}
+
+#[derive(Debug, Clone)]
+enum RepositoryAccessExpiryKey {
+    Pending(String),
+    Active(u64),
+}
+
+#[derive(Debug, Default)]
+struct RepositoryAccessExpiryState {
+    next_generation: u64,
+    pending: HashMap<String, PendingRepositoryAccessLease>,
+    active: HashMap<u64, ActiveRepositoryAccessLease>,
+    shutdown: bool,
+}
+
+#[derive(Debug)]
+struct RepositoryAccessExpirySchedulerInner {
+    state: Mutex<RepositoryAccessExpiryState>,
+    wake: Condvar,
+    worker_starts: AtomicUsize,
+}
+
+#[derive(Debug)]
+struct RepositoryAccessExpirySchedulerLifecycle {
+    inner: Arc<RepositoryAccessExpirySchedulerInner>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Clone, Debug)]
+struct RepositoryAccessExpiryScheduler {
+    inner: Arc<RepositoryAccessExpirySchedulerInner>,
+    _lifecycle: Arc<RepositoryAccessExpirySchedulerLifecycle>,
+}
+
+impl RepositoryAccessExpiryScheduler {
+    const MAX_WAIT: Duration = Duration::from_secs(60 * 60);
+
+    fn new() -> Self {
+        let inner = Arc::new(RepositoryAccessExpirySchedulerInner {
+            state: Mutex::new(RepositoryAccessExpiryState::default()),
+            wake: Condvar::new(),
+            worker_starts: AtomicUsize::new(0),
+        });
+        let worker_inner = Arc::clone(&inner);
+        let worker = std::thread::Builder::new()
+            .name("repository-access-expiry".to_string())
+            .spawn(move || Self::run(worker_inner))
+            .expect("failed to spawn repository access expiry scheduler");
+        inner.worker_starts.fetch_add(1, Ordering::Relaxed);
+        let lifecycle = Arc::new(RepositoryAccessExpirySchedulerLifecycle {
+            inner: Arc::clone(&inner),
+            worker: Mutex::new(Some(worker)),
+        });
+        Self {
+            inner,
+            _lifecycle: lifecycle,
+        }
+    }
+
+    fn next_generation(
+        state: &mut RepositoryAccessExpiryState,
+    ) -> Result<u64, WorkingDirectoryDiagnostic> {
+        state.next_generation = state.next_generation.checked_add(1).ok_or_else(|| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_generation_exhausted",
+                "Runtime Repository access generation is exhausted",
+            )
+        })?;
+        Ok(state.next_generation)
+    }
+
+    fn store_pending(
+        &self,
+        working_directory_id: &str,
+        access: RepositorySshMaterializationAccess,
+    ) -> Result<u64, WorkingDirectoryDiagnostic> {
+        let mut state = self.inner.state.lock().map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_unavailable",
+                "Runtime Repository access state is unavailable",
+            )
+        })?;
+        if state.shutdown {
+            return Err(WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_unavailable",
+                "Runtime Repository access state is shutting down",
+            ));
+        }
+        let generation = Self::next_generation(&mut state)?;
+        state.pending.insert(
+            working_directory_id.to_string(),
+            PendingRepositoryAccessLease { generation, access },
+        );
+        drop(state);
+        self.inner.wake.notify_one();
+        Ok(generation)
+    }
+
+    fn pending(
+        &self,
+        working_directory_id: &str,
+    ) -> Result<Option<RepositorySshMaterializationAccess>, WorkingDirectoryDiagnostic> {
+        self.inner
+            .state
+            .lock()
+            .map_err(|_| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_access_unavailable",
+                    "Runtime Repository access state is unavailable",
+                )
+            })
+            .map(|state| {
+                state
+                    .pending
+                    .get(working_directory_id)
+                    .map(|lease| lease.access.clone())
+            })
+    }
+
+    fn take_pending(
+        &self,
+        working_directory_id: &str,
+    ) -> Result<Option<RepositorySshMaterializationAccess>, WorkingDirectoryDiagnostic> {
+        let mut state = self.inner.state.lock().map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_unavailable",
+                "Runtime Repository access state is unavailable",
+            )
+        })?;
+        let access = state
+            .pending
+            .remove(working_directory_id)
+            .map(|lease| lease.access);
+        drop(state);
+        self.inner.wake.notify_one();
+        Ok(access)
+    }
+
+    fn remove_pending(&self, working_directory_id: &str) -> Result<(), WorkingDirectoryDiagnostic> {
+        let mut state = self.inner.state.lock().map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_unavailable",
+                "Runtime Repository access state is unavailable",
+            )
+        })?;
+        state.pending.remove(working_directory_id);
+        drop(state);
+        self.inner.wake.notify_one();
+        Ok(())
+    }
+
+    fn register_active(
+        &self,
+        access: &Arc<RepositoryCommandAccess>,
+        expires_at_epoch_seconds: u64,
+    ) -> Result<RepositoryAccessExpiryRegistration, WorkingDirectoryDiagnostic> {
+        let mut state = self.inner.state.lock().map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_unavailable",
+                "Runtime Repository access state is unavailable",
+            )
+        })?;
+        if state.shutdown {
+            return Err(WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_unavailable",
+                "Runtime Repository access state is shutting down",
+            ));
+        }
+        let generation = Self::next_generation(&mut state)?;
+        let lease_id = generation;
+        state.active.insert(
+            lease_id,
+            ActiveRepositoryAccessLease {
+                generation,
+                expires_at_epoch_seconds,
+                access: Arc::downgrade(access),
+            },
+        );
+        drop(state);
+        self.inner.wake.notify_one();
+        Ok(RepositoryAccessExpiryRegistration {
+            scheduler: Arc::downgrade(&self.inner),
+            lease_id,
+            generation,
+        })
+    }
+
+    fn next_expiry(
+        state: &RepositoryAccessExpiryState,
+    ) -> Option<(RepositoryAccessExpiryKey, u64, u64)> {
+        let mut next = None;
+        for (working_directory_id, lease) in &state.pending {
+            let candidate = (
+                RepositoryAccessExpiryKey::Pending(working_directory_id.clone()),
+                lease.generation,
+                lease.access.expires_at_epoch_seconds,
+            );
+            if next
+                .as_ref()
+                .map_or(true, |(_, _, expires_at)| candidate.2 < *expires_at)
+            {
+                next = Some(candidate);
+            }
+        }
+        for (lease_id, lease) in &state.active {
+            let candidate = (
+                RepositoryAccessExpiryKey::Active(*lease_id),
+                lease.generation,
+                lease.expires_at_epoch_seconds,
+            );
+            if next
+                .as_ref()
+                .map_or(true, |(_, _, expires_at)| candidate.2 < *expires_at)
+            {
+                next = Some(candidate);
+            }
+        }
+        next
+    }
+
+    fn expire_if_current(
+        state: &mut RepositoryAccessExpiryState,
+        key: &RepositoryAccessExpiryKey,
+        generation: u64,
+        now_epoch_seconds: u64,
+    ) -> Option<Weak<RepositoryCommandAccess>> {
+        match key {
+            RepositoryAccessExpiryKey::Pending(working_directory_id) => {
+                let should_remove = state
+                    .pending
+                    .get(working_directory_id)
+                    .is_some_and(|lease| {
+                        lease.generation == generation
+                            && lease.access.expires_at_epoch_seconds <= now_epoch_seconds
+                    });
+                if should_remove {
+                    state.pending.remove(working_directory_id);
+                }
+                None
+            }
+            RepositoryAccessExpiryKey::Active(lease_id) => {
+                let should_remove = state.active.get(lease_id).is_some_and(|lease| {
+                    lease.generation == generation
+                        && lease.expires_at_epoch_seconds <= now_epoch_seconds
+                });
+                if should_remove {
+                    state.active.remove(lease_id).map(|lease| lease.access)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn run(inner: Arc<RepositoryAccessExpirySchedulerInner>) {
+        loop {
+            let expired_access = {
+                let mut state = match inner.state.lock() {
+                    Ok(state) => state,
+                    Err(_) => return,
+                };
+                loop {
+                    if state.shutdown {
+                        return;
+                    }
+                    let Some((key, generation, expires_at_epoch_seconds)) =
+                        Self::next_expiry(&state)
+                    else {
+                        state = match inner.wake.wait(state) {
+                            Ok(state) => state,
+                            Err(_) => return,
+                        };
+                        continue;
+                    };
+                    let now_epoch_seconds = repository_access_now_epoch_seconds();
+                    if expires_at_epoch_seconds > now_epoch_seconds {
+                        let wait = Duration::from_secs(
+                            (expires_at_epoch_seconds - now_epoch_seconds)
+                                .min(Self::MAX_WAIT.as_secs()),
+                        );
+                        state = match inner.wake.wait_timeout(state, wait) {
+                            Ok((state, _)) => state,
+                            Err(_) => return,
+                        };
+                        continue;
+                    }
+                    break Self::expire_if_current(&mut state, &key, generation, now_epoch_seconds);
+                }
+            };
+            if let Some(access) = expired_access.and_then(|access| access.upgrade()) {
+                access.stop();
+            }
+        }
+    }
+
+    fn cancel_active(inner: &RepositoryAccessExpirySchedulerInner, lease_id: u64, generation: u64) {
+        let Ok(mut state) = inner.state.lock() else {
+            return;
+        };
+        let should_remove = state
+            .active
+            .get(&lease_id)
+            .is_some_and(|lease| lease.generation == generation);
+        if should_remove {
+            state.active.remove(&lease_id);
+        }
+        drop(state);
+        inner.wake.notify_one();
+    }
+
+    #[cfg(test)]
+    fn pending_generation(&self, working_directory_id: &str) -> Option<u64> {
+        self.inner
+            .state
+            .lock()
+            .ok()?
+            .pending
+            .get(working_directory_id)
+            .map(|lease| lease.generation)
+    }
+
+    #[cfg(test)]
+    fn expire_pending_for_test(
+        &self,
+        working_directory_id: &str,
+        generation: u64,
+        now_epoch_seconds: u64,
+    ) {
+        let Ok(mut state) = self.inner.state.lock() else {
+            return;
+        };
+        Self::expire_if_current(
+            &mut state,
+            &RepositoryAccessExpiryKey::Pending(working_directory_id.to_string()),
+            generation,
+            now_epoch_seconds,
+        );
+    }
+
+    #[cfg(test)]
+    fn pending_count(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .map(|state| state.pending.len())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn active_count(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .map(|state| state.active.len())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn worker_start_count(&self) -> usize {
+        self.inner.worker_starts.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for RepositoryAccessExpirySchedulerLifecycle {
+    fn drop(&mut self) {
+        let active = {
+            let mut state = match self.inner.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.shutdown = true;
+            state.pending.clear();
+            state
+                .active
+                .drain()
+                .map(|(_, lease)| lease.access)
+                .collect::<Vec<_>>()
+        };
+        self.inner.wake.notify_all();
+        for access in active {
+            if let Some(access) = access.upgrade() {
+                access.stop();
+            }
+        }
+        let worker = match self.worker.lock() {
+            Ok(mut worker) => worker.take(),
+            Err(mut poisoned) => poisoned.get_mut().take(),
+        };
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RepositoryAccessExpiryRegistration {
+    scheduler: Weak<RepositoryAccessExpirySchedulerInner>,
+    lease_id: u64,
+    generation: u64,
+}
+
+impl Drop for RepositoryAccessExpiryRegistration {
+    fn drop(&mut self) {
+        if let Some(scheduler) = self.scheduler.upgrade() {
+            RepositoryAccessExpiryScheduler::cancel_active(
+                &scheduler,
+                self.lease_id,
+                self.generation,
+            );
+        }
+    }
+}
+
+fn repository_access_now_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeGitMaterializer {
     runtime_root: PathBuf,
-    repository_access: Arc<Mutex<HashMap<String, RepositorySshMaterializationAccess>>>,
+    repository_access: RepositoryAccessExpiryScheduler,
 }
 
 impl RuntimeGitMaterializer {
     pub fn new(runtime_root: impl Into<PathBuf>) -> Self {
         Self {
             runtime_root: runtime_root.into(),
-            repository_access: Arc::new(Mutex::new(HashMap::new())),
+            repository_access: RepositoryAccessExpiryScheduler::new(),
         }
     }
 
@@ -366,53 +798,8 @@ impl RuntimeGitMaterializer {
         ssh: &RepositorySshMaterializationAccess,
     ) -> Result<(), WorkingDirectoryDiagnostic> {
         validate_ssh_materialization_access(ssh)?;
-        let working_directory_id = working_directory_id.to_string();
-        let credential_candidates = ssh
-            .credential_candidates
-            .iter()
-            .map(|candidate| {
-                (
-                    candidate.credential_id.clone(),
-                    candidate.credential_revision,
-                )
-            })
-            .collect::<Vec<_>>();
-        let expires_at = ssh.expires_at_epoch_seconds;
         self.repository_access
-            .lock()
-            .map_err(|_| {
-                WorkingDirectoryDiagnostic::new(
-                    "working_directory_repository_access_unavailable",
-                    "Runtime Repository access state is unavailable",
-                )
-            })?
-            .insert(working_directory_id.clone(), ssh.clone());
-        let repository_access = self.repository_access.clone();
-        std::thread::spawn(move || {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if expires_at > now {
-                std::thread::sleep(Duration::from_secs(expires_at - now));
-            }
-            if let Ok(mut access) = repository_access.lock()
-                && access.get(&working_directory_id).is_some_and(|access| {
-                    access
-                        .credential_candidates
-                        .iter()
-                        .map(|candidate| {
-                            (
-                                candidate.credential_id.clone(),
-                                candidate.credential_revision,
-                            )
-                        })
-                        .eq(credential_candidates.iter().cloned())
-                })
-            {
-                access.remove(&working_directory_id);
-            }
-        });
+            .store_pending(working_directory_id, ssh.clone())?;
         Ok(())
     }
 
@@ -421,16 +808,7 @@ impl RuntimeGitMaterializer {
         working_directory_id: &str,
         mut binding: WorkingDirectoryBinding,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
-        let access = self
-            .repository_access
-            .lock()
-            .map_err(|_| {
-                WorkingDirectoryDiagnostic::new(
-                    "working_directory_repository_access_unavailable",
-                    "Runtime Repository access state is unavailable",
-                )
-            })?
-            .remove(working_directory_id);
+        let access = self.repository_access.take_pending(working_directory_id)?;
         let Some(access) = access else {
             if binding
                 .working_directory
@@ -453,20 +831,9 @@ impl RuntimeGitMaterializer {
             &binding.working_directory.repository_id,
             &access,
         )?);
-        let weak_access = Arc::downgrade(&command_access);
-        let expires_at = access.expires_at_epoch_seconds;
-        std::thread::spawn(move || {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if expires_at > now {
-                std::thread::sleep(Duration::from_secs(expires_at - now));
-            }
-            if let Some(access) = weak_access.upgrade() {
-                access.stop();
-            }
-        });
+        let expiry_registration = self
+            .repository_access
+            .register_active(&command_access, access.expires_at_epoch_seconds)?;
         binding
             .command_environment
             .insert("SSH_AUTH_SOCK".to_string(), "/dev/null".to_string());
@@ -482,6 +849,9 @@ impl RuntimeGitMaterializer {
             }
             .to_string(),
         );
+        binding
+            .session_resources
+            .push(Arc::new(expiry_registration));
         binding.session_resources.push(command_access);
         Ok(binding)
     }
@@ -581,15 +951,7 @@ impl RuntimeGitMaterializer {
         }
         let access = self
             .repository_access
-            .lock()
-            .map_err(|_| {
-                WorkingDirectoryDiagnostic::new(
-                    "working_directory_repository_access_unavailable",
-                    "Runtime Repository access state is unavailable",
-                )
-            })?
-            .get(working_directory_id)
-            .cloned()
+            .pending(working_directory_id)?
             .ok_or_else(|| {
                 WorkingDirectoryDiagnostic::new(
                     "working_directory_remote_repository_access_required",
@@ -1049,8 +1411,10 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
                 session_resources: Vec::new(),
             };
             let _ = self.write_record(&updated);
-        } else if let Ok(mut access) = self.repository_access.lock() {
-            access.remove(&binding.working_directory.id);
+        } else {
+            let _ = self
+                .repository_access
+                .remove_pending(&binding.working_directory.id);
         }
         remove_result
     }
@@ -2749,6 +3113,155 @@ mod tests {
             secret_resource: repository_resource_handle(),
             known_hosts_entry: crate::catalog::SensitiveString::new("host key secret bytes"),
         }
+    }
+
+    fn fake_repository_command_access(root: &Path) -> (Arc<RepositoryCommandAccess>, PathBuf) {
+        let access_root = root.join("command-access");
+        let agent_root = root.join("agent");
+        fs::create_dir_all(&access_root).unwrap();
+        fs::create_dir_all(&agent_root).unwrap();
+        let socket = agent_root.join("agent.sock");
+        fs::write(&socket, b"socket marker").unwrap();
+        let access = Arc::new(RepositoryCommandAccess {
+            root: access_root.clone(),
+            ssh_command: access_root.join("ssh-command"),
+            agent: Arc::new(RepositorySshAgent {
+                root: agent_root,
+                socket,
+                child: Mutex::new(None),
+            }),
+            ssh_broker: None,
+        });
+        (access, access_root)
+    }
+
+    #[test]
+    fn repository_access_expiry_fences_a_stale_pending_generation_after_refresh() {
+        let scheduler = RepositoryAccessExpiryScheduler::new();
+        let working_directory_id = "working-directory-refresh";
+        let old_expiry = repository_access_now_epoch_seconds() + 60;
+        let mut old_access = repository_ssh_access();
+        old_access.expires_at_epoch_seconds = old_expiry;
+        scheduler
+            .store_pending(working_directory_id, old_access)
+            .unwrap();
+        let old_generation = scheduler
+            .pending_generation(working_directory_id)
+            .expect("old pending generation");
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let refresh_barrier = Arc::clone(&barrier);
+        let refresh_scheduler = scheduler.clone();
+        let refresh = std::thread::spawn(move || {
+            let mut refreshed_access = repository_ssh_access();
+            refreshed_access.expires_at_epoch_seconds = old_expiry + 60;
+            refresh_barrier.wait();
+            refresh_scheduler
+                .store_pending(working_directory_id, refreshed_access)
+                .unwrap();
+        });
+        barrier.wait();
+        refresh.join().unwrap();
+        let refreshed_generation = scheduler
+            .pending_generation(working_directory_id)
+            .expect("refreshed pending generation");
+        assert_ne!(old_generation, refreshed_generation);
+
+        scheduler.expire_pending_for_test(working_directory_id, old_generation, old_expiry);
+        let refreshed = scheduler
+            .pending(working_directory_id)
+            .unwrap()
+            .expect("stale expiry must retain refreshed access");
+        assert_eq!(refreshed.expires_at_epoch_seconds, old_expiry + 60);
+    }
+
+    #[test]
+    fn repository_access_expiry_uses_one_worker_for_many_live_leases() {
+        let scheduler = RepositoryAccessExpiryScheduler::new();
+        for index in 0..1_024 {
+            scheduler
+                .store_pending(
+                    &format!("working-directory-{index}"),
+                    repository_ssh_access(),
+                )
+                .unwrap();
+        }
+        assert_eq!(scheduler.worker_start_count(), 1);
+        assert_eq!(scheduler.pending_count(), 1_024);
+
+        for index in 0..512 {
+            assert!(
+                scheduler
+                    .take_pending(&format!("working-directory-{index}"))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        for index in 512..1_024 {
+            scheduler
+                .remove_pending(&format!("working-directory-{index}"))
+                .unwrap();
+        }
+        assert_eq!(scheduler.pending_count(), 0);
+        assert_eq!(scheduler.worker_start_count(), 1);
+    }
+
+    #[test]
+    fn repository_access_expiry_unregisters_active_leases_on_session_close() {
+        let scheduler = RepositoryAccessExpiryScheduler::new();
+        let root = tempfile::tempdir().unwrap();
+        let (access, access_root) = fake_repository_command_access(root.path());
+        let registration = scheduler.register_active(&access, u64::MAX).unwrap();
+        assert_eq!(scheduler.active_count(), 1);
+
+        drop(registration);
+        assert_eq!(scheduler.active_count(), 0);
+        assert!(access_root.exists());
+        drop(access);
+        assert!(!access_root.exists());
+    }
+
+    #[test]
+    fn repository_access_expiry_expires_pending_and_active_leases() {
+        let scheduler = RepositoryAccessExpiryScheduler::new();
+        let expiry = repository_access_now_epoch_seconds() + 1;
+        let mut pending = repository_ssh_access();
+        pending.expires_at_epoch_seconds = expiry;
+        scheduler
+            .store_pending("working-directory-expiring", pending)
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (access, access_root) = fake_repository_command_access(root.path());
+        let registration = scheduler.register_active(&access, expiry).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while (scheduler.pending_count() != 0
+            || scheduler.active_count() != 0
+            || access_root.exists())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(scheduler.pending_count(), 0);
+        assert_eq!(scheduler.active_count(), 0);
+        assert!(!access_root.exists());
+        drop(registration);
+        drop(access);
+    }
+
+    #[test]
+    fn repository_access_expiry_shutdown_revokes_and_joins() {
+        let scheduler = RepositoryAccessExpiryScheduler::new();
+        let scheduler_inner = Arc::downgrade(&scheduler.inner);
+        let root = tempfile::tempdir().unwrap();
+        let (access, access_root) = fake_repository_command_access(root.path());
+        let registration = scheduler.register_active(&access, u64::MAX).unwrap();
+
+        drop(scheduler);
+        assert!(scheduler_inner.upgrade().is_none());
+        assert!(!access_root.exists());
+        drop(registration);
+        drop(access);
     }
 
     fn git(path: &Path, args: &[&str]) {
