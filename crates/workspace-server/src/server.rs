@@ -172,7 +172,8 @@ use crate::store::{
     AccountRecord, ApiTokenRecord, AuthChallengeRecord, BrowserSessionRecord, ControlPlaneStore,
     DeviceLoginFlowRecord, FlowSourceRecord, PasskeyCredentialRecord, RepositoryInsertOutcome,
     RepositoryRecord, TicketAssignmentPrincipal, TicketAssignmentRole, TicketCoderAssignmentRecord,
-    TicketRoleAssignmentRecord, UserRecord, WorkdirCreateOperationRecord, WorkdirRegistryRecord,
+    TicketRoleAssignmentRecord, UserRecord, WorkdirCreateCredentialCandidate,
+    WorkdirCreateCredentialCandidateRole, WorkdirCreateOperationRecord, WorkdirRegistryRecord,
     WorkerControlGrantRecord, WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord,
     WorkspaceResourceKind, WorkspaceRuntimeAuthenticationMode as StoredRuntimeAuthenticationMode,
     WorkspaceRuntimeBinding, WorkspaceRuntimeBindingAuditRecord, WorkspaceRuntimeBindingMutation,
@@ -10917,6 +10918,7 @@ async fn create_workspace_working_directory(
                 host_trust_id: None,
                 host_trust_revision: None,
                 repository_access_mode: None,
+                credential_candidates: Vec::new(),
                 working_directory_id: next_backend_workdir_id(&request.repository_key),
                 state: "pending".to_string(),
                 failure: None,
@@ -17570,10 +17572,10 @@ fn authorize_repository_materialization_operation(
 ) -> ApiResult<()> {
     let context = if request.repository.source.kind == workspace_api::RepositorySourceKind::Ssh {
         if let (
-            Some(credential_id),
-            Some(credential_revision),
-            Some(host_trust_id),
-            Some(host_trust_revision),
+            Some(_credential_id),
+            Some(_credential_revision),
+            Some(_host_trust_id),
+            Some(_host_trust_revision),
             Some(access_mode),
         ) = (
             operation.credential_id.as_deref(),
@@ -17582,16 +17584,7 @@ fn authorize_repository_materialization_operation(
             operation.host_trust_revision,
             operation.repository_access_mode.as_deref(),
         ) {
-            let lease = api
-                .repository_secrets
-                .lease_ssh_materialization_access_revision(
-                    &api.config.workspace_id,
-                    credential_id,
-                    credential_revision,
-                    host_trust_id,
-                    host_trust_revision,
-                )?;
-            let leases = repository_ssh_lease_candidates(api, lease)?;
+            let leases = repository_ssh_lease_candidates_from_operation(api, operation, request)?;
             let primary_lease = leases.first().ok_or_else(|| {
                 settings_bad_request(
                     "working_directory_repository_access_invalid",
@@ -17712,6 +17705,20 @@ fn authorize_repository_materialization_operation(
                     "Repository SSH access has no credential candidates",
                 )
             })?;
+            let credential_candidates = ssh
+                .credential_candidates
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| WorkdirCreateCredentialCandidate {
+                    role: if index == 0 {
+                        WorkdirCreateCredentialCandidateRole::Primary
+                    } else {
+                        WorkdirCreateCredentialCandidateRole::WorkspaceDefaultFallback
+                    },
+                    credential_id: candidate.credential_id.clone(),
+                    credential_revision: candidate.credential_revision,
+                })
+                .collect::<Vec<_>>();
             api.config_store.bind_workdir_create_repository_access(
                 &api.config.workspace_id,
                 &operation.operation_id,
@@ -17724,6 +17731,7 @@ fn authorize_repository_materialization_operation(
                     workspace_api::RepositoryAccessMode::ReadOnly => "read_only",
                     workspace_api::RepositoryAccessMode::ReadWrite => "read_write",
                 },
+                &credential_candidates,
                 &now_registry_timestamp(),
             )?;
             context
@@ -17758,6 +17766,112 @@ fn authorize_worker_spawn_workdir_materialization(
 ) -> ApiResult<()> {
     let projection = active_repository_access_projection(api, &api.config.workspace_id)?;
     authorize_repository_materialization(api, runtime_id, operation_id, &projection, request)
+}
+
+fn repository_ssh_lease_candidates_from_operation(
+    api: &WorkspaceApi,
+    operation: &WorkdirCreateOperationRecord,
+    request: &WorkingDirectoryRequest,
+) -> ApiResult<Vec<crate::repository_access::LeasedRepositorySshAccess>> {
+    if operation.repository_id != request.repository.id
+        || operation.source_kind.as_deref() != Some(request.repository.source.kind.as_str())
+        || operation.source_uri.as_deref() != Some(request.repository.source.uri.as_str())
+        || operation.source_revision != Some(request.repository.source_revision)
+        || operation.source_fingerprint.as_deref()
+            != Some(request.repository.source_fingerprint.as_str())
+    {
+        return Err(settings_bad_request(
+            "working_directory_repository_access_snapshot_mismatch",
+            "persisted Workdir Repository access snapshot does not match the create request",
+        ));
+    }
+    let host_trust_id = operation.host_trust_id.as_deref().ok_or_else(|| {
+        settings_bad_request(
+            "working_directory_repository_access_snapshot_missing",
+            "persisted Workdir Repository access snapshot is incomplete",
+        )
+    })?;
+    let host_trust_revision = operation.host_trust_revision.ok_or_else(|| {
+        settings_bad_request(
+            "working_directory_repository_access_snapshot_missing",
+            "persisted Workdir Repository access snapshot is incomplete",
+        )
+    })?;
+    if operation.credential_candidates.is_empty() {
+        return Err(settings_bad_request(
+            "working_directory_repository_access_snapshot_missing",
+            "persisted Workdir credential candidate snapshot is unavailable",
+        ));
+    }
+    let primary_credential_id = operation.credential_id.as_deref().ok_or_else(|| {
+        settings_bad_request(
+            "working_directory_repository_access_snapshot_missing",
+            "persisted Workdir primary credential evidence is unavailable",
+        )
+    })?;
+    let primary_credential_revision = operation.credential_revision.ok_or_else(|| {
+        settings_bad_request(
+            "working_directory_repository_access_snapshot_missing",
+            "persisted Workdir primary credential evidence is unavailable",
+        )
+    })?;
+    crate::workdir_create_operations::validate_workdir_create_credential_candidates(
+        primary_credential_id,
+        primary_credential_revision,
+        &operation.credential_candidates,
+    )
+    .map_err(|_error| {
+        settings_bad_request(
+            "working_directory_repository_access_snapshot_invalid",
+            "persisted Workdir credential candidate snapshot is invalid",
+        )
+    })?;
+    let _access_mode = operation
+        .repository_access_mode
+        .as_deref()
+        .map(|access_mode| match access_mode {
+            "read_only" => Ok(workspace_api::RepositoryAccessMode::ReadOnly),
+            "read_write" => Ok(workspace_api::RepositoryAccessMode::ReadWrite),
+            _other => Err(settings_bad_request(
+                "working_directory_repository_access_snapshot_invalid",
+                "persisted Repository access mode is invalid",
+            )),
+        })
+        .transpose()?
+        .ok_or_else(|| {
+            settings_bad_request(
+                "working_directory_repository_access_snapshot_missing",
+                "persisted Workdir Repository access mode is unavailable",
+            )
+        })?;
+
+    let mut leases = Vec::with_capacity(operation.credential_candidates.len());
+    for candidate in &operation.credential_candidates {
+        let lease = api
+            .repository_secrets
+            .lease_ssh_materialization_access_revision(
+                &api.config.workspace_id,
+                &candidate.credential_id,
+                candidate.credential_revision,
+                host_trust_id,
+                host_trust_revision,
+            )
+            .map_err(|_| {
+                settings_bad_request(
+                    "working_directory_repository_access_snapshot_unavailable",
+                    "persisted Workdir credential or host-trust revision is unavailable",
+                )
+            })?;
+        if lease.host_trust_id != host_trust_id || lease.host_trust_revision != host_trust_revision
+        {
+            return Err(settings_bad_request(
+                "working_directory_repository_access_snapshot_mismatch",
+                "persisted Workdir host-trust snapshot does not match the credential candidate",
+            ));
+        }
+        leases.push(lease);
+    }
+    Ok(leases)
 }
 
 fn authorize_repository_materialization(
@@ -19617,6 +19731,89 @@ mod tests {
         assert_eq!(
             candidates[0].known_hosts_entry,
             candidates[1].known_hosts_entry
+        );
+
+        let source = workspace_api::RepositorySource {
+            kind: workspace_api::RepositorySourceKind::Ssh,
+            uri: "ssh://git@example.test/org/repository.git".to_string(),
+        };
+        let source_fingerprint = repository_source_fingerprint(&source);
+        let request = WorkingDirectoryRequest {
+            repository: worker_runtime::catalog::WorkingDirectoryRepository {
+                id: "repository-a".to_string(),
+                provider: "git".to_string(),
+                source: source.clone(),
+                source_revision: 1,
+                source_fingerprint: source_fingerprint.clone(),
+                selector: None,
+            },
+            materializer: Default::default(),
+            backend_workdir_id: Some("workdir-a".to_string()),
+            materialization: None,
+        };
+        let operation = WorkdirCreateOperationRecord {
+            workspace_id: api.config.workspace_id.clone(),
+            operation_id: "retry-workdir-a".to_string(),
+            request_fingerprint: "sha256:request".to_string(),
+            repository_id: "repository-a".to_string(),
+            selector: None,
+            requested_runtime_id: Some("runtime-1".to_string()),
+            resolved_runtime_id: "runtime-1".to_string(),
+            config_revision: 1,
+            config_projection_digest: "sha256:projection".to_string(),
+            source_kind: Some(source.kind.as_str().to_string()),
+            source_uri: Some(source.uri.clone()),
+            source_revision: Some(1),
+            source_fingerprint: Some(source_fingerprint),
+            credential_id: Some(candidates[0].credential_id.clone()),
+            credential_revision: Some(candidates[0].credential_revision),
+            host_trust_id: Some(candidates[0].host_trust_id.clone()),
+            host_trust_revision: Some(candidates[0].host_trust_revision),
+            repository_access_mode: Some("read_only".to_string()),
+            credential_candidates: candidates
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| WorkdirCreateCredentialCandidate {
+                    role: if index == 0 {
+                        WorkdirCreateCredentialCandidateRole::Primary
+                    } else {
+                        WorkdirCreateCredentialCandidateRole::WorkspaceDefaultFallback
+                    },
+                    credential_id: candidate.credential_id.clone(),
+                    credential_revision: candidate.credential_revision,
+                })
+                .collect(),
+            working_directory_id: "workdir-a".to_string(),
+            state: "failed".to_string(),
+            failure: Some("runtime unavailable".to_string()),
+            created_at: "2026-08-24T00:00:00Z".to_string(),
+            updated_at: "2026-08-24T00:00:01Z".to_string(),
+        };
+        let retry_candidates =
+            repository_ssh_lease_candidates_from_operation(&api, &operation, &request).unwrap();
+        assert_eq!(retry_candidates.len(), 2);
+        assert_eq!(
+            retry_candidates
+                .iter()
+                .map(|candidate| (
+                    candidate.credential_id.as_str(),
+                    candidate.credential_revision
+                ))
+                .collect::<Vec<_>>(),
+            operation
+                .credential_candidates
+                .iter()
+                .map(|candidate| (
+                    candidate.credential_id.as_str(),
+                    candidate.credential_revision
+                ))
+                .collect::<Vec<_>>()
+        );
+        let mut missing_snapshot = operation.clone();
+        missing_snapshot.credential_candidates.clear();
+        assert!(
+            repository_ssh_lease_candidates_from_operation(&api, &missing_snapshot, &request)
+                .is_err()
         );
 
         let default_binding = workspace_api::RepositorySshAccessBinding {
@@ -28175,6 +28372,7 @@ mod tests {
                 host_trust_id: None,
                 host_trust_revision: None,
                 repository_access_mode: None,
+                credential_candidates: Vec::new(),
                 working_directory_id: "workdir-provider-rejection".to_string(),
                 state: "pending".to_string(),
                 failure: None,

@@ -1,8 +1,14 @@
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
-use crate::store::WorkdirCreateOperationRecord;
+use crate::store::{
+    WorkdirCreateCredentialCandidate, WorkdirCreateCredentialCandidateRole,
+    WorkdirCreateOperationRecord,
+};
 use crate::{Error, Result, SqliteWorkspaceStore};
+
+const MAX_WORKDIR_CREATE_CREDENTIAL_CANDIDATES: usize = 2;
+const MAX_CREDENTIAL_ID_BYTES: usize = 128;
 
 pub fn selector_for_retry(
     explicit_selector: Option<&str>,
@@ -172,10 +178,17 @@ impl SqliteWorkspaceStore {
         host_trust_id: &str,
         host_trust_revision: u64,
         repository_access_mode: &str,
+        credential_candidates: &[WorkdirCreateCredentialCandidate],
         now: &str,
     ) -> Result<WorkdirCreateOperationRecord> {
+        validate_workdir_create_credential_candidates(
+            credential_id,
+            credential_revision,
+            credential_candidates,
+        )?;
         self.with_conn_mut(|conn| {
-            let operation = read_workdir_create_operation(conn, workspace_id, operation_id)?
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let operation = read_workdir_create_operation(&tx, workspace_id, operation_id)?
                 .ok_or_else(|| {
                     Error::RegistryInconsistency(format!(
                         "Workdir create operation `{operation_id}` disappeared before Repository access binding"
@@ -193,6 +206,7 @@ impl SqliteWorkspaceStore {
                     || operation.host_trust_revision != Some(host_trust_revision)
                     || operation.repository_access_mode.as_deref()
                         != Some(repository_access_mode)
+                    || operation.credential_candidates != credential_candidates
                 {
                     return Err(Error::InvalidInput(format!(
                         "Workdir create operation `{operation_id}` Repository access evidence changed"
@@ -200,7 +214,7 @@ impl SqliteWorkspaceStore {
                 }
                 return Ok(operation);
             }
-            conn.execute(
+            let updated = tx.execute(
                 r#"UPDATE workdir_create_operations
                    SET credential_id = ?4, credential_revision = ?5,
                        host_trust_id = ?6, host_trust_revision = ?7,
@@ -223,11 +237,60 @@ impl SqliteWorkspaceStore {
                     now,
                 ],
             )?;
-            read_workdir_create_operation(conn, workspace_id, operation_id)?.ok_or_else(|| {
-                Error::RegistryInconsistency(format!(
-                    "Workdir create operation `{operation_id}` disappeared after Repository access binding"
-                ))
-            })
+            if updated != 1 {
+                return Err(Error::RegistryInconsistency(format!(
+                    "Workdir create operation `{operation_id}` changed before Repository access binding"
+                )));
+            }
+            for (ordinal, candidate) in credential_candidates.iter().enumerate() {
+                tx.execute(
+                    r#"INSERT INTO workdir_create_credential_candidates (
+                           workspace_id, operation_id, ordinal, role,
+                           credential_id, credential_revision
+                       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+                    params![
+                        workspace_id,
+                        operation_id,
+                        i64::try_from(ordinal).map_err(|_| Error::InvalidInput(
+                            "credential candidate ordinal is out of range".to_string()
+                        ))?,
+                        candidate.role.as_str(),
+                        candidate.credential_id,
+                        i64::try_from(candidate.credential_revision).map_err(|_| {
+                            Error::InvalidInput(
+                                "credential candidate revision is out of range".to_string(),
+                            )
+                        })?,
+                    ],
+                )?;
+                tx.execute(
+                    r#"INSERT INTO workdir_create_credential_revision_retentions (
+                           workspace_id, operation_id, ordinal,
+                           credential_id, credential_revision
+                       ) VALUES (?1, ?2, ?3, ?4, ?5)"#,
+                    params![
+                        workspace_id,
+                        operation_id,
+                        i64::try_from(ordinal).map_err(|_| Error::InvalidInput(
+                            "credential candidate ordinal is out of range".to_string()
+                        ))?,
+                        candidate.credential_id,
+                        i64::try_from(candidate.credential_revision).map_err(|_| {
+                            Error::InvalidInput(
+                                "credential candidate revision is out of range".to_string(),
+                            )
+                        })?,
+                    ],
+                )?;
+            }
+            let bound = read_workdir_create_operation(&tx, workspace_id, operation_id)?
+                .ok_or_else(|| {
+                    Error::RegistryInconsistency(format!(
+                        "Workdir create operation `{operation_id}` disappeared after Repository access binding"
+                    ))
+                })?;
+            tx.commit()?;
+            Ok(bound)
         })
     }
 
@@ -241,7 +304,8 @@ impl SqliteWorkspaceStore {
         updated_at: &str,
     ) -> Result<WorkdirCreateOperationRecord> {
         self.with_conn_mut(|conn| {
-            let changed = conn.execute(
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
                 r#"UPDATE workdir_create_operations
                    SET state = ?1, failure = ?2, updated_at = ?3
                    WHERE workspace_id = ?4 AND operation_id = ?5
@@ -260,11 +324,21 @@ impl SqliteWorkspaceStore {
                     "Workdir create operation `{operation_id}` could not be finalized"
                 )));
             }
-            read_workdir_create_operation(conn, workspace_id, operation_id)?.ok_or_else(|| {
-                Error::RegistryInconsistency(format!(
-                    "Workdir create operation `{operation_id}` disappeared"
-                ))
-            })
+            if succeeded {
+                tx.execute(
+                    r#"DELETE FROM workdir_create_credential_revision_retentions
+                       WHERE workspace_id = ?1 AND operation_id = ?2"#,
+                    params![workspace_id, operation_id],
+                )?;
+            }
+            let finished = read_workdir_create_operation(&tx, workspace_id, operation_id)?
+                .ok_or_else(|| {
+                    Error::RegistryInconsistency(format!(
+                        "Workdir create operation `{operation_id}` disappeared"
+                    ))
+                })?;
+            tx.commit()?;
+            Ok(finished)
         })
     }
 
@@ -282,8 +356,9 @@ fn read_workdir_create_operation(
     workspace_id: &str,
     operation_id: &str,
 ) -> Result<Option<WorkdirCreateOperationRecord>> {
-    conn.query_row(
-        r#"SELECT workspace_id, operation_id, request_fingerprint, repository_id, selector,
+    let mut operation = conn
+        .query_row(
+            r#"SELECT workspace_id, operation_id, request_fingerprint, repository_id, selector,
                   requested_runtime_id, resolved_runtime_id, config_revision,
                   config_projection_digest, source_kind, source_uri, source_revision,
                   source_fingerprint, credential_id, credential_revision,
@@ -292,37 +367,146 @@ fn read_workdir_create_operation(
                   created_at, updated_at
            FROM workdir_create_operations
            WHERE workspace_id = ?1 AND operation_id = ?2"#,
-        params![workspace_id, operation_id],
-        |row| {
-            Ok(WorkdirCreateOperationRecord {
-                workspace_id: row.get(0)?,
-                operation_id: row.get(1)?,
-                request_fingerprint: row.get(2)?,
-                repository_id: row.get(3)?,
-                selector: row.get(4)?,
-                requested_runtime_id: row.get(5)?,
-                resolved_runtime_id: row.get(6)?,
-                config_revision: row.get::<_, i64>(7)? as u64,
-                config_projection_digest: row.get(8)?,
-                source_kind: row.get(9)?,
-                source_uri: row.get(10)?,
-                source_revision: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
-                source_fingerprint: row.get(12)?,
-                credential_id: row.get(13)?,
-                credential_revision: row.get::<_, Option<i64>>(14)?.map(|value| value as u64),
-                host_trust_id: row.get(15)?,
-                host_trust_revision: row.get::<_, Option<i64>>(16)?.map(|value| value as u64),
-                repository_access_mode: row.get(17)?,
-                working_directory_id: row.get(18)?,
-                state: row.get(19)?,
-                failure: row.get(20)?,
-                created_at: row.get(21)?,
-                updated_at: row.get(22)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(Error::from)
+            params![workspace_id, operation_id],
+            |row| {
+                Ok(WorkdirCreateOperationRecord {
+                    workspace_id: row.get(0)?,
+                    operation_id: row.get(1)?,
+                    request_fingerprint: row.get(2)?,
+                    repository_id: row.get(3)?,
+                    selector: row.get(4)?,
+                    requested_runtime_id: row.get(5)?,
+                    resolved_runtime_id: row.get(6)?,
+                    config_revision: row.get::<_, i64>(7)? as u64,
+                    config_projection_digest: row.get(8)?,
+                    source_kind: row.get(9)?,
+                    source_uri: row.get(10)?,
+                    source_revision: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
+                    source_fingerprint: row.get(12)?,
+                    credential_id: row.get(13)?,
+                    credential_revision: row.get::<_, Option<i64>>(14)?.map(|value| value as u64),
+                    host_trust_id: row.get(15)?,
+                    host_trust_revision: row.get::<_, Option<i64>>(16)?.map(|value| value as u64),
+                    repository_access_mode: row.get(17)?,
+                    credential_candidates: Vec::new(),
+                    working_directory_id: row.get(18)?,
+                    state: row.get(19)?,
+                    failure: row.get(20)?,
+                    created_at: row.get(21)?,
+                    updated_at: row.get(22)?,
+                })
+            },
+        )
+        .optional()?;
+
+    if let Some(operation) = operation.as_mut() {
+        let mut statement = conn.prepare(
+            r#"SELECT ordinal, role, credential_id, credential_revision
+               FROM workdir_create_credential_candidates
+               WHERE workspace_id = ?1 AND operation_id = ?2
+               ORDER BY ordinal ASC"#,
+        )?;
+        let rows = statement.query_map(params![workspace_id, operation_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        for (expected_ordinal, row) in rows.enumerate() {
+            let (ordinal, role, credential_id, credential_revision) = row?;
+            if ordinal
+                != i64::try_from(expected_ordinal).map_err(|_| {
+                    Error::Store(
+                        "Workdir create credential candidate ordinal is out of range".to_string(),
+                    )
+                })?
+            {
+                return Err(Error::Store(
+                    "Workdir create credential candidate ordinals are not contiguous".to_string(),
+                ));
+            }
+            operation
+                .credential_candidates
+                .push(WorkdirCreateCredentialCandidate {
+                    role: WorkdirCreateCredentialCandidateRole::parse(&role)?,
+                    credential_id,
+                    credential_revision: u64::try_from(credential_revision).map_err(|_| {
+                        Error::Store(format!(
+                            "invalid Workdir create credential candidate revision `{credential_revision}`"
+                        ))
+                    })?,
+                });
+        }
+        if !operation.credential_candidates.is_empty() {
+            validate_workdir_create_credential_candidates(
+                operation.credential_id.as_deref().unwrap_or_default(),
+                operation.credential_revision.unwrap_or_default(),
+                &operation.credential_candidates,
+            )
+            .map_err(|error| {
+                Error::Store(format!(
+                    "invalid persisted Workdir create credential snapshot: {error}"
+                ))
+            })?;
+        }
+    }
+    Ok(operation)
+}
+
+pub(crate) fn validate_workdir_create_credential_candidates(
+    credential_id: &str,
+    credential_revision: u64,
+    candidates: &[WorkdirCreateCredentialCandidate],
+) -> Result<()> {
+    if candidates.is_empty() || candidates.len() > MAX_WORKDIR_CREATE_CREDENTIAL_CANDIDATES {
+        return Err(Error::InvalidInput(format!(
+            "Workdir create credential candidates must contain 1..={MAX_WORKDIR_CREATE_CREDENTIAL_CANDIDATES} entries"
+        )));
+    }
+    if credential_id.is_empty() || credential_id.len() > MAX_CREDENTIAL_ID_BYTES {
+        return Err(Error::InvalidInput(
+            "Workdir create credential id is invalid".to_string(),
+        ));
+    }
+    if credential_revision == 0 {
+        return Err(Error::InvalidInput(
+            "Workdir create credential revision must be greater than zero".to_string(),
+        ));
+    }
+    let primary = &candidates[0];
+    if primary.role != WorkdirCreateCredentialCandidateRole::Primary
+        || primary.credential_id != credential_id
+        || primary.credential_revision != credential_revision
+    {
+        return Err(Error::InvalidInput(
+            "Workdir create primary credential evidence does not match the ordered candidate snapshot"
+                .to_string(),
+        ));
+    }
+    if candidates.len() == 2
+        && candidates[1].role != WorkdirCreateCredentialCandidateRole::WorkspaceDefaultFallback
+    {
+        return Err(Error::InvalidInput(
+            "Workdir create fallback credential role is invalid".to_string(),
+        ));
+    }
+    if candidates.iter().any(|candidate| {
+        candidate.credential_id.is_empty()
+            || candidate.credential_id.len() > MAX_CREDENTIAL_ID_BYTES
+            || candidate.credential_revision == 0
+    }) {
+        return Err(Error::InvalidInput(
+            "Workdir create credential candidate identity is invalid".to_string(),
+        ));
+    }
+    if candidates.len() == 2 && candidates[0].credential_id == candidates[1].credential_id {
+        return Err(Error::InvalidInput(
+            "Workdir create credential candidates contain a duplicate credential id".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -347,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_keeps_resolved_config_evidence_and_rejects_changed_input() {
+    fn retry_keeps_resolved_config_and_credential_candidates_after_fallback_moves() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
         futures::executor::block_on(store.upsert_workspace(&WorkspaceRecord {
             workspace_id: "workspace".to_string(),
@@ -403,6 +587,7 @@ mod tests {
             host_trust_id: None,
             host_trust_revision: None,
             repository_access_mode: None,
+            credential_candidates: Vec::new(),
             working_directory_id: "wd-1".to_string(),
             state: "pending".to_string(),
             failure: None,
@@ -413,6 +598,44 @@ mod tests {
             store.reserve_workdir_create_operation(&record).unwrap(),
             record
         );
+        store
+            .with_conn_mut(|conn| {
+                for (credential_id, revision) in
+                    [("credential-1", 3_i64), ("workspace-default-ssh", 7_i64)]
+                {
+                    conn.execute(
+                        r#"INSERT INTO repository_ssh_credentials (
+                               workspace_id, credential_id, name,
+                               public_key_algorithm, public_key_fingerprint,
+                               current_revision, status, created_at
+                           ) VALUES ('workspace', ?1, ?1, 'ssh-ed25519', ?1, ?2,
+                                     'active', '2026-08-24T00:00:00Z')"#,
+                        params![credential_id, revision],
+                    )?;
+                    conn.execute(
+                        r#"INSERT INTO repository_ssh_credential_revisions (
+                               workspace_id, credential_id, revision,
+                               public_key_algorithm, public_key_fingerprint, created_at
+                           ) VALUES ('workspace', ?1, ?2, 'ssh-ed25519', ?1,
+                                     '2026-08-24T00:00:00Z')"#,
+                        params![credential_id, revision],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let candidates = vec![
+            WorkdirCreateCredentialCandidate {
+                role: WorkdirCreateCredentialCandidateRole::Primary,
+                credential_id: "credential-1".to_string(),
+                credential_revision: 3,
+            },
+            WorkdirCreateCredentialCandidate {
+                role: WorkdirCreateCredentialCandidateRole::WorkspaceDefaultFallback,
+                credential_id: "workspace-default-ssh".to_string(),
+                credential_revision: 7,
+            },
+        ];
         let bound = store
             .bind_workdir_create_repository_access(
                 "workspace",
@@ -423,12 +646,22 @@ mod tests {
                 "trust-1",
                 5,
                 "read_only",
+                &candidates,
                 "2026-08-24T00:00:01Z",
             )
             .unwrap();
         assert_eq!(bound.credential_id.as_deref(), Some("credential-1"));
         assert_eq!(bound.credential_revision, Some(3));
         assert_eq!(bound.host_trust_revision, Some(5));
+        assert_eq!(bound.credential_candidates, candidates);
+        let serialized = serde_json::to_string(&bound).unwrap();
+        assert!(serialized.contains("workspace_default_fallback"));
+        assert!(!serialized.contains("private_key"));
+        assert!(!serialized.contains("known_hosts"));
+        // A concurrent Workspace-default rotation must not replace the fallback
+        // revision already bound to this operation.
+        let mut changed_candidates = candidates.clone();
+        changed_candidates[1].credential_revision = 8;
         assert!(
             store
                 .bind_workdir_create_repository_access(
@@ -436,10 +669,11 @@ mod tests {
                     "call-1",
                     &record.request_fingerprint,
                     "credential-1",
-                    4,
+                    3,
                     "trust-1",
                     5,
                     "read_only",
+                    &changed_candidates,
                     "2026-08-24T00:00:02Z",
                 )
                 .is_err()
@@ -475,6 +709,7 @@ mod tests {
             .unwrap();
         assert_eq!(retry.state, "pending");
         assert_eq!(retry.failure, None);
+        assert_eq!(retry.credential_candidates, candidates);
         assert_eq!(
             store
                 .load_workdir_create_operation("workspace", "call-1")

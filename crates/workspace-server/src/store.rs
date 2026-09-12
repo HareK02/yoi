@@ -18,7 +18,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 58;
+const LATEST_SCHEMA_VERSION: i64 = 59;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -32,6 +32,8 @@ const LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME: &str =
     "convert legacy Server-issued Runtime bindings to Workspace identity";
 const REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME: &str =
     "remove obsolete Workdir Repository cache generation";
+const WORKDIR_CREDENTIAL_CANDIDATE_SNAPSHOT_MIGRATION_NAME: &str =
+    "Workdir create credential candidate snapshots";
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -73,6 +75,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 58,
         name: REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME,
         apply: migrate_workdir_cache_generation_v57_to_v58,
+    },
+    Migration {
+        version: 59,
+        name: WORKDIR_CREDENTIAL_CANDIDATE_SNAPSHOT_MIGRATION_NAME,
+        apply: migrate_workdir_credential_candidate_snapshots_v58_to_v59,
     },
 ];
 
@@ -553,6 +560,39 @@ pub struct TicketWorkerAssignmentUpdate {
     pub previous: Option<TicketCoderAssignmentRecord>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkdirCreateCredentialCandidateRole {
+    Primary,
+    WorkspaceDefaultFallback,
+}
+
+impl WorkdirCreateCredentialCandidateRole {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::WorkspaceDefaultFallback => "workspace_default_fallback",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "primary" => Ok(Self::Primary),
+            "workspace_default_fallback" => Ok(Self::WorkspaceDefaultFallback),
+            other => Err(Error::Store(format!(
+                "invalid Workdir create credential candidate role `{other}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkdirCreateCredentialCandidate {
+    pub role: WorkdirCreateCredentialCandidateRole,
+    pub credential_id: String,
+    pub credential_revision: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkdirCreateOperationRecord {
     pub workspace_id: String,
@@ -573,6 +613,8 @@ pub struct WorkdirCreateOperationRecord {
     pub host_trust_id: Option<String>,
     pub host_trust_revision: Option<u64>,
     pub repository_access_mode: Option<String>,
+    #[serde(default)]
+    pub credential_candidates: Vec<WorkdirCreateCredentialCandidate>,
     pub working_directory_id: String,
     pub state: String,
     pub failure: Option<String>,
@@ -9504,6 +9546,56 @@ fn table_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>> {
         .map_err(Error::from)
 }
 
+fn migrate_workdir_credential_candidate_snapshots_v58_to_v59(conn: &Connection) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch(
+        r#"
+        CREATE TABLE workdir_create_credential_candidates (
+            workspace_id TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal < 2),
+            role TEXT NOT NULL CHECK (role IN ('primary', 'workspace_default_fallback')),
+            credential_id TEXT NOT NULL CHECK (length(credential_id) BETWEEN 1 AND 128),
+            credential_revision INTEGER NOT NULL CHECK (credential_revision > 0),
+            PRIMARY KEY (workspace_id, operation_id, ordinal),
+            UNIQUE (workspace_id, operation_id, role),
+            UNIQUE (workspace_id, operation_id, credential_id),
+            FOREIGN KEY (workspace_id, operation_id)
+                REFERENCES workdir_create_operations(workspace_id, operation_id)
+                ON DELETE CASCADE
+        );
+        CREATE INDEX idx_workdir_create_credential_candidates_revision
+            ON workdir_create_credential_candidates(
+                workspace_id, credential_id, credential_revision
+            );
+        CREATE TABLE workdir_create_credential_revision_retentions (
+            workspace_id TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            credential_id TEXT NOT NULL,
+            credential_revision INTEGER NOT NULL,
+            PRIMARY KEY (workspace_id, operation_id, ordinal),
+            FOREIGN KEY (workspace_id, operation_id, ordinal)
+                REFERENCES workdir_create_credential_candidates(
+                    workspace_id, operation_id, ordinal
+                )
+                ON DELETE CASCADE,
+            FOREIGN KEY (workspace_id, credential_id, credential_revision)
+                REFERENCES repository_ssh_credential_revisions(
+                    workspace_id, credential_id, revision
+                )
+                ON DELETE RESTRICT
+        );
+        "#,
+    )?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![59_i64, WORKDIR_CREDENTIAL_CANDIDATE_SNAPSHOT_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9572,6 +9664,8 @@ mod tests {
         create_latest_workspace_schema(&conn).unwrap();
         conn.execute_batch(
             r#"
+            DROP TABLE workdir_create_credential_revision_retentions;
+            DROP TABLE workdir_create_credential_candidates;
             DROP INDEX workspace_signing_identity_audit_workspace_idx;
             DROP TABLE workspace_signing_identity_audit;
             DROP TABLE workspace_signing_identity_provisioning_operations;
@@ -9713,6 +9807,10 @@ mod tests {
                     version: 58,
                     name: REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 59,
+                    name: WORKDIR_CREDENTIAL_CANDIDATE_SNAPSHOT_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -9750,6 +9848,10 @@ mod tests {
                         (
                             58,
                             REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME.to_string(),
+                        ),
+                        (
+                            59,
+                            WORKDIR_CREDENTIAL_CANDIDATE_SNAPSHOT_MIGRATION_NAME.to_string(),
                         ),
                     ]
                 );
@@ -9821,7 +9923,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![52, 53, 54, 55, 56, 57, 58]
+            vec![52, 53, 54, 55, 56, 57, 58, 59]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
@@ -9829,7 +9931,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 9);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 10);
     }
 
     #[test]
@@ -10614,6 +10716,33 @@ mod tests {
             !table_columns(&conn, "workdir_create_operations")
                 .unwrap()
                 .contains(&"cache_generation".to_string())
+        );
+    }
+
+    #[test]
+    fn schema_v59_adds_workdir_create_credential_candidate_snapshots() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        prepare_schema_v50(&path, Some("workspace-a"));
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 58)
+        {
+            (migration.apply)(&conn).unwrap();
+        }
+        migrate_workdir_credential_candidate_snapshots_v58_to_v59(&conn).unwrap();
+
+        assert_eq!(current_schema_version(&conn).unwrap(), 59);
+        assert!(table_exists(&conn, "workdir_create_credential_candidates").unwrap());
+        assert!(table_exists(&conn, "workdir_create_credential_revision_retentions").unwrap());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
         );
     }
 

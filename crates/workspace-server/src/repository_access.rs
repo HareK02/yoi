@@ -749,6 +749,20 @@ impl RepositorySecretService {
                     "credential `{credential_id}` revision changed"
                 )));
             }
+            let retained_by_workdir_create: bool = tx.query_row(
+                r#"SELECT EXISTS(
+                       SELECT 1
+                       FROM workdir_create_credential_revision_retentions
+                       WHERE workspace_id = ?1 AND credential_id = ?2
+                   )"#,
+                params![workspace_id, credential_id],
+                |row| row.get(0),
+            )?;
+            if retained_by_workdir_create {
+                return Err(Error::RepositoryConflict(format!(
+                    "credential `{credential_id}` is retained by a retryable Workdir create operation"
+                )));
+            }
             insert_audit(&tx, workspace_id, "credential_deleted", &credential_id, current.current_revision, actor_account_id, &now)?;
             let deleted = tx.execute(
                 "DELETE FROM repository_ssh_credentials WHERE workspace_id = ?1 AND credential_id = ?2 AND current_revision = ?3",
@@ -2403,6 +2417,114 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn retryable_workdir_create_retains_candidate_revision_until_success() {
+        let (_dir, store, service) = test_service();
+        let (private_key, _) = test_private_key(13);
+        service
+            .create_credential(
+                "workspace-a",
+                CreateRepositorySshCredentialRequest {
+                    operation_id: "create-retained".to_string(),
+                    credential_id: "retained-deploy".to_string(),
+                    name: "Retained deploy".to_string(),
+                    private_key,
+                    passphrase: None,
+                },
+                "owner-a",
+            )
+            .unwrap();
+        let operation = crate::store::WorkdirCreateOperationRecord {
+            workspace_id: "workspace-a".to_string(),
+            operation_id: "create-workdir-retained".to_string(),
+            request_fingerprint: "sha256:request".to_string(),
+            repository_id: "repo-a".to_string(),
+            selector: Some("develop".to_string()),
+            requested_runtime_id: Some("runtime-a".to_string()),
+            resolved_runtime_id: "runtime-a".to_string(),
+            config_revision: 1,
+            config_projection_digest: "sha256:projection".to_string(),
+            source_kind: Some("ssh".to_string()),
+            source_uri: Some("ssh://git@example.test/org/main.git".to_string()),
+            source_revision: Some(1),
+            source_fingerprint: Some("sha256:source".to_string()),
+            credential_id: None,
+            credential_revision: None,
+            host_trust_id: None,
+            host_trust_revision: None,
+            repository_access_mode: None,
+            credential_candidates: Vec::new(),
+            working_directory_id: "workdir-retained".to_string(),
+            state: "pending".to_string(),
+            failure: None,
+            created_at: "2026-08-24T00:00:00Z".to_string(),
+            updated_at: "2026-08-24T00:00:00Z".to_string(),
+        };
+        store.reserve_workdir_create_operation(&operation).unwrap();
+        let candidates = vec![crate::store::WorkdirCreateCredentialCandidate {
+            role: crate::store::WorkdirCreateCredentialCandidateRole::Primary,
+            credential_id: "retained-deploy".to_string(),
+            credential_revision: 1,
+        }];
+        store
+            .bind_workdir_create_repository_access(
+                "workspace-a",
+                "create-workdir-retained",
+                "sha256:request",
+                "retained-deploy",
+                1,
+                "host-a",
+                1,
+                "read_only",
+                &candidates,
+                "2026-08-24T00:00:01Z",
+            )
+            .unwrap();
+        let projection = RepositoryAccessProjection {
+            workspace_id: "workspace-a".to_string(),
+            config_revision: 1,
+            projection_digest: "sha256:empty".to_string(),
+            bindings: Vec::new(),
+        };
+
+        let retained = service
+            .delete_credential(
+                "workspace-a",
+                "retained-deploy",
+                DeleteRepositorySshCredentialRequest {
+                    operation_id: "delete-retained".to_string(),
+                    expected_revision: 1,
+                },
+                "owner-a",
+                &projection,
+            )
+            .unwrap_err();
+        assert!(matches!(retained, Error::RepositoryConflict(_)));
+
+        store
+            .finish_workdir_create_operation(
+                "workspace-a",
+                "create-workdir-retained",
+                "sha256:request",
+                true,
+                None,
+                "2026-08-24T00:00:02Z",
+            )
+            .unwrap();
+        service
+            .delete_credential(
+                "workspace-a",
+                "retained-deploy",
+                DeleteRepositorySshCredentialRequest {
+                    operation_id: "delete-released".to_string(),
+                    expected_revision: 1,
+                },
+                "owner-a",
+                &projection,
+            )
+            .unwrap();
     }
 
     #[test]
