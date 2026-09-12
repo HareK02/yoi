@@ -16,6 +16,7 @@ import type {
   RuntimeTrustKeyState,
   RuntimeTrustKeyStatus,
   RuntimeVerificationEvidenceSummary,
+  UpdateRemoteRuntimeRequest,
   WorkspaceRuntimeBindingState,
   WorkspaceRuntimeBindingSummary,
   WorkspaceRuntimeDetail,
@@ -917,6 +918,26 @@ export async function createRemoteRuntime(
     );
   }
   return runtime;
+}
+
+export async function updateRemoteRuntime(
+  workspaceId: string,
+  runtimeId: string,
+  request: UpdateRemoteRuntimeRequest,
+  fetchImpl: typeof fetch = fetch,
+): Promise<WorkspaceRuntimeDetail> {
+  const response = await fetchImpl(
+    workspaceApiPath(
+      workspaceId,
+      `/runtimes/${encodeURIComponent(runtimeId)}`,
+    ),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request),
+    },
+  );
+  return finishMutation(response, workspaceId, runtimeId);
 }
 
 export async function deleteRemoteRuntime(

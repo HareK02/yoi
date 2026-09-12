@@ -832,6 +832,14 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         expected_revision: Option<u64>,
         actor_account_id: &str,
     ) -> Result<(WorkspaceRuntimeBindingMutation, WorkspaceRuntimeBinding)>;
+    async fn update_workspace_runtime_binding_metadata(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        display_name: &str,
+        base_url: &str,
+        updated_at: &str,
+    ) -> Result<WorkspaceRuntimeBinding>;
     async fn revoke_workspace_runtime_binding_key(
         &self,
         workspace_id: &str,
@@ -2277,6 +2285,59 @@ impl SqliteWorkspaceStore {
         })
     }
 
+    pub fn update_workspace_runtime_binding_metadata(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        display_name: &str,
+        base_url: &str,
+        updated_at: &str,
+    ) -> Result<WorkspaceRuntimeBinding> {
+        validate_identifier("workspace_id", workspace_id)?;
+        validate_identifier("runtime_id", runtime_id)?;
+        validate_non_empty("runtime display_name", display_name)?;
+        validate_runtime_base_url(base_url)?;
+        validate_non_empty("updated_at", updated_at)?;
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let existing = tx
+                .query_row(
+                    r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
+                              public_key_fingerprint, binding_revision, state, authentication_mode,
+                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+                       FROM workspace_runtime_bindings
+                       WHERE workspace_id = ?1 AND runtime_id = ?2"#,
+                    params![workspace_id, runtime_id],
+                    read_workspace_runtime_binding,
+                )
+                .optional()?
+                .ok_or_else(|| Error::RuntimeBindingNotFound {
+                    runtime_id: runtime_id.to_string(),
+                })?;
+            if existing.display_name == display_name && existing.base_url == base_url {
+                tx.commit()?;
+                return Ok(existing);
+            }
+            tx.execute(
+                r#"UPDATE workspace_runtime_bindings
+                   SET display_name = ?3, base_url = ?4, updated_at = ?5
+                   WHERE workspace_id = ?1 AND runtime_id = ?2"#,
+                params![workspace_id, runtime_id, display_name, base_url, updated_at],
+            )?;
+            let updated = tx.query_row(
+                r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
+                          public_key_fingerprint, binding_revision, state, authentication_mode,
+                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+                   FROM workspace_runtime_bindings
+                   WHERE workspace_id = ?1 AND runtime_id = ?2"#,
+                params![workspace_id, runtime_id],
+                read_workspace_runtime_binding,
+            )?;
+            tx.commit()?;
+            Ok(updated)
+        })
+    }
+
     pub fn revoke_workspace_runtime_binding_key(
         &self,
         workspace_id: &str,
@@ -3502,6 +3563,24 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             record,
             expected_revision,
             actor_account_id,
+        )
+    }
+
+    async fn update_workspace_runtime_binding_metadata(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        display_name: &str,
+        base_url: &str,
+        updated_at: &str,
+    ) -> Result<WorkspaceRuntimeBinding> {
+        SqliteWorkspaceStore::update_workspace_runtime_binding_metadata(
+            self,
+            workspace_id,
+            runtime_id,
+            display_name,
+            base_url,
+            updated_at,
         )
     }
 

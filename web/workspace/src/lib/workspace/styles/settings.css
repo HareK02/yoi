@@ -445,6 +445,20 @@
     overflow-wrap: anywhere;
   }
 
+  .runtime-public-key-readonly {
+    display: grid;
+    gap: var(--space-1);
+    max-width: 56rem;
+  }
+
+  .runtime-public-key-readonly p {
+    color: var(--text-muted);
+  }
+
+  .runtime-public-key-readonly code {
+    overflow-wrap: anywhere;
+  }
+
   .runtime-trust-form {
     display: grid;
     gap: var(--space-2);

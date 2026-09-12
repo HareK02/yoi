@@ -93,9 +93,9 @@ use workspace_api::{
     RuntimeManagementSummary, RuntimeTrustAuditAction, RuntimeTrustAuditEntry,
     RuntimeTrustConflictKind, RuntimeTrustConflictResponse, RuntimeTrustKeyRevealResponse,
     RuntimeTrustKeyState, RuntimeTrustKeyStatus, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
-    TICKET_RELATIONS_QUERY_PATH, UpdateWorkspaceMetadataRequest, WhoamiResponse,
-    WorkerLaunchOptionsResponse, WorkerLaunchProfileCandidate, WorkerLaunchRuntimeOption,
-    WorkerLaunchWorkerSummary,
+    TICKET_RELATIONS_QUERY_PATH, UpdateRemoteRuntimeRequest, UpdateWorkspaceMetadataRequest,
+    WhoamiResponse, WorkerLaunchOptionsResponse, WorkerLaunchProfileCandidate,
+    WorkerLaunchRuntimeOption, WorkerLaunchWorkerSummary,
     WorkingDirectoryCreateRequest as BrowserWorkingDirectoryCreateRequest,
     WorkingDirectoryCreateResponse as BrowserWorkingDirectoryCreateResponse,
     WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
@@ -3420,7 +3420,9 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         )
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}",
-            get(scoped_get_runtime_detail).delete(scoped_delete_remote_runtime),
+            get(scoped_get_runtime_detail)
+                .post(scoped_update_remote_runtime)
+                .delete(scoped_delete_remote_runtime),
         )
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/trust-key",
@@ -12075,6 +12077,60 @@ async fn scoped_get_runtime_detail(
     ))
 }
 
+async fn scoped_update_remote_runtime(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimePath>,
+    Extension(actor): Extension<RequestActor>,
+    Json(request): Json<UpdateRemoteRuntimeRequest>,
+) -> ApiResult<Json<WorkspaceRuntimeDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    require_workspace_owner(
+        &api,
+        &path.workspace_id,
+        &actor,
+        "manage Workspace Runtimes",
+    )
+    .await?;
+    if path.runtime_id == EMBEDDED_WORKER_RUNTIME_ID {
+        return Err(settings_bad_request(
+            "embedded_runtime_not_config_managed",
+            "the embedded Runtime is built in and cannot be edited",
+        ));
+    }
+    let endpoint =
+        validate_runtime_metadata(request.display_name.as_deref(), &request.endpoint).await?;
+    let display_name = request
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&path.runtime_id);
+    let binding = api
+        .store
+        .update_workspace_runtime_binding_metadata(
+            &path.workspace_id,
+            &path.runtime_id,
+            display_name,
+            endpoint.as_str().trim_end_matches('/'),
+            &Utc::now().to_rfc3339(),
+        )
+        .await?;
+    let activate_runtime = binding.state == StoredRuntimeBindingState::Verified;
+    api.runtime_binding_expectations
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            (path.workspace_id.clone(), path.runtime_id.clone()),
+            binding.clone(),
+        );
+    api.runtime_subscription_broker
+        .unregister_runtime(&path.runtime_id);
+    api.register_workspace_runtime_binding(binding, activate_runtime)?;
+    Ok(Json(
+        workspace_runtime_detail(&api, &path.workspace_id, &path.runtime_id).await?,
+    ))
+}
+
 async fn scoped_reveal_runtime_trust_key(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
@@ -16593,7 +16649,11 @@ async fn validate_runtime_connection_request(
             "Runtime public bundle must contain a public key",
         ));
     }
-    let endpoint = Url::parse(request.endpoint.trim()).map_err(|_| {
+    validate_runtime_metadata(request.display_name.as_deref(), &request.endpoint).await
+}
+
+async fn validate_runtime_metadata(display_name: Option<&str>, endpoint: &str) -> ApiResult<Url> {
+    let endpoint = Url::parse(endpoint.trim()).map_err(|_| {
         settings_bad_request(
             "invalid_remote_runtime_endpoint",
             "endpoint must be an absolute HTTP or HTTPS URL",
@@ -16656,11 +16716,7 @@ async fn validate_runtime_connection_request(
             ));
         }
     }
-    if request
-        .display_name
-        .as_deref()
-        .is_some_and(|value| value.is_empty() || value.chars().any(char::is_control))
-    {
+    if display_name.is_some_and(|value| value.is_empty() || value.chars().any(char::is_control)) {
         return Err(settings_bad_request(
             "invalid_remote_runtime_display_name",
             "display_name must be non-empty when supplied and cannot contain control characters",
@@ -20867,6 +20923,124 @@ mod tests {
                 )),
             "restored Runtime must retain its revision-fenced binding expectation"
         );
+    }
+
+    #[tokio::test]
+    async fn verified_remote_runtime_metadata_update_preserves_public_key_and_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let actor = test_owner_actor();
+        let workspace_identity = api
+            .signing_identities
+            .provision_existing(&api.config.workspace_id, &actor.account_id)
+            .unwrap();
+        let runtime_identity = RuntimeIdentityMaterial::generate("verified-runtime").unwrap();
+        api.store
+            .upsert_workspace_runtime_binding_record(
+                WorkspaceRuntimeBinding {
+                    workspace_id: api.config.workspace_id.clone(),
+                    runtime_id: "verified-runtime".to_string(),
+                    display_name: "Old label".to_string(),
+                    base_url: "https://8.8.8.8".to_string(),
+                    public_key: runtime_identity.public_key.clone(),
+                    public_key_fingerprint: String::new(),
+                    binding_revision: 1,
+                    state: StoredRuntimeBindingState::Configured,
+                    authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
+                    workspace_key_id: Some(workspace_identity.key_id.clone()),
+                    workspace_key_generation: Some(workspace_identity.revision),
+                    created_at: "1".to_string(),
+                    updated_at: "1".to_string(),
+                    revoked_at: None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let configured = api
+            .store
+            .get_workspace_runtime_binding(&api.config.workspace_id, "verified-runtime")
+            .await
+            .unwrap()
+            .unwrap();
+        let evidence = crate::store::WorkspaceRuntimeVerificationEvidence {
+            workspace_id: configured.workspace_id.clone(),
+            runtime_id: configured.runtime_id.clone(),
+            binding_revision: configured.binding_revision,
+            workspace_key_id: workspace_identity.key_id,
+            workspace_identity_revision: workspace_identity.revision,
+            workspace_trust_generation: workspace_identity.revision,
+            runtime_public_key_fingerprint: configured.public_key_fingerprint.clone(),
+            runtime_identity_revision: 1,
+            challenge_id: "verified-metadata-update".to_string(),
+            state: "verified".to_string(),
+            last_outcome: "verified".to_string(),
+            verified_at: Some("2".to_string()),
+            checked_at: "2".to_string(),
+        };
+        api.store
+            .record_workspace_runtime_verification_attempt(&evidence)
+            .await
+            .unwrap();
+        api.store
+            .complete_workspace_runtime_verification(&evidence)
+            .await
+            .unwrap();
+
+        let Json(updated) = scoped_update_remote_runtime(
+            State(api.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id: api.config.workspace_id.clone(),
+                runtime_id: "verified-runtime".to_string(),
+            }),
+            Extension(actor.clone()),
+            Json(UpdateRemoteRuntimeRequest {
+                display_name: Some("New label".to_string()),
+                endpoint: "https://8.8.4.4".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(updated.runtime.runtime.label, "New label");
+        assert_eq!(updated.endpoint.as_deref(), Some("https://8.8.4.4"));
+        let binding = updated.runtime.management.binding.unwrap();
+        assert_eq!(binding.state, WorkspaceRuntimeBindingState::Verified);
+        assert_eq!(binding.revision, 1);
+        assert_eq!(binding.verification.unwrap().binding_revision, 1);
+        assert_eq!(
+            updated.trust_key.fingerprint.as_deref(),
+            Some(configured.public_key_fingerprint.as_str())
+        );
+        let stored = api
+            .store
+            .get_workspace_runtime_binding(&api.config.workspace_id, "verified-runtime")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.public_key, runtime_identity.public_key);
+        assert_eq!(
+            stored.public_key_fingerprint,
+            configured.public_key_fingerprint
+        );
+
+        let replacement = RuntimeIdentityMaterial::generate("verified-runtime").unwrap();
+        let error = create_remote_runtime(
+            State(api),
+            Extension(actor),
+            Json(CreateRemoteRuntimeRequest {
+                public_bundle: workspace_api::RuntimePublicIdentityBundle {
+                    identity_id: "verified-runtime".to_string(),
+                    public_key: replacement.public_key,
+                },
+                display_name: Some("New label".to_string()),
+                endpoint: "https://8.8.4.4".to_string(),
+                expected_revision: Some(1),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@ import {
   revokeRuntimeTrustKey,
   RuntimeTrustConflictError,
   RuntimeTrustRouteFence,
+  updateRemoteRuntime,
 } from "../src/lib/workspace/api/runtime-management.ts";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -271,6 +272,45 @@ Deno.test("mismatched revoke fingerprint never sends a request", async () => {
   }
   assert(rejected, "mismatched fingerprint should be rejected locally");
   assert(requests === 0, "mismatched fingerprint sent a revoke request");
+});
+
+Deno.test("Runtime metadata update never sends public key authority", async () => {
+  let requestedUrl = "";
+  let requestedMethod = "";
+  let requestedBody: unknown = null;
+  const fetchImpl = ((input: string | URL | Request, init?: RequestInit) => {
+    requestedUrl = String(input);
+    requestedMethod = init?.method ?? "GET";
+    requestedBody = JSON.parse(String(init?.body));
+    return Promise.resolve(Response.json(detail()));
+  }) as typeof fetch;
+
+  await updateRemoteRuntime(
+    "workspace-a",
+    "arcadia",
+    {
+      display_name: "Updated Runtime",
+      endpoint: "https://runtime.example.test/v2",
+    },
+    fetchImpl,
+  );
+
+  assert(
+    requestedUrl === "/api/w/workspace-a/runtimes/arcadia",
+    `unexpected update URL: ${requestedUrl}`,
+  );
+  assert(requestedMethod === "POST", "Runtime update must use POST");
+  assert(
+    JSON.stringify(requestedBody) ===
+      JSON.stringify({
+        display_name: "Updated Runtime",
+        endpoint: "https://runtime.example.test/v2",
+      }),
+    `unexpected update body: ${JSON.stringify(requestedBody)}`,
+  );
+  const body = requestedBody as Record<string, unknown>;
+  assert(!("public_bundle" in body), "metadata update sent public_bundle");
+  assert(!("public_key" in body), "metadata update sent public_key");
 });
 
 Deno.test("Runtime registration delete uses the Workspace-scoped resource route", async () => {
