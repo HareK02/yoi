@@ -11352,7 +11352,9 @@ fn execute_reserved_workdir_removal_with_provider(
     recovery: bool,
     provider: &dyn WorkdirRemovalRuntimeProvider,
 ) -> Result<WorkdirRemovalOperation> {
-    if operation.state == WorkdirRemovalOperationState::Completed {
+    if operation.state == WorkdirRemovalOperationState::Completed
+        && operation.disposition == Some(WorkdirRemovalDisposition::Removed)
+    {
         return Ok(operation);
     }
     let operation = if recovery && operation.state == WorkdirRemovalOperationState::Pending {
@@ -26667,6 +26669,7 @@ mod tests {
         assert_eq!(unknown_provider.cleanup_calls(), 0);
 
         let (dirty_operation, mut dirty_summary) = reserve_removal_fixture(&api, "provider-dirty");
+        let clean_retry_summary = dirty_summary.clone();
         dirty_summary.cleanliness = Some("dirty".to_string());
         let dirty_provider = FakeWorkdirRemovalProvider::new(
             workdir_removal_result(
@@ -26685,6 +26688,28 @@ mod tests {
         .unwrap();
         assert_eq!(dirty.disposition, Some(WorkdirRemovalDisposition::Retained));
         assert_eq!(dirty_provider.cleanup_calls(), 0);
+
+        let clean_retry_provider = FakeWorkdirRemovalProvider::new(
+            workdir_removal_result(
+                WorkerOperationState::Accepted,
+                Some(clean_retry_summary),
+                Vec::new(),
+            ),
+            workdir_removal_result(WorkerOperationState::Accepted, None, Vec::new()),
+        );
+        let removed_after_retry = execute_reserved_workdir_removal_with_provider(
+            &api,
+            dirty,
+            false,
+            &clean_retry_provider,
+        )
+        .unwrap();
+        assert_eq!(
+            removed_after_retry.disposition,
+            Some(WorkdirRemovalDisposition::Removed)
+        );
+        assert_eq!(removed_after_retry.attempt_count, 2);
+        assert_eq!(clean_retry_provider.cleanup_calls(), 1);
 
         let (corrupted_operation, mut corrupted_summary) =
             reserve_removal_fixture(&api, "provider-corrupted");

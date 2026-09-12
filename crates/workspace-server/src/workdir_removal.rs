@@ -264,7 +264,9 @@ impl SqliteWorkspaceStore {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let operation =
                 require_operation(&tx, workspace_id, operation_id, request_fingerprint)?;
-            if operation.state == WorkdirRemovalOperationState::Completed {
+            if operation.state == WorkdirRemovalOperationState::Completed
+                && operation.disposition == Some(WorkdirRemovalDisposition::Removed)
+            {
                 tx.commit()?;
                 return Ok(operation);
             }
@@ -1197,5 +1199,19 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+
+        let retry = store
+            .begin_workdir_removal_attempt(
+                &retained.workspace_id,
+                &retained.operation_id,
+                &retained.request_fingerprint,
+                attempt_owner(),
+            )
+            .unwrap();
+        assert_eq!(retry.state, WorkdirRemovalOperationState::Pending);
+        assert_eq!(retry.attempt_count, 1);
+        assert_eq!(retry.disposition, None);
+        assert_eq!(retry.failure_category, None);
+        assert!(retry.retryable);
     }
 }
