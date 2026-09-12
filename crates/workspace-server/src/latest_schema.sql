@@ -1107,6 +1107,150 @@ BEGIN
     SELECT RAISE(ABORT, 'runtime_removal_in_progress');
 END;
 
+CREATE TRIGGER worker_registry_insert_blocked_by_runtime_removal
+BEFORE INSERT ON worker_registry FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM runtime_removal_operations operation
+    WHERE operation.runtime_id = NEW.runtime_id
+      AND operation.state IN ('pending', 'cleanup_pending')
+)
+BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+CREATE TRIGGER worker_registry_update_blocked_by_runtime_removal
+BEFORE UPDATE ON worker_registry FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM runtime_removal_operations operation
+    WHERE operation.runtime_id = NEW.runtime_id
+      AND operation.state IN ('pending', 'cleanup_pending')
+)
+BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+CREATE TRIGGER workdir_registry_insert_blocked_by_runtime_removal
+BEFORE INSERT ON workdir_registry FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM runtime_removal_operations operation
+    WHERE operation.runtime_id = NEW.runtime_id
+      AND operation.state IN ('pending', 'cleanup_pending')
+)
+BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+CREATE TRIGGER workdir_registry_update_blocked_by_runtime_removal
+BEFORE UPDATE ON workdir_registry FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM runtime_removal_operations operation
+    WHERE operation.runtime_id = NEW.runtime_id
+      AND operation.state IN ('pending', 'cleanup_pending')
+)
+BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+CREATE TRIGGER worker_assignment_insert_blocked_by_runtime_removal
+BEFORE INSERT ON ticket_current_worker_assignments FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM runtime_removal_operations operation
+    WHERE operation.runtime_id = NEW.runtime_id
+      AND operation.state IN ('pending', 'cleanup_pending')
+)
+BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+CREATE TRIGGER worker_assignment_update_blocked_by_runtime_removal
+BEFORE UPDATE ON ticket_current_worker_assignments FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM runtime_removal_operations operation
+    WHERE operation.runtime_id = NEW.runtime_id
+      AND operation.state IN ('pending', 'cleanup_pending')
+)
+BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+CREATE TRIGGER workdir_attachment_insert_blocked_by_runtime_removal
+BEFORE INSERT ON worker_workdir_links FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM runtime_removal_operations operation
+    WHERE operation.runtime_id = NEW.runtime_id
+      AND operation.state IN ('pending', 'cleanup_pending')
+)
+BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+CREATE TRIGGER workdir_attachment_update_blocked_by_runtime_removal
+BEFORE UPDATE ON worker_workdir_links FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM runtime_removal_operations operation
+    WHERE operation.runtime_id = NEW.runtime_id
+      AND operation.state IN ('pending', 'cleanup_pending')
+)
+BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+CREATE TRIGGER worker_create_insert_blocked_by_runtime_removal
+BEFORE INSERT ON worker_create_reservations FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM runtime_removal_operations operation
+    WHERE operation.runtime_id = NEW.runtime_id
+      AND operation.state IN ('pending', 'cleanup_pending')
+)
+BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+CREATE TRIGGER worker_create_update_blocked_by_runtime_removal
+BEFORE UPDATE ON worker_create_reservations FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM runtime_removal_operations operation
+    WHERE operation.runtime_id = NEW.runtime_id
+      AND operation.state IN ('pending', 'cleanup_pending')
+)
+BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+CREATE TRIGGER workdir_create_insert_blocked_by_runtime_removal
+BEFORE INSERT ON workdir_create_operations FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM runtime_removal_operations operation
+    WHERE operation.runtime_id = NEW.resolved_runtime_id
+      AND operation.state IN ('pending', 'cleanup_pending')
+)
+BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+CREATE TRIGGER workdir_create_update_blocked_by_runtime_removal
+BEFORE UPDATE ON workdir_create_operations FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM runtime_removal_operations operation
+    WHERE operation.runtime_id = NEW.resolved_runtime_id
+      AND operation.state IN ('pending', 'cleanup_pending')
+)
+BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+CREATE TRIGGER worker_removal_insert_blocked_by_runtime_removal
+BEFORE INSERT ON worker_removal_operations FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM runtime_removal_operations operation
+    WHERE operation.runtime_id = NEW.runtime_id
+      AND operation.state IN ('pending', 'cleanup_pending')
+)
+BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+CREATE TRIGGER worker_removal_update_blocked_by_runtime_removal
+BEFORE UPDATE ON worker_removal_operations FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM runtime_removal_operations operation
+    WHERE operation.runtime_id = NEW.runtime_id
+      AND operation.state IN ('pending', 'cleanup_pending')
+)
+BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+CREATE TRIGGER workdir_removal_insert_blocked_by_runtime_removal
+BEFORE INSERT ON workdir_removal_operations FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM runtime_removal_operations operation
+    WHERE operation.runtime_id = NEW.runtime_id
+      AND operation.state IN ('pending', 'cleanup_pending')
+)
+BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+CREATE TRIGGER workdir_removal_update_blocked_by_runtime_removal
+BEFORE UPDATE ON workdir_removal_operations FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM runtime_removal_operations operation
+    WHERE operation.runtime_id = NEW.runtime_id
+      AND operation.state IN ('pending', 'cleanup_pending')
+)
+BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
 CREATE TABLE workspace_deletion_operations (
     operation_id TEXT PRIMARY KEY,
     request_fingerprint TEXT NOT NULL,

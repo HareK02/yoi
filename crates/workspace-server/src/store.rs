@@ -9587,7 +9587,8 @@ fn verify_canonical_workspace_runtime_binding(binding: WorkspaceRuntimeBinding) 
 }
 
 fn migrate_runtime_removal_operations_v59_to_v60(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch(
         r#"CREATE TABLE runtime_removal_operations (
              operation_id TEXT PRIMARY KEY,
              workspace_id TEXT NOT NULL,
@@ -9632,13 +9633,82 @@ fn migrate_runtime_removal_operations_v59_to_v60(conn: &Connection) -> Result<()
              SELECT RAISE(ABORT, 'runtime_removal_in_progress');
          END;"#,
     )?;
-    conn.execute(
+    tx.execute_batch(
+        r#"
+        CREATE TRIGGER worker_registry_insert_blocked_by_runtime_removal
+        BEFORE INSERT ON worker_registry FOR EACH ROW
+        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
+        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+        CREATE TRIGGER worker_registry_update_blocked_by_runtime_removal
+        BEFORE UPDATE ON worker_registry FOR EACH ROW
+        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
+        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+        CREATE TRIGGER workdir_registry_insert_blocked_by_runtime_removal
+        BEFORE INSERT ON workdir_registry FOR EACH ROW
+        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
+        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+        CREATE TRIGGER workdir_registry_update_blocked_by_runtime_removal
+        BEFORE UPDATE ON workdir_registry FOR EACH ROW
+        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
+        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+        CREATE TRIGGER worker_assignment_insert_blocked_by_runtime_removal
+        BEFORE INSERT ON ticket_current_worker_assignments FOR EACH ROW
+        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
+        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+        CREATE TRIGGER worker_assignment_update_blocked_by_runtime_removal
+        BEFORE UPDATE ON ticket_current_worker_assignments FOR EACH ROW
+        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
+        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+        CREATE TRIGGER workdir_attachment_insert_blocked_by_runtime_removal
+        BEFORE INSERT ON worker_workdir_links FOR EACH ROW
+        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
+        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+        CREATE TRIGGER workdir_attachment_update_blocked_by_runtime_removal
+        BEFORE UPDATE ON worker_workdir_links FOR EACH ROW
+        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
+        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+        CREATE TRIGGER worker_create_insert_blocked_by_runtime_removal
+        BEFORE INSERT ON worker_create_reservations FOR EACH ROW
+        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
+        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+        CREATE TRIGGER worker_create_update_blocked_by_runtime_removal
+        BEFORE UPDATE ON worker_create_reservations FOR EACH ROW
+        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
+        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+        CREATE TRIGGER workdir_create_insert_blocked_by_runtime_removal
+        BEFORE INSERT ON workdir_create_operations FOR EACH ROW
+        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.resolved_runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
+        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+        CREATE TRIGGER workdir_create_update_blocked_by_runtime_removal
+        BEFORE UPDATE ON workdir_create_operations FOR EACH ROW
+        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.resolved_runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
+        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+        CREATE TRIGGER worker_removal_insert_blocked_by_runtime_removal
+        BEFORE INSERT ON worker_removal_operations FOR EACH ROW
+        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
+        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+        CREATE TRIGGER worker_removal_update_blocked_by_runtime_removal
+        BEFORE UPDATE ON worker_removal_operations FOR EACH ROW
+        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
+        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+        CREATE TRIGGER workdir_removal_insert_blocked_by_runtime_removal
+        BEFORE INSERT ON workdir_removal_operations FOR EACH ROW
+        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
+        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+        CREATE TRIGGER workdir_removal_update_blocked_by_runtime_removal
+        BEFORE UPDATE ON workdir_removal_operations FOR EACH ROW
+        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
+        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+        "#,
+    )?;
+    tx.execute(
         "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
         params![
             LATEST_SCHEMA_VERSION,
             RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME
         ],
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -10438,7 +10508,7 @@ mod tests {
 
     #[test]
     fn runtime_removal_rejects_shared_binding_and_fences_new_binding_until_cleanup() {
-        let (_temp, store) = runtime_removal_test_store();
+        let (temp, store) = runtime_removal_test_store();
         store
             .with_conn(|conn| {
                 conn.execute_batch(
@@ -10500,26 +10570,50 @@ mod tests {
                 1,
             )
             .unwrap();
-        let blocked_insert = store.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO workspace_runtime_bindings(\
-                     workspace_id, runtime_id, display_name, base_url, public_key, \
-                     public_key_fingerprint, binding_revision, state, authentication_mode, \
-                     created_at, updated_at\
-                 ) VALUES (\
-                     'workspace-b', 'runtime-a', 'Runtime A', 'https://runtime.invalid', \
-                     'key-a', 'fingerprint-b', 1, 'verified', 'legacy_server_issuer', '1', '1'\
-                 )",
-                [],
-            )?;
-            Ok(())
-        });
+        let competing_conn = Connection::open(temp.path().join("server.db")).unwrap();
+        competing_conn
+            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")
+            .unwrap();
+        let blocked_insert = competing_conn.execute(
+            "INSERT INTO workspace_runtime_bindings(\
+                 workspace_id, runtime_id, display_name, base_url, public_key, \
+                 public_key_fingerprint, binding_revision, state, authentication_mode, \
+                 created_at, updated_at\
+             ) VALUES (\
+                 'workspace-b', 'runtime-a', 'Runtime A', 'https://runtime.invalid', \
+                 'key-a', 'fingerprint-b', 1, 'verified', 'legacy_server_issuer', '1', '1'\
+             )",
+            [],
+        );
         assert!(
             blocked_insert
                 .unwrap_err()
                 .to_string()
                 .contains("runtime_removal_in_progress")
         );
+
+        for competing_mutation in [
+            "INSERT INTO worker_registry(\
+                 workspace_id, worker_id, runtime_id, display_name, retention_state, created_at, updated_at\
+             ) VALUES ('workspace-a', 'racing-worker', 'runtime-a', 'Racing Worker', 'normal', '2', '2')",
+            "INSERT INTO worker_create_reservations(\
+                 workspace_id, allocation_key, worker_id, runtime_id, create_fingerprint, state, created_at, updated_at\
+             ) VALUES ('workspace-a', 'racing-allocation', 'racing-worker', 'runtime-a', 'racing-create', 'reserved', '2', '2')",
+            "INSERT INTO workdir_create_operations(\
+                 workspace_id, operation_id, request_fingerprint, repository_id, resolved_runtime_id, \
+                 config_revision, config_projection_digest, working_directory_id, state, created_at, updated_at\
+             ) VALUES (\
+                 'workspace-a', 'racing-workdir-create', 'racing-request', 'repository-a', 'runtime-a', \
+                 1, 'racing-projection', 'racing-workdir', 'pending', '2', '2'\
+             )",
+        ] {
+            let error = competing_conn.execute(competing_mutation, []).unwrap_err();
+            assert!(
+                error.to_string().contains("runtime_removal_in_progress"),
+                "competing Runtime resource mutation was not fenced: {error}"
+            );
+        }
+        assert_runtime_removal_binding_unchanged(&store);
     }
 
     #[test]
@@ -10602,6 +10696,22 @@ mod tests {
                 conn.execute_batch(
                     "DROP TRIGGER runtime_binding_insert_blocked_by_removal; \
                      DROP TRIGGER runtime_binding_update_blocked_by_removal; \
+                     DROP TRIGGER worker_registry_insert_blocked_by_runtime_removal; \
+                     DROP TRIGGER worker_registry_update_blocked_by_runtime_removal; \
+                     DROP TRIGGER workdir_registry_insert_blocked_by_runtime_removal; \
+                     DROP TRIGGER workdir_registry_update_blocked_by_runtime_removal; \
+                     DROP TRIGGER worker_assignment_insert_blocked_by_runtime_removal; \
+                     DROP TRIGGER worker_assignment_update_blocked_by_runtime_removal; \
+                     DROP TRIGGER workdir_attachment_insert_blocked_by_runtime_removal; \
+                     DROP TRIGGER workdir_attachment_update_blocked_by_runtime_removal; \
+                     DROP TRIGGER worker_create_insert_blocked_by_runtime_removal; \
+                     DROP TRIGGER worker_create_update_blocked_by_runtime_removal; \
+                     DROP TRIGGER workdir_create_insert_blocked_by_runtime_removal; \
+                     DROP TRIGGER workdir_create_update_blocked_by_runtime_removal; \
+                     DROP TRIGGER worker_removal_insert_blocked_by_runtime_removal; \
+                     DROP TRIGGER worker_removal_update_blocked_by_runtime_removal; \
+                     DROP TRIGGER workdir_removal_insert_blocked_by_runtime_removal; \
+                     DROP TRIGGER workdir_removal_update_blocked_by_runtime_removal; \
                      DROP TABLE runtime_removal_operations; \
                      DELETE FROM __yoi_schema_migrations; \
                      INSERT INTO __yoi_schema_migrations(version, name) \
@@ -10623,7 +10733,10 @@ mod tests {
                 )?;
                 let trigger_count: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM sqlite_master \
-                     WHERE type = 'trigger' AND name LIKE 'runtime_binding_%_blocked_by_removal'",
+                     WHERE type = 'trigger' AND (\
+                         name LIKE '%_blocked_by_runtime_removal' OR \
+                         name LIKE 'runtime_binding_%_blocked_by_removal'\
+                     )",
                     [],
                     |row| row.get(0),
                 )?;
@@ -10632,8 +10745,53 @@ mod tests {
                         row.get(0)
                     })?;
                 assert_eq!(table_count, 1);
-                assert_eq!(trigger_count, 2);
+                assert_eq!(trigger_count, 18);
                 assert_eq!(foreign_key_failures, 0);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn schema_v59_runtime_removal_migration_rolls_back_partial_ddl_and_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteWorkspaceStore::open(temp.path().join("server.db")).unwrap();
+        store
+            .with_conn(|conn| {
+                let trigger_names = {
+                    let mut stmt = conn.prepare(
+                        "SELECT name FROM sqlite_master \
+                         WHERE type = 'trigger' AND sql LIKE '%runtime_removal_operations%'",
+                    )?;
+                    stmt.query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                for trigger_name in trigger_names {
+                    conn.execute_batch(&format!("DROP TRIGGER \"{trigger_name}\";"))?;
+                }
+                conn.execute_batch(
+                    "DROP TABLE runtime_removal_operations; \
+                     DELETE FROM __yoi_schema_migrations WHERE version = 60; \
+                     CREATE INDEX runtime_removal_operations_one_active_runtime \
+                     ON workspace_runtime_bindings(runtime_id);",
+                )?;
+
+                let migration_error = migrate_runtime_removal_operations_v59_to_v60(conn)
+                    .expect_err("injected index-name collision must fail migration");
+                assert!(migration_error.to_string().contains("already exists"));
+                let table_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'runtime_removal_operations'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let marker_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM __yoi_schema_migrations WHERE version = 60",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(table_count, 0, "partial Runtime removal DDL leaked");
+                assert_eq!(marker_count, 0, "failed migration advanced schema marker");
                 Ok(())
             })
             .unwrap();
@@ -10707,6 +10865,22 @@ mod tests {
             DROP TABLE workdir_create_credential_candidates;
             DROP TRIGGER runtime_binding_insert_blocked_by_removal;
             DROP TRIGGER runtime_binding_update_blocked_by_removal;
+            DROP TRIGGER worker_registry_insert_blocked_by_runtime_removal;
+            DROP TRIGGER worker_registry_update_blocked_by_runtime_removal;
+            DROP TRIGGER workdir_registry_insert_blocked_by_runtime_removal;
+            DROP TRIGGER workdir_registry_update_blocked_by_runtime_removal;
+            DROP TRIGGER worker_assignment_insert_blocked_by_runtime_removal;
+            DROP TRIGGER worker_assignment_update_blocked_by_runtime_removal;
+            DROP TRIGGER workdir_attachment_insert_blocked_by_runtime_removal;
+            DROP TRIGGER workdir_attachment_update_blocked_by_runtime_removal;
+            DROP TRIGGER worker_create_insert_blocked_by_runtime_removal;
+            DROP TRIGGER worker_create_update_blocked_by_runtime_removal;
+            DROP TRIGGER workdir_create_insert_blocked_by_runtime_removal;
+            DROP TRIGGER workdir_create_update_blocked_by_runtime_removal;
+            DROP TRIGGER worker_removal_insert_blocked_by_runtime_removal;
+            DROP TRIGGER worker_removal_update_blocked_by_runtime_removal;
+            DROP TRIGGER workdir_removal_insert_blocked_by_runtime_removal;
+            DROP TRIGGER workdir_removal_update_blocked_by_runtime_removal;
             DROP TABLE runtime_removal_operations;
             DROP INDEX workspace_signing_identity_audit_workspace_idx;
             DROP TABLE workspace_signing_identity_audit;

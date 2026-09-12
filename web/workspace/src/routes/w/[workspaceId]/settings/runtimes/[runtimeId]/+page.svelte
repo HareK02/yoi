@@ -13,6 +13,7 @@
     updateRemoteRuntime,
     RuntimeTrustConflictError,
     RuntimeTrustRouteFence,
+    RuntimeRemovalAttempt,
     RuntimeTrustRequestError,
     type RuntimeTrustRouteOperation,
   } from '$lib/workspace/api/runtime-management';
@@ -37,6 +38,7 @@
   let replacementFingerprintError = $state<string | null>(null);
   let fingerprintGeneration = 0;
   const routeFence = new RuntimeTrustRouteFence();
+  const runtimeRemovalAttempt = new RuntimeRemovalAttempt();
   let routeGeneration = 0;
 
   $effect(() => {
@@ -51,6 +53,7 @@
     endpoint = data.runtimeDetail?.endpoint ?? '';
     editingMetadata = false;
     deleteRuntimeConfirmation = '';
+    runtimeRemovalAttempt.reset();
     busyAction = null;
     fieldError = null;
     deleteRuntimeError = null;
@@ -290,6 +293,7 @@
       deleteRuntimeError = 'The authoritative Runtime binding revision is unavailable. Reload before removal.';
       return;
     }
+    const operationId = runtimeRemovalAttempt.operationId();
     busyAction = 'delete';
     deleteRuntimeError = null;
     try {
@@ -297,11 +301,12 @@
         data.workspaceId,
         routeOperation.runtimeId,
         {
-          operation_id: crypto.randomUUID(),
+          operation_id: operationId,
           expected_binding_revision: trust.revision,
         },
       );
       if (!isCurrentRoute(routeOperation)) return;
+      runtimeRemovalAttempt.complete(operationId);
       await goto(`/w/${encodeURIComponent(data.workspaceId)}/settings/runtimes`, {
         replaceState: true,
       });

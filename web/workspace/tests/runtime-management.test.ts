@@ -12,6 +12,7 @@ import {
   previewRuntimePublicKeyFingerprint,
   removeRemoteRuntime,
   revokeRuntimeTrustKey,
+  RuntimeRemovalAttempt,
   RuntimeTrustConflictError,
   RuntimeTrustRouteFence,
   updateRemoteRuntime,
@@ -312,6 +313,58 @@ Deno.test("Runtime metadata update never sends public key authority", async () =
   const body = requestedBody as Record<string, unknown>;
   assert(!("public_bundle" in body), "metadata update sent public_bundle");
   assert(!("public_key" in body), "metadata update sent public_key");
+});
+
+Deno.test("Runtime removal attempt retains its id across response-loss retry", async () => {
+  const attempt = new RuntimeRemovalAttempt();
+  const operationIds: string[] = [];
+  let calls = 0;
+  const submit = async () => {
+    const operationId = attempt.operationId(() => "stable-removal-operation");
+    operationIds.push(operationId);
+    const operation = await removeRemoteRuntime(
+      "workspace-a",
+      "runtime-a",
+      { operation_id: operationId, expected_binding_revision: 4 },
+      () => {
+        calls += 1;
+        if (calls === 1) return Promise.reject(new Error("response lost"));
+        return Promise.resolve(Response.json({
+          operation_id: operationId,
+          workspace_id: "workspace-a",
+          runtime_id: "runtime-a",
+          state: "succeeded",
+          binding_removed: true,
+          runtime_registration_removed: true,
+          created_at: "2026-01-01T00:00:00Z",
+          updated_at: "2026-01-01T00:00:01Z",
+          completed_at: "2026-01-01T00:00:01Z",
+        }));
+      },
+    );
+    attempt.complete(operation.operation_id);
+  };
+
+  try {
+    await submit();
+    throw new Error("expected response-loss retry to fail");
+  } catch (error) {
+    assert(
+      error instanceof Error && error.message.includes("response lost"),
+      `unexpected response-loss error: ${String(error)}`,
+    );
+  }
+  await submit();
+  assert(
+    operationIds.length === 2 &&
+      operationIds.every((id) => id === "stable-removal-operation"),
+    `response-loss retry changed operation id: ${operationIds.join(",")}`,
+  );
+  assert(
+    attempt.operationId(() => "next-removal-operation") ===
+      "next-removal-operation",
+    "authoritative success did not clear the completed operation id",
+  );
 });
 
 Deno.test("Runtime removal uses the Workspace-scoped operation route", async () => {

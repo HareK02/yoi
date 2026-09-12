@@ -1026,6 +1026,23 @@ export async function updateRemoteRuntime(
   return finishMutation(response, workspaceId, runtimeId);
 }
 
+export class RuntimeRemovalAttempt {
+  #operationId: string | null = null;
+
+  operationId(create: () => string = () => crypto.randomUUID()): string {
+    if (this.#operationId === null) this.#operationId = create();
+    return this.#operationId;
+  }
+
+  complete(operationId: string): void {
+    if (this.#operationId === operationId) this.#operationId = null;
+  }
+
+  reset(): void {
+    this.#operationId = null;
+  }
+}
+
 export async function removeRemoteRuntime(
   workspaceId: string,
   runtimeId: string,
