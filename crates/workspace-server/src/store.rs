@@ -18,7 +18,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 59;
+const LATEST_SCHEMA_VERSION: i64 = 60;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -34,6 +34,7 @@ const REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME: &str =
     "remove obsolete Workdir Repository cache generation";
 const WORKDIR_CREDENTIAL_CANDIDATE_SNAPSHOT_MIGRATION_NAME: &str =
     "Workdir create credential candidate snapshots";
+const RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME: &str = "guarded Runtime removal operations";
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -80,6 +81,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 59,
         name: WORKDIR_CREDENTIAL_CANDIDATE_SNAPSHOT_MIGRATION_NAME,
         apply: migrate_workdir_credential_candidate_snapshots_v58_to_v59,
+    },
+    Migration {
+        version: 60,
+        name: RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME,
+        apply: migrate_runtime_removal_operations_v59_to_v60,
     },
 ];
 
@@ -269,6 +275,51 @@ pub struct WorkspaceRuntimeBinding {
     pub created_at: String,
     pub updated_at: String,
     pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRemovalOperation {
+    pub operation_id: String,
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub request_fingerprint: String,
+    pub expected_binding_revision: u64,
+    pub config_revision: u64,
+    pub state: RuntimeRemovalOperationState,
+    pub failure_category: Option<String>,
+    pub binding_removed: bool,
+    pub runtime_registration_removed: Option<bool>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeRemovalOperationState {
+    Pending,
+    CleanupPending,
+    Succeeded,
+    Failed,
+}
+
+impl RuntimeRemovalOperationState {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "cleanup_pending" => Ok(Self::CleanupPending),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            other => Err(Error::Store(format!(
+                "unknown Runtime removal operation state `{other}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRemovalReservation {
+    pub operation: RuntimeRemovalOperation,
+    pub replay: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -857,6 +908,37 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         workspace_id: &str,
         runtime_id: &str,
     ) -> Result<bool>;
+    async fn reserve_runtime_removal(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        operation_id: &str,
+        request_fingerprint: &str,
+        expected_binding_revision: u64,
+        config_revision: u64,
+    ) -> Result<RuntimeRemovalReservation>;
+    async fn get_runtime_removal(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<RuntimeRemovalOperation>>;
+    async fn mark_runtime_removal_failed(
+        &self,
+        operation_id: &str,
+        failure_category: &str,
+    ) -> Result<RuntimeRemovalOperation>;
+    async fn commit_runtime_binding_removal(
+        &self,
+        operation_id: &str,
+    ) -> Result<RuntimeRemovalOperation>;
+    async fn complete_runtime_removal(
+        &self,
+        operation_id: &str,
+        runtime_registration_removed: bool,
+    ) -> Result<RuntimeRemovalOperation>;
+    async fn list_resumable_runtime_removals(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<RuntimeRemovalOperation>>;
     async fn upsert_workspace_runtime_binding_record(
         &self,
         record: WorkspaceRuntimeBinding,
@@ -2005,6 +2087,255 @@ impl SqliteWorkspaceStore {
             )?;
             tx.commit()?;
             Ok(deleted == 1)
+        })
+    }
+
+    pub fn reserve_runtime_removal(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        operation_id: &str,
+        request_fingerprint: &str,
+        expected_binding_revision: u64,
+        config_revision: u64,
+    ) -> Result<RuntimeRemovalReservation> {
+        validate_identifier("workspace_id", workspace_id)?;
+        validate_identifier("runtime_id", runtime_id)?;
+        validate_identifier("operation_id", operation_id)?;
+        validate_non_empty("request_fingerprint", request_fingerprint)?;
+        if operation_id.len() > 128 || request_fingerprint.len() > 128 {
+            return Err(Error::InvalidInput(
+                "Runtime removal operation identity is too long".to_string(),
+            ));
+        }
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(existing) = load_runtime_removal_operation(&tx, operation_id)? {
+                if existing.workspace_id != workspace_id
+                    || existing.runtime_id != runtime_id
+                    || existing.request_fingerprint != request_fingerprint
+                    || existing.expected_binding_revision != expected_binding_revision
+                    || existing.config_revision != config_revision
+                {
+                    return Err(Error::RuntimeBindingConflict(
+                        "runtime_removal_operation_id_reused".to_string(),
+                    ));
+                }
+                if existing.state != RuntimeRemovalOperationState::Failed {
+                    tx.commit()?;
+                    return Ok(RuntimeRemovalReservation {
+                        operation: existing,
+                        replay: true,
+                    });
+                }
+                runtime_removal_preflight(
+                    &tx,
+                    workspace_id,
+                    runtime_id,
+                    expected_binding_revision,
+                )?;
+                let now = chrono::Utc::now().to_rfc3339();
+                tx.execute(
+                    "UPDATE runtime_removal_operations \
+                     SET state = 'pending', failure_category = NULL, updated_at = ?2, \
+                         completed_at = NULL \
+                     WHERE operation_id = ?1 AND state = 'failed'",
+                    params![operation_id, now],
+                )?;
+                let operation = load_runtime_removal_operation(&tx, operation_id)?.ok_or_else(|| {
+                    Error::Store("Runtime removal operation disappeared".to_string())
+                })?;
+                tx.commit()?;
+                return Ok(RuntimeRemovalReservation {
+                    operation,
+                    replay: true,
+                });
+            }
+
+            let active_operation_id = tx
+                .query_row(
+                    "SELECT operation_id FROM runtime_removal_operations \
+                     WHERE runtime_id = ?1 AND state IN ('pending', 'cleanup_pending')",
+                    params![runtime_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if active_operation_id.is_some() {
+                return Err(Error::RuntimeBindingConflict(
+                    "runtime_removal_already_in_progress".to_string(),
+                ));
+            }
+            runtime_removal_preflight(
+                &tx,
+                workspace_id,
+                runtime_id,
+                expected_binding_revision,
+            )?;
+            let now = chrono::Utc::now().to_rfc3339();
+            tx.execute(
+                "INSERT INTO runtime_removal_operations(\
+                     operation_id, workspace_id, runtime_id, request_fingerprint, \
+                     expected_binding_revision, config_revision, state, failure_category, \
+                     binding_removed, runtime_registration_removed, created_at, updated_at, completed_at\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, 0, NULL, ?7, ?7, NULL)",
+                params![
+                    operation_id,
+                    workspace_id,
+                    runtime_id,
+                    request_fingerprint,
+                    i64::try_from(expected_binding_revision).map_err(|_| {
+                        Error::InvalidInput("binding revision is too large".to_string())
+                    })?,
+                    i64::try_from(config_revision).map_err(|_| {
+                        Error::InvalidInput("config revision is too large".to_string())
+                    })?,
+                    now,
+                ],
+            )?;
+            let operation = load_runtime_removal_operation(&tx, operation_id)?.ok_or_else(|| {
+                Error::Store("Runtime removal operation was not persisted".to_string())
+            })?;
+            tx.commit()?;
+            Ok(RuntimeRemovalReservation {
+                operation,
+                replay: false,
+            })
+        })
+    }
+
+    pub fn get_runtime_removal(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<RuntimeRemovalOperation>> {
+        validate_identifier("operation_id", operation_id)?;
+        self.with_conn(|conn| load_runtime_removal_operation(conn, operation_id))
+    }
+
+    pub fn mark_runtime_removal_failed(
+        &self,
+        operation_id: &str,
+        failure_category: &str,
+    ) -> Result<RuntimeRemovalOperation> {
+        validate_identifier("operation_id", operation_id)?;
+        validate_non_empty("failure_category", failure_category)?;
+        let failure_category = failure_category.chars().take(256).collect::<String>();
+        self.with_conn(|conn| {
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE runtime_removal_operations \
+                 SET state = 'failed', failure_category = ?2, updated_at = ?3, completed_at = ?3 \
+                 WHERE operation_id = ?1 AND state = 'pending'",
+                params![operation_id, failure_category, now],
+            )?;
+            load_runtime_removal_operation(conn, operation_id)?
+                .ok_or_else(|| Error::Store("Runtime removal operation not found".to_string()))
+        })
+    }
+
+    pub fn commit_runtime_binding_removal(
+        &self,
+        operation_id: &str,
+    ) -> Result<RuntimeRemovalOperation> {
+        validate_identifier("operation_id", operation_id)?;
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let operation = load_runtime_removal_operation(&tx, operation_id)?
+                .ok_or_else(|| Error::Store("Runtime removal operation not found".to_string()))?;
+            if matches!(
+                operation.state,
+                RuntimeRemovalOperationState::CleanupPending
+                    | RuntimeRemovalOperationState::Succeeded
+            ) {
+                tx.commit()?;
+                return Ok(operation);
+            }
+            if operation.state != RuntimeRemovalOperationState::Pending {
+                return Err(Error::RuntimeBindingConflict(
+                    "runtime_removal_operation_not_pending".to_string(),
+                ));
+            }
+            runtime_removal_preflight(
+                &tx,
+                &operation.workspace_id,
+                &operation.runtime_id,
+                operation.expected_binding_revision,
+            )?;
+            tx.execute(
+                "DELETE FROM worker_mutation_source_proof_jtis \
+                 WHERE workspace_id = ?1 AND runtime_id = ?2",
+                params![operation.workspace_id, operation.runtime_id],
+            )?;
+            tx.execute(
+                "DELETE FROM workspace_runtime_binding_audit \
+                 WHERE workspace_id = ?1 AND runtime_id = ?2",
+                params![operation.workspace_id, operation.runtime_id],
+            )?;
+            let removed = tx.execute(
+                "DELETE FROM workspace_runtime_bindings \
+                 WHERE workspace_id = ?1 AND runtime_id = ?2 AND binding_revision = ?3",
+                params![
+                    operation.workspace_id,
+                    operation.runtime_id,
+                    i64::try_from(operation.expected_binding_revision).map_err(|_| {
+                        Error::InvalidInput("binding revision is too large".to_string())
+                    })?,
+                ],
+            )?;
+            if removed != 1 {
+                return Err(Error::RuntimeBindingRevisionConflict {
+                    expected: Some(operation.expected_binding_revision),
+                    actual: None,
+                });
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            tx.execute(
+                "UPDATE runtime_removal_operations \
+                 SET state = 'cleanup_pending', failure_category = NULL, binding_removed = 1, \
+                     updated_at = ?2, completed_at = NULL \
+                 WHERE operation_id = ?1 AND state = 'pending'",
+                params![operation_id, now],
+            )?;
+            let operation = load_runtime_removal_operation(&tx, operation_id)?
+                .ok_or_else(|| Error::Store("Runtime removal operation disappeared".to_string()))?;
+            tx.commit()?;
+            Ok(operation)
+        })
+    }
+
+    pub fn complete_runtime_removal(
+        &self,
+        operation_id: &str,
+        runtime_registration_removed: bool,
+    ) -> Result<RuntimeRemovalOperation> {
+        validate_identifier("operation_id", operation_id)?;
+        self.with_conn(|conn| {
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE runtime_removal_operations \
+                 SET state = 'succeeded', runtime_registration_removed = ?2, \
+                     failure_category = NULL, updated_at = ?3, completed_at = ?3 \
+                 WHERE operation_id = ?1 AND state = 'cleanup_pending'",
+                params![operation_id, i64::from(runtime_registration_removed), now],
+            )?;
+            load_runtime_removal_operation(conn, operation_id)?
+                .ok_or_else(|| Error::Store("Runtime removal operation not found".to_string()))
+        })
+    }
+
+    pub fn list_resumable_runtime_removals(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<RuntimeRemovalOperation>> {
+        validate_identifier("workspace_id", workspace_id)?;
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "{RUNTIME_REMOVAL_OPERATION_SELECT} \
+                 WHERE workspace_id = ?1 AND state IN ('pending', 'cleanup_pending') \
+                 ORDER BY created_at ASC, operation_id ASC"
+            ))?;
+            stmt.query_map(params![workspace_id], read_runtime_removal_operation)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
         })
     }
 
@@ -3570,6 +3901,67 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         runtime_id: &str,
     ) -> Result<bool> {
         SqliteWorkspaceStore::delete_workspace_runtime_binding(self, workspace_id, runtime_id)
+    }
+
+    async fn reserve_runtime_removal(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        operation_id: &str,
+        request_fingerprint: &str,
+        expected_binding_revision: u64,
+        config_revision: u64,
+    ) -> Result<RuntimeRemovalReservation> {
+        SqliteWorkspaceStore::reserve_runtime_removal(
+            self,
+            workspace_id,
+            runtime_id,
+            operation_id,
+            request_fingerprint,
+            expected_binding_revision,
+            config_revision,
+        )
+    }
+
+    async fn get_runtime_removal(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<RuntimeRemovalOperation>> {
+        SqliteWorkspaceStore::get_runtime_removal(self, operation_id)
+    }
+
+    async fn mark_runtime_removal_failed(
+        &self,
+        operation_id: &str,
+        failure_category: &str,
+    ) -> Result<RuntimeRemovalOperation> {
+        SqliteWorkspaceStore::mark_runtime_removal_failed(self, operation_id, failure_category)
+    }
+
+    async fn commit_runtime_binding_removal(
+        &self,
+        operation_id: &str,
+    ) -> Result<RuntimeRemovalOperation> {
+        SqliteWorkspaceStore::commit_runtime_binding_removal(self, operation_id)
+    }
+
+    async fn complete_runtime_removal(
+        &self,
+        operation_id: &str,
+        runtime_registration_removed: bool,
+    ) -> Result<RuntimeRemovalOperation> {
+        SqliteWorkspaceStore::complete_runtime_removal(
+            self,
+            operation_id,
+            runtime_registration_removed,
+        )
+    }
+
+    async fn list_resumable_runtime_removals(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<RuntimeRemovalOperation>> {
+        SqliteWorkspaceStore::list_resumable_runtime_removals(self, workspace_id)
     }
 
     async fn upsert_workspace_runtime_binding_record(
@@ -7136,6 +7528,155 @@ fn validate_workspace_runtime_verification(
     Ok(())
 }
 
+fn read_runtime_removal_operation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RuntimeRemovalOperation> {
+    let state_value = row.get::<_, String>(6)?;
+    let state = RuntimeRemovalOperationState::parse(&state_value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            6,
+            rusqlite::types::Type::Text,
+            error.to_string().into(),
+        )
+    })?;
+    let expected_binding_revision = u64::try_from(row.get::<_, i64>(4)?).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Integer,
+            "invalid Runtime removal binding revision".into(),
+        )
+    })?;
+    let config_revision = u64::try_from(row.get::<_, i64>(5)?).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Integer,
+            "invalid Runtime removal config revision".into(),
+        )
+    })?;
+    Ok(RuntimeRemovalOperation {
+        operation_id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        runtime_id: row.get(2)?,
+        request_fingerprint: row.get(3)?,
+        expected_binding_revision,
+        config_revision,
+        state,
+        failure_category: row.get(7)?,
+        binding_removed: row.get::<_, i64>(8)? != 0,
+        runtime_registration_removed: row.get::<_, Option<i64>>(9)?.map(|value| value != 0),
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+        completed_at: row.get(12)?,
+    })
+}
+
+const RUNTIME_REMOVAL_OPERATION_SELECT: &str = "SELECT operation_id, workspace_id, runtime_id, request_fingerprint, \
+            expected_binding_revision, config_revision, state, failure_category, \
+            binding_removed, runtime_registration_removed, created_at, updated_at, completed_at \
+     FROM runtime_removal_operations";
+
+fn load_runtime_removal_operation(
+    conn: &Connection,
+    operation_id: &str,
+) -> Result<Option<RuntimeRemovalOperation>> {
+    conn.query_row(
+        &format!("{RUNTIME_REMOVAL_OPERATION_SELECT} WHERE operation_id = ?1"),
+        params![operation_id],
+        read_runtime_removal_operation,
+    )
+    .optional()
+    .map_err(Error::from)
+}
+
+fn runtime_removal_preflight(
+    conn: &Connection,
+    workspace_id: &str,
+    runtime_id: &str,
+    expected_binding_revision: u64,
+) -> Result<()> {
+    let binding_revision = conn
+        .query_row(
+            "SELECT binding_revision FROM workspace_runtime_bindings \
+             WHERE workspace_id = ?1 AND runtime_id = ?2",
+            params![workspace_id, runtime_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(binding_revision) = binding_revision else {
+        return Err(Error::RuntimeBindingNotFound {
+            runtime_id: runtime_id.to_string(),
+        });
+    };
+    let binding_revision = u64::try_from(binding_revision)
+        .map_err(|_| Error::Store("Runtime binding revision is invalid".to_string()))?;
+    if binding_revision != expected_binding_revision {
+        return Err(Error::RuntimeBindingRevisionConflict {
+            expected: Some(expected_binding_revision),
+            actual: Some(binding_revision),
+        });
+    }
+
+    let guards = [
+        (
+            "other_workspace_binding",
+            "SELECT EXISTS(SELECT 1 FROM workspace_runtime_bindings \
+             WHERE runtime_id = ?1 AND workspace_id <> ?2 AND state <> 'revoked')",
+        ),
+        (
+            "active_worker",
+            "SELECT EXISTS(SELECT 1 FROM worker_registry WHERE runtime_id = ?1)",
+        ),
+        (
+            "active_worker_assignment",
+            "SELECT EXISTS(SELECT 1 FROM ticket_current_worker_assignments WHERE runtime_id = ?1)",
+        ),
+        (
+            "active_workdir",
+            "SELECT EXISTS(SELECT 1 FROM workdir_registry WHERE runtime_id = ?1)",
+        ),
+        (
+            "active_workdir_attachment",
+            "SELECT EXISTS(SELECT 1 FROM worker_workdir_links \
+             WHERE runtime_id = ?1 AND unlinked_at IS NULL)",
+        ),
+        (
+            "worker_create_or_restore",
+            "SELECT EXISTS(SELECT 1 FROM worker_create_reservations \
+             WHERE runtime_id = ?1 AND state <> 'removed')",
+        ),
+        (
+            "workdir_create",
+            "SELECT EXISTS(SELECT 1 FROM workdir_create_operations \
+             WHERE resolved_runtime_id = ?1 AND state = 'pending')",
+        ),
+        (
+            "worker_removal",
+            "SELECT EXISTS(SELECT 1 FROM worker_removal_operations \
+             WHERE runtime_id = ?1 AND state IN ('planned', 'executing', 'failed'))",
+        ),
+        (
+            "workdir_removal",
+            "SELECT EXISTS(SELECT 1 FROM workdir_removal_operations \
+             WHERE runtime_id = ?1 AND state IN ('pending', 'failed') AND retryable = 1)",
+        ),
+    ];
+    for (category, sql) in guards {
+        let blocked = if category == "other_workspace_binding" {
+            conn.query_row(sql, params![runtime_id, workspace_id], |row| {
+                row.get::<_, bool>(0)
+            })?
+        } else {
+            conn.query_row(sql, params![runtime_id], |row| row.get::<_, bool>(0))?
+        };
+        if blocked {
+            return Err(Error::RuntimeBindingConflict(format!(
+                "runtime_removal_{category}_blocked"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn read_workspace_runtime_binding(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<WorkspaceRuntimeBinding> {
@@ -9045,6 +9586,62 @@ fn verify_canonical_workspace_runtime_binding(binding: WorkspaceRuntimeBinding) 
     Ok(())
 }
 
+fn migrate_runtime_removal_operations_v59_to_v60(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"CREATE TABLE runtime_removal_operations (
+             operation_id TEXT PRIMARY KEY,
+             workspace_id TEXT NOT NULL,
+             runtime_id TEXT NOT NULL,
+             request_fingerprint TEXT NOT NULL,
+             expected_binding_revision INTEGER NOT NULL,
+             config_revision INTEGER NOT NULL,
+             state TEXT NOT NULL CHECK (state IN ('pending', 'cleanup_pending', 'succeeded', 'failed')),
+             failure_category TEXT,
+             binding_removed INTEGER NOT NULL CHECK (binding_removed IN (0, 1)),
+             runtime_registration_removed INTEGER CHECK (runtime_registration_removed IS NULL OR runtime_registration_removed IN (0, 1)),
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             completed_at TEXT,
+             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+         );
+         CREATE UNIQUE INDEX runtime_removal_operations_one_active_runtime
+         ON runtime_removal_operations(runtime_id)
+         WHERE state IN ('pending', 'cleanup_pending');
+         CREATE INDEX runtime_removal_operations_workspace_state
+         ON runtime_removal_operations(workspace_id, state, updated_at);
+         CREATE TRIGGER runtime_binding_insert_blocked_by_removal
+         BEFORE INSERT ON workspace_runtime_bindings
+         FOR EACH ROW
+         WHEN EXISTS (
+             SELECT 1 FROM runtime_removal_operations operation
+             WHERE operation.runtime_id = NEW.runtime_id
+               AND operation.state IN ('pending', 'cleanup_pending')
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'runtime_removal_in_progress');
+         END;
+         CREATE TRIGGER runtime_binding_update_blocked_by_removal
+         BEFORE UPDATE ON workspace_runtime_bindings
+         FOR EACH ROW
+         WHEN EXISTS (
+             SELECT 1 FROM runtime_removal_operations operation
+             WHERE operation.runtime_id = NEW.runtime_id
+               AND operation.state IN ('pending', 'cleanup_pending')
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'runtime_removal_in_progress');
+         END;"#,
+    )?;
+    conn.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![
+            LATEST_SCHEMA_VERSION,
+            RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME
+        ],
+    )?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(include_str!("latest_schema.sql"))?;
     Ok(())
@@ -9679,6 +10276,369 @@ fn migrate_workdir_credential_candidate_snapshots_v58_to_v59(conn: &Connection) 
 mod tests {
     use super::*;
 
+    fn runtime_removal_test_store() -> (tempfile::TempDir, SqliteWorkspaceStore) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteWorkspaceStore::open(temp.path().join("server.db")).unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "INSERT INTO accounts(account_id, kind, handle, display_name, created_at, updated_at) \
+                     VALUES ('owner', 'user', 'owner', 'Owner', '1', '1'); \
+                     INSERT INTO workspaces(workspace_id, owner_account_id, display_name, state, created_at, updated_at) \
+                     VALUES ('workspace-a', 'owner', 'Workspace A', 'active', '1', '1'); \
+                     INSERT INTO workspace_runtime_bindings(\
+                         workspace_id, runtime_id, display_name, base_url, public_key, \
+                         public_key_fingerprint, binding_revision, state, authentication_mode, \
+                         created_at, updated_at\
+                     ) VALUES (\
+                         'workspace-a', 'runtime-a', 'Runtime A', 'https://runtime.invalid', \
+                         'key-a', 'fingerprint-a', 3, 'verified', 'legacy_server_issuer', '1', '1'\
+                     );",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        (temp, store)
+    }
+
+    fn assert_runtime_removal_binding_unchanged(store: &SqliteWorkspaceStore) {
+        let binding = store
+            .get_workspace_runtime_binding("workspace-a", "runtime-a")
+            .unwrap()
+            .expect("Runtime binding must remain");
+        assert_eq!(binding.binding_revision, 3);
+        assert_eq!(binding.state, WorkspaceRuntimeBindingState::Verified);
+        assert!(binding.revoked_at.is_none());
+    }
+
+    #[test]
+    fn runtime_removal_preflight_rejects_stale_revision_and_active_resources_without_revoking_trust()
+     {
+        let (_temp, store) = runtime_removal_test_store();
+        let stale = store
+            .reserve_runtime_removal(
+                "workspace-a",
+                "runtime-a",
+                "remove-stale",
+                "fingerprint-stale",
+                2,
+                1,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            stale,
+            Error::RuntimeBindingRevisionConflict { .. }
+        ));
+        assert_runtime_removal_binding_unchanged(&store);
+
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO worker_registry(\
+                         workspace_id, worker_id, runtime_id, display_name, retention_state, created_at, updated_at\
+                     ) VALUES ('workspace-a', 'worker-a', 'runtime-a', 'Worker A', 'normal', '1', '1')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let worker = store
+            .reserve_runtime_removal(
+                "workspace-a",
+                "runtime-a",
+                "remove-worker",
+                "fingerprint-worker",
+                3,
+                1,
+            )
+            .unwrap_err();
+        assert!(
+            worker
+                .to_string()
+                .contains("runtime_removal_active_worker_blocked")
+        );
+        assert_runtime_removal_binding_unchanged(&store);
+    }
+
+    #[test]
+    fn runtime_removal_preflight_rejects_workdir_and_pending_create_without_revoking_trust() {
+        let (_temp, store) = runtime_removal_test_store();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "INSERT INTO repositories(\
+                         workspace_id, repository_id, repository_key, kind, uri, created_at, updated_at, \
+                         source_kind, source_uri, source_revision, source_fingerprint, observed_status\
+                     ) VALUES (\
+                         'workspace-a', 'repository-a', 'repository-a', 'git', '/repo', '1', '1', \
+                         'local', '/repo', 1, 'source-a', 'unverified'\
+                     ); \
+                     INSERT INTO workdir_registry(\
+                         workspace_id, workdir_id, runtime_id, repository_id, materialization_status, \
+                         cleanliness, created_at, updated_at\
+                     ) VALUES (\
+                         'workspace-a', 'workdir-a', 'runtime-a', 'repository-a', 'present', \
+                         'clean', '1', '1'\
+                     );",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let workdir = store
+            .reserve_runtime_removal(
+                "workspace-a",
+                "runtime-a",
+                "remove-workdir",
+                "fingerprint-workdir",
+                3,
+                1,
+            )
+            .unwrap_err();
+        assert!(
+            workdir
+                .to_string()
+                .contains("runtime_removal_active_workdir_blocked")
+        );
+        assert_runtime_removal_binding_unchanged(&store);
+
+        store
+            .with_conn(|conn| {
+                conn.execute("DELETE FROM workdir_registry", [])?;
+                conn.execute(
+                    "INSERT INTO workdir_create_operations(\
+                         workspace_id, operation_id, request_fingerprint, repository_id, \
+                         resolved_runtime_id, config_revision, config_projection_digest, \
+                         working_directory_id, state, created_at, updated_at\
+                     ) VALUES (\
+                         'workspace-a', 'create-workdir', 'request-a', 'repository-a', \
+                         'runtime-a', 1, 'projection-a', 'workdir-b', 'pending', '1', '1'\
+                     )",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let pending = store
+            .reserve_runtime_removal(
+                "workspace-a",
+                "runtime-a",
+                "remove-pending",
+                "fingerprint-pending",
+                3,
+                1,
+            )
+            .unwrap_err();
+        assert!(
+            pending
+                .to_string()
+                .contains("runtime_removal_workdir_create_blocked")
+        );
+        assert_runtime_removal_binding_unchanged(&store);
+    }
+
+    #[test]
+    fn runtime_removal_rejects_shared_binding_and_fences_new_binding_until_cleanup() {
+        let (_temp, store) = runtime_removal_test_store();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "INSERT INTO accounts(account_id, kind, handle, display_name, created_at, updated_at) \
+                     VALUES ('owner-b', 'user', 'owner-b', 'Owner B', '1', '1'); \
+                     INSERT INTO workspaces(workspace_id, owner_account_id, display_name, state, created_at, updated_at) \
+                     VALUES ('workspace-b', 'owner-b', 'Workspace B', 'active', '1', '1'); \
+                     INSERT INTO workspace_runtime_bindings(\
+                         workspace_id, runtime_id, display_name, base_url, public_key, \
+                         public_key_fingerprint, binding_revision, state, authentication_mode, \
+                         created_at, updated_at\
+                     ) VALUES (\
+                         'workspace-b', 'runtime-a', 'Runtime A', 'https://runtime.invalid', \
+                         'key-a', 'fingerprint-b', 1, 'verified', 'legacy_server_issuer', '1', '1'\
+                     );",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let shared = store
+            .reserve_runtime_removal(
+                "workspace-a",
+                "runtime-a",
+                "remove-shared",
+                "fingerprint-shared",
+                3,
+                1,
+            )
+            .unwrap_err();
+        assert!(
+            shared
+                .to_string()
+                .contains("runtime_removal_other_workspace_binding_blocked")
+        );
+        assert_runtime_removal_binding_unchanged(&store);
+        assert!(
+            store
+                .get_workspace_runtime_binding("workspace-b", "runtime-a")
+                .unwrap()
+                .is_some()
+        );
+
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "DELETE FROM workspace_runtime_bindings WHERE workspace_id = 'workspace-b'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        store
+            .reserve_runtime_removal(
+                "workspace-a",
+                "runtime-a",
+                "remove-fenced",
+                "fingerprint-fenced",
+                3,
+                1,
+            )
+            .unwrap();
+        let blocked_insert = store.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO workspace_runtime_bindings(\
+                     workspace_id, runtime_id, display_name, base_url, public_key, \
+                     public_key_fingerprint, binding_revision, state, authentication_mode, \
+                     created_at, updated_at\
+                 ) VALUES (\
+                     'workspace-b', 'runtime-a', 'Runtime A', 'https://runtime.invalid', \
+                     'key-a', 'fingerprint-b', 1, 'verified', 'legacy_server_issuer', '1', '1'\
+                 )",
+                [],
+            )?;
+            Ok(())
+        });
+        assert!(
+            blocked_insert
+                .unwrap_err()
+                .to_string()
+                .contains("runtime_removal_in_progress")
+        );
+    }
+
+    #[test]
+    fn runtime_removal_checkpoint_replays_and_recovers_after_reopen() {
+        let (temp, store) = runtime_removal_test_store();
+        let reserved = store
+            .reserve_runtime_removal(
+                "workspace-a",
+                "runtime-a",
+                "remove-runtime-a",
+                "fingerprint-a",
+                3,
+                7,
+            )
+            .unwrap();
+        assert!(!reserved.replay);
+        let failed = store
+            .mark_runtime_removal_failed("remove-runtime-a", "injected_cleanup_failure")
+            .unwrap();
+        assert_eq!(failed.state, RuntimeRemovalOperationState::Failed);
+        assert_runtime_removal_binding_unchanged(&store);
+        let retried = store
+            .reserve_runtime_removal(
+                "workspace-a",
+                "runtime-a",
+                "remove-runtime-a",
+                "fingerprint-a",
+                3,
+                7,
+            )
+            .unwrap();
+        assert!(retried.replay);
+        let checkpoint = store
+            .commit_runtime_binding_removal("remove-runtime-a")
+            .unwrap();
+        assert_eq!(
+            checkpoint.state,
+            RuntimeRemovalOperationState::CleanupPending
+        );
+        assert!(checkpoint.binding_removed);
+        drop(store);
+
+        let reopened = Connection::open(temp.path().join("server.db")).unwrap();
+        let (state, binding_removed): (String, i64) = reopened
+            .query_row(
+                "SELECT state, binding_removed FROM runtime_removal_operations \
+                 WHERE operation_id = 'remove-runtime-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "cleanup_pending");
+        assert_eq!(binding_removed, 1);
+        reopened
+            .execute(
+                "UPDATE runtime_removal_operations \
+                 SET state = 'succeeded', runtime_registration_removed = 1, completed_at = '2', updated_at = '2' \
+                 WHERE operation_id = 'remove-runtime-a' AND state = 'cleanup_pending'",
+                [],
+            )
+            .unwrap();
+        let completed: (String, i64) = reopened
+            .query_row(
+                "SELECT state, runtime_registration_removed FROM runtime_removal_operations \
+                 WHERE operation_id = 'remove-runtime-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(completed, ("succeeded".to_string(), 1));
+    }
+
+    #[test]
+    fn schema_v59_upgrade_adds_runtime_removal_authority_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "DROP TRIGGER runtime_binding_insert_blocked_by_removal; \
+                     DROP TRIGGER runtime_binding_update_blocked_by_removal; \
+                     DROP TABLE runtime_removal_operations; \
+                     DELETE FROM __yoi_schema_migrations; \
+                     INSERT INTO __yoi_schema_migrations(version, name) \
+                     VALUES (59, 'workspace schema baseline');",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+
+        let migrated = SqliteWorkspaceStore::open(&path).unwrap();
+        migrated
+            .with_conn(|conn| {
+                let table_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'runtime_removal_operations'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let trigger_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master \
+                     WHERE type = 'trigger' AND name LIKE 'runtime_binding_%_blocked_by_removal'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let foreign_key_failures: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get(0)
+                    })?;
+                assert_eq!(table_count, 1);
+                assert_eq!(trigger_count, 2);
+                assert_eq!(foreign_key_failures, 0);
+                Ok(())
+            })
+            .unwrap();
+    }
+
     #[test]
     fn current_schema_accepts_every_retained_canonical_provenance() {
         for baseline_version in OLDEST_SCHEMA_VERSION..=LATEST_SCHEMA_VERSION {
@@ -9745,6 +10705,9 @@ mod tests {
             r#"
             DROP TABLE workdir_create_credential_revision_retentions;
             DROP TABLE workdir_create_credential_candidates;
+            DROP TRIGGER runtime_binding_insert_blocked_by_removal;
+            DROP TRIGGER runtime_binding_update_blocked_by_removal;
+            DROP TABLE runtime_removal_operations;
             DROP INDEX workspace_signing_identity_audit_workspace_idx;
             DROP TABLE workspace_signing_identity_audit;
             DROP TABLE workspace_signing_identity_provisioning_operations;
@@ -9890,6 +10853,10 @@ mod tests {
                     version: 59,
                     name: WORKDIR_CREDENTIAL_CANDIDATE_SNAPSHOT_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 60,
+                    name: RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -9931,6 +10898,10 @@ mod tests {
                         (
                             59,
                             WORKDIR_CREDENTIAL_CANDIDATE_SNAPSHOT_MIGRATION_NAME.to_string(),
+                        ),
+                        (
+                            60,
+                            RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME.to_string(),
                         ),
                     ]
                 );
@@ -10002,7 +10973,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![52, 53, 54, 55, 56, 57, 58, 59]
+            vec![52, 53, 54, 55, 56, 57, 58, 59, 60]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
@@ -10010,7 +10981,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 10);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 11);
     }
 
     #[test]

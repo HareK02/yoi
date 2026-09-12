@@ -1810,6 +1810,43 @@ pub struct RevokeRuntimeTrustKeyRequest {
     pub expected_revision: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RemoveRuntimeRequest {
+    pub operation_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub expected_binding_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeRemovalOperationState {
+    Pending,
+    CleanupPending,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeRemovalOperationResponse {
+    pub operation_id: String,
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub state: RuntimeRemovalOperationState,
+    pub binding_removed: bool,
+    pub runtime_registration_removed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_category: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -3116,6 +3153,9 @@ pub fn catalog_typescript() -> String {
         WorkspaceRuntimeDetail::decl(&config),
         RuntimeTrustKeyRevealResponse::decl(&config),
         RevokeRuntimeTrustKeyRequest::decl(&config),
+        RemoveRuntimeRequest::decl(&config),
+        RuntimeRemovalOperationState::decl(&config),
+        RuntimeRemovalOperationResponse::decl(&config),
         RuntimeTrustConflictKind::decl(&config),
         RuntimeTrustConflictResponse::decl(&config),
         RuntimePublicIdentityBundle::decl(&config),

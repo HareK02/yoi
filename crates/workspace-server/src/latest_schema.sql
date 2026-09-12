@@ -1057,6 +1057,56 @@ CREATE UNIQUE INDEX worker_workdir_links_active_worker_unique
             WHERE unlinked_at IS NULL;
 CREATE INDEX worker_workdir_links_workdir
             ON worker_workdir_links(workspace_id, workdir_id);
+CREATE TABLE runtime_removal_operations (
+    operation_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    expected_binding_revision INTEGER NOT NULL,
+    config_revision INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'cleanup_pending', 'succeeded', 'failed')),
+    failure_category TEXT,
+    binding_removed INTEGER NOT NULL CHECK (binding_removed IN (0, 1)),
+    runtime_registration_removed INTEGER CHECK (runtime_registration_removed IS NULL OR runtime_registration_removed IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX runtime_removal_operations_one_active_runtime
+ON runtime_removal_operations(runtime_id)
+WHERE state IN ('pending', 'cleanup_pending');
+
+CREATE INDEX runtime_removal_operations_workspace_state
+ON runtime_removal_operations(workspace_id, state, updated_at);
+
+CREATE TRIGGER runtime_binding_insert_blocked_by_removal
+BEFORE INSERT ON workspace_runtime_bindings
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1
+    FROM runtime_removal_operations operation
+    WHERE operation.runtime_id = NEW.runtime_id
+      AND operation.state IN ('pending', 'cleanup_pending')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'runtime_removal_in_progress');
+END;
+
+CREATE TRIGGER runtime_binding_update_blocked_by_removal
+BEFORE UPDATE ON workspace_runtime_bindings
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1
+    FROM runtime_removal_operations operation
+    WHERE operation.runtime_id = NEW.runtime_id
+      AND operation.state IN ('pending', 'cleanup_pending')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'runtime_removal_in_progress');
+END;
+
 CREATE TABLE workspace_deletion_operations (
     operation_id TEXT PRIMARY KEY,
     request_fingerprint TEXT NOT NULL,

@@ -32,6 +32,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "objective_ticket_links",
     "objectives",
     "repositories",
+    "runtime_removal_operations",
     "repository_secret_audit_events",
     "repository_secret_operations",
     "repository_ssh_credential_revisions",

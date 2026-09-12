@@ -83,19 +83,20 @@ use workspace_api::{
     PasskeyLoginCompleteRequest, PasskeyLoginOptionsRequest, PasskeyLoginOptionsResponse,
     PasskeyRegistrationCompleteRequest, PasskeyRegistrationOptionsRequest,
     PasskeyRegistrationOptionsResponse, ProfileSettingsResponse, PutRepositorySshHostTrustRequest,
-    RepositoryAccessProjection, RepositoryDetailResponse, RepositoryListResponse,
-    RepositoryLogResponse, RepositorySshConnectionProbeRequest,
+    RemoveRuntimeRequest, RepositoryAccessProjection, RepositoryDetailResponse,
+    RepositoryListResponse, RepositoryLogResponse, RepositorySshConnectionProbeRequest,
     RepositorySshConnectionProbeResponse, RepositorySshConnectionTrustState,
     RepositorySshCredential, RepositorySshHostKeyCandidate, RepositorySshHostTrust,
     RepositorySshPublicKey, RequestActor, RevokeRuntimeTrustKeyRequest,
     RotateRepositorySshCredentialRequest, RuntimeConnectionDisplayState,
     RuntimeConnectionTestFailureKind, RuntimeConnectionTestResponse, RuntimeConnectionTestStatus,
-    RuntimeManagementSummary, RuntimeTrustAuditAction, RuntimeTrustAuditEntry,
-    RuntimeTrustConflictKind, RuntimeTrustConflictResponse, RuntimeTrustKeyRevealResponse,
-    RuntimeTrustKeyState, RuntimeTrustKeyStatus, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
-    TICKET_RELATIONS_QUERY_PATH, UpdateRemoteRuntimeRequest, UpdateWorkspaceMetadataRequest,
-    WhoamiResponse, WorkerLaunchOptionsResponse, WorkerLaunchProfileCandidate,
-    WorkerLaunchRuntimeOption, WorkerLaunchWorkerSummary,
+    RuntimeManagementSummary, RuntimeRemovalOperationResponse,
+    RuntimeRemovalOperationState as ApiRuntimeRemovalOperationState, RuntimeTrustAuditAction,
+    RuntimeTrustAuditEntry, RuntimeTrustConflictKind, RuntimeTrustConflictResponse,
+    RuntimeTrustKeyRevealResponse, RuntimeTrustKeyState, RuntimeTrustKeyStatus,
+    TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH, UpdateRemoteRuntimeRequest,
+    UpdateWorkspaceMetadataRequest, WhoamiResponse, WorkerLaunchOptionsResponse,
+    WorkerLaunchProfileCandidate, WorkerLaunchRuntimeOption, WorkerLaunchWorkerSummary,
     WorkingDirectoryCreateRequest as BrowserWorkingDirectoryCreateRequest,
     WorkingDirectoryCreateResponse as BrowserWorkingDirectoryCreateResponse,
     WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
@@ -171,7 +172,8 @@ use crate::skills;
 use crate::store::{
     AccountRecord, ApiTokenRecord, AuthChallengeRecord, BrowserSessionRecord, ControlPlaneStore,
     DeviceLoginFlowRecord, FlowSourceRecord, PasskeyCredentialRecord, RepositoryInsertOutcome,
-    RepositoryRecord, TicketAssignmentPrincipal, TicketAssignmentRole, TicketCoderAssignmentRecord,
+    RepositoryRecord, RuntimeRemovalOperation, RuntimeRemovalOperationState,
+    TicketAssignmentPrincipal, TicketAssignmentRole, TicketCoderAssignmentRecord,
     TicketRoleAssignmentRecord, UserRecord, WorkdirCreateCredentialCandidate,
     WorkdirCreateCredentialCandidateRole, WorkdirCreateOperationRecord, WorkdirRegistryRecord,
     WorkerControlGrantRecord, WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord,
@@ -2375,6 +2377,7 @@ impl WorkspaceApi {
                 .map_err(|message| Error::Config(message.to_string()))?;
         }
         recover_workdir_removals(&api)?;
+        recover_runtime_removals(&api).await;
         Ok(api)
     }
 
@@ -3422,7 +3425,7 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
             "/api/w/{workspace_id}/runtimes/{runtime_id}",
             get(scoped_get_runtime_detail)
                 .post(scoped_update_remote_runtime)
-                .delete(scoped_delete_remote_runtime),
+                .delete(scoped_remove_remote_runtime),
         )
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/trust-key",
@@ -12257,14 +12260,15 @@ async fn runtime_trust_conflict_response(
     )
 }
 
-async fn scoped_delete_remote_runtime(
+async fn scoped_remove_remote_runtime(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
     Extension(actor): Extension<RequestActor>,
-) -> ApiResult<StatusCode> {
+    Json(request): Json<RemoveRuntimeRequest>,
+) -> ApiResult<Json<RuntimeRemovalOperationResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     require_workspace_owner(&api, &path.workspace_id, &actor, "Runtime removal").await?;
-    delete_remote_runtime(State(api), AxumPath(path.runtime_id)).await
+    remove_remote_runtime(State(api), AxumPath(path.runtime_id), Json(request)).await
 }
 
 async fn scoped_test_runtime_connection(
@@ -13873,70 +13877,294 @@ async fn create_remote_runtime(
     Ok((status, Json(resource)))
 }
 
-async fn delete_remote_runtime(
-    State(api): State<WorkspaceApi>,
-    AxumPath(runtime_id): AxumPath<String>,
-) -> ApiResult<StatusCode> {
-    if runtime_id == EMBEDDED_WORKER_RUNTIME_ID {
-        return Err(settings_bad_request(
-            "embedded_runtime_not_config_managed",
-            "the embedded Runtime is built in and cannot be deleted",
+fn runtime_removal_response(operation: RuntimeRemovalOperation) -> RuntimeRemovalOperationResponse {
+    RuntimeRemovalOperationResponse {
+        operation_id: operation.operation_id,
+        workspace_id: operation.workspace_id,
+        runtime_id: operation.runtime_id,
+        state: match operation.state {
+            RuntimeRemovalOperationState::Pending => ApiRuntimeRemovalOperationState::Pending,
+            RuntimeRemovalOperationState::CleanupPending => {
+                ApiRuntimeRemovalOperationState::CleanupPending
+            }
+            RuntimeRemovalOperationState::Succeeded => ApiRuntimeRemovalOperationState::Succeeded,
+            RuntimeRemovalOperationState::Failed => ApiRuntimeRemovalOperationState::Failed,
+        },
+        binding_removed: operation.binding_removed,
+        runtime_registration_removed: operation.runtime_registration_removed,
+        failure_category: operation.failure_category,
+        created_at: operation.created_at,
+        updated_at: operation.updated_at,
+        completed_at: operation.completed_at,
+    }
+}
+
+fn runtime_removal_fingerprint(
+    workspace_id: &str,
+    runtime_id: &str,
+    expected_binding_revision: u64,
+) -> String {
+    let digest = Sha256::digest(format!(
+        "runtime-removal-v1\0{workspace_id}\0{runtime_id}\0{expected_binding_revision}"
+    ));
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256:{digest}")
+}
+
+fn runtime_removal_config_guard(
+    api: &WorkspaceApi,
+    operation: &RuntimeRemovalOperation,
+) -> Result<()> {
+    let config_state = api
+        .config_store
+        .load_workspace_config(&operation.workspace_id)?
+        .ok_or_else(|| {
+            Error::RegistryInconsistency(format!(
+                "Workspace {} has no active configuration",
+                operation.workspace_id
+            ))
+        })?;
+    if config_state.snapshot.revision != operation.config_revision {
+        return Err(Error::RuntimeBindingConflict(
+            "runtime_removal_config_revision_changed".to_string(),
         ));
     }
-    let binding = api
-        .store
-        .get_workspace_runtime_binding(&api.config.workspace_id, &runtime_id)
-        .await?
-        .ok_or_else(|| Error::UnknownRuntime(runtime_id.clone()))?;
-    if binding.revoked_at.is_none() {
+    let projection = crate::runtime_settings::project_runtime_from_workspace_config(
+        &operation.workspace_id,
+        &config_state,
+    )?;
+    if projection.default_runtime_id.as_deref() == Some(operation.runtime_id.as_str()) {
         return Err(Error::RuntimeBindingConflict(
-            "runtime trust is still active; revoke this Workspace's trust key with an expected revision before removing the inactive registration".to_string(),
-        )
-        .into());
+            "runtime_removal_config_reference_blocked".to_string(),
+        ));
     }
-    let has_other_active_binding = api
-        .store
-        .has_other_active_workspace_runtime_binding(&api.config.workspace_id, &runtime_id)
-        .await?;
-    if !has_other_active_binding {
+    Ok(())
+}
+
+async fn execute_runtime_removal(
+    api: &WorkspaceApi,
+    operation: RuntimeRemovalOperation,
+) -> ApiResult<RuntimeRemovalOperation> {
+    if operation.state == RuntimeRemovalOperationState::Succeeded {
+        return Ok(operation);
+    }
+    let operation = if operation.state == RuntimeRemovalOperationState::Pending {
+        if let Err(error) = runtime_removal_config_guard(api, &operation) {
+            let _ = api
+                .store
+                .mark_runtime_removal_failed(
+                    &operation.operation_id,
+                    "runtime_removal_config_guard_failed",
+                )
+                .await;
+            return Err(error.into());
+        }
+        let binding = api
+            .store
+            .get_workspace_runtime_binding(&operation.workspace_id, &operation.runtime_id)
+            .await?
+            .ok_or_else(|| Error::UnknownRuntime(operation.runtime_id.clone()))?;
         match api
             .runtime
-            .unregister_if_idle(&runtime_id, api.config.max_records.min(200))
-            .map_err(|err| err.into_error())?
+            .unregister_if_idle(&operation.runtime_id, api.config.max_records.min(200))
+            .map_err(|error| error.into_error())?
         {
             RuntimeRegistryUnregisterResult::Removed
             | RuntimeRegistryUnregisterResult::NotFound => {}
             RuntimeRegistryUnregisterResult::BlockedByWorkers {
                 worker_count,
-                diagnostics,
+                mut diagnostics,
             } => {
-                let mut diagnostics = diagnostics;
+                let _ = api
+                    .store
+                    .mark_runtime_removal_failed(
+                        &operation.operation_id,
+                        "runtime_removal_active_worker_blocked",
+                    )
+                    .await;
                 diagnostics.push(settings_diagnostic(
-                    "remote_runtime_delete_blocked",
+                    "runtime_removal_active_worker_blocked",
                     DiagnosticSeverity::Error,
                     format!(
-                        "Remote Runtime '{runtime_id}' has {worker_count} active worker(s); stop or move them before deleting its final Workspace registration."
+                        "Remote Runtime '{}' has {worker_count} active Worker(s); stop and remove them before removing the Runtime.",
+                        operation.runtime_id
                     ),
                 ));
                 return Err(ApiError::with_diagnostics(
-                    Error::RuntimeOperationFailed {
-                        runtime_id,
-                        code: "remote_runtime_delete_blocked".to_string(),
-                        message: "Remote Runtime has active workers".to_string(),
-                    },
+                    Error::RuntimeBindingConflict(
+                        "runtime_removal_active_worker_blocked".to_string(),
+                    ),
                     diagnostics,
                 ));
             }
         }
+        match api
+            .store
+            .commit_runtime_binding_removal(&operation.operation_id)
+            .await
+        {
+            Ok(operation) => operation,
+            Err(error) => {
+                let _ = api
+                    .store
+                    .mark_runtime_removal_failed(
+                        &operation.operation_id,
+                        "runtime_removal_commit_failed",
+                    )
+                    .await;
+                let restore_result = api.register_workspace_runtime_binding(binding, true);
+                if let Err(restore_error) = restore_result {
+                    tracing::warn!(
+                        workspace_id = %operation.workspace_id,
+                        runtime_id = %operation.runtime_id,
+                        operation_id = %operation.operation_id,
+                        error = %restore_error,
+                        "failed to restore Runtime registration after removal commit failure"
+                    );
+                }
+                return Err(error.into());
+            }
+        }
+    } else {
+        operation
+    };
+
+    if operation.state != RuntimeRemovalOperationState::CleanupPending {
+        return Err(Error::RuntimeBindingConflict(
+            "runtime_removal_operation_not_cleanup_pending".to_string(),
+        )
+        .into());
     }
-    if !api
+    api.runtime_binding_expectations
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(operation.workspace_id.clone(), operation.runtime_id.clone()));
+    api.runtime_subscription_broker
+        .unregister_runtime(&operation.runtime_id);
+    api.store
+        .complete_runtime_removal(&operation.operation_id, true)
+        .await
+        .map_err(Into::into)
+}
+
+async fn recover_runtime_removals(api: &WorkspaceApi) {
+    let operations = match api
         .store
-        .delete_workspace_runtime_binding(&api.config.workspace_id, &runtime_id)
-        .await?
+        .list_resumable_runtime_removals(&api.config.workspace_id)
+        .await
     {
-        return Err(Error::UnknownRuntime(runtime_id).into());
+        Ok(operations) => operations,
+        Err(error) => {
+            tracing::warn!(
+                workspace_id = %api.config.workspace_id,
+                error = %error,
+                "failed to list resumable Runtime removal operations"
+            );
+            return;
+        }
+    };
+    for operation in operations {
+        let operation_id = operation.operation_id.clone();
+        let runtime_id = operation.runtime_id.clone();
+        if let Err(error) = execute_runtime_removal(api, operation).await {
+            tracing::warn!(
+                workspace_id = %api.config.workspace_id,
+                runtime_id = %runtime_id,
+                operation_id = %operation_id,
+                error = ?error,
+                "Runtime removal recovery remains incomplete"
+            );
+        }
     }
-    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_remote_runtime(
+    State(api): State<WorkspaceApi>,
+    AxumPath(runtime_id): AxumPath<String>,
+    Json(request): Json<RemoveRuntimeRequest>,
+) -> ApiResult<Json<RuntimeRemovalOperationResponse>> {
+    if runtime_id == EMBEDDED_WORKER_RUNTIME_ID {
+        return Err(settings_bad_request(
+            "embedded_runtime_not_config_managed",
+            "the embedded Runtime is built in and cannot be removed",
+        ));
+    }
+    if request.operation_id.is_empty() || request.operation_id.len() > 128 {
+        return Err(Error::InvalidInput(
+            "operation_id must contain between 1 and 128 bytes".to_string(),
+        )
+        .into());
+    }
+    let request_fingerprint = runtime_removal_fingerprint(
+        &api.config.workspace_id,
+        &runtime_id,
+        request.expected_binding_revision,
+    );
+    if let Some(existing) = api.store.get_runtime_removal(&request.operation_id).await? {
+        if existing.workspace_id != api.config.workspace_id
+            || existing.runtime_id != runtime_id
+            || existing.request_fingerprint != request_fingerprint
+            || existing.expected_binding_revision != request.expected_binding_revision
+        {
+            return Err(Error::RuntimeBindingConflict(
+                "runtime_removal_operation_id_reused".to_string(),
+            )
+            .into());
+        }
+        let existing = if existing.state == RuntimeRemovalOperationState::Failed {
+            api.store
+                .reserve_runtime_removal(
+                    &existing.workspace_id,
+                    &existing.runtime_id,
+                    &existing.operation_id,
+                    &existing.request_fingerprint,
+                    existing.expected_binding_revision,
+                    existing.config_revision,
+                )
+                .await?
+                .operation
+        } else {
+            existing
+        };
+        let operation = execute_runtime_removal(&api, existing).await?;
+        return Ok(Json(runtime_removal_response(operation)));
+    }
+
+    let config_state = api
+        .config_store
+        .load_workspace_config(&api.config.workspace_id)?
+        .ok_or_else(|| {
+            Error::RegistryInconsistency(format!(
+                "Workspace {} has no active configuration",
+                api.config.workspace_id
+            ))
+        })?;
+    let runtime_projection = crate::runtime_settings::project_runtime_from_workspace_config(
+        &api.config.workspace_id,
+        &config_state,
+    )?;
+    if runtime_projection.default_runtime_id.as_deref() == Some(runtime_id.as_str()) {
+        return Err(Error::RuntimeBindingConflict(
+            "runtime_removal_config_reference_blocked".to_string(),
+        )
+        .into());
+    }
+    let reservation = api
+        .store
+        .reserve_runtime_removal(
+            &api.config.workspace_id,
+            &runtime_id,
+            &request.operation_id,
+            &request_fingerprint,
+            request.expected_binding_revision,
+            config_state.snapshot.revision,
+        )
+        .await?;
+    let operation = execute_runtime_removal(&api, reservation.operation).await?;
+    Ok(Json(runtime_removal_response(operation)))
 }
 
 async fn perform_workspace_runtime_verification(
@@ -25778,6 +26006,38 @@ mod tests {
             .unwrap();
     }
 
+    async fn register_test_runtime(api: &WorkspaceApi, runtime_id: &str) {
+        let identity = RuntimeIdentityMaterial::generate(runtime_id).unwrap();
+        let binding = WorkspaceRuntimeBinding {
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            runtime_id: runtime_id.to_string(),
+            display_name: format!("{runtime_id} display"),
+            base_url: "https://runtime.example.invalid".to_string(),
+            public_key: identity.public_key,
+            public_key_fingerprint: String::new(),
+            binding_revision: 1,
+            state: StoredRuntimeBindingState::Verified,
+            authentication_mode: StoredRuntimeAuthenticationMode::LegacyServerIssuer,
+            workspace_key_id: None,
+            workspace_key_generation: None,
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+            revoked_at: None,
+        };
+        api.store
+            .upsert_workspace_runtime_binding_record(binding.clone(), false)
+            .await
+            .unwrap();
+        api.runtime.register_or_replace(
+            RemoteWorkerRuntime::new(
+                remote_runtime_config_from_binding(&binding).unwrap(),
+                TEST_WORKSPACE_ID.to_string(),
+                "http://127.0.0.1:8787".to_string(),
+            )
+            .unwrap(),
+        );
+    }
+
     fn assign_test_orchestrator(api: &WorkspaceApi, ticket_id: &str) {
         api.store
             .set_current_ticket_role_assignment(
@@ -28920,7 +29180,10 @@ mod tests {
             app.clone(),
             "DELETE",
             &format!("{runtimes_uri}/{EMBEDDED_WORKER_RUNTIME_ID}"),
-            None,
+            Some(serde_json::json!({
+                "operation_id": "remove-embedded",
+                "expected_binding_revision": 1
+            })),
             StatusCode::BAD_REQUEST,
         )
         .await;
@@ -28988,25 +29251,30 @@ mod tests {
             .expect("team runtime launch option");
         assert_eq!(team_runtime["working_directory_required"], true);
 
-        api.store
-            .revoke_workspace_runtime_binding_key(
-                TEST_WORKSPACE_ID,
-                "team-runtime",
-                1,
-                &format!("account-{TEST_WORKSPACE_ID}"),
-                &Utc::now().to_rfc3339(),
-            )
-            .await
-            .unwrap();
+        let removal_request = serde_json::json!({
+            "operation_id": "remove-team-runtime",
+            "expected_binding_revision": 1
+        });
         let deleted = request_json(
             app.clone(),
             "DELETE",
             &format!("{runtimes_uri}/team-runtime"),
-            None,
-            StatusCode::NO_CONTENT,
+            Some(removal_request.clone()),
+            StatusCode::OK,
         )
         .await;
-        assert_eq!(deleted["message"], "");
+        assert_eq!(deleted["state"], "succeeded");
+        assert_eq!(deleted["binding_removed"], true);
+        assert_eq!(deleted["runtime_registration_removed"], true);
+        let replay = request_json(
+            app.clone(),
+            "DELETE",
+            &format!("{runtimes_uri}/team-runtime"),
+            Some(removal_request),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(replay, deleted);
         let launch_options = get_json(app.clone(), "/api/workers/launch-options").await;
         assert!(
             !launch_options["runtimes"]
@@ -29020,6 +29288,120 @@ mod tests {
             .await
             .unwrap();
         assert!(persisted.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_removal_config_and_revision_guards_preserve_active_trust() {
+        let root = tempfile::tempdir().unwrap();
+        let api = test_api(root.path()).await;
+        register_test_runtime(&api, "guarded-runtime").await;
+        let app = build_inner_router(api.clone()).layer(Extension(test_owner_actor()));
+        let runtimes_uri = format!("/api/w/{TEST_WORKSPACE_ID}/runtimes");
+
+        let stale = request_json(
+            app.clone(),
+            "DELETE",
+            &format!("{runtimes_uri}/guarded-runtime"),
+            Some(serde_json::json!({
+                "operation_id": "remove-guarded-stale",
+                "expected_binding_revision": 2
+            })),
+            StatusCode::CONFLICT,
+        )
+        .await;
+        assert!(
+            stale.to_string().contains("revision conflict"),
+            "unexpected stale-revision response: {stale}"
+        );
+        let binding = api
+            .store
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, "guarded-runtime")
+            .await
+            .unwrap()
+            .expect("stale removal must preserve binding");
+        assert_eq!(binding.binding_revision, 1);
+        assert!(binding.revoked_at.is_none());
+
+        set_test_default_runtime(&api, "guarded-runtime");
+        let referenced = request_json(
+            app,
+            "DELETE",
+            &format!("{runtimes_uri}/guarded-runtime"),
+            Some(serde_json::json!({
+                "operation_id": "remove-guarded-referenced",
+                "expected_binding_revision": 1
+            })),
+            StatusCode::CONFLICT,
+        )
+        .await;
+        assert!(
+            referenced
+                .to_string()
+                .contains("runtime_removal_config_reference_blocked"),
+            "unexpected config-reference response: {referenced}"
+        );
+        let binding = api
+            .store
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, "guarded-runtime")
+            .await
+            .unwrap()
+            .expect("config-blocked removal must preserve binding");
+        assert_eq!(binding.binding_revision, 1);
+        assert!(binding.revoked_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_recovers_runtime_removal_after_binding_checkpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let api = test_api(root.path()).await;
+        register_test_runtime(&api, "recover-runtime").await;
+        let config_revision = api
+            .config_store
+            .load_workspace_config(TEST_WORKSPACE_ID)
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .revision;
+        api.store
+            .reserve_runtime_removal(
+                TEST_WORKSPACE_ID,
+                "recover-runtime",
+                "remove-recover-runtime",
+                &runtime_removal_fingerprint(TEST_WORKSPACE_ID, "recover-runtime", 1),
+                1,
+                config_revision,
+            )
+            .await
+            .unwrap();
+        let checkpoint = api
+            .store
+            .commit_runtime_binding_removal("remove-recover-runtime")
+            .await
+            .unwrap();
+        assert_eq!(
+            checkpoint.state,
+            RuntimeRemovalOperationState::CleanupPending
+        );
+        drop(api);
+
+        let recovered = test_api(root.path()).await;
+        let operation = recovered
+            .store
+            .get_runtime_removal("remove-recover-runtime")
+            .await
+            .unwrap()
+            .expect("recovered removal operation must remain auditable");
+        assert_eq!(operation.state, RuntimeRemovalOperationState::Succeeded);
+        assert!(operation.binding_removed);
+        assert_eq!(operation.runtime_registration_removed, Some(true));
+        assert!(
+            recovered
+                .store
+                .get_workspace_runtime_binding(TEST_WORKSPACE_ID, "recover-runtime")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -29069,17 +29451,7 @@ mod tests {
             )
             .unwrap(),
         );
-        api.store
-            .revoke_workspace_runtime_binding_key(
-                TEST_WORKSPACE_ID,
-                "busy-runtime",
-                1,
-                &format!("account-{TEST_WORKSPACE_ID}"),
-                &Utc::now().to_rfc3339(),
-            )
-            .await
-            .unwrap();
-        let app = build_inner_router(api).layer(Extension(test_owner_actor()));
+        let app = build_inner_router(api.clone()).layer(Extension(test_owner_actor()));
         let workers = get_json(app.clone(), "/api/workers").await;
         assert!(
             workers["items"]
@@ -29094,7 +29466,10 @@ mod tests {
             app,
             "DELETE",
             &format!("/api/w/{TEST_WORKSPACE_ID}/runtimes/busy-runtime"),
-            None,
+            Some(serde_json::json!({
+                "operation_id": "remove-busy-runtime",
+                "expected_binding_revision": 1
+            })),
             StatusCode::CONFLICT,
         )
         .await;
@@ -29102,15 +29477,16 @@ mod tests {
             response["message"]
                 .as_str()
                 .unwrap()
-                .contains("remote_runtime_delete_blocked")
+                .contains("runtime_removal_active_worker_blocked")
         );
-        assert!(
-            response["diagnostics"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|diagnostic| { diagnostic["code"] == "remote_runtime_delete_blocked" })
-        );
+        let persisted = api
+            .store
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, "busy-runtime")
+            .await
+            .unwrap()
+            .expect("busy Runtime binding must remain after rejected removal");
+        assert_eq!(persisted.binding_revision, 1);
+        assert!(persisted.revoked_at.is_none());
     }
 
     async fn run_runtime_connection_test(
