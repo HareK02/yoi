@@ -55,6 +55,8 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "typed_ticket_relations",
     "typed_ticket_risk_flags",
     "typed_tickets",
+    "workdir_create_credential_candidates",
+    "workdir_create_credential_revision_retentions",
     "workdir_create_operations",
     "workdir_registry",
     "workdir_removal_operations",

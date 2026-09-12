@@ -628,6 +628,42 @@ CREATE TABLE workdir_create_operations (
             PRIMARY KEY (workspace_id, operation_id),
             UNIQUE (workspace_id, working_directory_id)
         );
+CREATE TABLE workdir_create_credential_candidates (
+    workspace_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal < 2),
+    role TEXT NOT NULL CHECK (role IN ('primary', 'workspace_default_fallback')),
+    credential_id TEXT NOT NULL CHECK (length(credential_id) BETWEEN 1 AND 128),
+    credential_revision INTEGER NOT NULL CHECK (credential_revision > 0),
+    PRIMARY KEY (workspace_id, operation_id, ordinal),
+    UNIQUE (workspace_id, operation_id, role),
+    UNIQUE (workspace_id, operation_id, credential_id),
+    FOREIGN KEY (workspace_id, operation_id)
+        REFERENCES workdir_create_operations(workspace_id, operation_id)
+        ON DELETE CASCADE
+);
+CREATE INDEX idx_workdir_create_credential_candidates_revision
+    ON workdir_create_credential_candidates(
+        workspace_id, credential_id, credential_revision
+    );
+CREATE TABLE workdir_create_credential_revision_retentions (
+    workspace_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    credential_id TEXT NOT NULL,
+    credential_revision INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, operation_id, ordinal),
+    FOREIGN KEY (workspace_id, operation_id, ordinal)
+        REFERENCES workdir_create_credential_candidates(
+            workspace_id, operation_id, ordinal
+        )
+        ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, credential_id, credential_revision)
+        REFERENCES repository_ssh_credential_revisions(
+            workspace_id, credential_id, revision
+        )
+        ON DELETE RESTRICT
+);
 CREATE TABLE "workdir_registry" (
     workspace_id TEXT NOT NULL,
     workdir_id TEXT NOT NULL,

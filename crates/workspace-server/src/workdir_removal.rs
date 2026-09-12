@@ -1098,6 +1098,7 @@ mod tests {
             host_trust_id: None,
             host_trust_revision: None,
             repository_access_mode: None,
+            credential_candidates: Vec::new(),
             working_directory_id: "workdir-a".to_string(),
             state: "pending".to_string(),
             failure: None,
