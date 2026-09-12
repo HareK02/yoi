@@ -7,7 +7,11 @@
   import { parseRepositorySshHostTrust } from '$lib/workspace/api/repository-access';
   import { formatDate, workspaceApiPath } from '$lib/workspace/api/http';
   import { parseRepositorySshConnectionProbeResponse } from '$lib/workspace/api/workspace-model';
-  import { repositorySshProbeRuntimes } from '$lib/workspace/repositories/ssh-connection';
+  import {
+    changeRepositorySshProbeRuntime,
+    RepositorySshProbeFence,
+    repositorySshProbeRuntimes
+  } from '$lib/workspace/repositories/ssh-connection';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
@@ -16,11 +20,28 @@
   let selectedHostKey = $state('');
   let pending = $state(false);
   let connectionMessage = $state<string | null>(null);
+  const probeFence = new RepositorySshProbeFence();
   const probeRuntimes = $derived(data.runtimes ? repositorySshProbeRuntimes(data.runtimes.items) : []);
+
+  function selectRuntime(runtimeId: string) {
+    const selection = changeRepositorySshProbeRuntime(
+      selectedRuntimeId,
+      runtimeId,
+      probe,
+      selectedHostKey
+    );
+    if (!selection.changed) return;
+    selectedRuntimeId = selection.runtimeId;
+    probe = selection.probe;
+    selectedHostKey = selection.selectedHostKey;
+    probeFence.enter(runtimeId);
+    connectionMessage = null;
+    pending = false;
+  }
 
   $effect(() => {
     if (!selectedRuntimeId) {
-      selectedRuntimeId = probeRuntimes[0]?.runtime_id ?? '';
+      selectRuntime(probeRuntimes[0]?.runtime_id ?? '');
     }
   });
 
@@ -45,42 +66,52 @@
   }
 
   async function runConnectionTest() {
+    const operation = probeFence.capture(selectedRuntimeId);
     pending = true;
     connectionMessage = null;
     probe = null;
     selectedHostKey = '';
     try {
-      const body: RepositorySshConnectionProbeRequest = { runtime_id: selectedRuntimeId };
-      probe = parseRepositorySshConnectionProbeResponse(await requestConnectionTest('POST', body));
+      const body: RepositorySshConnectionProbeRequest = { runtime_id: operation.runtimeId };
+      const nextProbe = parseRepositorySshConnectionProbeResponse(await requestConnectionTest('POST', body));
+      if (!probeFence.isCurrent(operation, selectedRuntimeId)) return;
+      if (nextProbe.runtime_id !== operation.runtimeId) {
+        throw new Error('SSH connection test returned a different Runtime');
+      }
+      probe = nextProbe;
       selectedHostKey = probe.candidates[0]?.host_key ?? '';
       connectionMessage = probe.trust_state === 'verified'
         ? 'The observed SSH host key matches the Workspace trust record.'
         : 'Review the observed fingerprint before trusting this SSH host.';
     } catch (error) {
+      if (!probeFence.isCurrent(operation, selectedRuntimeId)) return;
       connectionMessage = error instanceof Error ? error.message : 'SSH connection test failed';
     } finally {
-      pending = false;
+      if (probeFence.isCurrent(operation, selectedRuntimeId)) pending = false;
     }
   }
 
   async function confirmHostTrust() {
-    if (!probe || !selectedHostKey) return;
+    if (!probe || !selectedHostKey || probe.runtime_id !== selectedRuntimeId) return;
+    const operation = probeFence.capture(selectedRuntimeId);
     pending = true;
     connectionMessage = null;
     try {
       const body: ConfirmRepositorySshHostTrustRequest = {
         operation_id: `repository-ssh-confirm-${crypto.randomUUID()}`,
-        runtime_id: probe.runtime_id,
+        runtime_id: operation.runtimeId,
         host_key: selectedHostKey,
         expected_host_trust_revision: probe.expected_host_trust_revision
       };
       parseRepositorySshHostTrust(await requestConnectionTest('PUT', body));
+      if (!probeFence.isCurrent(operation, selectedRuntimeId)) return;
       probe = { ...probe, trust_state: 'verified' };
       connectionMessage = 'SSH host trust saved. Future connections must present this key.';
     } catch (error) {
+      if (!probeFence.isCurrent(operation, selectedRuntimeId)) return;
       connectionMessage = error instanceof Error ? error.message : 'Failed to save SSH host trust';
     } finally {
-      pending = false;
+      if (probeFence.isCurrent(operation, selectedRuntimeId)) pending = false;
     }
   }
 </script>
@@ -167,7 +198,7 @@
     {:else if data.runtimes}
       <label>
         <span>Runtime</span>
-        <select bind:value={selectedRuntimeId} disabled={pending}>
+        <select value={selectedRuntimeId} onchange={(event) => selectRuntime(event.currentTarget.value)}>
           {#each probeRuntimes as runtime}
             <option value={runtime.runtime_id}>{runtime.label} · {runtime.runtime_id}</option>
           {/each}
