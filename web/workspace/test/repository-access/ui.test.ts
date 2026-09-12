@@ -90,6 +90,46 @@ test("Repository Access generates and copies selectable public keys", () => {
   );
 });
 
+test("Repository Access hides Rotate for the Workspace default credential", () => {
+  const credentialsStart = source.indexOf("<h3>SSH credentials</h3>");
+  const generateStart = source.indexOf(
+    "<h3>Generate Repository SSH credential</h3>",
+  );
+  assert(
+    credentialsStart >= 0 && generateStart > credentialsStart,
+    "credential list should appear before the generation form",
+  );
+
+  const credentialList = source.slice(credentialsStart, generateStart);
+  const additionalCredentialGuard = credentialList.indexOf(
+    "{#if credential.credential_id !== workspaceDefaultCredentialId}",
+  );
+  const rotateAction = credentialList.indexOf(
+    "rotateCredentialId = rotateCredentialId === credential.credential_id",
+    additionalCredentialGuard,
+  );
+  const deleteAction = credentialList.indexOf(
+    "onclick={() => void deleteCredential(credential)}",
+    rotateAction,
+  );
+  const guardEnd = credentialList.indexOf("{/if}", deleteAction);
+
+  assert(
+    additionalCredentialGuard >= 0 &&
+      rotateAction > additionalCredentialGuard &&
+      deleteAction > rotateAction &&
+      guardEnd > deleteAction,
+    "Rotate and Delete should render only for additional credentials",
+  );
+  assert(
+    credentialList.indexOf(
+      "{#if rotateCredentialId === credential.credential_id}",
+      guardEnd,
+    ) > guardEnd,
+    "the existing rotation form should remain available after selecting an additional credential",
+  );
+});
+
 test("Repository credential submissions clear write-only fields in finally blocks", () => {
   const createStart = source.indexOf("async function createCredential()");
   const rotateStart = source.indexOf("async function rotateCredential(");
