@@ -1,7 +1,11 @@
 import { assert, assertEquals } from "jsr:@std/assert";
 import type { WorkspaceRuntimeResource } from "../src/lib/generated/workspace-api.ts";
 import { parseRepositorySshConnectionProbeResponse } from "../src/lib/workspace/api/workspace-model.ts";
-import { repositorySshProbeRuntimes } from "../src/lib/workspace/repositories/ssh-connection.ts";
+import {
+  changeRepositorySshProbeRuntime,
+  RepositorySshProbeFence,
+  repositorySshProbeRuntimes,
+} from "../src/lib/workspace/repositories/ssh-connection.ts";
 
 const root = new URL("../", import.meta.url);
 const pageSource = await Deno.readTextFile(
@@ -82,6 +86,47 @@ Deno.test("Repository SSH probe offers configured remote Runtimes regardless of 
     ) => runtime.runtime_id),
     ["arcadia"],
   );
+});
+
+Deno.test("changing the SSH probe Runtime clears the prior result and confirmation key", () => {
+  const runtimeAProbe = {
+    runtime_id: "runtime-a",
+    candidates: [{ host_key: "ssh-ed25519 runtime-a" }],
+  };
+
+  assertEquals(
+    changeRepositorySshProbeRuntime(
+      "runtime-a",
+      "runtime-b",
+      runtimeAProbe,
+      "ssh-ed25519 runtime-a",
+    ),
+    {
+      changed: true,
+      runtimeId: "runtime-b",
+      probe: null,
+      selectedHostKey: "",
+    },
+  );
+});
+
+Deno.test("a delayed SSH probe response cannot apply after the Runtime changes", async () => {
+  const fence = new RepositorySshProbeFence();
+  const operation = fence.capture("runtime-a");
+  let renderedRuntimeId: string | null = null;
+  let resolveProbe!: (runtimeId: string) => void;
+  const delayedProbe = new Promise<string>((resolve) => {
+    resolveProbe = resolve;
+  }).then((runtimeId) => {
+    if (fence.isCurrent(operation, "runtime-b")) {
+      renderedRuntimeId = runtimeId;
+    }
+  });
+
+  fence.enter("runtime-b");
+  resolveProbe("runtime-a");
+  await delayedProbe;
+  assertEquals(renderedRuntimeId, null);
 });
 
 Deno.test("Repository SSH connection test requires an explicit host-key confirmation", () => {
