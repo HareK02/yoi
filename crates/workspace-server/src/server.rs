@@ -2141,7 +2141,14 @@ impl WorkspaceApi {
                     EMBEDDED_RUNTIME_ID,
                     worker_remove_dispatcher.clone(),
                 )
-                .with_runtime_request_identity(embedded_identity, embedded_request_audience)
+                .with_workspace_request_client(
+                    worker_runtime::workspace_request::RuntimeWorkspaceRequestClient::new(
+                        config.workspace_id.clone(),
+                        embedded_request_audience.clone(),
+                        EMBEDDED_RUNTIME_ID,
+                    )
+                    .with_runtime_request_source(&embedded_identity, embedded_request_audience),
+                )
                 .with_runtime_store_dir(config.embedded_runtime_store_root.clone())
                 .with_controller_transport(worker::WorkerControllerTransport::InProcess)
                 .with_resource_client(Arc::new(resource_broker.clone())),
@@ -27993,7 +28000,14 @@ mod tests {
             format!("http://{addr}/api/runtime/v1/workspaces/{TEST_WORKSPACE_ID}/resources/fetch"),
             None,
         )
-        .with_runtime_request_source(&identity, "server-test");
+        .with_workspace_request_client(
+            worker_runtime::workspace_request::RuntimeWorkspaceRequestClient::new(
+                TEST_WORKSPACE_ID,
+                format!("http://{addr}"),
+                runtime_id,
+            )
+            .with_runtime_request_source(&identity, "server-test"),
+        );
 
         let response = client
             .fetch_resource(worker_runtime::resource::BackendResourceFetchRequest {

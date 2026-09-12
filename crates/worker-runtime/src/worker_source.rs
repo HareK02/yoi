@@ -1,16 +1,16 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::workspace_request::{RuntimeWorkspaceRequest, RuntimeWorkspaceRequestClient};
 use worker::{
     WorkspaceClient, WorkspaceClientError, WorkspacePromptCatalogResolution,
     WorkspacePromptProjection, WorkspaceRequest, WorkspaceRequestMethod, WorkspaceResponse,
 };
 
 use crate::auth::{
-    RUNTIME_REQUEST_SOURCE_PROOF_HEADER, RuntimeAuthError, RuntimeIdentityMaterial,
-    RuntimeRequestSourceSigner, RuntimeWorkerMutationSourceSigner, WORKER_REMOVE_PERMISSION,
-    WORKSPACE_REQUEST_PERMISSION, WORKSPACE_WORKER_DISCOVERY_PERMISSION, WorkerMutationActorKind,
-    WorkerMutationOperation, WorkerMutationSourceClaims, new_token_id,
+    RuntimeAuthError, RuntimeIdentityMaterial, RuntimeWorkerMutationSourceSigner,
+    WORKER_REMOVE_PERMISSION, WORKSPACE_REQUEST_PERMISSION, WORKSPACE_WORKER_DISCOVERY_PERMISSION,
+    WorkerMutationActorKind, WorkerMutationOperation, WorkerMutationSourceClaims, new_token_id,
 };
 use crate::runtime::RuntimeWorkspaceScope;
 use crate::worker_backend::WorkspacePromptProjectionCache;
@@ -133,9 +133,7 @@ pub trait EmbeddedWorkerMutationDispatcher: Send + Sync {
 #[derive(Clone)]
 enum RuntimeWorkerMutationTransport {
     Remote {
-        base_url: String,
-        request_source_signer: RuntimeRequestSourceSigner,
-        request_source_audience: String,
+        request_client: RuntimeWorkspaceRequestClient,
     },
     Embedded {
         dispatcher: Arc<dyn EmbeddedWorkerMutationDispatcher>,
@@ -155,17 +153,13 @@ impl RuntimeWorkerMutationForwarder {
         identity: &RuntimeIdentityMaterial,
         scope: RuntimeWorkspaceScope,
         source_worker_id: impl Into<String>,
-        base_url: impl Into<String>,
+        request_client: RuntimeWorkspaceRequestClient,
     ) -> Self {
         Self {
             authority: RuntimeWorkerMutationSourceAuthority::remote(identity),
             scope: scope.clone(),
             source_worker_id: source_worker_id.into(),
-            transport: RuntimeWorkerMutationTransport::Remote {
-                base_url: base_url.into().trim_end_matches('/').to_string(),
-                request_source_signer: RuntimeRequestSourceSigner::from_identity(identity),
-                request_source_audience: scope.server_id,
-            },
+            transport: RuntimeWorkerMutationTransport::Remote { request_client },
         }
     }
 
@@ -201,18 +195,11 @@ impl RuntimeWorkerMutationForwarder {
         )?;
         match (&self.transport, proof) {
             (
-                RuntimeWorkerMutationTransport::Remote {
-                    base_url,
-                    request_source_signer,
-                    request_source_audience,
-                },
+                RuntimeWorkerMutationTransport::Remote { request_client },
                 RuntimeOwnedWorkerMutationProof::Remote(token),
             ) => execute_remote_worker_remove_http(RemoteWorkerRemoveHttpRequest {
-                base_url: base_url.clone(),
-                workspace_id: self.scope.workspace_id.clone(),
+                request_client: request_client.clone(),
                 source_worker_id: self.source_worker_id.clone(),
-                request_source_signer: request_source_signer.clone(),
-                request_source_audience: request_source_audience.clone(),
                 token,
                 target_runtime_id: target_runtime_id.to_string(),
                 target_worker_id: target_worker_id.to_string(),
@@ -233,11 +220,8 @@ impl RuntimeWorkerMutationForwarder {
 }
 
 struct RemoteWorkerRemoveHttpRequest {
-    base_url: String,
-    workspace_id: String,
+    request_client: RuntimeWorkspaceRequestClient,
     source_worker_id: String,
-    request_source_signer: RuntimeRequestSourceSigner,
-    request_source_audience: String,
     token: String,
     target_runtime_id: String,
     target_worker_id: String,
@@ -270,54 +254,54 @@ fn execute_remote_worker_remove_http(
 fn execute_remote_worker_remove_http_blocking(
     request: RemoteWorkerRemoveHttpRequest,
 ) -> Result<WorkspaceResponse, RuntimeWorkerMutationForwardError> {
-    let path = format!("/api/w/{}/workers/remove", request.workspace_id);
-    let url = format!("{}{}", request.base_url, path);
-    let body = serde_json::to_string(&serde_json::json!({
+    let path = format!(
+        "/api/w/{}/workers/remove",
+        request.request_client.workspace_id()
+    );
+    let body = serde_json::to_vec(&serde_json::json!({
         "target_runtime_id": request.target_runtime_id,
         "target_worker_id": request.target_worker_id,
         "reason": request.reason,
     }))
     .map_err(|error| RuntimeWorkerMutationForwardError::Transport(error.to_string()))?;
-    let request_source_proof = request.request_source_signer.issue(
-        &request.request_source_audience,
-        &request.workspace_id,
-        Some(&request.source_worker_id),
-        WORKSPACE_REQUEST_PERMISSION,
-        "POST",
-        &path,
-        body.as_bytes(),
-        i64::try_from(unix_now_seconds()).unwrap_or(i64::MAX),
-        30,
-    )?;
-    let client = reqwest::blocking::Client::new();
-    let response = client
-        .post(url)
-        .header(RUNTIME_REQUEST_SOURCE_PROOF_HEADER, request_source_proof)
-        .header(
-            crate::auth::WORKER_MUTATION_SOURCE_PROOF_HEADER,
-            request.token,
-        )
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .send()
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        crate::auth::WORKER_MUTATION_SOURCE_PROOF_HEADER,
+        reqwest::header::HeaderValue::from_str(&request.token)
+            .map_err(|error| RuntimeWorkerMutationForwardError::Transport(error.to_string()))?,
+    );
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    let response = request
+        .request_client
+        .execute_blocking(RuntimeWorkspaceRequest {
+            method: reqwest::Method::POST,
+            path_and_query: path,
+            body,
+            headers,
+            permission: WORKSPACE_REQUEST_PERMISSION.to_string(),
+            worker_id: Some(request.source_worker_id),
+            timeout: Some(Duration::from_secs(5)),
+            max_response_bytes: 8 * 1024 * 1024,
+        })
         .map_err(|error| RuntimeWorkerMutationForwardError::Transport(error.to_string()))?;
-    let status = response.status().as_u16();
-    let body = response
-        .text()
+    let body = String::from_utf8(response.body)
         .map_err(|error| RuntimeWorkerMutationForwardError::Transport(error.to_string()))?;
-    Ok(WorkspaceResponse { status, body })
+    Ok(WorkspaceResponse {
+        status: response.status.as_u16(),
+        body,
+    })
 }
 
 #[derive(Clone)]
 pub struct RuntimeOwnedWorkspaceClient {
     workspace_id: String,
-    base_url: String,
-    runtime_id: String,
+    request_client: RuntimeWorkspaceRequestClient,
     worker_id: String,
     request_timeout: Option<Duration>,
     worker_remove: Option<RuntimeWorkerMutationForwarder>,
-    request_source_signer: Option<RuntimeRequestSourceSigner>,
-    request_source_audience: Option<String>,
     prompt_projection_cache: Option<Arc<WorkspacePromptProjectionCache>>,
 }
 
@@ -328,15 +312,32 @@ impl RuntimeOwnedWorkspaceClient {
         runtime_id: impl Into<String>,
         worker_id: impl Into<String>,
     ) -> Self {
+        let workspace_id = workspace_id.into();
         Self {
-            workspace_id: workspace_id.into(),
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-            runtime_id: runtime_id.into(),
+            request_client: RuntimeWorkspaceRequestClient::new(
+                workspace_id.clone(),
+                base_url,
+                runtime_id,
+            ),
+            workspace_id,
             worker_id: worker_id.into(),
             request_timeout: None,
             worker_remove: None,
-            request_source_signer: None,
-            request_source_audience: None,
+            prompt_projection_cache: None,
+        }
+    }
+
+    pub(crate) fn from_request_client(
+        request_client: RuntimeWorkspaceRequestClient,
+        worker_id: impl Into<String>,
+    ) -> Self {
+        let workspace_id = request_client.workspace_id().to_string();
+        Self {
+            workspace_id,
+            request_client,
+            worker_id: worker_id.into(),
+            request_timeout: None,
+            worker_remove: None,
             prompt_projection_cache: None,
         }
     }
@@ -351,8 +352,9 @@ impl RuntimeOwnedWorkspaceClient {
         identity: &RuntimeIdentityMaterial,
         audience: impl Into<String>,
     ) -> Self {
-        self.request_source_signer = Some(RuntimeRequestSourceSigner::from_identity(identity));
-        self.request_source_audience = Some(audience.into());
+        self.request_client = self
+            .request_client
+            .with_runtime_request_source(identity, audience);
         self
     }
 
@@ -375,44 +377,43 @@ impl RuntimeOwnedWorkspaceClient {
         request: WorkspaceRequest,
         permission: &'static str,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
-        let base_url = self.base_url.clone();
-        let workspace_id = self.workspace_id.clone();
-        let runtime_id = self.runtime_id.clone();
-        let worker_id = self.worker_id.clone();
-        let request_source_signer = self.request_source_signer.clone();
-        let request_source_audience = self.request_source_audience.clone();
-        let request_timeout = self.request_timeout;
-        if tokio::runtime::Handle::try_current().is_ok() {
-            std::thread::spawn(move || {
-                execute_runtime_owned_workspace_http(
-                    &base_url,
-                    &workspace_id,
-                    &runtime_id,
-                    &worker_id,
-                    request_source_signer.as_ref(),
-                    request_source_audience.as_deref(),
-                    request_timeout,
-                    permission,
-                    request,
-                )
-            })
-            .join()
-            .map_err(|_| {
-                WorkspaceClientError::Request("workspace request thread panicked".to_string())
-            })?
-        } else {
-            execute_runtime_owned_workspace_http(
-                &self.base_url,
-                &self.workspace_id,
-                &self.runtime_id,
-                &self.worker_id,
-                self.request_source_signer.as_ref(),
-                self.request_source_audience.as_deref(),
-                self.request_timeout,
-                permission,
-                request,
-            )
+        let method = match request.method {
+            WorkspaceRequestMethod::Get => reqwest::Method::GET,
+            WorkspaceRequestMethod::Post => reqwest::Method::POST,
+            WorkspaceRequestMethod::Put => reqwest::Method::PUT,
+            WorkspaceRequestMethod::Patch => reqwest::Method::PATCH,
+            WorkspaceRequestMethod::Delete => reqwest::Method::DELETE,
+        };
+        let body = request.body.unwrap_or_default().into_bytes();
+        let mut headers = reqwest::header::HeaderMap::new();
+        if !body.is_empty() {
+            headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                reqwest::header::HeaderValue::from_static("application/json"),
+            );
         }
+        let request_label = format!("{method} {}", request.path);
+        let response = self
+            .request_client
+            .execute_blocking(RuntimeWorkspaceRequest {
+                method,
+                path_and_query: request.path,
+                body,
+                headers,
+                permission: permission.to_string(),
+                worker_id: Some(self.worker_id.clone()),
+                timeout: self.request_timeout,
+                max_response_bytes: 8 * 1024 * 1024,
+            })
+            .map_err(|error| {
+                WorkspaceClientError::Request(format!("{request_label} failed: {error}"))
+            })?;
+        let body = String::from_utf8(response.body)
+            .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
+        Ok(WorkspaceResponse {
+            status: response.status.as_u16(),
+            body,
+        })
     }
 }
 
@@ -420,8 +421,8 @@ impl std::fmt::Debug for RuntimeOwnedWorkspaceClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RuntimeOwnedWorkspaceClient")
-            .field("workspace_id", &self.workspace_id)
-            .field("base_url", &self.base_url)
+            .field("workspace_id", &self.request_client.workspace_id())
+            .field("base_url", &self.request_client.base_url())
             .field("source", &"Runtime-owned")
             .field(
                 "worker_remove",
@@ -433,7 +434,7 @@ impl std::fmt::Debug for RuntimeOwnedWorkspaceClient {
 
 impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
     fn workspace_id(&self) -> Option<&str> {
-        Some(&self.workspace_id)
+        Some(self.request_client.workspace_id())
     }
 
     fn kind(&self) -> &str {
@@ -588,117 +589,6 @@ fn percent_encode_query(value: &str) -> String {
     encoded
 }
 
-fn execute_runtime_owned_workspace_http(
-    base_url: &str,
-    workspace_id: &str,
-    runtime_id: &str,
-    worker_id: &str,
-    request_source_signer: Option<&RuntimeRequestSourceSigner>,
-    request_source_audience: Option<&str>,
-    request_timeout: Option<Duration>,
-    permission: &'static str,
-    request: WorkspaceRequest,
-) -> Result<WorkspaceResponse, WorkspaceClientError> {
-    if !request.path.starts_with('/') || request.path.starts_with("//") {
-        return Err(WorkspaceClientError::InvalidPath(request.path));
-    }
-    let url = format!("{base_url}{}", request.path);
-    let method = match request.method {
-        WorkspaceRequestMethod::Get => reqwest::Method::GET,
-        WorkspaceRequestMethod::Post => reqwest::Method::POST,
-        WorkspaceRequestMethod::Put => reqwest::Method::PUT,
-        WorkspaceRequestMethod::Patch => reqwest::Method::PATCH,
-        WorkspaceRequestMethod::Delete => reqwest::Method::DELETE,
-    };
-    let client = reqwest::blocking::Client::builder()
-        .timeout(request_timeout)
-        .build()
-        .map_err(|error| {
-            WorkspaceClientError::Unavailable(format!(
-                "failed to build Workspace API HTTP client: {}",
-                reqwest_error_chain(&error)
-            ))
-        })?;
-    let request_label = format!("{method} {}", request.path);
-    let body = request.body.unwrap_or_default();
-    let mut request_builder = client
-        .request(method.clone(), url)
-        .header("x-yoi-runtime-id", runtime_id)
-        .header("x-yoi-worker-id", worker_id);
-    if let Some(signer) = request_source_signer {
-        let audience = request_source_audience.ok_or_else(|| {
-            WorkspaceClientError::Request(
-                "runtime request proof audience is unavailable".to_owned(),
-            )
-        })?;
-        let proof = signer
-            .issue(
-                audience,
-                workspace_id,
-                Some(worker_id),
-                permission,
-                method.as_str(),
-                &request.path,
-                body.as_bytes(),
-                i64::try_from(unix_now_seconds()).unwrap_or(i64::MAX),
-                30,
-            )
-            .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
-        request_builder = request_builder.header(RUNTIME_REQUEST_SOURCE_PROOF_HEADER, proof);
-    }
-    if !body.is_empty() {
-        request_builder = request_builder
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body);
-    }
-    let response = request_builder
-        .send()
-        .map_err(|error| workspace_http_error(&request_label, "waiting for response", error))?;
-    let status = response.status().as_u16();
-    let body = response
-        .text()
-        .map_err(|error| workspace_http_error(&request_label, "reading response body", error))?;
-    Ok(WorkspaceResponse { status, body })
-}
-
-fn workspace_http_error(
-    request_label: &str,
-    stage: &str,
-    error: reqwest::Error,
-) -> WorkspaceClientError {
-    let details = reqwest_error_chain(&error);
-    if error.is_timeout() {
-        WorkspaceClientError::Request(format!(
-            "Workspace API {request_label} timed out while {stage}: {details}"
-        ))
-    } else if error.is_connect() {
-        WorkspaceClientError::Unavailable(format!(
-            "Workspace API {request_label} could not connect while {stage}: {details}"
-        ))
-    } else {
-        WorkspaceClientError::Request(format!(
-            "Workspace API {request_label} transport failed while {stage}: {details}"
-        ))
-    }
-}
-
-fn reqwest_error_chain(error: &reqwest::Error) -> String {
-    let mut details = error.to_string();
-    let mut source = std::error::Error::source(error);
-    for _ in 0..4 {
-        let Some(current) = source else {
-            break;
-        };
-        let current_text = current.to_string();
-        if !current_text.is_empty() && !details.ends_with(&current_text) {
-            details.push_str(": ");
-            details.push_str(&current_text);
-        }
-        source = std::error::Error::source(current);
-    }
-    details
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeWorkerMutationForwardError {
     #[error(transparent)]
@@ -722,9 +612,9 @@ fn unix_now_seconds() -> u64 {
 mod tests {
     use super::*;
     use crate::auth::{
-        WorkerMutationSourceExpectation, decode_runtime_request_source_claims,
-        decode_worker_mutation_source_claims, request_body_digest,
-        verify_worker_mutation_source_proof,
+        RUNTIME_REQUEST_SOURCE_PROOF_HEADER, WorkerMutationSourceExpectation,
+        decode_runtime_request_source_claims, decode_worker_mutation_source_claims,
+        request_body_digest, verify_worker_mutation_source_proof,
     };
 
     #[test]
@@ -1132,7 +1022,12 @@ mod tests {
             &identity,
             scope,
             "worker-source",
-            format!("http://{address}"),
+            RuntimeWorkspaceRequestClient::new(
+                "workspace-a",
+                format!("http://{address}"),
+                "runtime-a",
+            )
+            .with_runtime_request_source(&identity, "server-a"),
         );
         let response = forwarder
             .execute_worker_remove("runtime-target", "worker-target", "retire obsolete Worker")

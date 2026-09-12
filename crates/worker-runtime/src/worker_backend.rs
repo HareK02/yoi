@@ -14,10 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::time::Duration;
 
-use crate::auth::{
-    BACKEND_RESOURCE_FETCH_PERMISSION, RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
-    RuntimeIdentityMaterial, RuntimeRequestSourceSigner, unix_now_seconds,
-};
+use crate::auth::{BACKEND_RESOURCE_FETCH_PERMISSION, RuntimeIdentityMaterial};
 use crate::catalog::{
     CreateWorkerRequest, ProfileSourceArchiveSource, RepositoryRefObservation,
     RepositoryRefObservationRequest, WorkingDirectoryRepositoryAccessRequest,
@@ -38,9 +35,8 @@ use crate::worker_source::{
 use crate::working_directory::{
     WorkingDirectoryBinding, WorkingDirectoryDiagnostic, WorkingDirectoryMaterializer,
 };
+use crate::workspace_request::{RuntimeWorkspaceRequest, RuntimeWorkspaceRequestClient};
 use async_trait::async_trait;
-#[cfg(feature = "http-server")]
-use futures::StreamExt;
 #[cfg(test)]
 use protocol::WorkerStatus;
 use protocol::{Event, Method, Segment, WorkerCommandEnvelope};
@@ -323,7 +319,7 @@ pub struct ProfileRuntimeWorkerFactory {
     prompt_projection_cache: Arc<WorkspacePromptProjectionCache>,
     runtime_id: Option<String>,
     worker_mutation_identity: Option<RuntimeIdentityMaterial>,
-    runtime_request_audience: Option<String>,
+    workspace_request_clients: Arc<HashMap<String, RuntimeWorkspaceRequestClient>>,
     embedded_worker_mutation_dispatcher: Option<Arc<dyn EmbeddedWorkerMutationDispatcher>>,
     controller_transport: WorkerControllerTransport,
 }
@@ -339,7 +335,7 @@ impl ProfileRuntimeWorkerFactory {
             prompt_projection_cache: Arc::new(WorkspacePromptProjectionCache::default()),
             runtime_id: None,
             worker_mutation_identity: None,
-            runtime_request_audience: None,
+            workspace_request_clients: Arc::new(HashMap::new()),
             embedded_worker_mutation_dispatcher: None,
             controller_transport: WorkerControllerTransport::UnixSocket,
         }
@@ -360,14 +356,10 @@ impl ProfileRuntimeWorkerFactory {
         self
     }
 
-    pub fn with_runtime_request_identity(
-        mut self,
-        identity: RuntimeIdentityMaterial,
-        audience: impl Into<String>,
-    ) -> Self {
-        self.runtime_id = Some(identity.identity_id.clone());
-        self.worker_mutation_identity = Some(identity);
-        self.runtime_request_audience = Some(audience.into());
+    pub fn with_workspace_request_client(mut self, client: RuntimeWorkspaceRequestClient) -> Self {
+        self.runtime_id = Some(client.runtime_id().to_string());
+        Arc::make_mut(&mut self.workspace_request_clients)
+            .insert(client.workspace_id().to_string(), client);
         self
     }
 
@@ -550,7 +542,7 @@ impl RuntimeWorkspaceBackendRef {
         worker_ref: &WorkerRef,
         workspace_scope: Option<&crate::runtime::RuntimeWorkspaceScope>,
         mutation_identity: Option<&RuntimeIdentityMaterial>,
-        runtime_request_audience: Option<&str>,
+        workspace_request_client: Option<&RuntimeWorkspaceRequestClient>,
         embedded_dispatcher: Option<&Arc<dyn EmbeddedWorkerMutationDispatcher>>,
         prompt_projection_cache: Option<Arc<WorkspacePromptProjectionCache>>,
     ) -> WorkerWorkspaceContext {
@@ -561,28 +553,33 @@ impl RuntimeWorkspaceBackendRef {
                 base_url,
                 runtime_id,
             } => {
-                let mut client = RuntimeOwnedWorkspaceClient::new(
-                    workspace_id.clone(),
-                    base_url.clone(),
-                    runtime_id.clone(),
-                    worker_ref.worker_id.to_string(),
-                );
+                let mut client = workspace_request_client
+                    .cloned()
+                    .map(|request_client| {
+                        RuntimeOwnedWorkspaceClient::from_request_client(
+                            request_client,
+                            worker_ref.worker_id.to_string(),
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        RuntimeOwnedWorkspaceClient::new(
+                            workspace_id.clone(),
+                            base_url.clone(),
+                            runtime_id.clone(),
+                            worker_ref.worker_id.to_string(),
+                        )
+                    });
                 if let Some(cache) = prompt_projection_cache {
                     client = client.with_prompt_projection_cache(cache);
                 }
-                if let Some(identity) = mutation_identity {
-                    let audience = runtime_request_audience
-                        .or_else(|| workspace_scope.map(|scope| scope.server_id.as_str()));
-                    if let Some(audience) = audience {
-                        client = client.with_runtime_request_source(identity, audience.to_owned());
-                    }
-                }
-                if let (Some(scope), Some(identity)) = (workspace_scope, mutation_identity) {
+                if let (Some(scope), Some(identity), Some(request_client)) =
+                    (workspace_scope, mutation_identity, workspace_request_client)
+                {
                     client = client.with_worker_remove(RuntimeWorkerMutationForwarder::remote(
                         identity,
                         scope.clone(),
                         worker_ref.worker_id.to_string(),
-                        base_url.clone(),
+                        request_client.clone(),
                     ));
                 } else if let (Some(scope), Some(dispatcher)) =
                     (workspace_scope, embedded_dispatcher)
@@ -606,10 +603,18 @@ impl RuntimeWorkspaceBackendRef {
 #[cfg(feature = "http-server")]
 async fn fetch_workspace_config_http(
     request: &WorkspaceConfigFetchRequest,
-    identity: Option<&RuntimeIdentityMaterial>,
-    audience: Option<&str>,
+    client: &RuntimeWorkspaceRequestClient,
 ) -> Result<WorkspaceConfigFetchResult, String> {
-    let mut url = reqwest::Url::parse(&request.workspace_api.base_url)
+    if !client.matches_workspace(
+        &request.workspace_api.workspace_id,
+        &request.workspace_api.base_url,
+    ) {
+        return Err(format!(
+            "Workspace request route does not match Workspace Config source: workspace={} base_url={}",
+            request.workspace_api.workspace_id, request.workspace_api.base_url
+        ));
+    }
+    let mut url = reqwest::Url::parse(client.base_url())
         .map_err(|error| format!("Workspace API base URL is invalid: {error}"))?;
     url.set_path(&format!(
         "/api/w/{}/runtime-config",
@@ -620,79 +625,48 @@ async fn fetch_workspace_config_http(
         | crate::catalog::ProfileSelector::Named(value) => value.clone(),
     };
     url.query_pairs_mut().append_pair("profile", &profile);
-
-    let path = url.path().to_owned();
-    let request_target = match url.query() {
-        Some(query) => format!("{path}?{query}"),
-        None => path.clone(),
-    };
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(WORKSPACE_CONFIG_HTTP_TIMEOUT)
-        .build()
-        .map_err(|error| format!("failed to build Workspace Config HTTP client: {error}"))?;
-    let mut http_request = client.get(url);
-    if let Some(identity) = identity {
-        let audience = audience
-            .ok_or_else(|| "Workspace Config request proof audience is unavailable".to_owned())?;
-        let proof = RuntimeRequestSourceSigner::from_identity(identity)
-            .issue(
-                audience,
-                &request.workspace_api.workspace_id,
-                None,
-                BACKEND_RESOURCE_FETCH_PERMISSION,
-                "GET",
-                &request_target,
-                b"",
-                i64::try_from(unix_now_seconds()).unwrap_or(i64::MAX),
-                30,
-            )
-            .map_err(|error| error.to_string())?;
-        http_request = http_request.header(RUNTIME_REQUEST_SOURCE_PROOF_HEADER, proof);
-    }
+    let mut headers = reqwest::header::HeaderMap::new();
     if let Some(cached) = request.cached.as_ref() {
-        http_request = http_request.header(
+        headers.insert(
             reqwest::header::IF_NONE_MATCH,
-            workspace_config_etag(&cached.digest),
+            reqwest::header::HeaderValue::from_str(&workspace_config_etag(&cached.digest))
+                .map_err(|error| format!("Workspace Config ETag is invalid: {error}"))?,
         );
     }
-
-    let response = http_request
-        .send()
+    let mut path_and_query = url.path().to_string();
+    if let Some(query) = url.query() {
+        path_and_query.push('?');
+        path_and_query.push_str(query);
+    }
+    let response = client
+        .execute(RuntimeWorkspaceRequest {
+            method: reqwest::Method::GET,
+            path_and_query,
+            body: Vec::new(),
+            headers,
+            permission: BACKEND_RESOURCE_FETCH_PERMISSION.to_string(),
+            worker_id: None,
+            timeout: Some(WORKSPACE_CONFIG_HTTP_TIMEOUT),
+            max_response_bytes: MAX_WORKSPACE_CONFIG_RESPONSE_BYTES,
+        })
         .await
         .map_err(|error| format!("failed to fetch latest Workspace Config: {error}"))?;
-    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+    if response.status == reqwest::StatusCode::NOT_MODIFIED {
         return Ok(WorkspaceConfigFetchResult::NotModified);
     }
-    if !response.status().is_success() {
+    if !response.status.is_success() {
         return Err(format!(
             "latest Workspace Config fetch failed with HTTP {}",
-            response.status()
+            response.status
         ));
     }
-    if response
-        .content_length()
-        .is_some_and(|size| size > MAX_WORKSPACE_CONFIG_RESPONSE_BYTES as u64)
-    {
-        return Err("latest Workspace Config response exceeds the size limit".to_string());
-    }
     let response_etag = response
-        .headers()
+        .headers
         .get(reqwest::header::ETAG)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string)
         .ok_or_else(|| "latest Workspace Config response is missing its ETag".to_string())?;
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|error| format!("failed to read latest Workspace Config: {error}"))?;
-        if body.len().saturating_add(chunk.len()) > MAX_WORKSPACE_CONFIG_RESPONSE_BYTES {
-            return Err("latest Workspace Config response exceeds the size limit".to_string());
-        }
-        body.extend_from_slice(&chunk);
-    }
-    let bundle = serde_json::from_slice::<ConfigBundle>(&body)
+    let bundle = serde_json::from_slice::<ConfigBundle>(&response.body)
         .map_err(|error| format!("failed to decode latest Workspace Config: {error}"))?;
     let expected_etag = workspace_config_etag(&bundle.metadata.digest);
     if response_etag != expected_etag {
@@ -704,10 +678,9 @@ async fn fetch_workspace_config_http(
 }
 
 #[cfg(not(feature = "http-server"))]
-async fn fetch_workspace_config_http(
+async fn fetch_workspace_config_http<T>(
     _request: &WorkspaceConfigFetchRequest,
-    _identity: Option<&RuntimeIdentityMaterial>,
-    _audience: Option<&str>,
+    _client: &T,
 ) -> Result<WorkspaceConfigFetchResult, String> {
     Err("Workspace Config fetch requires the worker-runtime http-server feature".to_string())
 }
@@ -805,12 +778,16 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         &self,
         request: WorkspaceConfigFetchRequest,
     ) -> Result<WorkspaceConfigFetchResult, String> {
-        fetch_workspace_config_http(
-            &request,
-            self.worker_mutation_identity.as_ref(),
-            self.runtime_request_audience.as_deref(),
-        )
-        .await
+        let client = self
+            .workspace_request_clients
+            .get(&request.workspace_api.workspace_id)
+            .ok_or_else(|| {
+                format!(
+                    "Workspace request client is unavailable for workspace {}",
+                    request.workspace_api.workspace_id
+                )
+            })?;
+        fetch_workspace_config_http(&request, client).await
     }
 
     fn observe_workspace_prompt_projection(
@@ -854,11 +831,16 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .map(|api| api.workspace_id.clone());
         let observation_grants = request.request.worker_observation_grants.clone();
         let observation_enabled = request.request.worker_observation_enabled;
+        let workspace_request_client = request
+            .request
+            .workspace_api
+            .as_ref()
+            .and_then(|api| self.workspace_request_clients.get(&api.workspace_id));
         let workspace_context = workspace_backend_ref.worker_context(
             &request.worker_ref,
             request.workspace_scope.as_ref(),
             self.worker_mutation_identity.as_ref(),
-            self.runtime_request_audience.as_deref(),
+            workspace_request_client,
             self.embedded_worker_mutation_dispatcher.as_ref(),
             Some(self.prompt_projection_cache.clone()),
         );
@@ -1039,11 +1021,16 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .map(|api| api.workspace_id.clone());
         let observation_grants = request.request.worker_observation_grants.clone();
         let observation_enabled = request.request.worker_observation_enabled;
+        let workspace_request_client = request
+            .request
+            .workspace_api
+            .as_ref()
+            .and_then(|api| self.workspace_request_clients.get(&api.workspace_id));
         let workspace_context = workspace_backend_ref.worker_context(
             &request.worker_ref,
             request.workspace_scope.as_ref(),
             self.worker_mutation_identity.as_ref(),
-            self.runtime_request_audience.as_deref(),
+            workspace_request_client,
             self.embedded_worker_mutation_dispatcher.as_ref(),
             Some(self.prompt_projection_cache.clone()),
         );
@@ -2241,7 +2228,7 @@ mod tests {
     use crate::catalog::{
         ConfigBundleRef, CreateWorkerRequest, MaterializerKind, ProfileSelector,
         RepositorySelector, WorkingDirectoryClaim, WorkingDirectoryRepository,
-        WorkingDirectoryRequest,
+        WorkingDirectoryRequest, WorkspaceApiRef,
     };
     use crate::execution::WorkerExecutionContext;
     use crate::identity::WorkerId;
@@ -2256,6 +2243,115 @@ mod tests {
     use futures::{Stream, StreamExt};
     use manifest::{Scope, WorkerManifest};
     use session_store::{LogEntry, WorkerMetadataStore};
+
+    #[test]
+    fn profile_factory_routes_workspace_requests_by_workspace_id() {
+        let profiles = tempfile::tempdir().unwrap();
+        let identity = RuntimeIdentityMaterial::generate("runtime-a").unwrap();
+        let factory = ProfileRuntimeWorkerFactory::new(profiles.path())
+            .with_workspace_request_client(
+                RuntimeWorkspaceRequestClient::new(
+                    "workspace-a",
+                    "https://workspace-a.example.test",
+                    "runtime-a",
+                )
+                .with_runtime_request_source(&identity, "server-a"),
+            )
+            .with_workspace_request_client(
+                RuntimeWorkspaceRequestClient::new(
+                    "workspace-b",
+                    "https://workspace-b.example.test",
+                    "runtime-a",
+                )
+                .with_runtime_request_source(&identity, "server-b"),
+            );
+
+        assert_eq!(
+            factory
+                .workspace_request_clients
+                .get("workspace-a")
+                .and_then(RuntimeWorkspaceRequestClient::audience),
+            Some("server-a")
+        );
+        assert_eq!(
+            factory
+                .workspace_request_clients
+                .get("workspace-b")
+                .and_then(RuntimeWorkspaceRequestClient::audience),
+            Some("server-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_config_refresh_uses_workspace_scoped_request_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let identity = RuntimeIdentityMaterial::generate("runtime-a").unwrap();
+        let base_url = format!("http://{address}");
+        let client =
+            RuntimeWorkspaceRequestClient::new("workspace-b", base_url.clone(), "runtime-a")
+                .with_runtime_request_source(&identity, "server-b");
+        let bundle = test_bundle();
+        let bundle_ref = ConfigBundleRef {
+            id: bundle.metadata.id.clone(),
+            digest: bundle.metadata.digest.clone(),
+        };
+        let request = WorkspaceConfigFetchRequest {
+            workspace_api: WorkspaceApiRef {
+                workspace_id: "workspace-b".to_string(),
+                base_url,
+            },
+            profile: crate::catalog::ProfileSelector::Named("coder".to_string()),
+            expected: bundle_ref.clone(),
+            cached: Some(bundle_ref),
+        };
+
+        let result = fetch_workspace_config_http(&request, &client)
+            .await
+            .unwrap();
+        assert!(matches!(result, WorkspaceConfigFetchResult::NotModified));
+        let raw_request = server.await.unwrap();
+        let proof = raw_request
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case(crate::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER)
+                        .then(|| value.trim().to_string())
+                })
+            })
+            .unwrap();
+        let claims = crate::auth::decode_runtime_request_source_claims(&proof).unwrap();
+        assert_eq!(claims.aud, "server-b");
+        assert_eq!(claims.workspace_id, "workspace-b");
+        assert_eq!(claims.worker_id, None);
+        assert_eq!(claims.method, "GET");
+        assert_eq!(
+            claims.path,
+            "/api/w/workspace-b/runtime-config?profile=coder"
+        );
+    }
 
     fn test_command() -> WorkerCommandEnvelope {
         WorkerCommandEnvelope {

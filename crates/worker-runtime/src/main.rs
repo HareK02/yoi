@@ -33,6 +33,7 @@ use worker_runtime::workspace_issuer::{
     WorkspaceIssuerTrustState, add_workspace_issuer_trust, replace_workspace_issuer_trust,
     revoke_workspace_issuer_trust, validate_workspace_issuer_trust_records,
 };
+use worker_runtime::workspace_request::RuntimeWorkspaceRequestClient;
 use worker_runtime::{Runtime, RuntimeOptions};
 
 fn main() -> ExitCode {
@@ -211,6 +212,22 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
     if let Some(identity) = runtime_auth.identity.clone() {
         factory = factory.with_remote_worker_mutation_identity(identity);
     }
+    if let Some(identity) = runtime_auth.identity.as_ref() {
+        for issuer in runtime_auth
+            .workspace_issuers
+            .iter()
+            .filter(|issuer| issuer.state == WorkspaceIssuerTrustState::Active)
+        {
+            factory = factory.with_workspace_request_client(
+                RuntimeWorkspaceRequestClient::new(
+                    issuer.workspace_id.clone(),
+                    issuer.backend_url.clone(),
+                    identity.identity_id.clone(),
+                )
+                .with_runtime_request_source(identity, issuer.backend_url.clone()),
+            );
+        }
+    }
     let mut backend_resource_client: Option<
         Arc<dyn worker_runtime::resource::BackendResourceClient>,
     > = None;
@@ -231,7 +248,14 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
                 endpoint,
                 config.backend_resource_token.clone(),
             )
-            .with_runtime_request_source(identity, workspace_issuer.backend_url.clone()),
+            .with_workspace_request_client(
+                RuntimeWorkspaceRequestClient::new(
+                    workspace_issuer.workspace_id.clone(),
+                    workspace_issuer.backend_url.clone(),
+                    identity.identity_id.clone(),
+                )
+                .with_runtime_request_source(identity, workspace_issuer.backend_url.clone()),
+            ),
         );
         factory = factory.with_resource_client(client.clone());
         backend_resource_client = Some(client);
@@ -257,7 +281,14 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
                     endpoint,
                     config.backend_resource_token.clone(),
                 )
-                .with_runtime_request_source(identity, workspace_issuer.backend_url.clone()),
+                .with_workspace_request_client(
+                    RuntimeWorkspaceRequestClient::new(
+                        workspace_issuer.workspace_id.clone(),
+                        workspace_issuer.backend_url.clone(),
+                        identity.identity_id.clone(),
+                    )
+                    .with_runtime_request_source(identity, workspace_issuer.backend_url.clone()),
+                ),
             );
             workspace_backend_resource_clients
                 .push((workspace_issuer.workspace_id.clone(), client));

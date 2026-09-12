@@ -1,9 +1,7 @@
-use crate::auth::{
-    BACKEND_RESOURCE_FETCH_PERMISSION, RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
-    RuntimeIdentityMaterial, RuntimeRequestSourceSigner, unix_now_seconds,
-};
+use crate::auth::BACKEND_RESOURCE_FETCH_PERMISSION;
 use crate::identity::WorkerId;
 use crate::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveRef, sha256_hex};
+use crate::workspace_request::{RuntimeWorkspaceRequest, RuntimeWorkspaceRequestClient};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -188,10 +186,8 @@ pub trait BackendResourceClient: Send + Sync + 'static {
 pub struct HttpBackendResourceClient {
     endpoint: String,
     bearer_token: Option<String>,
-    request_source_signer: Option<RuntimeRequestSourceSigner>,
-    request_source_audience: Option<String>,
+    workspace_request_client: Option<RuntimeWorkspaceRequestClient>,
     request_timeout: std::time::Duration,
-    client: reqwest::Client,
 }
 
 #[cfg(feature = "http-server")]
@@ -200,10 +196,8 @@ impl HttpBackendResourceClient {
         Self {
             endpoint: endpoint.into(),
             bearer_token,
-            request_source_signer: None,
-            request_source_audience: None,
+            workspace_request_client: None,
             request_timeout: DEFAULT_BACKEND_RESOURCE_FETCH_TIMEOUT,
-            client: reqwest::Client::new(),
         }
     }
 
@@ -212,13 +206,8 @@ impl HttpBackendResourceClient {
         self
     }
 
-    pub fn with_runtime_request_source(
-        mut self,
-        identity: &RuntimeIdentityMaterial,
-        audience: impl Into<String>,
-    ) -> Self {
-        self.request_source_signer = Some(RuntimeRequestSourceSigner::from_identity(identity));
-        self.request_source_audience = Some(audience.into());
+    pub fn with_workspace_request_client(mut self, client: RuntimeWorkspaceRequestClient) -> Self {
+        self.workspace_request_client = Some(client);
         self
     }
 }
@@ -240,59 +229,73 @@ impl BackendResourceClient for HttpBackendResourceClient {
                 message: error.to_string(),
             }
         })?;
-        let mut builder = self
-            .client
-            .post(endpoint.clone())
-            .timeout(self.request_timeout)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body.clone());
-        if let Some(signer) = self.request_source_signer.as_ref() {
-            let audience = self.request_source_audience.as_deref().ok_or_else(|| {
-                BackendResourceError::Unauthorized {
-                    message: "Runtime request proof audience is unavailable".to_owned(),
-                }
-            })?;
-            let proof = signer
-                .issue(
-                    audience,
-                    &request.handle.workspace_id,
-                    None,
-                    BACKEND_RESOURCE_FETCH_PERMISSION,
-                    "POST",
-                    endpoint.path(),
-                    &body,
-                    i64::try_from(unix_now_seconds()).unwrap_or(i64::MAX),
-                    30,
-                )
-                .map_err(|error| BackendResourceError::Unauthorized {
-                    message: error.to_string(),
-                })?;
-            builder = builder.header(RUNTIME_REQUEST_SOURCE_PROOF_HEADER, proof);
-        }
-        let builder = if let Some(token) = self.bearer_token.as_deref() {
-            builder.bearer_auth(token)
-        } else {
-            builder
-        };
-        let response = builder.send().await.map_err(|error| {
-            if error.is_timeout() {
-                BackendResourceError::Timeout
-            } else {
-                BackendResourceError::Transport {
-                    message: error.to_string(),
-                }
+        let client = self.workspace_request_client.as_ref().ok_or_else(|| {
+            BackendResourceError::Unauthorized {
+                message: "Workspace request client is unavailable".to_string(),
             }
         })?;
-        if response.status().is_success() {
-            response
-                .json::<BackendResourceFetchResponse>()
-                .await
-                .map_err(|err| BackendResourceError::InvalidResponse {
+        if client.workspace_id() != request.handle.workspace_id {
+            return Err(BackendResourceError::Unauthorized {
+                message: "Workspace request client does not match the resource workspace"
+                    .to_string(),
+            });
+        }
+        let base_url = client.base_url().trim_end_matches('/');
+        let endpoint_text = endpoint.as_str();
+        let endpoint_suffix = endpoint_text.strip_prefix(base_url).ok_or_else(|| {
+            BackendResourceError::Unauthorized {
+                message: "Workspace resource endpoint does not match its request client"
+                    .to_string(),
+            }
+        })?;
+        if !endpoint_suffix.starts_with('/') {
+            return Err(BackendResourceError::Unauthorized {
+                message: "Workspace resource endpoint does not match its request client"
+                    .to_string(),
+            });
+        }
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        if let Some(token) = self.bearer_token.as_deref() {
+            let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|error| BackendResourceError::Transport {
+                    message: error.to_string(),
+                })?;
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
+        let response = client
+            .execute(RuntimeWorkspaceRequest {
+                method: reqwest::Method::POST,
+                path_and_query: endpoint_suffix.to_string(),
+                body,
+                headers,
+                permission: BACKEND_RESOURCE_FETCH_PERMISSION.to_string(),
+                worker_id: None,
+                timeout: Some(self.request_timeout),
+                max_response_bytes: 8 * 1024 * 1024,
+            })
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    BackendResourceError::Timeout
+                } else {
+                    BackendResourceError::Transport {
+                        message: error.to_string(),
+                    }
+                }
+            })?;
+        if response.status.is_success() {
+            serde_json::from_slice::<BackendResourceFetchResponse>(&response.body).map_err(|err| {
+                BackendResourceError::InvalidResponse {
                     message: err.to_string(),
-                })
+                }
+            })
         } else {
-            let status = response.status();
-            match response.json::<BackendResourceError>().await {
+            let status = response.status;
+            match serde_json::from_slice::<BackendResourceError>(&response.body) {
                 Ok(error) => Err(error),
                 Err(err) => Err(BackendResourceError::Transport {
                     message: format!("backend resource fetch failed with HTTP {status}: {err}"),
@@ -383,6 +386,7 @@ pub fn validate_resource_handle_text(label: &str, value: &str) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::RuntimeIdentityMaterial;
     use crate::profile_archive::ProfileSourceGraphSummary;
     use std::collections::BTreeMap;
 
@@ -435,7 +439,14 @@ mod tests {
         let handle = handle_for(b"archive-bytes");
         let client = HttpBackendResourceClient::new(format!("{base_url}/fetch"), None)
             .with_request_timeout(std::time::Duration::from_millis(25))
-            .with_runtime_request_source(&identity, base_url);
+            .with_workspace_request_client(
+                RuntimeWorkspaceRequestClient::new(
+                    "workspace-test",
+                    base_url.clone(),
+                    "runtime-test",
+                )
+                .with_runtime_request_source(&identity, base_url),
+            );
 
         let error = client
             .fetch_resource(BackendResourceFetchRequest {
