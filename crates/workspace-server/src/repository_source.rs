@@ -113,8 +113,7 @@ pub fn classify_legacy_repository_source(value: &str) -> RepositorySource {
 }
 
 pub(crate) fn is_plain_http_repository_source(source: &RepositorySource) -> bool {
-    source.kind == RepositorySourceKind::Invalid
-        && Url::parse(&source.uri).is_ok_and(|url| url.scheme() == "http")
+    Url::parse(&source.uri).is_ok_and(|url| url.scheme() == "http")
 }
 
 pub fn repository_source_fingerprint(source: &RepositorySource) -> String {

@@ -1980,6 +1980,17 @@ mod tests {
         let error = validate_repository_access_source("remote", &source).unwrap_err();
         assert!(error.to_string().contains("unsupported plain HTTP"));
         assert!(error.to_string().contains("HTTPS or SSH"));
+
+        let mismatched = workspace_api::RepositorySource {
+            kind: workspace_api::RepositorySourceKind::Https,
+            uri: "http://git.example.test/team/project.git".to_string(),
+        };
+        let error = validate_repository_access_source("remote", &mismatched).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("repository_source_plain_http_unsupported")
+        );
     }
 
     #[test]
