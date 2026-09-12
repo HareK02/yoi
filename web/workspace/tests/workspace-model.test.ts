@@ -47,6 +47,19 @@ Deno.test("generated repository wrapper validates current Backend JSON", () => {
   }
 });
 
+Deno.test("plain HTTP repository source kind fails closed at the JSON boundary", () => {
+  const stale = structuredClone(repositoryList) as Record<string, unknown>;
+  const items = stale.items as Array<Record<string, unknown>>;
+  items[0].source = {
+    kind: "http",
+    uri: "http://git.example.test/team/project.git",
+  };
+  assertThrows(
+    () => parseRepositoryListResponse(stale),
+    ".source.kind is invalid",
+  );
+});
+
 Deno.test("stale repository aliases fail closed at the JSON boundary", () => {
   const stale = structuredClone(repositoryList) as Record<string, unknown>;
   const items = stale.items as Array<Record<string, unknown>>;

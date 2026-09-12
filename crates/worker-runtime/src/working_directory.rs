@@ -52,8 +52,6 @@ pub struct WorkingDirectoryEvidence {
     pub credential_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_trust_revision: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transport_warning: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -503,9 +501,7 @@ impl RuntimeGitMaterializer {
         }
         if matches!(
             request.repository.source.kind,
-            workspace_api::RepositorySourceKind::Https
-                | workspace_api::RepositorySourceKind::Http
-                | workspace_api::RepositorySourceKind::Ssh
+            workspace_api::RepositorySourceKind::Https | workspace_api::RepositorySourceKind::Ssh
         ) {
             validate_remote_source_uri(request)?;
             let materialization = request.materialization.as_ref().ok_or_else(|| {
@@ -529,8 +525,7 @@ impl RuntimeGitMaterializer {
         match request.repository.source.kind {
             workspace_api::RepositorySourceKind::LocalPath
             | workspace_api::RepositorySourceKind::File
-            | workspace_api::RepositorySourceKind::Https
-            | workspace_api::RepositorySourceKind::Http => {}
+            | workspace_api::RepositorySourceKind::Https => {}
             workspace_api::RepositorySourceKind::Ssh => {
                 let ssh = request
                     .materialization
@@ -545,10 +540,20 @@ impl RuntimeGitMaterializer {
                 validate_ssh_materialization_access(ssh)?;
             }
             workspace_api::RepositorySourceKind::Invalid => {
-                return Err(WorkingDirectoryDiagnostic::new(
-                    "working_directory_repository_source_invalid",
-                    "configured Repository source is invalid and cannot be materialized",
-                ));
+                let is_plain_http = url::Url::parse(&request.repository.source.uri)
+                    .is_ok_and(|url| url.scheme() == "http");
+                let (code, message) = if is_plain_http {
+                    (
+                        "working_directory_repository_plain_http_unsupported",
+                        "plain HTTP Repository sources are not executable; register an HTTPS or SSH source instead",
+                    )
+                } else {
+                    (
+                        "working_directory_repository_source_invalid",
+                        "configured Repository source is invalid and cannot be materialized",
+                    )
+                };
+                return Err(WorkingDirectoryDiagnostic::new(code, message));
             }
         }
         validate_selector(request.repository.selector.as_deref().unwrap_or("HEAD"))
@@ -723,8 +728,6 @@ impl RuntimeGitMaterializer {
                 host_trust_revision: context
                     .and_then(|value| value.ssh.as_ref())
                     .map(|value| value.host_trust_revision),
-                transport_warning: repository_transport_warning(request.repository.source.kind)
-                    .map(str::to_string),
             },
             cleanup_target: WorkingDirectoryCleanupTarget {
                 kind: "runtime_git_clone".to_string(),
@@ -2029,10 +2032,6 @@ fn validate_ssh_materialization_access(
     Ok(())
 }
 
-fn repository_transport_warning(kind: workspace_api::RepositorySourceKind) -> Option<&'static str> {
-    (kind == workspace_api::RepositorySourceKind::Http).then_some("plain_http_transport")
-}
-
 fn validate_remote_source_uri(
     request: &WorkingDirectoryRequest,
 ) -> Result<(), WorkingDirectoryDiagnostic> {
@@ -2074,12 +2073,10 @@ fn validate_remote_source_uri(
             "remote Repository source URI is invalid",
         )
     })?;
-    let expected_scheme = match request.repository.source.kind {
-        workspace_api::RepositorySourceKind::Https => "https",
-        workspace_api::RepositorySourceKind::Http => "http",
-        _ => return Ok(()),
-    };
-    if url.scheme() != expected_scheme
+    if request.repository.source.kind != workspace_api::RepositorySourceKind::Https {
+        return Ok(());
+    }
+    if url.scheme() != "https"
         || url.host_str().is_none()
         || url.password().is_some()
         || url.query().is_some()
@@ -2212,10 +2209,23 @@ fn read_bounded_command_output(mut reader: impl Read) -> Vec<u8> {
     captured
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_REPOSITORY_GIT_INVOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn test_repository_git_invocation_count() -> usize {
+    TEST_REPOSITORY_GIT_INVOCATIONS.with(std::cell::Cell::get)
+}
+
 fn run_repository_git_stdout(
     mut command: Command,
     source_kind: workspace_api::RepositorySourceKind,
 ) -> Result<String, WorkingDirectoryDiagnostic> {
+    #[cfg(test)]
+    TEST_REPOSITORY_GIT_INVOCATIONS.with(|count| count.set(count.get().saturating_add(1)));
+
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2306,6 +2316,9 @@ fn run_repository_git(
     mut command: Command,
     code: &'static str,
 ) -> Result<(), WorkingDirectoryDiagnostic> {
+    #[cfg(test)]
+    TEST_REPOSITORY_GIT_INVOCATIONS.with(|count| count.set(count.get().saturating_add(1)));
+
     tracing::info!(
         target: "yoi::repository_access",
         event = "repository_git_operation_started",
@@ -3778,15 +3791,25 @@ mod tests {
         );
 
         let mut http = request(repo.path());
-        http.repository.source = workspace_api::RepositorySource {
-            kind: workspace_api::RepositorySourceKind::Http,
-            uri: "http://example.test/repo.git".to_string(),
-        };
+        http.repository.source = serde_json::from_value(serde_json::json!({
+            "kind": "http",
+            "uri": "http://example.test/repo.git",
+        }))
+        .unwrap();
         http.materialization = Some(context(None));
-        RuntimeGitMaterializer::validate_request(&http).unwrap();
+        let git_invocations_before = test_repository_git_invocation_count();
+        let error = materializer
+            .materialize(&worker_ref(3), &http)
+            .expect_err("historical plain HTTP source must fail before Git execution");
         assert_eq!(
-            repository_transport_warning(http.repository.source.kind),
-            Some("plain_http_transport")
+            error.code,
+            "working_directory_repository_plain_http_unsupported"
+        );
+        assert!(error.message.contains("HTTPS or SSH"));
+        assert_eq!(
+            test_repository_git_invocation_count(),
+            git_invocations_before,
+            "plain HTTP rejection must occur before invoking Git"
         );
 
         let mut ssh = request(repo.path());
