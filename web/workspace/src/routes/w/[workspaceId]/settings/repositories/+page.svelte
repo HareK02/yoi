@@ -13,7 +13,7 @@
   }
 
   function supportsRepositoryAccess(kind: RepositorySourceKind): boolean {
-    return kind === 'ssh' || kind === 'http' || kind === 'https';
+    return kind === 'ssh' || kind === 'https';
   }
   let showAddRepository = $state(false);
   let repositoryKey = $state('');

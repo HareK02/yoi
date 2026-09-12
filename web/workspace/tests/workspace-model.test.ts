@@ -255,6 +255,15 @@ Deno.test("Repository settings consume the validated shared wire shape", async (
       throw new Error(`Repository settings should include ${token}`);
     }
   }
+  for (const kind of ["ssh", "https"]) {
+    if (!pageSource.includes(`kind === '${kind}'`)) {
+      throw new Error(`Repository Access should support ${kind}`);
+    }
+  }
+  if (pageSource.includes("kind === 'http'")) {
+    throw new Error("Repository Access must not support plain HTTP sources");
+  }
+
   for (
     const staleToken of [
       "repository.id",
