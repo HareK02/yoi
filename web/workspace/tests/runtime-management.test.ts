@@ -4,12 +4,13 @@ declare const Deno: {
 
 import {
   createRemoteRuntime,
-  deleteRemoteRuntime,
+  parseRuntimeRemovalOperationResponse,
   parseRuntimeTrustConflict,
   parseRuntimeTrustKeyRevealResponse,
   parseWorkspaceRuntimeDetail,
   parseWorkspaceRuntimeList,
   previewRuntimePublicKeyFingerprint,
+  removeRemoteRuntime,
   revokeRuntimeTrustKey,
   RuntimeTrustConflictError,
   RuntimeTrustRouteFence,
@@ -313,22 +314,56 @@ Deno.test("Runtime metadata update never sends public key authority", async () =
   assert(!("public_key" in body), "metadata update sent public_key");
 });
 
-Deno.test("Runtime registration delete uses the Workspace-scoped resource route", async () => {
+Deno.test("Runtime removal uses the Workspace-scoped operation route", async () => {
   let requestedUrl = "";
   let requestedMethod = "";
+  let requestedBody: unknown = null;
   const fetchImpl = ((input: string | URL | Request, init?: RequestInit) => {
     requestedUrl = String(input);
     requestedMethod = init?.method ?? "GET";
-    return Promise.resolve(new Response(null, { status: 204 }));
+    requestedBody = JSON.parse(String(init?.body));
+    return Promise.resolve(Response.json({
+      operation_id: "remove-runtime-a",
+      workspace_id: "workspace a",
+      runtime_id: "runtime/a",
+      state: "succeeded",
+      binding_removed: true,
+      runtime_registration_removed: true,
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:01Z",
+      completed_at: "2026-01-01T00:00:01Z",
+    }));
   }) as typeof fetch;
 
-  await deleteRemoteRuntime("workspace a", "runtime/a", fetchImpl);
+  const operation = await removeRemoteRuntime(
+    "workspace a",
+    "runtime/a",
+    { operation_id: "remove-runtime-a", expected_binding_revision: 7 },
+    fetchImpl,
+  );
 
   assert(
     requestedUrl === "/api/w/workspace%20a/runtimes/runtime%2Fa",
-    `unexpected delete URL: ${requestedUrl}`,
+    `unexpected removal URL: ${requestedUrl}`,
   );
-  assert(requestedMethod === "DELETE", "Runtime delete must use DELETE");
+  assert(requestedMethod === "DELETE", "Runtime removal must use DELETE");
+  assert(
+    JSON.stringify(requestedBody) === JSON.stringify({
+      operation_id: "remove-runtime-a",
+      expected_binding_revision: 7,
+    }),
+    "Runtime removal request body drifted",
+  );
+  assert(operation.state === "succeeded", "Runtime removal did not complete");
+
+  assertThrows(
+    () =>
+      parseRuntimeRemovalOperationResponse({
+        ...operation,
+        unknown: "rejected",
+      }),
+    "not part of the wire contract",
+  );
 });
 
 Deno.test("Runtime route fence rejects a delayed reveal from the prior Runtime", async () => {

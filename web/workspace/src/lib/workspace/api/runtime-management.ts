@@ -1,10 +1,13 @@
 import type {
   CreateRemoteRuntimeRequest,
   Diagnostic,
+  RemoveRuntimeRequest,
   RevokeRuntimeTrustKeyRequest,
   RuntimeConnectionDisplayState,
   RuntimeIdentityAuthority,
   RuntimeManagementSummary,
+  RuntimeRemovalOperationResponse,
+  RuntimeRemovalOperationState,
   RuntimeSourceKind,
   RuntimeSourceStatus,
   RuntimeSourceSummary,
@@ -82,6 +85,12 @@ const CONNECTION_STATES = new Set<RuntimeConnectionDisplayState>([
   "verified",
   "unavailable",
   "revoked",
+]);
+const REMOVAL_OPERATION_STATES = new Set<RuntimeRemovalOperationState>([
+  "pending",
+  "cleanup_pending",
+  "succeeded",
+  "failed",
 ]);
 
 const encoder = new TextEncoder();
@@ -770,6 +779,83 @@ export function parseRuntimeTrustConflict(
   };
 }
 
+export function parseRuntimeRemovalOperationResponse(
+  value: unknown,
+): RuntimeRemovalOperationResponse {
+  const response = object(value, "Runtime removal response");
+  exactKeys(
+    response,
+    [
+      "operation_id",
+      "workspace_id",
+      "runtime_id",
+      "state",
+      "binding_removed",
+      "runtime_registration_removed",
+      "created_at",
+      "updated_at",
+    ],
+    ["failure_category", "completed_at"],
+    "Runtime removal response",
+  );
+  const runtimeRegistrationRemoved = response.runtime_registration_removed;
+  if (
+    runtimeRegistrationRemoved !== null &&
+    typeof runtimeRegistrationRemoved !== "boolean"
+  ) {
+    return fail(
+      "Runtime removal response.runtime_registration_removed",
+      "must be a boolean or null",
+    );
+  }
+  return {
+    operation_id: boundedString(
+      response.operation_id,
+      "Runtime removal response.operation_id",
+      LIMITS.idBytes,
+    ),
+    workspace_id: boundedString(
+      response.workspace_id,
+      "Runtime removal response.workspace_id",
+      LIMITS.idBytes,
+    ),
+    runtime_id: boundedString(
+      response.runtime_id,
+      "Runtime removal response.runtime_id",
+      LIMITS.idBytes,
+    ),
+    state: enumValue(
+      response.state,
+      "Runtime removal response.state",
+      REMOVAL_OPERATION_STATES,
+    ),
+    binding_removed: boolean(
+      response.binding_removed,
+      "Runtime removal response.binding_removed",
+    ),
+    runtime_registration_removed: runtimeRegistrationRemoved,
+    failure_category: optionalNullableString(
+      response.failure_category,
+      "Runtime removal response.failure_category",
+      LIMITS.diagnosticCodeBytes,
+    ),
+    created_at: boundedString(
+      response.created_at,
+      "Runtime removal response.created_at",
+      LIMITS.timestampBytes,
+    ),
+    updated_at: boundedString(
+      response.updated_at,
+      "Runtime removal response.updated_at",
+      LIMITS.timestampBytes,
+    ),
+    completed_at: optionalNullableTimestamp(
+      response.completed_at,
+      "Runtime removal response.completed_at",
+    ),
+  };
+}
+
 function revisionForJson(revision: number | null): number | null {
   if (revision === null) return null;
   if (!Number.isSafeInteger(revision) || revision < 1) {
@@ -940,28 +1026,51 @@ export async function updateRemoteRuntime(
   return finishMutation(response, workspaceId, runtimeId);
 }
 
-export async function deleteRemoteRuntime(
+export async function removeRemoteRuntime(
   workspaceId: string,
   runtimeId: string,
+  request: RemoveRuntimeRequest,
   fetchImpl: typeof fetch = fetch,
-): Promise<void> {
+): Promise<RuntimeRemovalOperationResponse> {
   const response = await fetchImpl(
     workspaceApiPath(
       workspaceId,
       `/runtimes/${encodeURIComponent(runtimeId)}`,
     ),
-    { method: "DELETE" },
+    {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request),
+    },
   );
-  if (response.ok) return;
   let payload: unknown;
   try {
     payload = await readBoundedJson(response);
   } catch {
     throw new RuntimeTrustRequestError(
-      `Runtime registration delete failed (${response.status})`,
+      `Runtime removal failed (${response.status})`,
     );
   }
-  throw requestErrorFrom(payload, response.status);
+  if (!response.ok) throw requestErrorFrom(payload, response.status);
+  const operation = parseRuntimeRemovalOperationResponse(payload);
+  if (
+    operation.workspace_id !== workspaceId ||
+    operation.runtime_id !== runtimeId
+  ) {
+    throw new RuntimeTrustRequestError(
+      "Runtime removal response did not match the selected Runtime",
+    );
+  }
+  if (
+    operation.state !== "succeeded" ||
+    !operation.binding_removed ||
+    operation.runtime_registration_removed !== true
+  ) {
+    throw new RuntimeTrustRequestError(
+      "Runtime removal did not reach authoritative completion",
+    );
+  }
+  return operation;
 }
 
 export async function revealRuntimeTrustKey(

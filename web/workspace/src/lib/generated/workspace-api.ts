@@ -474,6 +474,30 @@ export type RuntimeTrustKeyRevealResponse = { public_key: string };
 
 export type RevokeRuntimeTrustKeyRequest = { expected_revision: number };
 
+export type RemoveRuntimeRequest = {
+  operation_id: string;
+  expected_binding_revision: number;
+};
+
+export type RuntimeRemovalOperationState =
+  | "pending"
+  | "cleanup_pending"
+  | "succeeded"
+  | "failed";
+
+export type RuntimeRemovalOperationResponse = {
+  operation_id: string;
+  workspace_id: string;
+  runtime_id: string;
+  state: RuntimeRemovalOperationState;
+  binding_removed: boolean;
+  runtime_registration_removed: boolean | null;
+  failure_category?: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string | null;
+};
+
 export type RuntimeTrustConflictKind = "stale_revision" | "fingerprint_in_use";
 
 export type RuntimeTrustConflictResponse = {

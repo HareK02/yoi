@@ -6,7 +6,7 @@
   } from '$lib/generated/workspace-api';
   import {
     createRemoteRuntime,
-    deleteRemoteRuntime,
+    removeRemoteRuntime,
     previewRuntimePublicKeyFingerprint,
     revealRuntimeTrustKey,
     revokeRuntimeTrustKey,
@@ -284,36 +284,34 @@
       return;
     }
 
-    const operation = routeFence.capture(data.runtimeId);
+    const routeOperation = routeFence.capture(data.runtimeId);
+    const trust = data.runtimeDetail.trust_key;
+    if (trust.revision == null) {
+      deleteRuntimeError = 'The authoritative Runtime binding revision is unavailable. Reload before removal.';
+      return;
+    }
     busyAction = 'delete';
     deleteRuntimeError = null;
     try {
-      if (data.runtimeDetail.trust_key.status !== 'revoked') {
-        const trust = data.runtimeDetail.trust_key;
-        if (trust.revision == null || !trust.fingerprint) {
-          throw new Error('Runtime trust revision and fingerprint are required before deletion.');
-        }
-        await revokeRuntimeTrustKey(
-          data.workspaceId,
-          operation.runtimeId,
-          { expected_revision: trust.revision },
-          trust.fingerprint,
-          trust.fingerprint,
-        );
-        if (!isCurrentRoute(operation)) return;
-      }
-      await deleteRemoteRuntime(data.workspaceId, operation.runtimeId);
-      if (!isCurrentRoute(operation)) return;
+      await removeRemoteRuntime(
+        data.workspaceId,
+        routeOperation.runtimeId,
+        {
+          operation_id: crypto.randomUUID(),
+          expected_binding_revision: trust.revision,
+        },
+      );
+      if (!isCurrentRoute(routeOperation)) return;
       await goto(`/w/${encodeURIComponent(data.workspaceId)}/settings/runtimes`, {
         replaceState: true,
       });
     } catch (error) {
-      if (!isCurrentRoute(operation)) return;
+      if (!isCurrentRoute(routeOperation)) return;
       deleteRuntimeError = error instanceof Error
         ? error.message
         : 'Runtime registration deletion failed.';
     } finally {
-      if (isCurrentRoute(operation)) busyAction = null;
+      if (isCurrentRoute(routeOperation)) busyAction = null;
     }
   }
 
@@ -589,14 +587,13 @@
       <section class="runtime-detail-section runtime-danger-zone" aria-labelledby="runtime-delete-heading">
         <h2 id="runtime-delete-heading">Delete Runtime registration</h2>
         <p>
-          Remove this Runtime binding from the current Workspace. This does not stop the Runtime process,
-          delete its Workers or Workdirs, or revoke this Workspace on the Runtime host.
+          The Backend removes Workspace trust and this Runtime registration as one guarded operation.
+          Active Workers, Workdirs, assignments, pending create or removal work, configuration references,
+          or another Workspace binding block the operation without changing trust.
         </p>
-        {#if trust.status !== 'revoked'}
-          <p class="section-state warning">
-            Deletion will revoke this Workspace trust first. Stop or move active Workers before continuing.
-          </p>
-        {/if}
+        <p class="section-state warning">
+          This does not stop the Runtime process or delete its Workers or Workdirs.
+        </p>
         <label for="runtime-delete-confirmation">Confirm Runtime ID</label>
         <input
           id="runtime-delete-confirmation"
@@ -616,11 +613,7 @@
             class="danger"
             disabled={busyAction !== null || deleteRuntimeConfirmation.trim() !== data.runtimeId}
             onclick={deleteRegistration}
-          >{busyAction === 'delete'
-              ? 'Deleting…'
-              : trust.status === 'revoked'
-              ? 'Delete registration'
-              : 'Revoke trust and delete registration'}</button>
+          >{busyAction === 'delete' ? 'Removing…' : 'Remove Runtime registration'}</button>
         </div>
       </section>
     {/if}

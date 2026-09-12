@@ -177,12 +177,13 @@ Deno.test("Runtime detail keeps trust controls owner-only and conflict-safe", as
       "Revoke Workspace trust",
       "Workspace trust only; this does not delete the Runtime process, Workers, or Workdirs.",
       "await revokeRuntimeTrustKey(",
-      "deleteRemoteRuntime(data.workspaceId, operation.runtimeId)",
-      "Revoke trust and delete registration",
-      "trust.status !== 'revoked'",
+      "await removeRemoteRuntime(",
+      "operation_id: crypto.randomUUID()",
+      "expected_binding_revision: trust.revision",
+      "The Backend removes Workspace trust and this Runtime registration as one guarded operation.",
       "deleteRuntimeConfirmation.trim() !== data.runtimeId",
       "Delete Runtime registration",
-      "Delete registration",
+      "Remove Runtime registration",
       "This does not stop the Runtime process",
       "RuntimeTrustConflictError",
       "RuntimeTrustRouteFence",
@@ -211,6 +212,9 @@ Deno.test("Runtime detail keeps trust controls owner-only and conflict-safe", as
       "fingerprintConfirmation",
       "revokeFingerprintConfirmation",
       "Confirm current fingerprint",
+      "deleteRemoteRuntime",
+      "if (data.runtimeDetail.trust_key.status !== 'revoked')",
+      "Revoke trust and delete registration",
     ]
   ) {
     assert(!page.includes(token), `Runtime detail must not require ${token}`);
