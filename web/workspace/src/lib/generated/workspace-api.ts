@@ -496,6 +496,11 @@ export type CreateRemoteRuntimeRequest = {
   expected_revision?: number | null;
 };
 
+export type UpdateRemoteRuntimeRequest = {
+  display_name?: string | null;
+  endpoint: string;
+};
+
 export type RuntimeConnectionTestStatus = "compatible" | "failed";
 
 export type RuntimeConnectionTestFailureKind =

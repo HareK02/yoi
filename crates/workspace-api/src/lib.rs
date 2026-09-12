@@ -1841,6 +1841,15 @@ pub struct CreateRemoteRuntimeRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct UpdateRemoteRuntimeRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub endpoint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeConnectionTestStatus {
     Compatible,
@@ -3098,6 +3107,7 @@ pub fn catalog_typescript() -> String {
         RuntimeTrustConflictResponse::decl(&config),
         RuntimePublicIdentityBundle::decl(&config),
         CreateRemoteRuntimeRequest::decl(&config),
+        UpdateRemoteRuntimeRequest::decl(&config),
         RuntimeConnectionTestStatus::decl(&config),
         RuntimeConnectionTestFailureKind::decl(&config),
         RuntimeConnectionTestResponse::decl(&config),
@@ -3615,6 +3625,33 @@ mod tests {
             working_directory: None,
             diagnostics: Vec::new(),
         }
+    }
+
+    #[test]
+    fn remote_runtime_metadata_update_cannot_carry_public_key_authority() {
+        let request = UpdateRemoteRuntimeRequest {
+            display_name: Some("Runtime A".to_string()),
+            endpoint: "https://runtime.example.test".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "display_name": "Runtime A",
+                "endpoint": "https://runtime.example.test",
+            })
+        );
+        assert!(
+            serde_json::from_value::<UpdateRemoteRuntimeRequest>(serde_json::json!({
+                "display_name": "Runtime A",
+                "endpoint": "https://runtime.example.test",
+                "public_bundle": {
+                    "identity_id": "runtime-a",
+                    "public_key": "yoi-ed25519-pub:v1:not-accepted",
+                },
+            }))
+            .is_err(),
+            "metadata updates must reject public key fields"
+        );
     }
 
     #[test]

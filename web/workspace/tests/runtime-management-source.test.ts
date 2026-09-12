@@ -129,8 +129,29 @@ Deno.test("Runtime detail keeps trust controls owner-only and conflict-safe", as
 
   const ownerGate = page.indexOf("data.workspace.permissions.manage_runtimes");
   const reveal = page.indexOf("Reveal public key");
+  const verifiedKey = page.indexOf("{#if verifiedTrust}");
   const mutation = page.indexOf('id="runtime-public-key-input"');
+  const metadataStart = page.indexOf("async function saveRuntimeMetadata");
+  const trustStart = page.indexOf("async function saveTrustKey");
+  const metadataMutation = page.slice(metadataStart, trustStart);
   assert(ownerGate >= 0, "Runtime trust controls should use manage_runtimes");
+  assert(
+    verifiedKey >= 0 && verifiedKey < mutation &&
+      page.slice(verifiedKey, mutation).includes("{:else}"),
+    "verified Runtime public key must be read-only while unverified trust keeps key input",
+  );
+  assert(
+    metadataMutation.includes("updateRemoteRuntime(") &&
+      metadataMutation.includes("display_name: normalizedDisplayName") &&
+      metadataMutation.includes("endpoint: normalizedEndpoint"),
+    "mutable Runtime settings should use the metadata-only update request",
+  );
+  assert(
+    !metadataMutation.includes("publicKey") &&
+      !metadataMutation.includes("public_bundle") &&
+      !metadataMutation.includes("public_key"),
+    "verified Runtime metadata updates must not carry public key authority",
+  );
   assert(
     page.includes("Current fingerprint"),
     "current fingerprint must be explicit",
@@ -168,6 +189,10 @@ Deno.test("Runtime detail keeps trust controls owner-only and conflict-safe", as
       "routeFence.enter(data.runtimeId)",
       "showPublicKey = false",
       "revealedPublicKey = null",
+      "saveRuntimeMetadata",
+      "Runtime settings",
+      "Edit Runtime",
+      "This verified key is read-only",
       "publicKey = ''",
       "requestError = null",
       "successMessage = null",

@@ -10,6 +10,7 @@
     previewRuntimePublicKeyFingerprint,
     revealRuntimeTrustKey,
     revokeRuntimeTrustKey,
+    updateRemoteRuntime,
     RuntimeTrustConflictError,
     RuntimeTrustRouteFence,
     RuntimeTrustRequestError,
@@ -23,8 +24,11 @@
   let showPublicKey = $state(false);
   let revealedPublicKey = $state<string | null>(null);
   let publicKey = $state('');
+  let displayName = $state('');
+  let endpoint = $state('');
+  let editingMetadata = $state(false);
   let deleteRuntimeConfirmation = $state('');
-  let busyAction = $state<'save' | 'revoke' | 'reveal' | 'copy' | 'delete' | null>(null);
+  let busyAction = $state<'metadata' | 'trust' | 'revoke' | 'reveal' | 'copy' | 'delete' | null>(null);
   let fieldError = $state<string | null>(null);
   let deleteRuntimeError = $state<string | null>(null);
   let requestError = $state<string | null>(null);
@@ -43,6 +47,9 @@
     showPublicKey = false;
     revealedPublicKey = null;
     publicKey = '';
+    displayName = data.runtimeDetail?.runtime.label ?? '';
+    endpoint = data.runtimeDetail?.endpoint ?? '';
+    editingMetadata = false;
     deleteRuntimeConfirmation = '';
     busyAction = null;
     fieldError = null;
@@ -105,6 +112,49 @@
     return routeFence.isCurrent(operation, data.runtimeId);
   }
 
+  function cancelRuntimeMetadataEdit(): void {
+    displayName = data.runtimeDetail?.runtime.label ?? '';
+    endpoint = data.runtimeDetail?.endpoint ?? '';
+    editingMetadata = false;
+    requestError = null;
+  }
+
+  async function saveRuntimeMetadata(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    if (busyAction !== null || !data.runtimeDetail) return;
+
+    requestError = null;
+    successMessage = null;
+    const normalizedDisplayName = displayName.trim();
+    const normalizedEndpoint = endpoint.trim();
+    if (!normalizedDisplayName) {
+      requestError = 'Enter a Runtime label.';
+      return;
+    }
+    if (!normalizedEndpoint) {
+      requestError = 'Enter the Runtime endpoint.';
+      return;
+    }
+
+    const operation = routeFence.capture(data.runtimeId);
+    busyAction = 'metadata';
+    try {
+      await updateRemoteRuntime(data.workspaceId, operation.runtimeId, {
+        display_name: normalizedDisplayName,
+        endpoint: normalizedEndpoint,
+      });
+      if (!isCurrentRoute(operation)) return;
+      successMessage = 'Runtime settings were updated.';
+      editingMetadata = false;
+      await reloadAuthority();
+    } catch (error) {
+      if (!isCurrentRoute(operation)) return;
+      requestError = error instanceof Error ? error.message : 'Runtime settings update failed.';
+    } finally {
+      if (isCurrentRoute(operation)) busyAction = null;
+    }
+  }
+
   async function saveTrustKey(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     if (busyAction !== null || !data.runtimeDetail) return;
@@ -135,7 +185,7 @@
     const action = trustAction(trust.status);
 
     const operation = routeFence.capture(data.runtimeId);
-    busyAction = 'save';
+    busyAction = 'trust';
     try {
       const binding = data.runtimeDetail.runtime.management.binding;
       if (!binding || !data.runtimeDetail.endpoint) {
@@ -339,6 +389,7 @@
     {@const detail = data.runtimeDetail}
     {@const runtime = detail.runtime}
     {@const trust = detail.trust_key}
+    {@const verifiedTrust = runtime.management.binding?.state === 'verified'}
     {@const currentAction = trustAction(trust.status)}
 
     <section class="runtime-detail-section" aria-labelledby="runtime-identity-heading">
@@ -373,6 +424,50 @@
     </section>
 
     {#if data.workspace.permissions.manage_runtimes && !runtime.management.built_in}
+      <section class="runtime-detail-section" aria-labelledby="runtime-settings-heading">
+        <h2 id="runtime-settings-heading">Runtime settings</h2>
+        {#if editingMetadata}
+          <form class="runtime-trust-form" onsubmit={saveRuntimeMetadata}>
+            <label for="runtime-display-name-input">Label</label>
+            <input
+              id="runtime-display-name-input"
+              bind:value={displayName}
+              autocomplete="off"
+              disabled={busyAction !== null}
+            />
+            <label for="runtime-endpoint-input">Endpoint</label>
+            <input
+              id="runtime-endpoint-input"
+              bind:value={endpoint}
+              inputmode="url"
+              autocomplete="url"
+              spellcheck="false"
+              disabled={busyAction !== null}
+            />
+            <div class="settings-action-row">
+              <button type="submit" disabled={busyAction !== null}>
+                {busyAction === 'metadata' ? 'Saving…' : 'Save Runtime settings'}
+              </button>
+              <button
+                class="settings-secondary-action"
+                type="button"
+                onclick={cancelRuntimeMetadataEdit}
+                disabled={busyAction !== null}
+              >Cancel</button>
+            </div>
+          </form>
+        {:else}
+          <div class="settings-action-row">
+            <button
+              class="settings-secondary-action"
+              type="button"
+              onclick={() => (editingMetadata = true)}
+              disabled={busyAction !== null}
+            >Edit Runtime</button>
+          </div>
+        {/if}
+      </section>
+
       <section class="runtime-detail-section" aria-labelledby="runtime-trust-heading">
         <h2 id="runtime-trust-heading">Workspace trust</h2>
 
@@ -395,7 +490,16 @@
           {/if}
         {/if}
 
-        <form class="runtime-trust-form" onsubmit={saveTrustKey}>
+        {#if verifiedTrust}
+          <div class="runtime-public-key-readonly">
+            <strong>Runtime public key</strong>
+            <p>
+              This verified key is read-only. Revoke Workspace trust and register the Runtime again to use a different public key.
+            </p>
+            <code>{trust.fingerprint}</code>
+          </div>
+        {:else}
+          <form class="runtime-trust-form" onsubmit={saveTrustKey}>
           <label for="runtime-public-key-input">Runtime public key</label>
           <textarea
             id="runtime-public-key-input"
@@ -427,10 +531,11 @@
           {/if}
           <div class="settings-action-row">
             <button type="submit" disabled={busyAction !== null}>
-              {busyAction === 'save' ? 'Saving…' : actionLabel(currentAction)}
+              {busyAction === 'trust' ? 'Saving…' : actionLabel(currentAction)}
             </button>
           </div>
-        </form>
+          </form>
+        {/if}
 
         <div class="runtime-revoke-row">
           <div>
