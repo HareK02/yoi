@@ -365,23 +365,23 @@ pub fn validate_repository_key(value: &str) -> Result<(), RepositoryKeyError> {
 ///
 /// Local paths remain distinct from network Git transports so callers cannot
 /// accidentally treat an unmaterialized remote as a server-local filesystem path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RepositorySourceKind {
     LocalPath,
     File,
     Ssh,
-    Http,
     Https,
     /// A legacy value that could not be classified during migration. It remains
-    /// inspectable but every provider operation must fail closed.
+    /// inspectable but every provider operation must fail closed. Historical
+    /// `http` wire values decode into this non-executable classification.
     Invalid,
 }
 
 impl RepositorySourceKind {
     pub const fn is_remote(self) -> bool {
-        matches!(self, Self::Ssh | Self::Http | Self::Https)
+        matches!(self, Self::Ssh | Self::Https)
     }
 
     pub const fn as_str(self) -> &'static str {
@@ -389,7 +389,6 @@ impl RepositorySourceKind {
             Self::LocalPath => "local_path",
             Self::File => "file",
             Self::Ssh => "ssh",
-            Self::Http => "http",
             Self::Https => "https",
             Self::Invalid => "invalid",
         }
@@ -400,10 +399,24 @@ impl RepositorySourceKind {
             "local_path" => Self::LocalPath,
             "file" => Self::File,
             "ssh" => Self::Ssh,
-            "http" => Self::Http,
             "https" => Self::Https,
-            "invalid" => Self::Invalid,
+            "http" | "invalid" => Self::Invalid,
             _ => return None,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for RepositorySourceKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).ok_or_else(|| {
+            serde::de::Error::unknown_variant(
+                &value,
+                &["local_path", "file", "ssh", "https", "invalid"],
+            )
         })
     }
 }
@@ -3409,6 +3422,27 @@ mod workdir_typescript_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_http_repository_source_kind_decodes_as_invalid_evidence() {
+        let source: RepositorySource = serde_json::from_value(serde_json::json!({
+            "kind": "http",
+            "uri": "http://git.example.test/team/project.git",
+            "revision": 1,
+        }))
+        .unwrap();
+
+        assert_eq!(source.kind, RepositorySourceKind::Invalid);
+        assert_eq!(
+            serde_json::to_value(source).unwrap()["kind"],
+            serde_json::json!("invalid")
+        );
+        assert_eq!(
+            RepositorySourceKind::parse("http"),
+            Some(RepositorySourceKind::Invalid)
+        );
+        assert!(!RepositorySourceKind::Invalid.is_remote());
+    }
 
     fn skill_projection() -> SkillProjectionIdentity {
         SkillProjectionIdentity {

@@ -56,7 +56,6 @@ const SOURCE_KINDS = new Set<RepositorySourceKind>([
   "local_path",
   "file",
   "ssh",
-  "http",
   "https",
   "invalid",
 ]);

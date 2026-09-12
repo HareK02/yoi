@@ -237,7 +237,6 @@ export type RepositorySourceKind =
   | "local_path"
   | "file"
   | "ssh"
-  | "http"
   | "https"
   | "invalid";
 

@@ -364,7 +364,6 @@ fn repository_local_path(source: &workspace_api::RepositorySource) -> Option<Pat
             .ok()
             .and_then(|uri| uri.to_file_path().ok()),
         workspace_api::RepositorySourceKind::Ssh
-        | workspace_api::RepositorySourceKind::Http
         | workspace_api::RepositorySourceKind::Https
         | workspace_api::RepositorySourceKind::Invalid => None,
     }
@@ -10818,9 +10817,8 @@ async fn create_workspace_working_directory(
                 "local_path" => workspace_api::RepositorySourceKind::LocalPath,
                 "file" => workspace_api::RepositorySourceKind::File,
                 "https" => workspace_api::RepositorySourceKind::Https,
-                "http" => workspace_api::RepositorySourceKind::Http,
+                "http" | "invalid" => workspace_api::RepositorySourceKind::Invalid,
                 "ssh" => workspace_api::RepositorySourceKind::Ssh,
-                "invalid" => workspace_api::RepositorySourceKind::Invalid,
                 _ => {
                     return Err(settings_bad_request(
                         "working_directory_repository_source_invalid",
@@ -22274,6 +22272,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replayed.status(), StatusCode::OK);
+
+        let plain_http = app
+            .clone()
+            .oneshot(create_repository(serde_json::json!({
+                "repository_key": "insecure-http",
+                "source": "http://git.example.test/team/project.git",
+                "default_ref": "main"
+            })))
+            .await
+            .unwrap();
+        assert_eq!(plain_http.status(), StatusCode::BAD_REQUEST);
+        let plain_http_body = to_bytes(plain_http.into_body(), usize::MAX).await.unwrap();
+        let plain_http_body = String::from_utf8_lossy(&plain_http_body);
+        assert!(plain_http_body.contains("repository_source_plain_http_unsupported"));
+        assert!(plain_http_body.contains("plain HTTP Repository sources"));
+        assert!(plain_http_body.contains("HTTPS or SSH"));
 
         let conflict = app
             .clone()

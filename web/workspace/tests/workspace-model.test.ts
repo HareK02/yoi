@@ -47,6 +47,19 @@ Deno.test("generated repository wrapper validates current Backend JSON", () => {
   }
 });
 
+Deno.test("plain HTTP repository source kind fails closed at the JSON boundary", () => {
+  const stale = structuredClone(repositoryList) as Record<string, unknown>;
+  const items = stale.items as Array<Record<string, unknown>>;
+  items[0].source = {
+    kind: "http",
+    uri: "http://git.example.test/team/project.git",
+  };
+  assertThrows(
+    () => parseRepositoryListResponse(stale),
+    ".source.kind is invalid",
+  );
+});
+
 Deno.test("stale repository aliases fail closed at the JSON boundary", () => {
   const stale = structuredClone(repositoryList) as Record<string, unknown>;
   const items = stale.items as Array<Record<string, unknown>>;
@@ -242,6 +255,15 @@ Deno.test("Repository settings consume the validated shared wire shape", async (
       throw new Error(`Repository settings should include ${token}`);
     }
   }
+  for (const kind of ["ssh", "https"]) {
+    if (!pageSource.includes(`kind === '${kind}'`)) {
+      throw new Error(`Repository Access should support ${kind}`);
+    }
+  }
+  if (pageSource.includes("kind === 'http'")) {
+    throw new Error("Repository Access must not support plain HTTP sources");
+  }
+
   for (
     const staleToken of [
       "repository.id",

@@ -136,6 +136,18 @@ pub fn project_repository_access_state(
     )
 }
 
+fn validate_repository_access_source(
+    repository_key: &str,
+    source: &workspace_api::RepositorySource,
+) -> Result<()> {
+    if crate::repository_source::is_plain_http_repository_source(source) {
+        return Err(Error::InvalidInput(format!(
+            "repository_source_plain_http_unsupported: Repository `{repository_key}` uses unsupported plain HTTP; register an HTTPS or SSH source instead"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn repository_ssh_endpoint(
     repository_key: &str,
     repository_uri: &str,
@@ -200,6 +212,7 @@ fn project_repository_access_evaluation(
         let repository = store
             .get_repository_by_key(workspace_id, &repository_key)?
             .ok_or_else(|| Error::InvalidInput(format!("unknown Repository `{repository_key}`")))?;
+        validate_repository_access_source(&repository_key, &repository.source)?;
         if repository.source.kind != workspace_api::RepositorySourceKind::Ssh {
             return Err(Error::InvalidInput(format!(
                 "Repository `{repository_key}` is not an ssh:// Repository"
@@ -1954,6 +1967,30 @@ mod tests {
         assert!(contribution.source.contains("...{"));
         assert!(!contribution.source.contains("private_key"));
         assert!(!contribution.source.contains("secret_ref"));
+    }
+
+    #[test]
+    fn workspace_config_projection_rejects_legacy_plain_http_repository_source() {
+        let source: RepositorySource = serde_json::from_value(serde_json::json!({
+            "kind": "http",
+            "uri": "http://git.example.test/team/project.git",
+        }))
+        .unwrap();
+
+        let error = validate_repository_access_source("remote", &source).unwrap_err();
+        assert!(error.to_string().contains("unsupported plain HTTP"));
+        assert!(error.to_string().contains("HTTPS or SSH"));
+
+        let mismatched = workspace_api::RepositorySource {
+            kind: workspace_api::RepositorySourceKind::Https,
+            uri: "http://git.example.test/team/project.git".to_string(),
+        };
+        let error = validate_repository_access_source("remote", &mismatched).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("repository_source_plain_http_unsupported")
+        );
     }
 
     #[test]

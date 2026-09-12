@@ -288,13 +288,12 @@ impl RepositoryRegistryReader {
 
     fn summary_for_config(&self, repository: &ConfiguredRepository) -> RepositorySummary {
         let mut diagnostics = Vec::new();
-        if repository.source.kind == workspace_api::RepositorySourceKind::Http {
+        if crate::repository_source::is_plain_http_repository_source(&repository.source) {
             diagnostics.push(RepositoryDiagnostic {
-                severity: "warning".to_string(),
-                code: "repository_source_insecure_http".to_string(),
-                message:
-                    "HTTP Repository source is unencrypted; prefer HTTPS or SSH when available."
-                        .to_string(),
+                severity: "error".to_string(),
+                code: "repository_source_plain_http_unsupported".to_string(),
+                message: "Plain HTTP Repository sources are not executable; register an HTTPS or SSH source instead."
+                    .to_string(),
             });
         }
         let git = match repository.provider.as_str() {
@@ -605,6 +604,39 @@ mod tests {
         assert!(projection.items.is_empty());
         assert_eq!(projection.diagnostics.len(), 1);
         assert_eq!(projection.diagnostics[0].code, "repository_config_empty");
+    }
+
+    #[test]
+    fn legacy_plain_http_source_is_projected_as_non_executable_error() {
+        let source: RepositorySource = serde_json::from_value(serde_json::json!({
+            "kind": "http",
+            "uri": "http://git.example.test/team/project.git",
+        }))
+        .unwrap();
+        let reader = RepositoryRegistryReader::new(vec![ConfiguredRepository {
+            id: "legacy-http".into(),
+            repository_key: "legacy-http".into(),
+            provider: "git".into(),
+            source_fingerprint: crate::repository_source::repository_source_fingerprint(&source),
+            source,
+            source_revision: 1,
+            observed_status: RepositoryObservedStatus::Unverified,
+            observed_at: None,
+            path: None,
+            default_selector: Some("main".into()),
+        }]);
+
+        let projection = reader.list();
+        assert_eq!(
+            projection.items[0].source.kind,
+            workspace_api::RepositorySourceKind::Invalid
+        );
+        let diagnostics = projection.items[0].diagnostics.as_ref().unwrap();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == "error"
+                && diagnostic.code == "repository_source_plain_http_unsupported"
+                && diagnostic.message.contains("HTTPS or SSH")
+        }));
     }
 
     #[test]

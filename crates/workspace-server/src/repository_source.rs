@@ -76,18 +76,19 @@ pub fn parse_repository_source(value: &str) -> Result<RepositorySource> {
             require_remote_host_and_path(&parsed)?;
             RepositorySourceKind::Ssh
         }
-        "http" | "https" => {
+        "http" => {
+            return Err(Error::InvalidInput(
+                "repository_source_plain_http_unsupported: plain HTTP Repository sources are not supported; use HTTPS or SSH".to_string(),
+            ));
+        }
+        "https" => {
             if !parsed.username().is_empty() {
                 return Err(Error::InvalidInput(
-                    "HTTP repository URI must not contain user information".to_string(),
+                    "HTTPS repository URI must not contain user information".to_string(),
                 ));
             }
             require_remote_host_and_path(&parsed)?;
-            if parsed.scheme() == "http" {
-                RepositorySourceKind::Http
-            } else {
-                RepositorySourceKind::Https
-            }
+            RepositorySourceKind::Https
         }
         scheme => {
             return Err(Error::InvalidInput(format!(
@@ -109,6 +110,10 @@ pub fn classify_legacy_repository_source(value: &str) -> RepositorySource {
         kind: RepositorySourceKind::Invalid,
         uri: value.trim().to_string(),
     })
+}
+
+pub(crate) fn is_plain_http_repository_source(source: &RepositorySource) -> bool {
+    Url::parse(&source.uri).is_ok_and(|url| url.scheme() == "http")
 }
 
 pub fn repository_source_fingerprint(source: &RepositorySource) -> String {
@@ -172,7 +177,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_local_file_ssh_http_and_https_sources_without_io() {
+    fn parses_local_file_ssh_and_https_sources_without_io() {
         let cases = [
             ("/runtime/repos/project", RepositorySourceKind::LocalPath),
             ("file:///runtime/repos/project", RepositorySourceKind::File),
@@ -185,10 +190,6 @@ mod tests {
                 RepositorySourceKind::Ssh,
             ),
             (
-                "http://git.test/org/project.git",
-                RepositorySourceKind::Http,
-            ),
-            (
                 "https://git.test/org/project.git",
                 RepositorySourceKind::Https,
             ),
@@ -196,6 +197,26 @@ mod tests {
         for (source, expected_kind) in cases {
             assert_eq!(parse_repository_source(source).unwrap().kind, expected_kind);
         }
+    }
+
+    #[test]
+    fn rejects_plain_http_with_secure_transport_guidance() {
+        for source in [
+            "http://git.test/org/project.git",
+            "http://localhost/org/project.git",
+            "http://127.0.0.1/org/project.git",
+        ] {
+            let error = parse_repository_source(source).expect_err("plain HTTP must fail closed");
+            assert!(error.to_string().contains("plain HTTP Repository sources"));
+            assert!(error.to_string().contains("HTTPS or SSH"));
+        }
+    }
+
+    #[test]
+    fn legacy_plain_http_is_preserved_only_as_invalid_evidence() {
+        let source = classify_legacy_repository_source("http://git.test/org/project.git");
+        assert_eq!(source.kind, RepositorySourceKind::Invalid);
+        assert_eq!(source.uri, "http://git.test/org/project.git");
     }
 
     #[test]
