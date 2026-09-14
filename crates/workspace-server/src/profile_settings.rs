@@ -1,11 +1,9 @@
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use config_source::{ConfigContentType, ConfigSchemaContribution, VirtualPath};
 use manifest::{ProfileSource, builtin_profile_catalog_snapshot, resolve_profile_artifact_value};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use worker::EffectivePromptCatalog;
 use worker_runtime::config_bundle::{
@@ -13,14 +11,14 @@ use worker_runtime::config_bundle::{
 };
 use worker_runtime::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveInput};
 use workspace_api::{
-    Diagnostic, DiagnosticSeverity, ProfileSettingsResponse, UpdateWorkspaceMetadataRequest,
-    WorkspaceMetadataSettingsResponse, WorkspaceProfileSourceProvenance,
+    ProfileSettingsResponse, WorkspaceMetadataSettingsResponse, WorkspaceProfileSourceProvenance,
     WorkspaceProfileSourceSummary, WorkspaceProfileSummary,
 };
 
 use crate::config_source::{
     WorkspaceConfigSchemaProvider, WorkspaceConfigState, evaluate_workspace_config_state,
 };
+use crate::store::WorkspaceRecord;
 use crate::{Error, Result};
 
 const PROFILE_SCHEMA_SOURCE: &str = r#"{
@@ -467,103 +465,29 @@ fn build_virtual_profile_archive(
     .map_err(|error| profile_validation_error("profile_source_archive_invalid", &error.to_string()))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WorkspaceIdentityFile {
-    workspace_id: String,
-    created_at: String,
-    display_name: String,
-}
-
 pub fn workspace_metadata_settings(
-    workspace_root: &Path,
-    fallback_workspace_id: &str,
-    fallback_created_at: &str,
-    fallback_display_name: &str,
+    workspace: &WorkspaceRecord,
 ) -> WorkspaceMetadataSettingsResponse {
-    let path = workspace_root.join(crate::identity::WORKSPACE_IDENTITY_RELATIVE_PATH);
-    let mut diagnostics = Vec::new();
-    let (workspace_id, created_at, display_name) = match fs::read_to_string(&path) {
-        Ok(raw) => match toml::from_str::<WorkspaceIdentityFile>(&raw) {
-            Ok(file) => (file.workspace_id, file.created_at, file.display_name),
-            Err(err) => {
-                diagnostics.push(diagnostic(
-                    "workspace_identity_parse_failed",
-                    DiagnosticSeverity::Error,
-                    format!("Workspace identity could not be parsed: {err}"),
-                ));
-                (
-                    fallback_workspace_id.to_string(),
-                    fallback_created_at.to_string(),
-                    fallback_display_name.to_string(),
-                )
-            }
-        },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            diagnostics.push(diagnostic(
-                "workspace_identity_missing",
-                DiagnosticSeverity::Warning,
-                "Workspace identity record is missing; showing active backend metadata.",
-            ));
-            (
-                fallback_workspace_id.to_string(),
-                fallback_created_at.to_string(),
-                fallback_display_name.to_string(),
-            )
-        }
-        Err(err) => {
-            diagnostics.push(diagnostic(
-                "workspace_identity_read_failed",
-                DiagnosticSeverity::Error,
-                format!(
-                    "Workspace identity could not be read: {}",
-                    sanitize_error(&err.to_string())
-                ),
-            ));
-            (
-                fallback_workspace_id.to_string(),
-                fallback_created_at.to_string(),
-                fallback_display_name.to_string(),
-            )
-        }
-    };
     WorkspaceMetadataSettingsResponse {
-        workspace_id,
-        display_name,
-        created_at,
-        revision: file_revision(&path),
-        source: "workspace_identity".to_string(),
-        diagnostics,
+        workspace_id: workspace.workspace_id.clone(),
+        display_name: workspace.display_name.clone(),
+        created_at: workspace.created_at.clone(),
+        revision: workspace.updated_at.clone(),
+        source: "server_db".to_string(),
+        diagnostics: Vec::new(),
     }
 }
 
-pub fn update_workspace_metadata(
-    workspace_root: &Path,
-    request: UpdateWorkspaceMetadataRequest,
-) -> Result<WorkspaceMetadataSettingsResponse> {
-    let path = workspace_root.join(crate::identity::WORKSPACE_IDENTITY_RELATIVE_PATH);
-    let current_revision = file_revision(&path);
-    if request.revision != current_revision {
+pub fn sanitize_workspace_display_name(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) || trimmed.len() > 120 {
         return Err(Error::RuntimeOperationFailed {
             runtime_id: "workspace-backend".to_string(),
-            code: "workspace_metadata_revision_conflict".to_string(),
-            message: "Workspace metadata changed before this update was applied".to_string(),
+            code: "workspace_display_name_invalid".to_string(),
+            message: "Workspace display name must be non-empty, bounded, and must not contain control characters".to_string(),
         });
     }
-    let raw = fs::read_to_string(&path)?;
-    let mut file: WorkspaceIdentityFile = toml::from_str(&raw)
-        .map_err(|err| Error::Config(format!("failed to parse workspace identity: {err}")))?;
-    let display_name = sanitize_display_name(&request.display_name)?;
-    file.display_name = display_name;
-    let encoded = toml::to_string_pretty(&file)
-        .map_err(|err| Error::Config(format!("failed to serialize workspace identity: {err}")))?;
-    fs::write(&path, encoded)?;
-    Ok(workspace_metadata_settings(
-        workspace_root,
-        &file.workspace_id,
-        &file.created_at,
-        &file.display_name,
-    ))
+    Ok(trimmed.to_string())
 }
 
 fn builtin_profile_summaries(default_profile: Option<&str>) -> Vec<WorkspaceProfileSummary> {
@@ -728,17 +652,6 @@ fn collect_decodal_import_specifiers(content: &str) -> Vec<String> {
     specifiers
 }
 
-fn sanitize_display_name(value: &str) -> Result<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.chars().any(char::is_control) || trimmed.len() > 120 {
-        return Err(Error::RuntimeOperationFailed {
-            runtime_id: "workspace-backend".to_string(),
-            code: "workspace_display_name_invalid".to_string(),
-            message: "Workspace display name must be non-empty, bounded, and must not contain control characters".to_string(),
-        });
-    }
-    Ok(trimmed.to_string())
-}
 pub fn selector_for_builtin_candidate(
     id: &str,
 ) -> Option<worker_runtime::catalog::ProfileSelector> {
@@ -753,47 +666,40 @@ pub fn selector_for_builtin_candidate(
         _ => None,
     }
 }
-fn file_revision(path: &Path) -> String {
-    let Ok(metadata) = fs::metadata(path) else {
-        return "missing".to_string();
-    };
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    format!("rev:{modified}:{}", metadata.len())
-}
-fn diagnostic(
-    code: impl Into<String>,
-    severity: DiagnosticSeverity,
-    message: impl Into<String>,
-) -> Diagnostic {
-    Diagnostic {
-        code: code.into(),
-        severity,
-        message: message.into(),
-    }
-}
-fn sanitize_error(value: &str) -> String {
-    value
-        .split_whitespace()
-        .map(|token| {
-            if token.starts_with('/') || token.contains("/.yoi/") || token.contains(".yoi/sessions")
-            {
-                "<redacted-path>"
-            } else {
-                token
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_metadata_projects_server_database_record_without_filesystem_diagnostics() {
+        let workspace = WorkspaceRecord {
+            workspace_id: "workspace-a".to_string(),
+            owner_account_id: "owner-account".to_string(),
+            display_name: "Workspace A".to_string(),
+            state: "active".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+        };
+
+        let settings = workspace_metadata_settings(&workspace);
+
+        assert_eq!(settings.workspace_id, workspace.workspace_id);
+        assert_eq!(settings.display_name, workspace.display_name);
+        assert_eq!(settings.created_at, workspace.created_at);
+        assert_eq!(settings.revision, workspace.updated_at);
+        assert_eq!(settings.source, "server_db");
+        assert!(settings.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn workspace_display_name_validation_is_bounded() {
+        assert_eq!(
+            sanitize_workspace_display_name("  Workspace A  ").unwrap(),
+            "Workspace A"
+        );
+        assert!(sanitize_workspace_display_name("\n").is_err());
+        assert!(sanitize_workspace_display_name(&"a".repeat(121)).is_err());
+    }
 
     fn valid_decodal(slug: &str) -> String {
         format!(r#"{{ slug = "{slug}"; model = {{ id = "gpt-5.4"; }}; }}"#)

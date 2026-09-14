@@ -840,6 +840,12 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     ) -> Result<Option<String>>;
     async fn upsert_workspace(&self, record: &WorkspaceRecord) -> Result<()>;
     async fn get_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>>;
+    async fn update_workspace_display_name(
+        &self,
+        workspace_id: &str,
+        expected_updated_at: &str,
+        display_name: &str,
+    ) -> Result<Option<WorkspaceRecord>>;
     fn create_workspace_bootstrap(
         &self,
         record: &WorkspaceBootstrapRecord,
@@ -3302,6 +3308,66 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )
             .optional()
             .map_err(Error::from)
+        })
+    }
+
+    async fn update_workspace_display_name(
+        &self,
+        workspace_id: &str,
+        expected_updated_at: &str,
+        display_name: &str,
+    ) -> Result<Option<WorkspaceRecord>> {
+        validate_identifier("workspace_id", workspace_id)?;
+        validate_non_empty("expected_updated_at", expected_updated_at)?;
+        validate_non_empty("display_name", display_name)?;
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = tx
+                .query_row(
+                    r#"SELECT workspace_id, owner_account_id, display_name, state, created_at, updated_at
+                       FROM workspaces WHERE workspace_id = ?1"#,
+                    params![workspace_id],
+                    read_workspace_record,
+                )
+                .optional()?;
+            let Some(current) = current else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            if current.updated_at != expected_updated_at {
+                tx.commit()?;
+                return Ok(None);
+            }
+            if current.display_name == display_name {
+                tx.commit()?;
+                return Ok(Some(current));
+            }
+
+            let now = chrono::Utc::now();
+            let updated_at = chrono::DateTime::parse_from_rfc3339(&current.updated_at)
+                .ok()
+                .map(|previous| previous.with_timezone(&chrono::Utc))
+                .filter(|previous| *previous >= now)
+                .map(|previous| previous + chrono::Duration::nanoseconds(1))
+                .unwrap_or(now)
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            let changed = tx.execute(
+                r#"UPDATE workspaces
+                   SET display_name = ?3, updated_at = ?4
+                   WHERE workspace_id = ?1 AND updated_at = ?2"#,
+                params![workspace_id, expected_updated_at, display_name, updated_at],
+            )?;
+            if changed != 1 {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let updated = WorkspaceRecord {
+                display_name: display_name.to_string(),
+                updated_at,
+                ..current
+            };
+            tx.commit()?;
+            Ok(Some(updated))
         })
     }
 
@@ -12333,6 +12399,49 @@ mod tests {
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_display_name_update_is_revision_guarded_and_preserves_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteWorkspaceStore::open(dir.path().join("server.db")).unwrap();
+        let record = WorkspaceRecord {
+            workspace_id: "workspace-a".to_string(),
+            owner_account_id: "owner-account".to_string(),
+            display_name: "Before".to_string(),
+            state: "active".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        store.upsert_workspace(&record).await.unwrap();
+
+        let updated = store
+            .update_workspace_display_name(&record.workspace_id, &record.updated_at, "After")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.workspace_id, record.workspace_id);
+        assert_eq!(updated.owner_account_id, record.owner_account_id);
+        assert_eq!(updated.created_at, record.created_at);
+        assert_eq!(updated.state, record.state);
+        assert_eq!(updated.display_name, "After");
+        assert_ne!(updated.updated_at, record.updated_at);
+
+        assert!(
+            store
+                .update_workspace_display_name(&record.workspace_id, &record.updated_at, "Stale",)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_workspace(&record.workspace_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            updated
         );
     }
 

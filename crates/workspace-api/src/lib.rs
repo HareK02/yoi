@@ -590,7 +590,7 @@ pub struct WorkspaceResponse {
     pub extension_points: WorkspaceExtensionPoints,
 }
 
-/// Workspace identity metadata exposed by the current settings resource.
+/// Workspace display metadata exposed from the Server DB settings authority.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]

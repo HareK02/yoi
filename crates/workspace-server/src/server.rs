@@ -142,7 +142,6 @@ use crate::hosts::{
     WorkerWorkspaceSummary, WorkspaceRuntimeAuthorization, is_disallowed_remote_runtime_address,
     is_loopback_runtime_origin, worker_spawn_create_fingerprint, workspace_worker_summary,
 };
-use crate::identity::WorkspaceIdentity;
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
 use crate::memory_staging::{
     list_memory_staging_from_authority, memory_staging_backlog_from_authority,
@@ -211,7 +210,7 @@ pub struct ServerConfig {
     pub workspace_id: String,
     pub workspace_display_name: String,
     pub workspace_created_at: String,
-    pub workspace_root: PathBuf,
+    pub workspace_execution_root: PathBuf,
     pub database_path: PathBuf,
     pub embedded_runtime_store_root: PathBuf,
     pub static_assets_dir: Option<PathBuf>,
@@ -224,16 +223,18 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    pub fn local_dev(workspace_root: impl Into<PathBuf>, identity: WorkspaceIdentity) -> Self {
-        let workspace_root = workspace_root.into();
-        let workspace_id = identity.workspace_id;
+    pub fn local_dev(
+        workspace_execution_root: impl Into<PathBuf>,
+        workspace: WorkspaceRecord,
+    ) -> Self {
+        let workspace_id = workspace.workspace_id.clone();
         let embedded_runtime_store_root = Self::default_embedded_runtime_store_root(&workspace_id);
         let database_path = Self::default_server_database_path();
         Self {
-            workspace_id,
-            workspace_display_name: identity.display_name,
-            workspace_created_at: identity.created_at,
-            workspace_root,
+            workspace_id: workspace.workspace_id,
+            workspace_display_name: workspace.display_name,
+            workspace_created_at: workspace.created_at,
+            workspace_execution_root: workspace_execution_root.into(),
             database_path,
             embedded_runtime_store_root,
             static_assets_dir: None,
@@ -320,9 +321,8 @@ impl ServerConfig {
                 workspace.workspace_id
             )));
         }
-        let workspace_data_root =
+        let workspace_execution_root =
             Self::default_workspace_backend_data_root(&workspace.workspace_id);
-        let workspace_root = workspace_data_root.clone();
         let repositories = repositories
             .into_iter()
             .map(|repository| ConfiguredRepository {
@@ -346,7 +346,7 @@ impl ServerConfig {
         scoped
             .workspace_created_at
             .clone_from(&workspace.created_at);
-        scoped.workspace_root = workspace_root;
+        scoped.workspace_execution_root = workspace_execution_root;
         scoped.embedded_runtime_store_root =
             Self::default_embedded_runtime_store_root(&workspace.workspace_id);
         scoped.repositories = repositories;
@@ -2138,7 +2138,7 @@ impl WorkspaceApi {
             ),
         );
         let execution_backend = WorkerRuntimeExecutionBackend::new(
-            ProfileRuntimeWorkerFactory::new(config.workspace_root.clone())
+            ProfileRuntimeWorkerFactory::new(config.workspace_execution_root.clone())
                 .with_embedded_worker_mutation_dispatcher(
                     EMBEDDED_RUNTIME_ID,
                     worker_remove_dispatcher.clone(),
@@ -2985,14 +2985,11 @@ fn load_configured_repositories_from_store(
     store
         .list_repositories(&config.workspace_id)?
         .into_iter()
-        .map(|record| configured_repository_from_record(&config.workspace_root, record))
+        .map(configured_repository_from_record)
         .collect()
 }
 
-fn configured_repository_from_record(
-    _workspace_root: &Path,
-    record: RepositoryRecord,
-) -> Result<ConfiguredRepository> {
+fn configured_repository_from_record(record: RepositoryRecord) -> Result<ConfiguredRepository> {
     let provider = record.provider.unwrap_or_else(|| record.kind.clone());
     let path = repository_local_path(&record.source);
     Ok(ConfiguredRepository {
@@ -3983,7 +3980,7 @@ struct TranscriptQuery {
     limit: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ScopedWorkspacePath {
     workspace_id: String,
 }
@@ -4212,11 +4209,13 @@ async fn scoped_get_workspace_settings(
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
 ) -> ApiResult<Json<WorkspaceMetadataSettingsResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
+    let workspace = api
+        .store
+        .get_workspace(&path.workspace_id)
+        .await?
+        .ok_or_else(|| Error::InvalidRecordId(path.workspace_id))?;
     Ok(Json(crate::profile_settings::workspace_metadata_settings(
-        &api.config.workspace_root,
-        &api.config.workspace_id,
-        &api.config.workspace_created_at,
-        &api.config.workspace_display_name,
+        &workspace,
     )))
 }
 
@@ -4226,8 +4225,31 @@ async fn scoped_update_workspace_settings(
     Json(request): Json<UpdateWorkspaceMetadataRequest>,
 ) -> ApiResult<Json<WorkspaceMetadataMutationResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let workspace =
-        crate::profile_settings::update_workspace_metadata(&api.config.workspace_root, request)?;
+    let display_name =
+        crate::profile_settings::sanitize_workspace_display_name(&request.display_name)?;
+    let current = api
+        .store
+        .get_workspace(&path.workspace_id)
+        .await?
+        .ok_or_else(|| Error::InvalidRecordId(path.workspace_id.clone()))?;
+    if request.revision != current.updated_at {
+        return Err(Error::RuntimeOperationFailed {
+            runtime_id: "workspace-backend".to_string(),
+            code: "workspace_metadata_revision_conflict".to_string(),
+            message: "Workspace metadata changed before this update was applied".to_string(),
+        }
+        .into());
+    }
+    let workspace = api
+        .store
+        .update_workspace_display_name(&path.workspace_id, &current.updated_at, &display_name)
+        .await?
+        .ok_or_else(|| Error::RuntimeOperationFailed {
+            runtime_id: "workspace-backend".to_string(),
+            code: "workspace_metadata_revision_conflict".to_string(),
+            message: "Workspace metadata changed before this update was applied".to_string(),
+        })?;
+    let workspace = crate::profile_settings::workspace_metadata_settings(&workspace);
     Ok(Json(WorkspaceMetadataMutationResponse {
         workspace,
         diagnostics: vec![workspace_api::Diagnostic {
@@ -13531,22 +13553,20 @@ async fn get_workspace(
     let cookie_name = auth_public_config(&api.config).cookie_name;
     let actor = resolve_request_actor(api.store.as_ref(), &headers, &cookie_name).await?;
     let schema_version = api.store.schema_version().await?;
-    let stored = api.store.get_workspace(api.workspace_id()).await?;
-    let is_owner = actor.as_ref().is_some_and(|actor| {
-        stored
-            .as_ref()
-            .is_some_and(|workspace| workspace.owner_account_id == actor.account_id)
-    });
-    let display_name = stored
+    let stored = api
+        .store
+        .get_workspace(api.workspace_id())
+        .await?
+        .ok_or_else(|| Error::InvalidRecordId(api.workspace_id().to_string()))?;
+    let is_owner = actor
         .as_ref()
-        .map(|record| record.display_name.clone())
-        .unwrap_or_else(|| api.config.workspace_display_name.clone());
+        .is_some_and(|actor| stored.owner_account_id == actor.account_id);
     let companion_status = api.companion.status();
     let companion_console = companion_console_extension_point(&companion_status);
     Ok(Json(WorkspaceResponse {
-        workspace_id: api.config.workspace_id.clone(),
-        display_name,
-        record_authority: "local_yoi_project_records".to_string(),
+        workspace_id: stored.workspace_id,
+        display_name: stored.display_name,
+        record_authority: "server_db".to_string(),
         schema_version,
         auth: api.config.auth.clone(),
         permissions: WorkspacePermissionSummary {
@@ -21945,11 +21965,14 @@ mod tests {
         }
     }
 
-    fn test_identity() -> WorkspaceIdentity {
-        WorkspaceIdentity {
+    fn test_workspace() -> WorkspaceRecord {
+        WorkspaceRecord {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
+            owner_account_id: "owner-account".to_string(),
             display_name: "Test Workspace".to_string(),
             created_at: TEST_CREATED_AT.to_string(),
+            updated_at: TEST_CREATED_AT.to_string(),
+            state: "active".to_string(),
         }
     }
 
@@ -21993,7 +22016,7 @@ mod tests {
             workspace_api::RepositorySourceKind::Https
         );
         assert_eq!(
-            scoped.workspace_root,
+            scoped.workspace_execution_root,
             ServerConfig::default_workspace_backend_data_root("remote-workspace")
         );
     }
@@ -22048,7 +22071,7 @@ mod tests {
     fn test_server_config(workspace_root: impl Into<PathBuf>) -> ServerConfig {
         let workspace_root = workspace_root.into();
         let store_root = workspace_root.join(".test-embedded-runtime-store");
-        let mut config = ServerConfig::local_dev(workspace_root.clone(), test_identity())
+        let mut config = ServerConfig::local_dev(workspace_root.clone(), test_workspace())
             .with_embedded_runtime_store_root(store_root);
         config.database_path = workspace_root.join(".test-yoi-server.db");
         config.backend_base_url = Some("http://127.0.0.1:8787".to_string());
@@ -25939,6 +25962,69 @@ mod tests {
         assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
     }
 
+    #[tokio::test]
+    async fn workspace_metadata_settings_ignore_repository_identity_file_and_update_server_db() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_identity_path = temp.path().join(".yoi/workspace.toml");
+        fs::create_dir_all(local_identity_path.parent().unwrap()).unwrap();
+        fs::write(&local_identity_path, "not valid toml = [").unwrap();
+        let api = test_api(temp.path()).await;
+        let path = ScopedWorkspacePath {
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+        };
+
+        let current = scoped_get_workspace_settings(State(api.clone()), AxumPath(path.clone()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(current.workspace_id, TEST_WORKSPACE_ID);
+        assert_eq!(current.display_name, "Test Workspace");
+        assert_eq!(current.source, "server_db");
+        assert!(current.diagnostics.is_empty());
+
+        let updated = scoped_update_workspace_settings(
+            State(api.clone()),
+            AxumPath(path),
+            Json(UpdateWorkspaceMetadataRequest {
+                display_name: "  Renamed Workspace  ".to_string(),
+                revision: current.revision.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .workspace;
+        assert_eq!(updated.display_name, "Renamed Workspace");
+        assert_ne!(updated.revision, current.revision);
+        assert_eq!(
+            fs::read_to_string(&local_identity_path).unwrap(),
+            "not valid toml = ["
+        );
+        assert_eq!(
+            api.store
+                .get_workspace(TEST_WORKSPACE_ID)
+                .await
+                .unwrap()
+                .unwrap()
+                .display_name,
+            "Renamed Workspace"
+        );
+
+        let stale = scoped_update_workspace_settings(
+            State(api),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            Json(UpdateWorkspaceMetadataRequest {
+                display_name: "Stale Workspace".to_string(),
+                revision: current.revision,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale.into_response().status(), StatusCode::CONFLICT);
+    }
+
     async fn test_api_with_recording_backend(
         workspace_root: impl Into<PathBuf>,
     ) -> (WorkspaceApi, Arc<DeterministicExecutionBackend>) {
@@ -26908,7 +26994,7 @@ mod tests {
                 provider: Some("git".to_string()),
                 source: workspace_api::RepositorySource {
                     kind: workspace_api::RepositorySourceKind::LocalPath,
-                    uri: api.config.workspace_root.display().to_string(),
+                    uri: api.config.workspace_execution_root.display().to_string(),
                 },
                 default_ref: Some("HEAD".to_string()),
                 source_revision: 1,
@@ -30158,7 +30244,7 @@ mod tests {
         let typed_workspace: workspace_api::WorkspaceResponse =
             serde_json::from_value(workspace.clone()).unwrap();
         assert!(!typed_workspace.permissions.manage_repositories);
-        assert_eq!(workspace["record_authority"], "local_yoi_project_records");
+        assert_eq!(workspace["record_authority"], "server_db");
         assert_eq!(
             workspace["extension_points"]["host_worker_bridge"]["status"],
             "runtime_registry"
@@ -30774,7 +30860,7 @@ mod tests {
         );
         assert!(!default_root.starts_with(workspace_root.join(".yoi")));
 
-        let mut config = ServerConfig::local_dev(workspace_root, test_identity())
+        let mut config = ServerConfig::local_dev(workspace_root, test_workspace())
             .with_embedded_runtime_store_root(default_root.clone());
         config.database_path = ServerConfig::server_database_path_for_data_dir(&data_dir);
         let store = test_control_store(&config);
@@ -31496,7 +31582,7 @@ mod tests {
     async fn scoped_flow_source_route_persists_compiled_dcdl() {
         let temp = tempfile::tempdir().unwrap();
         let app = test_app(temp.path()).await;
-        let workspace_id = test_identity().workspace_id;
+        let workspace_id = test_workspace().workspace_id;
         let source = r#"{
             schema_version = 1;
             name = "route-flow";
