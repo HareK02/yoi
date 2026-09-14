@@ -934,7 +934,7 @@
         token: number,
         target: ConsoleTarget,
     ) {
-        if (!targetWorker) {
+        if (!targetWorker || targetWorker.state === "stopped") {
             protocolState = "closed";
             return;
         }

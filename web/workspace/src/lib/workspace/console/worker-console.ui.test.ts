@@ -380,6 +380,7 @@ Deno.test("Worker Console uses protocol observation events without transcript fe
     consolePage.includes("connectProtocolTransport") &&
       consolePage.includes("handleIncomingProtocolEvent") &&
       consolePage.includes("workspaceMultiplexer") &&
+      consolePage.includes('targetWorker.state === "stopped"') &&
       consolePage.includes('topic: "worker_protocol"') &&
       !consolePage.includes("seenObservationEventIds") &&
       consolePage.includes("createConsoleProjector") &&
