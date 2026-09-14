@@ -3,20 +3,19 @@ use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use workspace_api::{
-    WorkspaceCatalogListResponse, WorkspaceCreateResponse, WorkspaceRepositoryRecord,
-    WorkspaceSummary,
+    RepositoryListResponse, RepositorySummary, WorkspaceCatalogListResponse,
+    WorkspaceCreateResponse, WorkspaceSummary,
 };
 
 const DEFAULT_WORKSPACE_LIMIT: usize = 200;
 
 pub type BackendWorkspace = WorkspaceSummary;
 pub type CreateBackendWorkspaceResponse = WorkspaceCreateResponse;
-pub type CreateBackendWorkspaceRepositoryRecord = WorkspaceRepositoryRecord;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CreateBackendWorkspaceRequest {
-    pub operation_key: String,
+    pub operation_id: String,
     pub display_name: String,
     pub repository: CreateBackendWorkspaceRepository,
 }
@@ -24,8 +23,8 @@ pub struct CreateBackendWorkspaceRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CreateBackendWorkspaceRepository {
-    pub uri: String,
-    pub display_name: Option<String>,
+    pub repository_key: String,
+    pub source: String,
     pub default_ref: Option<String>,
 }
 
@@ -71,6 +70,48 @@ impl From<reqwest::Error> for BackendWorkspaceClientError {
     fn from(error: reqwest::Error) -> Self {
         Self::Http(error)
     }
+}
+
+pub fn list_backend_workspaces_blocking(
+    target: &BackendWorkspaceCatalogTarget,
+) -> Result<Vec<BackendWorkspace>, BackendWorkspaceClientError> {
+    let client = BackendApiClient::from_stored_token(&target.base_url)?;
+    let response = client
+        .blocking_request(
+            Method::GET,
+            &format!("/api/workspaces?limit={DEFAULT_WORKSPACE_LIMIT}"),
+        )?
+        .send()?;
+    client.check_status(response.status())?;
+    Ok(response.json::<WorkspaceCatalogListResponse>()?.0)
+}
+
+pub fn list_backend_workspace_repositories_blocking(
+    target: &BackendWorkspaceCatalogTarget,
+    workspace_id: &str,
+) -> Result<Vec<RepositorySummary>, BackendWorkspaceClientError> {
+    if workspace_id.is_empty()
+        || workspace_id.len() > 200
+        || !workspace_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(BackendWorkspaceClientError::InvalidTarget(
+            "Workspace id returned by Backend is invalid".to_string(),
+        ));
+    }
+    let client = BackendApiClient::from_stored_token(&target.base_url)?;
+    let response = client
+        .blocking_request(Method::GET, &format!("/api/w/{workspace_id}/repositories"))?
+        .send()?;
+    client.check_status(response.status())?;
+    let response = response.json::<RepositoryListResponse>()?;
+    if response.workspace_id != workspace_id {
+        return Err(BackendWorkspaceClientError::InvalidTarget(
+            "Repository catalog response does not match the requested Workspace".to_string(),
+        ));
+    }
+    Ok(response.items)
 }
 
 pub async fn list_backend_workspaces(
@@ -144,19 +185,19 @@ mod tests {
     }
 
     #[test]
-    fn create_request_keeps_operation_key_for_exact_retry() {
+    fn create_request_keeps_operation_id_for_exact_retry() {
         let request = CreateBackendWorkspaceRequest {
-            operation_key: "workspace-create-1".to_string(),
+            operation_id: "workspace-create-1".to_string(),
             display_name: "Alpha".to_string(),
             repository: CreateBackendWorkspaceRepository {
-                uri: "/srv/repos/alpha".to_string(),
-                display_name: Some("Main".to_string()),
+                repository_key: "main".to_string(),
+                source: "/srv/repos/alpha".to_string(),
                 default_ref: Some("develop".to_string()),
             },
         };
 
         let retry = request.clone();
-        assert_eq!(retry.operation_key, "workspace-create-1");
+        assert_eq!(retry.operation_id, "workspace-create-1");
         assert_eq!(retry, request);
     }
 }

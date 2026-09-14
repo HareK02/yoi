@@ -189,7 +189,7 @@ fn prompt_create_request_inner() -> PickerResult<Option<CreateBackendWorkspaceRe
         println!("Repository path/URI is required.");
         return Ok(None);
     }
-    let repository_name = prompt_line("Repository display name [Main]: ")?;
+    let repository_key = prompt_line("Repository key [main]: ")?;
     let default_ref = prompt_line("Default ref [repository default]: ")?;
     let operation_key = format!(
         "tui-workspace-create-{}-{}",
@@ -200,15 +200,15 @@ fn prompt_create_request_inner() -> PickerResult<Option<CreateBackendWorkspaceRe
             .as_nanos()
     );
     Ok(Some(CreateBackendWorkspaceRequest {
-        operation_key,
+        operation_id: operation_key,
         display_name,
         repository: CreateBackendWorkspaceRepository {
-            uri,
-            display_name: Some(if repository_name.is_empty() {
-                "Main".to_string()
+            source: uri,
+            repository_key: if repository_key.is_empty() {
+                "main".to_string()
             } else {
-                repository_name
-            }),
+                repository_key
+            },
             default_ref: (!default_ref.is_empty()).then_some(default_ref),
         },
     }))

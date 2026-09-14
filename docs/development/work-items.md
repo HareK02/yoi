@@ -108,7 +108,7 @@ The first version intentionally does not implement roadmap scheduling, milestone
 
 ## Ticket configuration
 
-Workspace Ticket data and workflow authority live in the Workspace Server's SQLite control-plane store. Repository-local `.yoi/workspace.toml` and `.yoi/ticket.config.toml` are not Ticket, Workspace identity, Backend connection, or role-launch authority.
+Workspace Ticket data and workflow authority live in the Workspace Server's SQLite control-plane store. Repository-local `.yoi/workspace.toml` and `.yoi/ticket.config.toml` are not Ticket, Workspace identity, Backend connection, or role-launch authority. `yoi init --display-name <NAME> --repository-key <KEY>` registers the current Git repository through the Backend API and writes only global client routing under `$XDG_CONFIG_HOME/yoi/client.toml`.
 
 Fixed Ticket workflow roles are `intake`, `orchestrator`, `coder`, and `reviewer`. The Server resolves the selected Profile and launch material from the active Workspace configuration authority, and Runtime receives the resulting immutable launch snapshot. A repository checkout may still contain ordinary project files, but neither the client nor Runtime may infer Workspace identity, Backend routing, role Profile, or Ticket storage from repository-local `.yoi` files.
 

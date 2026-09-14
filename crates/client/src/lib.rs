@@ -34,7 +34,9 @@ pub use backend_runtime::{
 pub use backend_workspace::{
     BackendWorkspace, BackendWorkspaceCatalogTarget, BackendWorkspaceClientError,
     CreateBackendWorkspaceRepository, CreateBackendWorkspaceRequest,
-    CreateBackendWorkspaceResponse, create_backend_workspace, list_backend_workspaces,
+    CreateBackendWorkspaceResponse, create_backend_workspace,
+    list_backend_workspace_repositories_blocking, list_backend_workspaces,
+    list_backend_workspaces_blocking,
 };
 pub use client::{Client, ClientError};
 pub use target::{

@@ -4,19 +4,26 @@ use client::{
 };
 
 #[test]
-fn workspace_creation_request_preserves_operation_key_for_retry() {
+fn workspace_creation_request_preserves_operation_id_for_retry() {
     let request = CreateBackendWorkspaceRequest {
-        operation_key: "workspace-create-1".to_string(),
+        operation_id: "workspace-create-1".to_string(),
         display_name: "Alpha".to_string(),
         repository: CreateBackendWorkspaceRepository {
-            uri: "/srv/repos/alpha".to_string(),
-            display_name: Some("Main".to_string()),
+            repository_key: "main".to_string(),
+            source: "/srv/repos/alpha".to_string(),
             default_ref: Some("develop".to_string()),
         },
     };
 
     assert_eq!(request.clone(), request);
-    assert_eq!(request.operation_key, "workspace-create-1");
+    assert_eq!(request.operation_id, "workspace-create-1");
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["operation_id"], "workspace-create-1");
+    assert_eq!(json["repository"]["repository_key"], "main");
+    assert_eq!(json["repository"]["source"], "/srv/repos/alpha");
+    assert!(json.get("operation_key").is_none());
+    assert!(json["repository"].get("display_name").is_none());
+    assert!(json["repository"].get("uri").is_none());
 }
 
 #[test]

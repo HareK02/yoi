@@ -6822,6 +6822,7 @@ dependencies = [
  "tokio",
  "toml",
  "tui",
+ "uuid",
  "worker",
  "workspace-api",
 ]

@@ -6,6 +6,7 @@ mod plugin_cli;
 mod session_cli;
 mod ticket_cli;
 mod worker_cleanup_cli;
+mod workspace_bootstrap;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -24,6 +25,9 @@ use client::{BackendAuthTarget, Target, TargetKind, start_device_login, wait_for
 use memory_lint::{LintCliOptions, LintStatus};
 use serde::Deserialize;
 use tui::{LaunchMode, LaunchOptions};
+use workspace_bootstrap::{
+    InitOptions, discover_repository_root, run_init, select_backend_workspace_for_repository,
+};
 
 #[derive(Debug)]
 enum Mode {
@@ -48,6 +52,7 @@ enum Mode {
         backend_url: String,
         no_wait: bool,
     },
+    Init(InitOptions),
     WorkerRuntime(Vec<String>),
     Keys,
     SetupModel,
@@ -104,6 +109,19 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("yoi login: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Mode::Init(options) => match run_init(options).await {
+            Ok(workspace) => {
+                println!(
+                    "Initialized Workspace '{}' for repository '{}'",
+                    workspace.workspace.display_name, workspace.repository.repository_key
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("yoi init: {error}");
                 ExitCode::FAILURE
             }
         },
@@ -220,7 +238,7 @@ fn resolve_tui_target<R: CliConnectionResolver + ?Sized>(
     connection_resolver: &R,
     command: CliCommand,
     selection: &TargetSelection,
-    _workspace_root: &Path,
+    workspace_root: &Path,
 ) -> Result<Box<dyn Target>, ParseError> {
     if selection.explicit_local {
         return resolve_connection_aware_cli_connection(
@@ -232,12 +250,29 @@ fn resolve_tui_target<R: CliConnectionResolver + ?Sized>(
         );
     }
 
-    if selection.backend_url.is_none()
-        && let Ok(target) =
-            resolve_connection_aware_cli_connection(connection_resolver, command, false, None, None)
-        && target.kind() == TargetKind::Standalone
-    {
-        return Ok(target);
+    if selection.workspace_id.is_none() {
+        if selection.backend_url.is_none()
+            && let Ok(target) = resolve_connection_aware_cli_connection(
+                connection_resolver,
+                command,
+                false,
+                None,
+                None,
+            )
+            && target.kind() == TargetKind::Standalone
+        {
+            return Ok(target);
+        }
+
+        let (base_url, workspace_id) = connection_resolver
+            .select_workspace_for_repository(selection.backend_url.as_deref(), workspace_root)?;
+        return resolve_connection_aware_cli_connection(
+            connection_resolver,
+            command,
+            false,
+            Some(base_url),
+            Some(&workspace_id),
+        );
     }
 
     resolve_connection_aware_cli_connection(
@@ -435,6 +470,22 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             .map_err(|error| ParseError(error.to_string()))?;
             return Ok(Mode::Ticket { cli, target });
         }
+        "init" => {
+            if target_selection.explicit_local {
+                return Err(ParseError(
+                    "yoi init requires a Backend target and cannot use --local".to_string(),
+                ));
+            }
+            if target_selection.workspace_id.is_some() {
+                return Err(ParseError(
+                    "yoi init creates a Workspace and does not accept --workspace-id".to_string(),
+                ));
+            }
+            return Ok(Mode::Init(parse_init_args(
+                &args[1..],
+                target_selection.backend_url,
+            )?));
+        }
         "plugin" => {
             let _target = resolve_local_cli_connection(connection_resolver, CliCommand::Plugin)?;
             let plugin_cli = parse_plugin_args(&args[1..])?;
@@ -550,6 +601,68 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
     }
 
     parse_console_options(args, &target_selection, connection_resolver)
+}
+
+fn parse_init_args(
+    args: &[String],
+    explicit_backend_url: Option<String>,
+) -> Result<InitOptions, ParseError> {
+    let mut display_name = None;
+    let mut repository_key = None;
+    let mut repository_root = current_dir()?;
+    let mut default_ref = None;
+    let mut index = 0;
+    while index < args.len() {
+        let option = args[index].as_str();
+        let (slot, label) = match option {
+            "--display-name" => (&mut display_name, "--display-name"),
+            "--repository-key" => (&mut repository_key, "--repository-key"),
+            "--repository" => {
+                let value = required_option_value(args, index, "--repository")?;
+                repository_root = PathBuf::from(value);
+                index += 2;
+                continue;
+            }
+            "--default-ref" => (&mut default_ref, "--default-ref"),
+            "--help" | "-h" => {
+                return Err(ParseError(
+                    "usage: yoi [--backend URL] init --display-name NAME --repository-key KEY [--repository PATH] [--default-ref REF]"
+                        .to_string(),
+                ));
+            }
+            unknown => {
+                return Err(ParseError(format!("unknown yoi init option `{unknown}`")));
+            }
+        };
+        if slot.is_some() {
+            return Err(ParseError(format!("{label} may only be provided once")));
+        }
+        *slot = Some(required_option_value(args, index, label)?.to_string());
+        index += 2;
+    }
+
+    let repository_root = discover_repository_root(&repository_root)?;
+    Ok(InitOptions {
+        backend_url: resolve_backend_url(explicit_backend_url, None)?,
+        display_name: display_name
+            .ok_or_else(|| ParseError("yoi init requires --display-name NAME".to_string()))?,
+        repository_key: repository_key
+            .ok_or_else(|| ParseError("yoi init requires --repository-key KEY".to_string()))?,
+        repository_root,
+        default_ref,
+    })
+}
+
+fn required_option_value<'a>(
+    args: &'a [String],
+    index: usize,
+    option: &str,
+) -> Result<&'a str, ParseError> {
+    let value = args
+        .get(index + 1)
+        .filter(|value| !value.is_empty() && !value.starts_with('-'))
+        .ok_or_else(|| ParseError(format!("{option} requires a value")))?;
+    Ok(value)
 }
 
 fn parse_console_options<R: CliConnectionResolver + ?Sized>(
@@ -1046,7 +1159,7 @@ fn current_dir() -> Result<PathBuf, ParseError> {
         .map_err(|e| ParseError(format!("failed to resolve current directory: {e}")))
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct ClientConfigFile {
     default_backend: Option<String>,
     default_connection: ClientDefaultConnection,
@@ -1064,7 +1177,7 @@ struct ClientConfigOverlay {
     workspaces: BTreeMap<String, ClientWorkspaceConfigOverlay>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct ClientBackendConfig {
     url: Option<String>,
 }
@@ -1074,7 +1187,7 @@ struct ClientBackendConfigOverlay {
     url: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct ClientWorkspaceConfig {
     backend: Option<String>,
 }
@@ -1663,6 +1776,7 @@ Usage:
   yoi [TARGET] workers [-r|--stopped] [--runtime-id <ID>]
   yoi [TARGET] resume [--all] [--runtime-id <ID>]
   yoi --backend <URL> [--workspace-id <ID>] panel
+  yoi [--backend <URL>] init --display-name <NAME> --repository-key <KEY> [--repository <PATH>] [--default-ref <REF>]
   yoi [--backend <URL>] login [--no-wait]
   yoi <HOST_COMMAND> [OPTIONS]
 
@@ -1688,6 +1802,7 @@ Console options:
       --worker-id <ID>     Backend Worker id; requires --runtime-id
 
 Host commands:
+  yoi init                    Register the current Git repository as a new Backend Workspace.
   keys                         Manage local model/API keys
   setup-model                  Configure a local model provider
   worker [WORKER_OPTIONS]      Run the direct Worker process entrypoint
@@ -1722,7 +1837,7 @@ Authority:
 Options:
       --backend <URL>      Use this Workspace Backend
       --workspace-id <ID>  Scope Backend routes to a Workspace id
-      --workspace <PATH>   Resolve Backend Workspace identity from this repository root
+      --workspace <PATH>   Match this Git repository against Server DB Repository records
   -r, --stopped            List stopped Backend Workers
       --runtime-id <ID>    Restrict the Backend Worker picker to a Runtime id
   -h, --help               Print help
@@ -1764,6 +1879,7 @@ mod tests {
     use super::*;
     use crate::cli_connection::CliConnectionInput;
     use client::{BackendTarget, StandaloneTarget, Target, TargetKind, WorkerListRequest};
+    use std::process::Command;
 
     struct FixedCliConnectionResolver {
         backend_url: &'static str,
@@ -1811,6 +1927,42 @@ mod tests {
                 self.backend_url,
                 workspace_id.map(str::to_string),
             )))
+        }
+
+        fn select_workspace_for_repository(
+            &self,
+            _explicit_backend_url: Option<&str>,
+            _repository_path: &Path,
+        ) -> Result<(String, String), ParseError> {
+            Ok((
+                self.backend_url.to_string(),
+                "workspace-from-backend".to_string(),
+            ))
+        }
+    }
+
+    struct OfflineBackendCliConnectionResolver;
+
+    impl CliConnectionResolver for OfflineBackendCliConnectionResolver {
+        fn resolve_connection(
+            &self,
+            _command: CliCommand,
+            _input: cli_connection::CliConnectionInput<'_>,
+        ) -> Result<Box<dyn Target>, ParseError> {
+            Ok(Box::new(BackendTarget::new(
+                "http://offline.example",
+                None::<String>,
+            )))
+        }
+
+        fn select_workspace_for_repository(
+            &self,
+            _explicit_backend_url: Option<&str>,
+            _repository_path: &Path,
+        ) -> Result<(String, String), ParseError> {
+            Err(ParseError(
+                "failed to query Backend Workspace catalog: Backend is offline".to_string(),
+            ))
         }
     }
 
@@ -2054,7 +2206,15 @@ backend = "shared"
 
     #[test]
     fn parse_backend_runtime_picker_target_mode() {
-        match parse_args_from(["--backend", "http://127.0.0.1:8787", "--runtime-id", "r"]).unwrap()
+        match parse_args_from([
+            "--backend",
+            "http://127.0.0.1:8787",
+            "--workspace-id",
+            "workspace-a",
+            "--runtime-id",
+            "r",
+        ])
+        .unwrap()
         {
             Mode::Tui {
                 target,
@@ -2411,7 +2571,71 @@ backend = "shared"
     }
 
     #[test]
-    fn default_backend_target_does_not_read_repository_workspace_identity() {
+    fn backend_workspace_selection_reports_offline_without_local_fallback() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join(".yoi")).unwrap();
+        fs::write(
+            workspace.path().join(".yoi/workspace.toml"),
+            "workspace_id = \"stale-local-workspace\"\n",
+        )
+        .unwrap();
+
+        let error = resolve_tui_target(
+            &OfflineBackendCliConnectionResolver,
+            CliCommand::Ticket,
+            &TargetSelection::default(),
+            workspace.path(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Backend is offline"));
+        assert!(!error.contains("stale-local-workspace"));
+    }
+
+    #[test]
+    fn init_parsing_uses_git_root_without_writing_repository_local_identity() {
+        let repository = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+        let resolver = FixedCliConnectionResolver {
+            backend_url: "http://unused.example",
+        };
+        let args = vec![
+            "--backend".to_string(),
+            "http://backend.example".to_string(),
+            "init".to_string(),
+            "--display-name".to_string(),
+            "Workspace A".to_string(),
+            "--repository-key".to_string(),
+            "main".to_string(),
+            "--repository".to_string(),
+            repository.path().display().to_string(),
+            "--default-ref".to_string(),
+            "develop".to_string(),
+        ];
+
+        let mode = parse_args_slice_with_connection_resolver(&args, &resolver).unwrap();
+
+        let Mode::Init(options) = mode else {
+            panic!("expected init mode");
+        };
+        assert_eq!(options.backend_url, "http://backend.example");
+        assert_eq!(options.display_name, "Workspace A");
+        assert_eq!(options.repository_key, "main");
+        assert_eq!(options.default_ref.as_deref(), Some("develop"));
+        assert_eq!(
+            options.repository_root,
+            fs::canonicalize(repository.path()).unwrap()
+        );
+        assert!(!repository.path().join(".yoi/workspace.toml").exists());
+    }
+
+    #[test]
+    fn default_backend_target_selects_workspace_from_backend_not_repository_file() {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(workspace.path().join(".yoi")).unwrap();
         std::fs::write(
@@ -2433,8 +2657,11 @@ backend = "shared"
 
         assert_eq!(target.kind(), TargetKind::Backend);
         assert_eq!(
-            target.resolve().unwrap_err().to_string(),
-            "invalid Backend target: workspace selection is required for Backend product-state operations",
+            target.resolve().unwrap(),
+            client::ResolvedTarget::Backend {
+                base_url: "http://default-backend.example".to_string(),
+                workspace_id: "workspace-from-backend".to_string(),
+            }
         );
     }
 
@@ -2878,8 +3105,15 @@ backend = "shared"
 
     #[test]
     fn parse_panel_rejects_removed_host_local_restore_path() {
-        let err =
-            parse_args_from(["--backend", "http://127.0.0.1:8787", "panel", "-r"]).unwrap_err();
+        let err = parse_args_from([
+            "--backend",
+            "http://127.0.0.1:8787",
+            "--workspace-id",
+            "workspace-a",
+            "panel",
+            "-r",
+        ])
+        .unwrap_err();
         assert!(err.to_string().contains("removed host-local Worker path"));
     }
 }

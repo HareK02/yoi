@@ -12405,7 +12405,8 @@ mod tests {
     #[tokio::test]
     async fn workspace_display_name_update_is_revision_guarded_and_preserves_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SqliteWorkspaceStore::open(dir.path().join("server.db")).unwrap();
+        let database_path = dir.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&database_path).unwrap();
         let record = WorkspaceRecord {
             workspace_id: "workspace-a".to_string(),
             owner_account_id: "owner-account".to_string(),
@@ -12437,6 +12438,16 @@ mod tests {
         );
         assert_eq!(
             store
+                .get_workspace(&record.workspace_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            updated
+        );
+        drop(store);
+        let reopened = SqliteWorkspaceStore::open(database_path).unwrap();
+        assert_eq!(
+            reopened
                 .get_workspace(&record.workspace_id)
                 .await
                 .unwrap()
