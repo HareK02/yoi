@@ -1679,7 +1679,7 @@ Host commands:
   worker [WORKER_OPTIONS]      Run the direct Worker process entrypoint
   ticket <COMMAND>             Manage Tickets through a Backend target
   objective <COMMAND>          Manage Objectives through a Backend target
-  plugin <COMMAND>             Build/check/list/show plugins
+  plugin <COMMAND>             Author/check/pack explicit Plugin packages
   mcp <COMMAND>                Inspect configured MCP servers
   memory lint                  Lint local memory files
   session <COMMAND>            Inspect/prune Standalone session logs
@@ -1899,6 +1899,12 @@ backend = "shared"
         assert!(TOP_LEVEL_HELP.contains("default_connection = \"local\""));
         assert!(TOP_LEVEL_HELP.contains("yoi-server"));
         assert!(TOP_LEVEL_HELP.contains("yoi-runtime"));
+        assert!(
+            TOP_LEVEL_HELP.contains(
+                "plugin <COMMAND>             Author/check/pack explicit Plugin packages"
+            )
+        );
+        assert!(!TOP_LEVEL_HELP.contains("Build/check/list/show plugins"));
         assert!(!TOP_LEVEL_HELP.contains("yoi workspace"));
         assert!(!TOP_LEVEL_HELP.contains("yoi server"));
         assert!(!TOP_LEVEL_HELP.contains("TARGET_OPTIONS"));
