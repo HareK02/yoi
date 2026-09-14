@@ -74,9 +74,12 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    let mode = match parse_args() {
+fn main() -> ExitCode {
+    start_cli(parse_args)
+}
+
+fn start_cli(parse: impl FnOnce() -> Result<Mode, ParseError>) -> ExitCode {
+    let mode = match parse() {
         Ok(mode) => mode,
         Err(e) => {
             eprintln!("yoi: {e}");
@@ -85,6 +88,11 @@ async fn main() -> ExitCode {
         }
     };
 
+    run(mode)
+}
+
+#[tokio::main]
+async fn run(mode: Mode) -> ExitCode {
     match mode {
         Mode::Help => {
             print_help();
@@ -1825,6 +1833,22 @@ fn print_memory_lint_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_parses_connection_before_starting_tokio_runtime() {
+        let mut parsed = false;
+
+        let _ = start_cli(|| {
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "connection resolution must run before the CLI Tokio runtime starts"
+            );
+            parsed = true;
+            Ok(Mode::Help)
+        });
+
+        assert!(parsed);
+    }
     use crate::cli_connection::CliConnectionInput;
     use client::{BackendTarget, StandaloneTarget, Target, TargetKind, WorkerListRequest};
     use std::process::Command;
