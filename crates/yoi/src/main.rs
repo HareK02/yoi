@@ -220,7 +220,7 @@ fn resolve_tui_target<R: CliConnectionResolver + ?Sized>(
     connection_resolver: &R,
     command: CliCommand,
     selection: &TargetSelection,
-    workspace_root: &Path,
+    _workspace_root: &Path,
 ) -> Result<Box<dyn Target>, ParseError> {
     if selection.explicit_local {
         return resolve_connection_aware_cli_connection(
@@ -240,16 +240,12 @@ fn resolve_tui_target<R: CliConnectionResolver + ?Sized>(
         return Ok(target);
     }
 
-    let workspace_id = match selection.workspace_id.clone() {
-        Some(workspace_id) => Some(workspace_id),
-        None => resolve_workspace_id_from_root(workspace_root)?,
-    };
     resolve_connection_aware_cli_connection(
         connection_resolver,
         command,
         selection.explicit_local,
         selection.backend_url.clone(),
-        workspace_id.as_deref(),
+        selection.workspace_id.as_deref(),
     )
 }
 
@@ -1050,12 +1046,6 @@ fn current_dir() -> Result<PathBuf, ParseError> {
         .map_err(|e| ParseError(format!("failed to resolve current directory: {e}")))
 }
 
-#[derive(Debug, Deserialize)]
-struct WorkspaceIdentityFile {
-    #[serde(alias = "workspace_id")]
-    id: String,
-}
-
 #[derive(Debug, Default)]
 struct ClientConfigFile {
     default_backend: Option<String>,
@@ -1113,34 +1103,6 @@ impl ClientConfigFile {
             if let Some(backend) = workspace.backend {
                 entry.backend = Some(backend);
             }
-        }
-    }
-}
-
-fn resolve_workspace_id_from_root(workspace_root: &Path) -> Result<Option<String>, ParseError> {
-    let mut current = if workspace_root.is_absolute() {
-        workspace_root.to_path_buf()
-    } else {
-        current_dir()?.join(workspace_root)
-    };
-    loop {
-        let path = current.join(".yoi").join("workspace.toml");
-        if path.is_file() {
-            let contents = fs::read_to_string(&path)
-                .map_err(|e| ParseError(format!("failed to read {}: {e}", path.display())))?;
-            let identity: WorkspaceIdentityFile = toml::from_str(&contents)
-                .map_err(|e| ParseError(format!("failed to parse {}: {e}", path.display())))?;
-            let id = identity.id.trim();
-            if id.is_empty() {
-                return Err(ParseError(format!(
-                    "{} must contain a non-empty workspace id",
-                    path.display()
-                )));
-            }
-            return Ok(Some(id.to_string()));
-        }
-        if !current.pop() {
-            return Ok(None);
         }
     }
 }
@@ -1219,13 +1181,13 @@ fn read_client_config_overlay(path: &Path) -> Result<Option<ClientConfigOverlay>
 }
 
 fn client_global_config_path() -> Option<PathBuf> {
-    manifest::paths::data_dir().map(|dir| dir.join("client").join("config.toml"))
+    manifest::paths::config_dir().map(|dir| dir.join("client.toml"))
 }
 
 fn client_config_location_message() -> String {
     match client_global_config_path() {
         Some(path) => path.display().to_string(),
-        None => "<data_dir>/client/config.toml".to_string(),
+        None => "<config_dir>/client.toml".to_string(),
     }
 }
 
@@ -2028,6 +1990,8 @@ backend = "shared"
         match parse_args_from([
             "--backend",
             "http://127.0.0.1:8787",
+            "--workspace-id",
+            "workspace-a",
             "--runtime-id",
             "runtime-a",
             "--worker-id",
@@ -2447,7 +2411,7 @@ backend = "shared"
     }
 
     #[test]
-    fn default_backend_target_inherits_workspace_identity_from_workspace_root() {
+    fn default_backend_target_does_not_read_repository_workspace_identity() {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(workspace.path().join(".yoi")).unwrap();
         std::fs::write(
@@ -2467,12 +2431,10 @@ backend = "shared"
         )
         .unwrap();
 
+        assert_eq!(target.kind(), TargetKind::Backend);
         assert_eq!(
-            target.resolve().unwrap(),
-            client::ResolvedTarget::Backend {
-                base_url: "http://default-backend.example".to_string(),
-                workspace_id: "workspace-from-root".to_string(),
-            }
+            target.resolve().unwrap_err().to_string(),
+            "invalid Backend target: workspace selection is required for Backend product-state operations",
         );
     }
 

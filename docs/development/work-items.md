@@ -108,62 +108,9 @@ The first version intentionally does not implement roadmap scheduling, milestone
 
 ## Ticket configuration
 
-Workspace Ticket policy is configured by the tracked workspace settings file `.yoi/workspace.toml` under the `[ticket]` table. The old `.yoi/ticket.config.toml` file is obsolete: current code only reads it as a narrow read-only migration fallback when `.yoi/workspace.toml` has no `[ticket]` table. Workspace settings take precedence as soon as `[ticket]` exists.
+Workspace Ticket data and workflow authority live in the Workspace Server's SQLite control-plane store. Repository-local `.yoi/workspace.toml` and `.yoi/ticket.config.toml` are not Ticket, Workspace identity, Backend connection, or role-launch authority.
 
-MVP shape:
-
-```toml
-[ticket]
-language = "Japanese"
-
-[ticket.backend]
-provider = "builtin:yoi_local"
-root = ".yoi/tickets"
-
-[ticket.roles.intake]
-profile = "project:intake"
-launch_prompt = "ticket.intake.launch"
-
-[ticket.roles.orchestrator]
-profile = "project:orchestrator"
-launch_prompt = "ticket.orchestrator.launch"
-
-[ticket.roles.coder]
-profile = "project:coder"
-launch_prompt = "ticket.coder.launch"
-
-[ticket.roles.reviewer]
-profile = "project:reviewer"
-launch_prompt = "ticket.reviewer.launch"
-```
-
-Fixed roles are:
-
-- `intake`
-- `orchestrator`
-- `coder`
-- `reviewer`
-
-This is not an arbitrary role registry. The fixed roles are the roles required by Ticket orchestration.
-Stale `[ticket.roles.investigator]` config is rejected as an unsupported fixed role; remove it and,
-when a spike is useful, let the Orchestrator create an ordinary task-specific read-only helper Worker.
-
-`profile` selects the Worker runtime Profile for that role. The selected Profile owns durable role/system behavior. Workspace Ticket settings do not have a role-level `system_instruction` field.
-
-`launch_prompt` is a per-action first-run prompt reference for future prompt resolution. Current launcher behavior exposes the ref but does not treat it as system instruction.
-
-Role launch prompts are plain history input. State and phase-specific prompt injection are future work; any dynamic prompt content must be committed as history before it affects model context.
-
-`provider = "builtin:yoi_local"` selects Yoi's built-in local Ticket backend. `root = ".yoi/tickets"` is the canonical local storage root for this repository. Legacy `kind = "local"` is accepted only as a short transitional alias; new configs should use `provider`.
-
-If `.yoi/workspace.toml` has no `[ticket]` table and no legacy fallback file exists, defaults are:
-
-- backend provider: `builtin:yoi_local`
-- backend root: `<workspace>/.yoi/tickets`
-- all role profiles: `inherit`
-- no launch prompt refs
-
-Important: top-level Ticket role launches cannot execute `profile = "inherit"` because top-level launch has no parent Profile to inherit from. Configure concrete role profiles in `.yoi/workspace.toml` under `[ticket.roles.*]` before using `yoi panel` role-launch actions.
+Fixed Ticket workflow roles are `intake`, `orchestrator`, `coder`, and `reviewer`. The Server resolves the selected Profile and launch material from the active Workspace configuration authority, and Runtime receives the resulting immutable launch snapshot. A repository checkout may still contain ordinary project files, but neither the client nor Runtime may infer Workspace identity, Backend routing, role Profile, or Ticket storage from repository-local `.yoi` files.
 
 ## Ticket lifecycle
 
@@ -267,7 +214,7 @@ Close with a resolution that summarizes what changed, key commits, validation, r
 
 `yoi panel` is the active Ticket/Intake/Orchestrator Dashboard. It owns fixed Ticket role-launch actions and uses the shared client Ticket role launcher. The single-Worker Console no longer supports `:ticket ...` commands; typing them in command mode is treated like any other unknown command.
 
-Role actions map to the same fixed roles configured in `.yoi/workspace.toml` under `[ticket.roles]`:
+Role actions map to the fixed Workspace Ticket roles:
 
 - intake launches the intake role without an existing Ticket and requires freeform context.
 - route launches the orchestrator role for an existing Ticket.
@@ -278,60 +225,14 @@ All actions are explicit and user-triggered. They are not a scheduler, queue, sp
 
 ### Dashboard execution path
 
-The role-launch path is:
+The Dashboard sends the selected action and Ticket context to the Workspace Server. The Server validates Workspace access, resolves the current Server DB Workspace/Ticket authority and active Profile projection, launches or restores the role Worker through the shared Worker path, commits the typed initial input, and returns durable acceptance evidence. The client does not inspect repository-local `.yoi` files, choose a Ticket storage directory, or construct Runtime launch authority.
 
-```text
-User triggers a Ticket action in yoi panel
-  -> Dashboard builds a TicketRoleLaunchContext
-  -> client Ticket role launcher reads .yoi/workspace.toml [ticket] settings
-  -> launcher selects the role Profile
-  -> launcher spawns the role Worker
-  -> launcher sends Method::Submit with Text segments
-  -> launcher waits for run-acceptance evidence
-  -> Dashboard reports success/failure
-```
-
-The launched Worker receives dynamic Ticket/action context as its first committed run input. The Dashboard does not inject hidden context, does not write Ticket files directly, and does not construct prompt segments by hand.
-
-The first run input contains:
-
-- the selected fixed role;
-- Ticket id when the action targets an existing Ticket;
-- freeform user instruction/context from the action;
-- configured `launch_prompt` reference if present, as an unresolved reference for future prompt resolution.
-
-The selected Profile supplies durable system/role behavior. Workspace Ticket settings do not override system instruction.
-
-### Dashboard setup
-
-Because top-level role launches cannot inherit a parent Profile, configure concrete role profiles before using Dashboard role actions:
-
-```toml
-# .yoi/workspace.toml
-
-[ticket.backend]
-provider = "builtin:yoi_local"
-root = ".yoi/tickets"
-
-[ticket.roles.intake]
-profile = "project:intake"
-
-[ticket.roles.orchestrator]
-profile = "project:orchestrator"
-
-[ticket.roles.coder]
-profile = "project:coder"
-
-[ticket.roles.reviewer]
-profile = "project:reviewer"
-```
-
-If a role still uses `profile = "inherit"`, the Dashboard fails closed with a diagnostic explaining that a concrete profile is required.
+The launched Worker receives dynamic Ticket/action context as its first committed run input. The selected Profile supplies durable system/role behavior. Workspace Ticket metadata does not override system instruction.
 
 ### Dashboard troubleshooting
 
-- `profile = "inherit"`: configure a concrete role Profile in `.yoi/workspace.toml` under `[ticket.roles.<role>]`.
-- malformed workspace Ticket settings: fix the `[ticket]` table in `.yoi/workspace.toml` and retry.
+- unresolved Workspace selection: select an accessible Workspace from the Server catalog or pass an explicit Workspace selector.
+- unavailable role Profile: update the active Workspace configuration and retry after the Server projects the new revision.
 - missing Ticket id for route, implement, or review actions: provide the target Ticket.
 - launch success but no visible completion: attach to or inspect the launched Worker; completion notifications are hints, not authority.
 
