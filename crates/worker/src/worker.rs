@@ -7256,6 +7256,7 @@ fn delegated_scope_rule_to_scope_rule(rule: WorkerSpawnedScopeRule) -> Option<Sc
         target: rule.target,
         permission,
         recursive: rule.recursive,
+        symlink_policy: rule.symlink_policy,
     })
 }
 
@@ -7508,6 +7509,7 @@ mod spawned_context_tests {
                     target: cwd.clone(),
                     permission: Permission::Read,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 }],
                 deny: Vec::new(),
             },
@@ -7544,6 +7546,7 @@ mod spawned_context_tests {
                     target: workspace_root.clone(),
                     permission: Permission::Read,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 }],
                 deny: Vec::new(),
             },

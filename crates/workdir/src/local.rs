@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use manifest::{Scope, SharedScope};
+use manifest::{Permission, Scope, SharedScope, SymlinkPolicy};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::sync::{Mutex, broadcast, watch};
@@ -28,8 +28,9 @@ use crate::{
     CommandEvent, CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest,
     CommandSnapshot, CommandStatus, CommandStream, CommandStreamSlice, EditRequest, EditResult,
     GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult, ReadRequest,
-    ReadResult, StatRequest, StatResult, Workdir, WorkdirError, WorkdirPath, WorkdirSession,
-    WorkdirSessionCapabilities, WorkdirSessionCapability, WriteRequest, WriteResult,
+    ReadResult, StatRequest, StatResult, Workdir, WorkdirError, WorkdirPath,
+    WorkdirScopeAuthorizationRequest, WorkdirSession, WorkdirSessionCapabilities,
+    WorkdirSessionCapability, WorkdirToolScopePermission, WriteRequest, WriteResult,
 };
 #[cfg(test)]
 use crate::{EntryKind, WriteOutcome};
@@ -210,6 +211,17 @@ impl fs_operation::FsAccessPolicy for ScopeAccess {
 
     fn is_writable(&self, path: &Path) -> bool {
         self.0.is_writable(path)
+    }
+
+    fn is_readable_paths(&self, logical: &Path, resolved: &Path) -> bool {
+        matches!(
+            self.0.permission_at_paths(logical, resolved),
+            Some(Permission::Read | Permission::Write)
+        )
+    }
+
+    fn is_writable_paths(&self, logical: &Path, resolved: &Path) -> bool {
+        self.0.permission_at_paths(logical, resolved) == Some(Permission::Write)
     }
 }
 
@@ -397,6 +409,11 @@ impl LocalWorkdirSession {
             return Err(WorkdirError::RelativePath(path.to_path_buf()));
         }
         let symlink = first_symlink(path);
+        if let Some(info) = symlink.as_ref()
+            && !info.target_exists
+        {
+            return Err(broken_symlink_error(path, info));
+        }
         let scope = self.inner.scope.load();
         if !scope.is_readable(path) {
             return Err(symlink_out_of_scope_or_plain(
@@ -405,11 +422,6 @@ impl LocalWorkdirSession {
                 "read",
                 &scope,
             ));
-        }
-        if let Some(info) = symlink.as_ref() {
-            if !info.target_exists {
-                return Err(broken_symlink_error(path, info));
-            }
         }
         let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => WorkdirError::NotFound(path.to_path_buf()),
@@ -554,6 +566,64 @@ impl WorkdirSession for LocalWorkdirSession {
 
     fn capabilities(&self) -> WorkdirSessionCapabilities {
         self.inner.capabilities
+    }
+
+    async fn authorize_scope_path(
+        &self,
+        request: WorkdirScopeAuthorizationRequest,
+    ) -> Result<(), WorkdirError> {
+        self.ensure_open()?;
+        let logical = self.inner.root.join(request.path.as_str());
+        let resolved = fs_operation::resolve_access_path(&logical)
+            .map_err(|error| WorkdirError::io(&logical, error))?;
+        let parent_permission = self
+            .inner
+            .scope
+            .load()
+            .permission_at_paths(&logical, &resolved);
+        let parent_allows = match request.permission {
+            WorkdirToolScopePermission::Read => matches!(
+                parent_permission,
+                Some(Permission::Read | Permission::Write)
+            ),
+            WorkdirToolScopePermission::Write => parent_permission == Some(Permission::Write),
+        };
+        if !parent_allows {
+            return Err(WorkdirError::Denied(format!(
+                "Workdir path `{}` exceeds the provider attachment scope",
+                request.path
+            )));
+        }
+        let allowed = request.rules.iter().any(|rule| {
+            if request.permission == WorkdirToolScopePermission::Write
+                && rule.permission != WorkdirToolScopePermission::Write
+            {
+                return false;
+            }
+            let logical_target = self.inner.root.join(rule.target.as_str());
+            let (candidate, target) = match rule.symlink_policy {
+                SymlinkPolicy::Logical => (logical.as_path(), logical_target),
+                SymlinkPolicy::Resolved => {
+                    let Ok(target) = fs_operation::resolve_access_path(&logical_target) else {
+                        return false;
+                    };
+                    (resolved.as_path(), target)
+                }
+            };
+            if rule.recursive {
+                candidate.starts_with(target)
+            } else {
+                candidate == target || candidate.parent() == Some(target.as_path())
+            }
+        });
+        if allowed {
+            Ok(())
+        } else {
+            Err(WorkdirError::Denied(format!(
+                "Workdir path `{}` is outside the provider-resolved delegated scope",
+                request.path
+            )))
+        }
     }
 
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
@@ -1334,6 +1404,22 @@ mod tests {
         )
     }
 
+    fn make_logical_fs(dir: &TempDir) -> LocalWorkdirSession {
+        LocalWorkdirSession::new(
+            Scope::from_config(&ScopeConfig {
+                allow: vec![ScopeRule {
+                    target: dir.path().to_path_buf(),
+                    permission: Permission::Write,
+                    recursive: true,
+                    symlink_policy: SymlinkPolicy::Logical,
+                }],
+                deny: Vec::new(),
+            })
+            .unwrap(),
+            dir.path().to_path_buf(),
+        )
+    }
+
     #[tokio::test]
     async fn logical_provider_operations_cover_read_write_edit_stat_and_list() {
         let dir = TempDir::new().unwrap();
@@ -1533,6 +1619,102 @@ mod tests {
         assert_eq!(read.bytes, b"persisted");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolved_provider_scope_rejects_read_and_write_through_outside_alias() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("target.txt");
+        fs::write(&target, "secret").unwrap();
+        symlink(&target, root.path().join("alias.txt")).unwrap();
+        symlink(outside.path(), root.path().join("alias-dir")).unwrap();
+        let workdir = make_fs(&root);
+
+        assert!(matches!(
+            WorkdirSession::read(
+                &workdir,
+                ReadRequest {
+                    path: WorkdirPath::new("alias.txt").unwrap(),
+                    offset: 0,
+                    limit: 10,
+                    max_bytes: 1024,
+                }
+            )
+            .await,
+            Err(WorkdirError::SymlinkOutOfScope { .. })
+        ));
+        assert!(matches!(
+            WorkdirSession::write(
+                &workdir,
+                WriteRequest {
+                    path: WorkdirPath::new("alias.txt").unwrap(),
+                    content: b"changed".to_vec(),
+                    expected_hash: None,
+                }
+            )
+            .await,
+            Err(WorkdirError::SymlinkOutOfScope { .. })
+        ));
+        assert_eq!(fs::read_to_string(target).unwrap(), "secret");
+        assert!(matches!(
+            WorkdirSession::write(
+                &workdir,
+                WriteRequest {
+                    path: WorkdirPath::new("alias-dir/new.txt").unwrap(),
+                    content: b"new".to_vec(),
+                    expected_hash: None,
+                }
+            )
+            .await,
+            Err(WorkdirError::ReadOnly(_))
+        ));
+        assert!(!outside.path().join("new.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolved_deny_blocks_missing_write_through_logical_alias() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        symlink(outside.path(), root.path().join("alias")).unwrap();
+        let workdir = LocalWorkdirSession::new(
+            Scope::from_config(&ScopeConfig {
+                allow: vec![ScopeRule {
+                    target: root.path().to_path_buf(),
+                    permission: Permission::Write,
+                    recursive: true,
+                    symlink_policy: SymlinkPolicy::Logical,
+                }],
+                deny: vec![ScopeRule {
+                    target: outside.path().join("blocked.txt"),
+                    permission: Permission::Read,
+                    recursive: false,
+                    symlink_policy: SymlinkPolicy::Logical,
+                }],
+            })
+            .unwrap(),
+            root.path().to_path_buf(),
+        );
+
+        assert!(matches!(
+            WorkdirSession::write(
+                &workdir,
+                WriteRequest {
+                    path: WorkdirPath::new("alias/blocked.txt").unwrap(),
+                    content: b"blocked".to_vec(),
+                    expected_hash: None,
+                }
+            )
+            .await,
+            Err(WorkdirError::ReadOnly(_))
+        ));
+        assert!(!outside.path().join("blocked.txt").exists());
+    }
+
     #[tokio::test]
     async fn capability_boundary_rejects_direct_unsupported_operation() {
         let dir = TempDir::new().unwrap();
@@ -1645,7 +1827,7 @@ mod tests {
         let link = dir.path().join("outside-repo.txt");
         symlink(&target, &link).unwrap();
 
-        let fs = make_fs(&dir);
+        let fs = make_logical_fs(&dir);
         assert_eq!(fs.read_bytes(&link).unwrap(), b"secret");
     }
 
@@ -1748,7 +1930,7 @@ mod tests {
         let link = dir.path().join("outside-repo.txt");
         symlink(&target, &link).unwrap();
 
-        let fs = make_fs(&dir);
+        let fs = make_logical_fs(&dir);
         fs.write(&link, b"new").unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"new");
         assert!(
@@ -1778,11 +1960,13 @@ mod tests {
                 target: dir.path().to_path_buf(),
                 permission: Permission::Write,
                 recursive: true,
+                symlink_policy: Default::default(),
             }],
             deny: vec![ScopeRule {
                 target: sub.clone(),
                 permission: Permission::Write,
                 recursive: true,
+                symlink_policy: Default::default(),
             }],
         };
         let scope = Scope::from_config(&cfg).unwrap();
@@ -1846,6 +2030,7 @@ mod tests {
                     target: extra.path().to_path_buf(),
                     permission: Permission::Read,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 }])
             })
             .unwrap();
@@ -1882,6 +2067,7 @@ mod tests {
                     target: sub.clone(),
                     permission: Permission::Write,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 }])
             })
             .unwrap();
@@ -1918,6 +2104,7 @@ mod tests {
                     target: dir.path().to_path_buf(),
                     permission: Permission::Write,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 }])
             })
             .unwrap();
@@ -1935,14 +2122,14 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn provider_uses_logical_paths_through_symlinked_directories() {
+    async fn provider_uses_explicit_logical_policy_through_symlinked_directories() {
         use std::os::unix::fs::symlink;
 
         let dir = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         std::fs::write(outside.path().join("worker.json"), "scope-needle\n").unwrap();
         symlink(outside.path(), dir.path().join("yoi.local")).unwrap();
-        let workdir = make_fs(&dir);
+        let workdir = make_logical_fs(&dir);
 
         let read = WorkdirSession::read(
             &workdir,
@@ -1956,6 +2143,19 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(read.bytes, b"scope-needle\n");
+        let list = WorkdirSession::list(
+            &workdir,
+            ListRequest {
+                path: WorkdirPath::new("yoi.local").unwrap(),
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            list.entries[0].path,
+            WorkdirPath::new("yoi.local/worker.json").unwrap()
+        );
         let glob = WorkdirSession::glob(
             &workdir,
             GlobRequest {
@@ -2084,11 +2284,13 @@ mod tests {
                     target: dir.path().to_path_buf(),
                     permission: Permission::Write,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 },
                 ScopeRule {
                     target: spill.path().to_path_buf(),
                     permission: Permission::Read,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 },
             ],
             deny: Vec::new(),
@@ -2165,11 +2367,13 @@ mod tests {
                     target: dir.path().to_path_buf(),
                     permission: Permission::Write,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 },
                 ScopeRule {
                     target: spill.path().to_path_buf(),
                     permission: Permission::Read,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 },
             ],
             deny: Vec::new(),

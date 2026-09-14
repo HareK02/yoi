@@ -63,6 +63,8 @@ pub struct WorkerSpawnedScopeRule {
     pub target: PathBuf,
     pub permission: String,
     pub recursive: bool,
+    #[serde(default)]
+    pub symlink_policy: protocol::SymlinkPolicy,
 }
 
 /// One child Worker spawned by this Worker and persisted with the spawner's
@@ -683,6 +685,25 @@ mod tests {
     }
 
     #[test]
+    fn spawned_scope_rule_defaults_resolved_and_roundtrips_logical_policy() {
+        let legacy: WorkerSpawnedScopeRule = serde_json::from_value(serde_json::json!({
+            "target": "/workspace/src",
+            "permission": "read",
+            "recursive": true
+        }))
+        .unwrap();
+        assert_eq!(legacy.symlink_policy, protocol::SymlinkPolicy::Resolved);
+
+        let logical = WorkerSpawnedScopeRule {
+            symlink_policy: protocol::SymlinkPolicy::Logical,
+            ..legacy
+        };
+        let restored: WorkerSpawnedScopeRule =
+            serde_json::from_value(serde_json::to_value(&logical).unwrap()).unwrap();
+        assert_eq!(restored, logical);
+    }
+
+    #[test]
     fn worker_aggregate_store_writes_one_fixed_metadata_identity() {
         let tmp = tempfile::tempdir().unwrap();
         let store = WorkerAggregateStore::new(tmp.path(), "worker-runtime-7").unwrap();
@@ -835,6 +856,7 @@ mod tests {
             target: std::path::Path::new("/tmp/delegated").into(),
             permission: "write".into(),
             recursive: true,
+            symlink_policy: Default::default(),
         };
         store
             .set_spawned_children(

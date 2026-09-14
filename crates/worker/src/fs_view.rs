@@ -411,11 +411,13 @@ mod tests {
                 target: dir.path().to_path_buf(),
                 permission: Permission::Write,
                 recursive: true,
+                symlink_policy: Default::default(),
             }],
             deny: vec![ScopeRule {
                 target: secret.clone(),
                 permission: Permission::Read,
                 recursive: true,
+                symlink_policy: Default::default(),
             }],
         };
         let scope = Scope::from_config(&cfg).unwrap();
@@ -574,11 +576,13 @@ mod tests {
                 target: dir.path().to_path_buf(),
                 permission: Permission::Write,
                 recursive: true,
+                symlink_policy: Default::default(),
             }],
             deny: vec![ScopeRule {
                 target: secret.clone(),
                 permission: Permission::Read,
                 recursive: true,
+                symlink_policy: Default::default(),
             }],
         };
         let scope = Scope::from_config(&cfg).unwrap();

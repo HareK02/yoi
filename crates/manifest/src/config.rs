@@ -1329,6 +1329,7 @@ mod tests {
                     target: abs("/worker"),
                     permission: Permission::Write,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 }],
                 deny: Vec::new(),
             },
@@ -1575,6 +1576,7 @@ mod tests {
             target: PathBuf::from("secrets"),
             permission: Permission::Write,
             recursive: true,
+            symlink_policy: Default::default(),
         });
         let resolved = cfg.resolve_paths(Path::new("/workspace/proj"));
         assert_eq!(resolved.scope.allow[0].target, Path::new("/workspace/proj"));
@@ -1712,6 +1714,7 @@ mod tests {
                     target: abs("/a"),
                     permission: Permission::Read,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 }],
                 deny: Vec::new(),
             },
@@ -1723,11 +1726,13 @@ mod tests {
                     target: abs("/b"),
                     permission: Permission::Write,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 }],
                 deny: vec![ScopeRule {
                     target: abs("/a/secret"),
                     permission: Permission::Read,
                     recursive: false,
+                    symlink_policy: Default::default(),
                 }],
             },
             ..Default::default()
@@ -2091,6 +2096,7 @@ enabled = false
                         target: abs("/worker"),
                         permission: Permission::Read,
                         recursive: true,
+                        symlink_policy: Default::default(),
                     }],
                     deny: Vec::new(),
                 },
@@ -2193,6 +2199,7 @@ enabled = true
                         target: abs("/worker"),
                         permission: Permission::Read,
                         recursive: true,
+                        symlink_policy: Default::default(),
                     }],
                     deny: Vec::new(),
                 },
@@ -2269,6 +2276,7 @@ permission = "write"
                     target: abs("/worker"),
                     permission: Permission::Write,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 }],
                 deny: Vec::new(),
             },

@@ -970,6 +970,7 @@ fn profile_scope_intent_to_config(
             target: workspace_base.join(path),
             permission: Permission::Write,
             recursive: true,
+            symlink_policy: Default::default(),
         });
     }
     Ok(ScopeConfig {
@@ -977,6 +978,7 @@ fn profile_scope_intent_to_config(
             target: workspace_base.to_path_buf(),
             permission,
             recursive: true,
+            symlink_policy: Default::default(),
         }],
         deny,
     })

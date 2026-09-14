@@ -3,16 +3,17 @@
 //! Built from [`crate::ScopeConfig`] via [`Scope::from_config`]. Every
 //! rule `target` must already be an absolute path — per-layer path
 //! resolution runs earlier, inside [`crate::WorkerManifestConfig::resolve_paths`].
-//! All rule `target` paths inside the [`Scope`] are normalized lexically so
-//! access authority follows the path presented through the Workdir, not a
-//! symbolic-link target outside that logical tree.
+//! All rule targets retain both their lexically normalized logical identity and
+//! their provider-resolved identity. Allow rules select one identity explicitly;
+//! deny rules always inspect both so aliases cannot bypass a restriction.
 
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::{ArcSwap, Guard};
 
-use crate::{Permission, ScopeConfig, ScopeRule};
+use crate::{Permission, ScopeConfig, ScopeRule, SymlinkPolicy};
 
 /// Parsed, pwd-resolved set of allow/deny rules for a Worker.
 ///
@@ -26,10 +27,13 @@ pub struct Scope {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedRule {
-    /// Absolute, lexically normalized target directory/file.
-    target: PathBuf,
+    /// Absolute, lexically normalized target as presented through the Workdir.
+    logical_target: PathBuf,
+    /// Absolute target after provider-side symbolic-link resolution.
+    resolved_target: PathBuf,
     permission: Permission,
     recursive: bool,
+    symlink_policy: SymlinkPolicy,
 }
 
 /// Parsed filesystem authority this Worker may pass to spawned children.
@@ -98,18 +102,46 @@ fn permission_denies_requested(denied: Permission, requested: Permission) -> boo
 
 fn rule_covers(available: &ResolvedRule, requested: &ResolvedRule) -> bool {
     permission_covers(available.permission, requested.permission)
-        && rule_path_set_contains(available, requested)
+        && available.symlink_policy >= requested.symlink_policy
+        && rule_path_set_contains(
+            available,
+            requested,
+            match available.symlink_policy {
+                SymlinkPolicy::Resolved => RuleIdentity::Resolved,
+                SymlinkPolicy::Logical => RuleIdentity::Logical,
+            },
+        )
 }
 
 fn denial_overlaps_requested(deny: &ResolvedRule, requested: &ResolvedRule) -> bool {
     permission_denies_requested(deny.permission, requested.permission)
-        && rule_path_sets_overlap(deny, requested)
+        && (rule_path_sets_overlap(deny, requested, RuleIdentity::Logical)
+            || rule_path_sets_overlap(deny, requested, RuleIdentity::Resolved))
 }
 
-fn rule_path_set_contains(available: &ResolvedRule, requested: &ResolvedRule) -> bool {
+#[derive(Clone, Copy)]
+enum RuleIdentity {
+    Logical,
+    Resolved,
+}
+
+fn rule_target(rule: &ResolvedRule, identity: RuleIdentity) -> &Path {
+    match identity {
+        RuleIdentity::Logical => &rule.logical_target,
+        RuleIdentity::Resolved => &rule.resolved_target,
+    }
+}
+
+fn rule_path_set_contains(
+    available: &ResolvedRule,
+    requested: &ResolvedRule,
+    identity: RuleIdentity,
+) -> bool {
+    let available_target = rule_target(available, identity);
+    let requested_target = rule_target(requested, identity);
     match (available.recursive, requested.recursive) {
         // A recursive grant contains every possible requested path below its target.
-        (true, _) => requested.target.starts_with(&available.target),
+        (true, _) => requested_target.starts_with(available_target),
         // A non-recursive grant contains only the target and its direct children;
         // a recursive request always includes descendants beyond that finite-depth
         // set.
@@ -117,36 +149,42 @@ fn rule_path_set_contains(available: &ResolvedRule, requested: &ResolvedRule) ->
         // Two non-recursive rules have the same finite-depth set only when their
         // target is identical. A request rooted at a direct child would also grant
         // that child's children, which are grandchildren of `available.target`.
-        (false, false) => requested.target == available.target,
+        (false, false) => requested_target == available_target,
     }
 }
 
-fn rule_path_sets_overlap(left: &ResolvedRule, right: &ResolvedRule) -> bool {
+fn rule_path_sets_overlap(
+    left: &ResolvedRule,
+    right: &ResolvedRule,
+    identity: RuleIdentity,
+) -> bool {
+    let left_target = rule_target(left, identity);
+    let right_target = rule_target(right, identity);
     match (left.recursive, right.recursive) {
         (true, true) => {
-            left.target.starts_with(&right.target) || right.target.starts_with(&left.target)
+            left_target.starts_with(right_target) || right_target.starts_with(left_target)
         }
-        (true, false) => recursive_and_non_recursive_sets_overlap(left, right),
-        (false, true) => recursive_and_non_recursive_sets_overlap(right, left),
+        (true, false) => recursive_and_non_recursive_sets_overlap(left_target, right_target),
+        (false, true) => recursive_and_non_recursive_sets_overlap(right_target, left_target),
         (false, false) => {
-            left.target == right.target
-                || direct_child(&left.target, &right.target)
-                || direct_child(&right.target, &left.target)
+            left_target == right_target
+                || direct_child(left_target, right_target)
+                || direct_child(right_target, left_target)
         }
     }
 }
 
 fn recursive_and_non_recursive_sets_overlap(
-    recursive: &ResolvedRule,
-    non_recursive: &ResolvedRule,
+    recursive_target: &Path,
+    non_recursive_target: &Path,
 ) -> bool {
     // The non-recursive set is `{target} + direct children`. It overlaps a
     // recursive subtree when either the non-recursive target is inside that
     // subtree, or the recursive subtree begins at the non-recursive target or
     // one of its direct children.
-    non_recursive.target.starts_with(&recursive.target)
-        || recursive.target == non_recursive.target
-        || direct_child(&recursive.target, &non_recursive.target)
+    non_recursive_target.starts_with(recursive_target)
+        || recursive_target == non_recursive_target
+        || direct_child(recursive_target, non_recursive_target)
 }
 
 fn direct_child(child: &Path, parent: &Path) -> bool {
@@ -201,7 +239,8 @@ impl Scope {
     }
 
     /// Convenience constructor for tests and simple setups: a single
-    /// recursive `allow(Write)` rule rooted at the lexical path `root`.
+    /// recursive `allow(Write)` rule rooted at `root` with the default
+    /// resolved-target symlink policy.
     pub fn writable(root: impl AsRef<Path>) -> std::io::Result<Self> {
         let root = normalize_path(root.as_ref()).ok_or_else(|| {
             std::io::Error::new(
@@ -209,19 +248,26 @@ impl Scope {
                 "scope root must be an absolute path without root traversal",
             )
         })?;
+        let resolved_root = resolve_path(&root)?;
         Ok(Self {
             allow: vec![ResolvedRule {
-                target: root,
+                logical_target: root,
+                resolved_target: resolved_root,
                 permission: Permission::Write,
                 recursive: true,
+                symlink_policy: SymlinkPolicy::Resolved,
             }],
             deny: Vec::new(),
         })
     }
 
-    /// Return one rule's lexically normalized target without resolving symlinks.
+    /// Return one rule target in the identity selected by its symlink policy.
     pub fn resolved_target(rule: &ScopeRule) -> Result<PathBuf, ScopeError> {
-        Ok(resolve_rule(rule)?.target)
+        let rule = resolve_rule(rule)?;
+        Ok(match rule.symlink_policy {
+            SymlinkPolicy::Resolved => rule.resolved_target,
+            SymlinkPolicy::Logical => rule.logical_target,
+        })
     }
 
     /// Return whether this effective scope fully contains a requested rule.
@@ -248,10 +294,23 @@ impl Scope {
     /// Returns `None` when `path` is outside every allow rule, or when
     /// deny rules have knocked it below `Read`.
     pub fn permission_at(&self, path: &Path) -> Option<Permission> {
-        let resolved = normalize_path(path)?;
+        let logical = normalize_path(path)?;
+        let resolved = resolve_path(&logical).ok()?;
+        self.permission_at_paths(&logical, &resolved)
+    }
+
+    /// Effective permission for a path whose logical and provider-resolved
+    /// identities were obtained inside the filesystem provider boundary.
+    pub fn permission_at_paths(&self, logical: &Path, resolved: &Path) -> Option<Permission> {
+        let logical = normalize_path(logical)?;
+        let resolved = normalize_path(resolved)?;
         let mut effective: Option<Permission> = None;
         for rule in &self.allow {
-            if rule.matches(&resolved) {
+            let candidate = match rule.symlink_policy {
+                SymlinkPolicy::Resolved => &resolved,
+                SymlinkPolicy::Logical => &logical,
+            };
+            if rule.matches(candidate, rule.symlink_policy) {
                 effective = match effective {
                     None => Some(rule.permission),
                     Some(cur) => Some(cur.max(rule.permission)),
@@ -260,11 +319,13 @@ impl Scope {
         }
         let mut effective = effective?;
 
-        // Deny: min(min_deny) dictates the cap. Effective level is capped
-        // strictly below that value, so deny(read) wipes access entirely.
+        // Deny rules always inspect both identities. This prevents a logical
+        // alias or a second symlink to the same target from bypassing a deny.
         let mut min_deny: Option<Permission> = None;
         for rule in &self.deny {
-            if rule.matches(&resolved) {
+            if rule.matches(&logical, SymlinkPolicy::Logical)
+                || rule.matches(&resolved, SymlinkPolicy::Resolved)
+            {
                 min_deny = match min_deny {
                     None => Some(rule.permission),
                     Some(cur) => Some(cur.min(rule.permission)),
@@ -297,7 +358,7 @@ impl Scope {
     /// rule, preserving declaration order. Does not account for deny
     /// rules, which only cap effective permission at query time.
     pub fn readable_paths(&self) -> impl Iterator<Item = &Path> {
-        self.allow.iter().map(|r| r.target.as_path())
+        self.allow.iter().map(|r| r.logical_target.as_path())
     }
 
     /// Allow rules with their targets resolved to absolute paths.
@@ -309,9 +370,10 @@ impl Scope {
         self.allow
             .iter()
             .map(|r| ScopeRule {
-                target: r.target.clone(),
+                target: r.logical_target.clone(),
                 permission: r.permission,
                 recursive: r.recursive,
+                symlink_policy: r.symlink_policy,
             })
             .collect()
     }
@@ -326,9 +388,10 @@ impl Scope {
         self.deny
             .iter()
             .map(|r| ScopeRule {
-                target: r.target.clone(),
+                target: r.logical_target.clone(),
                 permission: r.permission,
                 recursive: r.recursive,
+                symlink_policy: r.symlink_policy,
             })
             .collect()
     }
@@ -339,7 +402,7 @@ impl Scope {
         self.allow
             .iter()
             .filter(|r| r.permission == Permission::Write)
-            .map(|r| r.target.as_path())
+            .map(|r| r.logical_target.as_path())
     }
 
     /// Build a new [`Scope`] equal to `self` with `extra_allow` appended
@@ -416,7 +479,10 @@ impl Scope {
     pub fn summary(&self) -> String {
         fn push_rule(out: &mut String, rule: &ResolvedRule) {
             out.push_str("  - ");
-            out.push_str(&rule.target.display().to_string());
+            out.push_str(&rule.logical_target.display().to_string());
+            if rule.symlink_policy == SymlinkPolicy::Logical {
+                out.push_str(" [logical-symlinks]");
+            }
             if !rule.recursive {
                 out.push_str(" [non-recursive]");
             }
@@ -514,11 +580,15 @@ impl SharedScope {
 }
 
 impl ResolvedRule {
-    fn matches(&self, path: &Path) -> bool {
+    fn matches(&self, path: &Path, identity: SymlinkPolicy) -> bool {
+        let target = match identity {
+            SymlinkPolicy::Resolved => &self.resolved_target,
+            SymlinkPolicy::Logical => &self.logical_target,
+        };
         if self.recursive {
-            path.starts_with(&self.target)
+            path.starts_with(target)
         } else {
-            path == self.target || path.parent() == Some(self.target.as_path())
+            path == target || path.parent() == Some(target.as_path())
         }
     }
 }
@@ -527,15 +597,61 @@ fn resolve_rule(rule: &ScopeRule) -> Result<ResolvedRule, ScopeError> {
     if !rule.target.is_absolute() {
         return Err(ScopeError::RelativeTarget(rule.target.clone()));
     }
-    let target = normalize_path(&rule.target).ok_or_else(|| ScopeError::ResolveTarget {
+    let logical_target = normalize_path(&rule.target).ok_or_else(|| ScopeError::ResolveTarget {
         path: rule.target.clone(),
         source: std::io::Error::new(std::io::ErrorKind::Other, "could not absolutize target"),
     })?;
+    let resolved_target =
+        resolve_path(&logical_target).map_err(|source| ScopeError::ResolveTarget {
+            path: rule.target.clone(),
+            source,
+        })?;
     Ok(ResolvedRule {
-        target,
+        logical_target,
+        resolved_target,
         permission: rule.permission,
         recursive: rule.recursive,
+        symlink_policy: rule.symlink_policy,
     })
+}
+
+/// Resolve every existing path component while retaining a missing final tail.
+/// A dangling symlink is rejected rather than treated as an ordinary missing
+/// component because its resolved authority cannot be established.
+fn resolve_path(path: &Path) -> std::io::Result<PathBuf> {
+    let mut cursor = path;
+    let mut missing = Vec::<OsString>::new();
+    loop {
+        match std::fs::canonicalize(cursor) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return normalize_path(&resolved).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "resolved target is not an absolute normalized path",
+                    )
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::symlink_metadata(cursor)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(error);
+                }
+                let name = cursor.file_name().ok_or(error)?;
+                missing.push(name.to_os_string());
+                cursor = cursor.parent().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "scope target has no existing ancestor",
+                    )
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Normalize an absolute path for lexical scope comparison without consulting
@@ -571,6 +687,7 @@ mod tests {
             target: target.to_path_buf(),
             permission,
             recursive,
+            symlink_policy: Default::default(),
         }
     }
 
@@ -685,6 +802,7 @@ mod tests {
                 target: dir.path().to_path_buf(),
                 permission: Permission::Write,
                 recursive: false,
+                symlink_policy: Default::default(),
             }],
             deny: Vec::new(),
         };
@@ -784,6 +902,7 @@ mod tests {
                 target: PathBuf::from("relative/path"),
                 permission: Permission::Read,
                 recursive: true,
+                symlink_policy: Default::default(),
             }],
             deny: Vec::new(),
         };
@@ -801,19 +920,84 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn scope_authorizes_symlink_paths_lexically_without_authorizing_targets() {
+    fn scope_defaults_to_resolved_symlink_authority_and_logical_is_explicit() {
         use std::os::unix::fs::symlink;
 
         let dir = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         std::fs::write(outside.path().join("outside.txt"), "visible through link").unwrap();
         symlink(outside.path(), dir.path().join("external")).unwrap();
-        let scope = Scope::writable(dir.path()).unwrap();
 
-        assert!(scope.is_readable(&dir.path().join("external/outside.txt")));
-        assert!(scope.is_writable(&dir.path().join("external/new.txt")));
-        assert!(!scope.is_readable(&outside.path().join("outside.txt")));
-        assert!(!scope.is_writable(&outside.path().join("new.txt")));
+        let resolved = Scope::writable(dir.path()).unwrap();
+        assert!(!resolved.is_readable(&dir.path().join("external/outside.txt")));
+        assert!(!resolved.is_writable(&dir.path().join("external/new.txt")));
+
+        let logical = Scope::from_config(&ScopeConfig {
+            allow: vec![ScopeRule {
+                target: dir.path().to_path_buf(),
+                permission: Permission::Write,
+                recursive: true,
+                symlink_policy: SymlinkPolicy::Logical,
+            }],
+            deny: Vec::new(),
+        })
+        .unwrap();
+        assert!(logical.is_readable(&dir.path().join("external/outside.txt")));
+        assert!(logical.is_writable(&dir.path().join("external/new.txt")));
+        assert!(!logical.is_readable(&outside.path().join("outside.txt")));
+        assert!(!logical.is_writable(&outside.path().join("new.txt")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deny_rules_match_both_logical_alias_and_resolved_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let secret = root.path().join("secret");
+        std::fs::create_dir(&secret).unwrap();
+        std::fs::write(secret.join("key"), "hidden").unwrap();
+        symlink(&secret, root.path().join("alias")).unwrap();
+        let scope = Scope::from_config(&ScopeConfig {
+            allow: vec![ScopeRule {
+                target: root.path().to_path_buf(),
+                permission: Permission::Write,
+                recursive: true,
+                symlink_policy: SymlinkPolicy::Logical,
+            }],
+            deny: vec![ScopeRule {
+                target: secret,
+                permission: Permission::Read,
+                recursive: true,
+                symlink_policy: SymlinkPolicy::Logical,
+            }],
+        })
+        .unwrap();
+
+        assert!(!scope.is_readable(&root.path().join("alias/key")));
+    }
+
+    #[test]
+    fn delegation_symlink_policy_is_monotonically_attenuated() {
+        let root = TempDir::new().unwrap();
+        let mut parent_rule = allow_rule(root.path(), Permission::Write);
+        parent_rule.symlink_policy = SymlinkPolicy::Logical;
+        let logical_parent = DelegationScope::from_config(&ScopeConfig {
+            allow: vec![parent_rule],
+            deny: Vec::new(),
+        })
+        .unwrap();
+        let resolved_child = allow_rule(&root.path().join("child"), Permission::Read);
+        assert!(logical_parent.allows_rule(&resolved_child).unwrap());
+
+        let resolved_parent = DelegationScope::from_config(&ScopeConfig {
+            allow: vec![allow_rule(root.path(), Permission::Write)],
+            deny: Vec::new(),
+        })
+        .unwrap();
+        let mut logical_child = resolved_child;
+        logical_child.symlink_policy = SymlinkPolicy::Logical;
+        assert!(!resolved_parent.allows_rule(&logical_child).unwrap());
     }
 
     #[test]
@@ -862,11 +1046,13 @@ mod tests {
                     target: docs.clone(),
                     permission: Permission::Read,
                     recursive: false,
+                    symlink_policy: Default::default(),
                 },
                 ScopeRule {
                     target: dir.path().to_path_buf(),
                     permission: Permission::Write,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 },
             ],
             deny: Vec::new(),
@@ -925,6 +1111,7 @@ mod tests {
                 target: extra.path().to_path_buf(),
                 permission: Permission::Read,
                 recursive: true,
+                symlink_policy: Default::default(),
             }])
             .unwrap();
         assert!(extended.is_readable(&extra.path().join("x")));
@@ -942,6 +1129,7 @@ mod tests {
                 target: sub.clone(),
                 permission: Permission::Write,
                 recursive: true,
+                symlink_policy: Default::default(),
             }])
             .unwrap();
         let f = sub.join("a.txt");
@@ -961,6 +1149,7 @@ mod tests {
             target: sub.clone(),
             permission: Permission::Write,
             recursive: true,
+            symlink_policy: Default::default(),
         };
         let base = Scope::writable(dir.path())
             .unwrap()
@@ -1014,6 +1203,7 @@ mod tests {
                     target: sub.clone(),
                     permission: Permission::Write,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 }])
             })
             .unwrap();
@@ -1032,6 +1222,7 @@ mod tests {
                 target: extra.path().to_path_buf(),
                 permission: Permission::Read,
                 recursive: true,
+                symlink_policy: Default::default(),
             }])
         })
         .unwrap();

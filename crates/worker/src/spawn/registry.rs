@@ -1030,6 +1030,7 @@ fn record_from_worker_state(child: &WorkerSpawnedChild) -> io::Result<SpawnedWor
                 target: rule.target.clone(),
                 permission,
                 recursive: rule.recursive,
+                symlink_policy: rule.symlink_policy,
             })
         })
         .collect::<io::Result<Vec<_>>>()?;
@@ -1072,6 +1073,7 @@ mod tests {
                 target: std::path::PathBuf::from("/tmp"),
                 permission: Permission::Read,
                 recursive: true,
+                symlink_policy: Default::default(),
             }],
             deny: Vec::new(),
         })
@@ -1090,6 +1092,7 @@ mod tests {
                 target: root.clone(),
                 permission: Permission::Read,
                 recursive: true,
+                symlink_policy: Default::default(),
             }],
             deny: Vec::new(),
         })
@@ -1109,6 +1112,7 @@ mod tests {
                     target: workdir::WorkdirPath::new("").unwrap(),
                     permission: workdir::WorkdirToolScopePermission::Read,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 }],
                 cwd: workdir::WorkdirPath::new("").unwrap(),
                 command: false,

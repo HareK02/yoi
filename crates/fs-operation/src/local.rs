@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,8 @@ pub fn run_stat(
 ) -> Result<StatResult, FsError> {
     let logical = request.path;
     let path = resolve(root, &logical)?;
-    if !access.is_readable(&path) {
+    let resolved = resolve_access_path(&path).map_err(|error| map_io(&logical, error))?;
+    if !access.is_readable_paths(&path, &resolved) {
         return Err(FsError::OutOfScope(PathBuf::from(logical.as_str())));
     }
     let metadata = fs::symlink_metadata(&path).map_err(|error| map_io(&logical, error))?;
@@ -113,12 +115,8 @@ pub fn run_write(
         if request.expected_hash.is_some() {
             return Err(FsError::Conflict(logical.as_str().to_string()));
         }
-        let parent = path.parent().ok_or_else(|| {
-            FsError::InvalidArgument(format!("{} has no parent", logical.as_str()))
-        })?;
-        let parent_logical = logical_parent(&logical);
-        require_access(parent, &parent_logical, access, true, true)?;
-        atomic_write(&path, &request.content, &logical)?;
+        let target = require_access(&path, &logical, access, true, true)?;
+        atomic_write(&target, &request.content, &logical)?;
     }
     Ok(WriteResult {
         bytes_written: request.content.len(),
@@ -173,6 +171,7 @@ pub fn run_list(
 ) -> Result<ListResult, FsError> {
     let logical = request.path;
     let path = resolve(root, &logical)?;
+    let logical_base = path.clone();
     let path = require_access(&path, &logical, access, false, true)?;
     let metadata = fs::metadata(&path).map_err(|error| map_io(&logical, error))?;
     if !metadata.is_dir() {
@@ -183,7 +182,15 @@ pub fn run_list(
     for entry in read_dir {
         let entry = entry.map_err(|error| map_io(&logical, error))?;
         let absolute = entry.path();
-        if !access.is_readable(&absolute) {
+        let relative_to_base = absolute.strip_prefix(&path).map_err(|_| {
+            FsError::InvalidArgument("provider returned a path outside its list base".to_string())
+        })?;
+        let logical_absolute = logical_base.join(relative_to_base);
+        let resolved = match resolve_access_path(&absolute) {
+            Ok(resolved) => resolved,
+            Err(_) => continue,
+        };
+        if !access.is_readable_paths(&logical_absolute, &resolved) {
             continue;
         }
         let link_metadata =
@@ -203,7 +210,7 @@ pub fn run_list(
         } else {
             EntryKind::Other
         };
-        let relative = absolute.strip_prefix(root).map_err(|_| {
+        let relative = logical_absolute.strip_prefix(root).map_err(|_| {
             FsError::InvalidArgument("provider returned a path outside its root".to_string())
         })?;
         entries.push(ListEntry {
@@ -249,18 +256,22 @@ fn require_access(
     write: bool,
     allow_symlink_directory: bool,
 ) -> Result<PathBuf, FsError> {
-    if let Some(info) = direct_symlink(path) {
-        if !info.target_exists {
-            return Err(FsError::BrokenSymlink {
-                path: PathBuf::from(logical.as_str()),
-                link: PathBuf::from(logical.as_str()),
-                target: PathBuf::from("<provider-internal target>"),
-            });
-        }
+    let symlink = direct_symlink(path);
+    if let Some(info) = symlink.as_ref()
+        && !info.target_exists
+    {
+        return Err(FsError::BrokenSymlink {
+            path: PathBuf::from(logical.as_str()),
+            link: PathBuf::from(logical.as_str()),
+            target: PathBuf::from("<provider-internal target>"),
+        });
+    }
+    let resolved = resolve_access_path(path).map_err(|error| map_io(logical, error))?;
+    if let Some(info) = symlink {
         let allowed = if write {
-            access.is_writable(path)
+            access.is_writable_paths(path, &resolved)
         } else {
-            access.is_readable(path)
+            access.is_readable_paths(path, &resolved)
         };
         if !allowed {
             return Err(FsError::SymlinkOutOfScope {
@@ -275,15 +286,15 @@ fn require_access(
                 target: PathBuf::from("<provider-internal target>"),
             });
         }
-        return Ok(info.resolved_path);
+        return Ok(resolved);
     }
     let allowed = if write {
-        access.is_writable(path)
+        access.is_writable_paths(path, &resolved)
     } else {
-        access.is_readable(path)
+        access.is_readable_paths(path, &resolved)
     };
     if allowed {
-        Ok(path.to_path_buf())
+        Ok(resolved)
     } else if write {
         Err(FsError::ReadOnly(PathBuf::from(logical.as_str())))
     } else {
@@ -291,12 +302,38 @@ fn require_access(
     }
 }
 
-fn logical_parent(path: &FsPath) -> FsPath {
-    let parent = Path::new(path.as_str())
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .to_string_lossy();
-    FsPath::new(parent).unwrap_or_else(|_| FsPath::root())
+/// Resolve every existing component of an absolute provider path while
+/// retaining a missing final tail for create operations. Dangling symlinks are
+/// rejected because no resolved authority identity can be established.
+pub fn resolve_access_path(path: &Path) -> std::io::Result<PathBuf> {
+    let mut cursor = path;
+    let mut missing = Vec::<OsString>::new();
+    loop {
+        match fs::canonicalize(cursor) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if fs::symlink_metadata(cursor)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(error);
+                }
+                let name = cursor.file_name().ok_or(error)?;
+                missing.push(name.to_os_string());
+                cursor = cursor.parent().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "path has no existing ancestor",
+                    )
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn atomic_write(path: &Path, content: &[u8], logical: &FsPath) -> Result<(), FsError> {

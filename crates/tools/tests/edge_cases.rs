@@ -40,6 +40,7 @@ fn setup() -> (TempDir, TempDir, Registry) {
         target: spill.path().to_path_buf(),
         permission: Permission::Read,
         recursive: true,
+        symlink_policy: Default::default(),
     });
     let scope = Scope::from_config(&config).unwrap();
     let fs: WorkdirSessionHandle =

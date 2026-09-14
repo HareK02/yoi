@@ -29,7 +29,7 @@ pub use profile::{
     WorkspaceAuthorityRequirement, resolve_profile_artifact, resolve_profile_artifact_value,
     validate_profile_execution_target,
 };
-pub use protocol::{Permission, ScopeRule};
+pub use protocol::{Permission, ScopeRule, SymlinkPolicy};
 pub use scope::{DelegationScope, Scope, ScopeError, SharedScope};
 
 use std::collections::{BTreeMap, HashMap};

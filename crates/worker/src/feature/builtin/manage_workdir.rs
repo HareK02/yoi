@@ -18,8 +18,9 @@ use workdir::workspace::WorkspaceWorkdirSessionOperationRequest;
 use workdir::{
     CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
     EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
-    ReadRequest, ReadResult, StatRequest, StatResult, Workdir, WorkdirError, WorkdirSession,
-    WorkdirSessionCapabilities, WorkdirSessionHandle, WriteRequest, WriteResult,
+    ReadRequest, ReadResult, StatRequest, StatResult, Workdir, WorkdirError,
+    WorkdirScopeAuthorizationRequest, WorkdirSession, WorkdirSessionCapabilities,
+    WorkdirSessionHandle, WriteRequest, WriteResult,
 };
 
 use workspace_api::{
@@ -281,6 +282,16 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
 
     fn capabilities(&self) -> WorkdirSessionCapabilities {
         WorkdirSessionCapabilities::ALL
+    }
+
+    async fn authorize_scope_path(
+        &self,
+        request: WorkdirScopeAuthorizationRequest,
+    ) -> Result<(), WorkdirError> {
+        match self.operate(WorkdirSessionOperation::AuthorizeScope(request))? {
+            WorkdirSessionOperationResult::AuthorizeScope => Ok(()),
+            _ => Err(Self::mismatch("authorize_scope")),
+        }
     }
 
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
@@ -1242,10 +1253,14 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_broker_operations_carry_no_child_context() {
-        let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
-            "operation": "stat",
-            "result": {"path": "visible.txt", "kind": "file", "size": 8}
-        }))]));
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![
+            response(json!({ "operation": "authorize_scope" })),
+            response(json!({ "operation": "authorize_scope" })),
+            response(json!({
+                "operation": "stat",
+                "result": {"path": "visible.txt", "kind": "file", "size": 8}
+            })),
+        ]));
         let broker = workdir::WorkdirToolBroker::new(WorkspaceAttachedWorkdirSession::handle(
             client.clone(),
         ));
@@ -1255,6 +1270,7 @@ mod tests {
                     target: workdir::WorkdirPath::new("").unwrap(),
                     permission: workdir::WorkdirToolScopePermission::Read,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 }],
                 cwd: workdir::WorkdirPath::new("").unwrap(),
                 command: false,
@@ -1269,7 +1285,7 @@ mod tests {
             .unwrap();
 
         let requests = client.requests();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 3);
         for request in requests {
             assert_eq!(
                 request.path,

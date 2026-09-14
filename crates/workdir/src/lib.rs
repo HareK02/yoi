@@ -28,8 +28,8 @@ pub use local::{
 };
 pub use operation::*;
 pub use scope::{
-    ReadOnlyWorkdirSession, WorkdirScopeLease, WorkdirToolBroker, WorkdirToolScope,
-    WorkdirToolScopePermission, WorkdirToolScopeRule,
+    ReadOnlyWorkdirSession, WorkdirScopeAuthorizationRequest, WorkdirScopeLease, WorkdirToolBroker,
+    WorkdirToolScope, WorkdirToolScopePermission, WorkdirToolScopeRule,
 };
 
 /// Persistent, opaque identity of one materialized Workdir.
@@ -146,6 +146,25 @@ pub type WriteOutcome = WriteResult;
 pub trait WorkdirSession: std::fmt::Debug + Send + Sync {
     fn workdir(&self) -> &Workdir;
     fn capabilities(&self) -> WorkdirSessionCapabilities;
+
+    /// Validate an attenuated filesystem rule at the provider boundary without
+    /// exposing the resolved host path. Providers that cannot resolve symbolic
+    /// links must reject resolved-policy checks rather than downgrade them.
+    async fn authorize_scope_path(
+        &self,
+        request: WorkdirScopeAuthorizationRequest,
+    ) -> Result<(), WorkdirError> {
+        if request.rules.iter().any(|rule| {
+            rule.symlink_policy == manifest::SymlinkPolicy::Logical
+                && scope::rule_allows_path(rule, &request.path, request.permission)
+        }) {
+            Ok(())
+        } else {
+            Err(WorkdirError::Denied(
+                "Workdir provider cannot establish resolved scope authority".to_string(),
+            ))
+        }
+    }
 
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError>;
     async fn read(&self, request: ReadRequest) -> Result<ReadResult, WorkdirError>;

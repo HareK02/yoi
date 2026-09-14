@@ -300,11 +300,13 @@ mod tests {
                     target: root.path().to_path_buf(),
                     permission: Permission::Write,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 },
                 ScopeRule {
                     target: output.path().to_path_buf(),
                     permission: Permission::Read,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 },
             ],
             deny: Vec::new(),

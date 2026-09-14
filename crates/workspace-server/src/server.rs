@@ -8433,7 +8433,8 @@ async fn scoped_execute_current_worker_workdir_operation(
                 .map(|()| WorkdirSessionOperationResult::CommandCancel)
                 .map_err(|error| current_worker_workdir_operation_error(&worker, error))?
         }
-        operation @ (WorkdirSessionOperation::Stat(_)
+        operation @ (WorkdirSessionOperation::AuthorizeScope(_)
+        | WorkdirSessionOperation::Stat(_)
         | WorkdirSessionOperation::Read(_)
         | WorkdirSessionOperation::Write(_)
         | WorkdirSessionOperation::Edit(_)
@@ -8484,6 +8485,10 @@ async fn execute_workdir_session_operation(
     operation: WorkdirSessionOperation,
 ) -> std::result::Result<WorkdirSessionOperationResult, workdir::WorkdirError> {
     match operation {
+        WorkdirSessionOperation::AuthorizeScope(request) => session
+            .authorize_scope_path(request)
+            .await
+            .map(|()| WorkdirSessionOperationResult::AuthorizeScope),
         WorkdirSessionOperation::Stat(request) => session
             .stat(request)
             .await

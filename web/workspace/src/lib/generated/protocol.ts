@@ -53,6 +53,8 @@ export type ErrorCode = "already_running" | "not_running" | "not_paused" | "prov
 
 export type Permission = "read" | "write";
 
+export type SymlinkPolicy = "resolved" | "logical";
+
 export type InFlightToolCallState = "pending" | "streaming_args" | "done";
 
 export type CommandStatus = "running" | "completed" | "failed" | "timed_out" | "cancelled";
@@ -94,7 +96,12 @@ permission: Permission,
  * When `false`, the rule only matches the target itself and its
  * direct children. Defaults to `true`.
  */
-recursive: boolean, };
+recursive: boolean,
+/**
+ * Which path identity an allow rule uses when symbolic links are
+ * encountered. Deny rules always inspect both identities.
+ */
+symlink_policy: SymlinkPolicy, };
 
 export type CompletionEntry = { value: string, is_dir: boolean, };
 

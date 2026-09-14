@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use globset::Glob;
 use ignore::WalkBuilder;
 
-use crate::{FsAccessPolicy, FsError, FsPath, GlobRequest, GlobResult};
+use crate::{FsAccessPolicy, FsError, FsPath, GlobRequest, GlobResult, resolve_access_path};
 
 /// Execute a bounded glob entirely inside the provider process.
 pub fn run_glob(
@@ -15,7 +15,11 @@ pub fn run_glob(
     if !root.is_absolute() {
         return Err(FsError::RelativePath(root.to_path_buf()));
     }
-    if !access.is_readable(base) {
+    let base_resolved = resolve_access_path(base).map_err(|error| FsError::Io {
+        path: PathBuf::from(request.path.as_str()),
+        source: error,
+    })?;
+    if !access.is_readable_paths(base, &base_resolved) {
         return Err(FsError::OutOfScope(PathBuf::from(request.path.as_str())));
     }
     let matcher = Glob::new(&request.pattern)
@@ -26,7 +30,9 @@ pub fn run_glob(
     walker.hidden(false).follow_links(false);
     for entry in walker.build().flatten() {
         let path = entry.path();
-        if !path.is_file() || !access.is_readable(path) {
+        let readable = resolve_access_path(path)
+            .is_ok_and(|resolved| access.is_readable_paths(path, &resolved));
+        if !path.is_file() || !readable {
             continue;
         }
         let relative = path.strip_prefix(base).unwrap_or(path);

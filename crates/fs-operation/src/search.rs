@@ -10,7 +10,9 @@ use ignore::WalkBuilder;
 use ignore::overrides::{Override, OverrideBuilder};
 use ignore::types::{Types, TypesBuilder};
 
-use crate::{FsError, GrepOutputMode, GrepRequest, GrepResult, direct_symlink};
+use crate::{
+    FsError, GrepOutputMode, GrepRequest, GrepResult, direct_symlink, resolve_access_path,
+};
 
 struct ContentLine {
     path: PathBuf,
@@ -220,14 +222,28 @@ pub fn run_grep(
         return Err(FsError::RelativePath(base));
     }
     let symlink = direct_symlink(&base);
-    if !access.is_readable(&base) {
+    if let Some(info) = symlink.as_ref()
+        && !info.target_exists
+    {
+        return Err(FsError::BrokenSymlink {
+            path: base.clone(),
+            link: info.link_path.clone(),
+            target: info.resolved_path.clone(),
+        });
+    }
+    let resolved_base = resolve_access_path(&base).map_err(|error| FsError::io(&base, error))?;
+    if !access.is_readable_paths(&base, &resolved_base) {
         return Err(if let Some(info) = symlink.as_ref() {
             let link_parent_readable = info
                 .link_path
                 .parent()
-                .map(|parent| access.is_readable(parent))
+                .and_then(|parent| {
+                    resolve_access_path(parent)
+                        .ok()
+                        .map(|resolved| access.is_readable_paths(parent, &resolved))
+                })
                 .unwrap_or(false);
-            if info.target_exists && link_parent_readable {
+            if link_parent_readable {
                 FsError::SymlinkOutOfScope {
                     path: base.clone(),
                     target: info.resolved_path.clone(),
@@ -239,15 +255,6 @@ pub fn run_grep(
         } else {
             FsError::OutOfScope(base.clone())
         });
-    }
-    if let Some(info) = symlink.as_ref() {
-        if !info.target_exists {
-            return Err(FsError::BrokenSymlink {
-                path: base.clone(),
-                link: info.link_path.clone(),
-                target: info.target_path.clone(),
-            });
-        }
     }
     let base_meta = std::fs::metadata(&base).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => FsError::NotFound(base.clone()),
@@ -321,7 +328,9 @@ pub fn run_grep(
             continue;
         }
         let path = entry.path();
-        if !access.is_readable(path) {
+        let readable = resolve_access_path(path)
+            .is_ok_and(|resolved| access.is_readable_paths(path, &resolved));
+        if !readable {
             continue;
         }
         if scan_path(

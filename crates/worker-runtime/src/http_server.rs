@@ -1012,6 +1012,10 @@ async fn run_workdir_session_operation(
     let operation = request.operation;
 
     let result = match operation {
+        WorkdirSessionOperation::AuthorizeScope(request) => {
+            session.authorize_scope_path(request).await?;
+            WorkdirSessionOperationResult::AuthorizeScope
+        }
         WorkdirSessionOperation::Stat(request) => {
             WorkdirSessionOperationResult::Stat(session.stat(request).await?)
         }
@@ -2982,6 +2986,33 @@ mod tests {
         .await
         .expect("owned operation");
         assert!(matches!(result, WorkdirSessionOperationResult::Stat(_)));
+
+        let authorization = WorkdirSessionOperationRequest {
+            operation: WorkdirSessionOperation::AuthorizeScope(
+                workdir::WorkdirScopeAuthorizationRequest {
+                    rules: vec![workdir::WorkdirToolScopeRule {
+                        target: WorkdirPath::new("hello.txt").unwrap(),
+                        permission: workdir::WorkdirToolScopePermission::Read,
+                        recursive: false,
+                        symlink_policy: Default::default(),
+                    }],
+                    path: WorkdirPath::new("hello.txt").unwrap(),
+                    permission: workdir::WorkdirToolScopePermission::Read,
+                },
+            ),
+        };
+        let Json(result) = run_workdir_session_operation(
+            State(state.clone()),
+            Path("session-1".to_string()),
+            Some(Extension(auth.clone())),
+            Ok(Json(authorization)),
+        )
+        .await
+        .expect("provider-side scope authorization");
+        assert!(matches!(
+            result,
+            WorkdirSessionOperationResult::AuthorizeScope
+        ));
 
         let grep = WorkdirSessionOperationRequest {
             operation: WorkdirSessionOperation::Grep(GrepRequest {

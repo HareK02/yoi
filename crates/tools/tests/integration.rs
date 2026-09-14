@@ -27,6 +27,7 @@ fn scope_with_spill(workspace: &Path, spill: &Path) -> Scope {
         target: spill.to_path_buf(),
         permission: Permission::Read,
         recursive: true,
+        symlink_policy: Default::default(),
     });
     Scope::from_config(&config).unwrap()
 }

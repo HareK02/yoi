@@ -16,8 +16,8 @@ use manifest::{
     CompactionConfigPartial, EngineManifestConfig, FileUploadLimitsPartial,
     PermissionConfigPartial, ProfileDiscovery, ProfileError, ProfileRegistry,
     ProfileRegistrySource, ProfileResolveOptions, ProfileResolver, ProfileSelector, ScopeConfig,
-    ScopeRule, SessionConfigPartial, ToolOutputLimitsPartial, WorkerManifest, WorkerManifestConfig,
-    WorkerMetaConfig,
+    ScopeRule, SessionConfigPartial, SymlinkPolicy, ToolOutputLimitsPartial, WorkerManifest,
+    WorkerManifestConfig, WorkerMetaConfig,
 };
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -61,7 +61,9 @@ struct SubWorkerSpawnInput {
     task: String,
     /// Allow rules delegated to the spawned SubWorker. Must be a subset of the
     /// spawner's explicit delegation authority; direct tool scope alone is not
-    /// sufficient. Omit `recursive` for normal workspace/worktree delegation; it defaults to true.
+    /// sufficient. Omit `recursive` for normal workspace/worktree delegation;
+    /// it defaults to true. Omit `symlink_policy` for the least-authority
+    /// `resolved` policy; `logical` requires matching parent authority.
     scope: Vec<ScopeRuleInput>,
     /// Explicitly grant command execution through the parent-owned Workdir tool broker.
     #[serde(default)]
@@ -88,6 +90,27 @@ struct ScopeRuleInput {
     /// children only. Defaults to `true`.
     #[serde(default = "default_true")]
     recursive: bool,
+    /// Symbolic-link identity used by this rule. `resolved` is the default
+    /// and least authority; `logical` requires matching parent authority.
+    #[serde(default)]
+    symlink_policy: SymlinkPolicyInput,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum SymlinkPolicyInput {
+    #[default]
+    Resolved,
+    Logical,
+}
+
+impl From<SymlinkPolicyInput> for SymlinkPolicy {
+    fn from(value: SymlinkPolicyInput) -> Self {
+        match value {
+            SymlinkPolicyInput::Resolved => Self::Resolved,
+            SymlinkPolicyInput::Logical => Self::Logical,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema, Clone, Copy)]
@@ -506,6 +529,7 @@ impl Tool for SubWorkerSpawnTool {
                 target: child_bash_output_dir.clone(),
                 permission: manifest::Permission::Read,
                 recursive: true,
+                symlink_policy: Default::default(),
             }])
             .map_err(|error| {
                 ToolError::ExecutionFailed(format!(
@@ -707,6 +731,7 @@ fn parse_workdir_scope(rules: &[ScopeRuleInput]) -> Result<Vec<WorkdirToolScopeR
                     PermissionInput::Write => WorkdirToolScopePermission::Write,
                 },
                 recursive: rule.recursive,
+                symlink_policy: rule.symlink_policy.into(),
             })
         })
         .collect()
@@ -1074,21 +1099,26 @@ mod tests {
                 target: ".".to_string(),
                 permission: PermissionInput::Read,
                 recursive: true,
+                symlink_policy: Default::default(),
             },
             ScopeRuleInput {
                 target: "src".to_string(),
                 permission: PermissionInput::Write,
                 recursive: false,
+                symlink_policy: SymlinkPolicyInput::Logical,
             },
         ])
         .unwrap();
         assert_eq!(rules[0].target.as_str(), "");
         assert_eq!(rules[1].target.as_str(), "src");
+        assert_eq!(rules[0].symlink_policy, SymlinkPolicy::Resolved);
+        assert_eq!(rules[1].symlink_policy, SymlinkPolicy::Logical);
         for target in ["/host/path", "../escape"] {
             let error = parse_workdir_scope(&[ScopeRuleInput {
                 target: target.to_string(),
                 permission: PermissionInput::Read,
                 recursive: true,
+                symlink_policy: Default::default(),
             }])
             .unwrap_err();
             assert!(matches!(error, ToolError::InvalidArgument(_)));
@@ -1126,6 +1156,7 @@ mod tests {
             target: path.to_path_buf(),
             permission,
             recursive: true,
+            symlink_policy: Default::default(),
         }
     }
 
@@ -1533,10 +1564,14 @@ enabled = false
         assert!(record.installed_tools.iter().any(|tool| tool == "Write"));
         assert!(!record.installed_tools.iter().any(|tool| tool == "Bash"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(
-            remote_client.requests().is_empty(),
-            "spawning a child must not open or delegate a provider Workdir session"
-        );
+        let requests = remote_client.requests();
+        assert!(!requests.is_empty());
+        assert!(requests.iter().all(|request| {
+            let body = request.body.as_deref().unwrap_or_default();
+            body.contains("authorize_scope")
+                && !body.contains(&bash_output_dir.display().to_string())
+                && !body.contains(&workspace_root.display().to_string())
+        }));
     }
 
     #[test]
@@ -1548,6 +1583,9 @@ enabled = false
             .expect("schema properties");
         assert!(properties.contains_key("cwd"), "schema: {schema}");
         assert!(properties.contains_key("command"), "schema: {schema}");
+        let schema_text = serde_json::to_string(&schema).unwrap();
+        assert!(schema_text.contains("symlink_policy"), "schema: {schema}");
+        assert!(schema_text.contains("logical"), "schema: {schema}");
         let required = schema
             .get("required")
             .and_then(serde_json::Value::as_array)
@@ -1708,10 +1746,29 @@ enabled = false
             self.requests
                 .lock()
                 .expect("remote Workdir request lock")
-                .push(request);
-            Err(WorkspaceClientError::Request(
-                "SubWorker spawn must not call the remote Workdir provider".into(),
-            ))
+                .push(request.clone());
+            let operation: workdir::workspace::WorkspaceWorkdirSessionOperationRequest =
+                serde_json::from_str(request.body.as_deref().unwrap_or_default()).map_err(
+                    |error| {
+                        WorkspaceClientError::Request(format!(
+                            "invalid remote Workdir operation: {error}"
+                        ))
+                    },
+                )?;
+            match operation.operation {
+                workdir::http::WorkdirSessionOperation::AuthorizeScope(_) => {
+                    Ok(WorkspaceResponse {
+                        status: 200,
+                        body: serde_json::to_string(
+                            &workdir::http::WorkdirSessionOperationResult::AuthorizeScope,
+                        )
+                        .unwrap(),
+                    })
+                }
+                _ => Err(WorkspaceClientError::Request(
+                    "SubWorker spawn may only authorize its provider-side scope".into(),
+                )),
+            }
         }
     }
 
@@ -1905,6 +1962,7 @@ max_tokens = 3333
             target: PathBuf::from("/tmp/child"),
             permission: Permission::Read,
             recursive: true,
+            symlink_policy: Default::default(),
         }];
 
         let config_json =

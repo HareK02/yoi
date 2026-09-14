@@ -743,6 +743,7 @@ fn comm_info_from_spawned_child(child: &session_store::WorkerSpawnedChild) -> Co
                 target: rule.target.clone(),
                 permission,
                 recursive: rule.recursive,
+                symlink_policy: rule.symlink_policy,
             })
         })
         .collect();
@@ -1324,6 +1325,7 @@ mod tests {
                 target: root.path().to_path_buf(),
                 permission: Permission::Read,
                 recursive: true,
+                symlink_policy: Default::default(),
             }],
             active_child_segment,
         )
@@ -1795,6 +1797,7 @@ mod tests {
                 target: PathBuf::from("/tmp"),
                 permission: "read".into(),
                 recursive: true,
+                symlink_policy: Default::default(),
             }],
             callback_address: PathBuf::from("/tmp/parent.sock"),
         }

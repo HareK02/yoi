@@ -27,6 +27,7 @@ async fn restore_reclaims_and_clears_legacy_process_children() {
             target: scope_root.path().to_path_buf(),
             permission: "write".into(),
             recursive: true,
+            symlink_policy: Default::default(),
         }],
     });
     store.write(&metadata).unwrap();
@@ -35,6 +36,7 @@ async fn restore_reclaims_and_clears_legacy_process_children() {
         target: scope_root.path().to_path_buf(),
         permission: Permission::Write,
         recursive: true,
+        symlink_policy: Default::default(),
     };
     let parent_scope = SharedScope::new(
         Scope::from_config(&ScopeConfig {

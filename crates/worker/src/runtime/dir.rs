@@ -299,6 +299,7 @@ mod tests {
                 target: "/tmp/work".into(),
                 permission: Permission::Write,
                 recursive: true,
+                symlink_policy: Default::default(),
             }],
             callback_address: "/run/yoi/my-worker/sock".into(),
         }];

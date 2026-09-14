@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub use glob::run_glob;
-pub use local::{run_edit, run_list, run_read, run_stat, run_write};
+pub use local::{resolve_access_path, run_edit, run_list, run_read, run_stat, run_write};
 pub use operation::*;
 pub use search::run_grep;
 
@@ -22,6 +22,19 @@ pub use search::run_grep;
 pub trait FsAccessPolicy: Send + Sync {
     fn is_readable(&self, path: &Path) -> bool;
     fn is_writable(&self, path: &Path) -> bool;
+
+    /// Authorize both the Workdir-visible path and its provider-resolved
+    /// target. Implementations that do not distinguish symbolic-link identity
+    /// retain resolved-target semantics through the defaults.
+    fn is_readable_paths(&self, logical: &Path, resolved: &Path) -> bool {
+        let _ = logical;
+        self.is_readable(resolved)
+    }
+
+    fn is_writable_paths(&self, logical: &Path, resolved: &Path) -> bool {
+        let _ = logical;
+        self.is_writable(resolved)
+    }
 }
 
 /// First symlink encountered while resolving a provider path.

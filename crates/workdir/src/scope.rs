@@ -8,6 +8,7 @@ use fs_operation::{
     EditRequest, EditResult, FsPath, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest,
     ListResult, ReadRequest, ReadResult, StatRequest, StatResult, WriteRequest, WriteResult,
 };
+use manifest::SymlinkPolicy;
 use tokio::sync::broadcast;
 
 const MAX_SCOPED_COMMANDS: usize = 16;
@@ -31,6 +32,17 @@ pub struct WorkdirToolScopeRule {
     pub target: FsPath,
     pub permission: WorkdirToolScopePermission,
     pub recursive: bool,
+    #[serde(default)]
+    pub symlink_policy: SymlinkPolicy,
+}
+
+/// Provider-side check for one operation under an attenuated tool scope.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkdirScopeAuthorizationRequest {
+    pub rules: Vec<WorkdirToolScopeRule>,
+    pub path: FsPath,
+    pub permission: WorkdirToolScopePermission,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -492,9 +504,39 @@ impl ScopedWorkdirSession {
         }
     }
 
-    fn resolve_operation_path(&self, path: &FsPath) -> Result<FsPath, WorkdirError> {
+    async fn ensure_scope_targets_are_authorized(
+        &self,
+        rules: &[WorkdirToolScopeRule],
+    ) -> Result<(), WorkdirError> {
+        for rule in rules {
+            self.source
+                .authorize_scope_path(WorkdirScopeAuthorizationRequest {
+                    rules: rules.to_vec(),
+                    path: rule.target.clone(),
+                    permission: rule.permission,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn resolve_operation_path(
+        &self,
+        path: &FsPath,
+        permission: WorkdirToolScopePermission,
+    ) -> Result<FsPath, WorkdirError> {
         self.ensure_active()?;
-        self.resolve_path(path)
+        let resolved = self.resolve_path(path)?;
+        if let Some(rules) = self.scope.as_ref() {
+            self.source
+                .authorize_scope_path(WorkdirScopeAuthorizationRequest {
+                    rules: rules.clone(),
+                    path: resolved.clone(),
+                    permission,
+                })
+                .await?;
+        }
+        Ok(resolved)
     }
 
     fn validate_scope(
@@ -582,6 +624,8 @@ impl ScopedWorkdirSession {
                 request.cwd
             )));
         }
+        self.ensure_scope_targets_are_authorized(&request.rules)
+            .await?;
         let validity = SessionValidity::child(self.validity.clone());
         let cleanup_pending = Arc::new(AtomicBool::new(true));
         let id = self.next_lease_id.fetch_add(1, Ordering::Relaxed);
@@ -692,49 +736,63 @@ impl WorkdirSession for ScopedWorkdirSession {
     }
 
     async fn stat(&self, mut request: StatRequest) -> Result<StatResult, WorkdirError> {
-        let path = self.resolve_operation_path(&request.path)?;
+        let path = self
+            .resolve_operation_path(&request.path, WorkdirToolScopePermission::Read)
+            .await?;
         self.ensure_read(&path, WorkdirSessionCapability::Read)?;
         request.path = path;
         self.source.stat(request).await
     }
 
     async fn read(&self, mut request: ReadRequest) -> Result<ReadResult, WorkdirError> {
-        let path = self.resolve_operation_path(&request.path)?;
+        let path = self
+            .resolve_operation_path(&request.path, WorkdirToolScopePermission::Read)
+            .await?;
         self.ensure_read(&path, WorkdirSessionCapability::Read)?;
         request.path = path;
         self.source.read(request).await
     }
 
     async fn write(&self, mut request: WriteRequest) -> Result<WriteResult, WorkdirError> {
-        let path = self.resolve_operation_path(&request.path)?;
+        let path = self
+            .resolve_operation_path(&request.path, WorkdirToolScopePermission::Write)
+            .await?;
         self.ensure_write(&path, WorkdirSessionCapability::Write)?;
         request.path = path;
         self.source.write(request).await
     }
 
     async fn edit(&self, mut request: EditRequest) -> Result<EditResult, WorkdirError> {
-        let path = self.resolve_operation_path(&request.path)?;
+        let path = self
+            .resolve_operation_path(&request.path, WorkdirToolScopePermission::Write)
+            .await?;
         self.ensure_write(&path, WorkdirSessionCapability::Edit)?;
         request.path = path;
         self.source.edit(request).await
     }
 
     async fn list(&self, mut request: ListRequest) -> Result<ListResult, WorkdirError> {
-        let path = self.resolve_operation_path(&request.path)?;
+        let path = self
+            .resolve_operation_path(&request.path, WorkdirToolScopePermission::Read)
+            .await?;
         self.ensure_read(&path, WorkdirSessionCapability::Read)?;
         request.path = path;
         self.source.list(request).await
     }
 
     async fn glob(&self, mut request: GlobRequest) -> Result<GlobResult, WorkdirError> {
-        let path = self.resolve_operation_path(&request.path)?;
+        let path = self
+            .resolve_operation_path(&request.path, WorkdirToolScopePermission::Read)
+            .await?;
         self.ensure_read(&path, WorkdirSessionCapability::Glob)?;
         request.path = path;
         self.source.glob(request).await
     }
 
     async fn grep(&self, mut request: GrepRequest) -> Result<GrepResult, WorkdirError> {
-        let path = self.resolve_operation_path(&request.path)?;
+        let path = self
+            .resolve_operation_path(&request.path, WorkdirToolScopePermission::Read)
+            .await?;
         self.ensure_read(&path, WorkdirSessionCapability::Grep)?;
         request.path = path;
         self.source.grep(request).await
@@ -943,6 +1001,16 @@ impl WorkdirSession for ReadOnlyWorkdirSession {
         WorkdirSessionCapabilities::READ_ONLY
     }
 
+    async fn authorize_scope_path(
+        &self,
+        request: WorkdirScopeAuthorizationRequest,
+    ) -> Result<(), WorkdirError> {
+        if request.permission == WorkdirToolScopePermission::Write {
+            return Err(WorkdirError::Denied("read-only workdir session".into()));
+        }
+        self.inner.authorize_scope_path(request).await
+    }
+
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
         self.inner.stat(request).await
     }
@@ -1106,7 +1174,7 @@ fn rules_overlap(left: &WorkdirToolScopeRule, right: &WorkdirToolScopeRule) -> b
             || rule_allows_path(right, &left.target, WorkdirToolScopePermission::Write))
 }
 
-fn rule_allows_path(
+pub(crate) fn rule_allows_path(
     rule: &WorkdirToolScopeRule,
     path: &FsPath,
     required: WorkdirToolScopePermission,
@@ -1136,6 +1204,11 @@ fn rule_contains_rule(parent: &WorkdirToolScopeRule, child: &WorkdirToolScopeRul
     if child.permission == WorkdirToolScopePermission::Write
         && parent.permission != WorkdirToolScopePermission::Write
     {
+        return false;
+    }
+    // Resolved < Logical: a child may narrow a Logical grant to Resolved,
+    // but cannot turn a Resolved parent grant into logical-alias authority.
+    if parent.symlink_policy < child.symlink_policy {
         return false;
     }
     if !path_in_rule(parent, &child.target) {
@@ -1168,6 +1241,7 @@ mod tests {
                     target: root.to_path_buf(),
                     permission: Permission::Write,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 }],
                 deny: Vec::new(),
             })
@@ -1188,6 +1262,7 @@ mod tests {
                 target: fs_path(path),
                 permission,
                 recursive: true,
+                symlink_policy: Default::default(),
             }],
             cwd: fs_path(path),
             command: permission == WorkdirToolScopePermission::Write,
@@ -1298,6 +1373,7 @@ mod tests {
                     target: fs_path("work"),
                     permission: WorkdirToolScopePermission::Write,
                     recursive: true,
+                    symlink_policy: Default::default(),
                 }],
                 cwd: fs_path("work"),
                 command: false,
@@ -1386,11 +1462,23 @@ mod tests {
     }
 
     #[test]
+    fn workdir_rule_defaults_to_resolved_symlink_policy_on_restore() {
+        let rule: WorkdirToolScopeRule = serde_json::from_value(serde_json::json!({
+            "target": "src",
+            "permission": "read",
+            "recursive": true
+        }))
+        .unwrap();
+        assert_eq!(rule.symlink_policy, SymlinkPolicy::Resolved);
+    }
+
+    #[test]
     fn non_recursive_rule_covers_target_and_direct_children_only() {
         let rule = WorkdirToolScopeRule {
             target: fs_path("docs"),
             permission: WorkdirToolScopePermission::Read,
             recursive: false,
+            symlink_policy: Default::default(),
         };
         assert!(path_in_rule(&rule, &fs_path("docs")));
         assert!(path_in_rule(&rule, &fs_path("docs/readme.md")));
@@ -1443,7 +1531,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn provider_scope_allows_read_through_its_logical_symlink_path() {
+    async fn provider_scope_rejects_symlink_aliases_by_default() {
         use std::os::unix::fs::symlink;
 
         let root = TempDir::new().unwrap();
@@ -1456,6 +1544,73 @@ mod tests {
             .scope(request("granted", WorkdirToolScopePermission::Read))
             .await
             .unwrap();
+
+        assert!(matches!(
+            child.read(read("link")).await,
+            Err(WorkdirError::Denied(message))
+                if message.contains("provider-resolved delegated scope")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolved_scope_follows_its_target_but_rejects_nested_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("target")).unwrap();
+        fs::create_dir_all(root.path().join("secret")).unwrap();
+        fs::write(root.path().join("target/visible"), "visible").unwrap();
+        fs::write(root.path().join("secret/key"), "hidden").unwrap();
+        symlink("target", root.path().join("granted")).unwrap();
+        symlink("../secret/key", root.path().join("target/escape")).unwrap();
+        let parent = session(root.path());
+        let child = parent
+            .scope(request("granted", WorkdirToolScopePermission::Read))
+            .await
+            .unwrap();
+
+        assert_eq!(child.read(read("visible")).await.unwrap().bytes, b"visible");
+        assert!(matches!(
+            child.read(read("escape")).await,
+            Err(WorkdirError::Denied(message))
+                if message.contains("provider-resolved delegated scope")
+        ));
+    }
+
+    #[tokio::test]
+    async fn nested_scope_cannot_expand_resolved_policy_to_logical() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("granted")).unwrap();
+        let parent = session(root.path());
+        let child = parent
+            .scope(request("granted", WorkdirToolScopePermission::Read))
+            .await
+            .unwrap();
+        let mut expanded = request(".", WorkdirToolScopePermission::Read);
+        expanded.rules[0].symlink_policy = SymlinkPolicy::Logical;
+
+        assert!(matches!(
+            child.scope(expanded).await,
+            Err(WorkdirError::Denied(message))
+                if message.contains("exceeds the parent tool scope")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_scope_allows_read_through_its_logical_symlink_path() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("granted")).unwrap();
+        fs::create_dir_all(root.path().join("secret")).unwrap();
+        fs::write(root.path().join("secret/key"), "hidden").unwrap();
+        symlink("../secret/key", root.path().join("granted/link")).unwrap();
+        let parent = session(root.path());
+        let mut scope = request("granted", WorkdirToolScopePermission::Read);
+        scope.rules[0].symlink_policy = SymlinkPolicy::Logical;
+        let child = parent.scope(scope).await.unwrap();
 
         assert_eq!(child.read(read("link")).await.unwrap().bytes, b"hidden");
     }
@@ -1470,10 +1625,9 @@ mod tests {
         fs::create_dir_all(root.path().join("secret")).unwrap();
         symlink("../secret", root.path().join("granted/outside")).unwrap();
         let parent = session(root.path());
-        let child = parent
-            .scope(request("granted", WorkdirToolScopePermission::Write))
-            .await
-            .unwrap();
+        let mut scope = request("granted", WorkdirToolScopePermission::Write);
+        scope.rules[0].symlink_policy = SymlinkPolicy::Logical;
+        let child = parent.scope(scope).await.unwrap();
 
         child
             .write(write("outside/new", "through-logical-path"))
@@ -1496,13 +1650,9 @@ mod tests {
         symlink("../secret", root.path().join("granted/outside")).unwrap();
         let parent = session(root.path());
 
-        let child = parent
-            .scope(request(
-                "granted/outside",
-                WorkdirToolScopePermission::Write,
-            ))
-            .await
-            .unwrap();
+        let mut scope = request("granted/outside", WorkdirToolScopePermission::Write);
+        scope.rules[0].symlink_policy = SymlinkPolicy::Logical;
+        let child = parent.scope(scope).await.unwrap();
         child
             .write(write("from-child", "child-authoritative"))
             .await

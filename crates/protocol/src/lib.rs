@@ -1599,10 +1599,28 @@ pub struct ScopeRule {
     /// direct children. Defaults to `true`.
     #[serde(default = "default_recursive")]
     pub recursive: bool,
+    /// Which path identity an allow rule uses when symbolic links are
+    /// encountered. Deny rules always inspect both identities.
+    #[serde(default)]
+    pub symlink_policy: SymlinkPolicy,
 }
 
 fn default_recursive() -> bool {
     true
+}
+
+/// Symbolic-link identity used by one filesystem allow rule.
+///
+/// `Resolved` is the least authority and the default: access is matched
+/// against the provider-resolved target. `Logical` intentionally grants the
+/// path as presented through the Workdir, even when it aliases another target.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "lowercase")]
+pub enum SymlinkPolicy {
+    #[default]
+    Resolved,
+    Logical,
 }
 
 /// Permission lattice used by [`ScopeRule`].
@@ -1622,6 +1640,25 @@ pub enum Permission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_rule_defaults_to_resolved_symlink_policy() {
+        let rule: ScopeRule = serde_json::from_value(serde_json::json!({
+            "target": "/workspace",
+            "permission": "read"
+        }))
+        .unwrap();
+        assert!(rule.recursive);
+        assert_eq!(rule.symlink_policy, SymlinkPolicy::Resolved);
+
+        let logical: ScopeRule = serde_json::from_value(serde_json::json!({
+            "target": "/workspace",
+            "permission": "read",
+            "symlink_policy": "logical"
+        }))
+        .unwrap();
+        assert_eq!(logical.symlink_policy, SymlinkPolicy::Logical);
+    }
 
     #[test]
     fn worker_state_snapshot_apply_is_monotonic_and_detects_conflicts() {
@@ -2462,6 +2499,7 @@ mod tests {
                 target: "/tmp/work".into(),
                 permission: Permission::Write,
                 recursive: true,
+                symlink_policy: Default::default(),
             }],
         });
         let json = serde_json::to_string(&method).unwrap();

@@ -11,8 +11,8 @@ use crate::{
     PasteArtifactRef, PendingSubmissionSummary, PendingSubmissionsSnapshot, Permission,
     RewindSummary, RewindTarget, RewindTargetId, RunResult, ScopeRule, Segment, SessionContentPart,
     SessionEntryProvenance, SessionMessageRole, SessionSnapshot, SessionSnapshotEntry,
-    SessionSnapshotEntryData, SessionToolAttachment, SubmissionDisposition, ToolResultDisposition,
-    TurnResult, UploadedFileAvailability, UploadedFileRef, WorkerBusyState,
+    SessionSnapshotEntryData, SessionToolAttachment, SubmissionDisposition, SymlinkPolicy,
+    ToolResultDisposition, TurnResult, UploadedFileAvailability, UploadedFileRef, WorkerBusyState,
     WorkerCommandAcknowledgement, WorkerCommandDisposition, WorkerCommandEnvelope,
     WorkerCommandKind, WorkerEvent, WorkerMaintenanceState, WorkerRunState, WorkerState,
     WorkerStateSnapshot, WorkerStatus,
@@ -64,6 +64,7 @@ pub fn generated_protocol_types() -> String {
     push_decl::<ToolResultDisposition>(&cfg, &mut output);
     push_decl::<ErrorCode>(&cfg, &mut output);
     push_decl::<Permission>(&cfg, &mut output);
+    push_decl::<SymlinkPolicy>(&cfg, &mut output);
     push_decl::<InFlightToolCallState>(&cfg, &mut output);
     push_decl::<CommandStatus>(&cfg, &mut output);
     push_decl::<CommandStream>(&cfg, &mut output);

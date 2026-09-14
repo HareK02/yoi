@@ -699,6 +699,7 @@ impl WorkerController {
                 target: bash_output_dir.clone(),
                 permission: manifest::Permission::Read,
                 recursive: true,
+                symlink_policy: Default::default(),
             }])
             .map_err(std::io::Error::other)?;
 

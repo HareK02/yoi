@@ -11,7 +11,7 @@ use crate::{
     CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
     EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
     ReadRequest, ReadResult, StatRequest, StatResult, WorkdirError, WorkdirId,
-    WorkdirSessionCapabilities, WriteRequest, WriteResult,
+    WorkdirScopeAuthorizationRequest, WorkdirSessionCapabilities, WriteRequest, WriteResult,
 };
 
 /// Opaque Runtime-owned identifier for one ephemeral Workdir session.
@@ -55,6 +55,7 @@ pub struct OpenWorkdirSessionResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "request", rename_all = "snake_case")]
 pub enum WorkdirSessionOperation {
+    AuthorizeScope(WorkdirScopeAuthorizationRequest),
     Stat(StatRequest),
     Read(ReadRequest),
     Write(WriteRequest),
@@ -79,6 +80,7 @@ pub struct WorkdirSessionOperationRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "result", rename_all = "snake_case")]
 pub enum WorkdirSessionOperationResult {
+    AuthorizeScope,
     Stat(StatResult),
     Read(ReadResult),
     Write(WriteResult),
@@ -445,6 +447,19 @@ mod client {
 
         fn capabilities(&self) -> WorkdirSessionCapabilities {
             self.capabilities
+        }
+
+        async fn authorize_scope_path(
+            &self,
+            request: WorkdirScopeAuthorizationRequest,
+        ) -> Result<(), WorkdirError> {
+            match self
+                .operate(WorkdirSessionOperation::AuthorizeScope(request))
+                .await?
+            {
+                WorkdirSessionOperationResult::AuthorizeScope => Ok(()),
+                _ => Err(Self::mismatch("authorize_scope")),
+            }
         }
 
         async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {

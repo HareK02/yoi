@@ -23,6 +23,7 @@ fn deny_write(target: &Path) -> ScopeRule {
         target: target.to_path_buf(),
         permission: Permission::Write,
         recursive: true,
+        symlink_policy: Default::default(),
     }
 }
 

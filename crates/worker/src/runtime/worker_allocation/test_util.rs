@@ -77,6 +77,7 @@ pub(crate) fn write_rule(path: &str, recursive: bool) -> ScopeRule {
         target: PathBuf::from(path),
         permission: Permission::Write,
         recursive,
+        symlink_policy: Default::default(),
     }
 }
 
@@ -85,6 +86,7 @@ pub(crate) fn read_rule(path: &str, recursive: bool) -> ScopeRule {
         target: PathBuf::from(path),
         permission: Permission::Read,
         recursive,
+        symlink_policy: Default::default(),
     }
 }
 

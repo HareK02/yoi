@@ -286,6 +286,7 @@ fn read_rule(target: PathBuf) -> ScopeRule {
         target,
         permission: Permission::Read,
         recursive: true,
+        symlink_policy: Default::default(),
     }
 }
 
@@ -294,6 +295,7 @@ fn write_rule(target: PathBuf) -> ScopeRule {
         target,
         permission: Permission::Write,
         recursive: true,
+        symlink_policy: Default::default(),
     }
 }
 
@@ -306,6 +308,7 @@ fn workspace_scope(
         target: workspace_root.to_path_buf(),
         permission,
         recursive: true,
+        symlink_policy: Default::default(),
     };
     let deny = deny_write
         .iter()
@@ -711,6 +714,7 @@ permission = "write"
             target: target.to_path_buf(),
             permission,
             recursive: true,
+            symlink_policy: Default::default(),
         }
     }
 

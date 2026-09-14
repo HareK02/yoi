@@ -36,6 +36,7 @@ async fn legacy_callback_cannot_register_process_subworker_authority() {
             target: scope_root.path().to_path_buf(),
             permission: Permission::Write,
             recursive: true,
+            symlink_policy: Default::default(),
         }],
     };
 
