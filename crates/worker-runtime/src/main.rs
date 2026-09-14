@@ -1273,7 +1273,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_dry_run_accepts_previous_schema_document_without_workers_field() {
+    fn migration_dry_run_accepts_supported_schema_v3_without_workers_field() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime");
         std::fs::create_dir_all(root.join("workers")).unwrap();
@@ -1312,7 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_dry_run_rejects_previous_schema_document_that_cannot_decode_as_v4() {
+    fn migration_dry_run_rejects_schema_v3_document_that_cannot_decode_as_v5() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime");
         std::fs::create_dir_all(root.join("workers")).unwrap();

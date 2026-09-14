@@ -15,7 +15,9 @@ use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
+const PREVIOUS_SCHEMA_VERSION: u32 = 4;
+const PRE_EXECUTION_SCHEMA_VERSION: u32 = 3;
 const RUNTIME_FILE: &str = "runtime.json";
 const WORKERS_DIR: &str = "workers";
 const WORKER_FILE: &str = "worker.json";
@@ -370,8 +372,8 @@ fn plan_runtime_store_migration(
             format!("Runtime store schema version {schema_version} is out of range"),
         )
     })?;
-    let staging = migration_sibling(root, "schema-v4-staging")?;
-    let backup = migration_sibling(root, "pre-schema-v4-backup")?;
+    let staging = migration_sibling(root, "schema-v5-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v5-backup")?;
     if staging.exists() || backup.exists() {
         return Err(runtime_store_corrupt(
             root,
@@ -397,11 +399,14 @@ fn plan_runtime_store_migration(
         };
         return Ok((plan, Vec::new()));
     }
-    if current_schema_version != 3 {
+    if !matches!(
+        current_schema_version,
+        PRE_EXECUTION_SCHEMA_VERSION | PREVIOUS_SCHEMA_VERSION
+    ) {
         return Err(runtime_store_corrupt(
             &runtime_path,
             format!(
-                "unsupported Runtime store schema version {schema_version}; expected 3 or {SCHEMA_VERSION}"
+                "unsupported Runtime store schema version {schema_version}; expected {PRE_EXECUTION_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
             ),
         ));
     }
@@ -428,6 +433,16 @@ fn plan_runtime_store_migration(
             runtime_store_corrupt(&source_dir, "Worker directory is not UTF-8".to_string())
         })?;
         let snapshot_path = source_dir.join(WORKER_FILE);
+        if !snapshot_path
+            .try_exists()
+            .map_err(|source| RuntimeError::StoreIo {
+                operation: "inspect Worker snapshot",
+                path: snapshot_path.clone(),
+                source,
+            })?
+        {
+            continue;
+        }
         let snapshot: serde_json::Value = read_json(&snapshot_path, "read Worker snapshot")?;
         let (worker_id, workspace_id, legacy_mapping) = if current_schema_version == 1 {
             let legacy_worker_id = name.parse::<u64>().map_err(|_| {
@@ -662,6 +677,42 @@ fn migrate_worker_document(
         {
             object.insert("working_directory".to_string(), working_directory);
         }
+    }
+    let legacy_materialization = object
+        .get("working_directory")
+        .and_then(|working_directory| working_directory.get("summary"))
+        .and_then(|summary| summary.get("materializer_kind"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| matches!(kind, "runtime_git_cache" | "local_git_worktree"));
+    if legacy_materialization {
+        object.insert("working_directory".to_string(), serde_json::Value::Null);
+    }
+    if let Some(profile_source) = object
+        .get_mut("request")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|request| request.get_mut("profile_source"))
+        .and_then(serde_json::Value::as_object_mut)
+        && profile_source
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("http")
+    {
+        let archive = profile_source
+            .get_mut("location")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|location| location.remove("archive"))
+            .ok_or_else(|| {
+                runtime_store_corrupt(
+                    snapshot_path,
+                    "legacy HTTP profile source is missing its archive".to_string(),
+                )
+            })?;
+        profile_source.clear();
+        profile_source.insert(
+            "kind".to_string(),
+            serde_json::Value::String("workspace_config".to_string()),
+        );
+        profile_source.insert("archive".to_string(), archive);
     }
     object.insert(
         "schema_version".to_string(),
@@ -1048,8 +1099,8 @@ fn migrate_runtime_store(
     if !plan.migration_required {
         return Ok(plan);
     }
-    let staging = migration_sibling(root, "schema-v4-staging")?;
-    let backup = migration_sibling(root, "pre-schema-v4-backup")?;
+    let staging = migration_sibling(root, "schema-v5-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v5-backup")?;
     if staging.exists() || backup.exists() {
         return Err(runtime_store_corrupt(
             root,
@@ -1490,4 +1541,113 @@ fn sync_directory(path: &Path, operation: &'static str) -> Result<(), RuntimeErr
             path: path.to_path_buf(),
             source,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_v4_migration_plan_ignores_orphan_worker_directories() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join(RUNTIME_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": PREVIOUS_SCHEMA_VERSION,
+                "display_name": null,
+                "backend": "fs_store",
+                "status": "running",
+                "next_diagnostic_id": 1,
+                "config_bundles": {},
+                "workspace_owners": {},
+                "diagnostics": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(root.path().join(WORKERS_DIR).join("orphan").join("session")).unwrap();
+        fs::write(
+            root.path()
+                .join(WORKERS_DIR)
+                .join("orphan")
+                .join("session")
+                .join("history.json"),
+            b"[]",
+        )
+        .unwrap();
+        let (plan, _) = plan_runtime_store_migration(root.path(), "runtime-test").unwrap();
+
+        assert!(plan.migration_required);
+        assert_eq!(plan.current_schema_version, PREVIOUS_SCHEMA_VERSION);
+        assert_eq!(plan.target_schema_version, SCHEMA_VERSION);
+        assert_eq!(plan.worker_count, 0);
+    }
+
+    #[test]
+    fn schema_v4_worker_migration_discards_unsupported_linked_worktree_binding() {
+        let source = serde_json::json!({
+            "schema_version": 4,
+            "request": {
+                "profile_source": {
+                    "kind": "http",
+                    "location": {
+                        "url": "https://workspace.example.test/archive",
+                        "etag": "profile-source:test",
+                        "archive": {
+                            "id": "profiles-v1",
+                            "digest": "sha256:test",
+                            "size_bytes": 1,
+                            "source_graph": {
+                                "source_count": 1,
+                                "total_source_bytes": 1,
+                                "entrypoints": {},
+                                "import_count": 0
+                            }
+                        }
+                    }
+                }
+            },
+            "working_directory": {
+                "summary": {
+                    "materializer_kind": "runtime_git_cache"
+                }
+            }
+        });
+        let path = Path::new("worker.json");
+
+        let migrated =
+            migrate_worker_document(source, PREVIOUS_SCHEMA_VERSION, None, path).unwrap();
+
+        assert_eq!(migrated["schema_version"], SCHEMA_VERSION);
+        assert_eq!(migrated["status"], "stopped");
+        assert_eq!(migrated["working_directory"], serde_json::Value::Null);
+        assert_eq!(
+            migrated["request"]["profile_source"]["kind"],
+            "workspace_config"
+        );
+        assert_eq!(
+            migrated["request"]["profile_source"]["archive"]["id"],
+            "profiles-v1"
+        );
+        assert_eq!(migrated["execution"]["restore_intent"], "explicit");
+    }
+
+    #[test]
+    fn schema_v4_worker_migration_preserves_runtime_clone_observation() {
+        let source = serde_json::json!({
+            "schema_version": 4,
+            "working_directory": {
+                "summary": {
+                    "materializer_kind": "runtime_git_clone"
+                }
+            }
+        });
+        let expected = source["working_directory"].clone();
+        let path = Path::new("worker.json");
+
+        let migrated =
+            migrate_worker_document(source, PREVIOUS_SCHEMA_VERSION, None, path).unwrap();
+
+        assert_eq!(migrated["working_directory"], expected);
+    }
 }

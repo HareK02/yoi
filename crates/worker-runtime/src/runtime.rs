@@ -6079,7 +6079,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("unsupported Runtime store schema version 2; expected 3 or 4")
+                .contains("unsupported Runtime store schema version 2; expected 3, 4, or 5")
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -6121,7 +6121,7 @@ mod tests {
         let worker_snapshot: serde_json::Value =
             serde_json::from_slice(&std::fs::read(worker_store_dir.join("worker.json")).unwrap())
                 .unwrap();
-        assert_eq!(worker_snapshot["schema_version"], serde_json::json!(4));
+        assert_eq!(worker_snapshot["schema_version"], serde_json::json!(5));
         assert_eq!(worker_snapshot["status"], serde_json::json!("stopped"));
         assert_eq!(
             worker_snapshot["execution"]["binding"]["run_generation"],
@@ -6556,7 +6556,7 @@ mod tests {
         );
         let migrated_json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&worker_path).unwrap()).unwrap();
-        assert_eq!(migrated_json["schema_version"], serde_json::json!(4));
+        assert_eq!(migrated_json["schema_version"], serde_json::json!(5));
         assert_eq!(migrated_json["status"], serde_json::json!("stopped"));
         assert_eq!(
             migrated_json["execution"]["binding"]["run_generation"],

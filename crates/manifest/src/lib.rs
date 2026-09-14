@@ -976,7 +976,8 @@ struct LegacyMemoryConfig {
     consolidation_threshold_bytes: Option<u64>,
 }
 
-const RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION: u64 = 2;
+const RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION: u64 = 3;
+const PREVIOUS_RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION: u64 = 2;
 
 /// Serialize a resolved Worker Manifest for durable Worker-specific storage.
 pub fn write_persisted_worker_manifest_snapshot(
@@ -1006,7 +1007,9 @@ pub fn read_persisted_worker_manifest_snapshot(
                 "resolved Worker manifest snapshot schema_version must be an integer",
             ))
         })?;
-        if version != RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION {
+        if version != RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION
+            && version != PREVIOUS_RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION
+        {
             return Err(serde_json::Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("unsupported resolved Worker manifest snapshot schema version {version}"),
@@ -1018,7 +1021,7 @@ pub fn read_persisted_worker_manifest_snapshot(
                 "resolved Worker manifest snapshot contains unknown fields",
             )));
         }
-        let manifest = object.get("manifest").cloned().ok_or_else(|| {
+        let mut manifest = object.get("manifest").cloned().ok_or_else(|| {
             serde_json::Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "resolved Worker manifest snapshot is missing manifest",
@@ -1032,6 +1035,9 @@ pub fn read_persisted_worker_manifest_snapshot(
                 std::io::ErrorKind::InvalidData,
                 "current resolved Worker manifest contains removed top-level memory authority",
             )));
+        }
+        if version == PREVIOUS_RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION {
+            migrate_legacy_manifest_authority(&mut manifest)?;
         }
         return validate_persisted_worker_manifest(serde_json::from_value(manifest)?);
     }
@@ -1053,6 +1059,49 @@ fn validate_persisted_worker_manifest(
             ))
         })?;
     Ok(manifest)
+}
+
+fn migrate_legacy_manifest_authority(
+    manifest: &mut serde_json::Value,
+) -> Result<(), serde_json::Error> {
+    let root = manifest.as_object_mut().ok_or_else(|| {
+        serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "resolved Worker manifest must be an object",
+        ))
+    })?;
+    root.remove("plugins");
+    if let Some(feature) = root.get_mut("feature") {
+        let feature = feature.as_object_mut().ok_or_else(|| {
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "resolved Worker manifest feature must be an object",
+            ))
+        })?;
+        feature.remove("plugins");
+        feature.remove("ticket_orchestration");
+        if let Some(workers) = feature.remove("workers") {
+            feature
+                .entry("sub_worker".to_string())
+                .or_insert_with(|| workers.clone());
+            feature.entry("worker".to_string()).or_insert(workers);
+        }
+        if let Some(ticket) = feature
+            .get_mut("ticket")
+            .and_then(serde_json::Value::as_object_mut)
+            && let Some(access) = ticket.remove("access")
+            && ticket
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            && access.as_str() == Some("lifecycle")
+        {
+            ticket.insert("authoring".to_string(), serde_json::Value::Bool(true));
+            ticket.insert("thread".to_string(), serde_json::Value::Bool(true));
+            ticket.insert("workflow".to_string(), serde_json::Value::Bool(true));
+        }
+    }
+    Ok(())
 }
 
 fn migrate_legacy_resolved_manifest_snapshot(
@@ -1080,7 +1129,7 @@ fn migrate_legacy_resolved_manifest_snapshot(
             .remove("memory")
             .unwrap_or_else(|| serde_json::json!({})),
     )?;
-    let enabled = legacy_feature_memory.enabled;
+    let requested_enabled = legacy_feature_memory.enabled;
     let staging_tools = legacy_feature_memory.staging;
 
     let legacy_memory: LegacyMemoryConfig =
@@ -1103,9 +1152,14 @@ fn migrate_legacy_resolved_manifest_snapshot(
             )));
         }
     };
-    if !enabled {
+    if !requested_enabled {
         workspace_settings = None;
     }
+    // Legacy standalone manifests could enable process-local Memory without a
+    // Workspace-owned settings snapshot. That authority no longer exists, so
+    // migration safely disables Memory instead of treating the whole Worker
+    // snapshot as corrupt.
+    let enabled = requested_enabled && workspace_settings.is_some();
     let extraction_enabled = legacy_memory.extract_threshold.is_some();
     if legacy_memory.consolidation_model.is_some() {
         return Err(serde_json::Error::io(std::io::Error::new(
@@ -1151,6 +1205,7 @@ fn migrate_legacy_resolved_manifest_snapshot(
             .insert("workspace_settings".to_string(), workspace_settings);
     }
     feature.insert("memory".to_string(), resolved);
+    migrate_legacy_manifest_authority(&mut snapshot)?;
     validate_persisted_worker_manifest(serde_json::from_value(snapshot)?)
 }
 
@@ -1601,7 +1656,7 @@ model_id = "claude-sonnet-4-20250514"
             "Français"
         );
         let current = write_persisted_worker_manifest_snapshot(&migrated).unwrap();
-        assert_eq!(current["schema_version"], 2);
+        assert_eq!(current["schema_version"], 3);
         assert!(current["manifest"].get("memory").is_none());
 
         let mut disabled =
@@ -1615,6 +1670,61 @@ model_id = "claude-sonnet-4-20250514"
         let disabled = read_persisted_worker_manifest_snapshot(disabled).unwrap();
         assert!(!disabled.feature.memory.profile.enabled);
         assert!(disabled.feature.memory.workspace_settings.is_none());
+    }
+
+    #[test]
+    fn persisted_manifest_adapter_drops_removed_plugin_authority() {
+        let manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        let mut versioned = write_persisted_worker_manifest_snapshot(&manifest).unwrap();
+        versioned["schema_version"] = serde_json::json!(2);
+        versioned["manifest"]["feature"]["plugins"] = serde_json::json!({ "enabled": true });
+        versioned["manifest"]["feature"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sub_worker");
+        versioned["manifest"]["feature"]
+            .as_object_mut()
+            .unwrap()
+            .remove("worker");
+        versioned["manifest"]["feature"]["workers"] = serde_json::json!({ "enabled": true });
+        versioned["manifest"]["feature"]["ticket"] =
+            serde_json::json!({ "enabled": true, "access": "lifecycle" });
+        versioned["manifest"]["feature"]["ticket_orchestration"] =
+            serde_json::json!({ "enabled": false });
+        versioned["manifest"]["plugins"] = serde_json::json!({
+            "enabled": ["legacy-plugin"],
+            "config": { "legacy-plugin": { "legacy": true } }
+        });
+
+        let restored = read_persisted_worker_manifest_snapshot(versioned).unwrap();
+        let current = write_persisted_worker_manifest_snapshot(&restored).unwrap();
+        assert_eq!(current["schema_version"], 3);
+        assert!(current["manifest"].get("plugins").is_none());
+        assert!(current["manifest"]["feature"].get("plugins").is_none());
+        assert!(current["manifest"]["feature"].get("workers").is_none());
+        assert_eq!(
+            current["manifest"]["feature"]["sub_worker"]["enabled"],
+            true
+        );
+        assert_eq!(current["manifest"]["feature"]["worker"]["enabled"], true);
+        assert_eq!(current["manifest"]["feature"]["ticket"]["authoring"], true);
+        assert_eq!(current["manifest"]["feature"]["ticket"]["thread"], true);
+        assert_eq!(current["manifest"]["feature"]["ticket"]["workflow"], true);
+
+        let mut legacy = serde_json::to_value(manifest).unwrap();
+        legacy.as_object_mut().unwrap().remove("memory");
+        legacy["feature"]["memory"] = serde_json::json!({
+            "enabled": true,
+            "staging": false
+        });
+        legacy["feature"]["plugins"] = serde_json::json!({ "enabled": false });
+        legacy["plugins"] = serde_json::json!({ "enabled": [] });
+        let legacy = read_persisted_worker_manifest_snapshot(legacy).unwrap();
+        let current = write_persisted_worker_manifest_snapshot(&legacy).unwrap();
+        assert_eq!(
+            current["manifest"]["feature"]["memory"]["profile"]["enabled"],
+            false
+        );
     }
 
     #[test]
@@ -1659,7 +1769,7 @@ model_id = "claude-sonnet-4-20250514"
 
         assert!(
             read_persisted_worker_manifest_snapshot(serde_json::json!({
-                "schema_version": 3,
+                "schema_version": 4,
                 "manifest": manifest,
             }))
             .is_err()
