@@ -45,6 +45,14 @@ pub struct WorkdirScopeAuthorizationRequest {
     pub permission: WorkdirToolScopePermission,
 }
 
+/// Provider-side overlap comparison that keeps resolved host paths private.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkdirScopeOverlapRequest {
+    pub left: WorkdirToolScopeRule,
+    pub right: WorkdirToolScopeRule,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkdirToolScope {
@@ -82,6 +90,7 @@ impl WorkdirToolBroker {
             capabilities,
             validity: SessionValidity::root(),
             child_write_leases: Mutex::new(HashMap::new()),
+            scope_lock: tokio::sync::Mutex::new(()),
             next_lease_id: AtomicU64::new(1),
             close_lock: Arc::new(tokio::sync::Mutex::new(())),
             owned_commands: Arc::new(Mutex::new(HashSet::new())),
@@ -322,6 +331,7 @@ struct ScopedWorkdirSession {
     capabilities: WorkdirSessionCapabilities,
     validity: Arc<SessionValidity>,
     child_write_leases: Mutex<HashMap<u64, ActiveWriteLease>>,
+    scope_lock: tokio::sync::Mutex<()>,
     next_lease_id: AtomicU64,
     close_lock: Arc<tokio::sync::Mutex<()>>,
     owned_commands: Arc<Mutex<HashSet<String>>>,
@@ -385,9 +395,6 @@ impl ScopedWorkdirSession {
                     "logical workdir path `{path}` is outside the scoped {permission:?} scope"
                 )));
             }
-        }
-        if permission == WorkdirToolScopePermission::Write {
-            self.ensure_parent_write_available(path)?;
         }
         Ok(())
     }
@@ -475,33 +482,48 @@ impl ScopedWorkdirSession {
         });
     }
 
-    fn ensure_parent_write_available(&self, path: &FsPath) -> Result<(), WorkdirError> {
-        let mut leases = self
-            .child_write_leases
-            .lock()
-            .expect("Workdir tool scope lease mutex poisoned");
-        leases.retain(|_, lease| {
-            lease
-                .validity
-                .upgrade()
-                .is_some_and(|validity| validity.is_active())
-                || lease
-                    .cleanup_pending
+    async fn ensure_parent_write_available(&self, path: &FsPath) -> Result<(), WorkdirError> {
+        let active_write_rules = {
+            let mut leases = self
+                .child_write_leases
+                .lock()
+                .expect("Workdir tool scope lease mutex poisoned");
+            leases.retain(|_, lease| {
+                lease
+                    .validity
                     .upgrade()
-                    .is_some_and(|pending| pending.load(Ordering::Acquire))
-        });
-        if leases.values().any(|lease| {
-            lease.rules.iter().any(|rule| {
-                rule.permission == WorkdirToolScopePermission::Write
-                    && rule_allows_path(rule, path, WorkdirToolScopePermission::Write)
-            })
-        }) {
-            Err(WorkdirError::Denied(format!(
-                "logical workdir path `{path}` is leased to child Workdir tools"
-            )))
-        } else {
-            Ok(())
+                    .is_some_and(|validity| validity.is_active())
+                    || lease
+                        .cleanup_pending
+                        .upgrade()
+                        .is_some_and(|pending| pending.load(Ordering::Acquire))
+            });
+            leases
+                .values()
+                .flat_map(|lease| lease.rules.iter().cloned())
+                .collect::<Vec<_>>()
+        };
+        let requested = WorkdirToolScopeRule {
+            target: path.clone(),
+            permission: WorkdirToolScopePermission::Write,
+            recursive: false,
+            symlink_policy: SymlinkPolicy::Resolved,
+        };
+        for active in active_write_rules {
+            if self
+                .source
+                .scope_rules_overlap(WorkdirScopeOverlapRequest {
+                    left: active,
+                    right: requested.clone(),
+                })
+                .await?
+            {
+                return Err(WorkdirError::Denied(format!(
+                    "path `{path}` is leased to child Workdir tools"
+                )));
+            }
         }
+        Ok(())
     }
 
     async fn ensure_scope_targets_are_authorized(
@@ -527,6 +549,9 @@ impl ScopedWorkdirSession {
     ) -> Result<FsPath, WorkdirError> {
         self.ensure_active()?;
         let resolved = self.resolve_path(path)?;
+        if permission == WorkdirToolScopePermission::Write {
+            self.ensure_parent_write_available(&resolved).await?;
+        }
         if let Some(rules) = self.scope.as_ref() {
             self.source
                 .authorize_scope_path(WorkdirScopeAuthorizationRequest {
@@ -613,6 +638,7 @@ impl ScopedWorkdirSession {
         self: &Arc<Self>,
         request: WorkdirToolScope,
     ) -> Result<WorkdirScopeLease, WorkdirError> {
+        let _scope_guard = self.scope_lock.lock().await;
         let capabilities = self.validate_scope(&request.rules, request.command)?;
         if !request
             .rules
@@ -629,50 +655,61 @@ impl ScopedWorkdirSession {
         let validity = SessionValidity::child(self.validity.clone());
         let cleanup_pending = Arc::new(AtomicBool::new(true));
         let id = self.next_lease_id.fetch_add(1, Ordering::Relaxed);
-        if request
+        let write_rules = request
             .rules
             .iter()
-            .any(|rule| rule.permission == WorkdirToolScopePermission::Write)
-        {
-            let mut leases = self
-                .child_write_leases
-                .lock()
-                .expect("Workdir tool scope lease mutex poisoned");
-            leases.retain(|_, lease| {
-                lease
-                    .validity
-                    .upgrade()
-                    .is_some_and(|validity| validity.is_active())
-                    || lease
-                        .cleanup_pending
-                        .upgrade()
-                        .is_some_and(|pending| pending.load(Ordering::Acquire))
-            });
-            let requested_write_rules = request
-                .rules
-                .iter()
-                .filter(|rule| rule.permission == WorkdirToolScopePermission::Write);
-            for requested in requested_write_rules {
-                if leases.values().any(|lease| {
+            .filter(|rule| rule.permission == WorkdirToolScopePermission::Write)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !write_rules.is_empty() {
+            let active_write_rules = {
+                let mut leases = self
+                    .child_write_leases
+                    .lock()
+                    .expect("Workdir tool scope lease mutex poisoned");
+                leases.retain(|_, lease| {
                     lease
-                        .rules
-                        .iter()
-                        .any(|active| rules_overlap(active, requested))
-                }) {
-                    return Err(WorkdirError::Denied(format!(
-                        "scoped write path `{}` overlaps an active child scope",
-                        requested.target
-                    )));
+                        .validity
+                        .upgrade()
+                        .is_some_and(|validity| validity.is_active())
+                        || lease
+                            .cleanup_pending
+                            .upgrade()
+                            .is_some_and(|pending| pending.load(Ordering::Acquire))
+                });
+                leases
+                    .values()
+                    .flat_map(|lease| lease.rules.iter().cloned())
+                    .collect::<Vec<_>>()
+            };
+            for requested in &write_rules {
+                for active in &active_write_rules {
+                    if self
+                        .source
+                        .scope_rules_overlap(WorkdirScopeOverlapRequest {
+                            left: active.clone(),
+                            right: requested.clone(),
+                        })
+                        .await?
+                    {
+                        return Err(WorkdirError::Denied(format!(
+                            "scoped write path `{}` overlaps an active child scope after provider resolution",
+                            requested.target
+                        )));
+                    }
                 }
             }
-            leases.insert(
-                id,
-                ActiveWriteLease {
-                    validity: Arc::downgrade(&validity),
-                    cleanup_pending: Arc::downgrade(&cleanup_pending),
-                    rules: request.rules.clone(),
-                },
-            );
+            self.child_write_leases
+                .lock()
+                .expect("Workdir tool scope lease mutex poisoned")
+                .insert(
+                    id,
+                    ActiveWriteLease {
+                        validity: Arc::downgrade(&validity),
+                        cleanup_pending: Arc::downgrade(&cleanup_pending),
+                        rules: request.rules.clone(),
+                    },
+                );
         }
         let owned_commands = Arc::new(Mutex::new(HashSet::new()));
         let pending_command_events = Arc::new(Mutex::new(HashMap::new()));
@@ -698,6 +735,7 @@ impl ScopedWorkdirSession {
             capabilities,
             validity: validity.clone(),
             child_write_leases: Mutex::new(HashMap::new()),
+            scope_lock: tokio::sync::Mutex::new(()),
             next_lease_id: AtomicU64::new(1),
             close_lock: close_lock.clone(),
             owned_commands,
@@ -1011,6 +1049,13 @@ impl WorkdirSession for ReadOnlyWorkdirSession {
         self.inner.authorize_scope_path(request).await
     }
 
+    async fn scope_rules_overlap(
+        &self,
+        request: WorkdirScopeOverlapRequest,
+    ) -> Result<bool, WorkdirError> {
+        self.inner.scope_rules_overlap(request).await
+    }
+
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
         self.inner.stat(request).await
     }
@@ -1165,13 +1210,6 @@ fn unix_timestamp_ms() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
-}
-
-fn rules_overlap(left: &WorkdirToolScopeRule, right: &WorkdirToolScopeRule) -> bool {
-    left.permission == WorkdirToolScopePermission::Write
-        && right.permission == WorkdirToolScopePermission::Write
-        && (rule_allows_path(left, &right.target, WorkdirToolScopePermission::Write)
-            || rule_allows_path(right, &left.target, WorkdirToolScopePermission::Write))
 }
 
 pub(crate) fn rule_allows_path(
@@ -1578,6 +1616,41 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sibling_write_scopes_reject_distinct_aliases_to_same_resolved_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("target")).unwrap();
+        symlink("target", root.path().join("alias-a")).unwrap();
+        symlink("target", root.path().join("alias-b")).unwrap();
+        let parent = session(root.path());
+        let _first = parent
+            .scope(request("alias-a", WorkdirToolScopePermission::Write))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            parent
+                .scope(request("alias-b", WorkdirToolScopePermission::Write))
+                .await,
+            Err(WorkdirError::Denied(message))
+                if message.contains("overlaps an active child scope after provider resolution")
+        ));
+        assert!(matches!(
+            parent
+                .write(WriteRequest {
+                    path: FsPath::new("target/from-parent").unwrap(),
+                    content: b"blocked".to_vec(),
+                    expected_hash: None,
+                })
+                .await,
+            Err(WorkdirError::Denied(message))
+                if message.contains("leased to child Workdir tools")
+        ));
+    }
+
     #[tokio::test]
     async fn nested_scope_cannot_expand_resolved_policy_to_logical() {
         let root = TempDir::new().unwrap();
@@ -1641,7 +1714,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn write_delegation_leases_the_logical_symlink_path() {
+    async fn write_delegation_leases_logical_alias_and_resolved_target() {
         use std::os::unix::fs::symlink;
 
         let root = TempDir::new().unwrap();
@@ -1657,10 +1730,13 @@ mod tests {
             .write(write("from-child", "child-authoritative"))
             .await
             .unwrap();
-        parent
-            .write(write("secret/parent", "still-authoritative"))
-            .await
-            .unwrap();
+        assert!(matches!(
+            parent
+                .write(write("secret/parent", "must-be-blocked"))
+                .await,
+            Err(WorkdirError::Denied(message))
+                if message.contains("leased to child Workdir tools")
+        ));
         assert_eq!(
             fs::read_to_string(root.path().join("secret/from-child")).unwrap(),
             "child-authoritative"

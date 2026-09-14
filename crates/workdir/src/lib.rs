@@ -28,8 +28,9 @@ pub use local::{
 };
 pub use operation::*;
 pub use scope::{
-    ReadOnlyWorkdirSession, WorkdirScopeAuthorizationRequest, WorkdirScopeLease, WorkdirToolBroker,
-    WorkdirToolScope, WorkdirToolScopePermission, WorkdirToolScopeRule,
+    ReadOnlyWorkdirSession, WorkdirScopeAuthorizationRequest, WorkdirScopeLease,
+    WorkdirScopeOverlapRequest, WorkdirToolBroker, WorkdirToolScope, WorkdirToolScopePermission,
+    WorkdirToolScopeRule,
 };
 
 /// Persistent, opaque identity of one materialized Workdir.
@@ -164,6 +165,15 @@ pub trait WorkdirSession: std::fmt::Debug + Send + Sync {
                 "Workdir provider cannot establish resolved scope authority".to_string(),
             ))
         }
+    }
+
+    async fn scope_rules_overlap(
+        &self,
+        _request: WorkdirScopeOverlapRequest,
+    ) -> Result<bool, WorkdirError> {
+        Err(WorkdirError::Denied(
+            "Workdir provider cannot compare resolved scope authority".to_string(),
+        ))
     }
 
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError>;

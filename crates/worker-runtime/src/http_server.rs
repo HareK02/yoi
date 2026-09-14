@@ -1016,6 +1016,10 @@ async fn run_workdir_session_operation(
             session.authorize_scope_path(request).await?;
             WorkdirSessionOperationResult::AuthorizeScope
         }
+        WorkdirSessionOperation::ScopeRulesOverlap(request) => {
+            let overlaps = session.scope_rules_overlap(request).await?;
+            WorkdirSessionOperationResult::ScopeRulesOverlap { overlaps }
+        }
         WorkdirSessionOperation::Stat(request) => {
             WorkdirSessionOperationResult::Stat(session.stat(request).await?)
         }
@@ -3012,6 +3016,33 @@ mod tests {
         assert!(matches!(
             result,
             WorkdirSessionOperationResult::AuthorizeScope
+        ));
+
+        let overlap_rule = workdir::WorkdirToolScopeRule {
+            target: WorkdirPath::new("hello.txt").unwrap(),
+            permission: workdir::WorkdirToolScopePermission::Write,
+            recursive: false,
+            symlink_policy: Default::default(),
+        };
+        let overlap = WorkdirSessionOperationRequest {
+            operation: WorkdirSessionOperation::ScopeRulesOverlap(
+                workdir::WorkdirScopeOverlapRequest {
+                    left: overlap_rule.clone(),
+                    right: overlap_rule,
+                },
+            ),
+        };
+        let Json(result) = run_workdir_session_operation(
+            State(state.clone()),
+            Path("session-1".to_string()),
+            Some(Extension(auth.clone())),
+            Ok(Json(overlap)),
+        )
+        .await
+        .expect("provider-side resolved overlap check");
+        assert!(matches!(
+            result,
+            WorkdirSessionOperationResult::ScopeRulesOverlap { overlaps: true }
         ));
 
         let grep = WorkdirSessionOperationRequest {

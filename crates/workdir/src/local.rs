@@ -29,8 +29,9 @@ use crate::{
     CommandSnapshot, CommandStatus, CommandStream, CommandStreamSlice, EditRequest, EditResult,
     GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult, ReadRequest,
     ReadResult, StatRequest, StatResult, Workdir, WorkdirError, WorkdirPath,
-    WorkdirScopeAuthorizationRequest, WorkdirSession, WorkdirSessionCapabilities,
-    WorkdirSessionCapability, WorkdirToolScopePermission, WriteRequest, WriteResult,
+    WorkdirScopeAuthorizationRequest, WorkdirScopeOverlapRequest, WorkdirSession,
+    WorkdirSessionCapabilities, WorkdirSessionCapability, WorkdirToolScopePermission, WriteRequest,
+    WriteResult,
 };
 #[cfg(test)]
 use crate::{EntryKind, WriteOutcome};
@@ -223,6 +224,41 @@ impl fs_operation::FsAccessPolicy for ScopeAccess {
     fn is_writable_paths(&self, logical: &Path, resolved: &Path) -> bool {
         self.0.permission_at_paths(logical, resolved) == Some(Permission::Write)
     }
+}
+
+fn path_sets_overlap(
+    left: &Path,
+    left_recursive: bool,
+    right: &Path,
+    right_recursive: bool,
+) -> bool {
+    match (left_recursive, right_recursive) {
+        (true, true) => left.starts_with(right) || right.starts_with(left),
+        (true, false) => {
+            right.starts_with(left)
+                || left == right
+                || left.parent().is_some_and(|parent| parent == right)
+        }
+        (false, true) => {
+            left.starts_with(right)
+                || left == right
+                || right.parent().is_some_and(|parent| parent == left)
+        }
+        (false, false) => {
+            left == right
+                || left.parent().is_some_and(|parent| parent == right)
+                || right.parent().is_some_and(|parent| parent == left)
+        }
+    }
+}
+
+fn rule_targets(
+    root: &Path,
+    rule: &crate::WorkdirToolScopeRule,
+) -> std::io::Result<(PathBuf, PathBuf)> {
+    let logical = root.join(rule.target.as_str());
+    let resolved = fs_operation::resolve_access_path(&logical)?;
+    Ok((logical, resolved))
 }
 
 #[derive(Debug)]
@@ -624,6 +660,28 @@ impl WorkdirSession for LocalWorkdirSession {
                 request.path
             )))
         }
+    }
+
+    async fn scope_rules_overlap(
+        &self,
+        request: WorkdirScopeOverlapRequest,
+    ) -> Result<bool, WorkdirError> {
+        self.ensure_open()?;
+        let (left_logical, left_resolved) = rule_targets(&self.inner.root, &request.left)
+            .map_err(|error| WorkdirError::io(&self.inner.root, error))?;
+        let (right_logical, right_resolved) = rule_targets(&self.inner.root, &request.right)
+            .map_err(|error| WorkdirError::io(&self.inner.root, error))?;
+        Ok(path_sets_overlap(
+            &left_logical,
+            request.left.recursive,
+            &right_logical,
+            request.right.recursive,
+        ) || path_sets_overlap(
+            &left_resolved,
+            request.left.recursive,
+            &right_resolved,
+            request.right.recursive,
+        ))
     }
 
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {

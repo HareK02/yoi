@@ -19,8 +19,8 @@ use workdir::{
     CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
     EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
     ReadRequest, ReadResult, StatRequest, StatResult, Workdir, WorkdirError,
-    WorkdirScopeAuthorizationRequest, WorkdirSession, WorkdirSessionCapabilities,
-    WorkdirSessionHandle, WriteRequest, WriteResult,
+    WorkdirScopeAuthorizationRequest, WorkdirScopeOverlapRequest, WorkdirSession,
+    WorkdirSessionCapabilities, WorkdirSessionHandle, WriteRequest, WriteResult,
 };
 
 use workspace_api::{
@@ -291,6 +291,16 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
         match self.operate(WorkdirSessionOperation::AuthorizeScope(request))? {
             WorkdirSessionOperationResult::AuthorizeScope => Ok(()),
             _ => Err(Self::mismatch("authorize_scope")),
+        }
+    }
+
+    async fn scope_rules_overlap(
+        &self,
+        request: WorkdirScopeOverlapRequest,
+    ) -> Result<bool, WorkdirError> {
+        match self.operate(WorkdirSessionOperation::ScopeRulesOverlap(request))? {
+            WorkdirSessionOperationResult::ScopeRulesOverlap { overlaps } => Ok(overlaps),
+            _ => Err(Self::mismatch("scope_rules_overlap")),
         }
     }
 

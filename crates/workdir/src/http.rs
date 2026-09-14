@@ -11,7 +11,8 @@ use crate::{
     CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
     EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
     ReadRequest, ReadResult, StatRequest, StatResult, WorkdirError, WorkdirId,
-    WorkdirScopeAuthorizationRequest, WorkdirSessionCapabilities, WriteRequest, WriteResult,
+    WorkdirScopeAuthorizationRequest, WorkdirScopeOverlapRequest, WorkdirSessionCapabilities,
+    WriteRequest, WriteResult,
 };
 
 /// Opaque Runtime-owned identifier for one ephemeral Workdir session.
@@ -56,6 +57,7 @@ pub struct OpenWorkdirSessionResponse {
 #[serde(tag = "operation", content = "request", rename_all = "snake_case")]
 pub enum WorkdirSessionOperation {
     AuthorizeScope(WorkdirScopeAuthorizationRequest),
+    ScopeRulesOverlap(WorkdirScopeOverlapRequest),
     Stat(StatRequest),
     Read(ReadRequest),
     Write(WriteRequest),
@@ -81,6 +83,7 @@ pub struct WorkdirSessionOperationRequest {
 #[serde(tag = "operation", content = "result", rename_all = "snake_case")]
 pub enum WorkdirSessionOperationResult {
     AuthorizeScope,
+    ScopeRulesOverlap { overlaps: bool },
     Stat(StatResult),
     Read(ReadResult),
     Write(WriteResult),
@@ -459,6 +462,19 @@ mod client {
             {
                 WorkdirSessionOperationResult::AuthorizeScope => Ok(()),
                 _ => Err(Self::mismatch("authorize_scope")),
+            }
+        }
+
+        async fn scope_rules_overlap(
+            &self,
+            request: WorkdirScopeOverlapRequest,
+        ) -> Result<bool, WorkdirError> {
+            match self
+                .operate(WorkdirSessionOperation::ScopeRulesOverlap(request))
+                .await?
+            {
+                WorkdirSessionOperationResult::ScopeRulesOverlap { overlaps } => Ok(overlaps),
+                _ => Err(Self::mismatch("scope_rules_overlap")),
             }
         }
 

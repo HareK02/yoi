@@ -8434,6 +8434,7 @@ async fn scoped_execute_current_worker_workdir_operation(
                 .map_err(|error| current_worker_workdir_operation_error(&worker, error))?
         }
         operation @ (WorkdirSessionOperation::AuthorizeScope(_)
+        | WorkdirSessionOperation::ScopeRulesOverlap(_)
         | WorkdirSessionOperation::Stat(_)
         | WorkdirSessionOperation::Read(_)
         | WorkdirSessionOperation::Write(_)
@@ -8489,6 +8490,10 @@ async fn execute_workdir_session_operation(
             .authorize_scope_path(request)
             .await
             .map(|()| WorkdirSessionOperationResult::AuthorizeScope),
+        WorkdirSessionOperation::ScopeRulesOverlap(request) => session
+            .scope_rules_overlap(request)
+            .await
+            .map(|overlaps| WorkdirSessionOperationResult::ScopeRulesOverlap { overlaps }),
         WorkdirSessionOperation::Stat(request) => session
             .stat(request)
             .await
