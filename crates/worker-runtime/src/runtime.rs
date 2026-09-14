@@ -2606,12 +2606,7 @@ impl RuntimeState {
         let diagnostics = persisted.diagnostics;
         let next_diagnostic_id = persisted.next_diagnostic_id;
         for (worker_id, worker) in persisted.workers {
-            let run_generation = worker
-                .execution
-                .binding
-                .as_ref()
-                .map(|binding| binding.run_generation)
-                .unwrap_or(0);
+            let run_generation = worker.execution.last_run_generation;
             workers.insert(
                 worker_id,
                 WorkerRecord {
@@ -3397,6 +3392,7 @@ impl WorkerRecord {
             request: self.request.clone(),
             status: self.status,
             execution: PersistedWorkerExecution {
+                last_run_generation: self.run_generation,
                 binding: self
                     .execution_bound
                     .then_some(PersistedWorkerExecutionBinding {
@@ -6079,7 +6075,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("unsupported Runtime store schema version 2; expected 3, 4, or 5")
+                .contains("unsupported Runtime store schema version 2; expected 3, 4, 5, or 6")
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -6121,8 +6117,12 @@ mod tests {
         let worker_snapshot: serde_json::Value =
             serde_json::from_slice(&std::fs::read(worker_store_dir.join("worker.json")).unwrap())
                 .unwrap();
-        assert_eq!(worker_snapshot["schema_version"], serde_json::json!(5));
+        assert_eq!(worker_snapshot["schema_version"], serde_json::json!(6));
         assert_eq!(worker_snapshot["status"], serde_json::json!("stopped"));
+        assert_eq!(
+            worker_snapshot["execution"]["last_run_generation"],
+            serde_json::json!(1)
+        );
         assert_eq!(
             worker_snapshot["execution"]["binding"]["run_generation"],
             serde_json::json!(1)
@@ -6556,11 +6556,15 @@ mod tests {
         );
         let migrated_json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&worker_path).unwrap()).unwrap();
-        assert_eq!(migrated_json["schema_version"], serde_json::json!(5));
+        assert_eq!(migrated_json["schema_version"], serde_json::json!(6));
         assert_eq!(migrated_json["status"], serde_json::json!("stopped"));
         assert_eq!(
-            migrated_json["execution"]["binding"]["run_generation"],
+            migrated_json["execution"]["last_run_generation"],
             serde_json::json!(7)
+        );
+        assert_eq!(
+            migrated_json["execution"]["binding"],
+            serde_json::Value::Null
         );
         assert_eq!(
             migrated_json["execution"]["restore_intent"],
