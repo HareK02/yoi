@@ -3,8 +3,9 @@ use std::io;
 use std::time::Duration;
 
 use client::{
-    BackendRuntimeListTarget, BackendWorkerSummary, list_backend_stopped_workers,
-    list_backend_workers, restore_backend_worker,
+    BackendRuntimeListTarget, BackendWorkerOperationState, BackendWorkerRestoreResponse,
+    BackendWorkerSummary, list_backend_stopped_workers, list_backend_workers,
+    restore_backend_worker,
 };
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -84,17 +85,20 @@ pub(crate) async fn run(
             let restore_target = target
                 .runtime_target(selected.runtime_id.clone(), selected.worker_id.clone())
                 .map_err(|error| io::Error::other(error.to_string()))?;
-            restore_backend_worker(&restore_target)
+            let restore = restore_backend_worker(&restore_target)
                 .await
                 .map_err(|error| {
                     io::Error::other(format!(
                         "failed to restore Backend worker {}/{}: {error}",
                         selected.runtime_id, selected.worker_id
                     ))
-                })?
-                .result
-                .worker
-                .unwrap_or(selected)
+                })?;
+            restored_worker(restore).map_err(|error| {
+                io::Error::other(format!(
+                    "failed to restore Backend worker {}/{}: {error}",
+                    selected.runtime_id, selected.worker_id
+                ))
+            })?
         } else {
             selected
         };
@@ -103,6 +107,33 @@ pub(crate) async fn run(
             .map_err(|error| io::Error::other(error.to_string()))?;
         return console::run_backend_runtime(attach_target).await;
     }
+}
+
+fn restored_worker(response: BackendWorkerRestoreResponse) -> Result<BackendWorkerSummary, String> {
+    if response.result.state != BackendWorkerOperationState::Accepted {
+        let diagnostics = response
+            .result
+            .diagnostics
+            .iter()
+            .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let state = match response.result.state {
+            BackendWorkerOperationState::Accepted => unreachable!(),
+            BackendWorkerOperationState::Rejected => "rejected",
+            BackendWorkerOperationState::Unsupported => "unsupported",
+        };
+        return Err(if diagnostics.is_empty() {
+            format!("restore was {state} without a diagnostic")
+        } else {
+            format!("restore was {state}: {diagnostics}")
+        });
+    }
+
+    response
+        .result
+        .worker
+        .ok_or_else(|| "restore was accepted without a Worker snapshot".to_string())
 }
 
 fn dedup_workers(workers: &mut Vec<BackendWorkerSummary>) {
@@ -405,7 +436,8 @@ fn working_directory_text(worker: &BackendWorkerSummary) -> String {
 mod tests {
     use super::*;
     use client::{
-        BackendWorkerCapabilitySummary, BackendWorkerImplementationSummary,
+        BackendDiagnostic, BackendDiagnosticSeverity, BackendWorkerCapabilitySummary,
+        BackendWorkerImplementationSummary, BackendWorkerRestoreResult,
         BackendWorkerWorkspaceSummary,
     };
 
@@ -461,6 +493,67 @@ mod tests {
     fn display_column(text: &str, value: &str) -> usize {
         let byte_offset = text.find(value).expect("value in rendered row");
         text_width(&text[..byte_offset])
+    }
+
+    fn restore_response(
+        state: BackendWorkerOperationState,
+        worker: Option<BackendWorkerSummary>,
+        diagnostics: Vec<BackendDiagnostic>,
+    ) -> BackendWorkerRestoreResponse {
+        BackendWorkerRestoreResponse {
+            workspace_id: "workspace-a".to_string(),
+            runtime_id: "runtime-a".to_string(),
+            worker_id: "worker-a".to_string(),
+            result: BackendWorkerRestoreResult {
+                state,
+                worker,
+                diagnostics,
+            },
+        }
+    }
+
+    #[test]
+    fn rejected_restore_surfaces_diagnostic_instead_of_attaching_selected_worker() {
+        let error = restored_worker(restore_response(
+            BackendWorkerOperationState::Rejected,
+            None,
+            vec![BackendDiagnostic {
+                code: "working_directory_not_found".to_string(),
+                severity: BackendDiagnosticSeverity::Error,
+                message: "working directory was not found".to_string(),
+            }],
+        ))
+        .expect_err("rejected restore must not produce a Worker to attach");
+
+        assert_eq!(
+            error,
+            "restore was rejected: working_directory_not_found: working directory was not found"
+        );
+    }
+
+    #[test]
+    fn accepted_restore_requires_returned_worker_snapshot() {
+        let error = restored_worker(restore_response(
+            BackendWorkerOperationState::Accepted,
+            None,
+            Vec::new(),
+        ))
+        .expect_err("accepted restore without a Worker must not attach the stale selection");
+
+        assert_eq!(error, "restore was accepted without a Worker snapshot");
+    }
+
+    #[test]
+    fn accepted_restore_returns_authoritative_worker_snapshot() {
+        let worker = worker("runtime-a", "worker-a", Some("builtin:companion"));
+        let restored = restored_worker(restore_response(
+            BackendWorkerOperationState::Accepted,
+            Some(worker.clone()),
+            Vec::new(),
+        ))
+        .expect("accepted restore should return its Worker snapshot");
+
+        assert_eq!(restored, worker);
     }
 
     #[test]

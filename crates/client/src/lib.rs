@@ -26,10 +26,11 @@ pub use backend_runtime::{
     BackendRuntimeListTarget, BackendRuntimeSummary, BackendRuntimeTarget,
     BackendWorkerCapabilitySummary, BackendWorkerImplementationSummary, BackendWorkerLaunchOptions,
     BackendWorkerLaunchProfileCandidate, BackendWorkerLaunchRuntimeOption,
-    BackendWorkerLaunchTarget, BackendWorkerRestoreResponse, BackendWorkerRestoreResult,
-    BackendWorkerSummary, BackendWorkerWorkspaceSummary, BackendWorkingDirectorySummary,
-    connect_backend_runtime, create_backend_worker, get_backend_worker_launch_options,
-    list_backend_stopped_workers, list_backend_workers, restore_backend_worker,
+    BackendWorkerLaunchTarget, BackendWorkerOperationState, BackendWorkerRestoreResponse,
+    BackendWorkerRestoreResult, BackendWorkerSummary, BackendWorkerWorkspaceSummary,
+    BackendWorkingDirectorySummary, connect_backend_runtime, create_backend_worker,
+    get_backend_worker_launch_options, list_backend_stopped_workers, list_backend_workers,
+    restore_backend_worker,
 };
 pub use backend_workspace::{
     BackendWorkspace, BackendWorkspaceCatalogTarget, BackendWorkspaceClientError,
