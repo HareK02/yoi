@@ -9,14 +9,21 @@ fn workspace_creation_request_preserves_operation_key_for_retry() {
         operation_key: "workspace-create-1".to_string(),
         display_name: "Alpha".to_string(),
         repository: CreateBackendWorkspaceRepository {
+            repository_key: "main".to_string(),
             uri: "/srv/repos/alpha".to_string(),
-            display_name: Some("Main".to_string()),
             default_ref: Some("develop".to_string()),
         },
     };
 
     assert_eq!(request.clone(), request);
     assert_eq!(request.operation_key, "workspace-create-1");
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["operation_key"], "workspace-create-1");
+    assert_eq!(json["repository"]["repository_key"], "main");
+    assert_eq!(json["repository"]["uri"], "/srv/repos/alpha");
+    assert!(json.get("operation_id").is_none());
+    assert!(json["repository"].get("display_name").is_none());
+    assert!(json["repository"].get("source").is_none());
 }
 
 #[test]

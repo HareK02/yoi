@@ -14,7 +14,7 @@ use yoi_workspace_server::store::{
 };
 use yoi_workspace_server::{
     ControlPlaneStore, ResolvedWorkspaceBackendConfig, ServerConfig, ServerHostConfigFile,
-    WorkspaceIdentity, WorkspaceRecord, serve_workspace_catalog,
+    WorkspaceRecord, serve_workspace_catalog,
 };
 
 #[derive(Debug)]
@@ -235,21 +235,21 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
 
     let store = Arc::new(SqliteWorkspaceStore::open(&database_path)?);
     let workspaces = store.list_workspaces()?;
-    let (identity, workspace_root) = if let Some(workspace) = workspaces.first() {
+    let (workspace, workspace_execution_root) = if let Some(workspace) = workspaces.first() {
         (
-            WorkspaceIdentity {
-                workspace_id: workspace.workspace_id.clone(),
-                created_at: workspace.created_at.clone(),
-                display_name: workspace.display_name.clone(),
-            },
-            workspace_root_from_server_data(workspace)?,
+            workspace.clone(),
+            workspace_execution_root_from_server_data(workspace)?,
         )
     } else {
+        let now = Utc::now().to_rfc3339();
         (
-            WorkspaceIdentity {
+            WorkspaceRecord {
                 workspace_id: "00000000-0000-0000-0000-000000000000".to_string(),
-                created_at: Utc::now().to_rfc3339(),
+                owner_account_id: "00000000-0000-0000-0000-000000000000".to_string(),
+                created_at: now.clone(),
+                updated_at: now,
                 display_name: "Server bootstrap".to_string(),
+                state: "bootstrap".to_string(),
             },
             database_path
                 .parent()
@@ -261,8 +261,11 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
         Some(path) => ServerHostConfigFile::load_from_path(path)?,
         None => ServerHostConfigFile::load_default()?,
     };
-    let mut resolved =
-        ResolvedWorkspaceBackendConfig::local_dev(&workspace_root, identity, &host_config)?;
+    let mut resolved = ResolvedWorkspaceBackendConfig::local_dev(
+        &workspace_execution_root,
+        workspace,
+        &host_config,
+    )?;
     resolved.database_path = database_path.clone();
     resolved.server.database_path = database_path.clone();
     append_workspace_runtime_sources(store.as_ref(), &mut resolved.server.remote_runtime_sources)?;
@@ -322,7 +325,9 @@ fn append_workspace_runtime_sources(
     Ok(())
 }
 
-fn workspace_root_from_server_data(workspace: &WorkspaceRecord) -> Result<PathBuf, CliError> {
+fn workspace_execution_root_from_server_data(
+    workspace: &WorkspaceRecord,
+) -> Result<PathBuf, CliError> {
     Ok(ServerConfig::default_workspace_backend_data_root(
         &workspace.workspace_id,
     ))

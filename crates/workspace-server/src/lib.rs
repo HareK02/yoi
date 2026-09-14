@@ -10,7 +10,6 @@ pub mod companion;
 pub mod config;
 pub mod config_source;
 pub mod hosts;
-pub mod identity;
 pub mod memory_backend;
 pub mod memory_staging;
 pub mod observation;
@@ -43,7 +42,6 @@ pub use authority::{
     WorkspaceAuthority,
 };
 pub use config::{ResolvedWorkspaceBackendConfig, ServerHostConfigFile};
-pub use identity::{WORKSPACE_IDENTITY_RELATIVE_PATH, WorkspaceIdentity};
 pub use records::{ObjectiveDetail, ObjectiveSummary, TicketDetail, TicketSummary};
 pub use repositories::{ConfiguredRepository, RepositoryLogRead, RepositoryRegistryReader};
 pub use server::{
@@ -137,8 +135,6 @@ pub enum Error {
     RegistryInconsistency(String),
     #[error("Worker source identity is invalid: {0}")]
     WorkerSourceIdentity(String),
-    #[error("workspace identity error: {0}")]
-    WorkspaceIdentity(String),
     #[error("Workspace signing identity error ({code}): {message}")]
     WorkspaceSigningIdentity { code: String, message: String },
     #[error("store error: {0}")]

@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use client::{BackendTarget, StandaloneTarget, Target, TargetKind};
 use serde::Deserialize;
 
@@ -103,6 +105,16 @@ pub(crate) trait CliConnectionResolver {
         command: CliCommand,
         input: CliConnectionInput<'_>,
     ) -> Result<Box<dyn Target>, ParseError>;
+
+    fn select_workspace_for_repository(
+        &self,
+        _explicit_backend_url: Option<&str>,
+        _repository_path: &Path,
+    ) -> Result<(String, String), ParseError> {
+        Err(ParseError(
+            "repository-based Workspace selection is unavailable".to_string(),
+        ))
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -176,6 +188,17 @@ impl CliConnectionResolver for ClientConfigCliConnectionResolver {
                 ))),
             },
         }
+    }
+
+    fn select_workspace_for_repository(
+        &self,
+        explicit_backend_url: Option<&str>,
+        repository_path: &Path,
+    ) -> Result<(String, String), ParseError> {
+        let base_url = resolve_backend_url(explicit_backend_url.map(str::to_string), None)?;
+        let workspace_id =
+            super::select_backend_workspace_for_repository(&base_url, repository_path)?;
+        Ok((base_url, workspace_id))
     }
 }
 

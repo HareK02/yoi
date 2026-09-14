@@ -5,8 +5,8 @@ use std::{fs, io};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::identity::WorkspaceIdentity;
 use crate::server::{AuthConfig, ServerConfig};
+use crate::store::WorkspaceRecord;
 use crate::{Error, Result};
 
 pub const SERVER_HOST_CONFIG_FILE_NAME: &str = "server.toml";
@@ -100,15 +100,15 @@ impl ServerHostConfigFile {
 impl ResolvedWorkspaceBackendConfig {
     pub fn local_dev(
         workspace_root: impl AsRef<Path>,
-        identity: WorkspaceIdentity,
+        workspace: WorkspaceRecord,
         host_config: &ServerHostConfigFile,
     ) -> Result<Self> {
         let workspace_root = workspace_root.as_ref();
-        let data_root = ServerConfig::default_workspace_backend_data_root(&identity.workspace_id);
+        let data_root = ServerConfig::default_workspace_backend_data_root(&workspace.workspace_id);
         let database_path = ServerConfig::default_server_database_path();
         let (browser_public_url, browser_rp_id) =
             resolve_browser_public_url(&host_config.browser.public_url)?;
-        let mut server = ServerConfig::local_dev(workspace_root.to_path_buf(), identity);
+        let mut server = ServerConfig::local_dev(workspace_root.to_path_buf(), workspace);
         server.database_path = database_path.clone();
         server.embedded_runtime_store_root = data_root.join("embedded-runtime");
         server.max_records = DEFAULT_MAX_RECORDS;
@@ -185,11 +185,14 @@ fn resolve_browser_public_url(value: &str) -> Result<(String, String)> {
 mod tests {
     use super::*;
 
-    fn identity() -> WorkspaceIdentity {
-        WorkspaceIdentity {
+    fn workspace() -> WorkspaceRecord {
+        WorkspaceRecord {
             workspace_id: "018f6a2c-1111-7000-8000-000000000001".to_string(),
+            owner_account_id: "018f6a2c-1111-7000-8000-000000000002".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
             display_name: "Workspace".to_string(),
+            state: "active".to_string(),
         }
     }
 
@@ -197,7 +200,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         ResolvedWorkspaceBackendConfig::local_dev(
             dir.path(),
-            identity(),
+            workspace(),
             &ServerHostConfigFile::default(),
         )
         .unwrap()
@@ -250,7 +253,7 @@ mod tests {
         .unwrap();
         let resolved = ResolvedWorkspaceBackendConfig::local_dev(
             tempfile::tempdir().unwrap().path(),
-            identity(),
+            workspace(),
             &host_config,
         )
         .unwrap();
@@ -280,7 +283,7 @@ mod tests {
             };
             let result = ResolvedWorkspaceBackendConfig::local_dev(
                 tempfile::tempdir().unwrap().path(),
-                identity(),
+                workspace(),
                 &host_config,
             );
             let error = match result {

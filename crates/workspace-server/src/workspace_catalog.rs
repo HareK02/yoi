@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use chrono::{SecondsFormat, Utc};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+pub use workspace_api::{InitialRepositoryIntent, WorkspaceCreateRequest};
 use workspace_api::{RepositoryObservedStatus, RepositorySource};
 
 use crate::repository_source::{parse_repository_source, repository_source_fingerprint};
@@ -18,23 +18,6 @@ use crate::{Error, Result};
 
 const MAX_DISPLAY_NAME_BYTES: usize = 200;
 const MAX_OPERATION_KEY_BYTES: usize = 200;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct InitialRepositoryIntent {
-    pub repository_key: String,
-    pub uri: String,
-    #[serde(default)]
-    pub default_ref: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct WorkspaceCreateRequest {
-    pub operation_key: String,
-    pub display_name: String,
-    pub repository: InitialRepositoryIntent,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceCreateResult {
