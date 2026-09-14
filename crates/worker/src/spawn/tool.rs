@@ -926,7 +926,6 @@ fn manifest_to_reusable_config(manifest: &WorkerManifest) -> WorkerManifestConfi
                 rules: p.rules.clone(),
             }),
         feature: manifest.feature.clone().into(),
-        plugins: manifest.plugins.clone(),
         mcp: manifest.mcp.clone(),
         compaction: manifest
             .compaction

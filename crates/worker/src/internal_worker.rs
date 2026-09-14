@@ -127,7 +127,6 @@ where
     // parent manifest cannot accidentally grant its normal public tool surface
     // or recursively schedule Feature-owned background work.
     manifest.feature = Default::default();
-    manifest.plugins = Default::default();
     manifest.mcp = Default::default();
     manifest.skills = None;
     manifest.compaction = None;
@@ -681,7 +680,6 @@ pub(crate) fn prepare_internal_worker_from_spec(
         } = spec;
         manifest.worker.name = format!("internal-{}-{}", identity.kind, identity.run_id);
         manifest.feature = Default::default();
-        manifest.plugins = Default::default();
         manifest.mcp = Default::default();
         manifest.skills = None;
         manifest.compaction = None;
