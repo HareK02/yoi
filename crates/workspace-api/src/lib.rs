@@ -520,6 +520,25 @@ pub struct WorkspaceRepositoryRecord {
     pub updated_at: String,
 }
 
+/// Initial Repository registration intent for Workspace creation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InitialRepositoryIntent {
+    pub repository_key: String,
+    pub uri: String,
+    #[serde(default)]
+    pub default_ref: Option<String>,
+}
+
+/// Request for atomically creating a Workspace and its initial Repository.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceCreateRequest {
+    pub operation_key: String,
+    pub display_name: String,
+    pub repository: InitialRepositoryIntent,
+}
+
 /// Response returned after atomically creating a Workspace and its first Repository.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -3894,6 +3913,35 @@ mod tests {
                 "created_at": "1",
                 "updated_at": "1",
                 "completed_at": null
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_create_request_has_one_closed_shared_wire_shape() {
+        let request = WorkspaceCreateRequest {
+            operation_key: "workspace-create-1".to_string(),
+            display_name: "Workspace".to_string(),
+            repository: InitialRepositoryIntent {
+                repository_key: "main".to_string(),
+                uri: "/srv/repositories/main".to_string(),
+                default_ref: Some("develop".to_string()),
+            },
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["operation_key"], "workspace-create-1");
+        assert_eq!(json["repository"]["uri"], "/srv/repositories/main");
+        assert!(json.get("operation_id").is_none());
+        assert!(json["repository"].get("source").is_none());
+        assert!(
+            serde_json::from_value::<WorkspaceCreateRequest>(serde_json::json!({
+                "operation_id": "workspace-create-1",
+                "display_name": "Workspace",
+                "repository": {
+                    "repository_key": "main",
+                    "source": "/srv/repositories/main"
+                }
             }))
             .is_err()
         );

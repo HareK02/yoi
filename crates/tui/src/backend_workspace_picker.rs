@@ -200,10 +200,10 @@ fn prompt_create_request_inner() -> PickerResult<Option<CreateBackendWorkspaceRe
             .as_nanos()
     );
     Ok(Some(CreateBackendWorkspaceRequest {
-        operation_id: operation_key,
+        operation_key,
         display_name,
         repository: CreateBackendWorkspaceRepository {
-            source: uri,
+            uri,
             repository_key: if repository_key.is_empty() {
                 "main".to_string()
             } else {

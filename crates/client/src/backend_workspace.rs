@@ -1,32 +1,18 @@
 use crate::{BackendApiClient, BackendApiClientError};
 use reqwest::Method;
-use serde::{Deserialize, Serialize};
 use std::fmt;
 use workspace_api::{
-    RepositoryListResponse, RepositorySummary, WorkspaceCatalogListResponse,
-    WorkspaceCreateResponse, WorkspaceSummary,
+    InitialRepositoryIntent, RepositoryListResponse, RepositorySummary,
+    WorkspaceCatalogListResponse, WorkspaceCreateRequest, WorkspaceCreateResponse,
+    WorkspaceSummary,
 };
 
 const DEFAULT_WORKSPACE_LIMIT: usize = 200;
 
 pub type BackendWorkspace = WorkspaceSummary;
 pub type CreateBackendWorkspaceResponse = WorkspaceCreateResponse;
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct CreateBackendWorkspaceRequest {
-    pub operation_id: String,
-    pub display_name: String,
-    pub repository: CreateBackendWorkspaceRepository,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct CreateBackendWorkspaceRepository {
-    pub repository_key: String,
-    pub source: String,
-    pub default_ref: Option<String>,
-}
+pub type CreateBackendWorkspaceRequest = WorkspaceCreateRequest;
+pub type CreateBackendWorkspaceRepository = InitialRepositoryIntent;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendWorkspaceCatalogTarget {
@@ -185,19 +171,19 @@ mod tests {
     }
 
     #[test]
-    fn create_request_keeps_operation_id_for_exact_retry() {
+    fn create_request_keeps_operation_key_for_exact_retry() {
         let request = CreateBackendWorkspaceRequest {
-            operation_id: "workspace-create-1".to_string(),
+            operation_key: "workspace-create-1".to_string(),
             display_name: "Alpha".to_string(),
             repository: CreateBackendWorkspaceRepository {
                 repository_key: "main".to_string(),
-                source: "/srv/repos/alpha".to_string(),
+                uri: "/srv/repos/alpha".to_string(),
                 default_ref: Some("develop".to_string()),
             },
         };
 
         let retry = request.clone();
-        assert_eq!(retry.operation_id, "workspace-create-1");
+        assert_eq!(retry.operation_key, "workspace-create-1");
         assert_eq!(retry, request);
     }
 }

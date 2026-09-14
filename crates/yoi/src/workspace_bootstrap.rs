@@ -32,11 +32,11 @@ pub(crate) async fn run_init(
     let response = create_backend_workspace(
         &target,
         &CreateBackendWorkspaceRequest {
-            operation_id: uuid::Uuid::now_v7().to_string(),
+            operation_key: uuid::Uuid::now_v7().to_string(),
             display_name: options.display_name,
             repository: CreateBackendWorkspaceRepository {
                 repository_key: options.repository_key,
-                source: repository_uri.to_string(),
+                uri: repository_uri.to_string(),
                 default_ref: options.default_ref,
             },
         },
