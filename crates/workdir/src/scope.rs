@@ -707,7 +707,7 @@ impl ScopedWorkdirSession {
                     ActiveWriteLease {
                         validity: Arc::downgrade(&validity),
                         cleanup_pending: Arc::downgrade(&cleanup_pending),
-                        rules: request.rules.clone(),
+                        rules: write_rules,
                     },
                 );
         }
@@ -792,6 +792,7 @@ impl WorkdirSession for ScopedWorkdirSession {
     }
 
     async fn write(&self, mut request: WriteRequest) -> Result<WriteResult, WorkdirError> {
+        let _scope_guard = self.scope_lock.lock().await;
         let path = self
             .resolve_operation_path(&request.path, WorkdirToolScopePermission::Write)
             .await?;
@@ -801,6 +802,7 @@ impl WorkdirSession for ScopedWorkdirSession {
     }
 
     async fn edit(&self, mut request: EditRequest) -> Result<EditResult, WorkdirError> {
+        let _scope_guard = self.scope_lock.lock().await;
         let path = self
             .resolve_operation_path(&request.path, WorkdirToolScopePermission::Write)
             .await?;
@@ -1294,6 +1296,134 @@ mod tests {
         )))
     }
 
+    #[derive(Debug)]
+    struct BlockingWriteSession {
+        inner: Arc<LocalWorkdirSession>,
+        entered: tokio::sync::watch::Sender<bool>,
+        release: Arc<tokio::sync::Notify>,
+        block_next_write: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl WorkdirSession for BlockingWriteSession {
+        fn workdir(&self) -> &Workdir {
+            self.inner.workdir()
+        }
+
+        fn capabilities(&self) -> WorkdirSessionCapabilities {
+            self.inner.capabilities()
+        }
+
+        async fn authorize_scope_path(
+            &self,
+            request: WorkdirScopeAuthorizationRequest,
+        ) -> Result<(), WorkdirError> {
+            self.inner.authorize_scope_path(request).await
+        }
+
+        async fn scope_rules_overlap(
+            &self,
+            request: WorkdirScopeOverlapRequest,
+        ) -> Result<bool, WorkdirError> {
+            self.inner.scope_rules_overlap(request).await
+        }
+
+        async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
+            self.inner.stat(request).await
+        }
+
+        async fn read(&self, request: ReadRequest) -> Result<ReadResult, WorkdirError> {
+            self.inner.read(request).await
+        }
+
+        async fn write(&self, request: WriteRequest) -> Result<WriteResult, WorkdirError> {
+            if self.block_next_write.swap(false, Ordering::AcqRel) {
+                let _ = self.entered.send(true);
+                self.release.notified().await;
+            }
+            WorkdirSession::write(self.inner.as_ref(), request).await
+        }
+
+        async fn edit(&self, request: EditRequest) -> Result<EditResult, WorkdirError> {
+            self.inner.edit(request).await
+        }
+
+        async fn list(&self, request: ListRequest) -> Result<ListResult, WorkdirError> {
+            self.inner.list(request).await
+        }
+
+        async fn glob(&self, request: GlobRequest) -> Result<GlobResult, WorkdirError> {
+            self.inner.glob(request).await
+        }
+
+        async fn grep(&self, request: GrepRequest) -> Result<GrepResult, WorkdirError> {
+            self.inner.grep(request).await
+        }
+
+        async fn start_command(
+            &self,
+            request: CommandRequest,
+        ) -> Result<CommandHandle, WorkdirError> {
+            self.inner.start_command(request).await
+        }
+
+        async fn command_status(
+            &self,
+            handle: CommandHandle,
+        ) -> Result<CommandStatus, WorkdirError> {
+            self.inner.command_status(handle).await
+        }
+
+        async fn command_output(
+            &self,
+            request: CommandOutputRequest,
+        ) -> Result<CommandOutput, WorkdirError> {
+            self.inner.command_output(request).await
+        }
+
+        async fn cancel_command(&self, handle: CommandHandle) -> Result<(), WorkdirError> {
+            self.inner.cancel_command(handle).await
+        }
+
+        fn subscribe_command_events(&self) -> Option<broadcast::Receiver<CommandEvent>> {
+            self.inner.subscribe_command_events()
+        }
+
+        fn command_snapshot(&self) -> Vec<CommandSnapshot> {
+            self.inner.command_snapshot()
+        }
+
+        async fn close(&self) -> Result<(), WorkdirError> {
+            self.inner.close().await
+        }
+    }
+
+    fn blocking_session(
+        root: &Path,
+    ) -> (
+        WorkdirToolBroker,
+        tokio::sync::watch::Receiver<bool>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let scope = SharedScope::new(Scope::writable(root).unwrap());
+        let inner = Arc::new(LocalWorkdirSession::materialized_bound(
+            Workdir::new("blocking-delegation-test"),
+            root.to_path_buf(),
+            root.to_path_buf(),
+            scope,
+            WorkdirSessionCapabilities::ALL,
+        ));
+        let (entered, receiver) = tokio::sync::watch::channel(false);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let source = Arc::new(BlockingWriteSession {
+            inner,
+            entered,
+            release: release.clone(),
+            block_next_write: std::sync::atomic::AtomicBool::new(true),
+        });
+        (WorkdirToolBroker::new(source), receiver, release)
+    }
+
     fn request(path: &str, permission: WorkdirToolScopePermission) -> WorkdirToolScope {
         WorkdirToolScope {
             rules: vec![WorkdirToolScopeRule {
@@ -1614,6 +1744,83 @@ mod tests {
             Err(WorkdirError::Denied(message))
                 if message.contains("provider-resolved delegated scope")
         ));
+    }
+
+    #[tokio::test]
+    async fn write_and_overlapping_scope_admission_are_serialized() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("shared")).unwrap();
+        let (parent, mut entered, release) = blocking_session(root.path());
+        let writer = {
+            let parent = parent.clone();
+            tokio::spawn(async move { parent.write(write("shared/file", "written")).await })
+        };
+        entered.changed().await.unwrap();
+        assert!(*entered.borrow());
+
+        let mut admission = {
+            let parent = parent.clone();
+            tokio::spawn(async move {
+                parent
+                    .scope(request("shared", WorkdirToolScopePermission::Write))
+                    .await
+            })
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut admission)
+                .await
+                .is_err(),
+            "scope admission must wait for the in-flight parent write"
+        );
+
+        release.notify_waiters();
+        writer.await.unwrap().unwrap();
+        let lease = tokio::time::timeout(std::time::Duration::from_secs(1), admission)
+            .await
+            .expect("scope admission should resume after write completion")
+            .unwrap()
+            .unwrap();
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn read_rules_do_not_expand_child_write_lease_conflicts() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("leased")).unwrap();
+        fs::create_dir_all(root.path().join("other")).unwrap();
+        let parent = session(root.path());
+        let child = parent
+            .scope(WorkdirToolScope {
+                rules: vec![
+                    WorkdirToolScopeRule {
+                        target: fs_path("leased"),
+                        permission: WorkdirToolScopePermission::Write,
+                        recursive: true,
+                        symlink_policy: SymlinkPolicy::Resolved,
+                    },
+                    WorkdirToolScopeRule {
+                        target: FsPath::root(),
+                        permission: WorkdirToolScopePermission::Read,
+                        recursive: true,
+                        symlink_policy: SymlinkPolicy::Resolved,
+                    },
+                ],
+                cwd: fs_path("leased"),
+                command: false,
+            })
+            .await
+            .unwrap();
+
+        parent
+            .write(write("other/parent", "allowed"))
+            .await
+            .unwrap();
+        let sibling = parent
+            .scope(request("other", WorkdirToolScopePermission::Write))
+            .await
+            .unwrap();
+        sibling.write(write("sibling", "allowed")).await.unwrap();
+        drop(child);
     }
 
     #[cfg(unix)]
