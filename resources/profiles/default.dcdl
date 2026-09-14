@@ -29,6 +29,5 @@ import "./base.dcdl" // {
             complete = false;
         };
         orchestration = { enabled = false; };
-        plugins = { enabled = false; };
     };
 }

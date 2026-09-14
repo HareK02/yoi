@@ -69,10 +69,6 @@ pub struct WorkerManifest {
     /// resolve disabled so Profile authors choose the exposed built-in surfaces.
     #[serde(default)]
     pub feature: FeatureConfig,
-    /// Explicit plugin package enablement. Discovery remains read-only; only
-    /// source-qualified entries listed here may resolve to active plugin metadata.
-    #[serde(default)]
-    pub plugins: plugin::PluginConfig,
     /// Explicit external Model Context Protocol provider configuration. This
     /// is config data only: declaring a server never starts a subprocess or
     /// grants OS sandboxing. Runtime MCP lifecycle/registration is a separate
@@ -106,6 +102,7 @@ pub struct WorkerManifest {
 /// sessions, secrets, or resolved host state. Tool registration still applies
 /// the normal scope, host-authority, backend, memory, and network checks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct FeatureConfig {
     #[serde(default)]
     pub task: FeatureFlagConfig,
@@ -135,8 +132,6 @@ pub struct FeatureConfig {
     pub merge_request: MergeRequestFeatureConfig,
     #[serde(default)]
     pub orchestration: FeatureFlagConfig,
-    #[serde(default)]
-    pub plugins: FeatureFlagConfig,
 }
 
 impl Default for FeatureConfig {
@@ -155,7 +150,6 @@ impl Default for FeatureConfig {
             ticket: TicketFeatureConfig::default(),
             merge_request: MergeRequestFeatureConfig::default(),
             orchestration: FeatureFlagConfig::disabled(),
-            plugins: FeatureFlagConfig::disabled(),
         }
     }
 }
@@ -941,9 +935,7 @@ impl Default for CompactionConfig {
 
 impl WorkerManifest {
     pub fn requires_persisted_execution_snapshot(&self) -> bool {
-        self.profile.is_some()
-            || self.plugins.has_resolved_plan()
-            || self.feature.memory.workspace_settings.is_some()
+        self.profile.is_some() || self.feature.memory.workspace_settings.is_some()
     }
 
     /// Parse a manifest from a TOML string.
@@ -1322,33 +1314,61 @@ model_id = "claude-sonnet-4-20250514"
     }
 
     #[test]
-    fn parse_plugin_enablement_config() {
+    fn dynamic_plugin_manifest_config_is_rejected() {
         let toml = format!(
             "{MINIMAL_REQUIRED}\n\
              [[plugins.enabled]]\n\
-             id = \"project:example\"\n\
-             version = \"0.1.0\"\n\
-             digest = \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\
-             surfaces = [\"hook\"]\n\n\
-             [plugins.enabled.config]\n\
-             greeting = \"hello\"\n"
+             id = \"project:example\"\n"
         );
-        let manifest = WorkerManifest::from_toml(&toml).unwrap();
-        assert_eq!(manifest.plugins.enabled.len(), 1);
-        let enabled = &manifest.plugins.enabled[0];
-        assert_eq!(enabled.id, "project:example");
-        assert_eq!(
-            enabled.version.as_ref().map(|version| version.0.as_str()),
-            Some("0.1.0")
+        let error = WorkerManifest::from_toml(&toml).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("dynamic Plugins are not supported"),
+            "unexpected error: {error}"
         );
-        assert_eq!(enabled.surfaces, vec![plugin::PluginSurface::Hook]);
-        assert_eq!(
-            enabled
-                .config
-                .as_ref()
-                .and_then(|value| value.get("greeting"))
-                .and_then(|value| value.as_str()),
-            Some("hello")
+    }
+
+    #[test]
+    fn persisted_manifest_with_dynamic_plugin_plan_is_rejected() {
+        let base =
+            serde_json::to_value(WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap()).unwrap();
+
+        let mut top_level = base.clone();
+        top_level.as_object_mut().unwrap().insert(
+            "plugins".to_string(),
+            serde_json::json!({
+                "resolved": [{
+                    "package_path": "/tmp/ambient.yoi-plugin"
+                }]
+            }),
+        );
+        let error = serde_json::from_value::<WorkerManifest>(top_level).unwrap_err();
+        assert!(error.to_string().contains("unknown field `plugins`"));
+
+        let mut nested = base;
+        nested
+            .get_mut("feature")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "plugins".to_string(),
+                serde_json::json!({ "enabled": true }),
+            );
+        let error = serde_json::from_value::<WorkerManifest>(nested).unwrap_err();
+        assert!(error.to_string().contains("unknown field `plugins`"));
+    }
+
+    #[test]
+    fn dynamic_plugin_feature_flag_is_rejected() {
+        let toml = format!("{MINIMAL_REQUIRED}\n[feature.plugins]\nenabled = true\n");
+        let error = WorkerManifest::from_toml(&toml).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("dynamic Plugins are not supported"),
+            "unexpected error: {error}"
         );
     }
 

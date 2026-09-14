@@ -1,177 +1,29 @@
-# Plugin Component Model migration
+# Plugin Component Model boundary
 
-Yoi's original Plugin Tool runtime used a narrow core-WebAssembly ABI. That was the right MVP shape because it made sandboxing, bounded input/output, and fail-closed host imports explicit, but it is no longer the public authoring interface.
+Dynamic Worker Plugin execution is not part of the current product. The `.yoi-plugin` component metadata retained in `manifest` is an offline package-format contract only.
 
-The supported runtime kind is now `wasm-component`, using the WebAssembly Component Model for Plugin Tool authoring and host APIs. Component Model adoption means Plugin interfaces are described as typed WIT worlds and lowered through the canonical ABI, instead of every Plugin author or SDK wrapper hand-writing pointer/length memory plumbing.
+## Current behavior
 
-## What Component Model changes
+- Worker creation and restore install no dynamic Plugin modules.
+- Manifest/Profile input rejects `plugins` and `feature.plugins`.
+- Runtime and Server startup perform no repository, ancestor, cwd, or user-data Plugin discovery.
+- No persisted local `package_path` is execution authority.
+- Only statically compiled trusted built-in Features contribute Worker capabilities.
+- `yoi plugin check` parses an explicitly named directory or package without instantiating a component.
 
-A core Wasm module exposes low-level functions and memory. Yoi's current Plugin Tool ABI is shaped like this:
+The package validator may reject legacy core-Wasm artifacts and require Component Model metadata, but passing validation does not make an artifact installable or executable.
 
-```text
-export memory
-export yoi_tool_call() -> i32
-import yoi:tool/tool_name_len() -> i32
-import yoi:tool/tool_name_read(ptr, len) -> i32
-import yoi:tool/input_len() -> i32
-import yoi:tool/input_read(ptr, len) -> i32
-import yoi:tool/output_write(ptr, len) -> i32
-```
+## Future platform constraints
 
-This is small and auditable, but it makes raw ABI details part of the authoring model. A Component Model world can instead describe a typed contract:
+A future Server Plugin platform may execute Wasmtime Component Model packages only after the architecture is implemented as a coherent authority boundary:
 
-```wit
-package yoi:plugin;
+1. an operator installs an immutable package into Server-owned artifact authority;
+2. a Workspace owner selects an installed package through an immutable Addon revision;
+3. Backend authors a per-Worker execution plan containing exact identities, digests, configuration, and bounded grants;
+4. Runtime fetches only Server-authorized digests and verifies package bytes and execution-plan identity;
+5. Runtime instantiates a fresh bounded Wasmtime Store with no ambient WASI authority; and
+6. restore uses the persisted execution plan and exact artifact rather than current Workspace settings or a filesystem path.
 
-interface tool {
-  record request {
-    tool-name: string,
-    input-json: string,
-  }
+Default components receive no filesystem, sockets, environment, clocks, randomness, subprocess, Workdir, broad Workspace client, credential, or network authority. Any host import must be narrow, typed, explicitly granted, live-revalidated where necessary, bounded, and audited.
 
-  record response {
-    output-json: string,
-  }
-
-  variant tool-error {
-    invalid-input(string),
-    denied(string),
-    failed(string),
-  }
-
-  run: func(req: request) -> result<response, tool-error>;
-}
-
-world tool-plugin {
-  export tool;
-}
-```
-
-The exact WIT is still design work, but the important boundary is fixed: the Plugin author sees typed values and generated bindings; the host sees typed imports/exports; Yoi still enforces package enablement and Plugin grants outside the component.
-
-## External patterns considered
-
-Common Wasm extension systems normally ship more than a runtime:
-
-- Extism-style systems provide host runtimes plus language PDKs. Plugin authors write normal typed functions while the PDK hides the raw ABI and host functions remain explicit.
-- Spin-style systems combine a manifest, language SDK/templates, default-deny outbound/file capabilities, and Wasm components.
-- wasmCloud-style systems separate components from capability providers and connect them through typed interfaces.
-- The Component Model standardizes the interface layer with WIT and canonical ABI so host APIs can be versioned and bindings generated across languages.
-
-The shared lesson is that a usable Wasm Plugin system needs a manifest, explicit capabilities, generated or hand-written SDK bindings, examples/templates, inspection tooling, and a versioned ABI. Yoi already has the manifest/discovery/enablement/grant/runtime foundation; the missing long-term piece is the typed component authoring interface.
-
-## Yoi policy
-
-Adopting the Component Model must not change Yoi's authority model:
-
-- Package discovery is inventory only and does not register or execute a Plugin.
-- Explicit enablement is required before any Tool surface is registered.
-- Plugin grants are required before runtime execution and before `https` / `fs` / future host API calls.
-- Component imports are not authority by themselves; host-side grant checks remain authoritative.
-- Tool calls and Tool results continue through the ordinary ToolRegistry and Engine history path.
-- No hidden context injection is introduced by component imports, resources, prompts, or SDK helpers.
-- Plugin SDKs and templates are authoring aids, not trust boundaries.
-
-## Migration shape
-
-`runtime.kind = "wasm-component"` is the sole public Plugin runtime kind. Legacy raw core-Wasm declarations (`kind = "wasm"` / `abi = "yoi-plugin-wasm-1"`) are rejected by manifest validation and are surfaced only as bounded diagnostics; they are not active/eligible Plugins and are not executed.
-
-The migration is now focused on the component surface:
-
-1. Keep WIT packages/worlds for Tool Plugin and initial host APIs versioned under `resources/plugin/wit`.
-2. Keep manifest/schema support centered on `runtime.kind = "wasm-component"`.
-3. Keep the component runtime backend and typed host import/export binding as the active execution path.
-4. Port future host API designs to WIT-compatible interfaces.
-5. Keep the Rust PDK/template aligned with the component world.
-
-## Runtime/backend caution
-
-The legacy core-Wasm implementation used `wasmi` as a transitional backend. The active Plugin Tool runtime is now selected by package runtime metadata and executed through `wasmtime::component`; discovery and static inspection must continue to avoid executing package code.
-
-Keep the component backend selected by package runtime metadata and Profile/feature policy. Do not make all Plugin packages depend on component execution during discovery or inspection.
-
-## Relationship to pending host APIs
-
-`https` and `fs` host API Tickets should avoid baking in raw pointer/length interfaces as the long-term authoring contract. If they land before the component runtime, implement them in a way that can be represented as WIT records/results later, and document raw ABI wrappers as transitional.
-
-For example, `https` should be modeled as typed request/response data with explicit grant checks for host/method/path/body bounds. `fs` should be modeled as scoped read/list/write operations with path normalization and root-escape rejection. Those concepts translate well to WIT.
-
-## Non-goals
-
-- Component Model adoption does not imply WASI filesystem/network access.
-- It does not replace Plugin grants with WIT imports.
-- It does not introduce Service, Ingress, WebSocket, or inbound HTTP by itself.
-- It does not merge Plugin and MCP. MCP remains a separate untrusted tool/resource/prompt bridge with its own policy.
-
-## Implemented runtime boundary
-
-Plugin Tool packages now select the runtime explicitly in `plugin.toml`:
-
-```toml
-[runtime]
-kind = "wasm-component"
-component = "plugin.component.wasm"
-world = "yoi:plugin/tool@1.0.0"
-```
-
-Legacy core-Wasm metadata is accepted only far enough to produce migration diagnostics: package checks and discovery reject `kind = "wasm"` / `abi = "yoi-plugin-wasm-1"`, `list`/`show` report those packages as rejected rather than active/eligible, and the active runtime path does not execute them.
-
-The component runtime uses `wasmtime::component` and expects the exported world
-`yoi:plugin/tool@1.0.0` with a `call(tool-name: string, input-json: string) ->
-string` export. The returned string is the normal ToolOutput JSON, so
-registration and execution still flow through the existing ToolRegistry and
-Engine Tool-result history path.
-
-Host imports are stable names under `yoi:host/*@1.0.0`; the repository WIT files
-live in `resources/plugin/wit/`. Importing `yoi:host/request@1.0.0` or
-`yoi:host/fs@1.0.0` is not authority. The runtime checks package grants before
-component instantiation and checks again on every host call. No WASI filesystem,
-network, environment, or other ambient imports are linked.
-
-Static discovery and `yoi plugin list/show` only parse package manifests and
-reported runtime metadata. They do not instantiate or execute the component.
-Wrong `world`, missing artifact metadata, missing `call` export, unsupported
-imports, or core-Wasm bytes in a component package all fail closed with bounded
-Plugin diagnostics or ordinary Tool errors.
-
-See `docs/examples/plugin-component-tool/lib.rs` and the embedded
-`resources/plugin/templates/rust-component-tool/` starter for the preferred
-Rust PDK authoring path. `yoi-plugin-pdk` is guest-side only: it re-exports
-`wit-bindgen`, provides typed JSON input/output helpers, renders bounded
-`ToolError` values as ordinary ToolOutput JSON, and does not depend on host
-runtime crates or grant authority. Package authors should generate bindings from
-`resources/plugin/wit`, build a component artifact, and set the component
-runtime metadata above.
-
-### v1 request/response shape
-
-The v1 component world intentionally keeps Tool input, Tool output, and host API
-payloads as JSON strings. This is a migration bridge that preserves the existing
-ToolOutput schema, Tool history behavior, grant checks, and raw-Wasm host API
-semantics while moving package authors onto WIT/canonical ABI bindings.
-Structured WIT records for Tool requests/responses/errors and host request/FS
-payloads are deferred to a follow-up API-design step rather than accidentally
-omitted.
-
-## Instance lifecycle surface
-
-The first instance-capable world is `yoi:plugin/instance@1.0.0`. It moves
-runtime ownership from per-Tool artifact execution to a host-managed
-`PluginInstance`. The same instance handles Tool, Service, and Ingress surfaces,
-so Plugin state/config/diagnostics can be shared without bypassing Yoi's normal
-authority model.
-
-Important boundaries:
-
-- Tool calls still enter through `ToolRegistry` and return ordinary `ToolOutput`
-  that is visible in the Engine history path.
-- Service and Ingress grants are separate from Tool grants. Sharing an instance
-  does not authorize a surface that lacks its own `surface.*` and per-surface
-  permission/grant.
-- Ingress delivery accepts bounded typed untrusted events and returns explicit
-  JSON to the host. It does not call model Tools or mutate LLM context/history.
-- Legacy raw-wasm and `yoi:plugin/tool@1.0.0` component packages are adapted
-  behind `PluginInstanceRegistry` for compatibility rather than executed through
-  a separate authority path.
-- Host APIs such as `https` and `fs` remain independently grant-gated and still
-  reject ambient filesystem/network authority.
+This future platform must not restore `.yoi/plugins`, user-data catalogs, cwd/ancestor discovery, native dynamic libraries, downloaded Cargo manifests, or local paths as compatibility authority.

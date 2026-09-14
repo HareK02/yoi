@@ -1345,7 +1345,7 @@ async fn run_login(backend_url: &str, no_wait: bool) -> Result<(), ParseError> {
 fn parse_plugin_args(args: &[String]) -> Result<plugin_cli::PluginCliCommand, ParseError> {
     let Some((subcommand, rest)) = args.split_first() else {
         return Err(ParseError(
-            "yoi plugin requires `new`, `check`, `pack`, `list`, or `show <ref>`".to_string(),
+            "yoi plugin requires `new`, `check`, or `pack`".to_string(),
         ));
     };
     match subcommand.as_str() {
@@ -1397,30 +1397,6 @@ fn parse_plugin_args(args: &[String]) -> Result<plugin_cli::PluginCliCommand, Pa
                 )),
             }
         }
-        "list" => {
-            let (plugin_args, positional) = parse_plugin_common_args(rest)?;
-            if !positional.is_empty() {
-                return Err(ParseError(
-                    "yoi plugin list does not accept positional arguments".to_string(),
-                ));
-            }
-            Ok(plugin_cli::PluginCliCommand::List(plugin_args))
-        }
-        "show" => {
-            let (plugin_args, positional) = parse_plugin_common_args(rest)?;
-            match positional.as_slice() {
-                [reference] => Ok(plugin_cli::PluginCliCommand::Show {
-                    reference: reference.clone(),
-                    args: plugin_args,
-                }),
-                [] => Err(ParseError(
-                    "yoi plugin show requires a plugin ref".to_string(),
-                )),
-                _ => Err(ParseError(
-                    "yoi plugin show accepts exactly one plugin ref".to_string(),
-                )),
-            }
-        }
         "--help" | "-h" => Err(ParseError(plugin_usage().to_string())),
         other => Err(ParseError(format!(
             "unknown yoi plugin subcommand `{other}`"
@@ -1438,35 +1414,7 @@ fn parse_plugin_common_args(
         let arg = &args[index];
         match arg.as_str() {
             "--json" => parsed.json = true,
-            "--workspace" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(ParseError("--workspace requires a value".to_string()));
-                };
-                parsed.workspace = Some(PathBuf::from(value));
-            }
-            "--profile" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(ParseError("--profile requires a value".to_string()));
-                };
-                parsed.profile = Some(value.clone());
-            }
             "--help" | "-h" => return Err(ParseError(plugin_usage().to_string())),
-            _ if arg.starts_with("--workspace=") => {
-                let value = arg.trim_start_matches("--workspace=");
-                if value.is_empty() {
-                    return Err(ParseError("--workspace requires a value".to_string()));
-                }
-                parsed.workspace = Some(PathBuf::from(value));
-            }
-            _ if arg.starts_with("--profile=") => {
-                let value = arg.trim_start_matches("--profile=");
-                if value.is_empty() {
-                    return Err(ParseError("--profile requires a value".to_string()));
-                }
-                parsed.profile = Some(value.to_string());
-            }
             _ if arg.starts_with('-') => {
                 return Err(ParseError(format!("unknown yoi plugin option `{arg}`")));
             }
@@ -1506,7 +1454,7 @@ fn parse_plugin_pack_args(
 }
 
 fn plugin_usage() -> &'static str {
-    "usage: yoi plugin new <rust-component-tool|rust-component-service> <path-or-name> [--json]\n       yoi plugin check <path-or-package> [--json]\n       yoi plugin pack <path> [--output <file>] [--json]\n       yoi plugin list [--workspace PATH] [--profile REF] [--json]\n       yoi plugin show <ref> [--workspace PATH] [--profile REF] [--json]"
+    "usage: yoi plugin new <rust-component-tool|rust-component-service> <path-or-name> [--json]\n       yoi plugin check <path-or-package> [--json]\n       yoi plugin pack <path> [--output <file>] [--json]"
 }
 
 fn parse_mcp_args(args: &[String]) -> Result<mcp_cli::McpCliCommand, ParseError> {
@@ -2654,29 +2602,26 @@ backend = "shared"
     }
 
     #[test]
-    fn parse_plugin_list_and_show() {
-        match parse_args_from(["plugin", "list", "--workspace=/tmp/ws", "--json"]).unwrap() {
-            Mode::Plugin(plugin_cli::PluginCliCommand::List(options)) => {
-                assert_eq!(options.workspace, Some(PathBuf::from("/tmp/ws")));
-                assert!(options.json);
-            }
-            _ => panic!("expected Plugin list mode"),
+    fn plugin_cli_rejects_ambient_catalog_commands_and_options() {
+        for args in [
+            vec!["plugin", "list"],
+            vec!["plugin", "show", "project:echo"],
+            vec!["plugin", "check", "plugin", "--workspace=/tmp/ws"],
+            vec!["plugin", "check", "plugin", "--profile", "project:inspect"],
+        ] {
+            let error = parse_args_from(args).unwrap_err();
+            assert!(
+                error.0.contains("unknown yoi plugin"),
+                "unexpected error: {error}"
+            );
         }
 
-        match parse_args_from([
-            "plugin",
-            "show",
-            "project:echo",
-            "--profile",
-            "project:inspect",
-        ])
-        .unwrap()
-        {
-            Mode::Plugin(plugin_cli::PluginCliCommand::Show { reference, args }) => {
-                assert_eq!(reference, "project:echo");
-                assert_eq!(args.profile.as_deref(), Some("project:inspect"));
+        match parse_args_from(["plugin", "check", "plugin.yoi-plugin", "--json"]).unwrap() {
+            Mode::Plugin(plugin_cli::PluginCliCommand::Check { input, args }) => {
+                assert_eq!(input, PathBuf::from("plugin.yoi-plugin"));
+                assert!(args.json);
             }
-            _ => panic!("expected Plugin show mode"),
+            _ => panic!("expected Plugin check mode"),
         }
     }
 

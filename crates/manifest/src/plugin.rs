@@ -91,118 +91,6 @@ pub const RUST_COMPONENT_INSTANCE_TEMPLATE: &[PluginTemplateResource] = &[
     },
 ];
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PluginConfig {
-    pub enabled: Vec<PluginEnablementConfig>,
-    /// Runtime restore metadata. Fresh resolution fills this from discovered packages;
-    /// restore uses it without selecting newer mutable-store contents.
-    pub resolved: Vec<ResolvedPluginRecord>,
-    /// Safe bounded discovery/resolution diagnostics recorded with the resolved plan.
-    pub diagnostics: Vec<PluginDiagnostic>,
-}
-
-impl PluginConfig {
-    pub fn is_empty(&self) -> bool {
-        self.enabled.is_empty() && self.resolved.is_empty()
-    }
-
-    pub fn has_resolved_plan(&self) -> bool {
-        !self.resolved.is_empty() || !self.diagnostics.is_empty()
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PluginEnablementConfig {
-    /// Source-qualified plugin id such as `user:example`, `project:example`, or `builtin:example`.
-    pub id: String,
-    /// Optional exact package version requirement. Rich version constraints are deferred.
-    pub version: Option<PluginExactVersion>,
-    /// Optional deterministic digest pin in `sha256:<hex>` form.
-    pub digest: Option<String>,
-    /// Optional explicit surface subset. When omitted, all declared package surfaces are selected.
-    pub surfaces: Vec<PluginSurface>,
-    /// Requested plugin grants. Non-empty authority-bearing grants currently fail closed.
-    pub grants: PluginGrantConfig,
-    /// Opaque plugin-local configuration copied into resolved metadata without interpretation.
-    pub config: Option<toml::Value>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PluginExactVersion(pub String);
-
-impl PluginExactVersion {
-    pub fn matches(&self, version: &str) -> bool {
-        self.0 == version
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PluginGrantConfig {
-    /// Source-qualified package id this grant is pinned to, for example `project:example`.
-    pub id: Option<String>,
-    /// Exact package version this grant is pinned to.
-    pub version: Option<PluginExactVersion>,
-    /// Deterministic package digest this grant is pinned to.
-    pub digest: Option<String>,
-    /// Explicit capabilities granted for the pinned package identity/version/digest.
-    pub permissions: Vec<PluginPermission>,
-    /// Bounded outbound request allowlist entries for `host_api.request`.
-    pub request: Vec<PluginRequestGrant>,
-    /// Bounded outbound WebSocket target allowlist entries for `host_api.websocket`.
-    pub websocket: Vec<PluginWebSocketGrant>,
-    /// Scoped filesystem allowlist entries for `host_api.fs`.
-    pub fs: Vec<PluginFsGrant>,
-}
-
-impl PluginGrantConfig {
-    pub fn is_empty(&self) -> bool {
-        self.permissions.is_empty()
-            && self.request.is_empty()
-            && self.websocket.is_empty()
-            && self.fs.is_empty()
-    }
-
-    pub fn binding_error(
-        &self,
-        identity: &SourceQualifiedPluginId,
-        digest: &str,
-        version: &str,
-    ) -> Option<&'static str> {
-        if self.is_empty() {
-            return None;
-        }
-        let Some(grant_id) = &self.id else {
-            return Some("plugin grant is missing a source-qualified package id binding");
-        };
-        match SourceQualifiedPluginId::parse(grant_id) {
-            Ok(grant_identity) if &grant_identity == identity => {}
-            Ok(_) => return Some("plugin grant package id binding does not match enabled package"),
-            Err(_) => {
-                return Some(
-                    "plugin grant package id binding is not a valid source-qualified plugin id",
-                );
-            }
-        }
-        let Some(grant_digest) = &self.digest else {
-            return Some("plugin grant is missing a deterministic digest binding");
-        };
-        if !digest_matches(grant_digest, digest) {
-            return Some("plugin grant digest binding does not match enabled package digest");
-        }
-        let Some(grant_version) = &self.version else {
-            return Some("plugin grant is missing an exact package version binding");
-        };
-        if !grant_version.matches(version) {
-            return Some("plugin grant version binding does not match enabled package version");
-        }
-        None
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PluginPermission {
@@ -310,48 +198,6 @@ impl PluginWebSocketGrant {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PluginFsGrant {
-    /// Absolute host path that bounds every relative `host_api.fs` request.
-    pub root: String,
-    /// Explicit operation kinds allowed below `root`; write does not imply read/list.
-    pub operations: Vec<PluginFsOperation>,
-}
-
-impl PluginFsGrant {
-    pub fn label(&self) -> String {
-        let operations = if self.operations.is_empty() {
-            "<no-operations>".to_string()
-        } else {
-            self.operations
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        format!("{} {}", self.root, operations)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PluginFsOperation {
-    Read,
-    List,
-    Write,
-}
-
-impl fmt::Display for PluginFsOperation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Read => f.write_str("read"),
-            Self::List => f.write_str("list"),
-            Self::Write => f.write_str("write"),
-        }
-    }
-}
-
 impl PluginPermission {
     pub fn label(&self) -> String {
         match self {
@@ -436,18 +282,12 @@ impl fmt::Display for PluginSurface {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginSourceKind {
-    User,
-    Project,
-    Builtin,
+    Explicit,
 }
 
 impl PluginSourceKind {
     fn qualifier(self) -> &'static str {
-        match self {
-            PluginSourceKind::User => "user",
-            PluginSourceKind::Project => "project",
-            PluginSourceKind::Builtin => "builtin",
-        }
+        "explicit"
     }
 }
 
@@ -479,9 +319,7 @@ impl SourceQualifiedPluginId {
             return Err(PluginIdParseError::InvalidLocalId);
         }
         let source = match source {
-            "user" => PluginSourceKind::User,
-            "project" => PluginSourceKind::Project,
-            "builtin" => PluginSourceKind::Builtin,
+            "explicit" => PluginSourceKind::Explicit,
             _ => return Err(PluginIdParseError::InvalidSource),
         };
         Ok(Self {
@@ -524,16 +362,14 @@ pub struct PluginPackageManifest {
     pub services: Vec<PluginServiceManifest>,
     #[serde(default)]
     pub ingresses: Vec<PluginIngressManifest>,
-    /// Permission requests declared by the package. These are requests only;
-    /// enablement grants must match them before runtime surfaces are exposed.
+    /// Permission declarations stored in the offline package. They grant no authority
+    /// and are not consumed by the current Worker runtime.
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
-    /// Manifest-declared URL targets for `host_api.request`. These are static permission requests;
-    /// enablement grants must explicitly approve matching targets.
+    /// URL target metadata retained in the offline package for a future installer.
     #[serde(default)]
     pub request: Vec<PluginRequestGrant>,
-    /// Manifest-declared URL targets for `host_api.websocket`. These are independent from
-    /// `host_api.request` targets and require independent enablement grants.
+    /// WebSocket target metadata retained in the offline package for a future installer.
     #[serde(default)]
     pub websocket: Vec<PluginWebSocketGrant>,
 }
@@ -599,9 +435,8 @@ pub struct PluginToolManifest {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
-    /// Whether this Tool declares side effects outside the model-visible result.
-    /// The flag does not grant authority; it requires a matching external_write
-    /// request and grant before registration or execution.
+    /// Declares possible external side effects for a future installer. This flag
+    /// grants no authority and is not consumed by the current Worker runtime.
     #[serde(default)]
     pub external_write: bool,
 }
@@ -635,8 +470,7 @@ pub struct PluginIngressManifest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PluginDiscoveryLimits {
-    pub max_packages_per_store: usize,
+pub struct PluginPackageLimits {
     pub max_package_size_bytes: u64,
     pub max_manifest_size_bytes: usize,
     pub max_entries_per_package: usize,
@@ -644,10 +478,9 @@ pub struct PluginDiscoveryLimits {
     pub max_expanded_size_bytes: u64,
 }
 
-impl Default for PluginDiscoveryLimits {
+impl Default for PluginPackageLimits {
     fn default() -> Self {
         Self {
-            max_packages_per_store: 128,
             max_package_size_bytes: 16 * 1024 * 1024,
             max_manifest_size_bytes: 64 * 1024,
             max_entries_per_package: 512,
@@ -657,37 +490,10 @@ impl Default for PluginDiscoveryLimits {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PluginDiscoveryOptions {
-    pub workspace_root: PathBuf,
-    pub user_data_home: Option<PathBuf>,
-    pub limits: PluginDiscoveryLimits,
-}
-
-impl PluginDiscoveryOptions {
-    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
-        Self {
-            workspace_root: workspace_root.into(),
-            user_data_home: None,
-            limits: PluginDiscoveryLimits::default(),
-        }
-    }
-
-    pub fn with_user_data_home(mut self, user_data_home: impl Into<PathBuf>) -> Self {
-        self.user_data_home = Some(user_data_home.into());
-        self
-    }
-
-    pub fn with_limits(mut self, limits: PluginDiscoveryLimits) -> Self {
-        self.limits = limits;
-        self
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
-pub struct DiscoveredPluginPackage {
+pub struct InspectedPluginPackage {
     pub identity: SourceQualifiedPluginId,
-    pub package_path: PathBuf,
+    pub input_path: PathBuf,
     pub package_label: String,
     pub digest: String,
     pub manifest: PluginPackageManifest,
@@ -701,79 +507,14 @@ pub struct DiscoveredPluginPackage {
 /// execute Plugin code.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MaterializedPluginPackage {
-    pub package: DiscoveredPluginPackage,
+    pub package: InspectedPluginPackage,
     pub files: BTreeMap<String, Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PackedPluginPackage {
     pub output_path: PathBuf,
-    pub package: DiscoveredPluginPackage,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct PluginDiscoveryReport {
-    pub packages: Vec<DiscoveredPluginPackage>,
-    pub diagnostics: Vec<PluginDiagnostic>,
-}
-
-impl PluginDiscoveryReport {
-    pub fn package(&self, identity: &SourceQualifiedPluginId) -> Vec<&DiscoveredPluginPackage> {
-        self.packages
-            .iter()
-            .filter(|package| &package.identity == identity)
-            .collect()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ResolvedPlugin {
-    pub identity: SourceQualifiedPluginId,
-    pub source: PluginSourceKind,
-    pub package_path: PathBuf,
-    pub package_label: String,
-    pub digest: String,
-    pub manifest: PluginPackageManifest,
-    pub enabled_surfaces: Vec<PluginSurface>,
-    pub grants: PluginGrantConfig,
-    pub config: Option<toml::Value>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ResolvedPluginRecord {
-    pub identity: SourceQualifiedPluginId,
-    pub source: PluginSourceKind,
-    pub package_path: PathBuf,
-    pub package_label: String,
-    pub digest: String,
-    pub version: String,
-    pub manifest: PluginPackageManifest,
-    pub enabled_surfaces: Vec<PluginSurface>,
-    pub grants: PluginGrantConfig,
-    pub config: Option<toml::Value>,
-}
-
-impl ResolvedPluginRecord {
-    pub fn from_resolved(resolved: &ResolvedPlugin) -> Self {
-        Self {
-            identity: resolved.identity.clone(),
-            source: resolved.source,
-            package_path: resolved.package_path.clone(),
-            package_label: resolved.package_label.clone(),
-            digest: resolved.digest.clone(),
-            version: resolved.manifest.version.clone(),
-            manifest: resolved.manifest.clone(),
-            enabled_surfaces: resolved.enabled_surfaces.clone(),
-            grants: resolved.grants.clone(),
-            config: resolved.config.clone(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct PluginResolution {
-    pub resolved: Vec<ResolvedPlugin>,
-    pub diagnostics: Vec<PluginDiagnostic>,
+    pub package: InspectedPluginPackage,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -818,11 +559,6 @@ impl PluginDiagnostic {
         self.package = Some(package.into());
         self
     }
-
-    fn with_digest(mut self, digest: impl Into<String>) -> Self {
-        self.digest = Some(digest.into());
-        self
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -845,581 +581,20 @@ pub enum PluginDiagnosticKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginDiagnosticPhase {
-    Discovery,
+    Inspection,
     Manifest,
-    Resolution,
-}
-
-pub fn discover_plugins(options: &PluginDiscoveryOptions) -> PluginDiscoveryReport {
-    let mut report = PluginDiscoveryReport::default();
-    let stores = plugin_stores(options);
-
-    for store in stores {
-        discover_store(&store, &options.limits, &mut report);
-    }
-
-    let mut counts: BTreeMap<SourceQualifiedPluginId, usize> = BTreeMap::new();
-    for package in &report.packages {
-        *counts.entry(package.identity.clone()).or_default() += 1;
-    }
-    for (identity, count) in counts {
-        if count > 1 {
-            report.diagnostics.push(
-                PluginDiagnostic::new(
-                    PluginDiagnosticKind::Duplicate,
-                    PluginDiagnosticPhase::Discovery,
-                    "duplicate plugin package identity in one source store",
-                )
-                .with_source(identity.source)
-                .with_identity(identity),
-            );
-        }
-    }
-
-    report.packages.sort_by(|left, right| {
-        left.identity
-            .cmp(&right.identity)
-            .then_with(|| left.digest.cmp(&right.digest))
-            .then_with(|| left.package_label.cmp(&right.package_label))
-    });
-    report
-}
-
-pub fn resolve_enabled_plugins(
-    config: &PluginConfig,
-    discovery: &PluginDiscoveryReport,
-) -> PluginResolution {
-    let mut resolution = PluginResolution::default();
-
-    for enablement in &config.enabled {
-        let identity = match SourceQualifiedPluginId::parse(&enablement.id) {
-            Ok(identity) => identity,
-            Err(PluginIdParseError::Unqualified) => {
-                resolution.diagnostics.push(
-                    PluginDiagnostic::new(
-                        PluginDiagnosticKind::Ambiguous,
-                        PluginDiagnosticPhase::Resolution,
-                        "plugin enablement id must be source-qualified as user:<id>, project:<id>, or builtin:<id>",
-                    )
-                    .with_identity(&enablement.id),
-                );
-                continue;
-            }
-            Err(PluginIdParseError::InvalidSource | PluginIdParseError::InvalidLocalId) => {
-                resolution.diagnostics.push(
-                    PluginDiagnostic::new(
-                        PluginDiagnosticKind::Malformed,
-                        PluginDiagnosticPhase::Resolution,
-                        "plugin enablement id is not a valid source-qualified plugin id",
-                    )
-                    .with_identity(&enablement.id),
-                );
-                continue;
-            }
-        };
-
-        let matches = discovery.package(&identity);
-        let package = match matches.as_slice() {
-            [] => {
-                resolution.diagnostics.push(
-                    PluginDiagnostic::new(
-                        PluginDiagnosticKind::Missing,
-                        PluginDiagnosticPhase::Resolution,
-                        "enabled plugin package was not discovered",
-                    )
-                    .with_source(identity.source)
-                    .with_identity(identity),
-                );
-                continue;
-            }
-            [package] => *package,
-            _ => {
-                resolution.diagnostics.push(
-                    PluginDiagnostic::new(
-                        PluginDiagnosticKind::Duplicate,
-                        PluginDiagnosticPhase::Resolution,
-                        "enabled plugin package identity resolved to multiple discovered packages",
-                    )
-                    .with_source(identity.source)
-                    .with_identity(identity),
-                );
-                continue;
-            }
-        };
-
-        if let Some(expected_digest) = &enablement.digest {
-            if !digest_matches(expected_digest, &package.digest) {
-                resolution.diagnostics.push(
-                    PluginDiagnostic::new(
-                        PluginDiagnosticKind::Digest,
-                        PluginDiagnosticPhase::Resolution,
-                        "enabled plugin digest pin does not match discovered package digest",
-                    )
-                    .with_source(identity.source)
-                    .with_identity(&identity)
-                    .with_package(&package.package_label)
-                    .with_digest(&package.digest),
-                );
-                continue;
-            }
-        }
-
-        if let Some(required_version) = &enablement.version {
-            if !required_version.matches(&package.manifest.version) {
-                resolution.diagnostics.push(
-                    PluginDiagnostic::new(
-                        PluginDiagnosticKind::Version,
-                        PluginDiagnosticPhase::Resolution,
-                        "enabled plugin exact version requirement does not match discovered package version",
-                    )
-                    .with_source(identity.source)
-                    .with_identity(&identity)
-                    .with_package(&package.package_label)
-                    .with_digest(&package.digest),
-                );
-                continue;
-            }
-        }
-
-        if let Some(message) =
-            enablement
-                .grants
-                .binding_error(&identity, &package.digest, &package.manifest.version)
-        {
-            resolution.diagnostics.push(
-                PluginDiagnostic::new(
-                    PluginDiagnosticKind::Grant,
-                    PluginDiagnosticPhase::Resolution,
-                    message,
-                )
-                .with_source(identity.source)
-                .with_identity(&identity)
-                .with_package(&package.package_label)
-                .with_digest(&package.digest),
-            );
-            continue;
-        }
-
-        let declared_surfaces = package.manifest.declared_surfaces();
-        let selected_surfaces: BTreeSet<_> = if enablement.surfaces.is_empty() {
-            declared_surfaces.clone()
-        } else {
-            enablement.surfaces.iter().copied().collect()
-        };
-        if let Some(surface) = selected_surfaces
-            .iter()
-            .find(|surface| !declared_surfaces.contains(surface))
-        {
-            resolution.diagnostics.push(
-                PluginDiagnostic::new(
-                    PluginDiagnosticKind::Surface,
-                    PluginDiagnosticPhase::Resolution,
-                    format!("enabled plugin requested undeclared surface `{surface}`"),
-                )
-                .with_source(identity.source)
-                .with_identity(&identity)
-                .with_package(&package.package_label)
-                .with_digest(&package.digest),
-            );
-            continue;
-        }
-
-        resolution.resolved.push(ResolvedPlugin {
-            identity: identity.clone(),
-            source: identity.source,
-            package_path: package.package_path.clone(),
-            package_label: package.package_label.clone(),
-            digest: package.digest.clone(),
-            manifest: package.manifest.clone(),
-            enabled_surfaces: selected_surfaces.into_iter().collect(),
-            grants: enablement.grants.clone(),
-            config: enablement.config.clone(),
-        });
-    }
-
-    resolution
-}
-
-pub fn resolve_plugin_config_for_startup(
-    config: &PluginConfig,
-    options: &PluginDiscoveryOptions,
-) -> PluginConfig {
-    if config.enabled.is_empty() || config.has_resolved_plan() {
-        return config.clone();
-    }
-
-    let discovery = discover_plugins(options);
-    let resolution = resolve_enabled_plugins(config, &discovery);
-    let mut snapshot = config.clone();
-    snapshot.resolved = resolution
-        .resolved
-        .iter()
-        .map(ResolvedPluginRecord::from_resolved)
-        .collect();
-    snapshot.diagnostics = discovery.diagnostics;
-    snapshot.diagnostics.extend(resolution.diagnostics);
-    snapshot
-}
-
-/// Reads the WebAssembly Component Model artifact selected by a resolved plugin
-/// package manifest while preserving package digest pinning.
-pub fn read_resolved_plugin_runtime_component(
-    record: &ResolvedPluginRecord,
-    limits: &PluginDiscoveryLimits,
-) -> Result<Vec<u8>, PluginDiagnostic> {
-    let runtime = record.manifest.runtime.as_ref().ok_or_else(|| {
-        PluginDiagnostic::new(
-            PluginDiagnosticKind::Missing,
-            PluginDiagnosticPhase::Manifest,
-            "resolved plugin package does not declare a component runtime",
-        )
-        .with_source(record.source)
-        .with_identity(&record.identity)
-        .with_package(&record.package_label)
-        .with_digest(&record.digest)
-    })?;
-
-    if runtime.kind != PLUGIN_RUNTIME_COMPONENT_KIND {
-        return Err(PluginDiagnostic::new(
-            PluginDiagnosticKind::Api,
-            PluginDiagnosticPhase::Manifest,
-            "plugin runtime kind is unsupported",
-        )
-        .with_source(record.source)
-        .with_identity(&record.identity)
-        .with_package(&record.package_label)
-        .with_digest(&record.digest));
-    }
-    if !matches!(
-        runtime.world.as_deref(),
-        Some(PLUGIN_COMPONENT_TOOL_WORLD) | Some(PLUGIN_COMPONENT_INSTANCE_WORLD)
-    ) {
-        return Err(PluginDiagnostic::new(
-            PluginDiagnosticKind::Api,
-            PluginDiagnosticPhase::Manifest,
-            "plugin component world is unsupported",
-        )
-        .with_source(record.source)
-        .with_identity(&record.identity)
-        .with_package(&record.package_label)
-        .with_digest(&record.digest));
-    }
-    let component = runtime.component.as_deref().ok_or_else(|| {
-        PluginDiagnostic::new(
-            PluginDiagnosticKind::Missing,
-            PluginDiagnosticPhase::Manifest,
-            "plugin component runtime artifact is required",
-        )
-        .with_source(record.source)
-        .with_identity(&record.identity)
-        .with_package(&record.package_label)
-        .with_digest(&record.digest)
-    })?;
-
-    let metadata = fs::metadata(&record.package_path).map_err(|error| {
-        PluginDiagnostic::new(
-            PluginDiagnosticKind::Io,
-            PluginDiagnosticPhase::Discovery,
-            format!(
-                "resolved plugin package metadata could not be read: {}",
-                safe_io_error(&error)
-            ),
-        )
-        .with_source(record.source)
-        .with_identity(&record.identity)
-        .with_package(&record.package_label)
-        .with_digest(&record.digest)
-    })?;
-    if !metadata.is_file() {
-        return Err(PluginDiagnostic::new(
-            PluginDiagnosticKind::Malformed,
-            PluginDiagnosticPhase::Discovery,
-            "resolved plugin package is not a regular file",
-        )
-        .with_source(record.source)
-        .with_identity(&record.identity)
-        .with_package(&record.package_label)
-        .with_digest(&record.digest));
-    }
-    if metadata.len() > limits.max_package_size_bytes {
-        return Err(PluginDiagnostic::new(
-            PluginDiagnosticKind::Bounds,
-            PluginDiagnosticPhase::Discovery,
-            "resolved plugin package exceeds the configured package size bound",
-        )
-        .with_source(record.source)
-        .with_identity(&record.identity)
-        .with_package(&record.package_label)
-        .with_digest(&record.digest));
-    }
-
-    let bytes = fs::read(&record.package_path).map_err(|error| {
-        PluginDiagnostic::new(
-            PluginDiagnosticKind::Io,
-            PluginDiagnosticPhase::Discovery,
-            format!(
-                "resolved plugin package content could not be read: {}",
-                safe_io_error(&error)
-            ),
-        )
-        .with_source(record.source)
-        .with_identity(&record.identity)
-        .with_package(&record.package_label)
-        .with_digest(&record.digest)
-    })?;
-    let archive = parse_stored_zip(&bytes, &record.package_label, record.source, limits)?;
-    let actual_digest = deterministic_digest(&archive.files);
-    if !digest_matches(&record.digest, &actual_digest) {
-        return Err(PluginDiagnostic::new(
-            PluginDiagnosticKind::Digest,
-            PluginDiagnosticPhase::Resolution,
-            "resolved plugin package digest does not match current package content",
-        )
-        .with_source(record.source)
-        .with_identity(&record.identity)
-        .with_package(&record.package_label)
-        .with_digest(actual_digest));
-    }
-
-    validate_manifest_path(
-        component,
-        &archive,
-        &record.package_label,
-        record.source,
-        &record.manifest.id,
-    )?;
-    let normalized = normalize_archive_path(component).ok_or_else(|| {
-        PluginDiagnostic::new(
-            PluginDiagnosticKind::Traversal,
-            PluginDiagnosticPhase::Manifest,
-            "plugin manifest references a path outside the package root",
-        )
-        .with_source(record.source)
-        .with_identity(&record.identity)
-        .with_package(&record.package_label)
-        .with_digest(&record.digest)
-    })?;
-    archive.files.get(&normalized).cloned().ok_or_else(|| {
-        PluginDiagnostic::new(
-            PluginDiagnosticKind::Missing,
-            PluginDiagnosticPhase::Manifest,
-            "plugin runtime component artifact is missing from the package",
-        )
-        .with_source(record.source)
-        .with_identity(&record.identity)
-        .with_package(&record.package_label)
-        .with_digest(&record.digest)
-    })
-}
-
-#[derive(Clone, Debug)]
-struct PluginStore {
-    source: PluginSourceKind,
-    path: PathBuf,
-}
-
-fn plugin_stores(options: &PluginDiscoveryOptions) -> Vec<PluginStore> {
-    let user_data_home = options
-        .user_data_home
-        .clone()
-        .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".local/share"))
-        });
-
-    let mut stores = Vec::new();
-    if let Some(user_data_home) = user_data_home {
-        stores.push(PluginStore {
-            source: PluginSourceKind::User,
-            path: user_data_home.join("yoi/plugins"),
-        });
-    }
-    stores.push(PluginStore {
-        source: PluginSourceKind::Project,
-        path: options.workspace_root.join(".yoi/plugins"),
-    });
-    stores
-}
-
-fn discover_store(
-    store: &PluginStore,
-    limits: &PluginDiscoveryLimits,
-    report: &mut PluginDiscoveryReport,
-) {
-    let canonical_store = match fs::canonicalize(&store.path) {
-        Ok(path) => path,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-        Err(error) => {
-            report.diagnostics.push(
-                PluginDiagnostic::new(
-                    PluginDiagnosticKind::Io,
-                    PluginDiagnosticPhase::Discovery,
-                    format!("plugin store could not be read: {}", safe_io_error(&error)),
-                )
-                .with_source(store.source),
-            );
-            return;
-        }
-    };
-
-    let entries = match fs::read_dir(&canonical_store) {
-        Ok(entries) => entries,
-        Err(error) => {
-            report.diagnostics.push(
-                PluginDiagnostic::new(
-                    PluginDiagnosticKind::Io,
-                    PluginDiagnosticPhase::Discovery,
-                    format!(
-                        "plugin store could not be listed: {}",
-                        safe_io_error(&error)
-                    ),
-                )
-                .with_source(store.source),
-            );
-            return;
-        }
-    };
-
-    let mut candidates = Vec::new();
-    for entry in entries {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) == Some("yoi-plugin") {
-            candidates.push(path);
-        }
-    }
-    candidates.sort();
-
-    if candidates.len() > limits.max_packages_per_store {
-        report.diagnostics.push(
-            PluginDiagnostic::new(
-                PluginDiagnosticKind::Bounds,
-                PluginDiagnosticPhase::Discovery,
-                "plugin store contains more packages than the configured discovery bound",
-            )
-            .with_source(store.source),
-        );
-        candidates.truncate(limits.max_packages_per_store);
-    }
-
-    for candidate in candidates {
-        let label = package_label(&candidate);
-        let canonical_candidate = match fs::canonicalize(&candidate) {
-            Ok(path) => path,
-            Err(error) => {
-                report.diagnostics.push(
-                    PluginDiagnostic::new(
-                        PluginDiagnosticKind::Io,
-                        PluginDiagnosticPhase::Discovery,
-                        format!(
-                            "plugin package could not be read: {}",
-                            safe_io_error(&error)
-                        ),
-                    )
-                    .with_source(store.source)
-                    .with_package(label),
-                );
-                continue;
-            }
-        };
-        if !canonical_candidate.starts_with(&canonical_store) {
-            report.diagnostics.push(
-                PluginDiagnostic::new(
-                    PluginDiagnosticKind::Traversal,
-                    PluginDiagnosticPhase::Discovery,
-                    "plugin package path escapes its source store",
-                )
-                .with_source(store.source)
-                .with_package(package_label(&candidate)),
-            );
-            continue;
-        }
-        let metadata = match fs::metadata(&canonical_candidate) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                report.diagnostics.push(
-                    PluginDiagnostic::new(
-                        PluginDiagnosticKind::Io,
-                        PluginDiagnosticPhase::Discovery,
-                        format!(
-                            "plugin package metadata could not be read: {}",
-                            safe_io_error(&error)
-                        ),
-                    )
-                    .with_source(store.source)
-                    .with_package(label),
-                );
-                continue;
-            }
-        };
-        if !metadata.is_file() {
-            report.diagnostics.push(
-                PluginDiagnostic::new(
-                    PluginDiagnosticKind::Malformed,
-                    PluginDiagnosticPhase::Discovery,
-                    "plugin package candidate is not a regular file",
-                )
-                .with_source(store.source)
-                .with_package(label),
-            );
-            continue;
-        }
-        if metadata.len() > limits.max_package_size_bytes {
-            report.diagnostics.push(
-                PluginDiagnostic::new(
-                    PluginDiagnosticKind::Bounds,
-                    PluginDiagnosticPhase::Discovery,
-                    "plugin package exceeds the configured package size bound",
-                )
-                .with_source(store.source)
-                .with_package(label),
-            );
-            continue;
-        }
-
-        match read_package(&canonical_candidate, &label, store.source, limits) {
-            Ok(package) => report.packages.push(package),
-            Err(diagnostic) => report.diagnostics.push(diagnostic),
-        }
-    }
-}
-
-fn read_package(
-    path: &Path,
-    label: &str,
-    source: PluginSourceKind,
-    limits: &PluginDiscoveryLimits,
-) -> Result<DiscoveredPluginPackage, PluginDiagnostic> {
-    let bytes = fs::read(path).map_err(|error| {
-        PluginDiagnostic::new(
-            PluginDiagnosticKind::Io,
-            PluginDiagnosticPhase::Discovery,
-            format!(
-                "plugin package content could not be read: {}",
-                safe_io_error(&error)
-            ),
-        )
-        .with_source(source)
-        .with_package(label)
-    })?;
-    materialize_archive(path, label, source, &bytes, limits)
-        .map(|materialized| materialized.package)
 }
 
 pub fn read_plugin_package_file(
     path: &Path,
     source: PluginSourceKind,
-    limits: &PluginDiscoveryLimits,
+    limits: &PluginPackageLimits,
 ) -> Result<MaterializedPluginPackage, PluginDiagnostic> {
     let label = package_label(path);
     let metadata = fs::metadata(path).map_err(|error| {
         PluginDiagnostic::new(
             PluginDiagnosticKind::Io,
-            PluginDiagnosticPhase::Discovery,
+            PluginDiagnosticPhase::Inspection,
             format!(
                 "plugin package metadata could not be read: {}",
                 safe_io_error(&error)
@@ -1431,7 +606,7 @@ pub fn read_plugin_package_file(
     if !metadata.is_file() {
         return Err(PluginDiagnostic::new(
             PluginDiagnosticKind::Malformed,
-            PluginDiagnosticPhase::Discovery,
+            PluginDiagnosticPhase::Inspection,
             "plugin package candidate is not a regular file",
         )
         .with_source(source)
@@ -1440,7 +615,7 @@ pub fn read_plugin_package_file(
     if metadata.len() > limits.max_package_size_bytes {
         return Err(PluginDiagnostic::new(
             PluginDiagnosticKind::Bounds,
-            PluginDiagnosticPhase::Discovery,
+            PluginDiagnosticPhase::Inspection,
             "plugin package exceeds the configured package size bound",
         )
         .with_source(source)
@@ -1449,7 +624,7 @@ pub fn read_plugin_package_file(
     let bytes = fs::read(path).map_err(|error| {
         PluginDiagnostic::new(
             PluginDiagnosticKind::Io,
-            PluginDiagnosticPhase::Discovery,
+            PluginDiagnosticPhase::Inspection,
             format!(
                 "plugin package content could not be read: {}",
                 safe_io_error(&error)
@@ -1464,13 +639,13 @@ pub fn read_plugin_package_file(
 pub fn read_plugin_directory(
     path: &Path,
     source: PluginSourceKind,
-    limits: &PluginDiscoveryLimits,
+    limits: &PluginPackageLimits,
 ) -> Result<MaterializedPluginPackage, PluginDiagnostic> {
     let label = package_label(path);
     let root = fs::canonicalize(path).map_err(|error| {
         PluginDiagnostic::new(
             PluginDiagnosticKind::Io,
-            PluginDiagnosticPhase::Discovery,
+            PluginDiagnosticPhase::Inspection,
             format!(
                 "plugin directory could not be read: {}",
                 safe_io_error(&error)
@@ -1482,7 +657,7 @@ pub fn read_plugin_directory(
     let metadata = fs::metadata(&root).map_err(|error| {
         PluginDiagnostic::new(
             PluginDiagnosticKind::Io,
-            PluginDiagnosticPhase::Discovery,
+            PluginDiagnosticPhase::Inspection,
             format!(
                 "plugin directory metadata could not be read: {}",
                 safe_io_error(&error)
@@ -1494,7 +669,7 @@ pub fn read_plugin_directory(
     if !metadata.is_dir() {
         return Err(PluginDiagnostic::new(
             PluginDiagnosticKind::Malformed,
-            PluginDiagnosticPhase::Discovery,
+            PluginDiagnosticPhase::Inspection,
             "plugin directory input is not a directory",
         )
         .with_source(source)
@@ -1509,7 +684,7 @@ pub fn read_plugin_directory(
 pub fn write_plugin_package_file(
     materialized: &MaterializedPluginPackage,
     output_path: &Path,
-    limits: &PluginDiscoveryLimits,
+    limits: &PluginPackageLimits,
 ) -> Result<PackedPluginPackage, PluginDiagnostic> {
     write_stored_zip_file(output_path, &materialized.files, limits)?;
     let package = read_plugin_package_file(output_path, materialized.package.source(), limits)?;
@@ -1519,7 +694,7 @@ pub fn write_plugin_package_file(
     })
 }
 
-impl DiscoveredPluginPackage {
+impl InspectedPluginPackage {
     pub fn source(&self) -> PluginSourceKind {
         self.identity.source
     }
@@ -1530,7 +705,7 @@ fn materialize_archive(
     label: &str,
     source: PluginSourceKind,
     bytes: &[u8],
-    limits: &PluginDiscoveryLimits,
+    limits: &PluginPackageLimits,
 ) -> Result<MaterializedPluginPackage, PluginDiagnostic> {
     let archive = parse_stored_zip(bytes, label, source, limits)?;
     materialize_files(path, label.to_string(), source, archive.files, limits)
@@ -1541,7 +716,7 @@ fn materialize_files(
     label: String,
     source: PluginSourceKind,
     files: BTreeMap<String, Vec<u8>>,
-    limits: &PluginDiscoveryLimits,
+    limits: &PluginPackageLimits,
 ) -> Result<MaterializedPluginPackage, PluginDiagnostic> {
     let archive = StoredArchive {
         files: files.clone(),
@@ -1585,9 +760,9 @@ fn materialize_files(
     validate_manifest(&manifest, &archive, &label, source)?;
     let digest = deterministic_digest(&archive.files);
     let identity = SourceQualifiedPluginId::new(source, manifest.id.clone());
-    let package = DiscoveredPluginPackage {
+    let package = InspectedPluginPackage {
         identity,
-        package_path: path.to_path_buf(),
+        input_path: path.to_path_buf(),
         package_label: label,
         digest,
         manifest,
@@ -1601,14 +776,14 @@ fn collect_directory_files(
     dir: &Path,
     label: &str,
     source: PluginSourceKind,
-    limits: &PluginDiscoveryLimits,
+    limits: &PluginPackageLimits,
     files: &mut BTreeMap<String, Vec<u8>>,
 ) -> Result<(), PluginDiagnostic> {
     let mut entries = fs::read_dir(dir)
         .map_err(|error| {
             PluginDiagnostic::new(
                 PluginDiagnosticKind::Io,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 format!(
                     "plugin directory could not be listed: {}",
                     safe_io_error(&error)
@@ -1625,7 +800,7 @@ fn collect_directory_files(
         let metadata = fs::symlink_metadata(&path).map_err(|error| {
             PluginDiagnostic::new(
                 PluginDiagnosticKind::Io,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 format!(
                     "plugin directory entry metadata could not be read: {}",
                     safe_io_error(&error)
@@ -1637,7 +812,7 @@ fn collect_directory_files(
         if metadata.file_type().is_symlink() {
             return Err(PluginDiagnostic::new(
                 PluginDiagnosticKind::Traversal,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 "plugin directory contains a symlink entry",
             )
             .with_source(source)
@@ -1653,7 +828,7 @@ fn collect_directory_files(
         if metadata.len() > limits.max_file_size_bytes {
             return Err(PluginDiagnostic::new(
                 PluginDiagnosticKind::Bounds,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 "plugin directory file exceeds the configured per-file bound",
             )
             .with_source(source)
@@ -1662,7 +837,7 @@ fn collect_directory_files(
         let canonical = fs::canonicalize(&path).map_err(|error| {
             PluginDiagnostic::new(
                 PluginDiagnosticKind::Io,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 format!(
                     "plugin directory file could not be read: {}",
                     safe_io_error(&error)
@@ -1674,7 +849,7 @@ fn collect_directory_files(
         if !canonical.starts_with(root) {
             return Err(PluginDiagnostic::new(
                 PluginDiagnosticKind::Traversal,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 "plugin directory file escapes the package root",
             )
             .with_source(source)
@@ -1683,7 +858,7 @@ fn collect_directory_files(
         let relative = canonical.strip_prefix(root).map_err(|_| {
             PluginDiagnostic::new(
                 PluginDiagnosticKind::Traversal,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 "plugin directory file escapes the package root",
             )
             .with_source(source)
@@ -1697,7 +872,7 @@ fn collect_directory_files(
             .ok_or_else(|| {
                 PluginDiagnostic::new(
                     PluginDiagnosticKind::Traversal,
-                    PluginDiagnosticPhase::Discovery,
+                    PluginDiagnosticPhase::Inspection,
                     "plugin directory contains an unsafe relative path",
                 )
                 .with_source(source)
@@ -1706,7 +881,7 @@ fn collect_directory_files(
         let content = fs::read(&path).map_err(|error| {
             PluginDiagnostic::new(
                 PluginDiagnosticKind::Io,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 format!(
                     "plugin directory file could not be read: {}",
                     safe_io_error(&error)
@@ -1719,7 +894,7 @@ fn collect_directory_files(
         if files.len() > limits.max_entries_per_package {
             return Err(PluginDiagnostic::new(
                 PluginDiagnosticKind::Bounds,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 "plugin directory contains more files than the configured bound",
             )
             .with_source(source)
@@ -1732,7 +907,7 @@ fn collect_directory_files(
         if expanded_size > limits.max_expanded_size_bytes {
             return Err(PluginDiagnostic::new(
                 PluginDiagnosticKind::Bounds,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 "plugin directory expanded size exceeds the configured bound",
             )
             .with_source(source)
@@ -1745,12 +920,12 @@ fn collect_directory_files(
 fn write_stored_zip_file(
     output_path: &Path,
     files: &BTreeMap<String, Vec<u8>>,
-    limits: &PluginDiscoveryLimits,
+    limits: &PluginPackageLimits,
 ) -> Result<(), PluginDiagnostic> {
     if files.len() > limits.max_entries_per_package {
         return Err(PluginDiagnostic::new(
             PluginDiagnosticKind::Bounds,
-            PluginDiagnosticPhase::Discovery,
+            PluginDiagnosticPhase::Inspection,
             "plugin package contains more entries than the configured bound",
         ));
     }
@@ -1760,14 +935,14 @@ fn write_stored_zip_file(
         let name = normalize_archive_path(name).ok_or_else(|| {
             PluginDiagnostic::new(
                 PluginDiagnosticKind::Traversal,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 "plugin package entry path escapes the archive root",
             )
         })?;
         if content.len() as u64 > limits.max_file_size_bytes {
             return Err(PluginDiagnostic::new(
                 PluginDiagnosticKind::Bounds,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 "plugin package entry exceeds the configured per-file bound",
             ));
         }
@@ -1818,7 +993,7 @@ fn write_stored_zip_file(
     if bytes.len() as u64 > limits.max_package_size_bytes {
         return Err(PluginDiagnostic::new(
             PluginDiagnosticKind::Bounds,
-            PluginDiagnosticPhase::Discovery,
+            PluginDiagnosticPhase::Inspection,
             "plugin package exceeds the configured package size bound",
         ));
     }
@@ -1829,7 +1004,7 @@ fn write_stored_zip_file(
         fs::create_dir_all(parent).map_err(|error| {
             PluginDiagnostic::new(
                 PluginDiagnosticKind::Io,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 format!(
                     "plugin package output directory could not be created: {}",
                     safe_io_error(&error)
@@ -1840,7 +1015,7 @@ fn write_stored_zip_file(
     fs::write(output_path, bytes).map_err(|error| {
         PluginDiagnostic::new(
             PluginDiagnosticKind::Io,
-            PluginDiagnosticPhase::Discovery,
+            PluginDiagnosticPhase::Inspection,
             format!(
                 "plugin package output could not be written: {}",
                 safe_io_error(&error)
@@ -2063,7 +1238,7 @@ fn parse_stored_zip(
     bytes: &[u8],
     label: &str,
     source: PluginSourceKind,
-    limits: &PluginDiscoveryLimits,
+    limits: &PluginPackageLimits,
 ) -> Result<StoredArchive, PluginDiagnostic> {
     let eocd_offset = find_eocd(bytes).ok_or_else(|| {
         malformed_zip(label, source, "zip end-of-central-directory was not found")
@@ -2092,7 +1267,7 @@ fn parse_stored_zip(
     if entry_count > limits.max_entries_per_package {
         return Err(PluginDiagnostic::new(
             PluginDiagnosticKind::Bounds,
-            PluginDiagnosticPhase::Discovery,
+            PluginDiagnosticPhase::Inspection,
             "plugin package contains more entries than the configured bound",
         )
         .with_source(source)
@@ -2162,7 +1337,7 @@ fn parse_stored_zip(
         let name = normalize_archive_path(raw_name).ok_or_else(|| {
             PluginDiagnostic::new(
                 PluginDiagnosticKind::Traversal,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 "plugin package entry path escapes the archive root",
             )
             .with_source(source)
@@ -2198,7 +1373,7 @@ fn parse_stored_zip(
         if is_zip_symlink(entry.external_attributes) {
             return Err(PluginDiagnostic::new(
                 PluginDiagnosticKind::Traversal,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 "plugin package contains a symlink entry",
             )
             .with_source(source)
@@ -2210,7 +1385,7 @@ fn parse_stored_zip(
         if entry.compression_method != ZIP_COMPRESSION_STORED {
             return Err(PluginDiagnostic::new(
                 PluginDiagnosticKind::Api,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 "plugin package uses an unsupported zip compression method",
             )
             .with_source(source)
@@ -2219,7 +1394,7 @@ fn parse_stored_zip(
         if u64::from(entry.uncompressed_size) > limits.max_file_size_bytes {
             return Err(PluginDiagnostic::new(
                 PluginDiagnosticKind::Bounds,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 "plugin package entry exceeds the configured per-file bound",
             )
             .with_source(source)
@@ -2229,7 +1404,7 @@ fn parse_stored_zip(
         if expanded_size > limits.max_expanded_size_bytes {
             return Err(PluginDiagnostic::new(
                 PluginDiagnosticKind::Bounds,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 "plugin package expanded size exceeds the configured bound",
             )
             .with_source(source)
@@ -2248,7 +1423,7 @@ fn parse_stored_zip(
         if files.insert(entry.name.clone(), data).is_some() {
             return Err(PluginDiagnostic::new(
                 PluginDiagnosticKind::Duplicate,
-                PluginDiagnosticPhase::Discovery,
+                PluginDiagnosticPhase::Inspection,
                 "plugin package contains duplicate normalized entry paths",
             )
             .with_source(source)
@@ -2326,7 +1501,7 @@ fn malformed_zip(
 ) -> PluginDiagnostic {
     PluginDiagnostic::new(
         PluginDiagnosticKind::Malformed,
-        PluginDiagnosticPhase::Discovery,
+        PluginDiagnosticPhase::Inspection,
         message,
     )
     .with_source(source)
@@ -2346,14 +1521,6 @@ fn deterministic_digest(files: &BTreeMap<String, Vec<u8>>) -> String {
         hasher.update(file_digest);
     }
     format!("sha256:{}", hex_lower(&hasher.finalize()))
-}
-
-fn digest_matches(expected: &str, actual: &str) -> bool {
-    if let Some(hex) = expected.strip_prefix("sha256:") {
-        actual.strip_prefix("sha256:") == Some(hex)
-    } else {
-        false
-    }
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -2460,1001 +1627,60 @@ fn is_safe_id(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use tempfile::tempdir;
 
-    #[test]
-    fn embedded_rust_component_tool_template_is_valid_package_shape() {
-        let paths: BTreeSet<_> = RUST_COMPONENT_TOOL_TEMPLATE
-            .iter()
-            .map(|file| file.path)
-            .collect();
-        assert_eq!(
-            paths,
-            BTreeSet::from([
-                "Cargo.toml",
-                "src/lib.rs",
-                "plugin.toml",
-                "plugin.component.wasm",
-                "README.md",
-            ])
-        );
-        assert!(
-            RUST_COMPONENT_TOOL_TEMPLATE
-                .iter()
-                .all(|file| !file.path.starts_with('/') && !file.path.contains(".."))
-        );
-
-        let manifest_text = RUST_COMPONENT_TOOL_TEMPLATE
-            .iter()
-            .find(|file| file.path == "plugin.toml")
-            .unwrap()
-            .contents;
-        let manifest: PluginPackageManifest = toml::from_str(manifest_text).unwrap();
-        assert_eq!(manifest.schema_version, SUPPORTED_PLUGIN_API_VERSION);
-        assert_eq!(
-            manifest.runtime.as_ref().unwrap().kind,
-            PLUGIN_RUNTIME_COMPONENT_KIND
-        );
-        assert_eq!(
-            manifest.runtime.as_ref().unwrap().world.as_deref(),
-            Some(PLUGIN_COMPONENT_TOOL_WORLD)
-        );
-        assert_eq!(manifest.tools.len(), 1);
+    fn materialize_template(root: &Path) {
+        for resource in RUST_COMPONENT_TOOL_TEMPLATE {
+            let path = root.join(resource.path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, resource.contents).unwrap();
+        }
     }
 
     #[test]
-    fn request_host_api_manifest_and_grant_parse_with_request_names() {
-        let manifest: PluginPackageManifest = toml::from_str(
-            r#"
-schema_version = 1
-id = "example"
-name = "Example"
-version = "1.0.0"
-description = "Example plugin"
-surfaces = ["tool"]
+    fn explicit_package_round_trip_does_not_discover_ambient_stores() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        let ambient = dir.path().join(".yoi/plugins/ignored.yoi-plugin");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(ambient.parent().unwrap()).unwrap();
+        fs::write(&ambient, b"malformed ambient package").unwrap();
+        materialize_template(&source);
 
-[[permissions]]
-kind = "host_api"
-api = "request"
+        let limits = PluginPackageLimits::default();
+        let package = read_plugin_directory(&source, PluginSourceKind::Explicit, &limits).unwrap();
+        let output = dir.path().join("explicit.yoi-plugin");
+        write_plugin_package_file(&package, &output, &limits).unwrap();
+        let reread =
+            read_plugin_package_file(&output, PluginSourceKind::Explicit, &limits).unwrap();
 
-[[request]]
-scheme = "https"
-host = "api.example.com"
-port = 443
-methods = ["GET", "POST"]
-path_prefixes = ["/v1/"]
-"#,
-        )
-        .unwrap();
-        assert_eq!(
-            manifest.permissions,
-            vec![PluginPermission::host_api(PluginHostApi::Request)]
-        );
-        assert_eq!(manifest.request.len(), 1);
-        assert_eq!(manifest.request[0].scheme, "https");
-        assert_eq!(manifest.request[0].host, "api.example.com");
-        assert_eq!(manifest.request[0].port, Some(443));
-        assert_eq!(
-            manifest.request[0].label(),
-            "https://api.example.com:443 GET,POST /v1/"
-        );
-
-        let grants: PluginGrantConfig = toml::from_str(
-            r#"
-permissions = [{ kind = "host_api", api = "request" }]
-
-[[request]]
-scheme = "http"
-host = "localhost"
-port = 8080
-methods = ["GET"]
-path_prefixes = ["/health"]
-"#,
-        )
-        .unwrap();
-        assert_eq!(
-            grants.permissions,
-            vec![PluginPermission::host_api(PluginHostApi::Request)]
-        );
-        assert_eq!(grants.request[0].scheme, "http");
-        assert_eq!(grants.request[0].host, "localhost");
+        assert_eq!(reread.package.identity.source, PluginSourceKind::Explicit);
+        assert_eq!(reread.package.digest, package.package.digest);
     }
 
     #[test]
-    fn legacy_https_request_names_are_not_accepted() {
-        let manifest_error = toml::from_str::<PluginPackageManifest>(
-            r#"
-schema_version = 1
-id = "example"
-name = "Example"
-version = "1.0.0"
-description = "Example plugin"
-surfaces = ["tool"]
-
-[[permissions]]
-kind = "host_api"
-api = "https"
-"#,
-        )
-        .expect_err(concat!(
-            "host_api.",
-            "https",
-            " must not be an active alias"
-        ));
-        assert!(manifest_error.to_string().contains("unknown variant"));
-
-        let grant_error = toml::from_str::<PluginGrantConfig>(
-            r#"
-permissions = [{ kind = "host_api", api = "request" }]
-
-[[https]]
-host = "api.example.com"
-methods = ["GET"]
-"#,
-        )
-        .expect_err(concat!("grants.", "https", " must not be an active alias"));
-        assert!(grant_error.to_string().contains("unknown field"));
-    }
-
-    #[test]
-    fn embedded_rust_component_instance_template_is_valid_package_shape() {
-        let paths: BTreeSet<_> = RUST_COMPONENT_INSTANCE_TEMPLATE
-            .iter()
-            .map(|file| file.path)
-            .collect();
-        assert_eq!(
-            paths,
-            BTreeSet::from([
-                "Cargo.toml",
-                "src/lib.rs",
-                "plugin.toml",
-                "plugin.component.wasm",
-                "README.md"
-            ])
-        );
-        assert!(
-            RUST_COMPONENT_INSTANCE_TEMPLATE
-                .iter()
-                .all(|file| !file.path.starts_with('/') && !file.path.contains(".."))
-        );
-        let manifest_text = RUST_COMPONENT_INSTANCE_TEMPLATE
-            .iter()
-            .find(|file| file.path == "plugin.toml")
-            .unwrap()
-            .contents;
-        let manifest: PluginPackageManifest = toml::from_str(manifest_text).unwrap();
-        assert_eq!(
-            manifest.runtime.as_ref().unwrap().world.as_deref(),
-            Some(PLUGIN_COMPONENT_INSTANCE_WORLD)
-        );
-        assert_eq!(manifest.services.len(), 1);
-        assert_eq!(manifest.ingresses.len(), 1);
-        assert!(
-            manifest
-                .declared_surfaces()
-                .contains(&PluginSurface::Service)
-        );
-        assert!(
-            manifest
-                .declared_surfaces()
-                .contains(&PluginSurface::Ingress)
-        );
-    }
-
-    #[test]
-    fn service_ingress_require_instance_component_world() {
-        let manifest: PluginPackageManifest = toml::from_str(
-            r#"
-schema_version = 1
-id = "bad.service"
-name = "Bad Service"
-version = "0.1.0"
-surfaces = ["service"]
-permissions = [{ kind = "surface", surface = "service" }, { kind = "service", name = "svc" }]
-
-[runtime]
-kind = "wasm-component"
-world = "yoi:plugin/tool@1.0.0"
-component = "plugin.component.wasm"
-
-[[services]]
-name = "svc"
-description = "bad"
-"#,
-        )
-        .unwrap();
-        let archive = StoredArchive {
-            files: BTreeMap::from([("plugin.component.wasm".to_string(), b"placeholder".to_vec())]),
-        };
-        let err = validate_manifest(
-            &manifest,
-            &archive,
-            "bad.service",
-            PluginSourceKind::Project,
-        )
-        .unwrap_err();
-        assert!(err.message.contains("service/ingress"));
-    }
-
-    #[test]
-    fn legacy_raw_wasm_runtime_manifest_is_rejected() {
-        let temp = TempDir::new().unwrap();
-        let workspace = temp.path().join("workspace");
-        let plugins = workspace.join(".yoi/plugins");
-        fs::create_dir_all(&plugins).unwrap();
-        let manifest = r#"
-schema_version = 1
-id = "legacy"
-name = "Legacy"
-version = "0.1.0"
-surfaces = ["tool"]
-
-[runtime]
-kind = "wasm"
-entry = "plugin.wasm"
-abi = "yoi-plugin-wasm-1"
-
-[[tools]]
-name = "Echo"
-description = "legacy"
-input_schema = { type = "object" }
-"#;
-        write_stored_zip(
-            &plugins.join("legacy.yoi-plugin"),
-            &[
-                ("plugin.toml", manifest.as_bytes().to_vec(), 0),
-                ("plugin.wasm", b"not wasm".to_vec(), 0),
-            ],
-        );
-
-        let report = discover_plugins(&PluginDiscoveryOptions::new(&workspace));
-
-        assert!(report.packages.is_empty());
-        let diagnostic = report
-            .diagnostics
-            .iter()
-            .find(|diag| diag.kind == PluginDiagnosticKind::Api)
+    fn production_source_has_no_ambient_plugin_authority() {
+        let source = include_str!("plugin.rs")
+            .split("#[cfg(test)]")
+            .next()
             .unwrap();
-        assert_eq!(diagnostic.phase, PluginDiagnosticPhase::Manifest);
-        assert_eq!(diagnostic.identity.as_deref(), Some("project:legacy"));
-        assert!(diagnostic.message.contains("legacy raw wasm"));
-        assert!(diagnostic.message.contains(PLUGIN_RUNTIME_COMPONENT_KIND));
-    }
-
-    #[test]
-    fn discovers_valid_user_and_workspace_packages() {
-        let temp = TempDir::new().unwrap();
-        let workspace = temp.path().join("workspace");
-        let user_data = temp.path().join("data");
-        fs::create_dir_all(workspace.join(".yoi/plugins")).unwrap();
-        fs::create_dir_all(user_data.join("yoi/plugins")).unwrap();
-        write_plugin(
-            &user_data.join("yoi/plugins/user-one.yoi-plugin"),
-            "user_one",
-            &[PluginSurface::Hook],
-            &[("hooks/user.md", b"hello".as_slice())],
-        );
-        write_plugin(
-            &workspace.join(".yoi/plugins/project-one.yoi-plugin"),
-            "project_one",
-            &[PluginSurface::Hook],
-            &[("hooks/project.md", b"hello".as_slice())],
-        );
-
-        let report = discover_plugins(
-            &PluginDiscoveryOptions::new(&workspace).with_user_data_home(&user_data),
-        );
-
-        assert_eq!(report.diagnostics, vec![]);
-        let identities: BTreeSet<_> = report
-            .packages
-            .iter()
-            .map(|package| package.identity.to_string())
-            .collect();
-        assert_eq!(
-            identities,
-            BTreeSet::from([
-                "project:project_one".to_string(),
-                "user:user_one".to_string()
-            ])
-        );
-        assert!(
-            report
-                .packages
-                .iter()
-                .all(|package| package.digest.starts_with("sha256:"))
-        );
-    }
-
-    #[test]
-    fn discovery_only_does_not_activate_packages() {
-        let (report, config) = fixture_with_enabled_plugin(false);
-
-        let resolution = resolve_enabled_plugins(&config, &report);
-
-        assert_eq!(report.packages.len(), 1);
-        assert!(resolution.resolved.is_empty());
-        assert!(resolution.diagnostics.is_empty());
-    }
-
-    #[test]
-    fn explicit_enablement_resolves_typed_metadata() {
-        let (report, config) = fixture_with_enabled_plugin(true);
-
-        let resolution = resolve_enabled_plugins(&config, &report);
-
-        assert_eq!(resolution.diagnostics, vec![]);
-        assert_eq!(resolution.resolved.len(), 1);
-        let resolved = &resolution.resolved[0];
-        assert_eq!(resolved.identity.to_string(), "project:example");
-        assert_eq!(resolved.enabled_surfaces, vec![PluginSurface::Hook]);
-        assert!(resolved.grants.is_empty());
-        assert_eq!(resolved.manifest.id, "example");
-    }
-
-    #[test]
-    fn duplicate_and_unqualified_ids_fail_closed() {
-        let temp = TempDir::new().unwrap();
-        let workspace = temp.path().join("workspace");
-        let plugins = workspace.join(".yoi/plugins");
-        fs::create_dir_all(&plugins).unwrap();
-        write_plugin(
-            &plugins.join("one.yoi-plugin"),
-            "dup",
-            &[PluginSurface::Hook],
-            &[("hooks/a.md", b"a")],
-        );
-        write_plugin(
-            &plugins.join("two.yoi-plugin"),
-            "dup",
-            &[PluginSurface::Hook],
-            &[("hooks/a.md", b"a")],
-        );
-        let report = discover_plugins(&PluginDiscoveryOptions::new(&workspace));
-
-        assert!(
-            report
-                .diagnostics
-                .iter()
-                .any(|diag| diag.kind == PluginDiagnosticKind::Duplicate)
-        );
-
-        let resolution = resolve_enabled_plugins(
-            &PluginConfig {
-                enabled: vec![
-                    PluginEnablementConfig {
-                        id: "project:dup".to_string(),
-                        ..PluginEnablementConfig::default()
-                    },
-                    PluginEnablementConfig {
-                        id: "dup".to_string(),
-                        ..PluginEnablementConfig::default()
-                    },
-                ],
-                ..PluginConfig::default()
-            },
-            &report,
-        );
-
-        assert!(resolution.resolved.is_empty());
-        assert!(
-            resolution
-                .diagnostics
-                .iter()
-                .any(|diag| diag.kind == PluginDiagnosticKind::Duplicate)
-        );
-        assert!(
-            resolution
-                .diagnostics
-                .iter()
-                .any(|diag| diag.kind == PluginDiagnosticKind::Ambiguous)
-        );
-    }
-
-    #[test]
-    fn digest_mismatch_fails_closed() {
-        let (report, _) = fixture_with_enabled_plugin(false);
-        let resolution = resolve_enabled_plugins(
-            &PluginConfig {
-                enabled: vec![PluginEnablementConfig {
-                    id: "project:example".to_string(),
-                    digest: Some("sha256:0000".to_string()),
-                    ..PluginEnablementConfig::default()
-                }],
-                ..PluginConfig::default()
-            },
-            &report,
-        );
-
-        assert!(resolution.resolved.is_empty());
-        assert_eq!(resolution.diagnostics[0].kind, PluginDiagnosticKind::Digest);
-    }
-
-    #[test]
-    fn exact_version_mismatch_fails_closed_with_distinct_diagnostic() {
-        let (report, _) = fixture_with_enabled_plugin(false);
-        let resolution = resolve_enabled_plugins(
-            &PluginConfig {
-                enabled: vec![PluginEnablementConfig {
-                    id: "project:example".to_string(),
-                    version: Some(PluginExactVersion("9.9.9".to_string())),
-                    ..PluginEnablementConfig::default()
-                }],
-                ..PluginConfig::default()
-            },
-            &report,
-        );
-
-        assert!(resolution.resolved.is_empty());
-        assert_eq!(
-            resolution.diagnostics[0].kind,
-            PluginDiagnosticKind::Version
-        );
-        assert_eq!(
-            resolution.diagnostics[0].phase,
-            PluginDiagnosticPhase::Resolution
-        );
-        assert!(
-            !resolution
-                .diagnostics
-                .iter()
-                .any(|diag| diag.kind == PluginDiagnosticKind::Api)
-        );
-    }
-
-    #[test]
-    fn resolved_plan_pins_unpinned_enablement_for_restore() {
-        let temp = TempDir::new().unwrap();
-        let workspace = temp.path().join("workspace");
-        let plugins = workspace.join(".yoi/plugins");
-        fs::create_dir_all(&plugins).unwrap();
-        let package = plugins.join("example.yoi-plugin");
-        write_plugin_version(
-            &package,
-            "example",
-            "0.1.0",
-            &[PluginSurface::Hook],
-            &[("hooks/example.md", b"v1")],
-        );
-        let options = PluginDiscoveryOptions::new(&workspace);
-        let config = PluginConfig {
-            enabled: vec![PluginEnablementConfig {
-                id: "project:example".to_string(),
-                ..PluginEnablementConfig::default()
-            }],
-            ..PluginConfig::default()
-        };
-
-        let startup_snapshot = resolve_plugin_config_for_startup(&config, &options);
-        assert_eq!(startup_snapshot.resolved.len(), 1);
-        let restored_digest = startup_snapshot.resolved[0].digest.clone();
-        assert_eq!(startup_snapshot.resolved[0].version, "0.1.0");
-
-        write_plugin_version(
-            &package,
-            "example",
-            "0.2.0",
-            &[PluginSurface::Hook],
-            &[("hooks/example.md", b"v2")],
-        );
-        let fresh_snapshot = resolve_plugin_config_for_startup(&config, &options);
-        assert_ne!(fresh_snapshot.resolved[0].digest, restored_digest);
-        assert_eq!(fresh_snapshot.resolved[0].version, "0.2.0");
-
-        let restored_snapshot = resolve_plugin_config_for_startup(&startup_snapshot, &options);
-        assert_eq!(restored_snapshot.resolved[0].digest, restored_digest);
-        assert_eq!(restored_snapshot.resolved[0].version, "0.1.0");
-    }
-
-    #[test]
-    fn currently_documented_manifest_shape_is_accepted() {
-        let temp = TempDir::new().unwrap();
-        let workspace = temp.path().join("workspace");
-        let plugins = workspace.join(".yoi/plugins");
-        fs::create_dir_all(&plugins).unwrap();
-        let manifest = r#"
-schema_version = 1
-id = "example.summarizer"
-name = "Example Summarizer"
-version = "0.1.0"
-description = "Adds a custom summary command."
-surfaces = ["hook"]
-
-[[hooks]]
-id = "summary"
-file = "hooks/summary.md"
-"#;
-        write_stored_zip(
-            &plugins.join("documented.yoi-plugin"),
-            &[
-                ("plugin.toml", manifest.as_bytes().to_vec(), 0),
-                ("hooks/summary.md", b"summarize".to_vec(), 0),
-            ],
-        );
-
-        let report = discover_plugins(&PluginDiscoveryOptions::new(&workspace));
-
-        assert_eq!(report.diagnostics, vec![]);
-        assert_eq!(report.packages.len(), 1);
-        assert_eq!(
-            report.packages[0].identity.to_string(),
-            "project:example.summarizer"
-        );
-    }
-
-    #[test]
-    fn package_manifest_tool_surface_shape_is_accepted() {
-        let manifest: PluginPackageManifest = toml::from_str(
-            r#"
-schema_version = 1
-id = "example.tool"
-name = "Example Tool"
-version = "0.1.0"
-
-[[tools]]
-name = "ExampleTool"
-description = "Runs a package-defined tool."
-input_schema = { type = "object", properties = { query = { type = "string" } }, required = ["query"], additionalProperties = false }
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(manifest.tools.len(), 1);
-        assert!(manifest.declared_surfaces().contains(&PluginSurface::Tool));
-        assert_eq!(manifest.tools[0].name, "ExampleTool");
-        assert_eq!(manifest.tools[0].input_schema["type"], "object");
-    }
-
-    #[test]
-    fn malformed_manifest_multibyte_diagnostic_is_bounded_and_redacted() {
-        let temp = TempDir::new().unwrap();
-        let workspace = temp.path().join("workspace");
-        let plugins = workspace.join(".yoi/plugins");
-        fs::create_dir_all(&plugins).unwrap();
-        let malformed = format!("schema_version = [\n# {}", "機密".repeat(200));
-        write_stored_zip(
-            &plugins.join("bad-multibyte.yoi-plugin"),
-            &[("plugin.toml", malformed.into_bytes(), 0)],
-        );
-
-        let report = discover_plugins(&PluginDiscoveryOptions::new(&workspace));
-
-        assert!(report.packages.is_empty());
-        let diagnostic = report
-            .diagnostics
-            .iter()
-            .find(|diag| diag.kind == PluginDiagnosticKind::Malformed)
-            .unwrap();
-        assert!(diagnostic.message.len() <= 241);
-        assert!(!diagnostic.message.contains("機密"));
-    }
-
-    #[test]
-    fn traversal_root_escape_in_archive_fails_closed() {
-        let temp = TempDir::new().unwrap();
-        let workspace = temp.path().join("workspace");
-        let plugins = workspace.join(".yoi/plugins");
-        fs::create_dir_all(&plugins).unwrap();
-        write_stored_zip(
-            &plugins.join("escape.yoi-plugin"),
-            &[
-                (
-                    "plugin.toml",
-                    manifest("escape", "0.1.0", &[PluginSurface::Hook]).into_bytes(),
-                    0,
-                ),
-                ("../evil", b"x".to_vec(), 0),
-            ],
-        );
-
-        let report = discover_plugins(&PluginDiscoveryOptions::new(&workspace));
-
-        assert!(report.packages.is_empty());
-        assert_eq!(report.diagnostics[0].kind, PluginDiagnosticKind::Traversal);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn package_symlink_store_escape_fails_closed() {
-        use std::os::unix::fs::symlink;
-
-        let temp = TempDir::new().unwrap();
-        let workspace = temp.path().join("workspace");
-        let plugins = workspace.join(".yoi/plugins");
-        let outside = temp.path().join("outside");
-        fs::create_dir_all(&plugins).unwrap();
-        write_plugin(
-            &outside,
-            "outside",
-            &[PluginSurface::Hook],
-            &[("hooks/a.md", b"a")],
-        );
-        symlink(&outside, plugins.join("outside.yoi-plugin")).unwrap();
-
-        let report = discover_plugins(&PluginDiscoveryOptions::new(&workspace));
-
-        assert!(report.packages.is_empty());
-        assert_eq!(report.diagnostics[0].kind, PluginDiagnosticKind::Traversal);
-    }
-
-    #[test]
-    fn unsupported_api_and_malformed_manifest_fail_closed() {
-        let temp = TempDir::new().unwrap();
-        let workspace = temp.path().join("workspace");
-        let plugins = workspace.join(".yoi/plugins");
-        fs::create_dir_all(&plugins).unwrap();
-        write_stored_zip(
-            &plugins.join("bad-schema.yoi-plugin"),
-            &[(
-                "plugin.toml",
-                manifest_with_schema("bad_schema", "0.1.0", 999).into_bytes(),
-                0,
-            )],
-        );
-        write_stored_zip(
-            &plugins.join("bad-toml.yoi-plugin"),
-            &[("plugin.toml", b"not = [valid".to_vec(), 0)],
-        );
-
-        let report = discover_plugins(&PluginDiscoveryOptions::new(&workspace));
-
-        assert!(report.packages.is_empty());
-        assert!(
-            report
-                .diagnostics
-                .iter()
-                .any(|diag| diag.kind == PluginDiagnosticKind::Api)
-        );
-        assert!(
-            report
-                .diagnostics
-                .iter()
-                .any(|diag| diag.kind == PluginDiagnosticKind::Malformed)
-        );
-    }
-
-    #[test]
-    fn typed_permission_grant_binding_resolves_only_exact_package_identity() {
-        let (report, _) = fixture_with_enabled_plugin(false);
-        let digest = report.packages[0].digest.clone();
-        let exact_grants = PluginGrantConfig {
-            id: Some("project:example".to_string()),
-            version: Some(PluginExactVersion("0.1.0".to_string())),
-            digest: Some(digest.clone()),
-            permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
-            request: Vec::new(),
-            websocket: Vec::new(),
-            fs: Vec::new(),
-        };
-        let resolution = resolve_enabled_plugins(
-            &PluginConfig {
-                enabled: vec![PluginEnablementConfig {
-                    id: "project:example".to_string(),
-                    grants: exact_grants,
-                    ..PluginEnablementConfig::default()
-                }],
-                ..PluginConfig::default()
-            },
-            &report,
-        );
-        assert!(
-            resolution.diagnostics.is_empty(),
-            "{:#?}",
-            resolution.diagnostics
-        );
-        assert_eq!(resolution.resolved.len(), 1);
-
-        for grants in [
-            PluginGrantConfig {
-                id: Some("project:other".to_string()),
-                version: Some(PluginExactVersion("0.1.0".to_string())),
-                digest: Some(digest.clone()),
-                permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
-                request: Vec::new(),
-                websocket: Vec::new(),
-                fs: Vec::new(),
-            },
-            PluginGrantConfig {
-                id: Some("project:example".to_string()),
-                version: Some(PluginExactVersion("0.1.1".to_string())),
-                digest: Some(digest.clone()),
-                permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
-                request: Vec::new(),
-                websocket: Vec::new(),
-                fs: Vec::new(),
-            },
-            PluginGrantConfig {
-                id: Some("project:example".to_string()),
-                version: Some(PluginExactVersion("0.1.0".to_string())),
-                digest: Some("sha256:unrelated".to_string()),
-                permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
-                request: Vec::new(),
-                websocket: Vec::new(),
-                fs: Vec::new(),
-            },
+        for forbidden in [
+            ".yoi/plugins",
+            "discover_plugins",
+            "resolve_enabled_plugins",
+            "resolve_plugin_config_for_startup",
+            "ResolvedPluginRecord",
+            "read_resolved_plugin_runtime_component",
+            "package_path",
+            "PluginSourceKind::Project",
+            "PluginSourceKind::User",
         ] {
-            let resolution = resolve_enabled_plugins(
-                &PluginConfig {
-                    enabled: vec![PluginEnablementConfig {
-                        id: "project:example".to_string(),
-                        grants,
-                        ..PluginEnablementConfig::default()
-                    }],
-                    ..PluginConfig::default()
-                },
-                &report,
-            );
-            assert!(resolution.resolved.is_empty());
             assert!(
-                resolution
-                    .diagnostics
-                    .iter()
-                    .any(|diag| diag.kind == PluginDiagnosticKind::Grant),
-                "{:#?}",
-                resolution.diagnostics
+                !source.contains(forbidden),
+                "ambient Plugin authority returned through {forbidden}"
             );
         }
-    }
-
-    #[test]
-    fn unknown_permission_kind_fails_closed_at_manifest_parse_boundary() {
-        let error = toml::from_str::<PluginPackageManifest>(
-            r#"schema_version = 1
-id = "example"
-name = "Example"
-version = "0.1.0"
-
-[[permissions]]
-kind = "ambient_shell"
-"#,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("ambient_shell"), "{error}");
-    }
-
-    #[test]
-    fn surface_and_grant_failures_do_not_resolve() {
-        let (report, _) = fixture_with_enabled_plugin(false);
-        let resolution = resolve_enabled_plugins(
-            &PluginConfig {
-                enabled: vec![
-                    PluginEnablementConfig {
-                        id: "project:example".to_string(),
-                        surfaces: vec![PluginSurface::Tool],
-                        ..PluginEnablementConfig::default()
-                    },
-                    PluginEnablementConfig {
-                        id: "project:example".to_string(),
-                        grants: PluginGrantConfig {
-                            permissions: vec![PluginPermission::surface(PluginSurface::Tool)],
-                            ..PluginGrantConfig::default()
-                        },
-                        ..PluginEnablementConfig::default()
-                    },
-                ],
-                ..PluginConfig::default()
-            },
-            &report,
-        );
-
-        assert!(resolution.resolved.is_empty());
-        assert!(
-            resolution
-                .diagnostics
-                .iter()
-                .any(|diag| diag.kind == PluginDiagnosticKind::Surface)
-        );
-        assert!(
-            resolution
-                .diagnostics
-                .iter()
-                .any(|diag| diag.kind == PluginDiagnosticKind::Grant)
-        );
-    }
-
-    fn fixture_with_enabled_plugin(enabled: bool) -> (PluginDiscoveryReport, PluginConfig) {
-        let temp = TempDir::new().unwrap();
-        let workspace = temp.path().join("workspace");
-        let plugins = workspace.join(".yoi/plugins");
-        fs::create_dir_all(&plugins).unwrap();
-        write_plugin(
-            &plugins.join("example.yoi-plugin"),
-            "example",
-            &[PluginSurface::Hook],
-            &[("hooks/example.md", b"hello")],
-        );
-        let report = discover_plugins(&PluginDiscoveryOptions::new(&workspace));
-        let config = PluginConfig {
-            enabled: if enabled {
-                vec![PluginEnablementConfig {
-                    id: "project:example".to_string(),
-                    ..PluginEnablementConfig::default()
-                }]
-            } else {
-                vec![]
-            },
-            ..PluginConfig::default()
-        };
-        (report, config)
-    }
-
-    fn write_plugin(
-        path: &Path,
-        id: &str,
-        surfaces: &[PluginSurface],
-        extra_files: &[(&str, &[u8])],
-    ) {
-        write_plugin_version(path, id, "0.1.0", surfaces, extra_files);
-    }
-
-    fn write_plugin_version(
-        path: &Path,
-        id: &str,
-        version: &str,
-        surfaces: &[PluginSurface],
-        extra_files: &[(&str, &[u8])],
-    ) {
-        let mut entries = vec![(
-            "plugin.toml",
-            manifest(id, version, surfaces).into_bytes(),
-            0,
-        )];
-        if surfaces.contains(&PluginSurface::Hook)
-            && !extra_files
-                .iter()
-                .any(|(path, _)| *path == "hooks/example.md")
-        {
-            entries.push(("hooks/example.md", b"hook".to_vec(), 0));
-        }
-        entries.extend(
-            extra_files
-                .iter()
-                .map(|(path, content)| (*path, content.to_vec(), 0)),
-        );
-        write_stored_zip(path, &entries);
-    }
-
-    fn manifest(id: &str, version: &str, surfaces: &[PluginSurface]) -> String {
-        let mut manifest = manifest_with_schema(id, version, SUPPORTED_PLUGIN_API_VERSION);
-        if surfaces.contains(&PluginSurface::Hook) {
-            manifest.push_str("\n[[hooks]]\nid = \"startup\"\nfile = \"hooks/example.md\"\n");
-        }
-        manifest
-    }
-
-    fn manifest_with_schema(id: &str, version: &str, schema_version: u32) -> String {
-        format!(
-            "schema_version = {schema_version}\nid = \"{id}\"\nname = \"Example\"\nversion = \"{version}\"\n"
-        )
-    }
-
-    fn write_stored_zip(path: &Path, entries: &[(&str, Vec<u8>, u32)]) {
-        let mut bytes = Vec::new();
-        let mut central = Vec::new();
-        for (name, content, external_attributes) in entries {
-            let local_offset = bytes.len() as u32;
-            write_u32(&mut bytes, ZIP_LOCAL_FILE);
-            write_u16(&mut bytes, 20);
-            write_u16(&mut bytes, 0x0800);
-            write_u16(&mut bytes, ZIP_COMPRESSION_STORED);
-            write_u16(&mut bytes, 0);
-            write_u16(&mut bytes, 0);
-            write_u32(&mut bytes, 0);
-            write_u32(&mut bytes, content.len() as u32);
-            write_u32(&mut bytes, content.len() as u32);
-            write_u16(&mut bytes, name.len() as u16);
-            write_u16(&mut bytes, 0);
-            bytes.extend_from_slice(name.as_bytes());
-            bytes.extend_from_slice(content);
-
-            write_u32(&mut central, ZIP_CENTRAL_DIRECTORY);
-            write_u16(&mut central, 20);
-            write_u16(&mut central, 20);
-            write_u16(&mut central, 0x0800);
-            write_u16(&mut central, ZIP_COMPRESSION_STORED);
-            write_u16(&mut central, 0);
-            write_u16(&mut central, 0);
-            write_u32(&mut central, 0);
-            write_u32(&mut central, content.len() as u32);
-            write_u32(&mut central, content.len() as u32);
-            write_u16(&mut central, name.len() as u16);
-            write_u16(&mut central, 0);
-            write_u16(&mut central, 0);
-            write_u16(&mut central, 0);
-            write_u16(&mut central, 0);
-            write_u32(&mut central, *external_attributes);
-            write_u32(&mut central, local_offset);
-            central.extend_from_slice(name.as_bytes());
-        }
-        let central_offset = bytes.len() as u32;
-        bytes.extend_from_slice(&central);
-        write_u32(&mut bytes, ZIP_EOCD);
-        write_u16(&mut bytes, 0);
-        write_u16(&mut bytes, 0);
-        write_u16(&mut bytes, entries.len() as u16);
-        write_u16(&mut bytes, entries.len() as u16);
-        write_u32(&mut bytes, central.len() as u32);
-        write_u32(&mut bytes, central_offset);
-        write_u16(&mut bytes, 0);
-        fs::write(path, bytes).unwrap();
-    }
-
-    fn write_u16(out: &mut Vec<u8>, value: u16) {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn write_u32(out: &mut Vec<u8>, value: u32) {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
-
-    #[test]
-    fn websocket_manifest_and_grants_parse_independently_from_request() {
-        let manifest: PluginPackageManifest = toml::from_str(
-            r#"
-schema_version = 1
-id = "project:example"
-name = "example"
-version = "1.0.0"
-surfaces = ["tool"]
-
-[runtime]
-kind = "wasm-component"
-component = "plugin.component.wasm"
-world = "yoi:plugin/tool@1.0.0"
-
-[[permissions]]
-kind = "host_api"
-api = "request"
-
-[[permissions]]
-kind = "host_api"
-api = "websocket"
-
-[[request]]
-scheme = "https"
-host = "api.example.com"
-methods = ["GET"]
-path_prefixes = ["/v1"]
-
-[[websocket]]
-scheme = "wss"
-host = "gateway.example.com"
-path_prefixes = ["/gateway"]
-"#,
-        )
-        .unwrap();
-        assert_eq!(manifest.request.len(), 1);
-        assert_eq!(manifest.websocket.len(), 1);
-        assert_eq!(
-            manifest.request[0].label(),
-            "https://api.example.com GET /v1"
-        );
-        assert_eq!(
-            manifest.websocket[0].label(),
-            "wss://gateway.example.com /gateway"
-        );
-        assert_eq!(
-            manifest.permissions[1],
-            PluginPermission::host_api(PluginHostApi::WebSocket)
-        );
-
-        let grants: PluginGrantConfig = toml::from_str(
-            r#"
-[[request]]
-scheme = "https"
-host = "api.example.com"
-methods = ["GET"]
-path_prefixes = ["/v1"]
-
-[[websocket]]
-scheme = "wss"
-host = "gateway.example.com"
-path_prefixes = ["/gateway"]
-"#,
-        )
-        .unwrap();
-        assert_eq!(grants.request.len(), 1);
-        assert_eq!(grants.websocket.len(), 1);
-        assert!(!grants.is_empty());
     }
 }
