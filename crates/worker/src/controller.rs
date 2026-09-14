@@ -1386,12 +1386,6 @@ where
         feature_registry
             .add_module(crate::feature::builtin::orchestration::orchestration_feature());
     }
-    for module in crate::feature::plugin::plugin_tool_features_if_enabled(
-        feature_config.plugins.enabled,
-        &worker.manifest().plugins,
-    ) {
-        feature_registry = feature_registry.with_module(module);
-    }
     if let Some(workspace_root) = local_workspace_root.as_ref() {
         if let Some(module) =
             crate::feature::mcp::discover_stdio_tool_feature(&mcp_config, workspace_root).await

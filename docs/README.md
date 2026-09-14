@@ -14,8 +14,8 @@ It is not a dumping ground for external research, old plans, API inventories, or
 6. [`design/flow-state-graph.md`](design/flow-state-graph.md) — Workspace Flow sources, immutable revisions, transition attempts, and bounded internal verification.
 7. [`design/profiles-manifests-prompts.md`](design/profiles-manifests-prompts.md) — reusable Profiles, resolved Manifests, and prompt resources.
 8. [`design/tool-permissions-scope.md`](design/tool-permissions-scope.md) — tool policy and filesystem scope.
-9. [`design/plugin-packages.md`](design/plugin-packages.md) — plugin package distribution, discovery, and enablement boundaries.
-10. [`development/plugin-development.md`](development/plugin-development.md) — how to build, package, enable, and inspect Yoi Plugins.
+9. [`design/plugin-packages.md`](design/plugin-packages.md) — the retained offline package format and the prohibition on ambient Plugin authority.
+10. [`development/plugin-development.md`](development/plugin-development.md) — explicit-path offline Plugin package authoring and inspection.
 11. [`design/memory-knowledge.md`](design/memory-knowledge.md) — generated memory and audit records.
 12. [`design/workspace-kanban-orchestrator-runtime.md`](design/workspace-kanban-orchestrator-runtime.md) — how Kanban operations become durable orchestration events and backend-internal routing decisions.
 13. [`design/workspace-runtime-docker.md`](design/workspace-runtime-docker.md) — the WebUI / Backend / Runtime split, Docker image layout, worker launch path, and workdir materialization boundary.

@@ -18,7 +18,6 @@ use crate::config::{
     CompactionConfigPartial, FeatureConfigPartial, PermissionConfigPartial, SessionConfigPartial,
 };
 use crate::model::{AuthRef, ModelManifest};
-use crate::plugin::PluginConfig;
 use crate::{
     EngineManifestConfig, McpConfig, McpStdioCwdPolicy, Permission, ResolveError, ScopeConfig,
     ScopeRule, SkillsConfig, WebConfig, WorkerManifest, WorkerManifestConfig, WorkerMetaConfig,
@@ -148,7 +147,6 @@ pub enum WorkspaceAuthorityRequirement {
     MergeRequest,
     Objective,
     Orchestration,
-    Plugins,
     Ticket,
     Worker,
 }
@@ -162,7 +160,6 @@ impl fmt::Display for WorkspaceAuthorityRequirement {
             Self::MergeRequest => formatter.write_str("feature.merge_request"),
             Self::Objective => formatter.write_str("feature.objective"),
             Self::Orchestration => formatter.write_str("feature.orchestration"),
-            Self::Plugins => formatter.write_str("feature.plugins or plugin packages"),
             Self::Ticket => formatter.write_str("feature.ticket"),
             Self::Worker => formatter.write_str("feature.worker"),
         }
@@ -201,9 +198,6 @@ pub fn validate_profile_execution_target(
     }
     if feature.orchestration.enabled {
         requirements.insert(WorkspaceAuthorityRequirement::Orchestration);
-    }
-    if feature.plugins.enabled || !manifest.plugins.is_empty() {
-        requirements.insert(WorkspaceAuthorityRequirement::Plugins);
     }
     if feature.ticket.enabled
         || feature.ticket.authoring
@@ -638,7 +632,6 @@ fn resolve_profile_value(
         session: profile.session,
         permissions: profile.permissions,
         feature: profile.feature,
-        plugins: profile.plugins,
         mcp: profile.mcp,
         compaction,
         web: profile.web,
@@ -683,8 +676,6 @@ struct ProfileConfig {
     permissions: Option<PermissionConfigPartial>,
     #[serde(default)]
     feature: FeatureConfigPartial,
-    #[serde(default)]
-    plugins: PluginConfig,
     #[serde(default)]
     mcp: McpConfig,
     #[serde(default)]
@@ -1270,6 +1261,51 @@ mod tests {
     }
 
     #[test]
+    fn ambient_plugin_directories_do_not_affect_builtin_profile_resolution() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace/nested");
+        std::fs::create_dir_all(&workspace).unwrap();
+        for root in [tmp.path(), tmp.path().join("workspace").as_path()] {
+            let package = root.join(".yoi/plugins/broken.yoi-plugin");
+            std::fs::create_dir_all(package.parent().unwrap()).unwrap();
+            std::fs::write(package, b"malformed ambient package").unwrap();
+        }
+
+        let resolved = ProfileResolver::new()
+            .with_workspace_base(&workspace)
+            .resolve_for_target(
+                &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "default"),
+                ProfileResolveOptions::with_worker_name("standalone-worker"),
+                ProfileExecutionTarget::Standalone,
+            )
+            .unwrap();
+
+        assert_eq!(resolved.manifest.worker.name, "standalone-worker");
+    }
+
+    #[test]
+    fn profile_rejects_dynamic_plugin_configuration() {
+        let tmp = TempDir::new().unwrap();
+        for body in [
+            "[feature.plugins]\nenabled = true\n",
+            "[[plugins.enabled]]\nid = \"explicit:example\"\n",
+        ] {
+            let profile = write_profile(tmp.path(), "plugin.toml", body);
+            let error = ProfileResolver::new()
+                .with_workspace_base(tmp.path())
+                .resolve(
+                    &ProfileSelector::path(profile),
+                    ProfileResolveOptions::with_worker_name("runtime-worker"),
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("unknown field"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn builtin_default_resolves_as_a_standalone_local_capability_profile() {
         let tmp = TempDir::new().unwrap();
         let resolved = ProfileResolver::new()
@@ -1307,8 +1343,6 @@ mod tests {
         assert!(!resolved.manifest.feature.flow.enabled);
         assert!(!resolved.manifest.feature.worker.enabled);
         assert!(!resolved.manifest.feature.manage_workdir.enabled);
-        assert!(!resolved.manifest.feature.plugins.enabled);
-        assert!(resolved.manifest.plugins.is_empty());
     }
 
     #[test]

@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::defaults;
 use crate::model::{AuthRef, ModelManifest, ReasoningControl};
-use crate::plugin::PluginConfig;
 use crate::{
     CompactionConfig, EngineManifest, FeatureConfig, FeatureFlagConfig, FileUploadLimits,
     McpConfig, McpEnvValue, McpStdioCwdPolicy, MemoryConsolidationProfileConfig,
@@ -55,10 +54,6 @@ pub struct WorkerManifestConfig {
     /// disabled after cascade merge.
     #[serde(default)]
     pub feature: FeatureConfigPartial,
-    /// Explicit plugin package enablement entries. Discovery/resolution is a
-    /// separate step and does not run during config merge.
-    #[serde(default)]
-    pub plugins: PluginConfig,
     /// Explicit Model Context Protocol provider declarations. Config parsing
     /// never starts a local MCP subprocess.
     #[serde(default)]
@@ -74,6 +69,7 @@ pub struct WorkerManifestConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeatureConfigPartial {
     #[serde(default)]
     pub task: Option<FeatureFlagConfigPartial>,
@@ -101,8 +97,6 @@ pub struct FeatureConfigPartial {
     pub merge_request: Option<MergeRequestFeatureConfigPartial>,
     #[serde(default)]
     pub orchestration: Option<FeatureFlagConfigPartial>,
-    #[serde(default)]
-    pub plugins: Option<FeatureFlagConfigPartial>,
 }
 
 impl FeatureConfigPartial {
@@ -145,7 +139,6 @@ impl FeatureConfigPartial {
                 other.orchestration,
                 FeatureFlagConfigPartial::merge,
             ),
-            plugins: merge_option(self.plugins, other.plugins, FeatureFlagConfigPartial::merge),
         }
     }
 }
@@ -370,10 +363,6 @@ impl From<FeatureConfigPartial> for FeatureConfig {
                 .orchestration
                 .map(FeatureFlagConfig::from)
                 .unwrap_or_default(),
-            plugins: value
-                .plugins
-                .map(FeatureFlagConfig::from)
-                .unwrap_or_default(),
         }
     }
 }
@@ -517,7 +506,6 @@ impl From<FeatureConfig> for FeatureConfigPartial {
             ticket: Some(value.ticket.into()),
             merge_request: Some(value.merge_request.into()),
             orchestration: Some(value.orchestration.into()),
-            plugins: Some(value.plugins.into()),
         }
     }
 }
@@ -654,6 +642,20 @@ pub(crate) fn reject_removed_manifest_fields(s: &str) -> Result<(), toml::de::Er
             "unknown field in manifest: memory (removed; configure feature.memory)",
         ));
     }
+    if value.get("plugins").is_some() {
+        return Err(toml::de::Error::custom(
+            "unknown field in manifest: plugins (dynamic Plugins are not supported)",
+        ));
+    }
+    if value
+        .get("feature")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|table| table.contains_key("plugins"))
+    {
+        return Err(toml::de::Error::custom(
+            "unknown field in manifest: feature.plugins (dynamic Plugins are not supported)",
+        ));
+    }
     if value
         .get("feature")
         .and_then(toml::Value::as_table)
@@ -771,7 +773,6 @@ impl WorkerManifestConfig {
                 PermissionConfigPartial::merge,
             ),
             feature: self.feature.merge(upper.feature),
-            plugins: merge_plugin_config(self.plugins, upper.plugins),
             mcp: merge_mcp_config(self.mcp, upper.mcp),
             compaction: merge_option(
                 self.compaction,
@@ -789,16 +790,6 @@ impl SkillsConfig {
         self.directories.extend(upper.directories);
         self
     }
-}
-
-fn merge_plugin_config(mut base: PluginConfig, upper: PluginConfig) -> PluginConfig {
-    let upper_has_resolved_plan = upper.has_resolved_plan();
-    base.enabled.extend(upper.enabled);
-    if upper_has_resolved_plan {
-        base.resolved = upper.resolved;
-        base.diagnostics = upper.diagnostics;
-    }
-    base
 }
 
 fn merge_mcp_config(mut base: McpConfig, upper: McpConfig) -> McpConfig {
@@ -1289,7 +1280,6 @@ impl TryFrom<WorkerManifestConfig> for WorkerManifest {
             session,
             permissions,
             feature: FeatureConfig::from(cfg.feature),
-            plugins: cfg.plugins,
             mcp: cfg.mcp,
             compaction,
             web: cfg.web,
@@ -1336,7 +1326,6 @@ mod tests {
             delegation_scope: ScopeConfig::default(),
             permissions: None,
             feature: FeatureConfigPartial::default(),
-            plugins: PluginConfig::default(),
             mcp: McpConfig::default(),
             session: None,
             compaction: None,

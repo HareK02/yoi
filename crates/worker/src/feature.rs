@@ -2211,7 +2211,6 @@ pub enum FeatureInstallError {
 pub mod background;
 pub mod builtin;
 pub mod mcp;
-pub mod plugin;
 pub(crate) mod session;
 
 #[cfg(test)]
@@ -2223,6 +2222,31 @@ mod tests {
     use futures::stream;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn worker_feature_composition_has_no_dynamic_plugin_install_path() {
+        let feature_source = include_str!("feature.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let controller_source = include_str!("controller.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for forbidden in [
+            "pub mod plugin",
+            "plugin_tool_features_if_enabled",
+            "ResolvedPluginRecord",
+            "read_resolved_plugin_runtime_component",
+            "feature.plugins",
+        ] {
+            assert!(
+                !feature_source.contains(forbidden) && !controller_source.contains(forbidden),
+                "dynamic Plugin install path returned through {forbidden}"
+            );
+        }
+        assert_eq!(FeatureId::builtin("task").as_str(), "builtin:task");
+    }
 
     #[derive(Clone)]
     struct DummyClient;
