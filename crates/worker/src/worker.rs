@@ -4,7 +4,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agen::llm_client::RequestConfig;
 use agen::llm_client::client::LlmClient;
@@ -40,6 +40,10 @@ use manifest::{
 };
 
 use crate::compact::state::CompactState;
+use crate::compact::telemetry::{
+    CompactAttempt, CompactFailureCategory, CompactMode, CompactSuccessStats,
+    CompactThresholdPolicy,
+};
 use crate::compact::usage_tracker::UsageTracker;
 use crate::feature::background::{BackgroundTaskRewriteGuard, FeatureBackgroundTaskRegistry};
 use crate::feature::builtin::memory::WorkspaceMemoryBackendError;
@@ -3359,12 +3363,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             domain: session_metrics::DOMAIN.into(),
             payload,
         };
-        if let Err(err) = self.commit_entry(entry) {
-            warn!(name = %metric.name, error = %err, "failed to record session metric; dropping");
+        if self.commit_entry(entry).is_err() {
+            warn!(name = %metric.name, "failed to record session metric; dropping");
+            let bounded_name = metric.name.chars().take(64).collect::<String>();
             self.alert(
                 AlertLevel::Warn,
                 AlertSource::Worker,
-                format!("failed to record metric `{}`: {}", metric.name, err),
+                format!("failed to record metric `{bounded_name}`"),
             );
         }
     }
@@ -4890,7 +4895,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         for recorded in usage_records {
             let crate::compact::usage_tracker::RecordedUsage {
                 record,
-                correlation_id,
+                post_requests,
             } = recorded;
             self.commit_entry(LogEntry::LlmUsage {
                 ts: segment_log::now_millis(),
@@ -4900,12 +4905,23 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 cache_write_tokens: record.cache_write_tokens,
                 output_tokens: record.output_tokens,
             })?;
-            if let Some(id) = correlation_id {
-                let metric = session_metrics::Metric::now("prune.post_request")
-                    .with_correlation_id(&id)
-                    .with_value(record.cache_read_tokens as f64)
+            for link in post_requests {
+                let value = match link.metric {
+                    crate::compact::usage_tracker::PostRequestMetric::Prune => {
+                        record.cache_read_tokens
+                    }
+                    crate::compact::usage_tracker::PostRequestMetric::Compaction => {
+                        record.input_total_tokens
+                    }
+                };
+                let metric = session_metrics::Metric::now(link.metric.name())
+                    .with_correlation_id(&link.correlation_id)
+                    .with_value(value as f64)
+                    .with_dimension("history_len", record.history_len.to_string())
+                    .with_dimension("input_total_tokens", record.input_total_tokens.to_string())
+                    .with_dimension("cache_read_tokens", record.cache_read_tokens.to_string())
                     .with_dimension("cache_write_tokens", record.cache_write_tokens.to_string())
-                    .with_dimension("history_len", record.history_len.to_string());
+                    .with_dimension("output_tokens", record.output_tokens.to_string());
                 self.try_record_metric(&metric);
             }
             self.usage_history
@@ -4986,6 +5002,31 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             error: None,
             new_segment_id: None,
         };
+        let started = Instant::now();
+        let source_location = self.segment_state.location();
+        let history_items = self.session.history().items_cloned();
+        let usage_history = self.usage_history();
+        let pre_context = agen::token_counter::total_tokens(&history_items, &usage_history);
+        let attempt = CompactAttempt::new(
+            lifecycle.compaction_id.clone(),
+            source_location.session_id,
+            source_location.segment_id,
+            match trigger {
+                CompactionTrigger::Manual => CompactMode::Manual,
+                CompactionTrigger::PreRun | CompactionTrigger::RequestThreshold => {
+                    CompactMode::Automatic
+                }
+            },
+            match trigger {
+                CompactionTrigger::Manual => CompactThresholdPolicy::Manual,
+                CompactionTrigger::PreRun => CompactThresholdPolicy::PreRun,
+                CompactionTrigger::RequestThreshold => CompactThresholdPolicy::RequestThreshold,
+            },
+            pre_context.tokens,
+            pre_context.source,
+            retained_tokens,
+        );
+        self.try_record_metric(&attempt.start_metric());
         let started_at_ms = lifecycle.started_at_ms;
         self.set_compaction_progress(Some(InFlightCompaction {
             phase: CompactionPhase::Preparing,
@@ -5006,12 +5047,24 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 .await
         };
         match outcome {
-            Ok((new_segment_id, _summary)) => {
+            Ok((new_segment_id, _summary, stats)) => {
                 debug_assert_eq!(lifecycle.state, CompactionLifecycleState::Done);
+                for metric in attempt.success_metrics(new_segment_id, started.elapsed(), &stats) {
+                    self.try_record_metric(&metric);
+                }
+                self.usage_tracker
+                    .note_compaction_correlation_id(attempt.correlation_id().to_string());
                 self.release_compaction_service(&lifecycle).await;
                 Ok(new_segment_id)
             }
             Err(error) => {
+                let observed_segment_id = self.segment_state.location().segment_id;
+                let metric = attempt.failure_metric(
+                    observed_segment_id,
+                    started.elapsed(),
+                    compact_failure_category(&error),
+                );
+                self.try_record_metric(&metric);
                 lifecycle.revision = lifecycle.revision.saturating_add(1);
                 lifecycle.state = if matches!(error, WorkerError::CompactCancelled) {
                     CompactionLifecycleState::Interrupted
@@ -5052,7 +5105,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         retained_tokens: u64,
         lifecycle: &mut CompactionLifecycle,
         trigger: CompactionTrigger,
-    ) -> Result<(SegmentId, String), WorkerError> {
+    ) -> Result<(SegmentId, String, CompactSuccessStats), WorkerError> {
         use crate::compact::worker::{
             CompactWorkerContext, CompactWorkerInterceptor, CompactionOutputFeature,
         };
@@ -5414,6 +5467,57 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         } else {
             Vec::new()
         };
+        let auto_read_tokens = agen::token_counter::total_tokens(&auto_read_messages, &[]).tokens;
+        let retained_estimate = agen::token_counter::total_tokens(&retained_items, &[]);
+        let retained_item_count = u64::try_from(retained_items.len()).unwrap_or(u64::MAX);
+        let summarized_item_count = u64::try_from(items_to_summarise.len()).unwrap_or(u64::MAX);
+        let compactor_entries = handle.entries();
+        let compactor_turns = compactor_entries
+            .iter()
+            .filter_map(|entry| match entry {
+                LogEntry::TurnEnd { turn_count, .. } => u64::try_from(*turn_count).ok(),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let compactor_tool_calls = u64::try_from(
+            compactor_entries
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry,
+                        LogEntry::AnnotatedAssistantItem { entry, .. }
+                            if matches!(&entry.item, session_store::LoggedItem::ToolCall { .. })
+                    )
+                })
+                .count(),
+        )
+        .unwrap_or(u64::MAX);
+        let mut compactor_usage = crate::compact::usage_tracker::UsageSnapshot::default();
+        let mut compactor_requests = 0_u64;
+        for entry in &compactor_entries {
+            if let LogEntry::LlmUsage {
+                input_total_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                output_tokens,
+                ..
+            } = entry
+            {
+                compactor_requests = compactor_requests.saturating_add(1);
+                compactor_usage.input_total_tokens = compactor_usage
+                    .input_total_tokens
+                    .saturating_add(*input_total_tokens);
+                compactor_usage.cache_read_tokens = compactor_usage
+                    .cache_read_tokens
+                    .saturating_add(*cache_read_tokens);
+                compactor_usage.cache_write_tokens = compactor_usage
+                    .cache_write_tokens
+                    .saturating_add(*cache_write_tokens);
+                compactor_usage.output_tokens =
+                    compactor_usage.output_tokens.saturating_add(*output_tokens);
+            }
+        }
 
         // Reference list as a single system message; omitted when empty.
         let reference_message = (!final_ctx.references.is_empty()).then(|| {
@@ -5651,7 +5755,25 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         lifecycle.state = CompactionLifecycleState::Done;
         lifecycle.ended_at_ms = Some(segment_log::now_millis());
         self.set_compaction_progress(None);
-        Ok((new_segment_id, summary_text))
+        Ok((
+            new_segment_id,
+            summary_text,
+            CompactSuccessStats {
+                retained_items: retained_item_count,
+                summarized_items: summarized_item_count,
+                retained_tokens: retained_estimate.tokens,
+                retained_tokens_source: retained_estimate.source,
+                overview_tokens: summary_input.overview_tokens,
+                summary_tokens,
+                auto_read_tokens,
+                result_context_tokens: result_estimate.tokens,
+                result_context_source: result_estimate.source,
+                usage: compactor_usage,
+                requests: compactor_requests,
+                turns: compactor_turns,
+                tool_calls: compactor_tool_calls,
+            },
+        ))
     }
 
     /// Build the LlmClient for the compactor Engine.
@@ -7011,6 +7133,27 @@ fn restored_flow_runtime_state(
             })
         })
         .transpose()
+}
+
+fn compact_failure_category(error: &WorkerError) -> CompactFailureCategory {
+    match error {
+        WorkerError::CompactCancelled => CompactFailureCategory::Cancelled,
+        WorkerError::CompactSummaryMissing => CompactFailureCategory::SummaryMissing,
+        WorkerError::CompactSummaryTooLarge { .. } => CompactFailureCategory::SummaryTooLarge,
+        WorkerError::CompactResultContextTooLarge { .. } => {
+            CompactFailureCategory::ResultContextTooLarge
+        }
+        WorkerError::WorkerStore(_) => CompactFailureCategory::ActiveSegmentCommit,
+        WorkerError::Store(_) => CompactFailureCategory::Storage,
+        WorkerError::InvalidState(_) | WorkerError::Engine(_) => {
+            CompactFailureCategory::InternalWorker
+        }
+        WorkerError::Provider(_)
+        | WorkerError::PromptCatalog(_)
+        | WorkerError::FeatureLifecycle(_)
+        | WorkerError::FeatureInstall(_) => CompactFailureCategory::Preparation,
+        _ => CompactFailureCategory::Other,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

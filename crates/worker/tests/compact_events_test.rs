@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use agen::Engine;
-use agen::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
+use agen::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent, UsageEvent};
 use agen::llm_client::types::Item;
 use agen::llm_client::{ClientError, LlmClient, Request};
 use async_trait::async_trait;
@@ -234,6 +234,49 @@ fn write_summary_tool_use_events(call_id: &str, text: &str) -> Vec<LlmEvent> {
     ]
 }
 
+fn write_summary_tool_use_events_with_usage(
+    call_id: &str,
+    text: &str,
+    input_total: u64,
+    cache_read: u64,
+    cache_write: u64,
+    output: u64,
+) -> Vec<LlmEvent> {
+    let mut events = write_summary_tool_use_events(call_id, text);
+    events.insert(
+        events.len() - 1,
+        LlmEvent::Usage(UsageEvent {
+            input_tokens: Some(input_total),
+            output_tokens: Some(output),
+            total_tokens: Some(input_total.saturating_add(output)),
+            cache_read_input_tokens: Some(cache_read),
+            cache_creation_input_tokens: Some(cache_write),
+        }),
+    );
+    events
+}
+
+fn text_events_with_full_usage(
+    text: &str,
+    input_total: u64,
+    cache_read: u64,
+    cache_write: u64,
+    output: u64,
+) -> Vec<LlmEvent> {
+    let mut events = single_text_events(text);
+    events.insert(
+        events.len() - 1,
+        LlmEvent::Usage(UsageEvent {
+            input_tokens: Some(input_total),
+            output_tokens: Some(output),
+            total_tokens: Some(input_total.saturating_add(output)),
+            cache_read_input_tokens: Some(cache_read),
+            cache_creation_input_tokens: Some(cache_write),
+        }),
+    );
+    events
+}
+
 // A low compact_threshold guarantees `try_pre_run_compact` will fire
 // the first time we check after a run.
 const POST_RUN_MANIFEST_TOML: &str = r#"
@@ -250,6 +293,27 @@ max_tokens = 100
 
 [compaction]
 compact_threshold = 1
+compact_retained_tokens = 0
+
+[[scope.allow]]
+target = "./"
+permission = "write"
+"#;
+
+const MANUAL_ONLY_MANIFEST_TOML: &str = r#"
+[worker]
+name = "test-worker"
+pwd = "./"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[engine]
+max_tokens = 100
+
+[compaction]
+compact_threshold = 1000000000
 compact_retained_tokens = 0
 
 [[scope.allow]]
@@ -457,6 +521,28 @@ async fn failed_active_segment_commit_keeps_live_and_durable_history_on_old_segm
     );
 
     assert_eq!(worker.segment_id(), old_segment_id);
+    let failure_metrics =
+        session_metrics::read_segment_metrics(&segment_store, worker.session_id(), old_segment_id)
+            .unwrap();
+    let start = failure_metrics
+        .iter()
+        .find(|record| record.metric.name == "compact.start")
+        .unwrap();
+    let finish = failure_metrics
+        .iter()
+        .find(|record| record.metric.name == "compact.finish")
+        .unwrap();
+    assert_eq!(finish.metric.dimensions["outcome"], "failure");
+    assert_eq!(
+        finish.metric.dimensions["failure_category"],
+        "active_segment_commit"
+    );
+    assert_eq!(finish.metric.correlation_id, start.metric.correlation_id);
+    assert!(
+        !serde_json::to_string(&finish.metric)
+            .unwrap()
+            .contains("injected active Segment commit failure")
+    );
     let metadata = metadata_store
         .read_by_name("test-worker")
         .unwrap()
@@ -605,16 +691,18 @@ permission = "write"
 async fn compact_emits_session_start_carrying_summary_and_task_snapshot() {
     let client = MockClient::new(vec![
         single_text_events("hi"),
-        write_summary_tool_use_events("call-1", "summary"),
-        single_text_events("done"),
+        write_summary_tool_use_events_with_usage("call-1", "summary", 100, 10, 5, 20),
+        text_events_with_full_usage("done", 50, 3, 2, 10),
+        text_events_with_full_usage("after", 44, 4, 1, 6),
     ]);
-    let mut worker = make_worker(client).await;
+    let mut worker = make_worker_with_manifest(MANUAL_ONLY_MANIFEST_TOML, client).await;
 
     let (tx, _rx_keep) = broadcast::channel::<Event>(64);
     worker.attach_working_event_tx(tx);
 
     worker.run_text("first").await.unwrap();
     let session_id = worker.session_id();
+    let source_segment_id = worker.segment_id();
     worker.compact(10_000).await.unwrap();
     let compacted_segment_id = worker.segment_id();
     let metadata = worker
@@ -642,6 +730,148 @@ async fn compact_emits_session_start_carrying_summary_and_task_snapshot() {
             .any(|text| text.starts_with("[Session TaskStore snapshot]")),
         "task snapshot system message missing from {system_texts:?}"
     );
+
+    worker.run_text("after compaction").await.unwrap();
+    let metrics = session_metrics::read_session_metrics(worker.store(), session_id).unwrap();
+    let starts = metrics
+        .iter()
+        .filter(|record| record.metric.name == "compact.start")
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].segment_id, source_segment_id);
+    assert_eq!(starts[0].metric.dimensions["mode"], "automatic");
+    assert_eq!(
+        starts[0].metric.dimensions["threshold_policy"],
+        "request_threshold"
+    );
+    let correlation_id = starts[0]
+        .metric
+        .correlation_id
+        .as_deref()
+        .expect("compact start must carry a correlation id");
+    let finish = metrics
+        .iter()
+        .find(|record| record.metric.name == "compact.finish")
+        .unwrap();
+    assert_eq!(finish.segment_id, compacted_segment_id);
+    assert_eq!(finish.metric.dimensions["outcome"], "success");
+    assert_eq!(
+        finish.metric.correlation_id.as_deref(),
+        Some(correlation_id)
+    );
+    assert_eq!(
+        finish.compacted_from.as_ref().unwrap().segment_id,
+        starts[0].segment_id
+    );
+
+    let value = |name: &str| {
+        metrics
+            .iter()
+            .find(|record| record.metric.name == name)
+            .and_then(|record| record.metric.value)
+            .unwrap() as u64
+    };
+    assert_eq!(value("compact.compactor.input_tokens"), 150);
+    assert_eq!(value("compact.compactor.cache_read_tokens"), 13);
+    assert_eq!(value("compact.compactor.cache_write_tokens"), 7);
+    assert_eq!(value("compact.compactor.output_tokens"), 30);
+    assert_eq!(value("compact.compactor.requests"), 2);
+    assert!(value("compact.compactor.tool_calls") >= 1);
+    assert!(value("compact.compactor.turns") >= 2);
+    assert!(value("compact.duration_ms") <= u64::MAX);
+    let cost = metrics
+        .iter()
+        .find(|record| record.metric.name == "compact.compactor.cost_usd")
+        .unwrap();
+    assert_eq!(cost.metric.value, None);
+    assert_eq!(cost.metric.dimensions["status"], "unavailable");
+    let post = metrics
+        .iter()
+        .find(|record| record.metric.name == "compact.post_request")
+        .unwrap();
+    assert_eq!(post.segment_id, compacted_segment_id);
+    assert_eq!(post.metric.correlation_id.as_deref(), Some(correlation_id));
+    assert_eq!(post.metric.dimensions["input_total_tokens"], "44");
+    assert_eq!(post.metric.dimensions["cache_read_tokens"], "4");
+    assert_eq!(post.metric.dimensions["cache_write_tokens"], "1");
+    assert_eq!(post.metric.dimensions["output_tokens"], "6");
+}
+
+#[tokio::test]
+async fn manual_compact_metrics_identify_manual_mode() {
+    let client = MockClient::new(vec![
+        single_text_events("seed response"),
+        write_summary_tool_use_events("summary", "replacement summary"),
+        single_text_events("done"),
+    ]);
+    let mut worker = make_worker_with_manifest(MANUAL_ONLY_MANIFEST_TOML, client).await;
+    worker.run_text("seed input").await.unwrap();
+    let session_id = worker.session_id();
+
+    worker.manual_compact().await.unwrap();
+
+    let metrics = session_metrics::read_session_metrics(worker.store(), session_id).unwrap();
+    let start = metrics
+        .iter()
+        .find(|record| record.metric.name == "compact.start")
+        .unwrap();
+    assert_eq!(start.metric.dimensions["mode"], "manual");
+    assert_eq!(start.metric.dimensions["threshold_policy"], "manual");
+    let finish = metrics
+        .iter()
+        .find(|record| record.metric.name == "compact.finish")
+        .unwrap();
+    assert_eq!(finish.metric.dimensions["outcome"], "success");
+    assert_eq!(finish.metric.correlation_id, start.metric.correlation_id);
+}
+
+#[tokio::test]
+async fn compact_failure_and_cancellation_emit_bounded_categories() {
+    let client = MockClient::new(vec![
+        single_text_events("seed response"),
+        single_text_events("missing summary"),
+        single_text_events("still missing summary"),
+    ]);
+    let mut worker = make_worker_with_manifest(MANUAL_ONLY_MANIFEST_TOML, client).await;
+    worker.run_text("seed input").await.unwrap();
+    let session_id = worker.session_id();
+    let source_segment_id = worker.segment_id();
+
+    let error = worker.manual_compact().await.unwrap_err();
+    assert!(matches!(error, worker::WorkerError::CompactSummaryMissing));
+    let metrics = session_metrics::read_session_metrics(worker.store(), session_id).unwrap();
+    let failure = metrics
+        .iter()
+        .find(|record| {
+            record.metric.name == "compact.finish"
+                && record.metric.dimensions["outcome"] == "failure"
+        })
+        .unwrap();
+    assert_eq!(failure.segment_id, source_segment_id);
+    assert_eq!(
+        failure.metric.dimensions["failure_category"],
+        "summary_missing"
+    );
+    let encoded = serde_json::to_string(&failure.metric).unwrap();
+    assert!(!encoded.contains("missing summary"));
+
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(true);
+    let error = worker
+        .manual_compact_with_cancel(cancel_rx)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, worker::WorkerError::CompactCancelled));
+    let metrics = session_metrics::read_session_metrics(worker.store(), session_id).unwrap();
+    let cancelled = metrics
+        .iter()
+        .filter(|record| {
+            record.metric.name == "compact.finish"
+                && record.metric.dimensions["outcome"] == "cancelled"
+        })
+        .last()
+        .unwrap();
+    assert_eq!(cancelled.segment_id, source_segment_id);
+    assert_eq!(cancelled.metric.dimensions["failure_category"], "cancelled");
 }
 
 #[tokio::test]
@@ -707,6 +937,20 @@ async fn pre_run_compact_publishes_runtime_progress_phases() {
         entry,
         LogEntry::Extension { domain, .. } if domain == "yoi.compaction"
     )));
+    let metrics = session_metrics::read_session_metrics(worker.store(), session_before).unwrap();
+    let start = metrics
+        .iter()
+        .find(|record| record.metric.name == "compact.start")
+        .unwrap();
+    assert_eq!(start.segment_id, segment_before);
+    assert_eq!(start.metric.dimensions["mode"], "automatic");
+    assert_eq!(start.metric.dimensions["threshold_policy"], "pre_run");
+    let finish = metrics
+        .iter()
+        .find(|record| record.metric.name == "compact.finish")
+        .unwrap();
+    assert_eq!(finish.metric.dimensions["outcome"], "success");
+    assert_eq!(finish.metric.correlation_id, start.metric.correlation_id);
 }
 
 #[tokio::test]
@@ -723,7 +967,7 @@ async fn request_threshold_compact_publishes_runtime_progress() {
         text_events_with_usage("a", 1000),
         write_summary_tool_use_events("call-1", "summary"),
         single_text_events("done"),
-        single_text_events("b"),
+        text_events_with_usage("b", 50),
     ]);
     let mut worker = make_worker_with_manifest(MID_TURN_MANIFEST_TOML, client).await;
 
@@ -749,6 +993,22 @@ async fn request_threshold_compact_publishes_runtime_progress() {
             .iter()
             .any(|event| matches!(event, Event::CompactionProgress { compaction: None }))
     );
+    let metrics =
+        session_metrics::read_session_metrics(worker.store(), worker.session_id()).unwrap();
+    let start = metrics
+        .iter()
+        .find(|record| record.metric.name == "compact.start")
+        .unwrap();
+    assert_eq!(
+        start.metric.dimensions["threshold_policy"],
+        "request_threshold"
+    );
+    let correlation_id = start.metric.correlation_id.as_deref().unwrap();
+    let post = metrics
+        .iter()
+        .find(|record| record.metric.name == "compact.post_request")
+        .unwrap();
+    assert_eq!(post.metric.correlation_id.as_deref(), Some(correlation_id));
 }
 
 #[tokio::test]

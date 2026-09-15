@@ -19,14 +19,41 @@ use std::sync::Mutex;
 use agen::UsageRecord;
 use agen::timeline::event::UsageEvent;
 
-/// One drained measurement: the underlying `UsageRecord` plus an optional
-/// `correlation_id` stamped by the prune projection (or any other future
-/// upstream observer) so that downstream metrics emitted alongside this
-/// record can be joined to it after the fact.
+/// The metric emitted after the next measured provider request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostRequestMetric {
+    Prune,
+    Compaction,
+}
+
+impl PostRequestMetric {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Prune => "prune.post_request",
+            Self::Compaction => "compact.post_request",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PostRequestLink {
+    pub(crate) correlation_id: String,
+    pub(crate) metric: PostRequestMetric,
+}
+
+/// One drained measurement and its causal metric links.
 #[derive(Debug, Clone)]
 pub(crate) struct RecordedUsage {
     pub(crate) record: UsageRecord,
-    pub(crate) correlation_id: Option<String>,
+    pub(crate) post_requests: Vec<PostRequestLink>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct UsageSnapshot {
+    pub(crate) input_total_tokens: u64,
+    pub(crate) cache_read_tokens: u64,
+    pub(crate) cache_write_tokens: u64,
+    pub(crate) output_tokens: u64,
 }
 
 /// Shared between the pre-request hook, the `on_usage` callback, and Worker.
@@ -34,11 +61,8 @@ pub(crate) struct UsageTracker {
     /// `history.len()` captured at the most recent `pre_llm_request`.
     /// Cleared when paired with an incoming `on_usage` event.
     pending_history_len: Mutex<Option<usize>>,
-    /// Optional `correlation_id` set by an upstream observer (currently
-    /// the prune projection on `Fired`). Paired into the next
-    /// `RecordedUsage` and cleared. Skips that don't fire leave this
-    /// `None`, so the resulting record carries no correlation.
-    pending_correlation_id: Mutex<Option<String>>,
+    /// Optional causal link consumed by the next measured request.
+    pending_correlations: Mutex<Vec<PostRequestLink>>,
     /// Records accumulated during the current run; drained by Worker.
     pending_records: Mutex<Vec<RecordedUsage>>,
 }
@@ -47,7 +71,7 @@ impl UsageTracker {
     pub(crate) fn new() -> Self {
         Self {
             pending_history_len: Mutex::new(None),
-            pending_correlation_id: Mutex::new(None),
+            pending_correlations: Mutex::new(Vec::new()),
             pending_records: Mutex::new(Vec::new()),
         }
     }
@@ -57,16 +81,23 @@ impl UsageTracker {
         *self.pending_history_len.lock().unwrap() = Some(history_len);
     }
 
-    /// Stash a `correlation_id` to be paired into the next `RecordedUsage`.
-    /// Currently invoked by the prune observer on `Fired` so that the
-    /// `prune.fire` metric and the `prune.post_request` metric (emitted
-    /// alongside the resulting `LlmUsage`) carry the same join key.
-    ///
-    /// Overwrites any previous unconsumed value — by construction the
-    /// observer fires at most once per outgoing LLM request, immediately
-    /// before the pre-request hook captures `history_len`.
+    /// Pair a prune event with the next provider request.
     pub(crate) fn note_correlation_id(&self, id: String) {
-        *self.pending_correlation_id.lock().unwrap() = Some(id);
+        self.note_post_request(id, PostRequestMetric::Prune);
+    }
+
+    /// Pair a completed compaction with the next normal provider request.
+    pub(crate) fn note_compaction_correlation_id(&self, id: String) {
+        self.note_post_request(id, PostRequestMetric::Compaction);
+    }
+
+    fn note_post_request(&self, id: String, metric: PostRequestMetric) {
+        let mut pending = self.pending_correlations.lock().unwrap();
+        pending.retain(|link| link.metric != metric);
+        pending.push(PostRequestLink {
+            correlation_id: id,
+            metric,
+        });
     }
 
     /// Called from the `on_usage` callback with the aggregated final
@@ -79,7 +110,7 @@ impl UsageTracker {
             Some(n) => n,
             None => return,
         };
-        let correlation_id = self.pending_correlation_id.lock().unwrap().take();
+        let post_requests = std::mem::take(&mut *self.pending_correlations.lock().unwrap());
         // UsageEvent.input_tokens は scheme 層で「占有量（プロンプト全長）」に
         // 正規化済みである前提（Anthropic は cache_read + cache_creation を
         // 加算して emit する）。
@@ -95,7 +126,7 @@ impl UsageTracker {
                 cache_write_tokens: cache_write,
                 output_tokens: output,
             },
-            correlation_id,
+            post_requests,
         });
     }
 
@@ -145,7 +176,7 @@ mod tests {
         assert_eq!(records[0].record.cache_read_tokens, 800);
         assert_eq!(records[0].record.cache_write_tokens, 100);
         assert_eq!(records[0].record.output_tokens, 42);
-        assert!(records[0].correlation_id.is_none());
+        assert!(records[0].post_requests.is_empty());
     }
 
     #[test]
@@ -193,6 +224,24 @@ mod tests {
     }
 
     #[test]
+    fn prune_and_compaction_links_share_the_next_request() {
+        let tracker = UsageTracker::new();
+        tracker.note_compaction_correlation_id("compact-id".into());
+        tracker.note_correlation_id("prune-id".into());
+        tracker.note_request(5);
+        tracker.record_usage(&make_event(100, 10, 2, 20));
+
+        let records = tracker.drain();
+        assert_eq!(records[0].post_requests.len(), 2);
+        assert!(records[0].post_requests.iter().any(|link| {
+            link.correlation_id == "compact-id" && link.metric == PostRequestMetric::Compaction
+        }));
+        assert!(records[0].post_requests.iter().any(|link| {
+            link.correlation_id == "prune-id" && link.metric == PostRequestMetric::Prune
+        }));
+    }
+
+    #[test]
     fn correlation_id_pairs_with_next_record_only() {
         let tracker = UsageTracker::new();
         // Stash an ID, then run a request → the ID should land on this record.
@@ -205,7 +254,9 @@ mod tests {
 
         let records = tracker.drain();
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].correlation_id.as_deref(), Some("abc"));
-        assert!(records[1].correlation_id.is_none());
+        assert_eq!(records[0].post_requests.len(), 1);
+        assert_eq!(records[0].post_requests[0].correlation_id, "abc");
+        assert_eq!(records[0].post_requests[0].metric, PostRequestMetric::Prune);
+        assert!(records[1].post_requests.is_empty());
     }
 }
