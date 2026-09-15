@@ -829,6 +829,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{LogEntry, Store};
 
     #[test]
     fn worker_metadata_manifest_snapshot_roundtrips() {
@@ -1048,6 +1049,111 @@ mod tests {
         assert!(restored.spawned_children.is_empty());
         assert_eq!(restored.reclaimed_children.len(), 1);
         assert_eq!(restored.reclaimed_children[0].scope_delegated, vec![scope]);
+    }
+
+    #[test]
+    fn staged_segment_is_invisible_until_cas_and_reopen_selects_committed_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        let workers = temp.path().join("workers");
+        let open = || {
+            CombinedStore::new(
+                crate::FsStore::new(&sessions).unwrap(),
+                FsWorkerStore::new(&workers).unwrap(),
+            )
+        };
+        let store = open();
+        let session_id = crate::new_session_id();
+        let old_segment_id = crate::new_segment_id();
+        let new_segment_id = crate::new_segment_id();
+        let entry = |label: &str| LogEntry::Extension {
+            ts: 1,
+            domain: label.into(),
+            payload: serde_json::json!({}),
+        };
+        store
+            .create_segment(session_id, old_segment_id, &[entry("old-history")])
+            .unwrap();
+        store
+            .write(&WorkerMetadata::new(
+                "agent",
+                Some(WorkerActiveSegmentRef::active_segment(
+                    session_id,
+                    old_segment_id,
+                )),
+            ))
+            .unwrap();
+        store
+            .create_segment(session_id, new_segment_id, &[entry("new-history")])
+            .unwrap();
+        drop(store);
+
+        let reopened = open();
+        assert_eq!(
+            reopened
+                .read_by_name("agent")
+                .unwrap()
+                .unwrap()
+                .active
+                .unwrap()
+                .segment_id,
+            Some(old_segment_id)
+        );
+        assert!(
+            reopened
+                .compare_and_swap_active(
+                    "agent",
+                    &WorkerActiveSegmentRef::active_segment(session_id, old_segment_id),
+                    WorkerActiveSegmentRef::active_segment(session_id, new_segment_id),
+                )
+                .unwrap()
+        );
+        drop(reopened);
+
+        let reopened = open();
+        assert_eq!(
+            reopened
+                .read_by_name("agent")
+                .unwrap()
+                .unwrap()
+                .active
+                .unwrap()
+                .segment_id,
+            Some(new_segment_id)
+        );
+        assert!(matches!(
+            reopened.read_all(session_id, new_segment_id).unwrap().as_slice(),
+            [LogEntry::Extension { domain, .. }] if domain == "new-history"
+        ));
+    }
+
+    #[test]
+    fn aggregate_store_uses_expected_old_segment_cas() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = WorkerAggregateStore::new(temp.path(), "agent").unwrap();
+        let session_id = crate::new_session_id();
+        let old = WorkerActiveSegmentRef::active_segment(session_id, crate::new_segment_id());
+        store
+            .write(&WorkerMetadata::new("agent", Some(old.clone())))
+            .unwrap();
+        assert!(
+            store
+                .compare_and_swap_active(
+                    "agent",
+                    &old,
+                    WorkerActiveSegmentRef::active_segment(session_id, crate::new_segment_id()),
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .compare_and_swap_active(
+                    "agent",
+                    &old,
+                    WorkerActiveSegmentRef::active_segment(session_id, crate::new_segment_id()),
+                )
+                .unwrap()
+        );
     }
 
     #[test]

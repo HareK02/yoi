@@ -1521,9 +1521,9 @@ impl App {
             } => {
                 self.rewind_refresh_fence = false;
                 self.pending_submissions = session.pending_submissions.clone();
+                self.apply_worker_state_snapshot(&state);
                 self.restore_snapshot(&session, greeting, in_flight);
                 self.replace_internal_worker_snapshots(internal_workers);
-                self.apply_worker_state_snapshot(&state);
             }
             Event::InternalWorker {
                 worker,
@@ -4339,16 +4339,24 @@ mod completion_flow_tests {
     #[test]
     fn snapshot_restores_and_runtime_clear_removes_compaction_progress() {
         let mut app = App::new("test".into());
-        app.worker_state.state = protocol::WorkerState::Busy(
-            protocol::WorkerBusyState::Maintenance(protocol::WorkerMaintenanceState::Compacting),
-        );
-        app.apply_in_flight_snapshot(InFlightSnapshot {
-            compaction: Some(protocol::InFlightCompaction {
-                phase: protocol::CompactionPhase::Summarizing,
-                started_at_ms: 100,
-                trigger: protocol::CompactionTrigger::Manual,
-            }),
-            ..InFlightSnapshot::default()
+        assert_eq!(app.worker_state.state, protocol::WorkerState::Idle);
+        let mut state = protocol::WorkerStateSnapshot::initial(2);
+        state.state = protocol::WorkerState::Busy(protocol::WorkerBusyState::Maintenance(
+            protocol::WorkerMaintenanceState::Compacting,
+        ));
+        app.handle_worker_event(Event::Snapshot {
+            session: public_session(Vec::new()),
+            greeting: test_greeting(),
+            state,
+            in_flight: InFlightSnapshot {
+                compaction: Some(protocol::InFlightCompaction {
+                    phase: protocol::CompactionPhase::Summarizing,
+                    started_at_ms: 100,
+                    trigger: protocol::CompactionTrigger::Manual,
+                }),
+                ..InFlightSnapshot::default()
+            },
+            internal_workers: Vec::new(),
         });
         assert_eq!(compact_block_count(&app), 0);
         assert_eq!(
