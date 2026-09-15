@@ -48,9 +48,9 @@ Compaction measurements stay out of the ordinary transcript. They are appended a
 3. Compare `compact.retained_tokens`, `compact.overview_tokens`,
    `compact.summary_tokens`, `compact.auto_read_tokens`, and
    `compact.result_context_tokens` to explain the context-size change.
-4. Compare the Compactor's input/output/cache-read/cache-write tokens, request,
+4. Compare the Compactor's input/output/cache-read/cache-creation tokens, request,
    turn, tool-call, and duration metrics. The current provider `UsageEvent` has no
-   pricing authority, so `compact.compactor.cost_usd` is valueless with
+   pricing authority, so `compact.cost_usd` is valueless with
    `status=unavailable` and `reason=provider_usage_unpriced`; do not fabricate a
    zero cost. Record a numeric value only after a price authority exists.
 5. Aggregate failure and cancellation using the fixed `failure_category` values.

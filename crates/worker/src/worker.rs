@@ -5043,12 +5043,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             }
             Err(error) => {
                 let observed_segment_id = self.segment_state.location().segment_id;
-                let metric = attempt.failure_metric(
+                for metric in attempt.failure_metrics(
                     observed_segment_id,
                     started.elapsed(),
                     compact_failure_category(&error),
-                );
-                self.try_record_metric(&metric);
+                ) {
+                    self.try_record_metric(&metric);
+                }
                 lifecycle.revision = lifecycle.revision.saturating_add(1);
                 lifecycle.state = if matches!(error, WorkerError::CompactCancelled) {
                     CompactionLifecycleState::Interrupted

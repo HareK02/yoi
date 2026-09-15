@@ -501,7 +501,8 @@ async fn active_segment_cas_rejects_stale_compaction_writer() {
         .iter()
         .find(|record| record.metric.name == "compact.finish")
         .unwrap();
-    assert_eq!(finish.metric.dimensions["outcome"], "failure");
+    assert_eq!(finish.metric.dimensions["outcome"], "failed");
+    assert_eq!(finish.metric.value, Some(1.0));
     assert_eq!(
         finish.metric.dimensions["failure_category"],
         "active_segment_commit"
@@ -550,7 +551,8 @@ async fn failed_active_segment_commit_keeps_live_and_durable_history_on_old_segm
         .iter()
         .find(|record| record.metric.name == "compact.finish")
         .unwrap();
-    assert_eq!(finish.metric.dimensions["outcome"], "failure");
+    assert_eq!(finish.metric.dimensions["outcome"], "failed");
+    assert_eq!(finish.metric.value, Some(1.0));
     assert_eq!(
         finish.metric.dimensions["failure_category"],
         "active_segment_commit"
@@ -758,6 +760,7 @@ async fn compact_emits_session_start_carrying_summary_and_task_snapshot() {
     assert_eq!(starts.len(), 1);
     assert_eq!(starts[0].segment_id, source_segment_id);
     assert_eq!(starts[0].metric.dimensions["mode"], "automatic");
+    assert_eq!(starts[0].metric.dimensions["trigger"], "automatic");
     assert_eq!(
         starts[0].metric.dimensions["threshold_policy"],
         "request_threshold"
@@ -772,7 +775,8 @@ async fn compact_emits_session_start_carrying_summary_and_task_snapshot() {
         .find(|record| record.metric.name == "compact.finish")
         .unwrap();
     assert_eq!(finish.segment_id, compacted_segment_id);
-    assert_eq!(finish.metric.dimensions["outcome"], "success");
+    assert_eq!(finish.metric.dimensions["outcome"], "succeeded");
+    assert_eq!(finish.metric.value, Some(1.0));
     assert_eq!(
         finish.metric.correlation_id.as_deref(),
         Some(correlation_id)
@@ -789,17 +793,17 @@ async fn compact_emits_session_start_carrying_summary_and_task_snapshot() {
             .and_then(|record| record.metric.value)
             .unwrap() as u64
     };
-    assert_eq!(value("compact.compactor.input_tokens"), 150);
-    assert_eq!(value("compact.compactor.cache_read_tokens"), 13);
-    assert_eq!(value("compact.compactor.cache_write_tokens"), 7);
-    assert_eq!(value("compact.compactor.output_tokens"), 30);
-    assert_eq!(value("compact.compactor.requests"), 2);
-    assert!(value("compact.compactor.tool_calls") >= 1);
-    assert!(value("compact.compactor.turns") >= 2);
+    assert_eq!(value("compact.input_tokens"), 150);
+    assert_eq!(value("compact.cache_read_tokens"), 13);
+    assert_eq!(value("compact.cache_creation_tokens"), 7);
+    assert_eq!(value("compact.output_tokens"), 30);
+    assert_eq!(value("compact.requests"), 2);
+    assert!(value("compact.tool_calls") >= 1);
+    assert!(value("compact.turns") >= 2);
     assert!(value("compact.duration_ms") <= u64::MAX);
     let cost = metrics
         .iter()
-        .find(|record| record.metric.name == "compact.compactor.cost_usd")
+        .find(|record| record.metric.name == "compact.cost_usd")
         .unwrap();
     assert_eq!(cost.metric.value, None);
     assert_eq!(cost.metric.dimensions["status"], "unavailable");
@@ -834,12 +838,14 @@ async fn manual_compact_metrics_identify_manual_mode() {
         .find(|record| record.metric.name == "compact.start")
         .unwrap();
     assert_eq!(start.metric.dimensions["mode"], "manual");
+    assert_eq!(start.metric.dimensions["trigger"], "manual");
     assert_eq!(start.metric.dimensions["threshold_policy"], "manual");
     let finish = metrics
         .iter()
         .find(|record| record.metric.name == "compact.finish")
         .unwrap();
-    assert_eq!(finish.metric.dimensions["outcome"], "success");
+    assert_eq!(finish.metric.dimensions["outcome"], "succeeded");
+    assert_eq!(finish.metric.value, Some(1.0));
     assert_eq!(finish.metric.correlation_id, start.metric.correlation_id);
 }
 
@@ -862,10 +868,11 @@ async fn compact_failure_and_cancellation_emit_bounded_categories() {
         .iter()
         .find(|record| {
             record.metric.name == "compact.finish"
-                && record.metric.dimensions["outcome"] == "failure"
+                && record.metric.dimensions["outcome"] == "failed"
         })
         .unwrap();
     assert_eq!(failure.segment_id, source_segment_id);
+    assert_eq!(failure.metric.value, Some(1.0));
     assert_eq!(
         failure.metric.dimensions["failure_category"],
         "summary_missing"
@@ -889,6 +896,7 @@ async fn compact_failure_and_cancellation_emit_bounded_categories() {
         .last()
         .unwrap();
     assert_eq!(cancelled.segment_id, source_segment_id);
+    assert_eq!(cancelled.metric.value, Some(1.0));
     assert_eq!(cancelled.metric.dimensions["failure_category"], "cancelled");
 }
 
@@ -962,12 +970,14 @@ async fn pre_run_compact_publishes_runtime_progress_phases() {
         .unwrap();
     assert_eq!(start.segment_id, segment_before);
     assert_eq!(start.metric.dimensions["mode"], "automatic");
+    assert_eq!(start.metric.dimensions["trigger"], "automatic");
     assert_eq!(start.metric.dimensions["threshold_policy"], "pre_run");
     let finish = metrics
         .iter()
         .find(|record| record.metric.name == "compact.finish")
         .unwrap();
-    assert_eq!(finish.metric.dimensions["outcome"], "success");
+    assert_eq!(finish.metric.dimensions["outcome"], "succeeded");
+    assert_eq!(finish.metric.value, Some(1.0));
     assert_eq!(finish.metric.correlation_id, start.metric.correlation_id);
 }
 
@@ -1017,6 +1027,7 @@ async fn request_threshold_compact_publishes_runtime_progress() {
         .iter()
         .find(|record| record.metric.name == "compact.start")
         .unwrap();
+    assert_eq!(start.metric.dimensions["trigger"], "automatic");
     assert_eq!(
         start.metric.dimensions["threshold_policy"],
         "request_threshold"

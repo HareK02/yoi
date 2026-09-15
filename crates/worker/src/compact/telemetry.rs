@@ -130,16 +130,11 @@ impl CompactAttempt {
         let dimensions = self.base_dimensions();
         let correlation_id = self.correlation_id.clone();
         let mut metrics = vec![
-            metric_with_context(
-                "compact.finish",
-                elapsed.as_millis().min(u128::from(MAX_SAFE_INTEGER)) as u64,
-                &dimensions,
-                &correlation_id,
-            )
-            .with_dimension("outcome", "success")
-            .with_dimension("result_segment_id", result_segment_id.to_string())
-            .with_dimension("retained_items", stats.retained_items.to_string())
-            .with_dimension("summarized_items", stats.summarized_items.to_string()),
+            metric_with_context("compact.finish", 1, &dimensions, &correlation_id)
+                .with_dimension("outcome", "succeeded")
+                .with_dimension("result_segment_id", result_segment_id.to_string())
+                .with_dimension("retained_items", stats.retained_items.to_string())
+                .with_dimension("summarized_items", stats.summarized_items.to_string()),
             metric_with_context(
                 "compact.retained_tokens",
                 stats.retained_tokens,
@@ -173,43 +168,38 @@ impl CompactAttempt {
             )
             .with_dimension("source", estimate_source(stats.result_context_source)),
             metric_with_context(
-                "compact.compactor.input_tokens",
+                "compact.input_tokens",
                 stats.usage.input_total_tokens,
                 &dimensions,
                 &correlation_id,
             ),
             metric_with_context(
-                "compact.compactor.output_tokens",
+                "compact.output_tokens",
                 stats.usage.output_tokens,
                 &dimensions,
                 &correlation_id,
             ),
             metric_with_context(
-                "compact.compactor.cache_read_tokens",
+                "compact.cache_read_tokens",
                 stats.usage.cache_read_tokens,
                 &dimensions,
                 &correlation_id,
             ),
             metric_with_context(
-                "compact.compactor.cache_write_tokens",
+                "compact.cache_creation_tokens",
                 stats.usage.cache_write_tokens,
                 &dimensions,
                 &correlation_id,
             ),
             metric_with_context(
-                "compact.compactor.requests",
+                "compact.requests",
                 stats.requests,
                 &dimensions,
                 &correlation_id,
             ),
+            metric_with_context("compact.turns", stats.turns, &dimensions, &correlation_id),
             metric_with_context(
-                "compact.compactor.turns",
-                stats.turns,
-                &dimensions,
-                &correlation_id,
-            ),
-            metric_with_context(
-                "compact.compactor.tool_calls",
+                "compact.tool_calls",
                 stats.tool_calls,
                 &dimensions,
                 &correlation_id,
@@ -229,7 +219,7 @@ impl CompactAttempt {
         // Provider UsageEvent currently carries tokens but no price or cost. Keep
         // the field explicit and valueless rather than fabricating a zero cost.
         metrics.push(
-            self.metric("compact.compactor.cost_usd")
+            self.metric("compact.cost_usd")
                 .with_dimension("status", "unavailable")
                 .with_dimension("reason", "provider_usage_unpriced")
                 .with_dimension("result_segment_id", result_segment_id.to_string()),
@@ -237,22 +227,29 @@ impl CompactAttempt {
         metrics
     }
 
-    pub(crate) fn failure_metric(
+    pub(crate) fn failure_metrics(
         &self,
         observed_segment_id: SegmentId,
         elapsed: Duration,
         category: CompactFailureCategory,
-    ) -> Metric {
+    ) -> [Metric; 2] {
         let outcome = if category == CompactFailureCategory::Cancelled {
             "cancelled"
         } else {
-            "failure"
+            "failed"
         };
-        self.metric("compact.finish")
-            .with_value(elapsed.as_millis().min(u128::from(MAX_SAFE_INTEGER)) as f64)
+        let outcome_metric = self
+            .metric("compact.finish")
+            .with_value(1.0)
             .with_dimension("outcome", outcome)
             .with_dimension("failure_category", category.as_str())
-            .with_dimension("observed_segment_id", observed_segment_id.to_string())
+            .with_dimension("observed_segment_id", observed_segment_id.to_string());
+        let duration_metric = self
+            .metric("compact.duration_ms")
+            .with_value(elapsed.as_millis().min(u128::from(MAX_SAFE_INTEGER)) as f64)
+            .with_dimension("outcome", outcome)
+            .with_dimension("observed_segment_id", observed_segment_id.to_string());
+        [outcome_metric, duration_metric]
     }
 
     fn metric(&self, name: &'static str) -> Metric {
@@ -269,6 +266,7 @@ impl CompactAttempt {
                 self.source_segment_id.to_string(),
             ),
             ("mode".into(), self.mode.as_str().into()),
+            ("trigger".into(), self.mode.as_str().into()),
             (
                 "threshold_policy".into(),
                 self.threshold_policy.as_str().into(),
@@ -359,6 +357,7 @@ mod tests {
         assert_eq!(start.name, "compact.start");
         assert_eq!(start.value, Some(MAX_SAFE_INTEGER as f64));
         assert_eq!(start.dimensions["mode"], "automatic");
+        assert_eq!(start.dimensions["trigger"], "automatic");
         assert_eq!(start.dimensions["threshold_policy"], "request_threshold");
         assert_eq!(start.dimensions["occupancy_source"], "measured");
         assert!(start.correlation_id.is_some());
@@ -400,12 +399,16 @@ mod tests {
             EstimateSource::NoData,
             1,
         );
-        let metric = attempt.failure_metric(
+        let [metric, duration] = attempt.failure_metrics(
             uuid::Uuid::now_v7(),
             Duration::from_millis(7),
             CompactFailureCategory::InternalWorker,
         );
         let encoded = serde_json::to_string(&metric).unwrap();
+        assert_eq!(metric.value, Some(1.0));
+        assert_eq!(metric.dimensions["outcome"], "failed");
+        assert_eq!(duration.name, "compact.duration_ms");
+        assert_eq!(duration.value, Some(7.0));
         assert!(encoded.contains("internal_worker"));
         assert!(!encoded.contains("error"));
         assert!(!encoded.contains("path"));
