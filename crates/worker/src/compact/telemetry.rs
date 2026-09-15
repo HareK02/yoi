@@ -266,7 +266,7 @@ impl CompactAttempt {
                 self.source_segment_id.to_string(),
             ),
             ("mode".into(), self.mode.as_str().into()),
-            ("trigger".into(), self.mode.as_str().into()),
+            ("trigger".into(), self.threshold_policy.as_str().into()),
             (
                 "threshold_policy".into(),
                 self.threshold_policy.as_str().into(),
@@ -305,6 +305,15 @@ fn metric_with_context(
     metric
 }
 
+pub(crate) fn new_compact_metric_correlation_id(lifecycle_id: &str) -> String {
+    loop {
+        let correlation_id = uuid::Uuid::now_v7().to_string();
+        if correlation_id != lifecycle_id {
+            return correlation_id;
+        }
+    }
+}
+
 pub(crate) fn correlated_post_request_metric(
     kind: PostRequestMetric,
     correlation_id: &str,
@@ -330,10 +339,10 @@ pub(crate) fn safe_metric_number(value: u64) -> f64 {
 
 fn estimate_source(source: EstimateSource) -> &'static str {
     match source {
-        EstimateSource::Measured => "measured",
-        EstimateSource::Interpolated => "interpolated",
-        EstimateSource::Extrapolated => "extrapolated",
-        EstimateSource::NoData => "no_data",
+        EstimateSource::Measured => "provider",
+        EstimateSource::Interpolated | EstimateSource::Extrapolated | EstimateSource::NoData => {
+            "fallback"
+        }
     }
 }
 
@@ -357,12 +366,28 @@ mod tests {
         assert_eq!(start.name, "compact.start");
         assert_eq!(start.value, Some(MAX_SAFE_INTEGER as f64));
         assert_eq!(start.dimensions["mode"], "automatic");
-        assert_eq!(start.dimensions["trigger"], "automatic");
+        assert_eq!(start.dimensions["trigger"], "request_threshold");
         assert_eq!(start.dimensions["threshold_policy"], "request_threshold");
-        assert_eq!(start.dimensions["occupancy_source"], "measured");
+        assert_eq!(start.dimensions["occupancy_source"], "provider");
         assert!(start.correlation_id.is_some());
         assert!(start.dimensions.keys().all(|key| key.len() <= 32));
         assert!(start.dimensions.values().all(|value| value.len() <= 64));
+    }
+
+    #[test]
+    fn occupancy_sources_match_the_public_provider_fallback_schema() {
+        assert_eq!(estimate_source(EstimateSource::Measured), "provider");
+        assert_eq!(estimate_source(EstimateSource::Interpolated), "fallback");
+        assert_eq!(estimate_source(EstimateSource::Extrapolated), "fallback");
+        assert_eq!(estimate_source(EstimateSource::NoData), "fallback");
+    }
+
+    #[test]
+    fn metric_correlation_id_is_distinct_from_lifecycle_identity() {
+        let lifecycle_id = uuid::Uuid::now_v7().to_string();
+        let correlation_id = new_compact_metric_correlation_id(&lifecycle_id);
+        assert_ne!(correlation_id, lifecycle_id);
+        assert!(uuid::Uuid::parse_str(&correlation_id).is_ok());
     }
 
     #[test]

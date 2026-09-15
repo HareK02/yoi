@@ -35,7 +35,7 @@ The important property is explainability: after compaction, records should still
 ## Metrics and comparison procedure
 
 Compaction measurements stay out of the ordinary transcript. They are appended as
-`session.metrics` extensions and are read only through the explicit
+`metrics` extensions and are read only through the explicit
 `session-metrics` reader/export path. `read_session_metrics` attaches the durable
 `segment_id` and `SegmentStart.compacted_from` lineage to each record.
 

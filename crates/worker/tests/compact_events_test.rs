@@ -760,7 +760,7 @@ async fn compact_emits_session_start_carrying_summary_and_task_snapshot() {
     assert_eq!(starts.len(), 1);
     assert_eq!(starts[0].segment_id, source_segment_id);
     assert_eq!(starts[0].metric.dimensions["mode"], "automatic");
-    assert_eq!(starts[0].metric.dimensions["trigger"], "automatic");
+    assert_eq!(starts[0].metric.dimensions["trigger"], "request_threshold");
     assert_eq!(
         starts[0].metric.dimensions["threshold_policy"],
         "request_threshold"
@@ -970,7 +970,7 @@ async fn pre_run_compact_publishes_runtime_progress_phases() {
         .unwrap();
     assert_eq!(start.segment_id, segment_before);
     assert_eq!(start.metric.dimensions["mode"], "automatic");
-    assert_eq!(start.metric.dimensions["trigger"], "automatic");
+    assert_eq!(start.metric.dimensions["trigger"], "pre_run");
     assert_eq!(start.metric.dimensions["threshold_policy"], "pre_run");
     let finish = metrics
         .iter()
@@ -1027,7 +1027,7 @@ async fn request_threshold_compact_publishes_runtime_progress() {
         .iter()
         .find(|record| record.metric.name == "compact.start")
         .unwrap();
-    assert_eq!(start.metric.dimensions["trigger"], "automatic");
+    assert_eq!(start.metric.dimensions["trigger"], "request_threshold");
     assert_eq!(
         start.metric.dimensions["threshold_policy"],
         "request_threshold"

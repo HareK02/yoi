@@ -42,7 +42,7 @@ use manifest::{
 use crate::compact::state::CompactState;
 use crate::compact::telemetry::{
     CompactAttempt, CompactFailureCategory, CompactMode, CompactSuccessStats,
-    CompactThresholdPolicy, correlated_post_request_metric,
+    CompactThresholdPolicy, correlated_post_request_metric, new_compact_metric_correlation_id,
 };
 use crate::compact::usage_tracker::UsageTracker;
 use crate::feature::background::{BackgroundTaskRewriteGuard, FeatureBackgroundTaskRegistry};
@@ -4991,8 +4991,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let history_items = self.session.history().items_cloned();
         let usage_history = self.usage_history();
         let pre_context = agen::token_counter::total_tokens(&history_items, &usage_history);
+        let metric_correlation_id = new_compact_metric_correlation_id(&lifecycle.compaction_id);
         let attempt = CompactAttempt::new(
-            lifecycle.compaction_id.clone(),
+            metric_correlation_id,
             source_location.session_id,
             source_location.segment_id,
             match trigger {

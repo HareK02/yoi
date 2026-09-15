@@ -24,7 +24,7 @@ use session_metrics::{
 
 let metric = Metric::now("compact.start")
     .with_value(12_345.0)
-    .with_dimension("trigger", "automatic")
+    .with_dimension("trigger", "pre_run")
     .with_correlation_id("018f6f8a-9822-7b11-8b35-706f30313700");
 record_metric(
     &store,
