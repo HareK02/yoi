@@ -2,10 +2,11 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use agen::token_counter::EstimateSource;
+use agen::usage_record::UsageRecord;
 use session_metrics::Metric;
 use session_store::{SegmentId, SessionId};
 
-use super::usage_tracker::UsageSnapshot;
+use super::usage_tracker::{PostRequestMetric, UsageSnapshot};
 
 const MAX_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 
@@ -112,7 +113,7 @@ impl CompactAttempt {
 
     pub(crate) fn start_metric(&self) -> Metric {
         self.metric("compact.start")
-            .with_value(safe_number(self.pre_context_tokens))
+            .with_value(safe_metric_number(self.pre_context_tokens))
             .with_dimension("occupancy_source", estimate_source(self.pre_context_source))
             .with_dimension(
                 "retained_token_budget",
@@ -300,13 +301,32 @@ fn metric_with_context(
     correlation_id: &str,
 ) -> Metric {
     let mut metric = Metric::now(name)
-        .with_value(safe_number(value))
+        .with_value(safe_metric_number(value))
         .with_correlation_id(correlation_id);
     metric.dimensions = dimensions.clone();
     metric
 }
 
-fn safe_number(value: u64) -> f64 {
+pub(crate) fn correlated_post_request_metric(
+    kind: PostRequestMetric,
+    correlation_id: &str,
+    record: &UsageRecord,
+) -> Metric {
+    let value = match kind {
+        PostRequestMetric::Prune => record.cache_read_tokens,
+        PostRequestMetric::Compaction => record.input_total_tokens,
+    };
+    Metric::now(kind.name())
+        .with_correlation_id(correlation_id)
+        .with_value(safe_metric_number(value))
+        .with_dimension("history_len", record.history_len.to_string())
+        .with_dimension("input_total_tokens", record.input_total_tokens.to_string())
+        .with_dimension("cache_read_tokens", record.cache_read_tokens.to_string())
+        .with_dimension("cache_write_tokens", record.cache_write_tokens.to_string())
+        .with_dimension("output_tokens", record.output_tokens.to_string())
+}
+
+pub(crate) fn safe_metric_number(value: u64) -> f64 {
     value.min(MAX_SAFE_INTEGER) as f64
 }
 
@@ -344,6 +364,28 @@ mod tests {
         assert!(start.correlation_id.is_some());
         assert!(start.dimensions.keys().all(|key| key.len() <= 32));
         assert!(start.dimensions.values().all(|value| value.len() <= 64));
+    }
+
+    #[test]
+    fn post_request_metric_saturates_values_above_json_safe_integer() {
+        let record = UsageRecord {
+            history_len: 1,
+            input_total_tokens: u64::MAX,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 1,
+        };
+        let metric = correlated_post_request_metric(
+            PostRequestMetric::Compaction,
+            "018f6f8a-9822-7b11-8b35-706f30313700",
+            &record,
+        );
+        assert_eq!(metric.name, "compact.post_request");
+        assert_eq!(metric.value, Some(MAX_SAFE_INTEGER as f64));
+        assert_eq!(
+            metric.dimensions["input_total_tokens"],
+            u64::MAX.to_string()
+        );
     }
 
     #[test]

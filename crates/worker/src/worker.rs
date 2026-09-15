@@ -42,7 +42,7 @@ use manifest::{
 use crate::compact::state::CompactState;
 use crate::compact::telemetry::{
     CompactAttempt, CompactFailureCategory, CompactMode, CompactSuccessStats,
-    CompactThresholdPolicy,
+    CompactThresholdPolicy, correlated_post_request_metric,
 };
 use crate::compact::usage_tracker::UsageTracker;
 use crate::feature::background::{BackgroundTaskRewriteGuard, FeatureBackgroundTaskRegistry};
@@ -3094,9 +3094,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             WorkerActiveSegmentRef::active_segment(replacement.session_id, replacement.segment_id),
         )?;
         if !matched {
-            return Err(WorkerError::InvalidState(
-                "active Segment changed before compaction commit".into(),
-            ));
+            return Err(WorkerError::CompactActiveSegmentChanged);
         }
         Ok(())
     }
@@ -4906,22 +4904,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 output_tokens: record.output_tokens,
             })?;
             for link in post_requests {
-                let value = match link.metric {
-                    crate::compact::usage_tracker::PostRequestMetric::Prune => {
-                        record.cache_read_tokens
-                    }
-                    crate::compact::usage_tracker::PostRequestMetric::Compaction => {
-                        record.input_total_tokens
-                    }
-                };
-                let metric = session_metrics::Metric::now(link.metric.name())
-                    .with_correlation_id(&link.correlation_id)
-                    .with_value(value as f64)
-                    .with_dimension("history_len", record.history_len.to_string())
-                    .with_dimension("input_total_tokens", record.input_total_tokens.to_string())
-                    .with_dimension("cache_read_tokens", record.cache_read_tokens.to_string())
-                    .with_dimension("cache_write_tokens", record.cache_write_tokens.to_string())
-                    .with_dimension("output_tokens", record.output_tokens.to_string());
+                let metric =
+                    correlated_post_request_metric(link.metric, &link.correlation_id, &record);
                 self.try_record_metric(&metric);
             }
             self.usage_history
@@ -7143,7 +7127,9 @@ fn compact_failure_category(error: &WorkerError) -> CompactFailureCategory {
         WorkerError::CompactResultContextTooLarge { .. } => {
             CompactFailureCategory::ResultContextTooLarge
         }
-        WorkerError::WorkerStore(_) => CompactFailureCategory::ActiveSegmentCommit,
+        WorkerError::WorkerStore(_) | WorkerError::CompactActiveSegmentChanged => {
+            CompactFailureCategory::ActiveSegmentCommit
+        }
         WorkerError::Store(_) => CompactFailureCategory::Storage,
         WorkerError::InvalidState(_) | WorkerError::Engine(_) => {
             CompactFailureCategory::InternalWorker
@@ -7207,6 +7193,9 @@ pub enum WorkerError {
 
     #[error(transparent)]
     Provider(#[from] crate::model_client::ProviderError),
+
+    #[error("active Segment changed before compaction commit")]
+    CompactActiveSegmentChanged,
 
     #[error("compaction thrash: context still exceeds threshold immediately after compact")]
     CompactThrash,

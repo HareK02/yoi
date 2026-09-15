@@ -475,10 +475,12 @@ async fn active_segment_cas_rejects_stale_compaction_writer() {
     let client = MockClient::new(vec![
         single_text_events("seed response"),
         write_summary_tool_use_events("summary-1", "replacement summary"),
+        single_text_events("done"),
     ]);
-    let (mut worker, metadata_store, _segment_store) = make_faulting_worker(client).await;
+    let (mut worker, metadata_store, segment_store) = make_faulting_worker(client).await;
     worker.run_text("seed input").await.unwrap();
     let old_segment_id = worker.segment_id();
+    let session_id = worker.session_id();
     let competing_segment_id = uuid::Uuid::now_v7();
     metadata_store
         .update_by_name("test-worker", |metadata| {
@@ -486,9 +488,25 @@ async fn active_segment_cas_rejects_stale_compaction_writer() {
         })
         .unwrap();
 
-    let _error = worker.compact(0).await.unwrap_err();
+    let error = worker.compact(0).await.unwrap_err();
+    assert!(
+        matches!(error, worker::WorkerError::CompactActiveSegmentChanged),
+        "unexpected stale CAS error: {error:?}"
+    );
 
     assert_eq!(worker.segment_id(), old_segment_id);
+    let failure_metrics =
+        session_metrics::read_segment_metrics(&segment_store, session_id, old_segment_id).unwrap();
+    let finish = failure_metrics
+        .iter()
+        .find(|record| record.metric.name == "compact.finish")
+        .unwrap();
+    assert_eq!(finish.metric.dimensions["outcome"], "failure");
+    assert_eq!(
+        finish.metric.dimensions["failure_category"],
+        "active_segment_commit"
+    );
+    assert!(!finish.metric.dimensions.contains_key("error"));
     assert_eq!(
         metadata_store
             .read_by_name("test-worker")
