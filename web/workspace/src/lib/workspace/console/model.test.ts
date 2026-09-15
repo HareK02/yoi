@@ -1084,19 +1084,18 @@ Deno.test("snapshot restores running compaction without staged content", () => {
   snapshot.data.in_flight = {
     blocks: [],
     compaction: {
-      schema_version: 3,
-      compaction_id: "compaction-snapshot",
-      revision: 1,
-      internal_worker: null,
+      phase: "summarizing",
       started_at_ms: 1_000,
+      trigger: "manual",
     },
   };
 
   const projection = projectConsole([{ eventId: "snapshot", event: snapshot }]);
 
   assertEquals(projection.lines.length, 1);
-  assertEquals(projection.lines[0].id, "compaction-compaction-snapshot");
-  assertEquals(projection.lines[0].compaction?.state, "running");
+  assertEquals(projection.lines[0].id, "compaction-runtime");
+  assertEquals(projection.lines[0].streaming, true);
+  assertEquals(projection.lines[0].body, "compacting · summarizing");
   assertEquals(projection.lines[0].body.includes("staged"), false);
 });
 

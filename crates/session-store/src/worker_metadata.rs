@@ -182,6 +182,24 @@ pub trait WorkerMetadataStore: Send + Sync {
         Ok(metadata)
     }
 
+    /// Compare and swap the active Segment pointer while preserving unrelated metadata.
+    /// Returns `false` without mutation when the durable pointer no longer matches.
+    fn compare_and_swap_active(
+        &self,
+        worker_name: &str,
+        expected: &WorkerActiveSegmentRef,
+        replacement: WorkerActiveSegmentRef,
+    ) -> Result<bool, WorkerStoreError> {
+        let mut matched = false;
+        self.update_by_name(worker_name, |metadata| {
+            if metadata.active.as_ref() == Some(expected) {
+                metadata.active = Some(replacement);
+                matched = true;
+            }
+        })?;
+        Ok(matched)
+    }
+
     /// Set the active pointer while preserving spawned children, workspace ownership, and manifest snapshot.
     fn set_active(
         &self,

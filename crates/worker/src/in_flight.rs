@@ -221,33 +221,13 @@ impl InFlightEvents {
         self.lock().commands = commands;
     }
 
-    /// Publish current compaction progress into reconnect snapshots.
-    /// Terminal lifecycle events clear the in-flight value; their durable
-    /// session record remains the historical authority.
-    pub(crate) fn update_compaction(&self, lifecycle: &protocol::CompactionLifecycle) {
+    /// Atomically update reconnect state and publish the matching live progress event.
+    pub(crate) fn set_compaction(&self, compaction: Option<protocol::InFlightCompaction>) {
         let mut inner = self.lock();
-        match lifecycle.state {
-            protocol::CompactionLifecycleState::Running => match &inner.compaction {
-                None => inner.compaction = protocol::InFlightCompaction::from_running(lifecycle),
-                Some(current)
-                    if current.compaction_id == lifecycle.compaction_id
-                        && lifecycle.revision > current.revision =>
-                {
-                    inner.compaction = protocol::InFlightCompaction::from_running(lifecycle);
-                }
-                Some(_) => {}
-            },
-            protocol::CompactionLifecycleState::Done
-            | protocol::CompactionLifecycleState::Failed
-            | protocol::CompactionLifecycleState::Interrupted => {
-                if inner.compaction.as_ref().is_some_and(|current| {
-                    current.compaction_id == lifecycle.compaction_id
-                        && lifecycle.revision > current.revision
-                }) {
-                    inner.compaction = None;
-                }
-            }
-        }
+        inner.compaction = compaction.clone();
+        let _ = self
+            .working_event_tx
+            .send(Event::CompactionProgress { compaction });
     }
 
     pub(crate) fn clear(&self) {
@@ -773,79 +753,42 @@ mod tests {
     }
 
     #[test]
-    fn compaction_progress_is_snapshot_only_while_running() {
+    fn compaction_progress_updates_snapshot_and_live_event_atomically() {
         let (working_event_tx, _) = broadcast::channel(16);
+        let mut rx = working_event_tx.subscribe();
         let in_flight = InFlightEvents::new(working_event_tx);
-        let running = protocol::CompactionLifecycle {
-            schema_version: 3,
-            compaction_id: "compact-1".into(),
-            revision: 1,
-            internal_worker: None,
-            state: protocol::CompactionLifecycleState::Running,
+        let progress = protocol::InFlightCompaction {
+            phase: protocol::CompactionPhase::Preparing,
             started_at_ms: 100,
-            ended_at_ms: None,
-            summary: None,
-            error: None,
-            new_segment_id: None,
+            trigger: protocol::CompactionTrigger::Manual,
         };
 
-        in_flight.update_compaction(&running);
+        in_flight.set_compaction(Some(progress.clone()));
         let guard = in_flight.snapshot_guard();
         assert_eq!(
-            snapshot_from_guard(&guard)
-                .compaction
-                .as_ref()
-                .map(|item| item.compaction_id.as_str()),
-            Some("compact-1")
+            snapshot_from_guard(&guard).compaction,
+            Some(progress.clone())
         );
         assert!(!snapshot_from_guard(&guard).is_empty());
         drop(guard);
-
-        let mut stale = running.clone();
-        stale.revision = 0;
-        in_flight.update_compaction(&stale);
-        let mut other = running.clone();
-        other.compaction_id = "compact-2".into();
-        other.revision = 2;
-        in_flight.update_compaction(&other);
-        let guard = in_flight.snapshot_guard();
-        assert_eq!(
-            snapshot_from_guard(&guard)
-                .compaction
-                .as_ref()
-                .map(|item| (item.compaction_id.as_str(), item.revision)),
-            Some(("compact-1", 1))
-        );
-        drop(guard);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Event::CompactionProgress { compaction: Some(item) } if item == progress
+        ));
 
         in_flight.clear();
-        let guard = in_flight.snapshot_guard();
-        assert_eq!(
-            snapshot_from_guard(&guard)
-                .compaction
-                .as_ref()
-                .map(|item| item.compaction_id.as_str()),
-            Some("compact-1")
-        );
-        drop(guard);
-
-        let mut stale_done = running.clone();
-        stale_done.state = protocol::CompactionLifecycleState::Done;
-        in_flight.update_compaction(&stale_done);
         let guard = in_flight.snapshot_guard();
         assert!(snapshot_from_guard(&guard).compaction.is_some());
         drop(guard);
 
-        let mut done = running;
-        done.revision = 2;
-        done.state = protocol::CompactionLifecycleState::Done;
-        done.ended_at_ms = Some(200);
-        done.summary = Some("private summary".into());
-        done.new_segment_id = Some("staged-segment".into());
-        in_flight.update_compaction(&done);
-
+        in_flight.set_compaction(None);
         let guard = in_flight.snapshot_guard();
         assert!(snapshot_from_guard(&guard).compaction.is_none());
+        drop(guard);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Event::CompactionProgress { compaction: None }
+        ));
     }
 
     #[test]

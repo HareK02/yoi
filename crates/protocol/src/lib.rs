@@ -1228,8 +1228,12 @@ pub enum Event {
     /// This is not part of LLM history or prompt context; clients may display it
     /// briefly as operational status.
     MemoryWorker(MemoryWorkerEvent),
-    /// Worker has started compacting the current session, or bound the run to its
-    /// observable Internal Worker. Revisions upsert one stable lifecycle item.
+    /// Runtime-only compaction progress. `None` clears the current status.
+    /// This never enters Session history and carries no operation or Segment identity.
+    CompactionProgress {
+        compaction: Option<InFlightCompaction>,
+    },
+    /// Legacy compaction lifecycle event retained for wire read compatibility.
     CompactStart {
         lifecycle: CompactionLifecycle,
     },
@@ -1416,26 +1420,30 @@ pub enum CommandEvent {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionPhase {
+    Preparing,
+    Summarizing,
+    Committing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    Manual,
+    PreRun,
+    RequestThreshold,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct InFlightCompaction {
-    pub schema_version: u32,
-    pub compaction_id: String,
-    pub revision: u64,
-    pub internal_worker: Option<InternalWorkerRef>,
+    pub phase: CompactionPhase,
     pub started_at_ms: u64,
-}
-
-impl InFlightCompaction {
-    pub fn from_running(lifecycle: &CompactionLifecycle) -> Option<Self> {
-        (lifecycle.state == CompactionLifecycleState::Running).then(|| Self {
-            schema_version: lifecycle.schema_version,
-            compaction_id: lifecycle.compaction_id.clone(),
-            revision: lifecycle.revision,
-            internal_worker: lifecycle.internal_worker.clone(),
-            started_at_ms: lifecycle.started_at_ms,
-        })
-    }
+    pub trigger: CompactionTrigger,
 }
 
 /// Unfinished model output and active command state included in
@@ -2309,11 +2317,9 @@ mod tests {
                     exit_code: None,
                 }],
                 compaction: Some(InFlightCompaction {
-                    schema_version: 3,
-                    compaction_id: "compaction-1".into(),
-                    revision: 1,
-                    internal_worker: None,
+                    phase: CompactionPhase::Summarizing,
                     started_at_ms: 99,
+                    trigger: CompactionTrigger::Manual,
                 }),
             },
             internal_workers: Vec::new(),
@@ -2327,14 +2333,20 @@ mod tests {
             "streaming_args"
         );
         assert_eq!(
-            parsed["data"]["in_flight"]["compaction"]["compaction_id"],
-            "compaction-1"
+            parsed["data"]["in_flight"]["compaction"]["phase"],
+            "summarizing"
+        );
+        assert_eq!(
+            parsed["data"]["in_flight"]["compaction"]["trigger"],
+            "manual"
         );
         assert!(
             parsed["data"]["in_flight"]["compaction"]
                 .as_object()
                 .is_some_and(|value| {
                     !value.contains_key("state")
+                        && !value.contains_key("compaction_id")
+                        && !value.contains_key("internal_worker")
                         && !value.contains_key("summary")
                         && !value.contains_key("new_segment_id")
                 }),
@@ -2344,7 +2356,10 @@ mod tests {
         match serde_json::from_str::<Event>(&json).unwrap() {
             Event::Snapshot { in_flight, .. } => {
                 assert_eq!(in_flight.blocks.len(), 3);
-                assert_eq!(in_flight.compaction.unwrap().compaction_id, "compaction-1");
+                assert_eq!(
+                    in_flight.compaction.unwrap().phase,
+                    CompactionPhase::Summarizing
+                );
             }
             other => panic!("expected Snapshot, got {other:?}"),
         }

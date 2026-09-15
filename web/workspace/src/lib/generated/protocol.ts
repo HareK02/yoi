@@ -75,6 +75,10 @@ export type CompactionLifecycle = { schema_version: number, compaction_id: strin
  */
 started_at_ms: number, ended_at_ms?: number | null, summary?: string | null, error?: string | null, new_segment_id?: string | null, };
 
+export type CompactionPhase = "preparing" | "summarizing" | "committing";
+
+export type CompactionTrigger = "manual" | "pre_run" | "request_threshold";
+
 export type UploadedFileAvailability = "available" | "unavailable" | "integrity_failed";
 
 export type UploadedFileRef = { artifact_id: string, file_name: string, media_type: string, created_at_ms: number, availability: UploadedFileAvailability, byte_len: number, sha256: string, source_entry_id?: string | null, };
@@ -113,7 +117,7 @@ export type RewindSummary = { truncated_to_entries: number, discarded_entries: n
 
 export type InFlightBlock = { "kind": "text", text: string, finished?: boolean, } | { "kind": "thinking", text: string, finished?: boolean, } | { "kind": "tool_call", id: string, name: string, args: string, state?: InFlightToolCallState, };
 
-export type InFlightCompaction = { schema_version: number, compaction_id: string, revision: number, internal_worker: InternalWorkerRef | null, started_at_ms: number, };
+export type InFlightCompaction = { phase: CompactionPhase, started_at_ms: number, trigger: CompactionTrigger, };
 
 export type InFlightSnapshot = { blocks?: Array<InFlightBlock>, commands?: Array<CommandSnapshot>,
 /**
@@ -318,4 +322,4 @@ in_flight?: InFlightSnapshot,
  * Parent-owned Internal Worker sessions visible to this client.
  * Service-private Internal Workers are deliberately excluded.
  */
-internal_workers?: Array<InternalWorkerSnapshot>, } } | { "event": "internal_worker", "data": { worker: InternalWorkerRef, revision: number, event: Event, } } | { "event": "internal_worker_removed", "data": { worker: InternalWorkerRef, revision: number, } } | { "event": "segment_rotated", "data": { session: SessionSnapshot, } } | { "event": "worker_state", "data": { snapshot: WorkerStateSnapshot, } } | { "event": "command_acknowledged", "data": { acknowledgement: WorkerCommandAcknowledgement, } } | { "event": "command", "data": { event: CommandEvent, } } | { "event": "completions", "data": { kind: CompletionKind, entries: Array<CompletionEntry>, } } | { "event": "rewind_targets", "data": { head_entries: number, targets: Array<RewindTarget>, } } | { "event": "rewind_applied", "data": { session: SessionSnapshot, input: Array<Segment>, summary: RewindSummary, } } | { "event": "workers_listed", "data": { workers: unknown, } } | { "event": "worker_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compact_start", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_done", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_failed", "data": { lifecycle: CompactionLifecycle, } } | { "event": "shutdown" };
+internal_workers?: Array<InternalWorkerSnapshot>, } } | { "event": "internal_worker", "data": { worker: InternalWorkerRef, revision: number, event: Event, } } | { "event": "internal_worker_removed", "data": { worker: InternalWorkerRef, revision: number, } } | { "event": "segment_rotated", "data": { session: SessionSnapshot, } } | { "event": "worker_state", "data": { snapshot: WorkerStateSnapshot, } } | { "event": "command_acknowledged", "data": { acknowledgement: WorkerCommandAcknowledgement, } } | { "event": "command", "data": { event: CommandEvent, } } | { "event": "completions", "data": { kind: CompletionKind, entries: Array<CompletionEntry>, } } | { "event": "rewind_targets", "data": { head_entries: number, targets: Array<RewindTarget>, } } | { "event": "rewind_applied", "data": { session: SessionSnapshot, input: Array<Segment>, summary: RewindSummary, } } | { "event": "workers_listed", "data": { workers: unknown, } } | { "event": "worker_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compaction_progress", "data": { compaction: InFlightCompaction | null, } } | { "event": "compact_start", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_done", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_failed", "data": { lifecycle: CompactionLifecycle, } } | { "event": "shutdown" };

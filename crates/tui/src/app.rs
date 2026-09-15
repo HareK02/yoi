@@ -1400,6 +1400,19 @@ impl App {
                     self.reset_run_state();
                 }
             }
+            Event::CompactionProgress { compaction } => {
+                if compaction.is_some() {
+                    if self.last_streaming_compact_mut().is_none() {
+                        self.blocks.push(Block::Compact(CompactEvent::Streaming {
+                            started_at: Instant::now(),
+                        }));
+                    }
+                } else if let Some(Block::Compact(CompactEvent::Streaming { .. })) =
+                    self.blocks.last()
+                {
+                    self.blocks.pop();
+                }
+            }
             Event::CompactStart { lifecycle } => {
                 let should_apply = match &self.active_compaction {
                     None => true,
@@ -1688,9 +1701,7 @@ impl App {
                 }
             }
         }
-        self.active_compaction = compaction
-            .as_ref()
-            .map(|lifecycle| (lifecycle.compaction_id.clone(), lifecycle.revision));
+        self.active_compaction = None;
         if compaction.is_some() && self.last_streaming_compact_mut().is_none() {
             self.blocks.push(Block::Compact(CompactEvent::Streaming {
                 started_at: Instant::now(),
@@ -4301,28 +4312,21 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn snapshot_restores_running_compaction_and_fences_unrelated_terminal() {
+    fn snapshot_restores_and_runtime_clear_removes_compaction_progress() {
         let mut app = App::new("test".into());
-        let lifecycle = test_compaction_lifecycle(protocol::CompactionLifecycleState::Running);
         app.apply_in_flight_snapshot(InFlightSnapshot {
-            compaction: Some(protocol::InFlightCompaction::from_running(&lifecycle).unwrap()),
+            compaction: Some(protocol::InFlightCompaction {
+                phase: protocol::CompactionPhase::Summarizing,
+                started_at_ms: 100,
+                trigger: protocol::CompactionTrigger::Manual,
+            }),
             ..InFlightSnapshot::default()
         });
-
-        let mut unrelated = lifecycle;
-        unrelated.compaction_id = "another-compaction".into();
-        unrelated.revision = 2;
-        unrelated.state = protocol::CompactionLifecycleState::Failed;
-        unrelated.error = Some("must not replace".into());
-        app.handle_worker_event(Event::CompactFailed {
-            lifecycle: unrelated,
-        });
-
         assert_eq!(compact_block_count(&app), 1);
-        assert!(matches!(
-            app.blocks.as_slice(),
-            [Block::Compact(CompactEvent::Streaming { .. })]
-        ));
+
+        app.handle_worker_event(Event::CompactionProgress { compaction: None });
+
+        assert_eq!(compact_block_count(&app), 0);
     }
 
     #[test]

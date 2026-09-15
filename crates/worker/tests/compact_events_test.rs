@@ -407,6 +407,37 @@ fn system_texts_in_sink_session_start(
 }
 
 #[tokio::test]
+async fn active_segment_cas_rejects_stale_compaction_writer() {
+    let client = MockClient::new(vec![
+        single_text_events("seed response"),
+        write_summary_tool_use_events("summary-1", "replacement summary"),
+    ]);
+    let (mut worker, metadata_store, _segment_store) = make_faulting_worker(client).await;
+    worker.run_text("seed input").await.unwrap();
+    let old_segment_id = worker.segment_id();
+    let competing_segment_id = uuid::Uuid::now_v7();
+    metadata_store
+        .update_by_name("test-worker", |metadata| {
+            metadata.active.as_mut().unwrap().segment_id = Some(competing_segment_id);
+        })
+        .unwrap();
+
+    let _error = worker.compact(0).await.unwrap_err();
+
+    assert_eq!(worker.segment_id(), old_segment_id);
+    assert_eq!(
+        metadata_store
+            .read_by_name("test-worker")
+            .unwrap()
+            .unwrap()
+            .active
+            .unwrap()
+            .segment_id,
+        Some(competing_segment_id)
+    );
+}
+
+#[tokio::test]
 async fn failed_active_segment_commit_keeps_live_and_durable_history_on_old_segment() {
     let client = MockClient::new(vec![
         single_text_events("seed response"),
@@ -614,7 +645,7 @@ async fn compact_emits_session_start_carrying_summary_and_task_snapshot() {
 }
 
 #[tokio::test]
-async fn pre_run_compact_success_broadcasts_start_and_done() {
+async fn pre_run_compact_publishes_runtime_progress_phases() {
     // Responses: (1) first run returns short text, (2) compact worker
     // emits write_summary then closes (two LLM calls inside the compact
     // worker: one for write_summary, one that the compact loop consumes
@@ -640,86 +671,46 @@ async fn pre_run_compact_success_broadcasts_start_and_done() {
     assert_ne!(worker.segment_id(), segment_before);
 
     let events = drain(&mut rx);
-    let kinds: Vec<&str> = events
-        .iter()
-        .map(|e| match e {
-            Event::CompactStart { .. } => "start",
-            Event::CompactDone { .. } => "done",
-            Event::CompactFailed { .. } => "failed",
-            _ => "other",
-        })
-        .collect();
-    assert!(
-        kinds.contains(&"start") && kinds.contains(&"done"),
-        "expected CompactStart + CompactDone in {kinds:?}"
-    );
-    assert!(
-        !kinds.contains(&"failed"),
-        "unexpected CompactFailed in {kinds:?}"
-    );
-    let starts = events
+    let progress = events
         .iter()
         .filter_map(|event| match event {
-            Event::CompactStart { lifecycle } => Some(lifecycle),
+            Event::CompactionProgress { compaction } => {
+                Some(compaction.as_ref().map(|item| item.phase))
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        starts.len(),
-        2,
-        "start and Internal Worker binding revisions"
+        progress,
+        vec![
+            Some(protocol::CompactionPhase::Preparing),
+            Some(protocol::CompactionPhase::Summarizing),
+            Some(protocol::CompactionPhase::Committing),
+            None,
+        ]
     );
-    assert_eq!(starts[0].compaction_id, starts[1].compaction_id);
-    assert_eq!(starts[0].revision, 1);
-    assert!(starts[0].internal_worker.is_none());
-    assert_eq!(starts[1].revision, 2);
-    assert!(matches!(
-        starts[1].internal_worker.as_ref().map(|worker| &worker.kind),
-        Some(protocol::InternalWorkerKind::Service { kind }) if kind == "compaction"
-    ));
+    assert!(events.iter().all(|event| !matches!(
+        event,
+        Event::CompactStart { .. } | Event::CompactDone { .. } | Event::CompactFailed { .. }
+    )));
     assert!(events.iter().any(|event| matches!(
         event,
         Event::InternalWorker { worker, .. }
             if matches!(&worker.kind, protocol::InternalWorkerKind::Service { kind } if kind == "compaction")
     )), "compactor activity must be projected through the parent stream");
-    let completed = events
-        .iter()
-        .find_map(|event| match event {
-            Event::CompactDone { lifecycle } => Some(lifecycle),
-            _ => None,
-        })
-        .expect("completed lifecycle");
-    assert_eq!(completed.compaction_id, starts[0].compaction_id);
-    assert_eq!(completed.revision, 3);
-    assert_eq!(completed.summary.as_deref(), Some("summary"));
-    assert_eq!(completed.state, protocol::CompactionLifecycleState::Done);
-    let done_index = events
-        .iter()
-        .position(|event| matches!(event, Event::CompactDone { .. }))
-        .expect("done event");
-    let removed_index = events
-        .iter()
-        .position(|event| matches!(event, Event::InternalWorkerRemoved { .. }))
-        .expect("terminal compactor session must be released");
-    assert!(
-        done_index < removed_index,
-        "terminal lifecycle precedes release fence"
-    );
 
-    // CompactDone carries the new Segment ID; the Session ID is unchanged.
-    let new_id_in_event = events.iter().find_map(|e| match e {
-        Event::CompactDone { lifecycle } => lifecycle
-            .new_segment_id
-            .as_deref()
-            .and_then(|value| uuid::Uuid::parse_str(value).ok()),
-        _ => None,
-    });
-    assert!(new_id_in_event.is_some(), "CompactDone missing");
-    assert_eq!(new_id_in_event.unwrap(), worker.segment_id());
+    let active_entries = worker
+        .store()
+        .read_all(worker.session_id(), worker.segment_id())
+        .unwrap();
+    assert!(!active_entries.iter().any(|entry| matches!(
+        entry,
+        LogEntry::Extension { domain, .. } if domain == "yoi.compaction"
+    )));
 }
 
 #[tokio::test]
-async fn mid_turn_compact_success_broadcasts_start_and_done() {
+async fn request_threshold_compact_publishes_runtime_progress() {
     // Path: `do_compact_and_resume` via PreRequestAction::Yield.
     //
     // Sequence of LLM calls the mock will serve:
@@ -748,36 +739,20 @@ async fn mid_turn_compact_success_broadcasts_start_and_done() {
     worker.run_text("second").await.unwrap();
 
     let events = drain(&mut rx);
-    let kinds: Vec<&str> = events
-        .iter()
-        .map(|e| match e {
-            Event::CompactStart { .. } => "start",
-            Event::CompactDone { .. } => "done",
-            Event::CompactFailed { .. } => "failed",
-            _ => "other",
-        })
-        .collect();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::CompactionProgress { compaction: Some(progress) }
+            if progress.phase == protocol::CompactionPhase::Committing
+    )));
     assert!(
-        kinds.contains(&"start") && kinds.contains(&"done"),
-        "expected CompactStart + CompactDone in {kinds:?}"
+        events
+            .iter()
+            .any(|event| matches!(event, Event::CompactionProgress { compaction: None }))
     );
-    assert!(
-        !kinds.contains(&"failed"),
-        "unexpected CompactFailed in {kinds:?}"
-    );
-
-    let new_id_in_event = events.iter().find_map(|e| match e {
-        Event::CompactDone { lifecycle } => lifecycle
-            .new_segment_id
-            .as_deref()
-            .and_then(|value| uuid::Uuid::parse_str(value).ok()),
-        _ => None,
-    });
-    assert_eq!(new_id_in_event, Some(worker.segment_id()));
 }
 
 #[tokio::test]
-async fn pre_run_compact_failure_broadcasts_start_and_failed() {
+async fn pre_run_compact_failure_clears_runtime_progress() {
     // Only the first run has a response. Compaction will run the
     // compact worker which immediately exhausts the mock → failure.
     let client = MockClient::new(vec![single_text_events("hi")]);
@@ -789,31 +764,28 @@ async fn pre_run_compact_failure_broadcasts_start_and_failed() {
     worker.run_text("first").await.unwrap();
     let _ = drain(&mut rx);
 
-    // Best-effort: returns Ok(()) even on failure, but emits CompactFailed.
+    // Best-effort: returns Ok(()) even on failure and clears runtime progress.
     worker.try_pre_run_compact().await;
 
     let events = drain(&mut rx);
-    let kinds: Vec<&str> = events
-        .iter()
-        .map(|e| match e {
-            Event::CompactStart { .. } => "start",
-            Event::CompactDone { .. } => "done",
-            Event::CompactFailed { .. } => "failed",
-            _ => "other",
-        })
-        .collect();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::CompactionProgress { compaction: Some(progress) }
+            if progress.phase == protocol::CompactionPhase::Preparing
+    )));
     assert!(
-        kinds.contains(&"start") && kinds.contains(&"failed"),
-        "expected CompactStart + CompactFailed in {kinds:?}"
+        events
+            .iter()
+            .any(|event| matches!(event, Event::CompactionProgress { compaction: None }))
     );
-    assert!(
-        !kinds.contains(&"done"),
-        "unexpected CompactDone in {kinds:?}"
-    );
+    assert!(events.iter().all(|event| !matches!(
+        event,
+        Event::CompactStart { .. } | Event::CompactDone { .. } | Event::CompactFailed { .. }
+    )));
 }
 
 #[tokio::test]
-async fn manual_compact_cancel_terminalizes_before_returning_idle() {
+async fn manual_compact_cancel_clears_progress_before_returning_idle() {
     let worker =
         make_worker_with_manifest(POST_RUN_MANIFEST_TOML, BlockingCompactClient::new()).await;
     let runtime_tmp = tempfile::tempdir().unwrap();
@@ -856,7 +828,9 @@ async fn manual_compact_cancel_terminalizes_before_returning_idle() {
                 .await
                 .expect("timeout waiting for compact start")
                 .expect("event"),
-            Event::CompactStart { .. }
+            Event::CompactionProgress {
+                compaction: Some(_)
+            }
         ) {
             break;
         }
@@ -875,9 +849,7 @@ async fn manual_compact_cancel_terminalizes_before_returning_idle() {
             .expect("timeout waiting for compact cancellation")
             .expect("event")
         {
-            Event::CompactFailed { lifecycle }
-                if lifecycle.state == protocol::CompactionLifecycleState::Interrupted =>
-            {
+            Event::CompactionProgress { compaction: None } => {
                 saw_interrupted = true;
             }
             Event::WorkerState { snapshot }
@@ -904,7 +876,9 @@ async fn manual_compact_cancel_terminalizes_before_returning_idle() {
                 .await
                 .expect("timeout waiting for second compact start")
                 .expect("event"),
-            Event::CompactStart { .. }
+            Event::CompactionProgress {
+                compaction: Some(_)
+            }
         ) {
             break;
         }
@@ -922,9 +896,7 @@ async fn manual_compact_cancel_terminalizes_before_returning_idle() {
             .expect("timeout waiting for shutdown")
             .expect("event")
         {
-            Event::CompactFailed { lifecycle }
-                if lifecycle.state == protocol::CompactionLifecycleState::Interrupted =>
-            {
+            Event::CompactionProgress { compaction: None } => {
                 interrupted_before_shutdown = true;
             }
             Event::Shutdown => {
@@ -944,7 +916,7 @@ async fn manual_compact_cancel_terminalizes_before_returning_idle() {
 }
 
 #[tokio::test]
-async fn controller_compact_method_emits_start_and_done() {
+async fn controller_compact_method_publishes_progress_and_clear() {
     let client = MockClient::new(vec![
         text_events_with_usage("hi", 1000),
         write_summary_tool_use_events("manual-summary", "manual compact summary"),
@@ -991,14 +963,12 @@ async fn controller_compact_method_emits_start_and_done() {
             .expect("timeout waiting for compact events")
             .expect("event")
         {
-            Event::CompactStart { .. } => saw_start = true,
-            Event::CompactDone { .. } => {
+            Event::CompactionProgress {
+                compaction: Some(_),
+            } => saw_start = true,
+            Event::CompactionProgress { compaction: None } => {
                 break;
             }
-            Event::CompactFailed { lifecycle } => panic!(
-                "manual compact failed: {}",
-                lifecycle.error.as_deref().unwrap_or("unknown error")
-            ),
             _ => {}
         }
     }

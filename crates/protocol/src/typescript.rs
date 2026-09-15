@@ -4,18 +4,18 @@ use ts_rs::{Config, TS};
 
 use crate::{
     Alert, AlertLevel, AlertSource, CommandEvent, CommandSnapshot, CommandStatus, CommandStream,
-    CommandStreamSlice, CompactionLifecycle, CompactionLifecycleState, CompletionEntry,
-    CompletionKind, ErrorCode, Event, Greeting, InFlightBlock, InFlightCompaction,
-    InFlightSnapshot, InFlightToolCallState, InternalWorkerKind, InternalWorkerRef,
-    InternalWorkerSnapshot, InvokeKind, MemoryWorkerEvent, Method, PasteArtifactAvailability,
-    PasteArtifactMediaType, PasteArtifactRef, PendingSubmissionSummary, PendingSubmissionsSnapshot,
-    Permission, RewindSummary, RewindTarget, RewindTargetId, RunResult, ScopeRule, Segment,
-    SessionContentPart, SessionEntryProvenance, SessionMessageRole, SessionSnapshot,
-    SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment, SubmissionDisposition,
-    SymlinkPolicy, ToolResultDisposition, TurnResult, UploadedFileAvailability, UploadedFileRef,
-    WorkerBusyState, WorkerCommandAcknowledgement, WorkerCommandDisposition, WorkerCommandEnvelope,
-    WorkerCommandKind, WorkerEvent, WorkerMaintenanceState, WorkerRunState, WorkerState,
-    WorkerStateSnapshot, WorkerStatus,
+    CommandStreamSlice, CompactionLifecycle, CompactionLifecycleState, CompactionPhase,
+    CompactionTrigger, CompletionEntry, CompletionKind, ErrorCode, Event, Greeting, InFlightBlock,
+    InFlightCompaction, InFlightSnapshot, InFlightToolCallState, InternalWorkerKind,
+    InternalWorkerRef, InternalWorkerSnapshot, InvokeKind, MemoryWorkerEvent, Method,
+    PasteArtifactAvailability, PasteArtifactMediaType, PasteArtifactRef, PendingSubmissionSummary,
+    PendingSubmissionsSnapshot, Permission, RewindSummary, RewindTarget, RewindTargetId, RunResult,
+    ScopeRule, Segment, SessionContentPart, SessionEntryProvenance, SessionMessageRole,
+    SessionSnapshot, SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment,
+    SubmissionDisposition, SymlinkPolicy, ToolResultDisposition, TurnResult,
+    UploadedFileAvailability, UploadedFileRef, WorkerBusyState, WorkerCommandAcknowledgement,
+    WorkerCommandDisposition, WorkerCommandEnvelope, WorkerCommandKind, WorkerEvent,
+    WorkerMaintenanceState, WorkerRunState, WorkerState, WorkerStateSnapshot, WorkerStatus,
     subscription::{
         EventSubscriptionSelector, SubscriptionEvent, SubscriptionEventPayload, SubscriptionFrame,
         SubscriptionFramePayload, SubscriptionId, SubscriptionRejectionCode, SubscriptionRequest,
@@ -73,6 +73,8 @@ pub fn generated_protocol_types() -> String {
     push_decl::<CommandEvent>(&cfg, &mut output);
     push_decl::<CompactionLifecycleState>(&cfg, &mut output);
     push_decl::<CompactionLifecycle>(&cfg, &mut output);
+    push_decl::<CompactionPhase>(&cfg, &mut output);
+    push_decl::<CompactionTrigger>(&cfg, &mut output);
     push_decl::<UploadedFileAvailability>(&cfg, &mut output);
     push_decl::<UploadedFileRef>(&cfg, &mut output);
     push_decl::<ScopeRule>(&cfg, &mut output);

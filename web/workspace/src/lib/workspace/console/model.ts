@@ -720,16 +720,25 @@ function compactionActivity(
 
 function applyInFlightCompaction(
   projection: ConsoleProjection,
-  progress: InFlightCompaction,
+  progress: InFlightCompaction | null,
 ): ConsoleProjection {
-  return applyCompactionLifecycle(projection, {
-    ...progress,
-    state: "running",
-    ended_at_ms: null,
-    summary: null,
-    error: null,
-    new_segment_id: null,
-  });
+  const id = "compaction-runtime";
+  const lines = projection.lines.filter((line) => line.id !== id);
+  if (!progress) return { ...projection, lines };
+  return {
+    ...projection,
+    lines: [
+      ...lines,
+      {
+        id,
+        kind: "status",
+        title: "Compaction",
+        body: `compacting · ${progress.phase.replaceAll("_", " ")}`,
+        source: "event",
+        streaming: true,
+      },
+    ],
+  };
 }
 
 function applyCompactionLifecycle(
@@ -1110,6 +1119,8 @@ export function applyProtocolEvent(
       // These are protocol/status/control events. TUI Console does not append
       // them to the conversation surface; browser Console should not either.
       break;
+    case "compaction_progress":
+      return applyInFlightCompaction(next, event.data.compaction ?? null);
     case "compact_start":
     case "compact_done":
     case "compact_failed":
