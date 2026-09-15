@@ -1403,7 +1403,21 @@ impl App {
                 }
             }
             Event::CompactionProgress { compaction } => {
-                self.compaction_progress = compaction;
+                self.compaction_progress = compaction.filter(|progress| {
+                    matches!(
+                        (&self.worker_state.state, progress.trigger),
+                        (
+                            protocol::WorkerState::Busy(protocol::WorkerBusyState::Maintenance(
+                                protocol::WorkerMaintenanceState::Compacting
+                            )),
+                            protocol::CompactionTrigger::Manual
+                        ) | (
+                            protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(_)),
+                            protocol::CompactionTrigger::PreRun
+                                | protocol::CompactionTrigger::RequestThreshold
+                        )
+                    )
+                });
             }
             Event::CompactStart { lifecycle } => {
                 let should_apply = match &self.active_compaction {
@@ -1522,9 +1536,19 @@ impl App {
             Event::WorkerState { snapshot } => {
                 self.rewind_refresh_fence = false;
                 self.apply_worker_state_snapshot(&snapshot);
+                if let Some(progress) = self.compaction_progress.take() {
+                    let _ = self.handle_worker_event(Event::CompactionProgress {
+                        compaction: Some(progress),
+                    });
+                }
             }
             Event::CommandAcknowledged { acknowledgement } => {
                 self.apply_worker_state_snapshot(&acknowledgement.state);
+                if let Some(progress) = self.compaction_progress.take() {
+                    let _ = self.handle_worker_event(Event::CompactionProgress {
+                        compaction: Some(progress),
+                    });
+                }
             }
             // Command telemetry is an operational Web Console surface. The
             // TUI continues to render the final Bash ToolResult from history.
@@ -1694,7 +1718,7 @@ impl App {
             }
         }
         self.active_compaction = None;
-        self.compaction_progress = compaction;
+        let _ = self.handle_worker_event(Event::CompactionProgress { compaction });
     }
 
     fn append_assistant_text(&mut self, text: &str) {
@@ -4300,8 +4324,24 @@ mod completion_flow_tests {
     }
 
     #[test]
+    fn compaction_progress_is_hidden_when_worker_state_is_inconsistent() {
+        let mut app = App::new("test".into());
+        app.handle_worker_event(Event::CompactionProgress {
+            compaction: Some(protocol::InFlightCompaction {
+                phase: protocol::CompactionPhase::Preparing,
+                started_at_ms: 100,
+                trigger: protocol::CompactionTrigger::Manual,
+            }),
+        });
+        assert!(app.compaction_progress.is_none());
+    }
+
+    #[test]
     fn snapshot_restores_and_runtime_clear_removes_compaction_progress() {
         let mut app = App::new("test".into());
+        app.worker_state.state = protocol::WorkerState::Busy(
+            protocol::WorkerBusyState::Maintenance(protocol::WorkerMaintenanceState::Compacting),
+        );
         app.apply_in_flight_snapshot(InFlightSnapshot {
             compaction: Some(protocol::InFlightCompaction {
                 phase: protocol::CompactionPhase::Summarizing,

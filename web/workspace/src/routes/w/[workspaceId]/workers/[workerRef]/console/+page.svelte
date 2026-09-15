@@ -248,6 +248,18 @@
         liveWorkerState ?? (worker?.state === "stopped" ? "stopped" : "loading"),
     );
     const workerRunning = $derived(workerState === "running");
+    const compactionProgress = $derived.by(() => {
+        const state = consoleProjection.workerState?.state;
+        if (!state || typeof state !== "object" || !("busy" in state)) return null;
+        const progress = consoleProjection.compaction;
+        if (!progress) return null;
+        const busy = state.busy;
+        if (!busy || typeof busy !== "object") return null;
+        const valid = progress.trigger === "manual"
+            ? "maintenance" in busy && busy.maintenance === "compacting"
+            : "run" in busy;
+        return valid ? progress : null;
+    });
     const workerPaused = $derived(workerState === "paused");
     const composerEditable = $derived(protocolState === "open" && !sending);
     const draftHasText = $derived(draft.content.trim().length > 0);
@@ -1907,7 +1919,7 @@
             requests={consoleProjection.runActivity.requests}
             uploadTokens={consoleProjection.runActivity.uploadTokens}
             outputTokens={consoleProjection.runActivity.outputTokens}
-            compaction={consoleProjection.compaction}
+            compaction={compactionProgress}
         />
     {/if}
 

@@ -139,10 +139,17 @@ fn draw_run_status(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn run_status_line(app: &App, now: Instant) -> Line<'static> {
-    let elapsed = app
-        .run_started_at
-        .and_then(|started_at| now.checked_duration_since(started_at))
-        .unwrap_or_default();
+    let elapsed = if let Some(progress) = &app.compaction_progress {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        std::time::Duration::from_millis(now_ms.saturating_sub(progress.started_at_ms))
+    } else {
+        app.run_started_at
+            .and_then(|started_at| now.checked_duration_since(started_at))
+            .unwrap_or_default()
+    };
     let spinner_index =
         ((elapsed.as_millis() / RUN_SPINNER_FRAME_MS) as usize) % RUN_SPINNER_FRAMES.len();
     let request_label = if app.run_requests == 1 {
@@ -161,8 +168,13 @@ fn run_status_line(app: &App, now: Instant) -> Line<'static> {
         Span::raw(" "),
     ];
     if let Some(progress) = &app.compaction_progress {
+        let phase = match progress.phase {
+            protocol::CompactionPhase::Preparing => "preparing",
+            protocol::CompactionPhase::Summarizing => "summarizing",
+            protocol::CompactionPhase::Committing => "committing",
+        };
         spans.push(Span::styled(
-            format!("Compacting · {:?}", progress.phase).to_lowercase(),
+            format!("Compacting · {phase}"),
             Style::default().fg(Color::Cyan),
         ));
         spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));

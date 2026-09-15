@@ -5610,18 +5610,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             session_id: old_loc.session_id,
             segment_id: new_segment_id,
         };
-        // Move the live writer lease under the same exclusive compaction owner
-        // before publishing the durable pointer. If the CAS loses, restore the
-        // derived lease and leave the staged Segment unreachable.
-        if self.scope_allocation.is_some() {
-            worker_allocation::update_segment(&self.manifest.worker.name, new_segment_id)?;
-        }
-        if let Err(error) = self.compare_and_swap_worker_metadata_segment(old_loc, new_location) {
-            if self.scope_allocation.is_some() {
-                worker_allocation::update_segment(&self.manifest.worker.name, old_loc.segment_id)?;
-            }
-            return Err(error);
-        }
+        // The writer lease is stable for the Worker lifetime and is keyed by
+        // worker name. Compaction must not transfer or rewrite that lease: the
+        // active Segment is derived exclusively from the CAS-protected Worker
+        // metadata pointer below. A lost CAS therefore leaves every live and
+        // durable authority on the previous Segment.
+        self.compare_and_swap_worker_metadata_segment(old_loc, new_location)?;
 
         // All live mutations after the durable commit are infallible and happen
         // before the replacement SegmentStart is broadcast. This keeps the

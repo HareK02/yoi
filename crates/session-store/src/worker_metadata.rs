@@ -795,6 +795,26 @@ where
     fn read_by_name(&self, worker_name: &str) -> Result<Option<WorkerMetadata>, WorkerStoreError> {
         self.worker_metadata_store.read_by_name(worker_name)
     }
+    fn update_by_name<F>(
+        &self,
+        worker_name: &str,
+        update: F,
+    ) -> Result<WorkerMetadata, WorkerStoreError>
+    where
+        F: FnOnce(&mut WorkerMetadata),
+    {
+        self.worker_metadata_store
+            .update_by_name(worker_name, update)
+    }
+    fn compare_and_swap_active(
+        &self,
+        worker_name: &str,
+        expected: &WorkerActiveSegmentRef,
+        replacement: WorkerActiveSegmentRef,
+    ) -> Result<bool, WorkerStoreError> {
+        self.worker_metadata_store
+            .compare_and_swap_active(worker_name, expected, replacement)
+    }
     fn list_names(&self) -> Result<Vec<String>, WorkerStoreError> {
         self.worker_metadata_store.list_names()
     }
@@ -1028,6 +1048,46 @@ mod tests {
         assert!(restored.spawned_children.is_empty());
         assert_eq!(restored.reclaimed_children.len(), 1);
         assert_eq!(restored.reclaimed_children[0].scope_delegated, vec![scope]);
+    }
+
+    #[test]
+    fn combined_store_delegates_atomic_active_segment_cas() {
+        let temp = tempfile::tempdir().unwrap();
+        let metadata = FsWorkerStore::new(temp.path().join("workers")).unwrap();
+        let store = CombinedStore::new(
+            crate::FsStore::new(temp.path().join("sessions")).unwrap(),
+            metadata,
+        );
+        let session_id = crate::new_session_id();
+        let old = WorkerActiveSegmentRef::active_segment(session_id, crate::new_segment_id());
+        store
+            .write(&WorkerMetadata::new("agent", Some(old.clone())))
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles = [crate::new_segment_id(), crate::new_segment_id()].map(|segment_id| {
+            let store = store.clone();
+            let old = old.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .compare_and_swap_active(
+                        "agent",
+                        &old,
+                        WorkerActiveSegmentRef::active_segment(session_id, segment_id),
+                    )
+                    .unwrap()
+            })
+        });
+        barrier.wait();
+        assert_eq!(
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .filter(|won| *won)
+                .count(),
+            1
+        );
     }
 
     #[test]

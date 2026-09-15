@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { InFlightCompaction } from "$lib/generated/protocol.ts";
   import Spinner from "./Spinner.svelte";
   import { formatRunElapsed, formatRunTokens } from "./run-status";
 
@@ -7,15 +8,16 @@
     requests: number;
     uploadTokens: number;
     outputTokens: number;
-    compaction?: { phase: string } | null;
+    compaction?: InFlightCompaction | null;
   };
 
   let { startedAtMs, requests, uploadTokens, outputTokens, compaction = null }: Props =
     $props();
   let nowMs = $state(Date.now());
+  const clockStartedAtMs = $derived(compaction?.started_at_ms ?? startedAtMs);
 
   $effect(() => {
-    startedAtMs;
+    clockStartedAtMs;
     nowMs = Date.now();
     const timer = window.setInterval(() => {
       nowMs = Date.now();
@@ -23,7 +25,9 @@
     return () => window.clearInterval(timer);
   });
 
-  const elapsed = $derived(formatRunElapsed(nowMs - (startedAtMs ?? nowMs)));
+  const elapsed = $derived(
+    formatRunElapsed(nowMs - (clockStartedAtMs ?? nowMs)),
+  );
   const requestLabel = $derived(requests === 1 ? "req" : "reqs");
 </script>
 
