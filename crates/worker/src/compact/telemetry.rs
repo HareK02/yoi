@@ -56,7 +56,7 @@ pub(crate) enum CompactFailureCategory {
 }
 
 impl CompactFailureCategory {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Cancelled => "cancelled",
             Self::SummaryMissing => "summary_missing",

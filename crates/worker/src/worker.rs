@@ -39,7 +39,10 @@ use manifest::{
     SharedScope, WorkerManifest, WorkerManifestConfig,
 };
 
-use crate::compact::state::CompactState;
+use crate::compact::state::{
+    AutomaticCompactBlock, AutomaticCompactDecision, AutomaticCompactTrigger, CompactState,
+    CompactionOutcome,
+};
 use crate::compact::telemetry::{
     CompactAttempt, CompactFailureCategory, CompactMode, CompactSuccessStats,
     CompactThresholdPolicy, correlated_post_request_metric, new_compact_metric_correlation_id,
@@ -3611,11 +3614,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// defensive reasons; this is the gate for joining the memory task
     /// before the compact runs.
     fn should_pre_run_compact(&self) -> bool {
-        self.compact_state.as_ref().is_some_and(|s| {
-            !s.is_disabled()
-                && !s.just_compacted()
-                && s.exceeds_post_run(self.total_tokens().tokens)
-        })
+        self.compact_state
+            .as_ref()
+            .is_some_and(|state| state.pre_run_eligible(self.total_tokens().tokens))
     }
 
     /// Prelude shared by `run` / `run_for_notification` / `resume`.
@@ -3630,8 +3631,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.ensure_interceptor_installed();
         self.ensure_system_prompt_materialized().await?;
         self.ensure_segment_head().await?;
-        if self.should_pre_run_compact() {}
-        self.try_pre_run_compact().await;
+        if self.should_pre_run_compact() {
+            self.try_pre_run_compact().await;
+        }
         Ok(())
     }
 
@@ -3901,6 +3903,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // context via a different entry point and never triggers this
         // path.
         self.prepare_interrupted_history_for_fresh_run()?;
+        self.ensure_interceptor_installed();
+        if let Some(state) = &self.compact_state {
+            state.begin_logical_run();
+        }
 
         self.prepare_for_run().await?;
 
@@ -4322,6 +4328,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             "run_for_notification expects a non-UserSend InvokeKind; got {kind:?}"
         );
         self.prepare_interrupted_history_for_fresh_run()?;
+        self.ensure_interceptor_installed();
+        if let Some(state) = &self.compact_state {
+            state.begin_logical_run();
+        }
         self.prepare_for_run().await?;
 
         // IDLE → active marker for the buffered notification / worker-event
@@ -4544,14 +4554,25 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             tracing::warn!(error = %error, "run-committed background task start failed");
         }
 
+        let request_block = self
+            .compact_state
+            .as_ref()
+            .and_then(|state| state.take_pending_request_block());
+        if let Some(block) = request_block {
+            if let Some(state) = &self.compact_state {
+                state.finish_logical_run();
+            }
+            return Err(automatic_compact_block_error(block));
+        }
+
         if matches!(result, EngineRunExit::Yielded) {
             self.last_run_interrupted = true;
             return self.do_compact_and_resume().await;
         }
 
-        if !matches!(result, EngineRunExit::Interrupted(_)) {
-            if let Some(ref state) = self.compact_state {
-                state.set_just_compacted(false);
+        if !matches!(result, EngineRunExit::Paused) {
+            if let Some(state) = &self.compact_state {
+                state.finish_logical_run();
             }
         }
 
@@ -4600,17 +4621,16 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         St: Clone + 'static,
     {
         Box::pin(async move {
-            // Thrash detection: if we just compacted and hit the threshold again,
-            // something is wrong.
-            if let Some(ref state) = self.compact_state {
-                if state.just_compacted() {
-                    state.set_just_compacted(false);
-                    return Err(WorkerError::CompactThrash);
+            let state = self.compact_state.clone();
+            if let Some(state) = &state {
+                if !state.has_claimed_attempt() {
+                    return Err(WorkerError::AutomaticCompactState(
+                        "automatic compaction yield had no claimed attempt".to_string(),
+                    ));
                 }
             }
 
-            let retained = self
-                .compact_state
+            let retained = state
                 .as_ref()
                 .map(|s| s.retained_tokens())
                 .unwrap_or(manifest::defaults::COMPACT_RETAINED_TOKENS);
@@ -4624,8 +4644,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                         new_segment_id = %new_segment_id,
                         "Compaction succeeded, resuming execution"
                     );
-                    if let Some(ref state) = self.compact_state {
-                        state.record_compact_success();
+                    if let Some(state) = &state {
+                        let completed = state.complete_automatic(CompactionOutcome::Succeeded);
+                        debug_assert!(
+                            completed,
+                            "automatic compaction must complete a claimed attempt"
+                        );
                     }
                     self.resume().await
                 }
@@ -4636,8 +4660,17 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                         AlertSource::Compactor,
                         format!("mid-run compaction failed: {e}"),
                     );
-                    if let Some(ref state) = self.compact_state {
-                        state.record_compact_failure();
+                    if let Some(state) = &state {
+                        let outcome = if matches!(e, WorkerError::CompactCancelled) {
+                            CompactionOutcome::Cancelled
+                        } else {
+                            CompactionOutcome::Failed(compact_failure_category(&e))
+                        };
+                        let completed = state.complete_automatic(outcome);
+                        debug_assert!(
+                            completed,
+                            "automatic compaction must complete a claimed attempt"
+                        );
                     }
                     Err(e)
                 }
@@ -4653,13 +4686,16 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Best-effort: failures are logged and surfaced, but do not abort the
     /// user turn that triggered the check.
     pub async fn try_pre_run_compact(&mut self) {
-        let state = match self.compact_state.as_ref() {
-            Some(s) if !s.is_disabled() && !s.just_compacted() => s.clone(),
-            _ => return,
+        let Some(state) = self.compact_state.clone() else {
+            return;
         };
         let current_tokens = self.total_tokens().tokens;
-        if !state.exceeds_post_run(current_tokens) {
-            return;
+        match state.evaluate_pre_run(current_tokens) {
+            AutomaticCompactDecision::Start(AutomaticCompactTrigger::PreRun) => {}
+            AutomaticCompactDecision::Continue | AutomaticCompactDecision::Block(_) => return,
+            AutomaticCompactDecision::Start(AutomaticCompactTrigger::RequestThreshold) => {
+                unreachable!("pre-run evaluation returned request-threshold trigger")
+            }
         }
 
         let retained = state.retained_tokens();
@@ -4672,7 +4708,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     new_segment_id = %new_segment_id,
                     "Proactive pre-run compaction succeeded"
                 );
-                state.record_compact_success();
+                let completed = state.complete_automatic(CompactionOutcome::Succeeded);
+                debug_assert!(
+                    completed,
+                    "automatic compaction must complete a claimed attempt"
+                );
             }
             Err(e) => {
                 warn!(error = %e, "Proactive pre-run compaction failed");
@@ -4681,7 +4721,16 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     AlertSource::Compactor,
                     format!("pre-run compaction failed: {e}"),
                 );
-                state.record_compact_failure();
+                let outcome = if matches!(e, WorkerError::CompactCancelled) {
+                    CompactionOutcome::Cancelled
+                } else {
+                    CompactionOutcome::Failed(compact_failure_category(&e))
+                };
+                let completed = state.complete_automatic(outcome);
+                debug_assert!(
+                    completed,
+                    "automatic compaction must complete a claimed attempt"
+                );
             }
         }
     }
@@ -4766,12 +4815,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.ensure_segment_head().await?;
 
         let state = self.compact_state.clone();
-        if state.as_ref().is_some_and(|s| s.is_disabled()) {
-            let message =
-                "manual compact is disabled after repeated compaction failures".to_string();
-            self.alert(AlertLevel::Warn, AlertSource::Compactor, message.clone());
-            return Ok(ManualCompactResult::Skipped { message });
-        }
 
         let retained = state
             .as_ref()
@@ -4795,7 +4838,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             Ok(new_segment_id) => {
                 info!(new_segment_id = %new_segment_id, "Manual compaction succeeded");
                 if let Some(ref state) = state {
-                    state.record_compact_success();
+                    state.reenable_automatic();
                 }
                 Ok(ManualCompactResult::Compacted { new_segment_id })
             }
@@ -4806,9 +4849,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     AlertSource::Compactor,
                     format!("manual compaction failed: {e}"),
                 );
-                if let Some(ref state) = state {
-                    state.record_compact_failure();
-                }
                 Err(e)
             }
         }
@@ -4895,6 +4935,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 record,
                 post_requests,
             } = recorded;
+            let committed_post_compact_request = post_requests.iter().any(|link| {
+                link.metric == crate::compact::usage_tracker::PostRequestMetric::Compaction
+            });
             self.commit_entry(LogEntry::LlmUsage {
                 ts: segment_log::now_millis(),
                 history_len: record.history_len,
@@ -4903,6 +4946,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 cache_write_tokens: record.cache_write_tokens,
                 output_tokens: record.output_tokens,
             })?;
+            if committed_post_compact_request {
+                if let Some(state) = &self.compact_state {
+                    state.post_compact_request_committed();
+                }
+            }
             for link in post_requests {
                 let metric =
                     correlated_post_request_metric(link.metric, &link.correlation_id, &record);
@@ -7121,6 +7169,18 @@ fn restored_flow_runtime_state(
         .transpose()
 }
 
+fn automatic_compact_block_error(block: AutomaticCompactBlock) -> WorkerError {
+    match block {
+        AutomaticCompactBlock::Thrash => WorkerError::CompactThrash,
+        AutomaticCompactBlock::Failed(category) | AutomaticCompactBlock::Disabled(category) => {
+            WorkerError::AutomaticCompactFailed {
+                category: category.as_str(),
+            }
+        }
+        AutomaticCompactBlock::Cancelled => WorkerError::CompactCancelled,
+    }
+}
+
 fn compact_failure_category(error: &WorkerError) -> CompactFailureCategory {
     match error {
         WorkerError::CompactCancelled => CompactFailureCategory::Cancelled,
@@ -7201,6 +7261,12 @@ pub enum WorkerError {
 
     #[error("compaction thrash: context still exceeds threshold immediately after compact")]
     CompactThrash,
+
+    #[error("automatic compaction failed and the provider request remained unsafe: {category}")]
+    AutomaticCompactFailed { category: &'static str },
+
+    #[error("invalid automatic compaction state: {0}")]
+    AutomaticCompactState(String),
 
     #[error("compact worker did not produce a summary (write_summary was never called)")]
     CompactSummaryMissing,

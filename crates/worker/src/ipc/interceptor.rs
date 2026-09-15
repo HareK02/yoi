@@ -25,7 +25,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use tracing::info;
 
-use crate::compact::state::CompactState;
+use crate::compact::state::{AutomaticCompactDecision, CompactState};
 use crate::compact::usage_tracker::UsageTracker;
 use session_store::SystemItem;
 
@@ -110,6 +110,9 @@ pub(crate) struct WorkerInterceptor {
     /// Tool calls observed in the current turn (reset on each new prompt).
     tool_calls_this_turn: AtomicUsize,
 }
+
+const THRESHOLD_COMPACT_BLOCKED_DIAGNOSTIC: &str =
+    "automatic compaction could not make the provider request context safe";
 
 impl WorkerInterceptor {
     #[cfg(test)]
@@ -229,27 +232,45 @@ impl WorkerInterceptor {
         Some(total_tokens(context, &records).tokens)
     }
 
-    fn request_threshold_exceeded(&self, current_tokens: Option<u64>, context: &[Item]) -> bool {
-        if let Some(state) = self.compact_state.as_ref() {
-            if !state.is_disabled() && !state.just_compacted() {
-                let current = current_tokens.unwrap_or(0);
-                if state.exceeds_request(current) {
-                    let shape = context_shape(context);
-                    info!(
-                        input_tokens = current,
-                        threshold = state.request_threshold().unwrap_or(0),
-                        items_len = shape.items_len,
-                        items_json_bytes = shape.items_json_bytes,
-                        reasoning_items = shape.reasoning_items,
-                        reasoning_encrypted_content_count = shape.reasoning_encrypted_content_count,
-                        reasoning_encrypted_content_bytes = shape.reasoning_encrypted_content_bytes,
-                        "Between-requests compaction threshold exceeded, yielding"
-                    );
-                    return true;
+    fn request_compact_decision(
+        &self,
+        current_tokens: Option<u64>,
+        context: &[Item],
+    ) -> AutomaticCompactDecision {
+        let Some(state) = self.compact_state.as_ref() else {
+            return AutomaticCompactDecision::Continue;
+        };
+        let current = current_tokens.unwrap_or(0);
+        let decision = state.evaluate_request(current);
+        if !matches!(decision, AutomaticCompactDecision::Continue) {
+            let shape = context_shape(context);
+            info!(
+                input_tokens = current,
+                ?decision,
+                items_len = shape.items_len,
+                items_json_bytes = shape.items_json_bytes,
+                reasoning_items = shape.reasoning_items,
+                reasoning_encrypted_content_count = shape.reasoning_encrypted_content_count,
+                reasoning_encrypted_content_bytes = shape.reasoning_encrypted_content_bytes,
+                "Between-requests automatic compaction decision"
+            );
+        }
+        decision
+    }
+
+    fn decision_action(&self, decision: AutomaticCompactDecision) -> Option<PreRequestAction> {
+        match decision {
+            AutomaticCompactDecision::Continue => None,
+            AutomaticCompactDecision::Start(_) => Some(PreRequestAction::Yield),
+            AutomaticCompactDecision::Block(block) => {
+                if let Some(state) = &self.compact_state {
+                    state.record_request_block(block);
                 }
+                Some(PreRequestAction::Cancel(
+                    THRESHOLD_COMPACT_BLOCKED_DIAGNOSTIC.to_string(),
+                ))
             }
         }
-        false
     }
     fn attach_prompt_provenance(&self, items: &mut [SystemItem]) {
         let prompts = self.prompts.load();
@@ -388,8 +409,10 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
     ) -> InterceptorResult<PreRequestAction> {
         let context = context.items;
         let initial_tokens = self.estimated_tokens(context);
-        if self.request_threshold_exceeded(initial_tokens, context) {
-            return Ok(PreRequestAction::Yield);
+        if let Some(action) =
+            self.decision_action(self.request_compact_decision(initial_tokens, context))
+        {
+            return Ok(action);
         }
         let info = PreRequestInfo {
             item_count: context.len(),
@@ -423,6 +446,22 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
             return Ok(PreRequestAction::Cancel(reason));
         }
         if should_yield {
+            if let Some(state) = &self.compact_state {
+                match state.claim_hook_yield() {
+                    AutomaticCompactDecision::Start(_) => {}
+                    AutomaticCompactDecision::Block(block) => {
+                        state.record_request_block(block);
+                        return Ok(PreRequestAction::Cancel(
+                            THRESHOLD_COMPACT_BLOCKED_DIAGNOSTIC.to_string(),
+                        ));
+                    }
+                    AutomaticCompactDecision::Continue => {
+                        return Ok(PreRequestAction::Cancel(
+                            THRESHOLD_COMPACT_BLOCKED_DIAGNOSTIC.to_string(),
+                        ));
+                    }
+                }
+            }
             return Ok(PreRequestAction::Yield);
         }
 
@@ -445,16 +484,26 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
         };
         let current_tokens = self.estimated_tokens(effective_context.as_ref());
 
-        if self.request_threshold_exceeded(current_tokens, effective_context.as_ref()) {
+        let compact_decision =
+            self.request_compact_decision(current_tokens, effective_context.as_ref());
+        if !matches!(compact_decision, AutomaticCompactDecision::Continue) {
             if let Err(error) = self.commit_system_items(&system_items) {
                 return Ok(PreRequestAction::Cancel(format!(
                     "session persistence failed: {error}"
                 )));
             }
-            return Ok(if appended_items.is_empty() {
-                PreRequestAction::Yield
-            } else {
-                PreRequestAction::YieldWith(appended_items)
+            return Ok(match compact_decision {
+                AutomaticCompactDecision::Start(_) if !appended_items.is_empty() => {
+                    PreRequestAction::YieldWith(appended_items)
+                }
+                AutomaticCompactDecision::Start(_) => PreRequestAction::Yield,
+                AutomaticCompactDecision::Block(block) => {
+                    if let Some(state) = &self.compact_state {
+                        state.record_request_block(block);
+                    }
+                    PreRequestAction::Cancel(THRESHOLD_COMPACT_BLOCKED_DIAGNOSTIC.to_string())
+                }
+                AutomaticCompactDecision::Continue => unreachable!(),
             });
         }
 
@@ -668,6 +717,18 @@ mod tests {
         Arc::new(builder.build())
     }
 
+    struct YieldingPreRequestHook;
+
+    #[async_trait]
+    impl Hook<PreLlmRequest> for YieldingPreRequestHook {
+        async fn call(
+            &self,
+            _info: &PreRequestContext,
+        ) -> Result<HookPreRequestAction, crate::hook::HookError> {
+            Ok(HookPreRequestAction::Yield)
+        }
+    }
+
     struct RecordingSystemItemCommitter {
         committed: Arc<Mutex<Vec<SystemItem>>>,
     }
@@ -751,6 +812,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hook_yield_claims_attempt_before_returning_to_compaction() {
+        let mut builder = HookRegistryBuilder::new();
+        builder.add_pre_llm_request(YieldingPreRequestHook);
+        let registry = Arc::new(builder.build());
+        let state = Arc::new(CompactState::new(None, Some(u64::MAX), 0));
+        let interceptor = WorkerInterceptor::new(
+            registry,
+            Some(Arc::clone(&state)),
+            Some(usage_handle_with(1, 1)),
+            NotifyBuffer::new(),
+            Arc::new(Mutex::new(Vec::new())),
+            test_prompts(),
+            None,
+        );
+        let mut ctx = vec![Item::user_message("hello")];
+
+        let action = interceptor
+            .pre_llm_request(PreLlmRequestContext {
+                invocation: Default::default(),
+                items: &mut ctx,
+                history: &[],
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(action, PreRequestAction::Yield));
+        assert!(state.has_claimed_attempt());
+    }
+
+    #[tokio::test]
     async fn pre_llm_request_yields_and_skips_hooks_when_request_threshold_exceeded() {
         let count = Arc::new(AtomicUsize::new(0));
         let registry = registry_with_pre_llm_hook(count.clone());
@@ -761,7 +852,7 @@ mod tests {
 
         let interceptor = WorkerInterceptor::new(
             registry,
-            Some(state),
+            Some(Arc::clone(&state)),
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
@@ -779,6 +870,10 @@ mod tests {
             .unwrap();
 
         assert!(matches!(action, PreRequestAction::Yield));
+        assert_eq!(
+            state.attempt_state(),
+            crate::compact::state::AutomaticCompactState::Attempted
+        );
         // Hook must not run when an internal mechanism short-circuits first.
         assert_eq!(count.load(Ordering::Relaxed), 0);
     }
@@ -798,7 +893,7 @@ mod tests {
 
         let interceptor = WorkerInterceptor::new(
             registry,
-            Some(state),
+            Some(Arc::clone(&state)),
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
@@ -821,8 +916,49 @@ mod tests {
             PreRequestAction::YieldWith(items) => assert_eq!(items.len(), 1),
             other => panic!("expected YieldWith queued system item, got {other:?}"),
         }
+        assert_eq!(
+            state.attempt_state(),
+            crate::compact::state::AutomaticCompactState::Attempted
+        );
         assert!(saw_handle.load(Ordering::Relaxed));
         assert_eq!(committed.lock().expect("committed system items").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_compaction_blocks_unsafe_request_until_usage_commit() {
+        let registry = Arc::new(HookRegistryBuilder::new().build());
+        let state = Arc::new(CompactState::new(None, Some(10), 0));
+        assert!(matches!(
+            state.evaluate_request(11),
+            AutomaticCompactDecision::Start(_)
+        ));
+        assert!(state.complete_automatic(crate::compact::state::CompactionOutcome::Succeeded));
+        let history = usage_handle_with(1, 11);
+        let interceptor = WorkerInterceptor::new(
+            registry,
+            Some(Arc::clone(&state)),
+            Some(history),
+            NotifyBuffer::new(),
+            Arc::new(Mutex::new(Vec::new())),
+            test_prompts(),
+            None,
+        );
+        let mut ctx = vec![Item::user_message("still too large")];
+
+        let action = interceptor
+            .pre_llm_request(PreLlmRequestContext {
+                invocation: Default::default(),
+                items: &mut ctx,
+                history: &[],
+            })
+            .await
+            .expect("pre-request interception should succeed");
+
+        assert!(matches!(action, PreRequestAction::Cancel(_)));
+        assert_eq!(
+            state.take_pending_request_block(),
+            Some(crate::compact::state::AutomaticCompactBlock::Thrash)
+        );
     }
 
     #[tokio::test]
@@ -843,7 +979,7 @@ mod tests {
 
         let interceptor = WorkerInterceptor::new(
             registry,
-            Some(state),
+            Some(Arc::clone(&state)),
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
@@ -875,7 +1011,7 @@ mod tests {
 
         let interceptor = WorkerInterceptor::new(
             registry,
-            Some(state),
+            Some(Arc::clone(&state)),
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
@@ -923,7 +1059,7 @@ mod tests {
         let history = Arc::new(Mutex::new(vec![record]));
         let interceptor = WorkerInterceptor::new(
             registry,
-            Some(state),
+            Some(Arc::clone(&state)),
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
@@ -957,7 +1093,7 @@ mod tests {
 
         let interceptor = WorkerInterceptor::new(
             registry,
-            Some(state),
+            Some(Arc::clone(&state)),
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),

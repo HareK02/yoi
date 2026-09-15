@@ -23,7 +23,7 @@ use session_store::{
 };
 use tokio::sync::broadcast;
 
-use worker::{Worker, WorkerController};
+use worker::{Worker, WorkerController, WorkerError};
 
 type TestStore = CombinedStore<FsStore, FsWorkerStore>;
 
@@ -992,12 +992,16 @@ async fn request_threshold_compact_publishes_runtime_progress() {
     //   [2] compact worker closes (its final "done" response).
     //   [3] resume() after compact makes one more LLM call.
     let client = MockClient::new(vec![
-        text_events_with_usage("a", 1000),
+        text_events_with_usage("a", 100_000),
         write_summary_tool_use_events("call-1", "summary"),
         single_text_events("done"),
         text_events_with_usage("b", 50),
     ]);
-    let mut worker = make_worker_with_manifest(MID_TURN_MANIFEST_TOML, client).await;
+    let manifest = MID_TURN_MANIFEST_TOML.replace(
+        "compact_request_threshold = 100",
+        "compact_request_threshold = 50000",
+    );
+    let mut worker = make_worker_with_manifest(&manifest, client).await;
 
     let (tx, mut rx) = broadcast::channel::<Event>(64);
     worker.attach_working_event_tx(tx);
@@ -1038,6 +1042,31 @@ async fn request_threshold_compact_publishes_runtime_progress() {
         .find(|record| record.metric.name == "compact.post_request")
         .unwrap();
     assert_eq!(post.metric.correlation_id.as_deref(), Some(correlation_id));
+}
+
+#[tokio::test]
+async fn compacted_context_above_request_threshold_fails_before_provider_request() {
+    let client = MockClient::new(vec![
+        text_events_with_usage("seed", 1000),
+        write_summary_tool_use_events("call-1", "still too large after compaction"),
+        single_text_events("done"),
+        single_text_events("must not be requested"),
+    ]);
+    let call_count = Arc::clone(&client.call_count);
+    let mut worker = make_worker_with_manifest(MID_TURN_MANIFEST_TOML, client).await;
+    worker.run_text("first").await.unwrap();
+
+    let error = worker
+        .run_text("second")
+        .await
+        .expect_err("unsafe compacted context must fail closed");
+
+    assert!(matches!(error, WorkerError::CompactThrash));
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        3,
+        "the provider must receive only the seed and compaction requests"
+    );
 }
 
 #[tokio::test]
@@ -1212,7 +1241,7 @@ async fn controller_compact_method_publishes_progress_and_clear() {
         single_text_events("done"),
         single_text_events("follow-up"),
     ]);
-    let worker = make_worker_with_manifest(POST_RUN_MANIFEST_TOML, client).await;
+    let worker = make_worker_with_manifest(MANUAL_ONLY_MANIFEST_TOML, client).await;
     let runtime_tmp = tempfile::tempdir().unwrap();
     let bash_output_dir = runtime_tmp.path().join("bash-output");
     let (handle, _shutdown) = WorkerController::spawn(worker, runtime_tmp.path(), &bash_output_dir)
