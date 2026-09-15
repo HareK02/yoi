@@ -6,6 +6,7 @@ import type {
   CompactionLifecycle,
   Event as ProtocolEvent,
   InFlightBlock,
+  InFlightCompaction,
   InFlightToolCallState,
   InternalWorkerRef,
   InternalWorkerSnapshot,
@@ -638,7 +639,7 @@ function projectInternalWorkerSnapshot(
   eventId: string,
   cwd: string | null,
 ): InternalWorkerProjection {
-  const console = snapshotProjectionFromSession(
+  let console = snapshotProjectionFromSession(
     `${eventId}:internal:${snapshot.worker.session_id}:snapshot`,
     snapshot.session,
     cwd,
@@ -669,6 +670,9 @@ function projectInternalWorkerSnapshot(
   console.internalWorkers = (snapshot.internal_workers ?? []).map((child) =>
     projectInternalWorkerSnapshot(child, eventId, cwd)
   );
+  if (snapshot.in_flight?.compaction) {
+    console = applyInFlightCompaction(console, snapshot.in_flight.compaction);
+  }
   return { worker: snapshot.worker, revision: snapshot.revision, console };
 }
 
@@ -712,6 +716,20 @@ function compactionActivity(
         : line.body || line.title
     )
     .filter((value, index, values) => value.length > 0 && values.indexOf(value) === index);
+}
+
+function applyInFlightCompaction(
+  projection: ConsoleProjection,
+  progress: InFlightCompaction,
+): ConsoleProjection {
+  return applyCompactionLifecycle(projection, {
+    ...progress,
+    state: "running",
+    ended_at_ms: null,
+    summary: null,
+    error: null,
+    new_segment_id: null,
+  });
 }
 
 function applyCompactionLifecycle(
@@ -970,6 +988,13 @@ export function applyProtocolEvent(
         projectInternalWorkerSnapshot(worker, envelope.eventId, next.cwd)
       );
       next.removedInternalWorkers = {};
+      if (event.data.in_flight?.compaction) {
+        const withCompaction = applyInFlightCompaction(
+          next,
+          event.data.in_flight.compaction,
+        );
+        next.lines = withCompaction.lines;
+      }
       for (const line of next.lines) {
         const compaction = line.compaction;
         if (!compaction) continue;
@@ -979,19 +1004,6 @@ export function applyProtocolEvent(
             ...compaction,
             candidate: compactionCandidate(next, sessionId),
             activity: compactionActivity(next, sessionId),
-          };
-        }
-        if (
-          compaction.state === "running" &&
-          (!sessionId || !next.internalWorkers.some((worker) =>
-            worker.worker.session_id === sessionId
-          ))
-        ) {
-          line.streaming = false;
-          line.compaction = {
-            ...line.compaction!,
-            state: "interrupted",
-            endedAtMs: envelope.observedAtMs ?? Date.now(),
           };
         }
       }

@@ -113,7 +113,16 @@ export type RewindSummary = { truncated_to_entries: number, discarded_entries: n
 
 export type InFlightBlock = { "kind": "text", text: string, finished?: boolean, } | { "kind": "thinking", text: string, finished?: boolean, } | { "kind": "tool_call", id: string, name: string, args: string, state?: InFlightToolCallState, };
 
-export type InFlightSnapshot = { blocks?: Array<InFlightBlock>, commands?: Array<CommandSnapshot>, };
+export type InFlightCompaction = { schema_version: number, compaction_id: string, revision: number, internal_worker: InternalWorkerRef | null, started_at_ms: number, };
+
+export type InFlightSnapshot = { blocks?: Array<InFlightBlock>, commands?: Array<CommandSnapshot>,
+/**
+ * The currently running compaction, if any.
+ *
+ * This is lifecycle progress only. Candidate history and the staged
+ * Segment remain private until the Segment is activated atomically.
+ */
+compaction?: InFlightCompaction | null, };
 
 export type SessionEntryProvenance = "human_input" | "worker_input" | "flow_instruction" | "backend_instruction" | "model_output" | "tool_output" | "derived_summary" | "legacy_unknown";
 

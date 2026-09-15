@@ -1416,6 +1416,28 @@ pub enum CommandEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct InFlightCompaction {
+    pub schema_version: u32,
+    pub compaction_id: String,
+    pub revision: u64,
+    pub internal_worker: Option<InternalWorkerRef>,
+    pub started_at_ms: u64,
+}
+
+impl InFlightCompaction {
+    pub fn from_running(lifecycle: &CompactionLifecycle) -> Option<Self> {
+        (lifecycle.state == CompactionLifecycleState::Running).then(|| Self {
+            schema_version: lifecycle.schema_version,
+            compaction_id: lifecycle.compaction_id.clone(),
+            revision: lifecycle.revision,
+            internal_worker: lifecycle.internal_worker.clone(),
+            started_at_ms: lifecycle.started_at_ms,
+        })
+    }
+}
+
 /// Unfinished model output and active command state included in
 /// `Event::Snapshot` for clients that attach while work is still streaming.
 ///
@@ -1430,11 +1452,17 @@ pub struct InFlightSnapshot {
     pub blocks: Vec<InFlightBlock>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<CommandSnapshot>,
+    /// The currently running compaction, if any.
+    ///
+    /// This is lifecycle progress only. Candidate history and the staged
+    /// Segment remain private until the Segment is activated atomically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<InFlightCompaction>,
 }
 
 impl InFlightSnapshot {
     pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty() && self.commands.is_empty()
+        self.blocks.is_empty() && self.commands.is_empty() && self.compaction.is_none()
     }
 }
 
@@ -2280,6 +2308,13 @@ mod tests {
                     stderr: CommandStreamSlice::default(),
                     exit_code: None,
                 }],
+                compaction: Some(InFlightCompaction {
+                    schema_version: 3,
+                    compaction_id: "compaction-1".into(),
+                    revision: 1,
+                    internal_worker: None,
+                    started_at_ms: 99,
+                }),
             },
             internal_workers: Vec::new(),
         };
@@ -2291,9 +2326,26 @@ mod tests {
             parsed["data"]["in_flight"]["blocks"][2]["state"],
             "streaming_args"
         );
+        assert_eq!(
+            parsed["data"]["in_flight"]["compaction"]["compaction_id"],
+            "compaction-1"
+        );
+        assert!(
+            parsed["data"]["in_flight"]["compaction"]
+                .as_object()
+                .is_some_and(|value| {
+                    !value.contains_key("state")
+                        && !value.contains_key("summary")
+                        && !value.contains_key("new_segment_id")
+                }),
+            "in-flight compaction progress must not expose terminal or staged state"
+        );
 
         match serde_json::from_str::<Event>(&json).unwrap() {
-            Event::Snapshot { in_flight, .. } => assert_eq!(in_flight.blocks.len(), 3),
+            Event::Snapshot { in_flight, .. } => {
+                assert_eq!(in_flight.blocks.len(), 3);
+                assert_eq!(in_flight.compaction.unwrap().compaction_id, "compaction-1");
+            }
             other => panic!("expected Snapshot, got {other:?}"),
         }
     }

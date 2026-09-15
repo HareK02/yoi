@@ -5,15 +5,15 @@ use ts_rs::{Config, TS};
 use crate::{
     Alert, AlertLevel, AlertSource, CommandEvent, CommandSnapshot, CommandStatus, CommandStream,
     CommandStreamSlice, CompactionLifecycle, CompactionLifecycleState, CompletionEntry,
-    CompletionKind, ErrorCode, Event, Greeting, InFlightBlock, InFlightSnapshot,
-    InFlightToolCallState, InternalWorkerKind, InternalWorkerRef, InternalWorkerSnapshot,
-    InvokeKind, MemoryWorkerEvent, Method, PasteArtifactAvailability, PasteArtifactMediaType,
-    PasteArtifactRef, PendingSubmissionSummary, PendingSubmissionsSnapshot, Permission,
-    RewindSummary, RewindTarget, RewindTargetId, RunResult, ScopeRule, Segment, SessionContentPart,
-    SessionEntryProvenance, SessionMessageRole, SessionSnapshot, SessionSnapshotEntry,
-    SessionSnapshotEntryData, SessionToolAttachment, SubmissionDisposition, SymlinkPolicy,
-    ToolResultDisposition, TurnResult, UploadedFileAvailability, UploadedFileRef, WorkerBusyState,
-    WorkerCommandAcknowledgement, WorkerCommandDisposition, WorkerCommandEnvelope,
+    CompletionKind, ErrorCode, Event, Greeting, InFlightBlock, InFlightCompaction,
+    InFlightSnapshot, InFlightToolCallState, InternalWorkerKind, InternalWorkerRef,
+    InternalWorkerSnapshot, InvokeKind, MemoryWorkerEvent, Method, PasteArtifactAvailability,
+    PasteArtifactMediaType, PasteArtifactRef, PendingSubmissionSummary, PendingSubmissionsSnapshot,
+    Permission, RewindSummary, RewindTarget, RewindTargetId, RunResult, ScopeRule, Segment,
+    SessionContentPart, SessionEntryProvenance, SessionMessageRole, SessionSnapshot,
+    SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment, SubmissionDisposition,
+    SymlinkPolicy, ToolResultDisposition, TurnResult, UploadedFileAvailability, UploadedFileRef,
+    WorkerBusyState, WorkerCommandAcknowledgement, WorkerCommandDisposition, WorkerCommandEnvelope,
     WorkerCommandKind, WorkerEvent, WorkerMaintenanceState, WorkerRunState, WorkerState,
     WorkerStateSnapshot, WorkerStatus,
     subscription::{
@@ -81,6 +81,7 @@ pub fn generated_protocol_types() -> String {
     push_decl::<RewindTarget>(&cfg, &mut output);
     push_decl::<RewindSummary>(&cfg, &mut output);
     push_decl::<InFlightBlock>(&cfg, &mut output);
+    push_decl::<InFlightCompaction>(&cfg, &mut output);
     push_decl::<InFlightSnapshot>(&cfg, &mut output);
     push_decl::<SessionEntryProvenance>(&cfg, &mut output);
     push_decl::<SessionMessageRole>(&cfg, &mut output);

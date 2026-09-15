@@ -8,7 +8,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use agen::Engine;
 use agen::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
@@ -17,13 +17,102 @@ use agen::llm_client::{ClientError, LlmClient, Request};
 use async_trait::async_trait;
 use futures::Stream;
 use protocol::{Event, Method, RunResult};
-use session_store::{CombinedStore, FsWorkerStore, WorkerMetadataStore};
-use session_store::{FsStore, LogEntry, Store};
+use session_store::{
+    CombinedStore, FsStore, FsWorkerStore, LogEntry, Store, WorkerMetadata, WorkerMetadataStore,
+    WorkerStoreError,
+};
 use tokio::sync::broadcast;
 
 use worker::{Worker, WorkerController};
 
 type TestStore = CombinedStore<FsStore, FsWorkerStore>;
+
+#[derive(Clone)]
+struct FaultingWorkerMetadataStore {
+    inner: FsWorkerStore,
+    fail_next_update: Arc<AtomicBool>,
+}
+
+impl FaultingWorkerMetadataStore {
+    fn new(root: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            inner: FsWorkerStore::new(root).unwrap(),
+            fail_next_update: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn arm_update_failure(&self) {
+        self.fail_next_update.store(true, Ordering::SeqCst);
+    }
+}
+
+impl WorkerMetadataStore for FaultingWorkerMetadataStore {
+    fn write(&self, metadata: &WorkerMetadata) -> Result<(), WorkerStoreError> {
+        let old_segment_id = self
+            .inner
+            .read_by_name(&metadata.worker_name)?
+            .and_then(|current| current.active)
+            .and_then(|active| active.segment_id);
+        let new_segment_id = metadata
+            .active
+            .as_ref()
+            .and_then(|active| active.segment_id);
+        if old_segment_id != new_segment_id && self.fail_next_update.swap(false, Ordering::SeqCst) {
+            return Err(WorkerStoreError::Io(std::io::Error::other(
+                "injected active Segment commit failure",
+            )));
+        }
+        self.inner.write(metadata)
+    }
+
+    fn read_by_name(&self, worker_name: &str) -> Result<Option<WorkerMetadata>, WorkerStoreError> {
+        self.inner.read_by_name(worker_name)
+    }
+
+    fn update_by_name<F>(
+        &self,
+        worker_name: &str,
+        mutate: F,
+    ) -> Result<WorkerMetadata, WorkerStoreError>
+    where
+        F: FnOnce(&mut WorkerMetadata),
+    {
+        let mut metadata = self
+            .inner
+            .read_by_name(worker_name)?
+            .unwrap_or_else(|| WorkerMetadata::new(worker_name, None));
+        let old_segment_id = metadata
+            .active
+            .as_ref()
+            .and_then(|active| active.segment_id);
+        mutate(&mut metadata);
+        let new_segment_id = metadata
+            .active
+            .as_ref()
+            .and_then(|active| active.segment_id);
+        if old_segment_id != new_segment_id && self.fail_next_update.swap(false, Ordering::SeqCst) {
+            return Err(WorkerStoreError::Io(std::io::Error::other(
+                "injected active Segment commit failure",
+            )));
+        }
+        self.inner.write(&metadata)?;
+        Ok(metadata)
+    }
+
+    fn list_names(&self) -> Result<Vec<String>, WorkerStoreError> {
+        self.inner.list_names()
+    }
+
+    fn root_dir(&self) -> Option<std::path::PathBuf> {
+        self.inner.root_dir()
+    }
+
+    fn delete_by_name(&self, worker_name: &str) -> Result<(), WorkerStoreError> {
+        self.inner.delete_by_name(worker_name)
+    }
+}
+
+type FaultingTestStore = CombinedStore<FsStore, FaultingWorkerMetadataStore>;
 
 fn annotated(item: Item) -> session_store::LoggedHistoryEntry {
     session_store::LoggedHistoryEntry {
@@ -229,6 +318,41 @@ async fn make_worker(client: MockClient) -> Worker<MockClient, TestStore> {
     make_worker_with_manifest(POST_RUN_MANIFEST_TOML, client).await
 }
 
+async fn make_faulting_worker(
+    client: MockClient,
+) -> (
+    Worker<MockClient, FaultingTestStore>,
+    FaultingWorkerMetadataStore,
+    FsStore,
+) {
+    let manifest = worker::WorkerManifest::from_toml(MID_TURN_MANIFEST_TOML).unwrap();
+    let store_tmp = tempfile::tempdir().unwrap();
+    let segment_store = FsStore::new(store_tmp.path()).unwrap();
+    let metadata_store = FaultingWorkerMetadataStore::new(store_tmp.path().join("pods"));
+    let store = CombinedStore::new(segment_store.clone(), metadata_store.clone());
+    std::mem::forget(store_tmp);
+
+    let pwd_tmp = tempfile::tempdir().unwrap();
+    let pwd = pwd_tmp.path().to_path_buf();
+    let scope = worker::Scope::writable(&pwd).unwrap();
+    std::mem::forget(pwd_tmp);
+
+    let engine =
+        Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(client);
+    let mut worker = Worker::new(
+        manifest,
+        engine,
+        store,
+        worker::WorkerWorkspaceContext::local_filesystem(None),
+        worker::WorkerFilesystemAuthority::local(pwd.clone(), pwd.clone()),
+        scope,
+    )
+    .await
+    .unwrap();
+    worker.enable_worker_metadata_write_through().unwrap();
+    (worker, metadata_store, segment_store)
+}
+
 /// Drain whatever events are already queued on `rx`. Non-blocking.
 fn drain(rx: &mut broadcast::Receiver<Event>) -> Vec<Event> {
     let mut out = Vec::new();
@@ -280,6 +404,45 @@ fn system_texts_in_sink_session_start(
             .collect();
     }
     Vec::new()
+}
+
+#[tokio::test]
+async fn failed_active_segment_commit_keeps_live_and_durable_history_on_old_segment() {
+    let client = MockClient::new(vec![
+        single_text_events("seed response"),
+        write_summary_tool_use_events("summary-1", "replacement summary"),
+        single_text_events("continued on old segment"),
+    ]);
+    let (mut worker, metadata_store, segment_store) = make_faulting_worker(client).await;
+    worker.run_text("seed input").await.unwrap();
+    let old_segment_id = worker.segment_id();
+
+    metadata_store.arm_update_failure();
+    let error = worker.compact(0).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected active Segment commit failure")
+    );
+
+    assert_eq!(worker.segment_id(), old_segment_id);
+    let metadata = metadata_store
+        .read_by_name("test-worker")
+        .unwrap()
+        .expect("active Worker metadata should remain present");
+    assert_eq!(
+        metadata.active.and_then(|active| active.segment_id),
+        Some(old_segment_id)
+    );
+
+    worker.run_text("continue input").await.unwrap();
+    let active_records = segment_store
+        .read_all(worker.session_id(), old_segment_id)
+        .unwrap();
+    assert!(
+        format!("{active_records:?}").contains("continue input"),
+        "the live Worker must continue appending to the old active Segment"
+    );
 }
 
 /// Worker metadata starts with a reserved Session and no Segment, then becomes

@@ -4567,6 +4567,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         lifecycle: CompactionLifecycle,
     ) -> Result<(), WorkerError> {
         self.persist_compaction_lifecycle(&lifecycle)?;
+        if let Some(in_flight) = &self.in_flight {
+            in_flight.update_compaction(&lifecycle);
+        }
         self.send_event(Event::CompactStart { lifecycle });
         Ok(())
     }
@@ -4576,6 +4579,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         lifecycle: CompactionLifecycle,
     ) -> Result<(), WorkerError> {
         self.persist_compaction_lifecycle(&lifecycle)?;
+        if let Some(in_flight) = &self.in_flight {
+            in_flight.update_compaction(&lifecycle);
+        }
         self.send_event(Event::CompactFailed { lifecycle });
         Ok(())
     }
@@ -5057,6 +5063,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         match outcome {
             Ok((new_segment_id, _summary)) => {
                 debug_assert_eq!(lifecycle.state, CompactionLifecycleState::Done);
+                if let Some(in_flight) = &self.in_flight {
+                    in_flight.update_compaction(&lifecycle);
+                }
                 self.send_event(Event::CompactDone {
                     lifecycle: lifecycle.clone(),
                 });
@@ -5661,54 +5670,66 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         });
         self.store
             .create_segment(old_loc.session_id, new_segment_id, &initial_entries)?;
+
+        // The name-keyed Worker metadata pointer is the durable commit point for
+        // Segment activation. Everything above is staging: a failure leaves the
+        // current Segment and live session untouched, while the unreachable
+        // replacement may be collected later. The metadata store publishes the
+        // complete record with an atomic replace, so restore observes either the
+        // old Segment or this fully-written replacement, never a partial switch.
+        self.write_worker_metadata_active(SegmentLocation {
+            session_id: old_loc.session_id,
+            segment_id: new_segment_id,
+        })?;
+
+        // All live mutations after the durable commit are infallible and happen
+        // before the replacement SegmentStart is broadcast. This keeps the
+        // append destination, Session projection, Engine cache identity, and
+        // reconnect snapshot on one side of the same activation boundary.
         self.segment_state.set_location(SegmentLocation {
             session_id: old_loc.session_id,
             segment_id: new_segment_id,
         });
         self.segment_state
             .set_entries_written(initial_entries.len());
-        // Broadcast the complete compacted prefix. Runtime-owned extensions
-        // must remain visible and restorable with the replacement segment.
-        self.sink
-            .reset_with_initial_entries(initial_entries.clone());
-        // Keep workers.json pointing at the live segment_id. Without this
-        // a concurrent `restore_from_manifest(new_segment_id)` would
-        // see no live writer and grab the session this Worker just moved
-        // into, causing two writers to race on the same jsonl. Skipped
-        // when no allocation is installed (e.g. compact under
-        // `Worker::new` in tests).
-        if self.scope_allocation.is_some() {
-            worker_allocation::update_segment(&self.manifest.worker.name, new_segment_id)?;
-        }
-        self.write_worker_metadata_active(SegmentLocation {
-            session_id: old_loc.session_id,
-            segment_id: new_segment_id,
-        })?;
-        // Align user_segments with the post-compaction history. Items
-        // before `retain_from` (now folded into the summary) lose their
-        // segments; only the user_messages surviving in retained_items
-        // keep them. They are always the trailing K entries of
-        // `self.user_segments` because submissions are appended in order.
         self.user_segments = retained_user_segments;
-
         self.session.replace_history(compacted_history_entries);
-        // Compaction-introduced system messages are part of the new
-        // SegmentStart's history (broadcast above) — clients derive
-        // their blocks from `SegmentStart.history`. No per-item
-        // broadcast is required.
-        let _ = &compact_introduced_system_messages;
         let worker = self.engine.as_mut().unwrap();
-        // Anchor the prompt cache at the summary item so that Anthropic
-        // can place a durable `cache_control` breakpoint there — our
-        // compact layout guarantees history[0] is the summary.
         worker.set_cache_anchor(Some(0));
-        // Re-key the OpenAI Responses prompt cache namespace to the new
-        // segment_id so post-compact turns use the rewritten session namespace.
         worker.set_cache_key(Some(new_segment_id.to_string()));
         self.usage_history
             .lock()
             .expect("usage_history poisoned")
             .clear();
+
+        // workers.json is live writer-bookkeeping derived from the durable
+        // metadata pointer above. A stale value still retains the worker-name
+        // lease and cannot authorize another writer; after a process exit it is
+        // reclaimed through the normal stale-allocation path. Do not report a
+        // committed compaction as failed solely because this derived projection
+        // could not be refreshed.
+        if self.scope_allocation.is_some()
+            && let Err(error) =
+                worker_allocation::update_segment(&self.manifest.worker.name, new_segment_id)
+        {
+            warn!(
+                worker = %self.manifest.worker.name,
+                segment_id = %new_segment_id,
+                error = %error,
+                "compaction committed but live writer allocation projection could not be refreshed"
+            );
+        }
+
+        // Broadcast only after every live authority points at the committed
+        // replacement. Runtime-owned extensions stay visible and restorable.
+        self.sink
+            .reset_with_initial_entries(initial_entries.clone());
+
+        // Compaction-introduced system messages are part of the new
+        // SegmentStart's history (broadcast above) — clients derive
+        // their blocks from `SegmentStart.history`. No per-item
+        // broadcast is required.
+        let _ = &compact_introduced_system_messages;
         Ok((new_segment_id, summary_text))
     }
 

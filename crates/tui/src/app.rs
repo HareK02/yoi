@@ -277,6 +277,8 @@ pub struct App {
     /// Turn/protocol errors retained when a real `SegmentStart` replaces the
     /// replayable conversation rows during segment rotation.
     run_error_messages: Vec<String>,
+    /// Current compaction identity/revision used to fence snapshot/live updates.
+    active_compaction: Option<(String, u64)>,
     /// Presentation-only Internal Worker projections keyed by session identity.
     /// They are rendered in separate selectable views and never mixed into `blocks`.
     pub internal_workers: Vec<InternalWorkerView>,
@@ -364,6 +366,7 @@ impl App {
             quit_confirm: None,
             shutdown_confirm: None,
             blocks: Vec::new(),
+            active_compaction: None,
             run_error_messages: Vec::new(),
             internal_workers: Vec::new(),
             selected_internal_worker_session_id: None,
@@ -1397,14 +1400,33 @@ impl App {
                     self.reset_run_state();
                 }
             }
-            Event::CompactStart { .. } => {
-                if self.last_streaming_compact_mut().is_none() {
-                    self.blocks.push(Block::Compact(CompactEvent::Streaming {
-                        started_at: Instant::now(),
-                    }));
+            Event::CompactStart { lifecycle } => {
+                let should_apply = match &self.active_compaction {
+                    None => true,
+                    Some((id, revision)) => {
+                        id == &lifecycle.compaction_id && lifecycle.revision > *revision
+                    }
+                };
+                if should_apply {
+                    self.active_compaction = Some((lifecycle.compaction_id, lifecycle.revision));
+                    if self.last_streaming_compact_mut().is_none() {
+                        self.blocks.push(Block::Compact(CompactEvent::Streaming {
+                            started_at: Instant::now(),
+                        }));
+                    }
                 }
             }
             Event::CompactDone { lifecycle } => {
+                let should_apply = match &self.active_compaction {
+                    None => true,
+                    Some((id, revision)) => {
+                        id == &lifecycle.compaction_id && lifecycle.revision > *revision
+                    }
+                };
+                if !should_apply {
+                    return None;
+                }
+                self.active_compaction = None;
                 self.session_context_tokens = 0;
                 let new_segment_id = lifecycle
                     .new_segment_id
@@ -1430,6 +1452,16 @@ impl App {
                 }
             }
             Event::CompactFailed { lifecycle } => {
+                let should_apply = match &self.active_compaction {
+                    None => true,
+                    Some((id, revision)) => {
+                        id == &lifecycle.compaction_id && lifecycle.revision > *revision
+                    }
+                };
+                if !should_apply {
+                    return None;
+                }
+                self.active_compaction = None;
                 let error = lifecycle
                     .error
                     .unwrap_or_else(|| "compaction failed".to_string());
@@ -1614,6 +1646,7 @@ impl App {
     }
 
     fn apply_in_flight_snapshot(&mut self, snapshot: InFlightSnapshot) {
+        let compaction = snapshot.compaction;
         for block in snapshot.blocks {
             match block {
                 InFlightBlock::Text { text, finished } => {
@@ -1654,6 +1687,14 @@ impl App {
                     }));
                 }
             }
+        }
+        self.active_compaction = compaction
+            .as_ref()
+            .map(|lifecycle| (lifecycle.compaction_id.clone(), lifecycle.revision));
+        if compaction.is_some() && self.last_streaming_compact_mut().is_none() {
+            self.blocks.push(Block::Compact(CompactEvent::Streaming {
+                started_at: Instant::now(),
+            }));
         }
     }
 
@@ -3773,6 +3814,7 @@ mod completion_flow_tests {
                     },
                 ],
                 commands: Vec::new(),
+                compaction: None,
             },
             internal_workers: Vec::new(),
         });
@@ -4222,6 +4264,7 @@ mod completion_flow_tests {
             lifecycle: test_compaction_lifecycle(protocol::CompactionLifecycleState::Running),
         });
         let mut lifecycle = test_compaction_lifecycle(protocol::CompactionLifecycleState::Done);
+        lifecycle.revision = 2;
         lifecycle.new_segment_id = Some(id.to_string());
         app.handle_worker_event(Event::CompactDone { lifecycle });
 
@@ -4243,6 +4286,7 @@ mod completion_flow_tests {
             lifecycle: test_compaction_lifecycle(protocol::CompactionLifecycleState::Running),
         });
         let mut lifecycle = test_compaction_lifecycle(protocol::CompactionLifecycleState::Failed);
+        lifecycle.revision = 2;
         lifecycle.error = Some("provider 429".into());
         app.handle_worker_event(Event::CompactFailed { lifecycle });
 
@@ -4253,6 +4297,31 @@ mod completion_flow_tests {
                 error,
                 elapsed_secs: Some(_),
             })] if error == "provider 429"
+        ));
+    }
+
+    #[test]
+    fn snapshot_restores_running_compaction_and_fences_unrelated_terminal() {
+        let mut app = App::new("test".into());
+        let lifecycle = test_compaction_lifecycle(protocol::CompactionLifecycleState::Running);
+        app.apply_in_flight_snapshot(InFlightSnapshot {
+            compaction: Some(protocol::InFlightCompaction::from_running(&lifecycle).unwrap()),
+            ..InFlightSnapshot::default()
+        });
+
+        let mut unrelated = lifecycle;
+        unrelated.compaction_id = "another-compaction".into();
+        unrelated.revision = 2;
+        unrelated.state = protocol::CompactionLifecycleState::Failed;
+        unrelated.error = Some("must not replace".into());
+        app.handle_worker_event(Event::CompactFailed {
+            lifecycle: unrelated,
+        });
+
+        assert_eq!(compact_block_count(&app), 1);
+        assert!(matches!(
+            app.blocks.as_slice(),
+            [Block::Compact(CompactEvent::Streaming { .. })]
         ));
     }
 

@@ -23,6 +23,7 @@ pub(crate) struct InFlightInner {
     next_block_id: u64,
     blocks: Vec<TrackedBlock>,
     commands: Vec<CommandSnapshot>,
+    compaction: Option<protocol::InFlightCompaction>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +54,7 @@ impl InFlightEvents {
                 next_block_id: 1,
                 blocks: Vec::new(),
                 commands: Vec::new(),
+                compaction: None,
             })),
             working_event_tx,
         }
@@ -219,6 +221,35 @@ impl InFlightEvents {
         self.lock().commands = commands;
     }
 
+    /// Publish current compaction progress into reconnect snapshots.
+    /// Terminal lifecycle events clear the in-flight value; their durable
+    /// session record remains the historical authority.
+    pub(crate) fn update_compaction(&self, lifecycle: &protocol::CompactionLifecycle) {
+        let mut inner = self.lock();
+        match lifecycle.state {
+            protocol::CompactionLifecycleState::Running => match &inner.compaction {
+                None => inner.compaction = protocol::InFlightCompaction::from_running(lifecycle),
+                Some(current)
+                    if current.compaction_id == lifecycle.compaction_id
+                        && lifecycle.revision > current.revision =>
+                {
+                    inner.compaction = protocol::InFlightCompaction::from_running(lifecycle);
+                }
+                Some(_) => {}
+            },
+            protocol::CompactionLifecycleState::Done
+            | protocol::CompactionLifecycleState::Failed
+            | protocol::CompactionLifecycleState::Interrupted => {
+                if inner.compaction.as_ref().is_some_and(|current| {
+                    current.compaction_id == lifecycle.compaction_id
+                        && lifecycle.revision > current.revision
+                }) {
+                    inner.compaction = None;
+                }
+            }
+        }
+    }
+
     pub(crate) fn clear(&self) {
         let mut inner = self.lock();
         inner.clear();
@@ -378,6 +409,7 @@ impl InFlightInner {
                 .filter_map(TrackedBlock::to_snapshot_block)
                 .collect(),
             commands: self.commands.clone(),
+            compaction: self.compaction.clone(),
         }
     }
 
@@ -738,6 +770,82 @@ mod tests {
         });
         let guard = in_flight.snapshot_guard();
         assert!(snapshot_from_guard(&guard).commands.is_empty());
+    }
+
+    #[test]
+    fn compaction_progress_is_snapshot_only_while_running() {
+        let (working_event_tx, _) = broadcast::channel(16);
+        let in_flight = InFlightEvents::new(working_event_tx);
+        let running = protocol::CompactionLifecycle {
+            schema_version: 3,
+            compaction_id: "compact-1".into(),
+            revision: 1,
+            internal_worker: None,
+            state: protocol::CompactionLifecycleState::Running,
+            started_at_ms: 100,
+            ended_at_ms: None,
+            summary: None,
+            error: None,
+            new_segment_id: None,
+        };
+
+        in_flight.update_compaction(&running);
+        let guard = in_flight.snapshot_guard();
+        assert_eq!(
+            snapshot_from_guard(&guard)
+                .compaction
+                .as_ref()
+                .map(|item| item.compaction_id.as_str()),
+            Some("compact-1")
+        );
+        assert!(!snapshot_from_guard(&guard).is_empty());
+        drop(guard);
+
+        let mut stale = running.clone();
+        stale.revision = 0;
+        in_flight.update_compaction(&stale);
+        let mut other = running.clone();
+        other.compaction_id = "compact-2".into();
+        other.revision = 2;
+        in_flight.update_compaction(&other);
+        let guard = in_flight.snapshot_guard();
+        assert_eq!(
+            snapshot_from_guard(&guard)
+                .compaction
+                .as_ref()
+                .map(|item| (item.compaction_id.as_str(), item.revision)),
+            Some(("compact-1", 1))
+        );
+        drop(guard);
+
+        in_flight.clear();
+        let guard = in_flight.snapshot_guard();
+        assert_eq!(
+            snapshot_from_guard(&guard)
+                .compaction
+                .as_ref()
+                .map(|item| item.compaction_id.as_str()),
+            Some("compact-1")
+        );
+        drop(guard);
+
+        let mut stale_done = running.clone();
+        stale_done.state = protocol::CompactionLifecycleState::Done;
+        in_flight.update_compaction(&stale_done);
+        let guard = in_flight.snapshot_guard();
+        assert!(snapshot_from_guard(&guard).compaction.is_some());
+        drop(guard);
+
+        let mut done = running;
+        done.revision = 2;
+        done.state = protocol::CompactionLifecycleState::Done;
+        done.ended_at_ms = Some(200);
+        done.summary = Some("private summary".into());
+        done.new_segment_id = Some("staged-segment".into());
+        in_flight.update_compaction(&done);
+
+        let guard = in_flight.snapshot_guard();
+        assert!(snapshot_from_guard(&guard).compaction.is_none());
     }
 
     #[test]

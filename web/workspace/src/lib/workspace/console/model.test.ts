@@ -1079,6 +1079,27 @@ Deno.test("projectConsole upserts compaction lifecycle by stable id", () => {
   assertEquals(completed.lines[0].streaming, false);
 });
 
+Deno.test("snapshot restores running compaction without staged content", () => {
+  const snapshot = snapshotEvent("/repo") as Extract<Event, { event: "snapshot" }>;
+  snapshot.data.in_flight = {
+    blocks: [],
+    compaction: {
+      schema_version: 3,
+      compaction_id: "compaction-snapshot",
+      revision: 1,
+      internal_worker: null,
+      started_at_ms: 1_000,
+    },
+  };
+
+  const projection = projectConsole([{ eventId: "snapshot", event: snapshot }]);
+
+  assertEquals(projection.lines.length, 1);
+  assertEquals(projection.lines[0].id, "compaction-compaction-snapshot");
+  assertEquals(projection.lines[0].compaction?.state, "running");
+  assertEquals(projection.lines[0].body.includes("staged"), false);
+});
+
 Deno.test("compaction service activity stays nested in one lifecycle item", () => {
   const worker = {
     session_id: "compactor-session",
