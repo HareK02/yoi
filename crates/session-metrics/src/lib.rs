@@ -12,13 +12,16 @@
 //!   観測できない値は `None` で明示する
 //! - 「後から埋まる値」（例: prune 発火直後の `cache_read_tokens`）は前 entry に
 //!   書き戻さず、`correlation_id` を共有する別 metric として流す。集計は読み手で join
-//! - 集計 / 可視化 API はこのクレートには無い。session-log を読めば取り出せる、
-//!   までが到達点
+//! - 集計 / 可視化には [`read_session_metrics`] / [`read_segment_metrics`] /
+//!   [`export_metrics_jsonl`] の明示的な metrics 専用経路を使う。通常の
+//!   Session snapshot は `Extension` を公開しない。
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use session_store::{SegmentId, SessionId, Store, StoreError, save_extension, segment_log};
+use session_store::{
+    LogEntry, SegmentId, SegmentOrigin, SessionId, Store, StoreError, save_extension, segment_log,
+};
 
 /// Domain tag used in `LogEntry::Extension` for all metrics records.
 pub const DOMAIN: &str = "metrics";
@@ -97,6 +100,165 @@ pub fn metrics_from_extensions(extensions: &[(String, serde_json::Value)]) -> Ve
         .collect()
 }
 
+/// A metric together with its durable Session/Segment origin.
+///
+/// `compacted_from` is copied from the Segment start record so readers can
+/// reconstruct compaction lineage without inferring relationships from metric
+/// names or timestamps.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocatedMetric {
+    pub session_id: SessionId,
+    pub segment_id: SegmentId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compacted_from: Option<SegmentOrigin>,
+    pub log_index: usize,
+    pub metric: Metric,
+}
+
+#[derive(Debug)]
+pub enum SessionMetricsError {
+    Store(StoreError),
+    MissingSegmentStart {
+        segment_id: SegmentId,
+    },
+    SessionMismatch {
+        requested: SessionId,
+        observed: SessionId,
+        segment_id: SegmentId,
+    },
+    Encode(serde_json::Error),
+}
+
+impl std::fmt::Display for SessionMetricsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Store(error) => write!(formatter, "session metrics store error: {error}"),
+            Self::MissingSegmentStart { segment_id } => {
+                write!(formatter, "segment {segment_id} has no start record")
+            }
+            Self::SessionMismatch {
+                requested,
+                observed,
+                segment_id,
+            } => write!(
+                formatter,
+                "segment {segment_id} belongs to session {observed}, not {requested}"
+            ),
+            Self::Encode(error) => write!(formatter, "session metrics encode error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionMetricsError {}
+
+impl From<StoreError> for SessionMetricsError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<serde_json::Error> for SessionMetricsError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Encode(error)
+    }
+}
+
+/// Read metrics from one exact Segment.
+///
+/// This is an explicit metrics-only surface. It validates the Segment's
+/// durable start record and retains the log position of each metric.
+pub fn read_segment_metrics(
+    store: &dyn Store,
+    session_id: SessionId,
+    segment_id: SegmentId,
+) -> Result<Vec<LocatedMetric>, SessionMetricsError> {
+    let entries = store.read_all(session_id, segment_id)?;
+    let (observed_session_id, compacted_from) = entries
+        .iter()
+        .find_map(|entry| match entry {
+            LogEntry::AnnotatedSegmentStart {
+                session_id,
+                compacted_from,
+                ..
+            } => Some((*session_id, compacted_from.clone())),
+            _ => None,
+        })
+        .ok_or(SessionMetricsError::MissingSegmentStart { segment_id })?;
+    if observed_session_id != session_id {
+        return Err(SessionMetricsError::SessionMismatch {
+            requested: session_id,
+            observed: observed_session_id,
+            segment_id,
+        });
+    }
+
+    Ok(entries
+        .iter()
+        .enumerate()
+        .filter_map(|(log_index, entry)| match entry {
+            LogEntry::Extension {
+                domain, payload, ..
+            } if domain == DOMAIN => {
+                serde_json::from_value::<Metric>(payload.clone())
+                    .ok()
+                    .map(|metric| LocatedMetric {
+                        session_id,
+                        segment_id,
+                        compacted_from: compacted_from.clone(),
+                        log_index,
+                        metric,
+                    })
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+/// Read every metric for a Session across all of its Segments.
+pub fn read_session_metrics(
+    store: &dyn Store,
+    session_id: SessionId,
+) -> Result<Vec<LocatedMetric>, SessionMetricsError> {
+    let mut metrics = Vec::new();
+    for segment_id in store.list_segments(session_id)? {
+        metrics.extend(read_segment_metrics(store, session_id, segment_id)?);
+    }
+    metrics.sort_by(|left, right| {
+        (
+            left.metric.ts,
+            metric_phase_order(&left.metric.name),
+            left.segment_id,
+            left.log_index,
+        )
+            .cmp(&(
+                right.metric.ts,
+                metric_phase_order(&right.metric.name),
+                right.segment_id,
+                right.log_index,
+            ))
+    });
+    Ok(metrics)
+}
+
+/// Serialize located metrics as newline-delimited JSON for an explicit export.
+pub fn export_metrics_jsonl(metrics: &[LocatedMetric]) -> Result<String, SessionMetricsError> {
+    let mut output = String::new();
+    for metric in metrics {
+        output.push_str(&serde_json::to_string(metric)?);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn metric_phase_order(name: &str) -> u8 {
+    match name {
+        "compact.start" => 0,
+        "compact.finish" => 2,
+        "compact.post_request" => 3,
+        _ => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +311,101 @@ mod tests {
         assert_eq!(metrics.len(), 2);
         assert_eq!(metrics[0].name, "a");
         assert_eq!(metrics[1].name, "b");
+    }
+
+    #[test]
+    fn explicit_reader_and_export_preserve_compaction_lineage() {
+        use session_store::FsStore;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = FsStore::new(temp.path()).unwrap();
+        let session_id = SessionId::parse_str("018f6f8a-9822-7b11-8b35-706f30313701").unwrap();
+        let source_segment_id =
+            SegmentId::parse_str("018f6f8a-9822-7b11-8b35-706f30313702").unwrap();
+        let result_segment_id =
+            SegmentId::parse_str("018f6f8a-9822-7b11-8b35-706f30313703").unwrap();
+        let correlation_id = "018f6f8a-9822-7b11-8b35-706f30313700";
+
+        store
+            .create_segment(
+                session_id,
+                source_segment_id,
+                &[LogEntry::AnnotatedSegmentStart {
+                    ts: 1,
+                    session_id,
+                    system_prompt: None,
+                    config: Default::default(),
+                    history: Vec::new(),
+                    forked_from: None,
+                    compacted_from: None,
+                }],
+            )
+            .unwrap();
+        let mut start = Metric::now("compact.start").with_correlation_id(correlation_id);
+        start.ts = 10;
+        record_metric(&store, session_id, source_segment_id, &start).unwrap();
+
+        let origin = SegmentOrigin {
+            segment_id: source_segment_id,
+            at_turn_index: 0,
+        };
+        store
+            .create_segment(
+                session_id,
+                result_segment_id,
+                &[LogEntry::AnnotatedSegmentStart {
+                    ts: 2,
+                    session_id,
+                    system_prompt: None,
+                    config: Default::default(),
+                    history: Vec::new(),
+                    forked_from: None,
+                    compacted_from: Some(origin.clone()),
+                }],
+            )
+            .unwrap();
+        let mut finish = Metric::now("compact.finish").with_correlation_id(correlation_id);
+        finish.ts = 10;
+        record_metric(&store, session_id, result_segment_id, &finish).unwrap();
+        let mut post = Metric::now("compact.post_request").with_correlation_id(correlation_id);
+        post.ts = 11;
+        record_metric(&store, session_id, result_segment_id, &post).unwrap();
+
+        let source_metrics = read_segment_metrics(&store, session_id, source_segment_id).unwrap();
+        assert_eq!(source_metrics.len(), 1);
+        assert_eq!(source_metrics[0].compacted_from, None);
+
+        let metrics = read_session_metrics(&store, session_id).unwrap();
+        assert_eq!(metrics.len(), 3);
+        assert_eq!(metrics[0].metric.name, "compact.start");
+        let finish = metrics
+            .iter()
+            .find(|record| record.metric.name == "compact.finish")
+            .unwrap();
+        assert_eq!(finish.segment_id, result_segment_id);
+        assert_eq!(finish.compacted_from, Some(origin));
+        assert!(
+            metrics
+                .iter()
+                .all(|record| { record.metric.correlation_id.as_deref() == Some(correlation_id) })
+        );
+
+        let exported = export_metrics_jsonl(&metrics).unwrap();
+        let ordinary_snapshot = session_store::public_snapshot::project_current_session_snapshot(
+            &store.read_all(session_id, result_segment_id).unwrap(),
+        );
+        let ordinary_json = serde_json::to_string(&ordinary_snapshot).unwrap();
+        assert!(!ordinary_json.contains("compact.finish"));
+        assert!(!ordinary_json.contains("compact.post_request"));
+        let decoded = exported
+            .lines()
+            .map(|line| serde_json::from_str::<LocatedMetric>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, metrics);
+
+        let reopened = FsStore::new(temp.path()).unwrap();
+        let restored = read_session_metrics(&reopened, session_id).unwrap();
+        assert_eq!(restored, metrics);
     }
 
     #[test]
