@@ -19,12 +19,13 @@ It is not a dumping ground for external research, old plans, API inventories, or
 11. [`design/memory-knowledge.md`](design/memory-knowledge.md) — generated memory and audit records.
 12. [`design/workspace-kanban-orchestrator-runtime.md`](design/workspace-kanban-orchestrator-runtime.md) — how Kanban operations become durable orchestration events and backend-internal routing decisions.
 13. [`design/workspace-runtime-docker.md`](design/workspace-runtime-docker.md) — the WebUI / Backend / Runtime split, Docker image layout, worker launch path, and workdir materialization boundary.
-14. [`development/server-runtime-auth.md`](development/server-runtime-auth.md) — manual Workspace Server / Runtime public-key exchange and authenticated Runtime startup checks.
-15. [`development/work-items.md`](development/work-items.md) — how project work is recorded and reviewed.
-16. [`development/rust-testing-strategy.md`](development/rust-testing-strategy.md) — what Yoi Rust tests should prove, where they belong, and how to name them.
-17. [`development/validation.md`](development/validation.md) — how to check changes.
-18. [`development/workspace-schema-migrations.md`](development/workspace-schema-migrations.md) — how to preflight, apply, verify, and roll back control-plane SQLite schema changes.
-19. [`design/standalone-agent-host.md`](design/standalone-agent-host.md) — in-process standalone Worker host の依存方向、authority、lifecycle、非目標。
+14. [`design/workspace-web-ux.md`](design/workspace-web-ux.md) — Workspace Webの情報設計、操作設計、視覚設計、レスポンシブ対応、アクセシビリティ、CSSの責務。
+15. [`development/server-runtime-auth.md`](development/server-runtime-auth.md) — manual Workspace Server / Runtime public-key exchange and authenticated Runtime startup checks.
+16. [`development/work-items.md`](development/work-items.md) — how project work is recorded and reviewed.
+17. [`development/rust-testing-strategy.md`](development/rust-testing-strategy.md) — what Yoi Rust tests should prove, where they belong, and how to name them.
+18. [`development/validation.md`](development/validation.md) — how to check changes.
+19. [`development/workspace-schema-migrations.md`](development/workspace-schema-migrations.md) — how to preflight, apply, verify, and roll back control-plane SQLite schema changes.
+20. [`design/standalone-agent-host.md`](design/standalone-agent-host.md) — in-process standalone Worker host の依存方向、authority、lifecycle、非目標。
 
 ## What belongs here
 
