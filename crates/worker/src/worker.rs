@@ -5610,7 +5610,18 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             session_id: old_loc.session_id,
             segment_id: new_segment_id,
         };
-        self.compare_and_swap_worker_metadata_segment(old_loc, new_location)?;
+        // Move the live writer lease under the same exclusive compaction owner
+        // before publishing the durable pointer. If the CAS loses, restore the
+        // derived lease and leave the staged Segment unreachable.
+        if self.scope_allocation.is_some() {
+            worker_allocation::update_segment(&self.manifest.worker.name, new_segment_id)?;
+        }
+        if let Err(error) = self.compare_and_swap_worker_metadata_segment(old_loc, new_location) {
+            if self.scope_allocation.is_some() {
+                worker_allocation::update_segment(&self.manifest.worker.name, old_loc.segment_id)?;
+            }
+            return Err(error);
+        }
 
         // All live mutations after the durable commit are infallible and happen
         // before the replacement SegmentStart is broadcast. This keeps the
@@ -5631,24 +5642,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .lock()
             .expect("usage_history poisoned")
             .clear();
-
-        // workers.json is live writer-bookkeeping derived from the durable
-        // metadata pointer above. A stale value still retains the worker-name
-        // lease and cannot authorize another writer; after a process exit it is
-        // reclaimed through the normal stale-allocation path. Do not report a
-        // committed compaction as failed solely because this derived projection
-        // could not be refreshed.
-        if self.scope_allocation.is_some()
-            && let Err(error) =
-                worker_allocation::update_segment(&self.manifest.worker.name, new_segment_id)
-        {
-            warn!(
-                worker = %self.manifest.worker.name,
-                segment_id = %new_segment_id,
-                error = %error,
-                "compaction committed but live writer allocation projection could not be refreshed"
-            );
-        }
 
         // Broadcast only after every live authority points at the committed
         // replacement. Runtime-owned extensions stay visible and restorable.

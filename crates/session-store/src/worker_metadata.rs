@@ -14,8 +14,24 @@
 
 use crate::{SegmentId, SessionId};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+fn metadata_lock(path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("metadata lock registry poisoned");
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
 
 /// Errors from Worker metadata persistence.
 #[derive(Debug, thiserror::Error)]
@@ -348,6 +364,7 @@ pub trait WorkerMetadataStore: Send + Sync {
 pub struct WorkerAggregateStore {
     root: PathBuf,
     worker_name: String,
+    update_lock: Arc<Mutex<()>>,
 }
 
 impl WorkerAggregateStore {
@@ -359,7 +376,11 @@ impl WorkerAggregateStore {
         let worker_name = worker_name.into();
         validate_worker_name(&worker_name)?;
         fs::create_dir_all(&root)?;
-        Ok(Self { root, worker_name })
+        Ok(Self {
+            update_lock: metadata_lock(&root),
+            root,
+            worker_name,
+        })
     }
 
     fn validate_name(&self, worker_name: &str) -> Result<(), WorkerStoreError> {
@@ -426,6 +447,47 @@ impl WorkerMetadataStore for WorkerAggregateStore {
         Ok(Some(metadata))
     }
 
+    fn update_by_name<F>(
+        &self,
+        worker_name: &str,
+        update: F,
+    ) -> Result<WorkerMetadata, WorkerStoreError>
+    where
+        F: FnOnce(&mut WorkerMetadata),
+    {
+        let _guard = self
+            .update_lock
+            .lock()
+            .expect("metadata update lock poisoned");
+        let mut metadata = self
+            .read_by_name(worker_name)?
+            .unwrap_or_else(|| WorkerMetadata::new(worker_name, None));
+        update(&mut metadata);
+        self.write(&metadata)?;
+        Ok(metadata)
+    }
+
+    fn compare_and_swap_active(
+        &self,
+        worker_name: &str,
+        expected: &WorkerActiveSegmentRef,
+        replacement: WorkerActiveSegmentRef,
+    ) -> Result<bool, WorkerStoreError> {
+        let _guard = self
+            .update_lock
+            .lock()
+            .expect("metadata update lock poisoned");
+        let Some(mut metadata) = self.read_by_name(worker_name)? else {
+            return Ok(false);
+        };
+        if metadata.active.as_ref() != Some(expected) {
+            return Ok(false);
+        }
+        metadata.active = Some(replacement);
+        self.write(&metadata)?;
+        Ok(true)
+    }
+
     fn list_names(&self) -> Result<Vec<String>, WorkerStoreError> {
         Ok(if self.metadata_path().is_file() {
             vec![self.worker_name.clone()]
@@ -452,6 +514,7 @@ impl WorkerMetadataStore for WorkerAggregateStore {
 #[derive(Clone)]
 pub struct FsWorkerStore {
     root: PathBuf,
+    update_lock: Arc<Mutex<()>>,
 }
 
 impl FsWorkerStore {
@@ -459,7 +522,10 @@ impl FsWorkerStore {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, WorkerStoreError> {
         let root = root.into();
         fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        Ok(Self {
+            update_lock: metadata_lock(&root),
+            root,
+        })
     }
 
     fn worker_dir(&self, worker_name: &str) -> Result<PathBuf, WorkerStoreError> {
@@ -475,12 +541,32 @@ impl FsWorkerStore {
 impl WorkerMetadataStore for FsWorkerStore {
     fn write(&self, metadata: &WorkerMetadata) -> Result<(), WorkerStoreError> {
         let path = self.metadata_path(&metadata.worker_name)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+        let mut content = serde_json::to_vec_pretty(metadata)?;
+        content.push(b'\n');
+        let parent = path.parent().expect("metadata path has parent");
+        fs::create_dir_all(parent)?;
+        let temp = parent.join(format!(
+            ".metadata.json.tmp-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let result = (|| -> Result<(), WorkerStoreError> {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            file.write_all(&content)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp, &path)?;
+            std::fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(temp);
         }
-        let content = serde_json::to_vec_pretty(metadata)?;
-        fs::write(path, content)?;
-        Ok(())
+        result
     }
 
     fn read_by_name(&self, worker_name: &str) -> Result<Option<WorkerMetadata>, WorkerStoreError> {
@@ -491,6 +577,47 @@ impl WorkerMetadataStore for FsWorkerStore {
             Err(err) => return Err(WorkerStoreError::Io(err)),
         };
         Ok(Some(serde_json::from_str(&content)?))
+    }
+
+    fn update_by_name<F>(
+        &self,
+        worker_name: &str,
+        update: F,
+    ) -> Result<WorkerMetadata, WorkerStoreError>
+    where
+        F: FnOnce(&mut WorkerMetadata),
+    {
+        let _guard = self
+            .update_lock
+            .lock()
+            .expect("metadata update lock poisoned");
+        let mut metadata = self
+            .read_by_name(worker_name)?
+            .unwrap_or_else(|| WorkerMetadata::new(worker_name, None));
+        update(&mut metadata);
+        self.write(&metadata)?;
+        Ok(metadata)
+    }
+
+    fn compare_and_swap_active(
+        &self,
+        worker_name: &str,
+        expected: &WorkerActiveSegmentRef,
+        replacement: WorkerActiveSegmentRef,
+    ) -> Result<bool, WorkerStoreError> {
+        let _guard = self
+            .update_lock
+            .lock()
+            .expect("metadata update lock poisoned");
+        let Some(mut metadata) = self.read_by_name(worker_name)? else {
+            return Ok(false);
+        };
+        if metadata.active.as_ref() != Some(expected) {
+            return Ok(false);
+        }
+        metadata.active = Some(replacement);
+        self.write(&metadata)?;
+        Ok(true)
     }
 
     fn list_names(&self) -> Result<Vec<String>, WorkerStoreError> {
@@ -901,5 +1028,39 @@ mod tests {
         assert!(restored.spawned_children.is_empty());
         assert_eq!(restored.reclaimed_children.len(), 1);
         assert_eq!(restored.reclaimed_children[0].scope_delegated, vec![scope]);
+    }
+
+    #[test]
+    fn active_segment_cas_allows_exactly_one_concurrent_winner() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FsWorkerStore::new(temp.path()).unwrap();
+        let session_id = crate::new_session_id();
+        let old = WorkerActiveSegmentRef::active_segment(session_id, crate::new_segment_id());
+        store
+            .write(&WorkerMetadata::new("agent", Some(old.clone())))
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles = [crate::new_segment_id(), crate::new_segment_id()].map(|segment_id| {
+            let store = store.clone();
+            let old = old.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .compare_and_swap_active(
+                        "agent",
+                        &old,
+                        WorkerActiveSegmentRef::active_segment(session_id, segment_id),
+                    )
+                    .unwrap()
+            })
+        });
+        barrier.wait();
+        let winners = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1);
     }
 }

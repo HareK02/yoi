@@ -151,7 +151,7 @@ fn run_status_line(app: &App, now: Instant) -> Line<'static> {
         format!("{} reqs", app.run_requests)
     };
 
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             RUN_SPINNER_FRAMES[spinner_index],
             Style::default()
@@ -159,6 +159,15 @@ fn run_status_line(app: &App, now: Instant) -> Line<'static> {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
+    ];
+    if let Some(progress) = &app.compaction_progress {
+        spans.push(Span::styled(
+            format!("Compacting · {:?}", progress.phase).to_lowercase(),
+            Style::default().fg(Color::Cyan),
+        ));
+        spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+    }
+    spans.extend([
         Span::styled(
             fmt_run_elapsed(elapsed.as_secs()),
             Style::default().fg(Color::Gray),
@@ -177,7 +186,8 @@ fn run_status_line(app: &App, now: Instant) -> Line<'static> {
             fmt_tokens(app.run_output_tokens),
             Style::default().fg(Color::Yellow),
         ),
-    ])
+    ]);
+    Line::from(spans)
 }
 
 fn fmt_run_elapsed(secs: u64) -> String {

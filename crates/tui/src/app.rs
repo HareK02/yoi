@@ -279,7 +279,7 @@ pub struct App {
     run_error_messages: Vec<String>,
     /// Current compaction identity/revision used to fence snapshot/live updates.
     active_compaction: Option<(String, u64)>,
-    compaction_progress: Option<protocol::InFlightCompaction>,
+    pub compaction_progress: Option<protocol::InFlightCompaction>,
     /// Presentation-only Internal Worker projections keyed by session identity.
     /// They are rendered in separate selectable views and never mixed into `blocks`.
     pub internal_workers: Vec<InternalWorkerView>,
