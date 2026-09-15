@@ -870,10 +870,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(action, PreRequestAction::Yield));
-        assert_eq!(
-            state.attempt_state(),
-            crate::compact::state::AutomaticCompactState::Attempted
-        );
+        assert!(state.has_claimed_attempt());
         // Hook must not run when an internal mechanism short-circuits first.
         assert_eq!(count.load(Ordering::Relaxed), 0);
     }
@@ -916,10 +913,7 @@ mod tests {
             PreRequestAction::YieldWith(items) => assert_eq!(items.len(), 1),
             other => panic!("expected YieldWith queued system item, got {other:?}"),
         }
-        assert_eq!(
-            state.attempt_state(),
-            crate::compact::state::AutomaticCompactState::Attempted
-        );
+        assert!(state.has_claimed_attempt());
         assert!(saw_handle.load(Ordering::Relaxed));
         assert_eq!(committed.lock().expect("committed system items").len(), 1);
     }

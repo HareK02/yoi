@@ -3476,7 +3476,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 tracker_for_usage.record_usage(event);
             });
 
-            let compact_state = if post_run_threshold.is_some() || request_threshold.is_some() {
+            let compact_state = {
                 if let (Some(post), Some(req)) = (post_run_threshold, request_threshold) {
                     if post > req {
                         warn!(
@@ -3494,8 +3494,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 ));
                 self.compact_state = Some(state.clone());
                 Some(state)
-            } else {
-                None
             };
 
             let usage_history_handle = compact_state.as_ref().map(|_| self.usage_history.clone());
@@ -4837,9 +4835,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         {
             Ok(new_segment_id) => {
                 info!(new_segment_id = %new_segment_id, "Manual compaction succeeded");
-                if let Some(ref state) = state {
-                    state.reenable_automatic();
-                }
                 Ok(ManualCompactResult::Compacted { new_segment_id })
             }
             Err(e) => {
@@ -7172,11 +7167,12 @@ fn restored_flow_runtime_state(
 fn automatic_compact_block_error(block: AutomaticCompactBlock) -> WorkerError {
     match block {
         AutomaticCompactBlock::Thrash => WorkerError::CompactThrash,
-        AutomaticCompactBlock::Failed(category) | AutomaticCompactBlock::Disabled(category) => {
-            WorkerError::AutomaticCompactFailed {
-                category: category.as_str(),
-            }
-        }
+        AutomaticCompactBlock::Failed(category) => WorkerError::AutomaticCompactFailed {
+            category: category.as_str(),
+        },
+        AutomaticCompactBlock::Attempted => WorkerError::AutomaticCompactState(
+            "automatic compaction attempt already claimed for this logical run".to_string(),
+        ),
         AutomaticCompactBlock::Cancelled => WorkerError::CompactCancelled,
     }
 }
