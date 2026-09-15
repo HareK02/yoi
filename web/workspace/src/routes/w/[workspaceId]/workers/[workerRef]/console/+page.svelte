@@ -1907,6 +1907,7 @@
             requests={consoleProjection.runActivity.requests}
             uploadTokens={consoleProjection.runActivity.uploadTokens}
             outputTokens={consoleProjection.runActivity.outputTokens}
+            compaction={consoleProjection.compaction}
         />
     {/if}
 

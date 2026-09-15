@@ -173,6 +173,7 @@ export type ConsoleProjection = {
   taskNextId: number;
   status: string | null;
   workerState: WorkerStateSnapshot | null;
+  compaction: InFlightCompaction | null;
   usage: string | null;
   runActivity: RunActivityStats;
   cwd: string | null;
@@ -246,6 +247,7 @@ export function emptyConsoleProjection(): ConsoleProjection {
     taskNextId: 1,
     status: null,
     workerState: null,
+    compaction: null,
     usage: null,
     runActivity: emptyRunActivityStats(),
     cwd: null,
@@ -722,23 +724,7 @@ function applyInFlightCompaction(
   projection: ConsoleProjection,
   progress: InFlightCompaction | null,
 ): ConsoleProjection {
-  const id = "compaction-runtime";
-  const lines = projection.lines.filter((line) => line.id !== id);
-  if (!progress) return { ...projection, lines };
-  return {
-    ...projection,
-    lines: [
-      ...lines,
-      {
-        id,
-        kind: "status",
-        title: "Compaction",
-        body: `compacting · ${progress.phase.replaceAll("_", " ")}`,
-        source: "event",
-        streaming: true,
-      },
-    ],
-  };
+  return { ...projection, compaction: progress };
 }
 
 function applyCompactionLifecycle(
@@ -863,6 +849,7 @@ export function applyProtocolEvent(
     taskNextId: projection.taskNextId,
     status: projection.status,
     workerState: projection.workerState,
+    compaction: projection.compaction,
     usage: projection.usage,
     runActivity: applyRunActivityEvent(
       projection.runActivity,
@@ -1003,6 +990,7 @@ export function applyProtocolEvent(
           event.data.in_flight.compaction,
         );
         next.lines = withCompaction.lines;
+        next.compaction = withCompaction.compaction;
       }
       for (const line of next.lines) {
         const compaction = line.compaction;
@@ -2013,6 +2001,7 @@ function snapshotProjectionFromSession(
     taskNextId: 1,
     status: null,
     workerState: null,
+    compaction: null,
     usage: null,
     runActivity: emptyRunActivityStats(),
     cwd,

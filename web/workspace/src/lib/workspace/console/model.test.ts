@@ -1092,11 +1092,9 @@ Deno.test("snapshot restores running compaction without staged content", () => {
 
   const projection = projectConsole([{ eventId: "snapshot", event: snapshot }]);
 
-  assertEquals(projection.lines.length, 1);
-  assertEquals(projection.lines[0].id, "compaction-runtime");
-  assertEquals(projection.lines[0].streaming, true);
-  assertEquals(projection.lines[0].body, "compacting · summarizing");
-  assertEquals(projection.lines[0].body.includes("staged"), false);
+  assertEquals(projection.lines.length, 0);
+  assertEquals(projection.compaction?.phase, "summarizing");
+  assertEquals(projection.compaction?.trigger, "manual");
 });
 
 Deno.test("compaction service activity stays nested in one lifecycle item", () => {

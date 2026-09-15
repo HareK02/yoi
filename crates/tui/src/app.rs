@@ -279,6 +279,7 @@ pub struct App {
     run_error_messages: Vec<String>,
     /// Current compaction identity/revision used to fence snapshot/live updates.
     active_compaction: Option<(String, u64)>,
+    compaction_progress: Option<protocol::InFlightCompaction>,
     /// Presentation-only Internal Worker projections keyed by session identity.
     /// They are rendered in separate selectable views and never mixed into `blocks`.
     pub internal_workers: Vec<InternalWorkerView>,
@@ -367,6 +368,7 @@ impl App {
             shutdown_confirm: None,
             blocks: Vec::new(),
             active_compaction: None,
+            compaction_progress: None,
             run_error_messages: Vec::new(),
             internal_workers: Vec::new(),
             selected_internal_worker_session_id: None,
@@ -1401,17 +1403,7 @@ impl App {
                 }
             }
             Event::CompactionProgress { compaction } => {
-                if compaction.is_some() {
-                    if self.last_streaming_compact_mut().is_none() {
-                        self.blocks.push(Block::Compact(CompactEvent::Streaming {
-                            started_at: Instant::now(),
-                        }));
-                    }
-                } else if let Some(Block::Compact(CompactEvent::Streaming { .. })) =
-                    self.blocks.last()
-                {
-                    self.blocks.pop();
-                }
+                self.compaction_progress = compaction;
             }
             Event::CompactStart { lifecycle } => {
                 let should_apply = match &self.active_compaction {
@@ -1702,11 +1694,7 @@ impl App {
             }
         }
         self.active_compaction = None;
-        if compaction.is_some() && self.last_streaming_compact_mut().is_none() {
-            self.blocks.push(Block::Compact(CompactEvent::Streaming {
-                started_at: Instant::now(),
-            }));
-        }
+        self.compaction_progress = compaction;
     }
 
     fn append_assistant_text(&mut self, text: &str) {
@@ -4322,11 +4310,15 @@ mod completion_flow_tests {
             }),
             ..InFlightSnapshot::default()
         });
-        assert_eq!(compact_block_count(&app), 1);
+        assert_eq!(compact_block_count(&app), 0);
+        assert_eq!(
+            app.compaction_progress.as_ref().map(|item| item.phase),
+            Some(protocol::CompactionPhase::Summarizing)
+        );
 
         app.handle_worker_event(Event::CompactionProgress { compaction: None });
 
-        assert_eq!(compact_block_count(&app), 0);
+        assert!(app.compaction_progress.is_none());
     }
 
     #[test]

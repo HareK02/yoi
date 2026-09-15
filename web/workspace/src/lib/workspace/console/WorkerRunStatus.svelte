@@ -7,9 +7,11 @@
     requests: number;
     uploadTokens: number;
     outputTokens: number;
+    compaction?: { phase: string } | null;
   };
 
-  let { startedAtMs, requests, uploadTokens, outputTokens }: Props = $props();
+  let { startedAtMs, requests, uploadTokens, outputTokens, compaction = null }: Props =
+    $props();
   let nowMs = $state(Date.now());
 
   $effect(() => {
@@ -27,6 +29,10 @@
 
 <div class="worker-run-status" role="status" aria-live="off">
   <Spinner />
+  {#if compaction}
+    <span>Compacting · {compaction.phase}</span>
+    <span aria-hidden="true">|</span>
+  {/if}
   <span>{elapsed}</span>
   <span aria-hidden="true">・</span>
   <span>{requests} {requestLabel}</span>
