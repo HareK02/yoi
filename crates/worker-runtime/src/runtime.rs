@@ -956,7 +956,7 @@ impl Runtime {
                 restore_intent: WorkerRestoreIntent::Explicit,
                 working_directory: None,
                 execution_handle: None,
-                internal_workers: BTreeMap::new(),
+                internal_workers: InternalWorkerActivityProjection::default(),
             };
             state.workers.insert(worker_id, record);
             state.persist_runtime_snapshot()?;
@@ -2621,7 +2621,7 @@ impl RuntimeState {
                     restore_intent: worker.execution.restore_intent,
                     working_directory: worker.working_directory,
                     execution_handle: None,
-                    internal_workers: BTreeMap::new(),
+                    internal_workers: InternalWorkerActivityProjection::default(),
                 },
             );
         }
@@ -2948,10 +2948,7 @@ impl RuntimeState {
                 .unwrap_or(0),
             worker_state: worker.worker_state.clone(),
             state: subscription_worker_state(worker.status),
-            has_running_internal_workers: worker
-                .internal_workers
-                .values()
-                .any(|worker| worker.status == protocol::WorkerStatus::Running),
+            has_running_internal_workers: worker.internal_workers.has_running_worker(),
             workspace_id: worker.workspace_id.clone(),
             display_name: worker.request.display_name.clone(),
             profile,
@@ -3164,67 +3161,175 @@ impl RuntimeState {
     }
 
     fn internal_worker_snapshot_statuses(
-        statuses: &mut BTreeMap<String, InternalWorkerActivity>,
+        activity: &mut InternalWorkerActivityProjection,
         snapshot: &protocol::InternalWorkerSnapshot,
     ) {
-        statuses.insert(
+        activity.workers.insert(
             snapshot.worker.session_id.clone(),
             InternalWorkerActivity {
-                status: snapshot.status,
+                status: Some(snapshot.status),
                 parent_session_id: snapshot.worker.parent_session_id.clone(),
+                revision: snapshot.revision,
             },
         );
         for child in &snapshot.internal_workers {
-            Self::internal_worker_snapshot_statuses(statuses, child);
+            Self::internal_worker_snapshot_statuses(activity, child);
+        }
+    }
+
+    fn internal_worker_subtree_ids(
+        activity: &InternalWorkerActivityProjection,
+        root_session_id: &str,
+    ) -> Vec<String> {
+        let mut subtree = vec![root_session_id.to_string()];
+        let mut index = 0;
+        while index < subtree.len() {
+            let parent_session_id = subtree[index].clone();
+            for (session_id, worker) in &activity.workers {
+                if worker.parent_session_id.as_deref() == Some(parent_session_id.as_str())
+                    && !subtree.contains(session_id)
+                {
+                    subtree.push(session_id.clone());
+                }
+            }
+            for (session_id, worker) in &activity.removed_workers {
+                if worker.parent_session_id.as_deref() == Some(parent_session_id.as_str())
+                    && !subtree.contains(session_id)
+                {
+                    subtree.push(session_id.clone());
+                }
+            }
+            index += 1;
+        }
+        subtree
+    }
+
+    fn clear_internal_worker_subtree(
+        activity: &mut InternalWorkerActivityProjection,
+        root_session_id: &str,
+    ) {
+        for session_id in Self::internal_worker_subtree_ids(activity, root_session_id) {
+            activity.workers.remove(&session_id);
+            activity.removed_workers.remove(&session_id);
         }
     }
 
     fn remove_internal_worker_subtree(
-        statuses: &mut BTreeMap<String, InternalWorkerActivity>,
-        root_session_id: &str,
+        activity: &mut InternalWorkerActivityProjection,
+        worker: &protocol::InternalWorkerRef,
+        revision: u64,
     ) {
-        let mut removed = vec![root_session_id.to_string()];
-        while let Some(parent_session_id) = removed.pop() {
-            let children = statuses
-                .iter()
-                .filter_map(|(session_id, worker)| {
-                    (worker.parent_session_id.as_deref() == Some(parent_session_id.as_str()))
-                        .then(|| session_id.clone())
-                })
-                .collect::<Vec<_>>();
-            statuses.remove(&parent_session_id);
-            removed.extend(children);
+        let known_revision = activity
+            .workers
+            .get(&worker.session_id)
+            .map(|worker| worker.revision)
+            .into_iter()
+            .chain(
+                activity
+                    .removed_workers
+                    .get(&worker.session_id)
+                    .map(|worker| worker.revision),
+            )
+            .max();
+        if known_revision.is_some_and(|known_revision| revision < known_revision) {
+            return;
+        }
+
+        for session_id in Self::internal_worker_subtree_ids(activity, &worker.session_id) {
+            let active = activity.workers.remove(&session_id);
+            let removed = activity.removed_workers.remove(&session_id);
+            let (worker_revision, parent_session_id) = if session_id == worker.session_id {
+                (revision, worker.parent_session_id.clone())
+            } else if let Some(active) = active {
+                (active.revision, active.parent_session_id)
+            } else if let Some(removed) = removed {
+                (removed.revision, removed.parent_session_id)
+            } else {
+                continue;
+            };
+            activity.removed_workers.insert(
+                session_id,
+                RemovedInternalWorkerActivity {
+                    revision: worker_revision,
+                    parent_session_id,
+                },
+            );
         }
     }
 
-    fn project_internal_worker_event(
-        statuses: &mut BTreeMap<String, InternalWorkerActivity>,
+    fn touch_internal_worker_activity(
+        activity: &mut InternalWorkerActivityProjection,
         worker: &protocol::InternalWorkerRef,
+        revision: u64,
+    ) {
+        activity
+            .workers
+            .entry(worker.session_id.clone())
+            .and_modify(|activity| {
+                activity.parent_session_id = worker.parent_session_id.clone();
+                activity.revision = revision;
+            })
+            .or_insert_with(|| InternalWorkerActivity {
+                status: None,
+                parent_session_id: worker.parent_session_id.clone(),
+                revision,
+            });
+    }
+
+    fn project_internal_worker_event(
+        activity: &mut InternalWorkerActivityProjection,
+        worker: &protocol::InternalWorkerRef,
+        revision: u64,
         event: &protocol::Event,
     ) {
+        if activity.removed_workers.contains_key(&worker.session_id)
+            || activity
+                .workers
+                .get(&worker.session_id)
+                .is_some_and(|current| revision <= current.revision)
+        {
+            return;
+        }
+
         match event {
             protocol::Event::Snapshot {
                 state,
                 internal_workers,
                 ..
             } => {
-                Self::remove_internal_worker_subtree(statuses, &worker.session_id);
-                statuses.insert(
+                Self::clear_internal_worker_subtree(activity, &worker.session_id);
+                activity.workers.insert(
                     worker.session_id.clone(),
                     InternalWorkerActivity {
-                        status: state.catalog_status(),
+                        status: Some(state.catalog_status()),
                         parent_session_id: worker.parent_session_id.clone(),
+                        revision,
                     },
                 );
                 for child in internal_workers {
-                    Self::internal_worker_snapshot_statuses(statuses, child);
+                    Self::internal_worker_snapshot_statuses(activity, child);
                 }
             }
             protocol::Event::InternalWorker {
                 worker: nested_worker,
+                revision: nested_revision,
                 event,
-                ..
-            } => Self::project_internal_worker_event(statuses, nested_worker, event),
+            } => {
+                Self::touch_internal_worker_activity(activity, worker, revision);
+                Self::project_internal_worker_event(
+                    activity,
+                    nested_worker,
+                    *nested_revision,
+                    event,
+                );
+            }
+            protocol::Event::InternalWorkerRemoved {
+                worker: removed_worker,
+                revision: removed_revision,
+            } => {
+                Self::touch_internal_worker_activity(activity, worker, revision);
+                Self::remove_internal_worker_subtree(activity, removed_worker, *removed_revision);
+            }
             protocol::Event::WorkerState { snapshot }
             | protocol::Event::CommandAcknowledged {
                 acknowledgement:
@@ -3232,43 +3337,46 @@ impl RuntimeState {
                         state: snapshot, ..
                     },
             } => {
-                statuses.insert(
+                activity.workers.insert(
                     worker.session_id.clone(),
                     InternalWorkerActivity {
-                        status: snapshot.catalog_status(),
+                        status: Some(snapshot.catalog_status()),
                         parent_session_id: worker.parent_session_id.clone(),
+                        revision,
                     },
                 );
             }
-            _ => {}
+            _ => Self::touch_internal_worker_activity(activity, worker, revision),
         }
     }
 
     fn update_internal_worker_activity(
-        statuses: &mut BTreeMap<String, InternalWorkerActivity>,
+        activity: &mut InternalWorkerActivityProjection,
         event: &protocol::Event,
     ) -> bool {
-        let was_running = statuses
-            .values()
-            .any(|worker| worker.status == protocol::WorkerStatus::Running);
+        let was_running = activity.has_running_worker();
         match event {
             protocol::Event::Snapshot {
                 internal_workers, ..
             } => {
-                statuses.clear();
+                activity.clear();
                 for child in internal_workers {
-                    Self::internal_worker_snapshot_statuses(statuses, child);
+                    Self::internal_worker_snapshot_statuses(activity, child);
                 }
             }
-            protocol::Event::InternalWorker { worker, event, .. } => {
-                Self::project_internal_worker_event(statuses, worker, event);
+            protocol::Event::InternalWorker {
+                worker,
+                revision,
+                event,
+            } => {
+                Self::project_internal_worker_event(activity, worker, *revision, event);
+            }
+            protocol::Event::InternalWorkerRemoved { worker, revision } => {
+                Self::remove_internal_worker_subtree(activity, worker, *revision);
             }
             _ => {}
         }
-        let is_running = statuses
-            .values()
-            .any(|worker| worker.status == protocol::WorkerStatus::Running);
-        was_running != is_running
+        was_running != activity.has_running_worker()
     }
 
     fn project_internal_worker_activity(
@@ -3316,8 +3424,34 @@ impl RuntimeState {
 
 #[derive(Debug, Clone)]
 struct InternalWorkerActivity {
-    status: protocol::WorkerStatus,
+    status: Option<protocol::WorkerStatus>,
     parent_session_id: Option<String>,
+    revision: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RemovedInternalWorkerActivity {
+    revision: u64,
+    parent_session_id: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct InternalWorkerActivityProjection {
+    workers: BTreeMap<String, InternalWorkerActivity>,
+    removed_workers: BTreeMap<String, RemovedInternalWorkerActivity>,
+}
+
+impl InternalWorkerActivityProjection {
+    fn clear(&mut self) {
+        self.workers.clear();
+        self.removed_workers.clear();
+    }
+
+    fn has_running_worker(&self) -> bool {
+        self.workers
+            .values()
+            .any(|worker| worker.status == Some(protocol::WorkerStatus::Running))
+    }
 }
 
 #[derive(Debug)]
@@ -3333,7 +3467,7 @@ struct WorkerRecord {
     restore_intent: WorkerRestoreIntent,
     working_directory: Option<CatalogWorkingDirectoryStatus>,
     execution_handle: Option<WorkerExecutionHandle>,
-    internal_workers: BTreeMap<String, InternalWorkerActivity>,
+    internal_workers: InternalWorkerActivityProjection,
 }
 
 impl WorkerRecord {
@@ -3793,92 +3927,40 @@ mod tests {
 
     fn internal_worker_status_event(
         worker: protocol::InternalWorkerRef,
+        revision: u64,
         status: protocol::WorkerStatus,
     ) -> protocol::Event {
         protocol::Event::InternalWorker {
             worker,
-            revision: 1,
+            revision,
             event: Box::new(protocol::Event::WorkerState {
                 snapshot: status.into(),
             }),
         }
     }
 
-    #[test]
-    fn internal_worker_activity_tracks_running_children_independently() {
-        let mut activity = BTreeMap::new();
-        assert!(RuntimeState::update_internal_worker_activity(
-            &mut activity,
-            &internal_worker_status_event(
-                internal_worker_ref("child-a", None),
-                protocol::WorkerStatus::Running,
-            ),
-        ));
-        assert!(!RuntimeState::update_internal_worker_activity(
-            &mut activity,
-            &internal_worker_status_event(
-                internal_worker_ref("child-b", None),
-                protocol::WorkerStatus::Running,
-            ),
-        ));
-        assert!(!RuntimeState::update_internal_worker_activity(
-            &mut activity,
-            &internal_worker_status_event(
-                internal_worker_ref("child-a", None),
-                protocol::WorkerStatus::Idle,
-            ),
-        ));
-        assert!(RuntimeState::update_internal_worker_activity(
-            &mut activity,
-            &internal_worker_status_event(
-                internal_worker_ref("child-b", None),
-                protocol::WorkerStatus::Stopped,
-            ),
-        ));
+    fn internal_worker_snapshot(
+        worker: protocol::InternalWorkerRef,
+        revision: u64,
+        status: protocol::WorkerStatus,
+        internal_workers: Vec<protocol::InternalWorkerSnapshot>,
+    ) -> protocol::InternalWorkerSnapshot {
+        protocol::InternalWorkerSnapshot {
+            worker,
+            revision,
+            status,
+            session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                entries: Vec::new(),
+            },
+            in_flight: protocol::InFlightSnapshot::default(),
+            error: None,
+            internal_workers,
+        }
     }
 
-    #[test]
-    fn nested_internal_worker_activity_reaches_the_parent_projection() {
-        let mut activity = BTreeMap::new();
-        let direct_child = internal_worker_ref("child", None);
-        let nested_running = protocol::Event::InternalWorker {
-            worker: direct_child.clone(),
-            revision: 1,
-            event: Box::new(internal_worker_status_event(
-                internal_worker_ref("grandchild", Some("child")),
-                protocol::WorkerStatus::Running,
-            )),
-        };
-        assert!(RuntimeState::update_internal_worker_activity(
-            &mut activity,
-            &nested_running,
-        ));
-
-        let nested_idle = protocol::Event::InternalWorker {
-            worker: direct_child,
-            revision: 2,
-            event: Box::new(internal_worker_status_event(
-                internal_worker_ref("grandchild", Some("child")),
-                protocol::WorkerStatus::Idle,
-            )),
-        };
-        assert!(RuntimeState::update_internal_worker_activity(
-            &mut activity,
-            &nested_idle,
-        ));
-    }
-
-    #[test]
-    fn parent_snapshot_replaces_stale_internal_worker_activity() {
-        let mut activity = BTreeMap::new();
-        RuntimeState::update_internal_worker_activity(
-            &mut activity,
-            &internal_worker_status_event(
-                internal_worker_ref("child-a", None),
-                protocol::WorkerStatus::Running,
-            ),
-        );
-        let snapshot = protocol::Event::Snapshot {
+    fn parent_snapshot(internal_workers: Vec<protocol::InternalWorkerSnapshot>) -> protocol::Event {
+        protocol::Event::Snapshot {
             session: protocol::SessionSnapshot {
                 pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
@@ -3895,13 +3977,236 @@ mod tests {
             },
             state: protocol::WorkerStatus::Idle.into(),
             in_flight: protocol::InFlightSnapshot::default(),
-            internal_workers: Vec::new(),
+            internal_workers,
+        }
+    }
+
+    #[test]
+    fn internal_worker_activity_tracks_running_children_independently() {
+        let mut activity = InternalWorkerActivityProjection::default();
+        assert!(RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &internal_worker_status_event(
+                internal_worker_ref("child-a", None),
+                1,
+                protocol::WorkerStatus::Running,
+            ),
+        ));
+        assert!(!RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &internal_worker_status_event(
+                internal_worker_ref("child-b", None),
+                1,
+                protocol::WorkerStatus::Running,
+            ),
+        ));
+        assert!(!RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &internal_worker_status_event(
+                internal_worker_ref("child-a", None),
+                2,
+                protocol::WorkerStatus::Idle,
+            ),
+        ));
+        assert!(RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &internal_worker_status_event(
+                internal_worker_ref("child-b", None),
+                2,
+                protocol::WorkerStatus::Stopped,
+            ),
+        ));
+    }
+
+    #[test]
+    fn nested_internal_worker_activity_reaches_the_parent_projection() {
+        let mut activity = InternalWorkerActivityProjection::default();
+        let direct_child = internal_worker_ref("child", None);
+        let nested_running = protocol::Event::InternalWorker {
+            worker: direct_child.clone(),
+            revision: 1,
+            event: Box::new(internal_worker_status_event(
+                internal_worker_ref("grandchild", Some("child")),
+                1,
+                protocol::WorkerStatus::Running,
+            )),
         };
+        assert!(RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &nested_running,
+        ));
+
+        let nested_idle = protocol::Event::InternalWorker {
+            worker: direct_child,
+            revision: 2,
+            event: Box::new(internal_worker_status_event(
+                internal_worker_ref("grandchild", Some("child")),
+                2,
+                protocol::WorkerStatus::Idle,
+            )),
+        };
+        assert!(RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &nested_idle,
+        ));
+    }
+
+    #[test]
+    fn parent_snapshot_replaces_stale_internal_worker_activity() {
+        let mut activity = InternalWorkerActivityProjection::default();
+        RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &internal_worker_status_event(
+                internal_worker_ref("child-a", None),
+                1,
+                protocol::WorkerStatus::Running,
+            ),
+        );
+        let snapshot = parent_snapshot(Vec::new());
         assert!(RuntimeState::update_internal_worker_activity(
             &mut activity,
             &snapshot,
         ));
-        assert!(activity.is_empty());
+        assert!(activity.workers.is_empty());
+        assert!(activity.removed_workers.is_empty());
+    }
+
+    #[test]
+    fn internal_worker_removal_is_revision_fenced_until_parent_snapshot() {
+        let mut activity = InternalWorkerActivityProjection::default();
+        let child_a = internal_worker_ref("child-a", None);
+        let child_b = internal_worker_ref("child-b", None);
+
+        assert!(RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &internal_worker_status_event(child_a.clone(), 2, protocol::WorkerStatus::Running),
+        ));
+        assert!(!RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &internal_worker_status_event(child_b.clone(), 1, protocol::WorkerStatus::Running),
+        ));
+
+        assert!(!RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &protocol::Event::InternalWorkerRemoved {
+                worker: child_a.clone(),
+                revision: 1,
+            },
+        ));
+        assert!(activity.workers.contains_key("child-a"));
+
+        assert!(!RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &protocol::Event::InternalWorkerRemoved {
+                worker: child_a,
+                revision: 2,
+            },
+        ));
+        assert!(!activity.workers.contains_key("child-a"));
+        assert!(activity.removed_workers.contains_key("child-a"));
+        assert!(activity.has_running_worker());
+
+        assert!(RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &protocol::Event::InternalWorkerRemoved {
+                worker: child_b.clone(),
+                revision: 1,
+            },
+        ));
+        assert!(!activity.has_running_worker());
+
+        assert!(!RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &internal_worker_status_event(child_b.clone(), 3, protocol::WorkerStatus::Running),
+        ));
+        assert!(!activity.workers.contains_key("child-b"));
+        assert!(!activity.has_running_worker());
+
+        assert!(RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &parent_snapshot(vec![internal_worker_snapshot(
+                child_b,
+                4,
+                protocol::WorkerStatus::Running,
+                Vec::new(),
+            )]),
+        ));
+        assert!(activity.has_running_worker());
+        assert!(activity.removed_workers.is_empty());
+    }
+
+    #[test]
+    fn nested_internal_worker_removal_discards_descendants_and_late_events() {
+        let mut activity = InternalWorkerActivityProjection::default();
+        let child = internal_worker_ref("child", None);
+        let grandchild = internal_worker_ref("grandchild", Some("child"));
+        let great_grandchild = internal_worker_ref("great-grandchild", Some("grandchild"));
+
+        assert!(!RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &internal_worker_status_event(child.clone(), 1, protocol::WorkerStatus::Idle),
+        ));
+        assert!(RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &protocol::Event::InternalWorker {
+                worker: child.clone(),
+                revision: 2,
+                event: Box::new(internal_worker_status_event(
+                    grandchild.clone(),
+                    1,
+                    protocol::WorkerStatus::Running,
+                )),
+            },
+        ));
+        assert!(!RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &protocol::Event::InternalWorker {
+                worker: child.clone(),
+                revision: 3,
+                event: Box::new(protocol::Event::InternalWorker {
+                    worker: grandchild.clone(),
+                    revision: 2,
+                    event: Box::new(internal_worker_status_event(
+                        great_grandchild,
+                        1,
+                        protocol::WorkerStatus::Running,
+                    )),
+                }),
+            },
+        ));
+
+        assert!(RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &protocol::Event::InternalWorker {
+                worker: child.clone(),
+                revision: 4,
+                event: Box::new(protocol::Event::InternalWorkerRemoved {
+                    worker: grandchild.clone(),
+                    revision: 2,
+                }),
+            },
+        ));
+        assert!(activity.workers.contains_key("child"));
+        assert!(!activity.workers.contains_key("grandchild"));
+        assert!(!activity.workers.contains_key("great-grandchild"));
+        assert!(activity.removed_workers.contains_key("grandchild"));
+        assert!(activity.removed_workers.contains_key("great-grandchild"));
+        assert!(!activity.has_running_worker());
+
+        assert!(!RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &protocol::Event::InternalWorker {
+                worker: child,
+                revision: 5,
+                event: Box::new(internal_worker_status_event(
+                    grandchild,
+                    4,
+                    protocol::WorkerStatus::Running,
+                )),
+            },
+        ));
+        assert!(!activity.has_running_worker());
+        assert!(!activity.workers.contains_key("grandchild"));
     }
 
     #[test]
@@ -4682,6 +4987,7 @@ mod tests {
                 &created.worker_ref,
                 internal_worker_status_event(
                     internal_worker_ref("child-live", None),
+                    1,
                     protocol::WorkerStatus::Running,
                 ),
             )
@@ -4699,10 +5005,10 @@ mod tests {
         runtime
             .observe_worker_event(
                 &created.worker_ref,
-                internal_worker_status_event(
-                    internal_worker_ref("child-live", None),
-                    protocol::WorkerStatus::Idle,
-                ),
+                protocol::Event::InternalWorkerRemoved {
+                    worker: internal_worker_ref("child-live", None),
+                    revision: 1,
+                },
             )
             .unwrap();
         let update = receive_subscription_update(&mut subscription).unwrap();
@@ -4720,8 +5026,31 @@ mod tests {
                 &created.worker_ref,
                 internal_worker_status_event(
                     internal_worker_ref("child-live", None),
+                    2,
                     protocol::WorkerStatus::Running,
                 ),
+            )
+            .unwrap();
+        assert!(
+            !runtime
+                .lock()
+                .unwrap()
+                .workers
+                .get(&created.worker_id)
+                .unwrap()
+                .internal_workers
+                .has_running_worker()
+        );
+
+        runtime
+            .observe_worker_event(
+                &created.worker_ref,
+                parent_snapshot(vec![internal_worker_snapshot(
+                    internal_worker_ref("child-live", None),
+                    3,
+                    protocol::WorkerStatus::Running,
+                    Vec::new(),
+                )]),
             )
             .unwrap();
         let update = receive_subscription_update(&mut subscription).unwrap();
@@ -5561,6 +5890,7 @@ mod tests {
                 in_flight: protocol::InFlightSnapshot {
                     blocks: Vec::new(),
                     commands: Vec::new(),
+                    compaction: None,
                 },
                 internal_workers: Vec::new(),
             },

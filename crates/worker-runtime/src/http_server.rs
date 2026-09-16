@@ -3606,6 +3606,7 @@ mod ws_tests {
                 in_flight: protocol::InFlightSnapshot {
                     blocks: Vec::new(),
                     commands: Vec::new(),
+                    compaction: None,
                 },
                 internal_workers: Vec::new(),
             })
