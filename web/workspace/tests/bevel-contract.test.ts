@@ -40,9 +40,14 @@ Deno.test("Bevel keeps depth visual while semantic controls remain children", as
     source.includes("@supports") &&
       source.includes("border-style: solid") &&
       source.includes(
+        "border-color: var(--_fallback-border, var(--line-strong))",
+      ) &&
+      source.includes("--_fallback-border: var(--line)") &&
+      source.includes("--_fallback-border: var(--line-strong)") &&
+      source.includes(
         "border-width: var(--_top-w) var(--_right-w) var(--_bottom-w) var(--_left-w)",
       ),
-    "Bevel must retain a side-selective plain border fallback around the enhanced edge",
+    "Bevel fallback colors must not outrank the enhanced transparent border",
   );
   assert(
     source.includes("calc(max(cos(180deg - var(--_L)), 0) * 100%)") &&
@@ -52,12 +57,12 @@ Deno.test("Bevel keeps depth visual while semantic controls remain children", as
     "Bevel must clamp unlit faces to the configured shadow without ambient light",
   );
   assert(
-    appCss.includes("--bevel-face-width: 2px") &&
+    appCss.includes("--bevel-face-width: 1px") &&
       source.includes("--_W: var(--bevel-face-width)") &&
       source.includes("inset: var(--bevel-face-width)") &&
       !source.includes("BevelSize") &&
       !source.includes("data-size"),
-    "Bevel must use the project-wide 2px edge and compose ridge from two 2px faces",
+    "Bevel must use the project-wide 1px edge and compose ridge from two 1px faces",
   );
   assert(
     source.includes("data-top={top ? 'true' : 'false'}") &&
@@ -94,9 +99,8 @@ Deno.test("Bevel keeps depth visual while semantic controls remain children", as
     "Bevel must use the shared highlight and shadow palette without owning a surface tone",
   );
   assert(
-    designLanguage.includes("Bevelはedge") &&
-      designLanguage.includes("lightingだけを所有する") &&
-      designLanguage.includes("text/content areaだけとする"),
+    designLanguage.includes("Bevel自体へbackgroundやsurface toneを与えず") &&
+      designLanguage.includes("text/content areaへ適用する"),
     "The design language must prohibit Bevel surface colors outside the child content area",
   );
   assert(
@@ -118,6 +122,15 @@ Deno.test("Workspace showroom exercises raised inset and ridge edges", async () 
       import.meta.url,
     ),
   );
+  const showroomCss = await Deno.readTextFile(
+    new URL(
+      "../src/routes/design-lab/workspace-web-ux/showroom.css",
+      import.meta.url,
+    ),
+  );
+  const tactileGroupRule = showroomCss.match(
+    /\.tactile-group \{([\s\S]*?)\n  \}/,
+  )?.[1];
 
   assert(
     workspaceSource.includes('profile="edge" depth="raised"') &&
@@ -127,6 +140,10 @@ Deno.test("Workspace showroom exercises raised inset and ridge edges", async () 
       workspaceSource.includes("top={false} left={false}") &&
       workspaceSource.includes("pressed"),
     "Workspace showroom must demonstrate edge and ridge depths with full and adjacent side selections",
+  );
+  assert(
+    tactileGroupRule && !tactileGroupRule.includes("background"),
+    "Showroom ridge items must leave their content area background unset",
   );
   assert(
     settingsSource.includes('profile="edge" depth="inset"') &&

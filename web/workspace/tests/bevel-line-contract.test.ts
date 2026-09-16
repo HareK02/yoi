@@ -28,14 +28,20 @@ Deno.test("BevelLine exposes a semantic directional separator", async () => {
   }
 
   assert(
-    appCss.includes("--bevel-face-width: 2px") &&
+    appCss.includes("--bevel-face-width: 1px") &&
       source.includes("--bevel-line-face-width: var(--bevel-face-width)") &&
       source.includes(
         "--bevel-line-width: calc(var(--bevel-line-face-width) * 2)",
       ) &&
       !source.includes("BevelLineWeight") &&
       !source.includes("data-weight"),
-    "BevelLine must compose a fixed 4px ridge from two project-wide 2px faces",
+    "BevelLine must compose a fixed 2px ridge from two project-wide 1px faces",
+  );
+  assert(
+    !source.includes("--bevel-line-inset") &&
+      !source.includes("padding-inline") &&
+      !source.includes("padding-block"),
+    "BevelLine must fill its parent layer without independent endpoint spacing",
   );
   assert(
     source.includes("background: var(--line-strong)") &&
@@ -76,7 +82,7 @@ Deno.test("Workspace showroom demonstrates both BevelLine directions", async () 
   );
 });
 
-Deno.test("Workspace shell and showroom use BevelLine for structural separators", async () => {
+Deno.test("Shell regions use single-edge Bevel while open separators use BevelLine", async () => {
   const rootLayout = await Deno.readTextFile(
     new URL("../src/routes/+layout.svelte", import.meta.url),
   );
@@ -95,18 +101,50 @@ Deno.test("Workspace shell and showroom use BevelLine for structural separators"
       import.meta.url,
     ),
   );
+  const designLanguage = await Deno.readTextFile(
+    new URL(
+      "../../../docs/development/ui-ux/design-language.md",
+      import.meta.url,
+    ),
+  );
 
   assert(
-    rootLayout.includes("app-shell__topbar-divider") &&
-      sidebarFrame.includes("sidebar-frame__divider--vertical") &&
-      sidebarFrame.includes("sidebar-frame__divider--horizontal"),
-    "Workspace shell must render structural dividers through BevelLine",
+    rootLayout.includes('class="app-shell__topbar-bevel"') &&
+      rootLayout.includes('depth="inset"') &&
+      rootLayout.includes("top={false} right={false} left={false}") &&
+      rootLayout.includes("bind:folded={sidebarFolded}") &&
+      rootLayout.includes("app-shell__mobile-sidebar-toggle") &&
+      rootLayout.includes("class:sidebar-open={!sidebarFolded}") &&
+      !rootLayout.includes("BevelLine") &&
+      sidebarFrame.includes('class="sidebar-frame__bevel"') &&
+      sidebarFrame.includes('depth="inset"') &&
+      sidebarFrame.includes("top={false} bottom={false} left={false}") &&
+      sidebarFrame.includes("$bindable(false)") &&
+      !sidebarFrame.includes("BevelLine") &&
+      sidebarCss.includes(".sidebar-frame.folded") &&
+      sidebarCss.includes("display: none") &&
+      sidebarCss.includes("display: grid"),
+    "Desktop shell boundaries must use one Bevel edge and Mobile must share Header fold state",
+  );
+  assert(
+    designLanguage.includes(
+      "Headerのbottom edgeとSidebarのright edgeだけを有効",
+    ) &&
+      designLanguage.includes("Mobileのfold controlはHeaderに置く") &&
+      designLanguage.includes("main contentと同時表示しない") &&
+      designLanguage.includes("同じlayerではheading、本文、Lineの端を揃え") &&
+      designLanguage.includes(
+        "親layoutがそのlayer全体へinline方向の余白を与え",
+      ) &&
+      showroomCss.includes(".resource-list {") &&
+      showroomCss.includes("margin-inline: var(--space-2)"),
+    "The design language and showroom must align same-layer lines and inset nested layers as a whole",
   );
   assert(
     !sidebarCss.includes("border-right:") &&
       !sidebarCss.includes("border-bottom:") &&
       !showroomCss.includes("border-top: 1px solid") &&
       !showroomCss.includes("border-bottom: 1px solid"),
-    "Shell and showroom structural separators must not fall back to one-sided solid borders",
+    "Shell and showroom structural boundaries must not fall back to one-sided solid borders",
   );
 });

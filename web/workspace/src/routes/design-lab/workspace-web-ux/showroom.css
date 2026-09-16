@@ -167,7 +167,6 @@
     gap: var(--space-4);
     padding: var(--space-3) var(--space-4);
     border-radius: inherit;
-    background: var(--bg-raised);
     color: var(--text);
   }
 
@@ -297,6 +296,7 @@
 
   .resource-list {
     min-width: 0;
+    margin-inline: var(--space-2);
   }
 
   .resource-row {
@@ -409,7 +409,7 @@
 
   .key-value,
   .technical-values {
-    margin: 0;
+    margin: 0 var(--space-2);
   }
 
   .key-value > div:not(.bevel-line),
@@ -553,6 +553,7 @@
   .sample-form {
     display: grid;
     gap: var(--space-5);
+    margin-inline: var(--space-2);
   }
 
   .form-grid {

@@ -2,80 +2,48 @@
 
 この文書は、Workspace Webをどう知覚させ、情報、状態、操作をどの視覚文法で表現するかを定義する。Product固有のresource構成は[`product-ux.md`](product-ux.md)、application shellとSidebar slotの実装構造は[`application-architecture.md`](application-architecture.md)、CSSとsource配置は[`../../../web/workspace/README.md`](../../../web/workspace/README.md)をauthorityとする。
 
-一つの規則は、次の4階層のうち最も具体的な一箇所だけをauthorityとする。別の章で同じ禁止や手段を再掲せず、必要な場合はauthorityとなる章を参照する。
+一つの規則は、以下の各章のうち最も具体的な一箇所だけをauthorityとする。別の章で同じ禁止や手段を再掲せず、必要な場合はauthorityとなる章を参照する。
+
+この文書はrendered resultが満たす設計規則を定義する。実装者自身がbefore/afterをcaptureして完了判定する手順は、[`visual-review.md`](visual-review.md)をauthorityとする。
 
 ## 1. Principles
 
-なぜこの設計にするかを定義する。個別の表示規則に迷った場合は、この章へ戻って判断する。
+この章は具体的な見た目や配置を定めない。複数の規則や要求が競合したときに、どちらを優先するか判断するための原理だけを定める。
 
-### 基本思想
+### Task before explanation
 
-- 作業ツールとして、シンプルで直感的なUX
-- UIのために曖昧な情報を推測しない。データを正直に表示し、操作を見通せるようにする
-- 状態・scope・操作を、装飾ではなく構造で読ませ、情報量を増やしても騒がしくならない
-- 説明的に見せるのではなく、配置と関係で理解させる
+現在のtaskと判断を、網羅的な説明、metadataの露出、装飾より優先する。UIはユーザーが次の有効な操作へ到達するまでの距離を短くする。
 
-### 知覚原則
+### Meaning before decoration
 
-size、weight、color、spacing、line、background、motionを使うときは、次のどの知覚を成立させるためか説明できなければならない。説明できない視覚表現は追加しない。
+視覚上の差は、情報の重要度、関係、操作可能性、または状態の違いを伝えるためにだけ使う。意味を説明できない視覚表現は追加しない。
 
-#### Hierarchy — 何が重要か
+### Authority before convenience
 
-- 情報は、primary、secondary、technicalの順に読む構造にする。
-- 重要度は、最初に配置順、次にsize、weight、contrastで示す。colorや装飾だけで重要度を作らない。
-- 同じscopeに最も強いheading、filled action、attention表現を複数置かない。
-- primary contentと、その判断に必要なstateまたはactionを初期viewportへ置く。
-- metadataと補助操作は、主要なidentityやcurrent stateより強く見せない。
+UIの都合でdata、state、permission、利用可能なactionを推測しない。表示とaffordanceは、現在のauthorityが確定している内容に一致させる。
 
-#### Grouping — 何と何が同じグループか
+### Complexity follows need
 
-- 同じ判断や操作に使う情報は、一つのまとまりとして知覚できるようにする。
-- groupの単位は、共通のownership、behavior、またはユーザーが行う一つの判断から決める。
-- label、value、help、error、actionの対応関係を、別の説明を読まなくても追えるようにする。
-- data sourceやDTOが同じという理由だけでgroup化しない。
-- 一つの関係へ複数の視覚cueを重ねず、何がgroupを成立させているか一つに定める。
-
-#### Separation — 何が別物か
-
-- 異なるgroupの境界を知覚でき、その強さが意味上の距離と一致するようにする。
-- すべての境界について、何と何を分けているか説明できなければならない。
-- 一つの意味上の境界へ複数のseparation cueを重ねない。
-- 境界がどのgroupの開始または終端を示すか、読み順から判別できるようにする。
-- 異なるhierarchyの境界をすべて同じ強さで表現しない。
-
-#### Affordance — 何が操作できるか
-
-- actionにはbutton、navigationにはlink、選択にはcontrolを使い、役割を見た目とsemantic elementで一致させる。
-- interactive elementは、通常、hover、focus、active、disabledを区別できるようにする。
-- staticなstatus、key、metadataをbuttonやpillの形にしない。
-- clickable rowは、click可能な範囲と遷移先を一つにする。
-- permissionがない操作をdisabled controlとして見せることでaffordanceを偽らない。
-
-#### State — 現在どういう状態か
-
-- 権威を持つdata sourceのstateをそのまま表示し、UIの都合でunknown、stale、unavailableを推測で埋めない。
-- stateは対象resourceまたはoperationの近くに置き、何のstateかを位置関係で判別できるようにする。
-- stateはmarkerとtextで示し、colorを補助に使う。
-- loading、empty、error、permission denied、unavailable、staleを別の状態として扱う。
-- 非同期operationでは、開始、処理中、完了、失敗を見通せるようにする。
-
-#### Focus — 今どこを見るべきか
-
-- 一つのscopeでは、primary resource、current attention、next actionのいずれか一つを最初のfocusにする。
-- accent、filled action、強いcontrast、motionを複数箇所で競合させない。
-- normal stateは静かに保ち、attention表現は現在判断が必要な例外へ限定する。
-- 視覚的なfocusとkeyboard focusを一致させる。
-- focusを作るために周囲の情報を過度に薄くしたり、小さくしたりしない。
-
-### 検証原則
-
-この文書はrendered resultが満たす設計規則を定義する。実装者自身がbefore/afterをcaptureし、grouping、separator、spacing、wrapping、responsive、stateを目視して完了判定する手順は、[`visual-review.md`](visual-review.md)をauthorityとする。
+複雑さを消すのではなく、判断に必要になる位置と時点で開示する。初期表示では、現在のtaskと競合する詳細を前面へ出さない。
 
 ## 2. Semantics / Grammar
 
-何を、どの関係と意味で表現するかを定義する。
+この章は、Workspace Webで情報、操作、状態を何として扱い、どう表現するかを定める。
 
-### 情報階層
+### Information structure
+
+#### Priority and focus
+
+- 情報はprimary、secondary、technicalの順に読む構造にする。
+- 一つのscopeでは、primary resource、current attention、next actionのいずれか一つを最初のfocusにする。
+- 重要度は最初に配置順、次にsize、weight、contrastで示す。colorや装飾だけで重要度を作らない。
+- 同じscopeに最も強いheading、filled action、attention表現を複数置かない。
+- metadataと補助操作は、主要なidentityやcurrent stateより強く見せない。
+- accent、filled action、強いcontrast、motionを複数箇所で競合させない。
+- normal stateは静かに保ち、attention表現は現在判断が必要な例外へ限定する。
+- focusを作るために周囲の情報を過度に薄くしたり、小さくしたりしない。
+
+#### Page and section structure
 
 route titleはshell headerとmain contentを通じて一度だけ表示する。
 
@@ -85,9 +53,18 @@ route titleはshell headerとmain contentを通じて一度だけ表示する。
 - route分類、breadcrumb、header titleをeyebrow、heading、keyで繰り返さない。
 - subtitleとledeは原則として置かない。
 
-一つのsectionは、一つの目的、ownership、または読み順を持つ。目的が異なる内容を同じsectionへ入れず、同じ目的の内容を見た目だけで複数sectionへ分けない。Section間とsection内の関係は`Principles`のGroupingとSeparationに従い、具体的なcueは`Primitives / Tokens`だけから選ぶ。
+一つのsectionは、一つの目的、ownership、または読み順を持つ。目的が異なる内容を同じsectionへ入れず、同じ目的の内容を見た目だけで複数sectionへ分けない。Section間とsection内の関係は次のGrouping and separationに従い、具体的なcueは`Primitives / Tokens`だけから選ぶ。
 
-### Metadata
+#### Grouping and separation
+
+- 同じ判断や操作に使う情報は、一つのまとまりとして知覚できるようにする。
+- groupの単位は、共通のownership、behavior、またはユーザーが行う一つの判断から決める。data sourceやDTOが同じという理由だけでgroup化しない。
+- label、value、help、error、actionの対応関係を、別の説明を読まなくても追えるようにする。
+- 異なるgroupの境界を知覚でき、その強さが意味上の距離と一致するようにする。
+- 境界は何と何を分け、どのgroupの開始または終端を示すか説明できるようにする。
+- 一つのgroupまたは境界へ複数の視覚cueを重ねず、異なるhierarchyの境界をすべて同じ強さで表現しない。
+
+#### Metadata
 
 主要表示に置くのは、identity、healthまたはattention、比較、次の操作に必要な値だけとする。
 
@@ -102,7 +79,7 @@ route titleはshell headerとmain contentを通じて一度だけ表示する。
 
 機械的な値にはmonospace familyを使う。DTOに値が存在することだけを理由に表示しない。
 
-### 段階的な開示
+#### 段階的な開示
 
 - primary viewにはidentity、current state、attention、次の有効なactionを表示する。
 - 副次的な運用情報はplain section、side panel、またはlabel付き`details`へ置く。
@@ -111,7 +88,25 @@ route titleはshell headerとmain contentを通じて一度だけ表示する。
 - create formとedit formは明示的なactionの後に表示する。
 - blocking error、permission requirement、validation constraint、unsaved changeを閉じたdisclosureへ隠さない。
 
-### Authority、権限、操作
+### Interaction and state
+
+#### Affordance
+
+- actionにはbutton、navigationにはlink、選択にはcontrolを使い、役割を見た目とsemantic elementで一致させる。
+- interactive elementは、通常、hover、focus、active、disabledを区別できるようにする。
+- staticなstatus、key、metadataをbuttonやpillの形にしない。
+- clickable rowは、click可能な範囲と遷移先を一つにする。
+- permissionがない操作をdisabled controlとして見せることでaffordanceを偽らない。
+
+#### State representation
+
+- 権威を持つdata sourceのstateをそのまま表示し、UIの都合でunknown、stale、unavailableを推測で埋めない。
+- stateは対象resourceまたはoperationの近くに置き、何のstateかを位置関係で判別できるようにする。
+- stateはmarkerとtextで示し、colorを補助に使う。
+- loading、empty、error、permission denied、unavailable、staleを別の状態として扱う。
+- 非同期operationでは、開始、処理中、完了、失敗を見通せるようにする。
+
+#### Authority、権限、操作
 
 - permissionはcontrolのenabled状態だけでなく、表示構成そのものへ反映する。
 - readは可能だがmutationできない場合、有用なread viewだけを構成する。
@@ -121,7 +116,7 @@ route titleはshell headerとmain contentを通じて一度だけ表示する。
 - destructive actionには対象と結果を明記し、復元できない場合は意図的なconfirmationを要求する。
 - 同じscopeのfilled primary actionは一つだけとする。
 
-### Loading、empty、error、unavailable
+loading、empty、error、unavailableは同じfallbackへまとめず、それぞれ次の表現を使う。
 
 #### Loading
 
@@ -148,7 +143,9 @@ route titleはshell headerとmain contentを通じて一度だけ表示する。
 
 resource unavailable、capability missing、permission deniedを別の状態として扱う。`403`をempty listとして表示したり、別scopeへredirectしたりしない。
 
-### 文言
+## 3. Language / Copy
+
+UI copyの語彙、長さ、説明責任を定める。
 
 - 具体的な名詞と動詞を使う。
 - identifier、API名、type名は正確性が必要な場合に原文を維持する。
@@ -156,6 +153,10 @@ resource unavailable、capability missing、permission deniedを別の状態と�
 - proseを追加するのは、判断を変える具体的な情報、warning、permission、validation constraint、error recoveryに必要な場合だけとする。
 - empty copyとstatus copyは短く、事実を直接書く。
 - buttonは操作を表す。`Submit`、`OK`、装飾的なcategory labelを避ける。
+
+## 4. Cross-cutting requirements
+
+viewport、input modality、支援技術にかかわらず、すべての表現とcomponentが満たす要件を定める。
 
 ### Responsive
 
@@ -171,14 +172,14 @@ resource unavailable、capability missing、permission deniedを別の状態と�
 
 - semantic elementを使う。
 - すべてのcontrolに明示的なaccessible nameを与える。
-- keyboard focusを常に見えるようにする。
+- 視覚的なfocusとkeyboard focusを一致させ、常に見えるようにする。
 - tab orderを画面上の順序と作業順に合わせる。
 - icon-only controlには具体的な`aria-label`を付ける。
 - stateはcolor以外のtextまたはsemantic distinctionを持つ。
 - 必要なhorizontal scroll regionはfocus可能にし、accessible nameを付ける。
 - lightとdarkで同じsemantic tokenを使う。
 
-## 3. Primitives / Tokens
+## 5. Primitives / Tokens
 
 色、文字、間隔、形、motionの最小単位を定義する。
 
@@ -204,9 +205,6 @@ colorはCSS custom propertyをauthorityとし、通常のWorkspace colorはOKLCH
 --danger
 --interactive-hover
 --interactive-selected
---bevel-highlight
---bevel-shadow
---bevel-face-width
 --shadow-overlay
 ```
 
@@ -214,11 +212,6 @@ colorはCSS custom propertyをauthorityとし、通常のWorkspace colorはOKLCH
 - muted textは新しいhueを増やす前にlightnessとchromaを下げる。
 - accentとstatus colorはstate、focus、navigationへ限定する。
 - componentへraw colorを追加せず、semantic tokenを使う。
-- `--bevel-highlight`と`--bevel-shadow`はBevel共通の照明endpointとし、componentのbackgroundから派生させない。Bevel wrapper、`profile`、`depth`、描画辺へsurface色を与えてはならず、Bevelはedge lightingだけを所有する。背景色を変更できるのは内側のsemantic childが所有するtext/content areaだけとする。
-- Bevelの一面の幅はproject-wideな`--bevel-face-width: 2px`へ固定し、component APIから変更させない。`edge`は一面2px、`ridge`と`BevelLine`は二面を重ねた合計4pxとする。
-- Bevelのgeometryは`profile = edge | ridge`、凹凸方向は`depth = raised | inset`として直交させる。`ridge + inset`はgrooveを表す。Lineも`depth = raised | inset`を使う。
-- Box Bevelは`top`、`right`、`bottom`、`left`で描画辺を個別に選べる。defaultは全辺有効とし、角丸はその角に隣接する2辺がともに有効な場合だけ描画する。ridgeの内側面も有効辺からだけinsetする。
-- 独立した構造separatorは`BevelLine`を使い、片側のsolid borderで代用しない。外周border、focus ring、status marker、表の意味的なgridは別のprimitiveとして扱う。
 - 意味が重なるtoken aliasを作らない。
 
 ConsoleとterminalのANSI paletteは専用tokenを使い、通常のstatusやformへ流用しない。
@@ -262,15 +255,29 @@ ConsoleとterminalのANSI paletteは専用tokenを使い、通常のstatusやfor
 - motionは任意かつ短くし、意味の必須条件にしない。
 - 繰り返しまたは連続animationではreduced-motion preferenceを尊重する。
 
-## 4. Components / Patterns
+## 6. Components / Patterns
 
-実際のUIを、上のprinciple、grammar、tokenから組み立てる。完成pageを固定templateにしない。
+実際のUIを、上のprinciple、grammar、communication、cross-cutting requirement、tokenから組み立てる。完成pageを固定templateにしない。
+
+### Bevel / Structural edge
+
+- raised edgeは、周囲より前にあるcontrolまたはsurfaceを表す場合に使う。
+- inset edgeは、入力を受け取る領域または周囲より奥にあるsurfaceを表す場合に使う。
+- ridgeとgrooveは構造上の境界を表すために使い、status、attention、単なる装飾には使わない。
+- spacingやalignmentだけで関係を十分に示せる場合、Bevelを追加しない。
+- Bevel自体へbackgroundやsurface toneを与えず、必要なbackgroundは内側のsemantic childが持つtext/content areaへ適用する。
+- 隣接するsurfaceでは、実際に境界となる辺だけを見せ、存在しない境界やcornerを装飾目的で追加しない。
+- standaloneな閉じた領域は、領域自体をBevelで囲う。ページ全体を分割するHeaderとSidebarはclosed boxとして隣接させず、DesktopではHeaderのbottom edgeとSidebarのright edgeだけを有効にして内部境界を示す。viewport外周に重なるtop／left edgeは描画しない。
+- `BevelLine`は開いた領域内の構造separatorだけに使う。同じlayerではheading、本文、Lineの端を揃え、Lineだけに端方向のpaddingやmarginを追加しない。
+- 内側のlayerを分離するときは、親layoutがそのlayer全体へinline方向の余白を与え、content、row、Lineを一緒に内側へ移す。Lineだけを短くして階層を表現しない。
+- 外周border、focus ring、status marker、tableの意味的なgridはBevelや`BevelLine`へ置き換えない。
 
 ### Sidebar
 
 - Sidebarは現在位置と利用可能なscopeを一つのnavigation hierarchyとして示す。
 - desktop幅は`clamp(220px, 20vw, 280px)`を基本とする。
-- navigation contentだけをscrollさせ、fold controlはframe下部に残す。
+- navigation contentだけをscrollさせる。Desktopのfold controlはSidebar下部、Mobileのfold controlはHeaderに置く。
+- MobileでSidebarを表示するときはHeader下の残りviewport全体をSidebarに使い、main contentと同時表示しない。
 - navigationとscope controlだけを置く。
 - navigation linkはsidebar幅全体を使うflat rowとする。
 - active stateは一つのcueと`aria-current="page"`で示す。

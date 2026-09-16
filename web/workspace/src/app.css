@@ -51,7 +51,7 @@
     --interactive-selected: oklch(93% 0.02 230);
     --bevel-highlight: #fff;
     --bevel-shadow: #000;
-    --bevel-face-width: 2px;
+    --bevel-face-width: 1px;
     --shadow-overlay: 0 12px 32px oklch(0% 0 0 / 0.14);
 
     --font-sans: "Gen Interface JP", sans-serif;

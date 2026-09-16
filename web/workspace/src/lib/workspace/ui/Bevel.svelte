@@ -128,7 +128,7 @@
     inset: 0;
     box-sizing: border-box;
     border-style: solid;
-    border-color: var(--line-strong);
+    border-color: var(--_fallback-border, var(--line-strong));
     border-width: var(--_top-w) var(--_right-w) var(--_bottom-w) var(--_left-w);
     border-radius: inherit;
     pointer-events: none;
@@ -155,11 +155,11 @@
   }
 
   .bevel[data-profile='edge'][data-depth='inset']::before {
-    border-color: var(--line);
+    --_fallback-border: var(--line);
   }
 
   .bevel[data-profile='ridge'][data-depth='inset']::before {
-    border-color: var(--line);
+    --_fallback-border: var(--line);
   }
 
   .bevel[data-profile='ridge']::after {
@@ -168,7 +168,7 @@
       var(--bevel-right-inset)
       var(--bevel-bottom-inset)
       var(--bevel-left-inset);
-    border-color: var(--line);
+    --_fallback-border: var(--line);
     border-radius:
       max(0px, calc(var(--bevel-top-left-radius) - var(--bevel-face-width)))
       max(0px, calc(var(--bevel-top-right-radius) - var(--bevel-face-width)))
@@ -177,7 +177,7 @@
   }
 
   .bevel[data-profile='ridge'][data-depth='inset']::after {
-    border-color: var(--line-strong);
+    --_fallback-border: var(--line-strong);
   }
 
   .bevel[data-invalid='true'],
