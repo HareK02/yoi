@@ -266,11 +266,11 @@ pub struct CreateWorkerRequest {
     pub memory_settings: Option<manifest::WorkspaceMemorySettingsSnapshot>,
 }
 
-/// Worker lifecycle status for the in-memory embedded runtime.
+/// Last persisted Worker lifecycle status.
 ///
-/// Run termination details are carried separately by the Worker protocol. In
-/// particular, cancellation returns a Worker to `Idle`; it is not a lifecycle
-/// state of its own.
+/// This is not proof that the current Runtime process holds a live execution handle. Run
+/// termination details remain separate Worker protocol state; in particular, cancellation
+/// returns a Worker to `Idle` and is not a lifecycle state of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerStatus {
@@ -293,12 +293,17 @@ pub(crate) enum WorkerRestoreIntent {
     Explicit,
 }
 
-/// Lightweight catalog row.
+/// Lightweight persisted Worker identity projection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSummary {
     pub worker_ref: WorkerRef,
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
+    /// Creation timestamp in Unix epoch milliseconds for records created on this schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_ms: Option<u64>,
+    /// Whether the persisted execution metadata was valid when this identity was loaded.
+    pub execution_metadata_available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_state: Option<protocol::WorkerStateSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -313,12 +318,17 @@ pub struct WorkerSummary {
     pub config_bundle: Option<ConfigBundleRef>,
 }
 
-/// Full Worker catalog/lifecycle detail.
+/// Full persisted Worker identity and lifecycle detail.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerDetail {
     pub worker_ref: WorkerRef,
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
+    /// Creation timestamp in Unix epoch milliseconds for records created on this schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_ms: Option<u64>,
+    /// Whether the persisted execution metadata was valid when this identity was loaded.
+    pub execution_metadata_available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_state: Option<protocol::WorkerStateSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

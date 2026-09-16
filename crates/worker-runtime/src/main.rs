@@ -1,7 +1,7 @@
-// Worker-backed Runtime REST process wrapper.
+// Worker-backed Runtime host service.
 //
-// This binary starts a Runtime command API with a real worker execution backend.
-// A REST Runtime process that cannot spawn Workers is not a valid Runtime for the
+// This binary starts a Runtime command API with a real Worker execution backend.
+// A Runtime service that cannot create and restore Workers is not available to the
 // Workspace Browser.
 
 use std::collections::VecDeque;
@@ -1152,7 +1152,7 @@ fn usage() -> &'static str {
        yoi-runtime migrate --dry-run [--runtime-id <ID>] [OPTIONS]
 
 Starts a worker-backed Runtime REST command API for a trusted backend/proxy.
-Browsers must not connect to this Runtime process directly.
+Browsers must not connect to this Runtime service directly.
 
 Options:
   --bind <ADDR>                         Bind socket address (default: 127.0.0.1:38800)
@@ -1280,7 +1280,7 @@ mod tests {
         std::fs::write(
             root.join("runtime.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": 6,
+                "schema_version": 7,
                 "display_name": "local",
                 "backend": "fs_store",
                 "status": "running",
@@ -1319,7 +1319,7 @@ mod tests {
         std::fs::write(
             root.join("runtime.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": 6,
+                "schema_version": 7,
                 "display_name": "local",
                 "backend": "fs_store",
                 "status": 3,

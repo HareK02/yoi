@@ -2129,7 +2129,11 @@ impl EmbeddedWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: summary.workspace_id.clone(),
             },
-            state: embedded_worker_status_label(summary.status).to_string(),
+            state: embedded_worker_state_label(
+                summary.status,
+                summary.execution_metadata_available,
+            )
+            .to_string(),
             worker_state: summary.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
@@ -2139,11 +2143,14 @@ impl EmbeddedWorkerRuntime {
                 display_hint: "backend-internal worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_stop: self.can_stop_embedded_worker(summary.status),
+                can_stop: summary.execution_metadata_available
+                    && self.can_stop_embedded_worker(summary.status),
                 can_spawn_followup: false,
             },
             working_directory: summary.working_directory.map(|status| status.summary),
-            diagnostics: embedded_worker_projection_diagnostics(),
+            diagnostics: embedded_worker_projection_diagnostics(
+                summary.execution_metadata_available,
+            ),
         }
     }
 
@@ -2169,7 +2176,8 @@ impl EmbeddedWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: detail.workspace_id.clone(),
             },
-            state: embedded_worker_status_label(detail.status).to_string(),
+            state: embedded_worker_state_label(detail.status, detail.execution_metadata_available)
+                .to_string(),
             worker_state: detail.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
@@ -2179,11 +2187,14 @@ impl EmbeddedWorkerRuntime {
                 display_hint: "backend-internal worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_stop: self.can_stop_embedded_worker(detail.status),
+                can_stop: detail.execution_metadata_available
+                    && self.can_stop_embedded_worker(detail.status),
                 can_spawn_followup: false,
             },
             working_directory: detail.working_directory.map(|status| status.summary),
-            diagnostics: embedded_worker_projection_diagnostics(),
+            diagnostics: embedded_worker_projection_diagnostics(
+                detail.execution_metadata_available,
+            ),
         }
     }
 }
@@ -3914,7 +3925,11 @@ impl RemoteWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: summary.workspace_id.clone(),
             },
-            state: embedded_worker_status_label(summary.status).to_string(),
+            state: embedded_worker_state_label(
+                summary.status,
+                summary.execution_metadata_available,
+            )
+            .to_string(),
             worker_state: summary.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
@@ -3924,15 +3939,12 @@ impl RemoteWorkerRuntime {
                 display_hint: "Backend-proxied remote worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_stop: runtime_worker_can_stop(true, summary.status),
+                can_stop: summary.execution_metadata_available
+                    && runtime_worker_can_stop(true, summary.status),
                 can_spawn_followup: false,
             },
             working_directory: summary.working_directory.map(|status| status.summary),
-            diagnostics: vec![diagnostic(
-                "remote_runtime_projection",
-                DiagnosticSeverity::Info,
-                "Remote Worker identity is projected only as runtime_id plus worker_id; endpoint and credentials remain backend-private".to_string(),
-            )],
+            diagnostics: remote_worker_projection_diagnostics(summary.execution_metadata_available),
         }
     }
 
@@ -3958,7 +3970,8 @@ impl RemoteWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: detail.workspace_id.clone(),
             },
-            state: embedded_worker_status_label(detail.status).to_string(),
+            state: embedded_worker_state_label(detail.status, detail.execution_metadata_available)
+                .to_string(),
             worker_state: detail.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
@@ -3968,15 +3981,12 @@ impl RemoteWorkerRuntime {
                 display_hint: "Backend-proxied remote worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_stop: runtime_worker_can_stop(true, detail.status),
+                can_stop: detail.execution_metadata_available
+                    && runtime_worker_can_stop(true, detail.status),
                 can_spawn_followup: false,
             },
             working_directory: detail.working_directory.map(|status| status.summary),
-            diagnostics: vec![diagnostic(
-                "remote_runtime_projection",
-                DiagnosticSeverity::Info,
-                "Remote Worker identity is projected only as runtime_id plus worker_id; endpoint and credentials remain backend-private".to_string(),
-            )],
+            diagnostics: remote_worker_projection_diagnostics(detail.execution_metadata_available),
         }
     }
 
@@ -4696,12 +4706,49 @@ fn embedded_worker_status_label(status: EmbeddedWorkerStatus) -> &'static str {
     }
 }
 
-fn embedded_worker_projection_diagnostics() -> Vec<RuntimeDiagnostic> {
-    vec![diagnostic(
+fn embedded_worker_state_label(
+    status: EmbeddedWorkerStatus,
+    execution_metadata_available: bool,
+) -> &'static str {
+    if !execution_metadata_available {
+        return "execution_unavailable";
+    }
+    embedded_worker_status_label(status)
+}
+
+fn execution_metadata_diagnostic(execution_metadata_available: bool) -> Option<RuntimeDiagnostic> {
+    (!execution_metadata_available).then(|| {
+        diagnostic(
+            "worker_execution_unavailable",
+            DiagnosticSeverity::Error,
+            "Persisted Worker identity is available, but execution metadata is unavailable"
+                .to_string(),
+        )
+    })
+}
+
+fn embedded_worker_projection_diagnostics(
+    execution_metadata_available: bool,
+) -> Vec<RuntimeDiagnostic> {
+    let mut diagnostics = vec![diagnostic(
         "embedded_runtime_projection",
         DiagnosticSeverity::Info,
         "Worker identity is projected only as runtime_id plus worker_id; embedded runtime internals remain backend-private".to_string(),
-    )]
+    )];
+    diagnostics.extend(execution_metadata_diagnostic(execution_metadata_available));
+    diagnostics
+}
+
+fn remote_worker_projection_diagnostics(
+    execution_metadata_available: bool,
+) -> Vec<RuntimeDiagnostic> {
+    let mut diagnostics = vec![diagnostic(
+        "remote_runtime_projection",
+        DiagnosticSeverity::Info,
+        "Remote Worker identity is projected only as runtime_id plus worker_id; endpoint and credentials remain backend-private".to_string(),
+    )];
+    diagnostics.extend(execution_metadata_diagnostic(execution_metadata_available));
+    diagnostics
 }
 
 fn spawn_config_bundle_ref(request: &WorkerSpawnRequest) -> Option<ConfigBundleRef> {
@@ -6787,11 +6834,14 @@ mod tests {
     }
 
     #[test]
-    fn remote_runtime_projection_uses_canonical_worker_status_for_stop_capability() {
-        let worker_ids = (1..=4)
+    fn remote_runtime_projection_uses_execution_availability_and_canonical_status() {
+        let worker_ids = (1..=5)
             .map(|value| EmbeddedWorkerId::from_legacy_u64(value).to_string())
             .collect::<Vec<_>>();
         let worker_id = worker_ids[0].clone();
+        let mut execution_unavailable =
+            worker_json_with_status("remote:primary", &worker_ids[4], "running");
+        execution_unavailable["execution_metadata_available"] = serde_json::json!(false);
         let (base_url, server) = serve_mock_http(vec![
             mock_response(
                 "GET",
@@ -6803,7 +6853,8 @@ mod tests {
                         worker_json_with_status("remote:primary", &worker_ids[0], "stopped"),
                         worker_json_with_status("remote:primary", &worker_ids[1], "running"),
                         worker_json_with_status("remote:primary", &worker_ids[2], "paused"),
-                        worker_json_with_status("remote:primary", &worker_ids[3], "idle")
+                        worker_json_with_status("remote:primary", &worker_ids[3], "idle"),
+                        execution_unavailable
                     ]
                 })
                 .to_string(),
@@ -6838,15 +6889,23 @@ mod tests {
         )]);
 
         let workers = registry.list_workers(10);
-        assert_eq!(workers.items.len(), 4);
+        assert_eq!(workers.items.len(), 5);
         assert!(!workers.items[0].capabilities.can_stop);
         assert!(workers.items[1].capabilities.can_stop);
         assert!(workers.items[2].capabilities.can_stop);
         assert!(workers.items[3].capabilities.can_stop);
+        assert!(!workers.items[4].capabilities.can_stop);
         assert_eq!(workers.items[0].state, "stopped");
         assert_eq!(workers.items[1].state, "running");
         assert_eq!(workers.items[2].state, "paused");
         assert_eq!(workers.items[3].state, "idle");
+        assert_eq!(workers.items[4].state, "execution_unavailable");
+        assert!(
+            workers.items[4]
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "worker_execution_unavailable")
+        );
 
         let stopped_detail = registry
             .worker(&RuntimeWorkerRef::new("remote:primary", &worker_id))
@@ -7119,6 +7178,7 @@ mod tests {
             "runtime_id": runtime_id,
             "worker_id": worker_id,
             "status": status,
+            "execution_metadata_available": true,
             "intent": { "kind": "role", "role": "coder", "purpose": "remote test" },
             "profile": { "kind": "builtin", "value": "coder" },
             "profile_source": {
