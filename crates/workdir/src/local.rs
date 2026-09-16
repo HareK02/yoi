@@ -1569,7 +1569,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, WorkdirError::Conflict(_)));
+        assert_eq!(
+            error.to_string(),
+            "The target file's content or existence changed since it was last observed; read the file again before retrying: notes/item.txt"
+        );
 
         std::fs::remove_file(dir.path().join("notes/item.txt")).unwrap();
         let error = WorkdirSession::write(
@@ -1582,7 +1585,38 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, WorkdirError::Conflict(_)));
+        assert_eq!(
+            error.to_string(),
+            "The target file's content or existence changed since it was last observed; read the file again before retrying: notes/item.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_conflicts_when_observed_absence_becomes_a_file() {
+        let dir = TempDir::new().unwrap();
+        let workdir = make_fs(&dir);
+        let path = WorkdirPath::new("race.txt").unwrap();
+
+        let error = WorkdirSession::stat(&workdir, StatRequest { path: path.clone() })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, WorkdirError::NotFound(_)));
+
+        std::fs::write(dir.path().join("race.txt"), "created externally").unwrap();
+        let error = WorkdirSession::write(
+            &workdir,
+            WriteRequest {
+                path,
+                content: b"worker content".to_vec(),
+                expected_hash: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "The target file's content or existence changed since it was last observed; read the file again before retrying: race.txt"
+        );
     }
 
     #[tokio::test]

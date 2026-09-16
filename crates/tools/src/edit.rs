@@ -298,7 +298,12 @@ mod tests {
             .execute(&inp.to_string(), Default::default())
             .await
             .unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("modified externally"), "{msg}");
+        match err {
+            ToolError::ExecutionFailed(message) => assert_eq!(
+                message,
+                "The target file's content or existence changed since it was last observed; read the file again before retrying: a.txt"
+            ),
+            other => panic!("expected execution failure, got {other:?}"),
+        }
     }
 }

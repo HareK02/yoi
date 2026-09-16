@@ -235,7 +235,7 @@ pub enum WorkdirError {
     #[error("Workdir transport failed: {0}")]
     Transport(String),
 
-    #[error("Workdir content was modified externally before the operation could be applied: {0}")]
+    #[error("{0}")]
     Conflict(String),
 
     #[error("unknown Workdir session command: {0}")]
@@ -349,7 +349,9 @@ impl From<fs_operation::FsError> for WorkdirError {
             fs_operation::FsError::SymlinkTargetIsDirectory { path, target } => {
                 Self::SymlinkTargetIsDirectory { path, target }
             }
-            fs_operation::FsError::Conflict(message) => Self::Conflict(message),
+            fs_operation::FsError::Conflict(path) => Self::Conflict(format!(
+                "The target file's content or existence changed since it was last observed; read the file again before retrying: {path}"
+            )),
             fs_operation::FsError::InvalidGlob(message) => Self::InvalidGlob(message),
             fs_operation::FsError::InvalidRegex(message) => Self::InvalidRegex(message),
             fs_operation::FsError::InvalidArgument(message) => Self::InvalidArgument(message),
