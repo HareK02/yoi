@@ -24,6 +24,7 @@ const PREVIOUS_SCHEMA_VERSION: u32 = 7;
 const LEGACY_SCHEMA_VERSION: u32 = 6;
 const RUNTIME_FILE: &str = "runtime.json";
 const WORKERS_DIR: &str = "workers";
+const ORPHANED_WORKERS_DIR: &str = "orphaned-workers";
 const WORKER_FILE: &str = "worker.json";
 const WORKER_EXECUTION_FILE: &str = "execution.json";
 const WORKER_METADATA_FILE: &str = "metadata.json";
@@ -466,6 +467,7 @@ pub struct FsRuntimeStoreMigrationPlan {
     pub target_schema_version: u32,
     pub migration_required: bool,
     pub worker_count: usize,
+    pub archived_orphan_worker_count: usize,
     pub migrated_worker_aggregate_count: usize,
     pub migrated_diagnostic_worker_ref_count: usize,
     pub cleared_diagnostic_worker_ref_count: usize,
@@ -534,6 +536,7 @@ fn plan_runtime_store_migration(
             target_schema_version: SCHEMA_VERSION,
             migration_required: false,
             worker_count: 0,
+            archived_orphan_worker_count: 0,
             migrated_worker_aggregate_count: 0,
             migrated_diagnostic_worker_ref_count: 0,
             cleared_diagnostic_worker_ref_count: 0,
@@ -563,6 +566,7 @@ fn plan_runtime_store_migration(
         .map_err(|error| runtime_io_error("read workers", &workers_dir, error))?;
     entries.sort_by_key(|entry| entry.file_name());
     let mut planned = Vec::with_capacity(entries.len());
+    let mut archived_orphan_worker_count = 0;
     let mut target_ids = std::collections::BTreeSet::new();
     for entry in entries {
         let source_dir = entry.path();
@@ -585,6 +589,7 @@ fn plan_runtime_store_migration(
                 source,
             })?
         {
+            archived_orphan_worker_count += 1;
             continue;
         }
         let snapshot: serde_json::Value = read_json(&snapshot_path, "read Worker record")?;
@@ -687,6 +692,7 @@ fn plan_runtime_store_migration(
         target_schema_version: SCHEMA_VERSION,
         migration_required: true,
         worker_count: planned.len(),
+        archived_orphan_worker_count,
         migrated_worker_aggregate_count,
         migrated_diagnostic_worker_ref_count: diagnostic_refs.migrated,
         cleared_diagnostic_worker_ref_count: diagnostic_refs.cleared,
@@ -1440,6 +1446,45 @@ fn migrate_runtime_store(
     Ok(plan)
 }
 
+fn archive_orphaned_worker_directories(root: &Path) -> Result<usize, RuntimeError> {
+    let workers_dir = root.join(WORKERS_DIR);
+    let mut orphaned = fs::read_dir(&workers_dir)
+        .map_err(|source| runtime_io_error("read Worker records", &workers_dir, source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| runtime_io_error("read Worker records", &workers_dir, source))?
+        .into_iter()
+        .filter_map(|entry| {
+            let path = entry.path();
+            (!path.join(WORKER_FILE).is_file()).then_some((entry.file_name(), path))
+        })
+        .collect::<Vec<_>>();
+    orphaned.sort_by(|(left, _), (right, _)| left.cmp(right));
+    if orphaned.is_empty() {
+        return Ok(0);
+    }
+
+    let archive_dir = root.join(ORPHANED_WORKERS_DIR);
+    fs::create_dir_all(&archive_dir).map_err(|source| {
+        runtime_io_error("create orphaned Worker archive", &archive_dir, source)
+    })?;
+    for (name, source_dir) in &orphaned {
+        let target_dir = archive_dir.join(name);
+        if target_dir.exists() {
+            return Err(runtime_store_corrupt(
+                &target_dir,
+                format!(
+                    "orphaned Worker archive target already exists for {}",
+                    source_dir.display()
+                ),
+            ));
+        }
+        fs::rename(source_dir, &target_dir).map_err(|source| {
+            runtime_io_error("archive orphaned Worker directory", source_dir, source)
+        })?;
+    }
+    Ok(orphaned.len())
+}
+
 fn migrate_runtime_store_in_place(
     root: &Path,
     runtime_id: &str,
@@ -1521,6 +1566,16 @@ fn migrate_runtime_store_in_place(
         }
     }
 
+    let archived_orphan_worker_count = archive_orphaned_worker_directories(root)?;
+    if archived_orphan_worker_count != plan.archived_orphan_worker_count {
+        return Err(runtime_store_corrupt(
+            root,
+            format!(
+                "archived {archived_orphan_worker_count} orphaned Worker directories; migration plan expected {}",
+                plan.archived_orphan_worker_count
+            ),
+        ));
+    }
     let (document, _) = migrate_runtime_document(
         document,
         plan.current_schema_version,
@@ -2070,7 +2125,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v4_migration_plan_ignores_orphan_worker_directories() {
+    fn schema_v7_migration_archives_orphan_worker_directories() {
         let root = tempfile::tempdir().unwrap();
         fs::write(
             root.path().join(RUNTIME_FILE),
@@ -2103,6 +2158,21 @@ mod tests {
         assert_eq!(plan.current_schema_version, PREVIOUS_SCHEMA_VERSION);
         assert_eq!(plan.target_schema_version, SCHEMA_VERSION);
         assert_eq!(plan.worker_count, 0);
+        assert_eq!(plan.archived_orphan_worker_count, 1);
+
+        let opened =
+            FsRuntimeStore::open_or_create(root.path().to_path_buf(), "runtime-test").unwrap();
+
+        assert!(opened.state.unwrap().diagnostics.is_empty());
+        assert!(!root.path().join(WORKERS_DIR).join("orphan").exists());
+        assert!(
+            root.path()
+                .join(ORPHANED_WORKERS_DIR)
+                .join("orphan")
+                .join("session")
+                .join("history.json")
+                .is_file()
+        );
     }
 
     fn schema_v7_worker_document(worker_id: WorkerId) -> serde_json::Value {
@@ -2335,6 +2405,14 @@ mod tests {
             "write test Worker",
         )
         .unwrap();
+        let orphan_history = root
+            .path()
+            .join(WORKERS_DIR)
+            .join("legacy-orphan")
+            .join("session")
+            .join("history.json");
+        fs::create_dir_all(orphan_history.parent().unwrap()).unwrap();
+        fs::write(&orphan_history, b"[]").unwrap();
 
         let opened =
             FsRuntimeStore::open_or_create(root.path().to_path_buf(), "test-runtime").unwrap();
@@ -2359,6 +2437,14 @@ mod tests {
         .unwrap();
         assert_eq!(execution["schema_version"], SCHEMA_VERSION);
         assert_eq!(execution["binding"], serde_json::json!({}));
+        assert!(
+            root.path()
+                .join(ORPHANED_WORKERS_DIR)
+                .join("legacy-orphan")
+                .join("session")
+                .join("history.json")
+                .is_file()
+        );
     }
 
     #[test]
