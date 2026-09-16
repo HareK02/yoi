@@ -3231,7 +3231,7 @@ impl RuntimeState {
                     .map(|worker| worker.revision),
             )
             .max();
-        if known_revision.is_some_and(|known_revision| revision < known_revision) {
+        if known_revision.is_some_and(|known_revision| revision <= known_revision) {
             return;
         }
 
@@ -4098,8 +4098,17 @@ mod tests {
         assert!(!RuntimeState::update_internal_worker_activity(
             &mut activity,
             &protocol::Event::InternalWorkerRemoved {
-                worker: child_a,
+                worker: child_a.clone(),
                 revision: 2,
+            },
+        ));
+        assert!(activity.workers.contains_key("child-a"));
+
+        assert!(!RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &protocol::Event::InternalWorkerRemoved {
+                worker: child_a,
+                revision: 3,
             },
         ));
         assert!(!activity.workers.contains_key("child-a"));
@@ -4110,7 +4119,7 @@ mod tests {
             &mut activity,
             &protocol::Event::InternalWorkerRemoved {
                 worker: child_b.clone(),
-                revision: 1,
+                revision: 2,
             },
         ));
         assert!(!activity.has_running_worker());
@@ -4182,7 +4191,7 @@ mod tests {
                 revision: 4,
                 event: Box::new(protocol::Event::InternalWorkerRemoved {
                     worker: grandchild.clone(),
-                    revision: 2,
+                    revision: 3,
                 }),
             },
         ));
@@ -5007,7 +5016,7 @@ mod tests {
                 &created.worker_ref,
                 protocol::Event::InternalWorkerRemoved {
                     worker: internal_worker_ref("child-live", None),
-                    revision: 1,
+                    revision: 2,
                 },
             )
             .unwrap();
@@ -5026,7 +5035,7 @@ mod tests {
                 &created.worker_ref,
                 internal_worker_status_event(
                     internal_worker_ref("child-live", None),
-                    2,
+                    3,
                     protocol::WorkerStatus::Running,
                 ),
             )
@@ -5047,7 +5056,7 @@ mod tests {
                 &created.worker_ref,
                 parent_snapshot(vec![internal_worker_snapshot(
                     internal_worker_ref("child-live", None),
-                    3,
+                    4,
                     protocol::WorkerStatus::Running,
                     Vec::new(),
                 )]),
