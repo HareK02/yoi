@@ -21,6 +21,12 @@ pub enum RuntimeError {
         message: String,
     },
 
+    #[error("worker {worker_id} metadata deletion failed: {message}")]
+    WorkerDeletePersistenceFailed {
+        worker_id: WorkerId,
+        message: String,
+    },
+
     #[error("worker creation has no execution backend: {message}")]
     ExecutionBackendUnavailable { message: String },
 

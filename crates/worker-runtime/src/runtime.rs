@@ -72,6 +72,10 @@ impl RuntimeWorkspaceScope {
 }
 
 const SUBSCRIPTION_QUEUE_CAPACITY: usize = 256;
+const WORKER_DELETE_FAILURE_DIAGNOSTIC_CODE: &str = "worker_delete_persistence_failed";
+const WORKER_DELETE_FAILURE_DIAGNOSTIC_MESSAGE: &str =
+    "Worker metadata deletion failed; the persisted Worker identity was retained for retry";
+const WORKER_DELETE_FAILURE_MESSAGE_MAX_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkerRestoreMode {
@@ -2206,7 +2210,14 @@ impl Runtime {
                 worker_ref.worker_id
             )));
         }
-        state.delete_worker_record(&worker_ref.worker_id)?;
+        if state.delete_worker_record(&worker_ref.worker_id).is_err() {
+            state.record_worker_delete_persistence_failure(worker_ref);
+            let _diagnostic_persistence = state.persist_runtime_snapshot();
+            return Err(RuntimeError::WorkerDeletePersistenceFailed {
+                worker_id: worker_ref.worker_id,
+                message: WORKER_DELETE_FAILURE_DIAGNOSTIC_MESSAGE.to_string(),
+            });
+        }
         let removed = state.workers.remove(&worker_ref.worker_id).ok_or_else(|| {
             RuntimeError::WorkerNotFound {
                 worker_id: worker_ref.worker_id,
@@ -3281,6 +3292,40 @@ impl RuntimeState {
         })
     }
 
+    fn record_worker_delete_persistence_failure(&mut self, worker_ref: &WorkerRef) {
+        debug_assert!(
+            WORKER_DELETE_FAILURE_DIAGNOSTIC_MESSAGE.len()
+                <= WORKER_DELETE_FAILURE_MESSAGE_MAX_BYTES
+        );
+        if self.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == WORKER_DELETE_FAILURE_DIAGNOSTIC_CODE
+                && diagnostic.worker_ref.as_ref() == Some(worker_ref)
+        }) {
+            return;
+        }
+        #[cfg(feature = "fs-store")]
+        let diagnostic_id = {
+            let diagnostic_id = self.next_diagnostic_id;
+            self.next_diagnostic_id = self.next_diagnostic_id.saturating_add(1);
+            diagnostic_id
+        };
+        #[cfg(not(feature = "fs-store"))]
+        let diagnostic_id = self
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.diagnostics.push(RuntimeDiagnostic {
+            id: diagnostic_id,
+            code: WORKER_DELETE_FAILURE_DIAGNOSTIC_CODE.to_string(),
+            severity: DiagnosticSeverity::Error,
+            message: WORKER_DELETE_FAILURE_DIAGNOSTIC_MESSAGE.to_string(),
+            worker_ref: Some(worker_ref.clone()),
+        });
+    }
+
     #[cfg(feature = "fs-store")]
     fn record_restore_failure(
         &mut self,
@@ -3892,6 +3937,9 @@ fn runtime_worker_create_failure_fields(
         RuntimeError::WorkerNotFound { .. } => ("worker_not_found", None, None),
         RuntimeError::WorkerExecutionUnavailable { .. } => {
             ("worker_execution_unavailable", None, None)
+        }
+        RuntimeError::WorkerDeletePersistenceFailed { .. } => {
+            (WORKER_DELETE_FAILURE_DIAGNOSTIC_CODE, None, None)
         }
         RuntimeError::ExecutionBackendUnavailable { .. } => {
             ("execution_backend_unavailable", None, None)
@@ -6677,6 +6725,105 @@ mod tests {
         ));
         let summary = runtime.summary().unwrap();
         assert_eq!(summary.worker_count, 0);
+    }
+
+    #[test]
+    fn delete_worker_persistence_failure_retains_identity_and_bounded_diagnostic() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = root.path().join("runtime");
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions {
+                root: store_root.clone(),
+                runtime_id: "delete-persistence-failure".to_string(),
+                display_name: None,
+            },
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("retain identity after delete failure"))
+            .unwrap();
+        runtime
+            .stop_worker(&worker.worker_ref, Some("done".to_string()))
+            .unwrap();
+        let worker_dir = store_root
+            .join("workers")
+            .join(worker.worker_id.to_string());
+        let saved_worker_dir = store_root.join("saved-worker-record");
+        std::fs::rename(&worker_dir, &saved_worker_dir).unwrap();
+        std::fs::write(&worker_dir, b"not a directory").unwrap();
+
+        let error = runtime.delete_worker(&worker.worker_ref).unwrap_err();
+
+        assert!(matches!(
+            &error,
+            RuntimeError::WorkerDeletePersistenceFailed { worker_id, message }
+                if *worker_id == worker.worker_id
+                    && message == WORKER_DELETE_FAILURE_DIAGNOSTIC_MESSAGE
+                    && message.len() <= WORKER_DELETE_FAILURE_MESSAGE_MAX_BYTES
+        ));
+        let error_text = error.to_string();
+        assert!(error_text.len() <= WORKER_DELETE_FAILURE_MESSAGE_MAX_BYTES + 96);
+        assert!(!error_text.contains(root.path().to_string_lossy().as_ref()));
+        assert_eq!(
+            runtime.worker_detail(&worker.worker_ref).unwrap().worker_id,
+            worker.worker_id
+        );
+        let diagnostic = runtime
+            .diagnostics()
+            .unwrap()
+            .into_iter()
+            .find(|diagnostic| {
+                diagnostic.code == WORKER_DELETE_FAILURE_DIAGNOSTIC_CODE
+                    && diagnostic.worker_ref.as_ref() == Some(&worker.worker_ref)
+            })
+            .expect("retained delete failure diagnostic");
+        assert_eq!(diagnostic.message, WORKER_DELETE_FAILURE_DIAGNOSTIC_MESSAGE);
+        assert!(diagnostic.message.len() <= WORKER_DELETE_FAILURE_MESSAGE_MAX_BYTES);
+        assert!(
+            !diagnostic
+                .message
+                .contains(root.path().to_string_lossy().as_ref())
+        );
+        let persisted_runtime: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(store_root.join("runtime.json")).expect("runtime snapshot"),
+        )
+        .expect("runtime snapshot json");
+        assert!(
+            persisted_runtime["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic["code"] == WORKER_DELETE_FAILURE_DIAGNOSTIC_CODE
+                        && diagnostic["message"] == WORKER_DELETE_FAILURE_DIAGNOSTIC_MESSAGE
+                })
+        );
+        assert!(matches!(
+            runtime.delete_worker(&worker.worker_ref),
+            Err(RuntimeError::WorkerDeletePersistenceFailed { .. })
+        ));
+        assert_eq!(
+            runtime
+                .diagnostics()
+                .unwrap()
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code == WORKER_DELETE_FAILURE_DIAGNOSTIC_CODE
+                        && diagnostic.worker_ref.as_ref() == Some(&worker.worker_ref)
+                })
+                .count(),
+            1
+        );
+
+        std::fs::remove_file(&worker_dir).unwrap();
+        std::fs::rename(&saved_worker_dir, &worker_dir).unwrap();
+        assert!(runtime.delete_worker(&worker.worker_ref).unwrap().deleted);
+        assert!(matches!(
+            runtime.worker_detail(&worker.worker_ref),
+            Err(RuntimeError::WorkerNotFound { .. })
+        ));
     }
 
     #[test]

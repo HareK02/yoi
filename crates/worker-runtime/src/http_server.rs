@@ -2482,6 +2482,7 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         RuntimeError::StoreIo { .. }
         | RuntimeError::StoreMissing { .. }
         | RuntimeError::StoreCorrupt { .. }
+        | RuntimeError::WorkerDeletePersistenceFailed { .. }
         | RuntimeError::StatePoisoned => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -2493,6 +2494,9 @@ fn code_for_runtime_error(error: &RuntimeError) -> String {
         RuntimeError::WorkerNotFound { .. } => "worker_not_found".to_string(),
         RuntimeError::WorkerExecutionUnavailable { .. } => {
             "worker_execution_unavailable".to_string()
+        }
+        RuntimeError::WorkerDeletePersistenceFailed { .. } => {
+            "worker_delete_persistence_failed".to_string()
         }
         RuntimeError::ExecutionBackendUnavailable { .. } => {
             "execution_backend_unavailable".to_string()
@@ -3503,6 +3507,25 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, RuntimeHttpServerError::AuthRequired));
+    }
+
+    #[test]
+    fn worker_delete_persistence_error_is_bounded_and_typed() {
+        let worker_id = crate::identity::WorkerId::now_v7();
+        let error = RuntimeError::WorkerDeletePersistenceFailed {
+            worker_id,
+            message: "Worker metadata deletion failed; the persisted Worker identity was retained for retry".to_string(),
+        };
+
+        assert_eq!(
+            status_for_runtime_error(&error),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            code_for_runtime_error(&error),
+            "worker_delete_persistence_failed"
+        );
+        assert!(!error.to_string().contains('/'));
     }
 
     #[test]
