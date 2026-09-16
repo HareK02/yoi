@@ -43,7 +43,8 @@ impl From<ToolsError> for ToolError {
                 | workdir::WorkdirError::Io { .. }
                 | workdir::WorkdirError::Unavailable(_)
                 | workdir::WorkdirError::OperationFailed
-                | workdir::WorkdirError::Transport(_),
+                | workdir::WorkdirError::Transport(_)
+                | workdir::WorkdirError::Conflict(_),
             ) => ToolError::ExecutionFailed(err.to_string()),
             ToolsError::FileSystem(_)
             | ToolsError::WorkdirSession(_)
@@ -52,6 +53,51 @@ impl From<ToolsError> for ToolError {
             | ToolsError::StringNotFound { .. }
             | ToolsError::NotUnique { .. }
             | ToolsError::InvalidArgument(_) => ToolError::InvalidArgument(err.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use workdir::http::{WorkdirTransportError, WorkdirTransportErrorCode};
+
+    #[test]
+    fn local_workdir_content_conflict_is_retryable_execution_failure() {
+        let error = ToolError::from(ToolsError::WorkdirSession(
+            fs_operation::FsError::Conflict("src/main.rs".to_string()).into(),
+        ));
+
+        match error {
+            ToolError::ExecutionFailed(message) => assert_eq!(
+                message,
+                "The target file's content or existence changed since it was last observed; read the file again before retrying: src/main.rs"
+            ),
+            other => panic!("expected execution failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_workdir_content_conflict_is_retryable_without_host_path() {
+        let transport = WorkdirTransportError::from_workdir_error(
+            &workdir::WorkdirError::Conflict("/runtime/private/checkout/src/main.rs".to_string()),
+        );
+        assert_eq!(transport.code, WorkdirTransportErrorCode::Conflict);
+        assert_eq!(
+            transport.message,
+            "The target file's content or existence changed since it was last observed; read the file again before retrying"
+        );
+        let error = ToolError::from(ToolsError::WorkdirSession(transport.into_workdir_error()));
+
+        match error {
+            ToolError::ExecutionFailed(message) => {
+                assert_eq!(
+                    message,
+                    "The target file's content or existence changed since it was last observed; read the file again before retrying"
+                );
+                assert!(!message.contains("/runtime/private"));
+            }
+            other => panic!("expected execution failure, got {other:?}"),
         }
     }
 }

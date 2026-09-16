@@ -174,7 +174,10 @@ impl WorkdirTransportError {
         use WorkdirTransportErrorCode as Code;
         let (code, message) = match error {
             WorkdirError::NotFound(_) => (Code::NotFound, "Workdir path was not found"),
-            WorkdirError::Conflict(_) => (Code::Conflict, "Workdir content changed"),
+            WorkdirError::Conflict(_) => (
+                Code::Conflict,
+                "The target file's content or existence changed since it was last observed; read the file again before retrying",
+            ),
             WorkdirError::Unsupported(capability) => {
                 return Self {
                     code: Code::Unsupported,
@@ -673,7 +676,7 @@ mod tests {
             (
                 WorkdirTransportErrorCode::Conflict,
                 409,
-                "modified externally",
+                "The target file's content or existence changed since it was last observed",
             ),
             (WorkdirTransportErrorCode::Unsupported, 400, "unsupported"),
             (WorkdirTransportErrorCode::Denied, 403, "denied"),
@@ -715,7 +718,12 @@ mod tests {
         ] {
             let transport = WorkdirTransportError {
                 code,
-                message: "safe provider message".to_string(),
+                message: if code == WorkdirTransportErrorCode::Conflict {
+                    "The target file's content or existence changed since it was last observed; read the file again before retrying"
+                        .to_string()
+                } else {
+                    "safe provider message".to_string()
+                },
             };
             assert_eq!(code.http_status(), expected_status);
             let workdir_error = transport.clone().into_workdir_error();
@@ -782,5 +790,21 @@ mod tests {
             transport.into_workdir_error(),
             WorkdirError::Io { .. }
         ));
+
+        let error = WorkdirError::Conflict(
+            "The target file's content or existence changed since it was last observed; read the file again before retrying: /secret/runtime/root/file"
+                .to_string(),
+        );
+        let transport = WorkdirTransportError::from_workdir_error(&error);
+        assert_eq!(transport.code, WorkdirTransportErrorCode::Conflict);
+        assert_eq!(
+            transport.message,
+            "The target file's content or existence changed since it was last observed; read the file again before retrying"
+        );
+        assert!(!transport.message.contains("/secret"));
+        assert_eq!(
+            transport.into_workdir_error().to_string(),
+            "The target file's content or existence changed since it was last observed; read the file again before retrying"
+        );
     }
 }
