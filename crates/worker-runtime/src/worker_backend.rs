@@ -1197,7 +1197,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
 #[derive(Clone)]
 struct RuntimeExecutionTaskScope {
     tasks: Arc<Mutex<Vec<RuntimeExecutionTask>>>,
-    terminal_failure: Arc<Mutex<Option<String>>>,
 }
 
 struct RuntimeExecutionTask {
@@ -1214,7 +1213,6 @@ impl RuntimeExecutionTaskScope {
                 task: controller_task,
                 abort_before_join: false,
             }])),
-            terminal_failure: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1241,15 +1239,8 @@ impl RuntimeExecutionTaskScope {
     }
 
     async fn join(&self) -> Result<(), String> {
-        if let Some(message) = self
-            .terminal_failure
-            .lock()
-            .map_err(|_| "execution task failure lock is poisoned".to_string())?
-            .clone()
-        {
-            return Err(message);
-        }
-
+        let mut first_failure = None;
+        let mut pending = Vec::new();
         loop {
             let next = {
                 let mut tasks = self
@@ -1263,7 +1254,7 @@ impl RuntimeExecutionTaskScope {
                 }
             };
             let Some(mut task) = next else {
-                return Ok(());
+                break;
             };
             let name = task.name;
             if task.abort_before_join {
@@ -1273,22 +1264,28 @@ impl RuntimeExecutionTaskScope {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) if task.abort_before_join && error.is_cancelled() => {}
                 Ok(Err(error)) => {
-                    let message = format!("{name} task failed while stopping Worker: {error}");
-                    if let Ok(mut failure) = self.terminal_failure.lock() {
-                        *failure = Some(message.clone());
-                    }
-                    return Err(message);
+                    first_failure.get_or_insert_with(|| {
+                        format!("{name} task failed while stopping Worker: {error}")
+                    });
                 }
                 Err(_) => {
-                    self.tasks
-                        .lock()
-                        .map_err(|_| "execution task registry lock is poisoned".to_string())?
-                        .insert(0, task);
-                    return Err(format!(
-                        "{name} task did not stop before timeout; stop remains retryable"
-                    ));
+                    first_failure.get_or_insert_with(|| {
+                        format!("{name} task did not stop before timeout; stop remains retryable")
+                    });
+                    pending.push(task);
                 }
             }
+        }
+        if !pending.is_empty() {
+            let mut tasks = match self.tasks.lock() {
+                Ok(tasks) => tasks,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            tasks.extend(pending);
+        }
+        match first_failure {
+            Some(message) => Err(message),
+            None => Ok(()),
         }
     }
 }
@@ -2545,6 +2542,22 @@ mod tests {
             claims.path,
             "/api/w/workspace-b/runtime-config?profile=coder"
         );
+    }
+
+    #[tokio::test]
+    async fn execution_scope_drains_remaining_tasks_after_join_failure_and_allows_retry() {
+        let failed = tokio::spawn(async { panic!("injected controller failure") });
+        let scope = RuntimeExecutionTaskScope::new(failed);
+        scope.push(
+            "protocol bridge",
+            tokio::spawn(std::future::pending()),
+            true,
+        );
+
+        let error = scope.join().await.unwrap_err();
+        assert!(error.contains("controller task failed"));
+        assert!(scope.tasks.lock().unwrap().is_empty());
+        scope.join().await.unwrap();
     }
 
     fn adapter_command(
@@ -4197,7 +4210,36 @@ mod tests {
         let detail = runtime
             .create_worker(create_request("restore-after-stop"))
             .unwrap();
+        let failed_task = backend
+            .spawn_on_adapter_runtime(async { panic!("injected owned task failure") })
+            .unwrap();
+        backend
+            .workers
+            .lock()
+            .unwrap()
+            .get(&detail.worker_ref)
+            .unwrap()
+            .tasks
+            .push("injected failure", failed_task, false);
 
+        let first_stop = runtime.stop_worker(&detail.worker_ref, None).unwrap_err();
+        assert!(
+            first_stop
+                .to_string()
+                .contains("injected failure task failed")
+        );
+        assert_eq!(
+            runtime.worker_detail(&detail.worker_ref).unwrap().status,
+            crate::catalog::WorkerStatus::Idle
+        );
+        assert!(
+            backend
+                .workers
+                .lock()
+                .unwrap()
+                .contains_key(&detail.worker_ref),
+            "failed cleanup must retain retry authority"
+        );
         runtime.stop_worker(&detail.worker_ref, None).unwrap();
         assert_eq!(
             runtime.worker_detail(&detail.worker_ref).unwrap().status,

@@ -2220,6 +2220,43 @@ async fn status_json_reflects_worker_name() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn shutdown_closes_method_admission_before_terminal_confirmation() {
+    let worker = make_worker(MockClient::new(simple_text_events())).await;
+    let runtime_base = tempfile::tempdir().unwrap();
+    let bash_output_dir = runtime_base.path().join("bash-output");
+    let (handle, mut shutdown_rx) =
+        WorkerController::spawn(worker, runtime_base.path(), &bash_output_dir)
+            .await
+            .unwrap();
+    handle
+        .send(Method::Shutdown {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                biased;
+                result = handle.send(Method::ListRewindTargets) => {
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                result = &mut shutdown_rx => {
+                    result.expect("controller shutdown signal should remain open");
+                    panic!("method admission remained open until terminal confirmation");
+                }
+            }
+        }
+    })
+    .await
+    .expect("method admission did not close during shutdown");
+    shutdown_rx.await.unwrap();
+}
+
+#[tokio::test]
 async fn shutdown_joins_socket_server_with_active_connection() {
     use tokio::net::UnixStream;
 

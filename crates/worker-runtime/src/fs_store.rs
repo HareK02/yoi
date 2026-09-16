@@ -1725,10 +1725,34 @@ mod tests {
         let Some(root) = std::env::var_os("YOI_TEST_RUNTIME_STORE_LOCK_ROOT") else {
             return;
         };
+        let root = PathBuf::from(root);
+        if std::env::var_os("YOI_TEST_RUNTIME_STORE_LOCK_EXIT_WITHOUT_DROP").is_some() {
+            let _store = FsRuntimeStore::open_or_create(root, "runtime-test").unwrap();
+            std::process::exit(0);
+        }
         assert!(matches!(
-            FsRuntimeStore::open_or_create(PathBuf::from(root), "runtime-test").unwrap_err(),
+            FsRuntimeStore::open_or_create(root, "runtime-test").unwrap_err(),
             RuntimeError::RuntimeStoreAlreadyOpen { .. }
         ));
+    }
+
+    #[test]
+    fn runtime_store_owner_lock_is_released_when_process_exits_without_drop() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("crashed-runtime-store");
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("fs_store::tests::runtime_store_owner_lock_child_probe")
+            .arg("--exact")
+            .env("YOI_TEST_RUNTIME_STORE_LOCK_ROOT", &root)
+            .env("YOI_TEST_RUNTIME_STORE_LOCK_EXIT_WITHOUT_DROP", "1")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "process-exit lock probe failed: {}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        acquire_runtime_store_owner_lock(&root).unwrap();
     }
 
     #[test]

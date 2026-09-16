@@ -2383,6 +2383,10 @@ async fn controller_loop<C, St>(
         }
     }
 
+    // Close method admission before any fallible child/session cleanup. Existing
+    // senders then fail instead of accepting work that this execution can no
+    // longer process.
+    drop(method_rx);
     let had_socket_server = _socket_server.is_some();
     if let Some(socket_server) = _socket_server {
         socket_server.shutdown().await;

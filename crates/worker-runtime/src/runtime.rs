@@ -162,6 +162,36 @@ pub struct Runtime {
     worker_operations: Arc<Mutex<BTreeMap<WorkerId, Arc<Mutex<()>>>>>,
 }
 
+struct WorkerOperationLease {
+    worker_id: WorkerId,
+    operation_lock: Arc<Mutex<()>>,
+    registry: Arc<Mutex<BTreeMap<WorkerId, Arc<Mutex<()>>>>>,
+}
+
+impl std::ops::Deref for WorkerOperationLease {
+    type Target = Mutex<()>;
+
+    fn deref(&self) -> &Self::Target {
+        self.operation_lock.as_ref()
+    }
+}
+
+impl Drop for WorkerOperationLease {
+    fn drop(&mut self) {
+        let mut registry = match self.registry.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if Arc::strong_count(&self.operation_lock) == 2
+            && registry
+                .get(&self.worker_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.operation_lock))
+        {
+            registry.remove(&self.worker_id);
+        }
+    }
+}
+
 impl Runtime {
     /// Create a memory-backed Runtime with generated identity.
     pub fn new_memory() -> Self {
@@ -1295,8 +1325,7 @@ impl Runtime {
         scope: &RuntimeWorkspaceScope,
         worker_ref: &WorkerRef,
     ) -> Result<WorkerDetail, RuntimeError> {
-        self.ensure_worker_in_workspace(scope, worker_ref)?;
-        self.restore_worker(worker_ref)
+        self.restore_worker_with_scope(worker_ref, Some(scope))
     }
 
     /// Attach a live execution to a persisted Worker definition.
@@ -1306,10 +1335,21 @@ impl Runtime {
     /// converges on its already-installed execution rather than spawning another
     /// controller.
     pub fn restore_worker(&self, worker_ref: &WorkerRef) -> Result<WorkerDetail, RuntimeError> {
+        self.restore_worker_with_scope(worker_ref, None)
+    }
+
+    fn restore_worker_with_scope(
+        &self,
+        worker_ref: &WorkerRef,
+        scope: Option<&RuntimeWorkspaceScope>,
+    ) -> Result<WorkerDetail, RuntimeError> {
         let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
         let _operation_guard = operation_lock
             .lock()
             .map_err(|_| RuntimeError::StatePoisoned)?;
+        if let Some(scope) = scope {
+            self.ensure_worker_in_workspace(scope, worker_ref)?;
+        }
         self.restore_worker_under_lock(worker_ref, WorkerRestoreMode::Explicit)
     }
 
@@ -1934,8 +1974,7 @@ impl Runtime {
         worker_ref: &WorkerRef,
         reason: Option<String>,
     ) -> Result<WorkerLifecycleAck, RuntimeError> {
-        self.ensure_worker_in_workspace(scope, worker_ref)?;
-        self.stop_worker(worker_ref, reason)
+        self.stop_worker_with_scope(worker_ref, reason, Some(scope))
     }
 
     /// Stop a Worker. Repeated stops are idempotent. The per-Worker lifecycle
@@ -1946,10 +1985,22 @@ impl Runtime {
         worker_ref: &WorkerRef,
         reason: Option<String>,
     ) -> Result<WorkerLifecycleAck, RuntimeError> {
+        self.stop_worker_with_scope(worker_ref, reason, None)
+    }
+
+    fn stop_worker_with_scope(
+        &self,
+        worker_ref: &WorkerRef,
+        reason: Option<String>,
+        scope: Option<&RuntimeWorkspaceScope>,
+    ) -> Result<WorkerLifecycleAck, RuntimeError> {
         let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
         let _operation_guard = operation_lock
             .lock()
             .map_err(|_| RuntimeError::StatePoisoned)?;
+        if let Some(scope) = scope {
+            self.ensure_worker_in_workspace(scope, worker_ref)?;
+        }
 
         let (backend, handle) = {
             let state = self.lock()?;
@@ -2043,8 +2094,7 @@ impl Runtime {
         scope: &RuntimeWorkspaceScope,
         worker_ref: &WorkerRef,
     ) -> Result<WorkerDeleteResult, RuntimeError> {
-        self.ensure_worker_in_workspace(scope, worker_ref)?;
-        self.delete_worker(worker_ref)
+        self.delete_worker_with_scope(worker_ref, Some(scope))
     }
 
     /// Delete a non-running Worker from Runtime state and persisted Worker storage.
@@ -2052,10 +2102,21 @@ impl Runtime {
         &self,
         worker_ref: &WorkerRef,
     ) -> Result<WorkerDeleteResult, RuntimeError> {
+        self.delete_worker_with_scope(worker_ref, None)
+    }
+
+    fn delete_worker_with_scope(
+        &self,
+        worker_ref: &WorkerRef,
+        scope: Option<&RuntimeWorkspaceScope>,
+    ) -> Result<WorkerDeleteResult, RuntimeError> {
         let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
         let _operation_guard = operation_lock
             .lock()
             .map_err(|_| RuntimeError::StatePoisoned)?;
+        if let Some(scope) = scope {
+            self.ensure_worker_in_workspace(scope, worker_ref)?;
+        }
         let (backend, execution_handle) = {
             let state = self.lock()?;
             state.ensure_running()?;
@@ -2540,15 +2601,25 @@ impl Runtime {
         Ok(result)
     }
 
-    fn worker_operation_lock(&self, worker_id: WorkerId) -> Result<Arc<Mutex<()>>, RuntimeError> {
-        let mut operations = self
-            .worker_operations
-            .lock()
-            .map_err(|_| RuntimeError::StatePoisoned)?;
-        Ok(operations
-            .entry(worker_id)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone())
+    fn worker_operation_lock(
+        &self,
+        worker_id: WorkerId,
+    ) -> Result<WorkerOperationLease, RuntimeError> {
+        let operation_lock = {
+            let mut operations = self
+                .worker_operations
+                .lock()
+                .map_err(|_| RuntimeError::StatePoisoned)?;
+            operations
+                .entry(worker_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        Ok(WorkerOperationLease {
+            worker_id,
+            operation_lock,
+            registry: self.worker_operations.clone(),
+        })
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, RuntimeState>, RuntimeError> {
@@ -5790,6 +5861,43 @@ mod tests {
     }
 
     #[test]
+    fn remove_waits_for_in_flight_restore_and_cannot_delete_live_execution() {
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime = Arc::new(
+            Runtime::with_execution_backend(RuntimeOptions::default(), backend.clone()).unwrap(),
+        );
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let created = runtime
+            .create_worker(task_request("restore remove race"))
+            .unwrap();
+        runtime.stop_worker(&created.worker_ref, None).unwrap();
+        let gate = Arc::new(RestoreGate::default());
+        *backend.restore_gate.lock().unwrap() = Some(gate.clone());
+
+        let restore_runtime = runtime.clone();
+        let restore_ref = created.worker_ref.clone();
+        let restoring = std::thread::spawn(move || restore_runtime.restore_worker(&restore_ref));
+        assert!(gate.wait_for_entered(1, std::time::Duration::from_secs(2)));
+        let remove_runtime = runtime.clone();
+        let remove_ref = created.worker_ref.clone();
+        let removing = std::thread::spawn(move || remove_runtime.delete_worker(&remove_ref));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(runtime.list_workers().unwrap().len(), 1);
+
+        gate.release();
+        assert_eq!(
+            restoring.join().unwrap().unwrap().status,
+            WorkerStatus::Idle
+        );
+        assert!(matches!(
+            removing.join().unwrap().unwrap_err(),
+            RuntimeError::InvalidRequest(message) if message.contains("must be stopped")
+        ));
+        assert_eq!(runtime.list_workers().unwrap().len(), 1);
+        assert!(runtime.worker_operations.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn failed_stop_cleanup_retains_execution_for_retry() {
         let (runtime, backend) = runtime_and_backend();
         runtime.store_config_bundle(test_bundle()).unwrap();
@@ -5912,6 +6020,58 @@ mod tests {
                 .as_ref()
                 .map(|state| state.execution_generation)
         );
+        assert!(runtime.worker_operations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn operation_lock_registry_reclaims_idle_worker_entries() {
+        let runtime = runtime_with_backend();
+        for _ in 0..256 {
+            let lease = runtime.worker_operation_lock(WorkerId::now_v7()).unwrap();
+            let guard = lease.lock().unwrap();
+            drop(guard);
+            drop(lease);
+        }
+        assert!(runtime.worker_operations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn scoped_stop_revalidates_workspace_after_waiting_for_worker_lock() {
+        let (runtime, backend) = runtime_and_backend();
+        let runtime = Arc::new(runtime);
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let workspace_scope = scope("workspace-a", "server-a");
+        let worker = runtime
+            .create_worker_scoped(
+                &workspace_scope,
+                scoped_task_request("scoped stop race", "workspace-a"),
+            )
+            .unwrap();
+        let lease = runtime
+            .worker_operation_lock(worker.worker_ref.worker_id)
+            .unwrap();
+        let guard = lease.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let stopping_runtime = runtime.clone();
+        let stopping_ref = worker.worker_ref.clone();
+        let stopping_scope = workspace_scope.clone();
+        let stopping = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            stopping_runtime.stop_worker_scoped(&stopping_scope, &stopping_ref, None)
+        });
+        started_rx.recv().unwrap();
+        {
+            let mut state = runtime.lock().unwrap();
+            state.worker_mut(&worker.worker_ref).unwrap().workspace_id =
+                Some("workspace-b".to_string());
+        }
+        drop(guard);
+        drop(lease);
+
+        let error = stopping.join().unwrap().unwrap_err();
+        assert!(matches!(error, RuntimeError::WorkerNotFound { .. }));
+        assert_eq!(*backend.stop_count.lock().unwrap(), 0);
+        assert!(runtime.worker_operations.lock().unwrap().is_empty());
     }
 
     #[test]
