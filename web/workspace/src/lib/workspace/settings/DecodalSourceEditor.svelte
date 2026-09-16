@@ -65,7 +65,7 @@
     '.cm-content': { padding: '0.75rem 0', caretColor: 'var(--text-strong)' },
     '.cm-fixed-schema-wrapper': {
       color: 'var(--text-muted)',
-      backgroundColor: 'var(--interactive-muted)',
+      backgroundColor: 'var(--interactive-hover)',
       fontWeight: '600',
     },
     '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--text-strong)', borderLeftWidth: '2px' },

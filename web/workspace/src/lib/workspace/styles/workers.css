@@ -9,7 +9,7 @@
   .section-action {
     margin-left: auto;
     border: 1px solid var(--line);
-    border-radius: 999px;
+    border-radius: var(--radius-soft);
     background: var(--bg-subtle);
     color: var(--text-strong);
     font-size: 0.72rem;

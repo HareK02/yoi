@@ -2,6 +2,7 @@
   import { page } from '$app/state';
   import { setContext } from 'svelte';
   import WorkspaceAlerts from '$lib/workspace/alerts/WorkspaceAlerts.svelte';
+  import BevelLine from '$lib/workspace/ui/BevelLine.svelte';
   import { provideHeaderController, type HeaderController } from '$lib/workspace/header/context';
   import GlobalSidebar from '$lib/workspace/sidebar/GlobalSidebar.svelte';
   import SidebarFrame from '$lib/workspace/sidebar/SidebarFrame.svelte';
@@ -46,6 +47,12 @@
         </svg>
       </a>
     </nav>
+    <BevelLine
+      class="app-shell__topbar-divider"
+      direction="x"
+      length="100%"
+      decorative
+    />
   </header>
   <main class="app-shell__main">
     {@render children()}
@@ -77,9 +84,14 @@
     min-width: 0;
     min-height: 3.25rem;
     padding: 0 var(--space-5);
-    border-bottom: 1px solid var(--line);
     background: color-mix(in srgb, var(--bg-raised) 88%, transparent);
     backdrop-filter: blur(14px);
+  }
+
+  :global(.app-shell__topbar-divider) {
+    position: absolute;
+    inset-inline: 0;
+    inset-block-end: 0;
   }
 
   .app-shell__topbar-location {

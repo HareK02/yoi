@@ -19,13 +19,16 @@ It is not a dumping ground for external research, old plans, API inventories, or
 11. [`design/memory-knowledge.md`](design/memory-knowledge.md) — generated memory and audit records.
 12. [`design/workspace-kanban-orchestrator-runtime.md`](design/workspace-kanban-orchestrator-runtime.md) — how Kanban operations become durable orchestration events and backend-internal routing decisions.
 13. [`design/workspace-runtime-docker.md`](design/workspace-runtime-docker.md) — the WebUI / Backend / Runtime split, Docker image layout, worker launch path, and workdir materialization boundary.
-14. [`design/workspace-web-ux.md`](design/workspace-web-ux.md) — Workspace Webの情報設計、操作設計、視覚設計、レスポンシブ対応、アクセシビリティ、CSSの責務。
-15. [`development/server-runtime-auth.md`](development/server-runtime-auth.md) — manual Workspace Server / Runtime public-key exchange and authenticated Runtime startup checks.
-16. [`development/work-items.md`](development/work-items.md) — how project work is recorded and reviewed.
-17. [`development/rust-testing-strategy.md`](development/rust-testing-strategy.md) — what Yoi Rust tests should prove, where they belong, and how to name them.
-18. [`development/validation.md`](development/validation.md) — how to check changes.
-19. [`development/workspace-schema-migrations.md`](development/workspace-schema-migrations.md) — how to preflight, apply, verify, and roll back control-plane SQLite schema changes.
-20. [`design/standalone-agent-host.md`](design/standalone-agent-host.md) — in-process standalone Worker host の依存方向、authority、lifecycle、非目標。
+14. [`development/ui-ux/design-language.md`](development/ui-ux/design-language.md) — Workspace Webの視覚・interaction原則、文法、token、汎用component。
+15. [`development/ui-ux/product-ux.md`](development/ui-ux/product-ux.md) — Workspace resource、navigation IA、resource固有pattern。
+16. [`development/ui-ux/application-architecture.md`](development/ui-ux/application-architecture.md) — application shell、Header、Sidebar、nested override architecture。
+17. [`development/ui-ux/visual-review.md`](development/ui-ux/visual-review.md) — Web UI実装者がbefore/afterを目視し、完了前に残すvisual validation evidence。
+18. [`development/server-runtime-auth.md`](development/server-runtime-auth.md) — manual Workspace Server / Runtime public-key exchange and authenticated Runtime startup checks.
+19. [`development/work-items.md`](development/work-items.md) — how project work is recorded and reviewed.
+20. [`development/rust-testing-strategy.md`](development/rust-testing-strategy.md) — what Yoi Rust tests should prove, where they belong, and how to name them.
+21. [`development/validation.md`](development/validation.md) — how to check changes.
+22. [`development/workspace-schema-migrations.md`](development/workspace-schema-migrations.md) — how to preflight, apply, verify, and roll back control-plane SQLite schema changes.
+23. [`design/standalone-agent-host.md`](design/standalone-agent-host.md) — in-process standalone Worker host の依存方向、authority、lifecycle、非目標。
 
 ## What belongs here
 

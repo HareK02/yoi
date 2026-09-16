@@ -26,9 +26,9 @@
     color: var(--text-strong);
   }
   .workspace-danger-button {
-    border: 1px solid #a63f3f;
-    background: #a63f3f;
-    color: #fff;
+    border: 1px solid var(--danger);
+    background: var(--danger);
+    color: var(--bg-raised);
   }
   .workspace-primary-button:disabled,
   .workspace-secondary-button:disabled,
@@ -47,8 +47,8 @@
     padding: 0.7rem 0.85rem;
   }
   .workspace-callout.is-error {
-    border-color: #a63f3f;
-    color: #d66;
+    border-color: var(--danger);
+    color: var(--danger);
   }
   .workspace-empty-copy {
     margin: 0;
@@ -104,10 +104,10 @@
     width: 0.55rem;
     height: 0.55rem;
     border-radius: 50%;
-    background: #a75454;
+    background: var(--danger);
   }
   .orchestrator-status[data-online="true"] .orchestrator-status-dot {
-    background: #43a66d;
+    background: var(--success);
   }
   .ticket-panel-summary {
     display: grid;
@@ -160,10 +160,10 @@
     background: var(--text-muted);
   }
   .ticket-lane[data-state="ready-planning"] .ticket-state-dot {
-    background: #43a66d;
+    background: var(--success);
   }
   .ticket-lane[data-state="inprogress-queued"] .ticket-state-dot {
-    background: #d09b37;
+    background: var(--warning);
   }
   .ticket-lane[data-state="done-closed"] .ticket-state-dot {
     background: var(--accent);
@@ -247,11 +247,18 @@
     gap: 0.25rem;
   }
   .ticket-risk-list span {
-    border: 1px solid #a97531;
-    border-radius: 999px;
-    color: #d3a55d;
-    padding: 0.1rem 0.35rem;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    color: var(--warning);
     font-size: 0.62rem;
+  }
+  .ticket-risk-list span::before {
+    width: 0.4rem;
+    height: 0.4rem;
+    border-radius: 50%;
+    background: currentColor;
+    content: "";
   }
   .ticket-lane-empty {
     padding: 1.2rem 0.4rem;
@@ -282,12 +289,19 @@
     font-size: 0.72rem;
   }
   .workspace-status-pill {
-    border: 1px solid var(--line);
-    border-radius: 999px;
-    padding: 0.15rem 0.45rem;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
     color: var(--text-muted);
     font-size: 0.68rem;
     text-transform: uppercase;
+  }
+  .workspace-status-pill::before {
+    width: 0.45rem;
+    height: 0.45rem;
+    border-radius: 50%;
+    background: currentColor;
+    content: "";
   }
   .ticket-detail-grid {
     display: grid;
@@ -372,7 +386,7 @@
     margin-bottom: var(--space-3);
   }
   .ticket-close-card {
-    border-color: color-mix(in srgb, #a63f3f 55%, var(--line));
+    border-color: color-mix(in srgb, var(--danger) 55%, var(--line));
   }
   .ticket-relations-list, .ticket-blocker-list {
     display: grid;
@@ -391,7 +405,7 @@
     text-decoration: none;
   }
   .ticket-blocker-list a {
-    border-color: #a97531;
+    border-color: var(--warning);
   }
   .ticket-relations-list span,
   .ticket-relations-list small,

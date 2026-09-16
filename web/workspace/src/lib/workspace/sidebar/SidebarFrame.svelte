@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
+  import BevelLine from '$lib/workspace/ui/BevelLine.svelte';
   import './sidebar.css';
 
   type Props = {
@@ -43,4 +44,17 @@
       {/if}
     </button>
   </div>
+
+  <BevelLine
+    class="sidebar-frame__divider sidebar-frame__divider--vertical"
+    direction="y"
+    length="100%"
+    decorative
+  />
+  <BevelLine
+    class="sidebar-frame__divider sidebar-frame__divider--horizontal"
+    direction="x"
+    length="100%"
+    decorative
+  />
 </aside>

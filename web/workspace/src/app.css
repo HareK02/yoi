@@ -6,16 +6,20 @@
 @import "@fontsource/ibm-plex-mono/latin-500.css";
 @import "@fontsource/ibm-plex-mono/latin-600.css";
 @import "@fontsource/ibm-plex-mono/latin-700.css";
+
 @layer reset, tokens, base, layout, components;
+
 @layer reset {
   *,
   *::before,
   *::after {
     box-sizing: border-box;
   }
+
   body {
     margin: 0;
   }
+
   button,
   input,
   textarea,
@@ -23,9 +27,11 @@
     font: inherit;
   }
 }
+
 @layer tokens {
   :root {
     color-scheme: light dark;
+
     --bg: oklch(98.5% 0 0);
     --bg-raised: oklch(96% 0 0);
     --bg-subtle: oklch(93% 0 0);
@@ -41,6 +47,25 @@
     --success: oklch(48% 0.11 145);
     --warning: oklch(62% 0.12 85);
     --danger: oklch(54% 0.14 25);
+    --interactive-hover: oklch(94.5% 0 0);
+    --interactive-selected: oklch(93% 0.02 230);
+    --bevel-highlight: #fff;
+    --bevel-shadow: #000;
+    --bevel-face-width: 2px;
+    --shadow-overlay: 0 12px 32px oklch(0% 0 0 / 0.14);
+
+    --font-sans: "Gen Interface JP", sans-serif;
+    --font-mono: "IBM Plex Mono", monospace;
+
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-5: 24px;
+    --space-6: 32px;
+
+    --radius-soft: 8px;
+
     --tui-green: #76946a;
     --tui-red: #c34043;
     --tui-yellow: #c0a36e;
@@ -49,19 +74,8 @@
     --tui-magenta: #957fb8;
     --tui-gray: #727169;
     --tui-dark-gray: #54546d;
-    --space-1: 4px;
-    --space-2: 8px;
-    --space-3: 12px;
-    --space-4: 16px;
-    --space-5: 24px;
-    --space-6: 32px;
-    --radius-soft: 8px;
-    --radius-panel: 12px;
-    --interactive-hover: oklch(94.5% 0 0);
-    --interactive-selected: oklch(93% 0.02 230);
-    --font-sans: "Gen Interface JP", sans-serif;
-    --font-mono: "IBM Plex Mono", monospace;
   }
+
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: oklch(16% 0 0);
@@ -81,21 +95,22 @@
       --danger: oklch(76% 0.14 25);
       --interactive-hover: oklch(29% 0 0);
       --interactive-selected: oklch(30% 0.025 230);
+      --shadow-overlay: 0 14px 36px oklch(0% 0 0 / 0.38);
     }
   }
 }
+
 @layer base {
   html {
     font-size: 14px;
   }
+
   body {
     background: var(--bg);
     color: var(--text);
     font-family: var(--font-sans);
   }
-  a {
-    color: var(--accent);
-  }
+
   h1,
   h2,
   h3,
@@ -104,127 +119,44 @@
   dd {
     overflow-wrap: anywhere;
   }
+
   h1,
   h2,
   h3 {
-    color: var(--text-strong);
     margin-top: 0;
+    color: var(--text-strong);
   }
+
   p {
     line-height: 1.55;
   }
+
   code,
   pre {
+    color: var(--code);
     font-family: var(--font-mono);
   }
-  code {
-    color: var(--code);
-  }
+
   small {
     color: var(--text-muted);
-    display: block;
-    margin-top: var(--space-1);
-  }
-}
-@layer layout {
-  .grid {
-    display: grid;
-    gap: var(--space-5);
-    grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
-    min-width: 0;
-  }
-  .runtime {
-    grid-template-columns: repeat(auto-fit, minmax(min(360px, 100%), 1fr));
-  }
-  .stack {
-    display: grid;
-    gap: var(--space-4);
-  }
-}
-@layer components {
-  .section-note,
-  .section-state,
-  .muted {
-    color: var(--text-muted);
-    font-size: 0.82rem;
-  }
-  .section-note,
-  .section-state {
-    margin: 0;
-    line-height: 1.45;
-  }
-  .card {
-    min-width: 0;
-    padding: 0;
-  }
-  dl {
-    display: grid;
-    gap: var(--space-1);
-    margin: 0;
-  }
-  dl > div {
-    display: grid;
-    grid-template-columns: minmax(6.5rem, 10rem) minmax(0, 1fr);
-    align-items: baseline;
-    gap: var(--space-3);
-    min-width: 0;
-  }
-  dt {
-    color: var(--text-faint);
-    font-size: 0.72rem;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    white-space: nowrap;
-  }
-  dd {
-    min-width: 0;
-    margin: 0;
-  }
-  dd small {
-    display: inline;
-    margin-top: 0;
-    margin-left: var(--space-2);
-  }
-  .table-wrap {
-    overflow-x: auto;
-  }
-  table {
-    width: 100%;
-    border-collapse: collapse;
-  }
-  th,
-  td {
-    border-bottom: 1px solid var(--line);
-    padding: 10px 8px;
-    text-align: left;
-    vertical-align: top;
-  }
-  th {
-    color: var(--text-faint);
-    font-size: 0.78rem;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-  }
-  .inline-link,
-  .secondary-button {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: var(--space-1);
-    border-radius: 999px;
-    border: 1px solid var(--line);
-    padding: 0.4rem 0.75rem;
-    background: var(--bg);
-    color: var(--accent);
-    font-size: 0.85rem;
-    font-weight: 800;
-    text-decoration: none;
-    cursor: pointer;
+    font-size: 0.85em;
   }
 
-  .secondary-button:hover,
-  .inline-link:hover {
-    border-color: var(--line-strong);
-    background: var(--bg-raised);
+  :where(
+    a,
+    button,
+    input,
+    select,
+    textarea,
+    summary,
+    [tabindex]
+  ):focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background: var(--interactive-selected);
+    color: var(--text-strong);
   }
 }

@@ -74,11 +74,20 @@
   }
 
   .workspace-card-heading > span {
-    border: 1px solid var(--line);
-    border-radius: 999px;
-    padding: 0.15rem 0.5rem;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    color: var(--text-muted);
     font-size: 0.7rem;
     text-transform: uppercase;
+  }
+
+  .workspace-card-heading > span::before {
+    width: 0.45rem;
+    height: 0.45rem;
+    border-radius: 50%;
+    background: currentColor;
+    content: "";
   }
 
   .workspace-card-heading > .workspace-state-active {

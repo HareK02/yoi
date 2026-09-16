@@ -231,7 +231,7 @@
   }
 
   .compaction-error {
-    color: var(--tui-error);
+    color: var(--danger);
   }
 
   .activity-summary {
@@ -245,7 +245,7 @@
   }
 
   .console-line.error .activity-summary {
-    color: var(--tui-error);
+    color: var(--danger);
   }
 
   .run-stats {

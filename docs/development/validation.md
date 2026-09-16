@@ -32,6 +32,20 @@ cargo check --workspace
 
 Avoid repository-wide formatting churn when a validation failure is caused by pre-existing unrelated formatting.
 
+## Web UI changes
+
+Rendered Web UI changes require implementer-owned visual review in addition to type check, linter, and test. Follow [`ui-ux/visual-review.md`](ui-ux/visual-review.md).
+
+Minimum evidence includes:
+
+- before/after capture under the relevant persona, viewport, theme, and data state;
+- the implementer’s own inspection of grouping, separator meaning, spacing, wrapping, overflow, responsive order, and visible errors;
+- `review-context.json` inspection;
+- disposition of every observed problem;
+- artifact paths and a final `pass | fail` result.
+
+A successful capture command, HTTP 200, screenshot generation, or later Reviewer inspection does not replace this validation.
+
 ## Work item checks
 
 Run:
