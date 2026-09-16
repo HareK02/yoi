@@ -96,6 +96,7 @@ impl FsRuntimeStore {
         options: &FsRuntimeStoreOptions,
     ) -> Result<FsRuntimeStoreMigrationPlan, RuntimeError> {
         let _owner_lock = acquire_runtime_store_owner_lock(&options.root)?;
+        recover_runtime_store_migration(&options.root)?;
         migrate_runtime_store(&options.root, &options.runtime_id)
     }
 
@@ -111,6 +112,14 @@ impl FsRuntimeStore {
         root: PathBuf,
         runtime_id: &str,
     ) -> Result<OpenedFsRuntimeStore, RuntimeError> {
+        let parent = runtime_store_parent(&root)?;
+        fs::create_dir_all(parent).map_err(|source| RuntimeError::StoreIo {
+            operation: "create runtime store parent",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let owner_lock = acquire_runtime_store_owner_lock(&root)?;
+        recover_runtime_store_migration(&root)?;
         let existed = root.exists();
         if existed && !root.is_dir() {
             return Err(RuntimeError::StoreCorrupt {
@@ -127,7 +136,6 @@ impl FsRuntimeStore {
                 source,
             })?;
         }
-        let owner_lock = acquire_runtime_store_owner_lock(&root)?;
 
         fs::create_dir_all(root.join(WORKERS_DIR)).map_err(|source| RuntimeError::StoreIo {
             operation: "create runtime store",
@@ -335,25 +343,17 @@ impl FsRuntimeStore {
 fn acquire_runtime_store_owner_lock(
     root: &Path,
 ) -> Result<Arc<RuntimeStoreOwnerLock>, RuntimeError> {
-    let canonical_root = fs::canonicalize(root).map_err(|source| RuntimeError::StoreIo {
-        operation: "resolve runtime store owner lock",
-        path: root.to_path_buf(),
+    let root_parent = runtime_store_parent(root)?;
+    let parent = fs::canonicalize(root_parent).map_err(|source| RuntimeError::StoreIo {
+        operation: "resolve runtime store owner lock parent",
+        path: root_parent.to_path_buf(),
         source,
     })?;
-    let parent = canonical_root
-        .parent()
-        .ok_or_else(|| RuntimeError::StoreCorrupt {
-            operation: "resolve runtime store owner lock",
-            path: root.to_path_buf(),
-            message: "runtime store root has no parent".to_string(),
-        })?;
-    let name = canonical_root
-        .file_name()
-        .ok_or_else(|| RuntimeError::StoreCorrupt {
-            operation: "resolve runtime store owner lock",
-            path: root.to_path_buf(),
-            message: "runtime store root has no file name".to_string(),
-        })?;
+    let name = root.file_name().ok_or_else(|| RuntimeError::StoreCorrupt {
+        operation: "resolve runtime store owner lock",
+        path: root.to_path_buf(),
+        message: "runtime store root has no file name".to_string(),
+    })?;
     let mut lock_name = std::ffi::OsString::from(".");
     lock_name.push(name);
     lock_name.push(".runtime-owner.lock");
@@ -1013,13 +1013,22 @@ fn migrate_runtime_document(
     Ok((document, counts))
 }
 
-fn migration_sibling(root: &Path, suffix: &str) -> Result<PathBuf, RuntimeError> {
+fn runtime_store_parent(root: &Path) -> Result<&Path, RuntimeError> {
     let parent = root.parent().ok_or_else(|| {
         runtime_store_corrupt(
             root,
             "Runtime store root has no parent directory".to_string(),
         )
     })?;
+    Ok(if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    })
+}
+
+fn migration_sibling(root: &Path, suffix: &str) -> Result<PathBuf, RuntimeError> {
+    let parent = runtime_store_parent(root)?;
     let name = root
         .file_name()
         .and_then(|name| name.to_str())
@@ -1027,6 +1036,131 @@ fn migration_sibling(root: &Path, suffix: &str) -> Result<PathBuf, RuntimeError>
             runtime_store_corrupt(root, "Runtime store root name is not UTF-8".to_string())
         })?;
     Ok(parent.join(format!(".{name}.{suffix}")))
+}
+
+fn migration_directory_exists(path: &Path) -> Result<bool, RuntimeError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(RuntimeError::StoreIo {
+                operation: "inspect Runtime migration artifact",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(runtime_store_corrupt(
+            path,
+            "Runtime migration artifact is not a regular directory".to_string(),
+        ));
+    }
+    Ok(true)
+}
+
+fn validate_current_runtime_store(root: &Path) -> Result<(), RuntimeError> {
+    let store = FsRuntimeStore {
+        root: root.to_path_buf(),
+        _owner_lock: None,
+    };
+    store.load_runtime_state().map(|_| ())
+}
+
+fn validate_completed_migration_staging(root: &Path) -> Result<(), RuntimeError> {
+    let store = FsRuntimeStore {
+        root: root.to_path_buf(),
+        _owner_lock: None,
+    };
+    let state = store.load_runtime_state()?;
+    if let Some(worker) = state.workers.values().find(|worker| {
+        matches!(
+            worker.execution_state,
+            PersistedWorkerExecutionState::Unavailable
+        )
+    }) {
+        return Err(runtime_store_corrupt(
+            root,
+            format!(
+                "migrated Worker {} has unavailable execution metadata",
+                worker.worker_id
+            ),
+        ));
+    }
+    if state
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "worker_record_unavailable")
+    {
+        return Err(runtime_store_corrupt(
+            root,
+            "migrated Runtime store contains unavailable Worker records".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn remove_runtime_migration_directory(path: &Path) -> Result<(), RuntimeError> {
+    if !migration_directory_exists(path)? {
+        return Ok(());
+    }
+    fs::remove_dir_all(path)
+        .map_err(|source| runtime_io_error("remove Runtime migration artifact", path, source))
+}
+
+fn recover_runtime_store_migration(root: &Path) -> Result<(), RuntimeError> {
+    let staging = migration_sibling(root, "schema-v8-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v8-backup")?;
+    let root_exists = migration_directory_exists(root)?;
+    let staging_exists = migration_directory_exists(&staging)?;
+    let backup_exists = migration_directory_exists(&backup)?;
+    let parent = runtime_store_parent(root)?;
+
+    if root_exists {
+        if staging_exists {
+            remove_runtime_migration_directory(&staging)?;
+            sync_directory(parent, "recover Runtime migration")?;
+        }
+        if backup_exists {
+            validate_current_runtime_store(root)?;
+            remove_runtime_migration_directory(&backup)?;
+            sync_directory(parent, "recover Runtime migration")?;
+        }
+        return Ok(());
+    }
+
+    if staging_exists {
+        match validate_completed_migration_staging(&staging) {
+            Ok(()) => {
+                fs::rename(&staging, root).map_err(|source| {
+                    runtime_io_error("activate recovered Runtime migration", &staging, source)
+                })?;
+                sync_directory(parent, "recover Runtime migration")?;
+                if backup_exists {
+                    remove_runtime_migration_directory(&backup)?;
+                    sync_directory(parent, "recover Runtime migration")?;
+                }
+                return Ok(());
+            }
+            Err(_staging_error) if backup_exists => {
+                remove_runtime_migration_directory(&staging)?;
+                fs::rename(&backup, root).map_err(|source| {
+                    runtime_io_error("restore Runtime migration backup", &backup, source)
+                })?;
+                sync_directory(parent, "recover Runtime migration")?;
+                return Ok(());
+            }
+            Err(staging_error) => return Err(staging_error),
+        }
+    }
+
+    if backup_exists {
+        fs::rename(&backup, root).map_err(|source| {
+            runtime_io_error("restore Runtime migration backup", &backup, source)
+        })?;
+        sync_directory(parent, "recover Runtime migration")?;
+    }
+    Ok(())
 }
 
 fn runtime_ephemeral_socket(root: &Path, path: &Path) -> Result<bool, RuntimeError> {
@@ -1145,6 +1279,31 @@ fn copy_runtime_tree(root: &Path, source: &Path, target: &Path) -> Result<(), Ru
     Ok(())
 }
 
+fn sync_runtime_tree(path: &Path) -> Result<(), RuntimeError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| runtime_io_error("sync Runtime migration tree", path, source))?;
+    if metadata.file_type().is_file() {
+        return File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|source| runtime_io_error("sync Runtime migration file", path, source));
+    }
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(runtime_store_corrupt(
+            path,
+            "Runtime migration sync refuses symlinks and special files".to_string(),
+        ));
+    }
+    let mut entries = fs::read_dir(path)
+        .map_err(|source| runtime_io_error("read Runtime migration tree", path, source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| runtime_io_error("read Runtime migration tree", path, source))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        sync_runtime_tree(&entry.path())?;
+    }
+    sync_directory(path, "sync Runtime migration directory")
+}
+
 fn migrate_runtime_store(
     root: &Path,
     runtime_id: &str,
@@ -1176,18 +1335,18 @@ fn migrate_runtime_store(
             return Err(error);
         }
     };
-    let staged_store = FsRuntimeStore {
-        root: staging.clone(),
-        _owner_lock: None,
-    };
-    if let Err(error) = staged_store.load_runtime_state() {
+    if let Err(error) = validate_completed_migration_staging(&staging) {
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
     }
+    sync_runtime_tree(&staging)?;
+    let parent = runtime_store_parent(root)?;
     fs::rename(root, &backup)
         .map_err(|error| runtime_io_error("backup runtime store", root, error))?;
+    sync_directory(parent, "backup runtime store")?;
     if let Err(error) = fs::rename(&staging, root) {
-        let rollback = fs::rename(&backup, root);
+        let rollback = fs::rename(&backup, root)
+            .and_then(|()| File::open(parent).and_then(|directory| directory.sync_all()));
         return match rollback {
             Ok(()) => Err(runtime_io_error(
                 "activate migrated runtime store",
@@ -1203,8 +1362,10 @@ fn migrate_runtime_store(
             )),
         };
     }
+    sync_directory(parent, "activate migrated runtime store")?;
     fs::remove_dir_all(&backup)
         .map_err(|error| runtime_io_error("remove runtime migration backup", &backup, error))?;
+    sync_directory(parent, "remove runtime migration backup")?;
     debug_assert_eq!(plan.mapping_digest, staged_plan.mapping_digest);
     Ok(plan)
 }
@@ -1731,6 +1892,33 @@ fn sync_directory(path: &Path, operation: &'static str) -> Result<(), RuntimeErr
 mod tests {
     use super::*;
 
+    fn write_empty_schema_v7_store(root: &Path) {
+        fs::create_dir_all(root.join(WORKERS_DIR)).unwrap();
+        fs::write(
+            root.join(RUNTIME_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": PREVIOUS_SCHEMA_VERSION,
+                "display_name": "test-runtime",
+                "backend": "fs_store",
+                "status": "running",
+                "next_diagnostic_id": 1,
+                "config_bundles": {},
+                "workspace_owners": {},
+                "assignments": [],
+                "execution": [],
+                "diagnostics": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn stored_schema_version(root: &Path) -> u64 {
+        let document: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join(RUNTIME_FILE)).unwrap()).unwrap();
+        document["schema_version"].as_u64().unwrap()
+    }
+
     #[test]
     fn runtime_store_owner_lock_child_probe() {
         let Some(root) = std::env::var_os("YOI_TEST_RUNTIME_STORE_LOCK_ROOT") else {
@@ -1877,6 +2065,86 @@ mod tests {
                 "restore_intent": "automatic"
             }
         })
+    }
+
+    #[test]
+    fn startup_recovers_staging_created_before_source_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runtime-store");
+        write_empty_schema_v7_store(&root);
+        let staging = migration_sibling(&root, "schema-v8-staging").unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("partial"), b"partial").unwrap();
+        let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
+
+        store.store.load_runtime_state().unwrap();
+        assert_eq!(stored_schema_version(&root), u64::from(SCHEMA_VERSION));
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn startup_restores_backup_when_source_was_renamed_before_activation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runtime-store");
+        write_empty_schema_v7_store(&root);
+        let backup = migration_sibling(&root, "pre-schema-v8-backup").unwrap();
+        fs::rename(&root, &backup).unwrap();
+        let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
+
+        store.store.load_runtime_state().unwrap();
+        assert_eq!(stored_schema_version(&root), u64::from(SCHEMA_VERSION));
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn startup_promotes_valid_staging_after_source_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runtime-store");
+        write_empty_schema_v7_store(&root);
+        let staging = migration_sibling(&root, "schema-v8-staging").unwrap();
+        copy_runtime_tree(&root, &root, &staging).unwrap();
+        migrate_runtime_store_in_place(&staging, "test-runtime").unwrap();
+        let backup = migration_sibling(&root, "pre-schema-v8-backup").unwrap();
+        fs::rename(&root, &backup).unwrap();
+        let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
+
+        store.store.load_runtime_state().unwrap();
+        assert_eq!(stored_schema_version(&root), u64::from(SCHEMA_VERSION));
+        assert!(!staging.exists());
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn startup_restores_backup_when_staging_is_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runtime-store");
+        write_empty_schema_v7_store(&root);
+        let staging = migration_sibling(&root, "schema-v8-staging").unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join(RUNTIME_FILE), b"{\"schema_version\":8}").unwrap();
+        let backup = migration_sibling(&root, "pre-schema-v8-backup").unwrap();
+        fs::rename(&root, &backup).unwrap();
+
+        let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
+
+        store.store.load_runtime_state().unwrap();
+        assert_eq!(stored_schema_version(&root), u64::from(SCHEMA_VERSION));
+        assert!(!staging.exists());
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn startup_removes_backup_left_after_activation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runtime-store");
+        write_empty_schema_v7_store(&root);
+        migrate_runtime_store_in_place(&root, "test-runtime").unwrap();
+        let backup = migration_sibling(&root, "pre-schema-v8-backup").unwrap();
+        write_empty_schema_v7_store(&backup);
+        let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
+
+        store.store.load_runtime_state().unwrap();
+        assert!(!backup.exists());
     }
 
     #[test]
