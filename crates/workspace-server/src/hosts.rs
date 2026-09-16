@@ -5116,6 +5116,12 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             DiagnosticSeverity::Error,
             "Embedded Runtime store is already owned by another Runtime process".to_string(),
         ),
+        EmbeddedRuntimeError::WorkerDeletePersistenceFailed { .. } => diagnostic(
+            "worker_delete_persistence_failed",
+            DiagnosticSeverity::Error,
+            "Worker metadata deletion failed; the persisted Worker identity was retained for retry"
+                .to_string(),
+        ),
         EmbeddedRuntimeError::StoreIo { .. }
         | EmbeddedRuntimeError::StoreMissing { .. }
         | EmbeddedRuntimeError::StoreCorrupt { .. } => diagnostic(
@@ -5421,6 +5427,20 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    #[test]
+    fn embedded_delete_persistence_failure_diagnostic_is_bounded_and_path_free() {
+        let diagnostic =
+            embedded_runtime_diagnostic(&EmbeddedRuntimeError::WorkerDeletePersistenceFailed {
+                worker_id: EmbeddedWorkerId::now_v7(),
+                message: "/private/runtime/workers/raw-os-error".to_string(),
+            });
+
+        assert_eq!(diagnostic.code, "worker_delete_persistence_failed");
+        assert_eq!(diagnostic.severity, DiagnosticSeverity::Error);
+        assert!(diagnostic.message.len() <= 256);
+        assert!(!diagnostic.message.contains("/private/runtime"));
+    }
 
     #[test]
     fn strict_remote_runtime_dns_resolution_has_a_short_timeout() {
