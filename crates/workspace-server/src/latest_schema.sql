@@ -775,7 +775,7 @@ CREATE TABLE "worker_registry" (
 CREATE TABLE worker_removal_operations (
         operation_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL UNIQUE, input_fingerprint TEXT NOT NULL,
         workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL, worker_id TEXT NOT NULL,
-        worker_revision TEXT NOT NULL, run_generation INTEGER NOT NULL CHECK(run_generation>=0),
+        worker_revision TEXT NOT NULL,
         policy_id TEXT NOT NULL, policy_revision INTEGER NOT NULL,
         session_disposition TEXT NOT NULL, metadata_disposition TEXT NOT NULL,
         archive_retention_kind TEXT NOT NULL, archive_retention_seconds INTEGER,

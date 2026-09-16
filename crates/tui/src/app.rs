@@ -342,7 +342,7 @@ impl App {
         Self {
             worker_name,
             connected: false,
-            worker_state: WorkerStateSnapshot::initial(1),
+            worker_state: WorkerStateSnapshot::initial(),
             next_command_id: 1,
             worker_status: WorkerStatus::Idle,
             running: false,
@@ -1128,25 +1128,14 @@ impl App {
         let command_id = self
             .next_command_id
             .max(self.worker_state.last_command_id.saturating_add(1));
-        let command = WorkerCommandEnvelope::for_snapshot(command_id, &self.worker_state);
+        let command = WorkerCommandEnvelope::new(command_id);
         self.next_command_id = command_id.saturating_add(1);
         command
     }
 
     fn apply_worker_state_snapshot(&mut self, snapshot: &WorkerStateSnapshot) {
-        match protocol::apply_worker_state_snapshot(&mut self.worker_state, snapshot) {
-            Ok(protocol::WorkerStateSnapshotApply::Applied) => {
-                self.set_worker_status(self.worker_state.catalog_status());
-            }
-            Ok(
-                protocol::WorkerStateSnapshotApply::Duplicate
-                | protocol::WorkerStateSnapshotApply::Stale,
-            ) => {}
-            Err(error) => self.handle_error(
-                ErrorCode::Internal,
-                format!("worker state stream rejected: {error}"),
-            ),
-        }
+        self.worker_state = snapshot.clone();
+        self.set_worker_status(self.worker_state.catalog_status());
     }
 
     pub fn handle_worker_event(&mut self, event: Event) -> Option<Method> {
@@ -3651,8 +3640,6 @@ mod completion_flow_tests {
         assert_eq!(app.worker_status, WorkerStatus::Idle);
 
         let running = WorkerStateSnapshot {
-            execution_generation: 1,
-            revision: 1,
             state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
                 protocol::WorkerRunState::Running,
             )),
@@ -3669,11 +3656,9 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn worker_state_events_and_acknowledgements_share_monotonic_application() {
+    fn worker_state_events_and_acknowledgements_replace_full_state() {
         let mut app = App::new("test".into());
         let running = WorkerStateSnapshot {
-            execution_generation: 4,
-            revision: 3,
             state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
                 protocol::WorkerRunState::Running,
             )),
@@ -3682,22 +3667,22 @@ mod completion_flow_tests {
         app.handle_worker_event(Event::WorkerState {
             snapshot: running.clone(),
         });
-        app.handle_worker_event(Event::WorkerState {
-            snapshot: WorkerStateSnapshot {
-                revision: 2,
-                state: protocol::WorkerState::Idle,
-                ..running.clone()
-            },
-        });
         assert_eq!(app.worker_state, running);
 
+        let fresh_idle = WorkerStateSnapshot {
+            state: protocol::WorkerState::Idle,
+            last_command_id: 0,
+        };
+        app.handle_worker_event(Event::WorkerState {
+            snapshot: fresh_idle.clone(),
+        });
+        assert_eq!(app.worker_state, fresh_idle);
+
         let paused = WorkerStateSnapshot {
-            revision: 4,
             state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
                 protocol::WorkerRunState::Paused,
             )),
             last_command_id: 3,
-            ..running.clone()
         };
         app.handle_worker_event(Event::CommandAcknowledged {
             acknowledgement: protocol::WorkerCommandAcknowledgement {
@@ -3708,17 +3693,6 @@ mod completion_flow_tests {
             },
         });
         assert_eq!(app.worker_state, paused);
-
-        app.handle_worker_event(Event::WorkerState {
-            snapshot: WorkerStateSnapshot {
-                state: protocol::WorkerState::Idle,
-                ..paused.clone()
-            },
-        });
-        assert_eq!(app.worker_state, paused);
-        assert!(app.run_error_messages.iter().any(|message| {
-            message.contains("conflicting worker state snapshots at generation 4 revision 4")
-        }));
     }
 
     #[test]
@@ -4340,7 +4314,7 @@ mod completion_flow_tests {
     fn snapshot_restores_and_runtime_clear_removes_compaction_progress() {
         let mut app = App::new("test".into());
         assert_eq!(app.worker_state.state, protocol::WorkerState::Idle);
-        let mut state = protocol::WorkerStateSnapshot::initial(2);
+        let mut state = protocol::WorkerStateSnapshot::initial();
         state.state = protocol::WorkerState::Busy(protocol::WorkerBusyState::Maintenance(
             protocol::WorkerMaintenanceState::Compacting,
         ));
@@ -4395,10 +4369,7 @@ mod completion_flow_tests {
     }
 
     fn test_worker_state(status: WorkerStatus) -> WorkerStateSnapshot {
-        let mut snapshot = WorkerStateSnapshot::from(status);
-        snapshot.execution_generation = 1;
-        snapshot.revision = 1;
-        snapshot
+        WorkerStateSnapshot::from(status)
     }
 
     fn test_greeting() -> protocol::Greeting {

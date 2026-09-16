@@ -17,10 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const SCHEMA_VERSION: u32 = 6;
-const PREVIOUS_SCHEMA_VERSION: u32 = 5;
-const EXECUTION_SCHEMA_VERSION: u32 = 4;
-const PRE_EXECUTION_SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 7;
+const PREVIOUS_SCHEMA_VERSION: u32 = 6;
 const RUNTIME_FILE: &str = "runtime.json";
 const WORKERS_DIR: &str = "workers";
 const WORKER_FILE: &str = "worker.json";
@@ -371,13 +369,12 @@ pub(crate) struct PersistedRuntimeState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PersistedWorkerExecutionBinding {
-    pub(crate) run_generation: u64,
-}
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedWorkerExecutionBinding {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PersistedWorkerExecution {
-    pub(crate) last_run_generation: u64,
     pub(crate) binding: Option<PersistedWorkerExecutionBinding>,
     pub(crate) restore_intent: WorkerRestoreIntent,
 }
@@ -465,8 +462,8 @@ fn plan_runtime_store_migration(
             format!("Runtime store schema version {schema_version} is out of range"),
         )
     })?;
-    let staging = migration_sibling(root, "schema-v6-staging")?;
-    let backup = migration_sibling(root, "pre-schema-v6-backup")?;
+    let staging = migration_sibling(root, "schema-v7-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v7-backup")?;
     if staging.exists() || backup.exists() {
         return Err(runtime_store_corrupt(
             root,
@@ -492,14 +489,11 @@ fn plan_runtime_store_migration(
         };
         return Ok((plan, Vec::new()));
     }
-    if !matches!(
-        current_schema_version,
-        PRE_EXECUTION_SCHEMA_VERSION | EXECUTION_SCHEMA_VERSION | PREVIOUS_SCHEMA_VERSION
-    ) {
+    if current_schema_version != PREVIOUS_SCHEMA_VERSION {
         return Err(runtime_store_corrupt(
             &runtime_path,
             format!(
-                "unsupported Runtime store schema version {schema_version}; expected {PRE_EXECUTION_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
+                "unsupported Runtime store schema version {schema_version}; expected {PREVIOUS_SCHEMA_VERSION} or {SCHEMA_VERSION}"
             ),
         ));
     }
@@ -661,118 +655,19 @@ struct DiagnosticWorkerRefMigrationCounts {
     cleared: usize,
 }
 
-fn migrate_v1_worker_document(
-    mut snapshot: serde_json::Value,
-    mapping: &LegacyWorkerIdentityMapping,
-    snapshot_path: &Path,
-) -> Result<serde_json::Value, RuntimeError> {
-    let worker_id_text = mapping.worker_id.to_string();
-    let snapshot_object = snapshot.as_object_mut().ok_or_else(|| {
-        runtime_store_corrupt(
-            snapshot_path,
-            "Worker snapshot must be an object".to_string(),
-        )
-    })?;
-    snapshot_object.insert(
-        "schema_version".to_string(),
-        serde_json::Value::from(SCHEMA_VERSION),
-    );
-    snapshot_object.insert(
-        "worker_id".to_string(),
-        serde_json::Value::String(worker_id_text.clone()),
-    );
-    snapshot_object
-        .get_mut("worker_ref")
-        .and_then(serde_json::Value::as_object_mut)
-        .ok_or_else(|| {
-            runtime_store_corrupt(
-                snapshot_path,
-                "Worker snapshot worker_ref must be an object".to_string(),
-            )
-        })?
-        .insert(
-            "worker_id".to_string(),
-            serde_json::Value::String(worker_id_text.clone()),
-        );
-    let request = snapshot_object
-        .get_mut("request")
-        .and_then(serde_json::Value::as_object_mut)
-        .ok_or_else(|| {
-            runtime_store_corrupt(
-                snapshot_path,
-                "Worker snapshot request must be an object".to_string(),
-            )
-        })?;
-    let fingerprint = request
-        .remove("idempotency_fingerprint")
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| {
-            format!(
-                "legacy:{}:{}:{}",
-                mapping.workspace_id, mapping.runtime_id, mapping.legacy_worker_id
-            )
-        });
-    request.remove("idempotency_key");
-    request.insert(
-        "worker_id".to_string(),
-        serde_json::Value::String(worker_id_text),
-    );
-    request.insert(
-        "create_fingerprint".to_string(),
-        serde_json::Value::String(fingerprint),
-    );
-    Ok(snapshot)
-}
-
-fn max_persisted_run_generation(snapshot_path: &Path) -> Result<u64, RuntimeError> {
-    let worker_dir = snapshot_path.parent().ok_or_else(|| {
-        runtime_store_corrupt(
-            snapshot_path,
-            "Worker snapshot path is missing its aggregate directory".to_string(),
-        )
-    })?;
-    let runs_dir = worker_dir.join("runs");
-    if !runs_dir
-        .try_exists()
-        .map_err(|source| runtime_io_error("inspect Worker runs", &runs_dir, source))?
-    {
-        return Ok(0);
-    }
-    let entries = fs::read_dir(&runs_dir)
-        .map_err(|source| runtime_io_error("read Worker runs", &runs_dir, source))?;
-    let mut max_generation = 0;
-    for entry in entries {
-        let entry =
-            entry.map_err(|source| runtime_io_error("read Worker runs", &runs_dir, source))?;
-        let Some(generation) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        max_generation = max_generation.max(generation);
-    }
-    Ok(max_generation)
-}
-
 fn migrate_worker_document(
     mut document: serde_json::Value,
     source_schema_version: u32,
-    mapping: Option<&LegacyWorkerIdentityMapping>,
+    _mapping: Option<&LegacyWorkerIdentityMapping>,
     snapshot_path: &Path,
 ) -> Result<serde_json::Value, RuntimeError> {
-    if source_schema_version == 1 {
-        document = migrate_v1_worker_document(
-            document,
-            mapping.ok_or_else(|| {
-                runtime_store_corrupt(
-                    snapshot_path,
-                    "schema-v1 Worker migration is missing its identity mapping".to_string(),
-                )
-            })?,
+    if source_schema_version != PREVIOUS_SCHEMA_VERSION {
+        return Err(runtime_store_corrupt(
             snapshot_path,
-        )?;
+            format!(
+                "unsupported Worker snapshot schema {source_schema_version}; expected {PREVIOUS_SCHEMA_VERSION}"
+            ),
+        ));
     }
     let object = document.as_object_mut().ok_or_else(|| {
         runtime_store_corrupt(
@@ -780,116 +675,79 @@ fn migrate_worker_document(
             "Worker snapshot must be an object".to_string(),
         )
     })?;
-    let declared_run_generation = object
-        .remove("run_generation")
-        .map(|value| {
-            value.as_u64().ok_or_else(|| {
-                runtime_store_corrupt(
-                    snapshot_path,
-                    "Worker snapshot run_generation must be an unsigned integer".to_string(),
-                )
-            })
-        })
-        .transpose()?;
-    let legacy_execution = object.remove("execution");
-    let execution = legacy_execution
-        .as_ref()
-        .and_then(serde_json::Value::as_object);
-    let persisted_last_run_generation = execution
-        .and_then(|execution| execution.get("last_run_generation"))
-        .map(|value| {
-            value.as_u64().ok_or_else(|| {
-                runtime_store_corrupt(
-                    snapshot_path,
-                    "Worker execution last_run_generation must be an unsigned integer".to_string(),
-                )
-            })
-        })
-        .transpose()?;
-    let binding_run_generation = execution
-        .and_then(|execution| execution.get("binding"))
-        .and_then(serde_json::Value::as_object)
-        .and_then(|binding| binding.get("run_generation"))
-        .map(|value| {
-            value.as_u64().ok_or_else(|| {
+    let execution = object
+        .get_mut("execution")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| {
+            runtime_store_corrupt(
+                snapshot_path,
+                "Worker snapshot execution must be an object".to_string(),
+            )
+        })?;
+    let last_run_generation = execution
+        .remove("last_run_generation")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| {
+            runtime_store_corrupt(
+                snapshot_path,
+                "Worker execution last_run_generation must be an unsigned integer".to_string(),
+            )
+        })?;
+    let binding = execution.get_mut("binding").ok_or_else(|| {
+        runtime_store_corrupt(
+            snapshot_path,
+            "Worker execution is missing binding".to_string(),
+        )
+    })?;
+    if let Some(binding_object) = binding.as_object_mut() {
+        let binding_run_generation = binding_object
+            .remove("run_generation")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| {
                 runtime_store_corrupt(
                     snapshot_path,
                     "Worker execution binding run_generation must be an unsigned integer"
                         .to_string(),
                 )
-            })
-        })
-        .transpose()?;
-    let run_generation = declared_run_generation
-        .into_iter()
-        .chain(persisted_last_run_generation)
-        .chain(binding_run_generation)
-        .chain(std::iter::once(max_persisted_run_generation(
-            snapshot_path,
-        )?))
-        .max()
-        .unwrap_or(0);
-    if !object.contains_key("working_directory") {
-        if let Some(working_directory) = legacy_execution
-            .as_ref()
-            .and_then(serde_json::Value::as_object)
-            .and_then(|execution| execution.get("working_directory"))
-            .cloned()
-        {
-            object.insert("working_directory".to_string(), working_directory);
-        }
-    }
-    let legacy_materialization = object
-        .get("working_directory")
-        .and_then(|working_directory| working_directory.get("summary"))
-        .and_then(|summary| summary.get("materializer_kind"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|kind| matches!(kind, "runtime_git_cache" | "local_git_worktree"));
-    if legacy_materialization {
-        object.insert("working_directory".to_string(), serde_json::Value::Null);
-    }
-    if let Some(profile_source) = object
-        .get_mut("request")
-        .and_then(serde_json::Value::as_object_mut)
-        .and_then(|request| request.get_mut("profile_source"))
-        .and_then(serde_json::Value::as_object_mut)
-        && profile_source
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            == Some("http")
-    {
-        let archive = profile_source
-            .get_mut("location")
-            .and_then(serde_json::Value::as_object_mut)
-            .and_then(|location| location.remove("archive"))
-            .ok_or_else(|| {
-                runtime_store_corrupt(
-                    snapshot_path,
-                    "legacy HTTP profile source is missing its archive".to_string(),
-                )
             })?;
-        profile_source.clear();
-        profile_source.insert(
-            "kind".to_string(),
-            serde_json::Value::String("workspace_config".to_string()),
-        );
-        profile_source.insert("archive".to_string(), archive);
+        if binding_run_generation != last_run_generation {
+            return Err(runtime_store_corrupt(
+                snapshot_path,
+                format!(
+                    "execution binding run_generation {binding_run_generation} does not match last_run_generation {last_run_generation}"
+                ),
+            ));
+        }
+        if !binding_object.is_empty() {
+            return Err(runtime_store_corrupt(
+                snapshot_path,
+                "Worker execution binding contains unsupported fields".to_string(),
+            ));
+        }
+    } else if !binding.is_null() {
+        return Err(runtime_store_corrupt(
+            snapshot_path,
+            "Worker execution binding must be an object or null".to_string(),
+        ));
+    }
+    if !execution.contains_key("restore_intent") {
+        return Err(runtime_store_corrupt(
+            snapshot_path,
+            "Worker execution is missing restore_intent".to_string(),
+        ));
+    }
+    if execution
+        .keys()
+        .any(|key| key != "binding" && key != "restore_intent")
+    {
+        return Err(runtime_store_corrupt(
+            snapshot_path,
+            "Worker execution contains unsupported fields".to_string(),
+        ));
     }
     object.insert(
         "schema_version".to_string(),
         serde_json::Value::from(SCHEMA_VERSION),
-    );
-    object.insert(
-        "status".to_string(),
-        serde_json::Value::String("stopped".to_string()),
-    );
-    object.insert(
-        "execution".to_string(),
-        serde_json::json!({
-            "last_run_generation": run_generation,
-            "binding": null,
-            "restore_intent": "explicit",
-        }),
     );
     Ok(document)
 }
@@ -1259,8 +1117,8 @@ fn migrate_runtime_store(
     if !plan.migration_required {
         return Ok(plan);
     }
-    let staging = migration_sibling(root, "schema-v6-staging")?;
-    let backup = migration_sibling(root, "pre-schema-v6-backup")?;
+    let staging = migration_sibling(root, "schema-v7-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v7-backup")?;
     if staging.exists() || backup.exists() {
         return Err(runtime_store_corrupt(
             root,
@@ -1534,52 +1392,18 @@ impl WorkerSnapshot {
                 ),
             });
         }
-        if let Some(binding) = self.execution.binding.as_ref()
-            && binding.run_generation != self.execution.last_run_generation
-        {
-            return Err(RuntimeError::StoreCorrupt {
-                operation: "read worker snapshot",
-                path: path.to_path_buf(),
-                message: format!(
-                    "execution binding run_generation {} does not match last_run_generation {}",
-                    binding.run_generation, self.execution.last_run_generation
-                ),
-            });
-        }
         match (self.status, self.execution.restore_intent) {
             (status, WorkerRestoreIntent::Automatic) if status.is_active() => {
-                let Some(binding) = self.execution.binding.as_ref() else {
+                if self.execution.binding.is_none() {
                     return Err(RuntimeError::StoreCorrupt {
                         operation: "read worker snapshot",
                         path: path.to_path_buf(),
                         message: "automatic restore intent requires an execution binding"
                             .to_string(),
                     });
-                };
-                if binding.run_generation == 0 {
-                    return Err(RuntimeError::StoreCorrupt {
-                        operation: "read worker snapshot",
-                        path: path.to_path_buf(),
-                        message: "execution binding run_generation must be greater than zero"
-                            .to_string(),
-                    });
                 }
             }
-            (WorkerStatus::Stopped, WorkerRestoreIntent::Explicit) => {
-                if self
-                    .execution
-                    .binding
-                    .as_ref()
-                    .is_some_and(|binding| binding.run_generation == 0)
-                {
-                    return Err(RuntimeError::StoreCorrupt {
-                        operation: "read worker snapshot",
-                        path: path.to_path_buf(),
-                        message: "execution binding run_generation must be greater than zero"
-                            .to_string(),
-                    });
-                }
-            }
+            (WorkerStatus::Stopped, WorkerRestoreIntent::Explicit) => {}
             _ => {
                 return Err(RuntimeError::StoreCorrupt {
                     operation: "read worker snapshot",
@@ -1837,96 +1661,47 @@ mod tests {
     }
 
     #[test]
-    fn schema_v5_worker_migration_recovers_last_generation_from_run_aggregates() {
-        let root = tempfile::tempdir().unwrap();
-        let worker_dir = root.path().join("worker-a");
-        fs::create_dir_all(worker_dir.join("runs/1")).unwrap();
-        fs::create_dir_all(worker_dir.join("runs/7")).unwrap();
-        fs::create_dir_all(worker_dir.join("runs/incomplete")).unwrap();
-        let path = worker_dir.join(WORKER_FILE);
-        let source = serde_json::json!({
-            "schema_version": 5,
-            "execution": {
-                "binding": null,
-                "restore_intent": "explicit"
-            }
-        });
-
-        let migrated =
-            migrate_worker_document(source, PREVIOUS_SCHEMA_VERSION, None, &path).unwrap();
-
-        assert_eq!(
-            migrated["execution"]["last_run_generation"],
-            serde_json::json!(7)
-        );
-        assert_eq!(migrated["execution"]["binding"], serde_json::Value::Null);
-    }
-
-    #[test]
-    fn schema_v4_worker_migration_discards_unsupported_linked_worktree_binding() {
-        let source = serde_json::json!({
-            "schema_version": 4,
-            "request": {
-                "profile_source": {
-                    "kind": "http",
-                    "location": {
-                        "url": "https://workspace.example.test/archive",
-                        "etag": "profile-source:test",
-                        "archive": {
-                            "id": "profiles-v1",
-                            "digest": "sha256:test",
-                            "size_bytes": 1,
-                            "source_graph": {
-                                "source_count": 1,
-                                "total_source_bytes": 1,
-                                "entrypoints": {},
-                                "import_count": 0
-                            }
-                        }
-                    }
-                }
-            },
-            "working_directory": {
-                "summary": {
-                    "materializer_kind": "runtime_git_cache"
-                }
-            }
-        });
+    fn schema_v6_worker_migration_removes_generation_and_preserves_active_restore() {
         let path = Path::new("worker.json");
+        let source = serde_json::json!({
+            "schema_version": PREVIOUS_SCHEMA_VERSION,
+            "status": "running",
+            "execution": {
+                "last_run_generation": 7,
+                "binding": { "run_generation": 7 },
+                "restore_intent": "automatic"
+            }
+        });
 
         let migrated =
-            migrate_worker_document(source, EXECUTION_SCHEMA_VERSION, None, path).unwrap();
+            migrate_worker_document(source, PREVIOUS_SCHEMA_VERSION, None, path).unwrap();
 
         assert_eq!(migrated["schema_version"], SCHEMA_VERSION);
-        assert_eq!(migrated["status"], "stopped");
-        assert_eq!(migrated["working_directory"], serde_json::Value::Null);
-        assert_eq!(
-            migrated["request"]["profile_source"]["kind"],
-            "workspace_config"
-        );
-        assert_eq!(
-            migrated["request"]["profile_source"]["archive"]["id"],
-            "profiles-v1"
-        );
-        assert_eq!(migrated["execution"]["restore_intent"], "explicit");
+        assert_eq!(migrated["status"], "running");
+        assert_eq!(migrated["execution"]["binding"], serde_json::json!({}));
+        assert_eq!(migrated["execution"]["restore_intent"], "automatic");
+        assert!(migrated["execution"].get("last_run_generation").is_none());
     }
 
     #[test]
-    fn schema_v4_worker_migration_preserves_runtime_clone_observation() {
+    fn schema_v6_worker_migration_rejects_mismatched_generation_state() {
+        let path = Path::new("worker.json");
         let source = serde_json::json!({
-            "schema_version": 4,
-            "working_directory": {
-                "summary": {
-                    "materializer_kind": "runtime_git_clone"
-                }
+            "schema_version": PREVIOUS_SCHEMA_VERSION,
+            "execution": {
+                "last_run_generation": 7,
+                "binding": { "run_generation": 6 },
+                "restore_intent": "automatic"
             }
         });
-        let expected = source["working_directory"].clone();
-        let path = Path::new("worker.json");
 
-        let migrated =
-            migrate_worker_document(source, EXECUTION_SCHEMA_VERSION, None, path).unwrap();
+        let error =
+            migrate_worker_document(source, PREVIOUS_SCHEMA_VERSION, None, path).unwrap_err();
 
-        assert_eq!(migrated["working_directory"], expected);
+        assert!(
+            error
+                .to_string()
+                .contains("does not match last_run_generation")
+        );
     }
 }

@@ -190,12 +190,6 @@ fn command_admission_disposition(
             Err(WorkerCommandDisposition::StaleCommandId)
         }
         WorkerCommandAdmission::Conflict => Err(WorkerCommandDisposition::Conflict),
-        WorkerCommandAdmission::ExecutionGenerationMismatch => {
-            Err(WorkerCommandDisposition::StaleExecutionGeneration)
-        }
-        WorkerCommandAdmission::StateRevisionMismatch => {
-            Err(WorkerCommandDisposition::StaleWorkerStateRevision)
-        }
     }
 }
 
@@ -204,14 +198,14 @@ fn validate_command(
     kind: WorkerCommandKind,
     shared_state: &WorkerSharedState,
 ) -> Result<(), WorkerCommandDisposition> {
-    command_admission_disposition(shared_state.admit_command(envelope, kind, true))
+    command_admission_disposition(shared_state.admit_command(envelope, kind))
 }
 
 fn validate_shutdown_command(
     envelope: WorkerCommandEnvelope,
     shared_state: &WorkerSharedState,
 ) -> Result<(), WorkerCommandDisposition> {
-    match shared_state.admit_command(envelope, WorkerCommandKind::Shutdown, false) {
+    match shared_state.admit_command(envelope, WorkerCommandKind::Shutdown) {
         WorkerCommandAdmission::Accepted | WorkerCommandAdmission::Retry => Ok(()),
         admission => command_admission_disposition(admission),
     }
@@ -793,19 +787,11 @@ impl WorkerController {
             .await
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         let greeting = build_greeting(&worker);
-        let execution_generation = runtime_dir
-            .path()
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.parse::<u64>().ok())
-            .filter(|generation| *generation > 0)
-            .unwrap_or(1);
-        let shared_state = Arc::new(WorkerSharedState::new_with_generation(
+        let shared_state = Arc::new(WorkerSharedState::new(
             worker.manifest().worker.name.clone(),
             worker.segment_id(),
             manifest_toml.clone(),
             greeting,
-            execution_generation,
         ));
         if let Some(fs_for_view) = fs_for_view {
             shared_state.set_fs_view(crate::fs_view::WorkerFsView::new(fs_for_view));
@@ -3436,7 +3422,7 @@ mod tests {
             .transition(WorkerState::Busy(WorkerBusyState::Run(
                 WorkerRunState::Running,
             )));
-        let command = WorkerCommandEnvelope::for_snapshot(1, &env.shared_state.snapshot());
+        let command = WorkerCommandEnvelope::new(1);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
             method_tx
@@ -3719,7 +3705,7 @@ mod tests {
             .transition(WorkerState::Busy(WorkerBusyState::Run(
                 WorkerRunState::Running,
             )));
-        let command = WorkerCommandEnvelope::for_snapshot(1, &env.shared_state.snapshot());
+        let command = WorkerCommandEnvelope::new(1);
         env._method_tx
             .send(Method::Compact { command })
             .await
@@ -3770,8 +3756,8 @@ mod tests {
     }
 
     #[test]
-    fn command_admission_rejects_stale_generation_revision_and_order() {
-        let shared = WorkerSharedState::new_with_generation(
+    fn command_admission_rejects_stale_ids_and_reuse_conflicts() {
+        let shared = WorkerSharedState::new(
             "worker".into(),
             session_store::new_segment_id(),
             String::new(),
@@ -3785,39 +3771,10 @@ mod tests {
                 context_window: 1,
                 context_tokens: 0,
             },
-            9,
-        );
-        assert_eq!(
-            validate_command(
-                WorkerCommandEnvelope {
-                    command_id: 1,
-                    expected_execution_generation: 8,
-                    expected_worker_state_revision: 0,
-                },
-                WorkerCommandKind::Pause,
-                &shared,
-            ),
-            Err(WorkerCommandDisposition::StaleExecutionGeneration)
-        );
-        assert_eq!(
-            validate_command(
-                WorkerCommandEnvelope {
-                    command_id: 2,
-                    expected_execution_generation: 9,
-                    expected_worker_state_revision: 1,
-                },
-                WorkerCommandKind::Pause,
-                &shared,
-            ),
-            Err(WorkerCommandDisposition::StaleWorkerStateRevision)
         );
         assert!(
             validate_command(
-                WorkerCommandEnvelope {
-                    command_id: 1,
-                    expected_execution_generation: 9,
-                    expected_worker_state_revision: 0,
-                },
+                WorkerCommandEnvelope { command_id: 1 },
                 WorkerCommandKind::Pause,
                 &shared,
             )
@@ -3825,11 +3782,7 @@ mod tests {
         );
         assert_eq!(
             validate_command(
-                WorkerCommandEnvelope {
-                    command_id: 1,
-                    expected_execution_generation: 9,
-                    expected_worker_state_revision: 0,
-                },
+                WorkerCommandEnvelope { command_id: 1 },
                 WorkerCommandKind::Pause,
                 &shared,
             ),
@@ -3837,11 +3790,7 @@ mod tests {
         );
         assert_eq!(
             validate_command(
-                WorkerCommandEnvelope {
-                    command_id: 1,
-                    expected_execution_generation: 9,
-                    expected_worker_state_revision: 0,
-                },
+                WorkerCommandEnvelope { command_id: 1 },
                 WorkerCommandKind::Cancel,
                 &shared,
             ),
@@ -3849,11 +3798,7 @@ mod tests {
         );
         assert!(
             validate_command(
-                WorkerCommandEnvelope {
-                    command_id: 2,
-                    expected_execution_generation: 9,
-                    expected_worker_state_revision: 1,
-                },
+                WorkerCommandEnvelope { command_id: 2 },
                 WorkerCommandKind::Pause,
                 &shared,
             )

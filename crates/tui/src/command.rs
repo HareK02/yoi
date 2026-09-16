@@ -410,10 +410,7 @@ fn compact_command(invocation: CommandInvocation<'_>) -> CommandExecution {
     let _ = invocation.args.raw();
     CommandExecution {
         method: Some(Method::Compact {
-            command: protocol::WorkerCommandEnvelope::for_snapshot(
-                0,
-                &protocol::WorkerStateSnapshot::initial(1),
-            ),
+            command: protocol::WorkerCommandEnvelope::new(0),
         }),
         diagnostics: vec![CommandDiagnostic::new("compact requested")],
         exit_command_mode: true,

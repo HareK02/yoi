@@ -21861,7 +21861,6 @@ mod tests {
                     self.backend_id(),
                 ),
                 worker_state: protocol::WorkerStateSnapshot {
-                    execution_generation: request.run_generation,
                     ..protocol::WorkerStatus::Idle.into()
                 },
                 working_directory,
@@ -21901,10 +21900,11 @@ mod tests {
                     context_window: 0,
                     context_tokens: 0,
                 },
-                state: protocol::WorkerStateSnapshot::initial(1),
+                state: protocol::WorkerStateSnapshot::initial(),
                 in_flight: protocol::InFlightSnapshot {
                     blocks: Vec::new(),
                     commands: Vec::new(),
+                    compaction: None,
                 },
                 internal_workers: Vec::new(),
             })
@@ -21965,12 +21965,12 @@ mod tests {
                     uuid::Uuid::now_v7().to_string(),
                     protocol::SubmissionDisposition::Started,
                 )
-                .with_worker_state(protocol::WorkerStateSnapshot::initial(1))
+                .with_worker_state(protocol::WorkerStateSnapshot::initial())
             } else {
                 worker_runtime::execution::WorkerExecutionResult::accepted(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
                 )
-                .with_worker_state(protocol::WorkerStateSnapshot::initial(1))
+                .with_worker_state(protocol::WorkerStateSnapshot::initial())
             }
         }
     }
@@ -31548,11 +31548,7 @@ mod tests {
                 protocol::subscription::SubscriptionWorkerProtocolMethod {
                     subscription_id: second_protocol_subscription_id,
                     method: protocol::Method::Resume {
-                        command: protocol::WorkerCommandEnvelope {
-                            command_id: 1,
-                            expected_execution_generation: 1,
-                            expected_worker_state_revision: 0,
-                        },
+                        command: protocol::WorkerCommandEnvelope { command_id: 1 },
                     },
                 },
             ),

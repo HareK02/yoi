@@ -27,11 +27,8 @@ type TestStore = CombinedStore<FsStore, FsWorkerStore>;
 
 static NEXT_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
 
-fn worker_command(handle: &WorkerHandle) -> protocol::WorkerCommandEnvelope {
-    protocol::WorkerCommandEnvelope::for_snapshot(
-        NEXT_COMMAND_ID.fetch_add(1, Ordering::Relaxed),
-        &handle.shared_state.snapshot(),
-    )
+fn worker_command(_handle: &WorkerHandle) -> protocol::WorkerCommandEnvelope {
+    protocol::WorkerCommandEnvelope::new(NEXT_COMMAND_ID.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Reconstruct a worker-history-like `Vec<Item>` from the live session

@@ -459,8 +459,6 @@ mod tests {
             },
             state: "idle".to_string(),
             worker_state: Some(protocol::WorkerStateSnapshot {
-                execution_generation: 1,
-                revision: 1,
                 state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
                     protocol::WorkerRunState::Running,
                 )),
@@ -593,8 +591,6 @@ mod tests {
         short.display_name = short.label.clone();
         short.state = "idle".to_string();
         short.worker_state = Some(protocol::WorkerStateSnapshot {
-            execution_generation: 1,
-            revision: 2,
             state: protocol::WorkerState::Idle,
             last_command_id: 0,
         });

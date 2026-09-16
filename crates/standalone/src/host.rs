@@ -318,10 +318,7 @@ impl StandaloneHost {
     }
 
     pub async fn shutdown(mut self) -> Result<(), StandaloneShutdownError> {
-        let command = protocol::WorkerCommandEnvelope::for_snapshot(
-            u64::MAX,
-            &self.handle.shared_state.snapshot(),
-        );
+        let command = protocol::WorkerCommandEnvelope::new(u64::MAX);
         let _ = self.handle.send(Method::Shutdown { command }).await;
         let Some(shutdown) = self.shutdown.take() else {
             self.retain_lease();
@@ -504,10 +501,7 @@ fn active_pointer(
 }
 
 async fn stop_started_worker(started: BootstrappedWorker) {
-    let command = protocol::WorkerCommandEnvelope::for_snapshot(
-        u64::MAX,
-        &started.handle.shared_state.snapshot(),
-    );
+    let command = protocol::WorkerCommandEnvelope::new(u64::MAX);
     let _ = started.handle.send(Method::Shutdown { command }).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), started.shutdown).await;
 }

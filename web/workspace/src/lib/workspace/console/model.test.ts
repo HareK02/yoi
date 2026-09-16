@@ -21,8 +21,6 @@ declare const Deno: {
 
 function workerState(status: WorkerStatus): WorkerStateSnapshot {
   return {
-    execution_generation: 1,
-    revision: status === "idle" ? 0 : 1,
     last_command_id: 0,
     state: status === "idle"
       ? { kind: "idle" }
@@ -218,17 +216,17 @@ Deno.test("console routing projects live errors but not completion replies", () 
   );
 });
 
-Deno.test("Worker state events and acknowledgements apply monotonically", () => {
+Deno.test("Worker state events and acknowledgements replace the full state", () => {
   const projector = createConsoleProjector();
   const running: WorkerStateSnapshot = {
-    execution_generation: 4,
-    revision: 3,
     last_command_id: 2,
     state: { kind: "busy", state: { kind: "run", state: "running" } },
   };
+  const freshIdle: WorkerStateSnapshot = {
+    last_command_id: 0,
+    state: { kind: "idle" },
+  };
   const paused: WorkerStateSnapshot = {
-    ...running,
-    revision: 4,
     last_command_id: 3,
     state: { kind: "busy", state: { kind: "run", state: "paused" } },
   };
@@ -238,11 +236,8 @@ Deno.test("Worker state events and acknowledgements apply monotonically", () => 
       event: { event: "worker_state", data: { snapshot: running } },
     },
     {
-      eventId: "stale",
-      event: {
-        event: "worker_state",
-        data: { snapshot: { ...running, revision: 2, state: { kind: "idle" } } },
-      },
+      eventId: "fresh-idle",
+      event: { event: "worker_state", data: { snapshot: freshIdle } },
     },
     {
       eventId: "pause-ack",
@@ -263,18 +258,17 @@ Deno.test("Worker state events and acknowledgements apply monotonically", () => 
   assertEquals(projection.status, "paused");
 
   projection = projector.append([{
-    eventId: "conflict",
+    eventId: "replacement",
     event: {
       event: "worker_state",
-      data: { snapshot: { ...paused, state: { kind: "idle" } } },
+      data: { snapshot: freshIdle },
     },
   }]);
-  assertEquals(projection.workerState, paused);
+  assertEquals(projection.workerState, freshIdle);
+  assertEquals(projection.status, "idle");
   assert(
-    projection.lines.some((line) =>
-      line.eventId === "conflict:worker-state-conflict" && line.error
-    ),
-    "conflicting equal-version snapshots must fail closed",
+    !projection.lines.some((line) => line.eventId?.includes("worker-state-conflict")),
+    "full snapshots must not be rejected by a client-side version comparison",
   );
 });
 

@@ -5836,7 +5836,6 @@ mod tests {
                     self.backend_id(),
                 ),
                 worker_state: protocol::WorkerStateSnapshot {
-                    execution_generation: request.run_generation,
                     ..protocol::WorkerStatus::Idle.into()
                 },
                 working_directory: request

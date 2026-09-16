@@ -39,7 +39,6 @@ pub struct WorkerRetentionInventory {
     pub workspace_id: String,
     pub runtime_id: String,
     pub worker_id: WorkerId,
-    pub run_generation: u64,
     pub session_id: Option<String>,
     pub segment_ids: Vec<String>,
     pub session_bytes: u64,
@@ -118,7 +117,6 @@ pub struct WorkerRetentionExecutionRequest {
     pub source_runtime_id: String,
     pub worker_id: WorkerId,
     pub expected_worker_revision: String,
-    pub expected_run_generation: u64,
     pub source_created_at: String,
     pub removed_at: String,
     pub effective_profile: Option<String>,
@@ -171,7 +169,6 @@ pub(crate) trait WorkerRetentionProvider: Send + Sync {
         workspace_id: &str,
         runtime_id: &str,
         worker_id: WorkerId,
-        run_generation: u64,
     ) -> Result<WorkerRetentionInventory, RuntimeError>;
 
     fn execute(
@@ -283,7 +280,7 @@ impl FsWorkerRetentionProvider {
                 continue;
             };
             let worker_dir = self.worker_dir(worker_id);
-            let snapshot: WorkerGenerationSnapshot = match read_json(
+            let snapshot: WorkerAggregateSnapshot = match read_json(
                 &worker_dir.join("worker.json"),
                 "scan Worker retention inventory",
             ) {
@@ -303,12 +300,7 @@ impl FsWorkerRetentionProvider {
                 ));
                 continue;
             }
-            match self.inventory(
-                workspace_id,
-                runtime_id,
-                worker_id,
-                snapshot.run_generation(),
-            ) {
+            match self.inventory(workspace_id, runtime_id, worker_id) {
                 Ok(item) => workers.push(item),
                 Err(_) => diagnostics.push(runtime_aggregate_diagnostic(
                     &bounded_id,
@@ -380,25 +372,17 @@ impl WorkerRetentionProvider for FsWorkerRetentionProvider {
         workspace_id: &str,
         runtime_id: &str,
         worker_id: WorkerId,
-        run_generation: u64,
     ) -> Result<WorkerRetentionInventory, RuntimeError> {
         let worker_dir = self.worker_dir(worker_id);
         if !worker_dir.is_dir() {
             return Err(RuntimeError::WorkerNotFound { worker_id });
         }
-        let worker: WorkerGenerationSnapshot = read_json(
+        let worker: WorkerAggregateSnapshot = read_json(
             &worker_dir.join("worker.json"),
             "inventory Worker retention",
         )?;
         if worker.workspace_id.as_deref() != Some(workspace_id) {
             return Err(RuntimeError::WorkerNotFound { worker_id });
-        }
-        let current_run_generation = worker.run_generation();
-        if current_run_generation != run_generation {
-            return Err(RuntimeError::InvalidRequest(format!(
-                "Worker retention inventory expected generation {run_generation}, current generation is {}",
-                current_run_generation
-            )));
         }
         let session_dir = worker_dir.join("session");
         let (session_id, segment_ids, session_bytes) = if session_dir.is_dir() {
@@ -437,7 +421,6 @@ impl WorkerRetentionProvider for FsWorkerRetentionProvider {
             workspace_id: workspace_id.to_string(),
             runtime_id: runtime_id.to_string(),
             worker_id,
-            run_generation,
             session_id,
             segment_ids,
             session_bytes,
@@ -497,21 +480,13 @@ impl WorkerRetentionProvider for FsWorkerRetentionProvider {
                 worker_id: request.worker_id,
             });
         }
-        let snapshot: WorkerGenerationSnapshot =
+        let snapshot: WorkerAggregateSnapshot =
             read_json(&worker_dir.join("worker.json"), "execute Worker retention")?;
         if snapshot.workspace_id.as_deref() != Some(request.workspace_id.as_str()) {
             return Err(RuntimeError::WorkerNotFound {
                 worker_id: request.worker_id,
             });
         }
-        let run_generation = snapshot.run_generation();
-        if run_generation != request.expected_run_generation {
-            return Err(RuntimeError::InvalidRequest(format!(
-                "Worker retention plan expected generation {}, current generation is {}",
-                request.expected_run_generation, run_generation
-            )));
-        }
-
         let archive = match request.session_disposition {
             SessionDisposition::Archive => {
                 Some(commit_session_archive(self, request, &worker_dir)?)
@@ -572,30 +547,9 @@ impl WorkerRetentionProvider for FsWorkerRetentionProvider {
 }
 
 #[derive(Deserialize)]
-struct WorkerGenerationSnapshot {
+struct WorkerAggregateSnapshot {
     #[serde(default)]
     workspace_id: Option<String>,
-    execution: WorkerGenerationExecution,
-}
-
-#[derive(Deserialize)]
-struct WorkerGenerationExecution {
-    binding: Option<WorkerGenerationBinding>,
-}
-
-#[derive(Deserialize)]
-struct WorkerGenerationBinding {
-    run_generation: u64,
-}
-
-impl WorkerGenerationSnapshot {
-    fn run_generation(&self) -> u64 {
-        self.execution
-            .binding
-            .as_ref()
-            .map(|binding| binding.run_generation)
-            .unwrap_or(0)
-    }
 }
 
 #[derive(Deserialize)]
@@ -1286,13 +1240,12 @@ mod tests {
         fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
     }
 
-    fn source(root: &Path, worker_id: WorkerId, generation: u64) {
+    fn source(root: &Path, worker_id: WorkerId) {
         let worker = root.join("workers").join(worker_id.to_string());
         write_json(
             &worker.join("worker.json"),
             &serde_json::json!({
-                "workspace_id": "workspace-a",
-                "execution": {"binding": {"run_generation": generation}}
+                "workspace_id": "workspace-a"
             }),
         );
         write_json(
@@ -1301,22 +1254,17 @@ mod tests {
         );
         fs::create_dir_all(worker.join("session/segments")).unwrap();
         fs::write(worker.join("session/segments/segment-a.jsonl"), b"one\n").unwrap();
-        fs::create_dir_all(worker.join(format!("runs/{generation}"))).unwrap();
+        fs::create_dir_all(worker.join("runs/attempt-a")).unwrap();
         fs::write(
-            worker.join(format!("runs/{generation}/worker.out.log")),
+            worker.join("runs/attempt-a/worker.out.log"),
             b"diagnostic\n",
         )
         .unwrap();
-        fs::write(
-            worker.join(format!("runs/{generation}/worker.sock")),
-            b"not retained",
-        )
-        .unwrap();
+        fs::write(worker.join("runs/attempt-a/worker.sock"), b"not retained").unwrap();
     }
 
     fn request(
         worker_id: WorkerId,
-        generation: u64,
         disposition: SessionDisposition,
     ) -> WorkerRetentionExecutionRequest {
         WorkerRetentionExecutionRequest {
@@ -1328,7 +1276,6 @@ mod tests {
             workspace_id: "workspace-a".to_string(),
             source_runtime_id: "runtime-a".to_string(),
             worker_id,
-            expected_run_generation: generation,
             source_created_at: "2026-01-01T00:00:00Z".to_string(),
             removed_at: "2026-01-02T00:00:00Z".to_string(),
             effective_profile: Some("builtin:coder".to_string()),
@@ -1344,9 +1291,9 @@ mod tests {
     fn archive_is_verified_before_source_removal_and_retry_converges() {
         let temp = tempfile::tempdir().unwrap();
         let worker_id = WorkerId::from_legacy_u64(7);
-        source(temp.path(), worker_id, 4);
+        source(temp.path(), worker_id);
         let provider = FsWorkerRetentionProvider::new(temp.path());
-        let request = request(worker_id, 4, SessionDisposition::Archive);
+        let request = request(worker_id, SessionDisposition::Archive);
 
         let first = provider.execute(&request).unwrap();
         assert!(first.source_removed);
@@ -1375,7 +1322,7 @@ mod tests {
     fn archive_failure_keeps_live_source_for_retry() {
         let temp = tempfile::tempdir().unwrap();
         let worker_id = WorkerId::from_legacy_u64(8);
-        source(temp.path(), worker_id, 2);
+        source(temp.path(), worker_id);
         let collision = temp.path().join("archives/workers/archive-a");
         fs::create_dir_all(&collision).unwrap();
         fs::write(collision.join("manifest.json"), b"not-json").unwrap();
@@ -1383,7 +1330,7 @@ mod tests {
 
         assert!(
             provider
-                .execute(&request(worker_id, 2, SessionDisposition::Archive))
+                .execute(&request(worker_id, SessionDisposition::Archive))
                 .is_err()
         );
         assert!(
@@ -1403,13 +1350,13 @@ mod tests {
     fn target_inventory_and_execute_reject_cross_workspace_aggregate() {
         let temp = tempfile::tempdir().unwrap();
         let worker_id = WorkerId::from_legacy_u64(16);
-        source(temp.path(), worker_id, 3);
+        source(temp.path(), worker_id);
         let provider = FsWorkerRetentionProvider::new(temp.path());
         assert!(matches!(
-            provider.inventory("other-workspace", "runtime-a", worker_id, 3),
+            provider.inventory("other-workspace", "runtime-a", worker_id),
             Err(RuntimeError::WorkerNotFound { .. })
         ));
-        let mut request = request(worker_id, 3, SessionDisposition::Purge);
+        let mut request = request(worker_id, SessionDisposition::Purge);
         request.workspace_id = "other-workspace".to_string();
         assert!(matches!(
             provider.execute(&request),
@@ -1434,20 +1381,12 @@ mod tests {
     }
 
     #[test]
-    fn purge_removes_aggregate_and_rejects_stale_generation() {
+    fn purge_removes_worker_aggregate() {
         let temp = tempfile::tempdir().unwrap();
         let provider = FsWorkerRetentionProvider::new(temp.path());
         let worker_id = WorkerId::from_legacy_u64(9);
-        source(temp.path(), worker_id, 5);
-        let stale = request(worker_id, 4, SessionDisposition::Purge);
-        assert!(provider.execute(&stale).is_err());
-        assert!(
-            temp.path()
-                .join(format!("workers/{worker_id}/session"))
-                .is_dir()
-        );
-
-        let mut current = request(worker_id, 5, SessionDisposition::Purge);
+        source(temp.path(), worker_id);
+        let mut current = request(worker_id, SessionDisposition::Purge);
         current.operation_id = "operation-current".to_string();
         current.input_fingerprint = "fingerprint-current".to_string();
         let result = provider.execute(&current).unwrap();
@@ -1464,9 +1403,9 @@ mod tests {
     fn pending_receipt_recovers_delete_to_receipt_crash_window() {
         let temp = tempfile::tempdir().unwrap();
         let worker_id = WorkerId::from_legacy_u64(11);
-        source(temp.path(), worker_id, 1);
+        source(temp.path(), worker_id);
         let provider = FsWorkerRetentionProvider::new(temp.path());
-        let request = request(worker_id, 1, SessionDisposition::Archive);
+        let request = request(worker_id, SessionDisposition::Archive);
         let completed = provider.execute(&request).unwrap();
         let receipt_path = temp.path().join("retention/operations/operation-a.json");
         let mut receipt: RetentionOperationReceipt =
@@ -1482,9 +1421,9 @@ mod tests {
     #[test]
     fn provider_snapshot_scans_aggregate_storage_independent_of_runtime_catalog() {
         let temp = tempfile::tempdir().unwrap();
-        source(temp.path(), WorkerId::from_legacy_u64(13), 2);
+        source(temp.path(), WorkerId::from_legacy_u64(13));
         let other_worker = WorkerId::from_legacy_u64(14);
-        source(temp.path(), other_worker, 1);
+        source(temp.path(), other_worker);
         write_json(
             &temp
                 .path()
@@ -1492,8 +1431,7 @@ mod tests {
                 .join(other_worker.to_string())
                 .join("worker.json"),
             &serde_json::json!({
-                "workspace_id": "other-workspace",
-                "execution": {"binding": {"run_generation": 1}}
+                "workspace_id": "other-workspace"
             }),
         );
         fs::create_dir_all(temp.path().join("workers/not-a-worker")).unwrap();
@@ -1532,9 +1470,9 @@ mod tests {
     fn diagnostics_retry_rejects_corrupt_existing_archive_before_source_delete() {
         let temp = tempfile::tempdir().unwrap();
         let worker_id = WorkerId::from_legacy_u64(12);
-        source(temp.path(), worker_id, 1);
+        source(temp.path(), worker_id);
         let provider = FsWorkerRetentionProvider::new(temp.path());
-        let mut request = request(worker_id, 1, SessionDisposition::Archive);
+        let mut request = request(worker_id, SessionDisposition::Archive);
         request.diagnostics_disposition = DiagnosticsDisposition::Retain;
         provider.execute(&request).unwrap();
 
@@ -1543,10 +1481,10 @@ mod tests {
             serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
         receipt.result.source_removed = false;
         fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
-        source(temp.path(), worker_id, 1);
+        source(temp.path(), worker_id);
         fs::write(
             temp.path()
-                .join("archives/diagnostics/operation-a/runs/1/worker.out.log"),
+                .join("archives/diagnostics/operation-a/runs/attempt-a/worker.out.log"),
             b"corrupt\n",
         )
         .unwrap();
@@ -1564,9 +1502,9 @@ mod tests {
     fn concurrent_retry_produces_one_archive() {
         let temp = tempfile::tempdir().unwrap();
         let worker_id = WorkerId::from_legacy_u64(10);
-        source(temp.path(), worker_id, 1);
+        source(temp.path(), worker_id);
         let provider = Arc::new(FsWorkerRetentionProvider::new(temp.path()));
-        let request = Arc::new(request(worker_id, 1, SessionDisposition::Archive));
+        let request = Arc::new(request(worker_id, SessionDisposition::Archive));
         let barrier = Arc::new(Barrier::new(3));
         let handles = (0..2)
             .map(|_| {

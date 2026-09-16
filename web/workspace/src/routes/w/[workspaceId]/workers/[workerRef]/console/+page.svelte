@@ -562,8 +562,6 @@
         nextWorkerCommandId = commandId + 1;
         const envelope = {
             command_id: commandId,
-            expected_execution_generation: state.execution_generation,
-            expected_worker_state_revision: state.revision,
         };
         switch (command) {
             case "pause":

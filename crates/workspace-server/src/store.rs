@@ -18,7 +18,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 60;
+const LATEST_SCHEMA_VERSION: i64 = 61;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -35,6 +35,7 @@ const REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME: &str =
 const WORKDIR_CREDENTIAL_CANDIDATE_SNAPSHOT_MIGRATION_NAME: &str =
     "Workdir create credential candidate snapshots";
 const RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME: &str = "guarded Runtime removal operations";
+const REMOVE_WORKER_RUN_GENERATION_MIGRATION_NAME: &str = "remove obsolete Worker run generation";
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -86,6 +87,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 60,
         name: RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME,
         apply: migrate_runtime_removal_operations_v59_to_v60,
+    },
+    Migration {
+        version: 61,
+        name: REMOVE_WORKER_RUN_GENERATION_MIGRATION_NAME,
+        apply: migrate_worker_run_generation_v60_to_v61,
     },
 ];
 
@@ -9769,9 +9775,20 @@ fn migrate_runtime_removal_operations_v59_to_v60(conn: &Connection) -> Result<()
     )?;
     tx.execute(
         "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![60, RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_worker_run_generation_v60_to_v61(conn: &Connection) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch("ALTER TABLE worker_removal_operations DROP COLUMN run_generation;")?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
         params![
             LATEST_SCHEMA_VERSION,
-            RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME
+            REMOVE_WORKER_RUN_GENERATION_MIGRATION_NAME
         ],
     )?;
     tx.commit()?;
@@ -10779,6 +10796,8 @@ mod tests {
                      DROP TRIGGER workdir_removal_insert_blocked_by_runtime_removal; \
                      DROP TRIGGER workdir_removal_update_blocked_by_runtime_removal; \
                      DROP TABLE runtime_removal_operations; \
+                     ALTER TABLE worker_removal_operations \
+                     ADD COLUMN run_generation INTEGER NOT NULL DEFAULT 0; \
                      DELETE FROM __yoi_schema_migrations; \
                      INSERT INTO __yoi_schema_migrations(version, name) \
                      VALUES (59, 'workspace schema baseline');",
@@ -10816,6 +10835,50 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn schema_v60_upgrade_removes_worker_run_generation_column() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        drop(SqliteWorkspaceStore::open(&path).unwrap());
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE worker_removal_operations \
+                 ADD COLUMN run_generation INTEGER NOT NULL DEFAULT 0; \
+                 DELETE FROM __yoi_schema_migrations; \
+                 INSERT INTO __yoi_schema_migrations(version,name) \
+                 VALUES (60,'workspace schema baseline');",
+            )
+            .unwrap();
+        }
+
+        drop(SqliteWorkspaceStore::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            current_schema_version(&conn).unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
+        let columns = conn
+            .prepare("PRAGMA table_info(worker_removal_operations)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(!columns.iter().any(|column| column == "run_generation"));
+        assert_eq!(
+            conn.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        let foreign_key_failures: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_failures, 0);
     }
 
     #[test]
@@ -10948,6 +11011,8 @@ mod tests {
             DROP TRIGGER workdir_removal_insert_blocked_by_runtime_removal;
             DROP TRIGGER workdir_removal_update_blocked_by_runtime_removal;
             DROP TABLE runtime_removal_operations;
+            ALTER TABLE worker_removal_operations
+            ADD COLUMN run_generation INTEGER NOT NULL DEFAULT 0;
             DROP INDEX workspace_signing_identity_audit_workspace_idx;
             DROP TABLE workspace_signing_identity_audit;
             DROP TABLE workspace_signing_identity_provisioning_operations;
@@ -11097,6 +11162,10 @@ mod tests {
                     version: 60,
                     name: RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 61,
+                    name: REMOVE_WORKER_RUN_GENERATION_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -11142,6 +11211,10 @@ mod tests {
                         (
                             60,
                             RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME.to_string(),
+                        ),
+                        (
+                            61,
+                            REMOVE_WORKER_RUN_GENERATION_MIGRATION_NAME.to_string(),
                         ),
                     ]
                 );
@@ -11213,7 +11286,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![52, 53, 54, 55, 56, 57, 58, 59, 60]
+            vec![52, 53, 54, 55, 56, 57, 58, 59, 60, 61]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
@@ -11221,7 +11294,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 11);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 12);
     }
 
     #[test]

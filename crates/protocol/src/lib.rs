@@ -85,24 +85,19 @@ impl AuthenticatedInputSource {
     }
 }
 
-/// Immutable identity and revision fence for one state-changing Worker command.
+/// Caller-owned identity for one state-changing Worker command.
+///
+/// A controller accepts command ids in strictly increasing order. Exact retries
+/// of an accepted id must retain the same command kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkerCommandEnvelope {
-    /// Caller-owned sequence. A controller accepts command ids in strictly
-    /// increasing order for one execution generation.
     pub command_id: u64,
-    pub expected_execution_generation: u64,
-    pub expected_worker_state_revision: u64,
 }
 
 impl WorkerCommandEnvelope {
-    pub fn for_snapshot(command_id: u64, snapshot: &WorkerStateSnapshot) -> Self {
-        Self {
-            command_id,
-            expected_execution_generation: snapshot.execution_generation,
-            expected_worker_state_revision: snapshot.revision,
-        }
+    pub fn new(command_id: u64) -> Self {
+        Self { command_id }
     }
 }
 
@@ -122,8 +117,6 @@ pub enum WorkerCommandKind {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerCommandDisposition {
     Accepted,
-    StaleExecutionGeneration,
-    StaleWorkerStateRevision,
     StaleCommandId,
     Conflict,
     InvalidState,
@@ -175,18 +168,14 @@ pub enum WorkerMaintenanceState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkerStateSnapshot {
-    pub execution_generation: u64,
-    pub revision: u64,
-    /// Highest lifecycle command id observed by this controller generation.
+    /// Highest lifecycle command id observed by this controller instance.
     pub last_command_id: u64,
     pub state: WorkerState,
 }
 
 impl WorkerStateSnapshot {
-    pub fn initial(execution_generation: u64) -> Self {
+    pub fn initial() -> Self {
         Self {
-            execution_generation,
-            revision: 0,
             last_command_id: 0,
             state: WorkerState::Idle,
         }
@@ -204,53 +193,6 @@ impl WorkerStateSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkerStateSnapshotApply {
-    Applied,
-    Duplicate,
-    Stale,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WorkerStateSnapshotConflict {
-    pub execution_generation: u64,
-    pub revision: u64,
-}
-
-impl std::fmt::Display for WorkerStateSnapshotConflict {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "conflicting worker state snapshots at generation {} revision {}",
-            self.execution_generation, self.revision
-        )
-    }
-}
-
-impl std::error::Error for WorkerStateSnapshotConflict {}
-
-pub fn apply_worker_state_snapshot(
-    current: &mut WorkerStateSnapshot,
-    incoming: &WorkerStateSnapshot,
-) -> Result<WorkerStateSnapshotApply, WorkerStateSnapshotConflict> {
-    use std::cmp::Ordering;
-
-    let ordering = (incoming.execution_generation, incoming.revision)
-        .cmp(&(current.execution_generation, current.revision));
-    match ordering {
-        Ordering::Greater => {
-            *current = incoming.clone();
-            Ok(WorkerStateSnapshotApply::Applied)
-        }
-        Ordering::Less => Ok(WorkerStateSnapshotApply::Stale),
-        Ordering::Equal if incoming == current => Ok(WorkerStateSnapshotApply::Duplicate),
-        Ordering::Equal => Err(WorkerStateSnapshotConflict {
-            execution_generation: incoming.execution_generation,
-            revision: incoming.revision,
-        }),
-    }
-}
-
 impl From<WorkerStatus> for WorkerStateSnapshot {
     fn from(status: WorkerStatus) -> Self {
         let state = match status {
@@ -261,8 +203,6 @@ impl From<WorkerStatus> for WorkerStateSnapshot {
             WorkerStatus::Paused => WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Paused)),
         };
         Self {
-            execution_generation: 1,
-            revision: 0,
             last_command_id: 0,
             state,
         }
@@ -1697,55 +1637,24 @@ mod tests {
     }
 
     #[test]
-    fn worker_state_snapshot_apply_is_monotonic_and_detects_conflicts() {
-        let mut current = WorkerStateSnapshot::initial(4);
-        let mut newer = current.clone();
-        newer.revision = 1;
-        newer.state = WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running));
-
-        assert_eq!(
-            apply_worker_state_snapshot(&mut current, &newer),
-            Ok(WorkerStateSnapshotApply::Applied)
-        );
-        assert_eq!(
-            apply_worker_state_snapshot(&mut current, &newer),
-            Ok(WorkerStateSnapshotApply::Duplicate)
-        );
-
-        let stale_revision = WorkerStateSnapshot::initial(4);
-        assert_eq!(
-            apply_worker_state_snapshot(&mut current, &stale_revision),
-            Ok(WorkerStateSnapshotApply::Stale)
-        );
-        let stale_generation = WorkerStateSnapshot {
-            execution_generation: 3,
-            revision: u64::MAX,
-            ..newer.clone()
+    fn worker_state_snapshot_wire_shape_has_one_authoritative_state() {
+        let snapshot = WorkerStateSnapshot {
+            last_command_id: 7,
+            state: WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running)),
         };
+        let value = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(
-            apply_worker_state_snapshot(&mut current, &stale_generation),
-            Ok(WorkerStateSnapshotApply::Stale)
-        );
-
-        let conflicting = WorkerStateSnapshot {
-            state: WorkerState::Idle,
-            ..newer.clone()
-        };
-        assert_eq!(
-            apply_worker_state_snapshot(&mut current, &conflicting),
-            Err(WorkerStateSnapshotConflict {
-                execution_generation: 4,
-                revision: 1,
+            value,
+            serde_json::json!({
+                "last_command_id": 7,
+                "state": {
+                    "kind": "busy",
+                    "state": { "kind": "run", "state": "running" }
+                }
             })
         );
-        assert_eq!(current, newer);
-
-        let next_generation = WorkerStateSnapshot::initial(5);
-        assert_eq!(
-            apply_worker_state_snapshot(&mut current, &next_generation),
-            Ok(WorkerStateSnapshotApply::Applied)
-        );
-        assert_eq!(current, next_generation);
+        assert!(value.get("execution_generation").is_none());
+        assert!(value.get("revision").is_none());
     }
 
     #[test]
@@ -1942,28 +1851,21 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_methods_roundtrip_with_fences() {
+    fn lifecycle_methods_roundtrip_with_command_identity() {
         for method in [
             Method::Pause {
-                command: WorkerCommandEnvelope {
-                    command_id: 11,
-                    expected_execution_generation: 4,
-                    expected_worker_state_revision: 8,
-                },
+                command: WorkerCommandEnvelope { command_id: 11 },
             },
             Method::Compact {
-                command: WorkerCommandEnvelope {
-                    command_id: 12,
-                    expected_execution_generation: 4,
-                    expected_worker_state_revision: 9,
-                },
+                command: WorkerCommandEnvelope { command_id: 12 },
             },
         ] {
             let json = serde_json::to_string(&method).unwrap();
+            assert!(!json.contains("expected_execution_generation"));
+            assert!(!json.contains("expected_worker_state_revision"));
             let decoded: Method = serde_json::from_str(&json).unwrap();
             match decoded {
                 Method::Pause { command } | Method::Compact { command } => {
-                    assert_eq!(command.expected_execution_generation, 4);
                     assert!(command.command_id >= 11);
                 }
                 other => panic!("unexpected lifecycle method: {other:?}"),
@@ -2260,7 +2162,7 @@ mod tests {
 
     #[test]
     fn event_snapshot_in_flight_roundtrip_and_default() {
-        let inbound = r#"{"event":"snapshot","data":{"session":{"entries":[]},"greeting":{"worker_name":"test","cwd":"/tmp","provider":"p","model":"m","scope_summary":"s","tools":[]},"state":{"execution_generation":1,"revision":1,"last_command_id":0,"state":{"kind":"busy","state":{"kind":"run","state":"running"}}}}}"#;
+        let inbound = r#"{"event":"snapshot","data":{"session":{"entries":[]},"greeting":{"worker_name":"test","cwd":"/tmp","provider":"p","model":"m","scope_summary":"s","tools":[]},"state":{"last_command_id":0,"state":{"kind":"busy","state":{"kind":"run","state":"running"}}}}}"#;
         let decoded: Event = serde_json::from_str(inbound).unwrap();
         match decoded {
             Event::Snapshot { in_flight, .. } => assert!(in_flight.is_empty()),
@@ -2404,8 +2306,6 @@ mod tests {
     fn event_worker_state_format() {
         let event = Event::WorkerState {
             snapshot: WorkerStateSnapshot {
-                execution_generation: 7,
-                revision: 3,
                 last_command_id: 9,
                 state: WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running)),
             },
@@ -2413,8 +2313,12 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "worker_state");
-        assert_eq!(parsed["data"]["snapshot"]["execution_generation"], 7);
-        assert_eq!(parsed["data"]["snapshot"]["revision"], 3);
+        assert!(
+            parsed["data"]["snapshot"]
+                .get("execution_generation")
+                .is_none()
+        );
+        assert!(parsed["data"]["snapshot"].get("revision").is_none());
         assert_eq!(parsed["data"]["snapshot"]["state"]["kind"], "busy");
 
         let decoded: Event = serde_json::from_str(&json).unwrap();
@@ -2422,10 +2326,8 @@ mod tests {
             decoded,
             Event::WorkerState {
                 snapshot: WorkerStateSnapshot {
-                    execution_generation: 7,
-                    revision: 3,
+                    last_command_id: 9,
                     state: WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running)),
-                    ..
                 }
             }
         ));
@@ -2885,8 +2787,6 @@ mod tests {
                     "tools": []
                 },
                 "state": {
-                    "execution_generation": 1,
-                    "revision": 0,
                     "last_command_id": 0,
                     "state": { "kind": "idle" }
                 }

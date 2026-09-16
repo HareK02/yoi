@@ -784,58 +784,12 @@ function refreshCompactionActivity(
   return changed ? { ...projection, lines } : projection;
 }
 
-function workerStateEqual(left: WorkerState, right: WorkerState): boolean {
-  if (left.kind !== right.kind) return false;
-  if (left.kind === "idle" || right.kind === "idle") return true;
-  return left.state.kind === right.state.kind &&
-    left.state.state === right.state.state;
-}
-
-function workerStateSnapshotEqual(
-  left: WorkerStateSnapshot,
-  right: WorkerStateSnapshot,
-): boolean {
-  return left.execution_generation === right.execution_generation &&
-    left.revision === right.revision &&
-    left.last_command_id === right.last_command_id &&
-    workerStateEqual(left.state, right.state);
-}
-
 function applyWorkerStateSnapshot(
   projection: ConsoleProjection,
   incoming: WorkerStateSnapshot,
-  eventId: string,
 ): void {
-  const current = projection.workerState;
-  if (!current) {
-    projection.workerState = incoming;
-    projection.status = workerStatusFromState(incoming);
-    return;
-  }
-  const generationOrder = incoming.execution_generation -
-    current.execution_generation;
-  const revisionOrder = incoming.revision - current.revision;
-  if (generationOrder > 0 || (generationOrder === 0 && revisionOrder > 0)) {
-    projection.workerState = incoming;
-    projection.status = workerStatusFromState(incoming);
-    return;
-  }
-  if (generationOrder < 0 || (generationOrder === 0 && revisionOrder < 0)) {
-    return;
-  }
-  if (!workerStateSnapshotEqual(current, incoming)) {
-    projection.lines.push(
-      line(
-        `${eventId}:worker-state-conflict`,
-        "error",
-        "error · internal",
-        `worker state stream rejected: conflicting snapshots at generation ${incoming.execution_generation} revision ${incoming.revision}`,
-        undefined,
-        false,
-        true,
-      ),
-    );
-  }
+  projection.workerState = incoming;
+  projection.status = workerStatusFromState(incoming);
 }
 
 export function applyProtocolEvent(
@@ -1004,7 +958,7 @@ export function applyProtocolEvent(
           };
         }
       }
-      applyWorkerStateSnapshot(next, event.data.state, envelope.eventId);
+      applyWorkerStateSnapshot(next, event.data.state);
       break;
     }
     case "internal_worker": {
@@ -1053,14 +1007,10 @@ export function applyProtocolEvent(
       break;
     }
     case "worker_state":
-      applyWorkerStateSnapshot(next, event.data.snapshot, envelope.eventId);
+      applyWorkerStateSnapshot(next, event.data.snapshot);
       break;
     case "command_acknowledged":
-      applyWorkerStateSnapshot(
-        next,
-        event.data.acknowledgement.state,
-        envelope.eventId,
-      );
+      applyWorkerStateSnapshot(next, event.data.acknowledgement.state);
       break;
     case "command":
       applyCommandEvent(next, envelope.eventId, event.data.event);

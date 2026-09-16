@@ -28,8 +28,6 @@ pub(crate) enum WorkerCommandAdmission {
     Retry,
     Conflict,
     StaleCommandId,
-    ExecutionGenerationMismatch,
-    StateRevisionMismatch,
 }
 
 /// Shared state between WorkerController and runtime directory.
@@ -60,22 +58,12 @@ impl WorkerSharedState {
         manifest_toml: String,
         greeting: protocol::Greeting,
     ) -> Self {
-        Self::new_with_generation(worker_name, segment_id, manifest_toml, greeting, 1)
-    }
-
-    pub fn new_with_generation(
-        worker_name: String,
-        segment_id: SegmentId,
-        manifest_toml: String,
-        greeting: protocol::Greeting,
-        execution_generation: u64,
-    ) -> Self {
         Self {
             worker_name,
             segment_id,
             manifest_toml,
             greeting,
-            state: RwLock::new(WorkerStateSnapshot::initial(execution_generation)),
+            state: RwLock::new(WorkerStateSnapshot::initial()),
             accepted_commands: RwLock::new(VecDeque::new()),
             fs_view: OnceLock::new(),
             flow_transition_enabled: AtomicBool::new(false),
@@ -108,7 +96,6 @@ impl WorkerSharedState {
             .write()
             .expect("worker state lock poisoned; refusing an inferred fallback state");
         if snapshot.state != state {
-            snapshot.revision = snapshot.revision.saturating_add(1);
             snapshot.state = state;
         }
         snapshot.clone()
@@ -118,7 +105,6 @@ impl WorkerSharedState {
         &self,
         envelope: WorkerCommandEnvelope,
         kind: WorkerCommandKind,
-        require_state_revision: bool,
     ) -> WorkerCommandAdmission {
         let mut snapshot = self
             .state
@@ -138,18 +124,11 @@ impl WorkerSharedState {
                 WorkerCommandAdmission::Conflict
             };
         }
-        if envelope.expected_execution_generation != snapshot.execution_generation {
-            return WorkerCommandAdmission::ExecutionGenerationMismatch;
-        }
-        if require_state_revision && envelope.expected_worker_state_revision != snapshot.revision {
-            return WorkerCommandAdmission::StateRevisionMismatch;
-        }
         if envelope.command_id <= snapshot.last_command_id {
             return WorkerCommandAdmission::StaleCommandId;
         }
 
         snapshot.last_command_id = envelope.command_id;
-        snapshot.revision = snapshot.revision.saturating_add(1);
         accepted.push_back(AcceptedWorkerCommand {
             envelope,
             kind,
@@ -248,12 +227,11 @@ mod tests {
     use super::*;
 
     fn test_state() -> WorkerSharedState {
-        WorkerSharedState::new_with_generation(
+        WorkerSharedState::new(
             "test-worker".into(),
             session_store::new_segment_id(),
             "[engine]\nname = \"test-worker\"".into(),
             test_greeting(),
-            7,
         )
     }
 
@@ -273,43 +251,34 @@ mod tests {
     #[test]
     fn initial_snapshot_is_idle() {
         let state = test_state();
-        assert_eq!(state.snapshot(), WorkerStateSnapshot::initial(7));
+        assert_eq!(state.snapshot(), WorkerStateSnapshot::initial());
         assert_eq!(state.catalog_status(), WorkerStatus::Idle);
     }
 
     #[test]
-    fn transitions_increment_revision_only_when_state_changes() {
+    fn transitions_publish_full_state() {
         let state = test_state();
         let running = WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running));
-        let snapshot = state.transition(running.clone());
-        assert_eq!(snapshot.revision, 1);
-        assert_eq!(snapshot.state, running);
-        assert_eq!(state.transition(running).revision, 1);
+        assert_eq!(state.transition(running.clone()).state, running);
 
         let paused = WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Paused));
         let snapshot = state.transition(paused.clone());
-        assert_eq!(snapshot.revision, 2);
         assert_eq!(snapshot.state, paused);
+        assert_eq!(snapshot.last_command_id, 0);
         assert_eq!(state.catalog_status(), WorkerStatus::Paused);
     }
 
     #[test]
-    fn accepted_command_identity_advances_revision_and_detects_reuse_conflicts() {
+    fn accepted_command_identity_advances_last_id_and_detects_reuse_conflicts() {
         let state = test_state();
-        let envelope = WorkerCommandEnvelope {
-            command_id: 9,
-            expected_execution_generation: 7,
-            expected_worker_state_revision: 0,
-        };
+        let envelope = WorkerCommandEnvelope { command_id: 9 };
         assert_eq!(
-            state.admit_command(envelope, WorkerCommandKind::Pause, true),
+            state.admit_command(envelope, WorkerCommandKind::Pause),
             WorkerCommandAdmission::Accepted
         );
         assert_eq!(
             state.snapshot(),
             WorkerStateSnapshot {
-                execution_generation: 7,
-                revision: 1,
                 last_command_id: 9,
                 state: WorkerState::Idle,
             }
@@ -325,14 +294,14 @@ mod tests {
             Some(Some(WorkerCommandDisposition::Accepted))
         );
         assert_eq!(
-            state.admit_command(envelope, WorkerCommandKind::Pause, true),
+            state.admit_command(envelope, WorkerCommandKind::Pause),
             WorkerCommandAdmission::Retry
         );
         assert_eq!(
-            state.admit_command(envelope, WorkerCommandKind::Cancel, true),
+            state.admit_command(envelope, WorkerCommandKind::Cancel),
             WorkerCommandAdmission::Conflict
         );
-        assert_eq!(state.snapshot().revision, 1);
+        assert_eq!(state.snapshot().last_command_id, 9);
     }
 
     #[test]
@@ -343,8 +312,8 @@ mod tests {
         )));
         let parsed: serde_json::Value = serde_json::from_str(&state.status_json()).unwrap();
         assert_eq!(parsed["state"], "running");
-        assert_eq!(parsed["worker_state"]["execution_generation"], 7);
-        assert_eq!(parsed["worker_state"]["revision"], 1);
+        assert!(parsed["worker_state"].get("execution_generation").is_none());
+        assert!(parsed["worker_state"].get("revision").is_none());
         assert_eq!(parsed["worker_state"]["state"]["kind"], "busy");
         assert_eq!(parsed["worker_name"], "test-worker");
         assert!(parsed["segment_id"].is_string());

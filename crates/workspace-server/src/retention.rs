@@ -91,7 +91,6 @@ pub struct WorkerRemovalPlan {
     pub workspace_id: String,
     pub worker: RuntimeWorkerRef,
     pub worker_revision: String,
-    pub run_generation: u64,
     pub policy_id: String,
     pub policy_revision: u64,
     pub session_disposition: SessionDisposition,
@@ -219,7 +218,7 @@ impl SqliteWorkspaceStore {
             let plan_id=stable("wrp",&fp); let operation_id=stable("wro",&fp);
             let archive_id=(policy.session_disposition==SessionDisposition::Archive).then(||stable("wra",&fp));
             let state=if blockers.is_empty(){WorkerRemovalPlanState::Planned}else{WorkerRemovalPlanState::Blocked};
-            tx.execute("INSERT OR IGNORE INTO worker_removal_operations(operation_id,plan_id,input_fingerprint,workspace_id,runtime_id,worker_id,worker_revision,run_generation,policy_id,policy_revision,session_disposition,metadata_disposition,archive_retention_kind,archive_retention_seconds,diagnostics_disposition,diagnostics_retention_seconds,archive_id,blockers_json,state,reason,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?21)",params![operation_id,plan_id,fp,req.workspace_id,req.worker.runtime_id,req.worker.worker_id,worker.updated_at,inv.run_generation,policy.policy_id,policy.revision,sess(policy.session_disposition),meta(policy.metadata_disposition),archive_kind(policy.archive_retention),archive_seconds(policy.archive_retention),diag(policy.diagnostics_disposition),policy.diagnostics_retention_seconds,archive_id,serde_json::to_string(&blockers).map_err(|e|StoreError::InvalidInput(e.to_string()))?,state_s(state),req.reason,now])?;
+            tx.execute("INSERT OR IGNORE INTO worker_removal_operations(operation_id,plan_id,input_fingerprint,workspace_id,runtime_id,worker_id,worker_revision,policy_id,policy_revision,session_disposition,metadata_disposition,archive_retention_kind,archive_retention_seconds,diagnostics_disposition,diagnostics_retention_seconds,archive_id,blockers_json,state,reason,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?20)",params![operation_id,plan_id,fp,req.workspace_id,req.worker.runtime_id,req.worker.worker_id,worker.updated_at,policy.policy_id,policy.revision,sess(policy.session_disposition),meta(policy.metadata_disposition),archive_kind(policy.archive_retention),archive_seconds(policy.archive_retention),diag(policy.diagnostics_disposition),policy.diagnostics_retention_seconds,archive_id,serde_json::to_string(&blockers).map_err(|e|StoreError::InvalidInput(e.to_string()))?,state_s(state),req.reason,now])?;
             let plan=load_plan(&tx,&plan_id)?.ok_or_else(||StoreError::InvalidInput("plan missing".into()))?;
             if plan.input_fingerprint!=fp{return Err(StoreError::InvalidInput(format!("fingerprint:{}",plan.operation_id)));}
             tx.commit()?; Ok(plan)
@@ -304,7 +303,6 @@ impl SqliteWorkspaceStore {
                 source_runtime_id: plan.worker.runtime_id.clone(),
                 worker_id: worker_id,
                 expected_worker_revision: plan.worker_revision.clone(),
-                expected_run_generation: plan.run_generation,
                 source_created_at: worker.created_at,
                 removed_at,
                 effective_profile: worker.profile,
@@ -376,7 +374,6 @@ impl SqliteWorkspaceStore {
                 source_runtime_id: plan.worker.runtime_id.clone(),
                 worker_id: worker_id,
                 expected_worker_revision: plan.worker_revision.clone(),
-                expected_run_generation: plan.run_generation,
                 source_created_at: worker
                     .as_ref()
                     .map(|worker| worker.created_at.clone())
@@ -682,20 +679,20 @@ fn load_plan_op(c: &Connection, id: &str) -> crate::Result<Option<WorkerRemovalP
 fn load_plan_q(c: &Connection, key: &str, id: &str) -> crate::Result<Option<WorkerRemovalPlan>> {
     let query = format!(
         "SELECT plan_id,operation_id,input_fingerprint,workspace_id,runtime_id,worker_id,
-                worker_revision,run_generation,policy_id,policy_revision,session_disposition,
+                worker_revision,policy_id,policy_revision,session_disposition,
                 metadata_disposition,archive_retention_kind,archive_retention_seconds,
                 diagnostics_disposition,diagnostics_retention_seconds,archive_id,blockers_json,
                 state,reason,created_at,updated_at,failure_category
          FROM worker_removal_operations WHERE {key}=?1"
     );
     c.query_row(&query, params![id], |row| {
-        let session: String = row.get(10)?;
-        let metadata: String = row.get(11)?;
-        let archive_kind: String = row.get(12)?;
-        let archive_seconds: Option<i64> = row.get(13)?;
-        let diagnostics: String = row.get(14)?;
-        let blockers: String = row.get(17)?;
-        let state: String = row.get(18)?;
+        let session: String = row.get(9)?;
+        let metadata: String = row.get(10)?;
+        let archive_kind: String = row.get(11)?;
+        let archive_seconds: Option<i64> = row.get(12)?;
+        let diagnostics: String = row.get(13)?;
+        let blockers: String = row.get(16)?;
+        let state: String = row.get(17)?;
         Ok(WorkerRemovalPlan {
             plan_id: row.get(0)?,
             operation_id: row.get(1)?,
@@ -706,27 +703,26 @@ fn load_plan_q(c: &Connection, key: &str, id: &str) -> crate::Result<Option<Work
                 worker_id: row.get(5)?,
             },
             worker_revision: row.get(6)?,
-            run_generation: row.get::<_, i64>(7)? as u64,
-            policy_id: row.get(8)?,
-            policy_revision: row.get::<_, i64>(9)? as u64,
+            policy_id: row.get(7)?,
+            policy_revision: row.get::<_, i64>(8)? as u64,
             session_disposition: parse_s(&session)?,
             metadata_disposition: parse_m(&metadata)?,
             archive_retention: parse_archive(&archive_kind, archive_seconds)?,
             diagnostics_disposition: parse_d(&diagnostics)?,
-            diagnostics_retention_seconds: row.get::<_, Option<i64>>(15)?.map(|v| v as u64),
-            archive_id: row.get(16)?,
+            diagnostics_retention_seconds: row.get::<_, Option<i64>>(14)?.map(|v| v as u64),
+            archive_id: row.get(15)?,
             blockers: serde_json::from_str(&blockers).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    17,
+                    16,
                     rusqlite::types::Type::Text,
                     Box::new(error),
                 )
             })?,
             state: parse_state(&state)?,
-            reason: row.get(19)?,
-            created_at: row.get(20)?,
-            updated_at: row.get(21)?,
-            failure_category: row.get(22)?,
+            reason: row.get(18)?,
+            created_at: row.get(19)?,
+            updated_at: row.get(20)?,
+            failure_category: row.get(21)?,
         })
     })
     .optional()
@@ -755,7 +751,6 @@ fn fingerprint(
         r.worker.runtime_id,
         r.worker.worker_id,
         worker_revision,
-        i.run_generation,
         i.session_id,
         i.segment_ids,
         p.policy_id,
@@ -992,7 +987,6 @@ mod tests {
             workspace_id: "w".into(),
             runtime_id: "r".into(),
             worker_id: worker_id(),
-            run_generation: 2,
             session_id: Some("s".into()),
             segment_ids: vec!["a".into()],
             session_bytes: 1,
@@ -1139,13 +1133,12 @@ mod tests {
     }
 
     #[test]
-    fn prepared_execution_is_derived_from_pinned_plan_generation() {
+    fn prepared_execution_is_derived_from_pinned_plan() {
         let s = setup();
         let plan = s.plan_worker_removal(&req(), &inv()).unwrap();
         let prepared = s
             .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
             .unwrap();
-        assert_eq!(prepared.runtime_request.expected_run_generation, 2);
         assert_eq!(
             prepared.runtime_request.session_disposition,
             SessionDisposition::Archive
@@ -1264,7 +1257,6 @@ mod tests {
             workspace_id: "w".into(),
             runtime_id: "r".into(),
             worker_id: WorkerId::from_legacy_u64(2),
-            run_generation: 1,
             session_id: Some("orphan-session".into()),
             segment_ids: vec![],
             session_bytes: 10,

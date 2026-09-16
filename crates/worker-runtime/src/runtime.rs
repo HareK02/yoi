@@ -987,7 +987,6 @@ impl Runtime {
                 worker_state: None,
                 workspace_id: scope.map(|scope| scope.workspace_id.clone()),
                 request: durable_request,
-                run_generation: 1,
                 execution_bound: true,
                 restore_intent: WorkerRestoreIntent::Explicit,
                 working_directory: None,
@@ -999,7 +998,6 @@ impl Runtime {
             state.persist_worker(&worker_ref.worker_id)?;
             let spawn_request = WorkerExecutionSpawnRequest {
                 worker_ref: worker_ref.clone(),
-                run_generation: 1,
                 request,
                 workspace_scope: scope.cloned(),
                 context: self.execution_context(worker_ref.clone()),
@@ -1361,7 +1359,7 @@ impl Runtime {
         let (backend, request) = {
             let mut state = self.lock()?;
             state.ensure_running()?;
-            let (worker_request, previous_working_directory, run_generation) = {
+            let (worker_request, previous_working_directory) = {
                 let worker = state.worker(worker_ref)?;
                 if worker.execution_handle.is_some() {
                     if worker.status.is_active() {
@@ -1387,11 +1385,7 @@ impl Runtime {
                     }
                     _ => {}
                 }
-                (
-                    worker.request.clone(),
-                    worker.working_directory.clone(),
-                    worker.run_generation.saturating_add(1).max(1),
-                )
+                (worker.request.clone(), worker.working_directory.clone())
             };
             let backend = state.execution_backend.clone().ok_or_else(|| {
                 RuntimeError::WorkerExecutionUnavailable {
@@ -1401,7 +1395,6 @@ impl Runtime {
             })?;
             {
                 let worker = state.worker_mut(worker_ref)?;
-                worker.run_generation = run_generation;
                 worker.execution_bound = true;
             }
             state.persist_worker(&worker_ref.worker_id)?;
@@ -1413,7 +1406,6 @@ impl Runtime {
             });
             let request = WorkerExecutionRestoreRequest {
                 worker_ref: worker_ref.clone(),
-                run_generation,
                 request: worker_request,
                 workspace_scope,
                 context: self.execution_context(worker_ref.clone()),
@@ -1910,12 +1902,7 @@ impl Runtime {
         };
         let mut state = self.lock()?;
         let worker = state.worker_mut(worker_ref)?;
-        let applied = worker
-            .apply_worker_state(&snapshot)
-            .is_ok_and(|result| matches!(result, protocol::WorkerStateSnapshotApply::Applied));
-        if !applied {
-            return Ok(());
-        }
+        worker.apply_worker_state(&snapshot);
         state.publish_worker_upsert(worker_ref.worker_id)?;
         state.persist_runtime_snapshot()?;
         state.persist_worker(&worker_ref.worker_id)?;
@@ -2517,7 +2504,6 @@ impl Runtime {
             workspace_id,
             runtime_id,
             worker.worker_id,
-            worker.run_generation,
         )
     }
 
@@ -2588,12 +2574,6 @@ impl Runtime {
             return Err(RuntimeError::InvalidRequest(
                 "Worker retention requires a stopped Worker".to_string(),
             ));
-        }
-        if worker.run_generation != request.expected_run_generation {
-            return Err(RuntimeError::InvalidRequest(format!(
-                "Worker retention plan expected generation {}, current generation is {}",
-                request.expected_run_generation, worker.run_generation
-            )));
         }
         let result = provider.execute(request)?;
         state.workers.remove(&request.worker_id);
@@ -2758,7 +2738,6 @@ impl RuntimeState {
         let diagnostics = persisted.diagnostics;
         let next_diagnostic_id = persisted.next_diagnostic_id;
         for (worker_id, worker) in persisted.workers {
-            let run_generation = worker.execution.last_run_generation;
             workers.insert(
                 worker_id,
                 WorkerRecord {
@@ -2768,7 +2747,6 @@ impl RuntimeState {
                     worker_state: None,
                     workspace_id: worker.workspace_id,
                     request: worker.request,
-                    run_generation,
                     execution_bound: worker.execution.binding.is_some(),
                     restore_intent: worker.execution.restore_intent,
                     working_directory: worker.working_directory,
@@ -3563,14 +3541,8 @@ impl RuntimeState {
             } => snapshot,
             _ => return false,
         };
-        match worker.apply_worker_state(incoming) {
-            Ok(protocol::WorkerStateSnapshotApply::Applied) => true,
-            Ok(
-                protocol::WorkerStateSnapshotApply::Duplicate
-                | protocol::WorkerStateSnapshotApply::Stale,
-            )
-            | Err(_) => false,
-        }
+        worker.apply_worker_state(incoming);
+        true
     }
 }
 
@@ -3614,7 +3586,6 @@ struct WorkerRecord {
     worker_state: Option<protocol::WorkerStateSnapshot>,
     workspace_id: Option<String>,
     request: CreateWorkerRequest,
-    run_generation: u64,
     execution_bound: bool,
     restore_intent: WorkerRestoreIntent,
     working_directory: Option<CatalogWorkingDirectoryStatus>,
@@ -3623,17 +3594,8 @@ struct WorkerRecord {
 }
 
 impl WorkerRecord {
-    fn apply_worker_state(
-        &mut self,
-        incoming: &protocol::WorkerStateSnapshot,
-    ) -> Result<protocol::WorkerStateSnapshotApply, protocol::WorkerStateSnapshotConflict> {
-        match self.worker_state.as_mut() {
-            Some(current) => protocol::apply_worker_state_snapshot(current, incoming),
-            None => {
-                self.worker_state = Some(incoming.clone());
-                Ok(protocol::WorkerStateSnapshotApply::Applied)
-            }
-        }
+    fn apply_worker_state(&mut self, incoming: &protocol::WorkerStateSnapshot) {
+        self.worker_state = Some(incoming.clone());
     }
 
     fn belongs_to_workspace(&self, workspace_id: &str) -> bool {
@@ -3678,12 +3640,9 @@ impl WorkerRecord {
             request: self.request.clone(),
             status: self.status,
             execution: PersistedWorkerExecution {
-                last_run_generation: self.run_generation,
                 binding: self
                     .execution_bound
-                    .then_some(PersistedWorkerExecutionBinding {
-                        run_generation: self.run_generation,
-                    }),
+                    .then_some(PersistedWorkerExecutionBinding {}),
                 restore_intent: self.restore_intent,
             },
             workspace_id: self.workspace_id.clone(),
@@ -4028,11 +3987,7 @@ mod tests {
     }
 
     fn test_command() -> protocol::WorkerCommandEnvelope {
-        protocol::WorkerCommandEnvelope {
-            command_id: 1,
-            expected_execution_generation: 1,
-            expected_worker_state_revision: 0,
-        }
+        protocol::WorkerCommandEnvelope { command_id: 1 }
     }
 
     #[test]
@@ -4891,7 +4846,6 @@ mod tests {
         restore_result: Mutex<Option<WorkerExecutionSpawnResult>>,
         restore_gate: Mutex<Option<Arc<RestoreGate>>>,
         restore_count: Mutex<u64>,
-        run_generations: Mutex<Vec<u64>>,
         config_bundles: Mutex<Vec<Option<ConfigBundle>>>,
         workspace_config_fetches: Mutex<Vec<WorkspaceConfigFetchRequest>>,
         workspace_config_results: Mutex<Vec<WorkspaceConfigFetchResult>>,
@@ -4989,10 +4943,6 @@ mod tests {
         }
 
         fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
-            self.run_generations
-                .lock()
-                .unwrap()
-                .push(request.run_generation);
             self.config_bundles
                 .lock()
                 .unwrap()
@@ -5004,7 +4954,6 @@ mod tests {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
                 worker_state: protocol::WorkerStateSnapshot {
-                    execution_generation: request.run_generation,
                     ..protocol::WorkerStatus::Idle.into()
                 },
                 working_directory: request
@@ -5023,10 +4972,6 @@ mod tests {
             if let Some(gate) = restore_gate {
                 gate.enter_and_wait();
             }
-            self.run_generations
-                .lock()
-                .unwrap()
-                .push(request.run_generation);
             self.config_bundles
                 .lock()
                 .unwrap()
@@ -5041,7 +4986,6 @@ mod tests {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
                 worker_state: protocol::WorkerStateSnapshot {
-                    execution_generation: request.run_generation,
                     ..protocol::WorkerStatus::Idle.into()
                 },
                 working_directory: request
@@ -5962,11 +5906,8 @@ mod tests {
         assert_eq!(*backend.restore_count.lock().unwrap(), 1);
         assert_eq!(restored.status, WorkerStatus::Idle);
         assert_eq!(
-            restored
-                .worker_state
-                .as_ref()
-                .map(|state| state.execution_generation),
-            Some(2)
+            restored.worker_state.as_ref().map(|state| &state.state),
+            Some(&protocol::WorkerState::Idle)
         );
     }
 
@@ -6010,16 +5951,7 @@ mod tests {
         );
         assert_eq!(*backend.restore_count.lock().unwrap(), 1);
         assert_eq!(restored[0].worker_ref, restored[1].worker_ref);
-        assert_eq!(
-            restored[0]
-                .worker_state
-                .as_ref()
-                .map(|state| state.execution_generation),
-            restored[1]
-                .worker_state
-                .as_ref()
-                .map(|state| state.execution_generation)
-        );
+        assert_eq!(restored[0].worker_state, restored[1].worker_state);
         assert!(runtime.worker_operations.lock().unwrap().is_empty());
     }
 
@@ -6087,69 +6019,55 @@ mod tests {
         let worker_state = restored
             .worker_state
             .expect("restored Worker must expose its initial state");
-        assert_eq!(worker_state.execution_generation, 2);
+        assert_eq!(worker_state.last_command_id, 0);
         assert_eq!(worker_state.state, protocol::WorkerState::Idle);
     }
 
     #[test]
-    fn runtime_applies_only_newer_worker_state_snapshots() {
+    fn runtime_replaces_worker_state_with_each_full_snapshot() {
         let (runtime, _) = runtime_and_backend();
         let detail = runtime
-            .create_worker(task_request("state ordering"))
+            .create_worker(task_request("state replacement"))
             .unwrap();
         let running = protocol::WorkerStateSnapshot {
-            execution_generation: 7,
-            revision: 3,
             state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
                 protocol::WorkerRunState::Running,
             )),
             last_command_id: 2,
         };
-        assert!({
+        {
             let mut state = runtime.lock().unwrap();
-            state.project_protocol_event_to_worker_state(
+            assert!(state.project_protocol_event_to_worker_state(
                 &detail.worker_ref,
                 &protocol::Event::WorkerState {
                     snapshot: running.clone(),
                 },
-            )
-        });
+            ));
+        }
         assert_eq!(
             runtime
                 .worker_detail(&detail.worker_ref)
                 .unwrap()
                 .worker_state,
-            Some(running.clone())
+            Some(running)
         );
 
-        assert!({
+        let fresh = protocol::WorkerStateSnapshot {
+            state: protocol::WorkerState::Idle,
+            last_command_id: 0,
+        };
+        {
             let mut state = runtime.lock().unwrap();
-            !state.project_protocol_event_to_worker_state(
+            assert!(state.project_protocol_event_to_worker_state(
                 &detail.worker_ref,
                 &protocol::Event::WorkerState {
-                    snapshot: protocol::WorkerStateSnapshot {
-                        revision: 2,
-                        state: protocol::WorkerState::Idle,
-                        ..running.clone()
-                    },
+                    snapshot: fresh.clone(),
                 },
-            )
-        });
-        assert!({
-            let mut state = runtime.lock().unwrap();
-            !state.project_protocol_event_to_worker_state(
-                &detail.worker_ref,
-                &protocol::Event::WorkerState {
-                    snapshot: protocol::WorkerStateSnapshot {
-                        state: protocol::WorkerState::Idle,
-                        ..running.clone()
-                    },
-                },
-            )
-        });
+            ));
+        }
         let after = runtime.worker_detail(&detail.worker_ref).unwrap();
         assert_eq!(after.status, WorkerStatus::Idle);
-        assert_eq!(after.worker_state, Some(running));
+        assert_eq!(after.worker_state, Some(fresh));
     }
 
     #[test]
@@ -6369,7 +6287,6 @@ mod tests {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
                 worker_state: protocol::WorkerStateSnapshot {
-                    execution_generation: request.run_generation,
                     ..protocol::WorkerStatus::Idle.into()
                 },
                 working_directory: request
@@ -6468,15 +6385,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(*backend.restore_count.lock().unwrap(), 1);
-        assert_eq!(*backend.run_generations.lock().unwrap(), vec![1, 2]);
         let restored = runtime.worker_detail(&detail.worker_ref).unwrap();
         assert_eq!(restored.status, WorkerStatus::Idle);
         assert_eq!(
             restored
                 .worker_state
                 .as_ref()
-                .map(|snapshot| (snapshot.execution_generation, &snapshot.state)),
-            Some((2, &protocol::WorkerState::Idle))
+                .map(|snapshot| &snapshot.state),
+            Some(&protocol::WorkerState::Idle)
         );
     }
 
@@ -6828,7 +6744,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("unsupported Runtime store schema version 2; expected 3, 4, 5, or 6")
+                .contains("unsupported Runtime store schema version 2; expected 6 or 7")
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -6870,15 +6786,16 @@ mod tests {
         let worker_snapshot: serde_json::Value =
             serde_json::from_slice(&std::fs::read(worker_store_dir.join("worker.json")).unwrap())
                 .unwrap();
-        assert_eq!(worker_snapshot["schema_version"], serde_json::json!(6));
+        assert_eq!(worker_snapshot["schema_version"], serde_json::json!(7));
         assert_eq!(worker_snapshot["status"], serde_json::json!("stopped"));
-        assert_eq!(
-            worker_snapshot["execution"]["last_run_generation"],
-            serde_json::json!(1)
+        assert!(
+            worker_snapshot["execution"]
+                .get("last_run_generation")
+                .is_none()
         );
         assert_eq!(
-            worker_snapshot["execution"]["binding"]["run_generation"],
-            serde_json::json!(1)
+            worker_snapshot["execution"]["binding"],
+            serde_json::json!({})
         );
         assert_eq!(
             worker_snapshot["execution"]["restore_intent"],
@@ -7256,8 +7173,8 @@ mod tests {
 
     #[cfg(feature = "fs-store")]
     #[test]
-    fn fs_store_migrates_schema_v3_workers_to_stopped_explicit_restore() {
-        let root = fs_store_root("schema-v3-restore-intent");
+    fn fs_store_migrates_schema_v6_workers_without_losing_automatic_restore() {
+        let root = fs_store_root("schema-v6-no-generation");
         let options = crate::fs_store::FsRuntimeStoreOptions {
             root: root.clone(),
             runtime_id: "test-runtime".to_string(),
@@ -7270,7 +7187,7 @@ mod tests {
         .unwrap();
         runtime.store_config_bundle(test_bundle()).unwrap();
         let worker = runtime
-            .create_worker(task_request("schema v3 worker"))
+            .create_worker(task_request("schema v6 worker"))
             .unwrap();
         drop(runtime);
 
@@ -7281,7 +7198,7 @@ mod tests {
             .join("worker.json");
         let mut runtime_json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&runtime_path).unwrap()).unwrap();
-        runtime_json["schema_version"] = serde_json::json!(3);
+        runtime_json["schema_version"] = serde_json::json!(6);
         std::fs::write(
             &runtime_path,
             serde_json::to_vec_pretty(&runtime_json).unwrap(),
@@ -7289,10 +7206,9 @@ mod tests {
         .unwrap();
         let mut worker_json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&worker_path).unwrap()).unwrap();
-        worker_json["schema_version"] = serde_json::json!(3);
-        worker_json.as_object_mut().unwrap().remove("status");
-        worker_json.as_object_mut().unwrap().remove("execution");
-        worker_json["run_generation"] = serde_json::json!(7);
+        worker_json["schema_version"] = serde_json::json!(6);
+        worker_json["execution"]["last_run_generation"] = serde_json::json!(1);
+        worker_json["execution"]["binding"] = serde_json::json!({"run_generation": 1});
         std::fs::write(
             &worker_path,
             serde_json::to_vec_pretty(&worker_json).unwrap(),
@@ -7302,35 +7218,24 @@ mod tests {
         let backend = Arc::new(TestExecutionBackend::default());
         let migrated =
             Runtime::with_fs_store_and_execution_backend(options, backend.clone()).unwrap();
-        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
         assert_eq!(
             migrated.worker_detail(&worker.worker_ref).unwrap().status,
-            WorkerStatus::Stopped
+            WorkerStatus::Idle
         );
         let migrated_json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&worker_path).unwrap()).unwrap();
-        assert_eq!(migrated_json["schema_version"], serde_json::json!(6));
-        assert_eq!(migrated_json["status"], serde_json::json!("stopped"));
-        assert_eq!(
-            migrated_json["execution"]["last_run_generation"],
-            serde_json::json!(7)
-        );
-        assert_eq!(
-            migrated_json["execution"]["binding"],
-            serde_json::Value::Null
+        assert_eq!(migrated_json["schema_version"], serde_json::json!(7));
+        assert_eq!(migrated_json["execution"]["binding"], serde_json::json!({}));
+        assert!(
+            migrated_json["execution"]
+                .get("last_run_generation")
+                .is_none()
         );
         assert_eq!(
             migrated_json["execution"]["restore_intent"],
-            serde_json::json!("explicit")
+            serde_json::json!("automatic")
         );
-        assert!(matches!(
-            migrated.send_input(&worker.worker_ref, WorkerInput::notify("do not restore")),
-            Err(RuntimeError::WorkerExecutionUnavailable { .. })
-        ));
-
-        migrated.restore_worker(&worker.worker_ref).unwrap();
-        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
-        assert_eq!(backend.run_generations.lock().unwrap().as_slice(), &[8]);
 
         let _ = std::fs::remove_dir_all(root);
     }

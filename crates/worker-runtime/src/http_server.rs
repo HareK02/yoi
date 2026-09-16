@@ -3126,7 +3126,6 @@ mod tests {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
                 worker_state: protocol::WorkerStateSnapshot {
-                    execution_generation: request.run_generation,
                     ..protocol::WorkerStatus::Idle.into()
                 },
                 working_directory: request
@@ -3143,7 +3142,6 @@ mod tests {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
                 worker_state: protocol::WorkerStateSnapshot {
-                    execution_generation: request.run_generation,
                     ..protocol::WorkerStatus::Idle.into()
                 },
                 working_directory: request.previous_working_directory,
@@ -3561,7 +3559,6 @@ mod ws_tests {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
                 worker_state: protocol::WorkerStateSnapshot {
-                    execution_generation: request.run_generation,
                     ..protocol::WorkerStatus::Idle.into()
                 },
                 working_directory: request
@@ -3604,7 +3601,7 @@ mod ws_tests {
                     context_window: 0,
                     context_tokens: 0,
                 },
-                state: protocol::WorkerStateSnapshot::initial(1),
+                state: protocol::WorkerStateSnapshot::initial(),
                 in_flight: protocol::InFlightSnapshot {
                     blocks: Vec::new(),
                     commands: Vec::new(),
@@ -3833,7 +3830,6 @@ mod ws_tests {
                 .unwrap()
                 .worker_state
                 .expect("connected test Worker must expose its initial state");
-            snapshot.revision += 1;
             snapshot.state = protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
                 protocol::WorkerRunState::Running,
             ));

@@ -1135,7 +1135,7 @@ async fn manual_compact_cancel_clears_progress_before_returning_idle() {
         }
     }
 
-    let compact = protocol::WorkerCommandEnvelope::for_snapshot(1, &handle.shared_state.snapshot());
+    let compact = protocol::WorkerCommandEnvelope::new(1);
     handle
         .send(Method::Compact { command: compact })
         .await
@@ -1154,7 +1154,7 @@ async fn manual_compact_cancel_clears_progress_before_returning_idle() {
         }
     }
 
-    let cancel = protocol::WorkerCommandEnvelope::for_snapshot(2, &handle.shared_state.snapshot());
+    let cancel = protocol::WorkerCommandEnvelope::new(2);
     handle
         .send(Method::Cancel { command: cancel })
         .await
@@ -1183,7 +1183,7 @@ async fn manual_compact_cancel_clears_progress_before_returning_idle() {
         }
     }
 
-    let compact = protocol::WorkerCommandEnvelope::for_snapshot(3, &handle.shared_state.snapshot());
+    let compact = protocol::WorkerCommandEnvelope::new(3);
     handle
         .send(Method::Compact { command: compact })
         .await
@@ -1201,8 +1201,7 @@ async fn manual_compact_cancel_clears_progress_before_returning_idle() {
             break;
         }
     }
-    let shutdown =
-        protocol::WorkerCommandEnvelope::for_snapshot(4, &handle.shared_state.snapshot());
+    let shutdown = protocol::WorkerCommandEnvelope::new(4);
     handle
         .send(Method::Shutdown { command: shutdown })
         .await
@@ -1269,7 +1268,7 @@ async fn controller_compact_method_publishes_progress_and_clear() {
         }
     }
 
-    let command = protocol::WorkerCommandEnvelope::for_snapshot(1, &handle.shared_state.snapshot());
+    let command = protocol::WorkerCommandEnvelope::new(1);
     handle
         .send(Method::Compact { command })
         .await
@@ -1316,6 +1315,6 @@ async fn controller_compact_method_publishes_progress_and_clear() {
         protocol::WorkerStatus::Idle,
         "successful manual compaction must release the execution fence"
     );
-    let command = protocol::WorkerCommandEnvelope::for_snapshot(2, &handle.shared_state.snapshot());
+    let command = protocol::WorkerCommandEnvelope::new(2);
     let _ = handle.send(Method::Shutdown { command }).await;
 }

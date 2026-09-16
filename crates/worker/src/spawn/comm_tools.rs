@@ -138,10 +138,7 @@ mod tests {
         );
 
         let method = Method::Shutdown {
-            command: protocol::WorkerCommandEnvelope::for_snapshot(
-                1,
-                &protocol::WorkerStateSnapshot::initial(1),
-            ),
+            command: protocol::WorkerCommandEnvelope::new(1),
         };
         connect_and_send(&socket, &method).await.unwrap();
 

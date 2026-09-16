@@ -20,7 +20,6 @@ impl WorkerExecutionBackend for TestExecutionBackend {
         WorkerExecutionSpawnResult::connected(
             WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
             protocol::WorkerStateSnapshot {
-                execution_generation: request.run_generation,
                 ..protocol::WorkerStatus::Idle.into()
             },
             None,
@@ -182,7 +181,6 @@ async fn equal_downstream_selectors_share_one_upstream_subscription() {
         .worker_state
         .clone()
         .expect("connected test Worker must expose its initial state");
-    running.revision += 1;
     running.state = protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
         protocol::WorkerRunState::Running,
     ));
@@ -348,7 +346,6 @@ async fn embedded_runtime_uses_in_process_subscription_source() {
         .worker_state
         .clone()
         .expect("connected test Worker must expose its initial state");
-    running.revision += 1;
     running.state = protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
         protocol::WorkerRunState::Running,
     ));

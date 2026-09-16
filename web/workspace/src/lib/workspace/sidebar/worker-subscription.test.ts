@@ -37,8 +37,6 @@ function worker(
 Deno.test('Worker list state uses the authoritative live snapshot separately from lifecycle', () => {
   const active = worker('runtime-a', 'worker-1', 1);
   active.worker_state = {
-    execution_generation: 4,
-    revision: 2,
     last_command_id: 1,
     state: { kind: 'busy', state: { kind: 'run', state: 'paused' } },
   };

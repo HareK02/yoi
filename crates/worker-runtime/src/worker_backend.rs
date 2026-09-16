@@ -57,7 +57,7 @@ fn next_internal_command(
         })
         .unwrap_or(floor)
         .max(floor);
-    Ok(WorkerCommandEnvelope::for_snapshot(command_id, &snapshot))
+    Ok(WorkerCommandEnvelope::new(command_id))
 }
 use session_store::{CombinedStore, WorkerAggregateStore, WorkerSessionStore};
 #[cfg(test)]
@@ -401,6 +401,13 @@ impl ProfileRuntimeWorkerFactory {
                 "Runtime Worker aggregate root is not configured; global Session/metadata roots are migration-only"
                     .to_string()
             })
+    }
+
+    fn worker_run_dir(&self, worker_ref: &WorkerRef) -> Result<PathBuf, String> {
+        Ok(self
+            .worker_aggregate_dir(worker_ref)?
+            .join("runs")
+            .join(uuid::Uuid::now_v7().to_string()))
     }
 
     fn runtime_worker_name_for_ref(worker_ref: &crate::identity::WorkerRef) -> String {
@@ -898,9 +905,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             )?;
         let store = CombinedStore::new(session_store, worker_metadata_store);
 
-        let run_dir = worker_aggregate_dir
-            .join("runs")
-            .join(request.run_generation.to_string());
+        let run_dir = self.worker_run_dir(&request.worker_ref)?;
         let bash_output_dir = bash_output_dir_for_worker_id(&request.worker_ref.worker_id);
         let mut prepared = WorkerBootstrap::new(
             manifest,
@@ -1152,9 +1157,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         }
 
         let workspace_client = worker.workspace_client_handle();
-        let run_dir = worker_aggregate_dir
-            .join("runs")
-            .join(request.run_generation.to_string());
+        let run_dir = self.worker_run_dir(&request.worker_ref)?;
         let bash_output_dir = bash_output_dir_for_worker_id(&request.worker_ref.worker_id);
         let started = PreparedWorker::new(
             worker,
@@ -1745,25 +1748,17 @@ fn apply_protocol_worker_state(
     current: &Arc<RwLock<protocol::WorkerStateSnapshot>>,
     event: &mut Event,
 ) -> Result<bool, String> {
-    let (incoming, replace_stale) = match event {
-        Event::WorkerState { snapshot } => (snapshot, false),
-        Event::Snapshot { state, .. } => (state, true),
-        Event::CommandAcknowledged { acknowledgement } => (&mut acknowledgement.state, true),
+    let incoming = match event {
+        Event::WorkerState { snapshot } => snapshot,
+        Event::Snapshot { state, .. } => state,
+        Event::CommandAcknowledged { acknowledgement } => &mut acknowledgement.state,
         _ => return Ok(true),
     };
     let mut current = current
         .write()
         .map_err(|_| "worker state projection lock is poisoned".to_string())?;
-    match protocol::apply_worker_state_snapshot(&mut current, incoming) {
-        Ok(protocol::WorkerStateSnapshotApply::Applied)
-        | Ok(protocol::WorkerStateSnapshotApply::Duplicate) => Ok(true),
-        Ok(protocol::WorkerStateSnapshotApply::Stale) if replace_stale => {
-            *incoming = current.clone();
-            Ok(true)
-        }
-        Ok(protocol::WorkerStateSnapshotApply::Stale) => Ok(false),
-        Err(error) => Err(error.to_string()),
-    }
+    *current = incoming.clone();
+    Ok(true)
 }
 
 impl<F> WorkerExecutionBackend for WorkerRuntimeExecutionBackend<F>
@@ -2572,37 +2567,33 @@ mod tests {
             .read()
             .unwrap()
             .clone();
-        WorkerCommandEnvelope::for_snapshot(state.last_command_id.saturating_add(1), &state)
+        WorkerCommandEnvelope::new(state.last_command_id.saturating_add(1))
     }
 
     #[test]
-    fn protocol_bridge_applies_state_and_acknowledgement_monotonically() {
+    fn protocol_bridge_replaces_every_full_state_snapshot() {
         let running = protocol::WorkerStateSnapshot {
-            execution_generation: 4,
-            revision: 3,
             state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
                 protocol::WorkerRunState::Running,
             )),
             last_command_id: 2,
         };
-        let current = Arc::new(RwLock::new(running.clone()));
-        let mut stale = Event::WorkerState {
-            snapshot: protocol::WorkerStateSnapshot {
-                revision: 2,
-                state: protocol::WorkerState::Idle,
-                ..running.clone()
-            },
+        let current = Arc::new(RwLock::new(running));
+        let idle = protocol::WorkerStateSnapshot {
+            state: protocol::WorkerState::Idle,
+            last_command_id: 0,
         };
-        assert!(!apply_protocol_worker_state(&current, &mut stale).unwrap());
-        assert_eq!(*current.read().unwrap(), running);
+        let mut replacement = Event::WorkerState {
+            snapshot: idle.clone(),
+        };
+        assert!(apply_protocol_worker_state(&current, &mut replacement).unwrap());
+        assert_eq!(*current.read().unwrap(), idle);
 
         let paused = protocol::WorkerStateSnapshot {
-            revision: 4,
             state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
                 protocol::WorkerRunState::Paused,
             )),
             last_command_id: 3,
-            ..running.clone()
         };
         let mut acknowledgement = Event::CommandAcknowledged {
             acknowledgement: protocol::WorkerCommandAcknowledgement {
@@ -2613,15 +2604,6 @@ mod tests {
             },
         };
         assert!(apply_protocol_worker_state(&current, &mut acknowledgement).unwrap());
-        assert_eq!(*current.read().unwrap(), paused);
-
-        let mut conflict = Event::WorkerState {
-            snapshot: protocol::WorkerStateSnapshot {
-                state: protocol::WorkerState::Idle,
-                ..paused.clone()
-            },
-        };
-        assert!(apply_protocol_worker_state(&current, &mut conflict).is_err());
         assert_eq!(*current.read().unwrap(), paused);
     }
 
@@ -3037,7 +3019,6 @@ mod tests {
         ) -> Result<RuntimeWorkerController, String> {
             let request = WorkerExecutionSpawnRequest {
                 worker_ref: request.worker_ref,
-                run_generation: request.run_generation,
                 request: request.request,
                 workspace_scope: request.workspace_scope,
                 context: request.context,
@@ -3388,7 +3369,6 @@ mod tests {
             crate::identity::WorkerRef::new(crate::identity::WorkerId::from_legacy_u64(1));
         let request = WorkerExecutionSpawnRequest {
             worker_ref: worker_ref.clone(),
-            run_generation: 1,
             request: create_request("1"),
             workspace_scope: None,
             context: test_execution_context(worker_ref),
@@ -3518,7 +3498,6 @@ mod tests {
             .with_remote_worker_mutation_identity(identity)
             .restore_controller(WorkerExecutionRestoreRequest {
                 worker_ref: worker_ref.clone(),
-                run_generation: 1,
                 request,
                 workspace_scope: Some(crate::runtime::RuntimeWorkspaceScope::new(
                     "workspace-restore",
@@ -3583,11 +3562,13 @@ mod tests {
             )
             .unwrap();
 
-        let run_dir = runtime_store_dir
+        let runs_dir = runtime_store_dir
             .join("workers")
             .join(worker_ref.worker_id.to_string())
-            .join("runs/2");
-        let socket_path = run_dir.join("worker.sock");
+            .join("runs");
+        let socket_path = runs_dir
+            .join(uuid::Uuid::nil().to_string())
+            .join("worker.sock");
         assert!(
             socket_path.as_os_str().as_encoded_bytes().len() > 107,
             "test path must exceed Linux sockaddr_un.sun_path capacity: {}",
@@ -3599,7 +3580,6 @@ mod tests {
             .with_controller_transport(WorkerControllerTransport::InProcess)
             .restore_controller(WorkerExecutionRestoreRequest {
                 worker_ref: worker_ref.clone(),
-                run_generation: 2,
                 request: create_request("embedded restore"),
                 workspace_scope: None,
                 context: test_execution_context(worker_ref),
@@ -3614,7 +3594,12 @@ mod tests {
             controller.handle.shared_state.catalog_status(),
             WorkerStatus::Idle
         );
-        assert!(!socket_path.exists());
+        let run_dir = std::fs::read_dir(&runs_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .next()
+            .expect("restore must create one run artifact directory");
+        assert!(!run_dir.join("worker.sock").exists());
         assert!(run_dir.join("worker.out.log").is_file());
         assert!(run_dir.join("worker.err.log").is_file());
         let worker_state = Arc::new(RwLock::new(controller.handle.shared_state.snapshot()));
@@ -3726,10 +3711,16 @@ mod tests {
         let mut request = create_request("embedded singleton");
         request.profile = ProfileSelector::Builtin("default".to_string());
         let worker = runtime.create_worker(request).unwrap();
-        let first_run_socket = runtime_store_dir
+        let runs_dir = runtime_store_dir
             .join("workers")
             .join(worker.worker_id.to_string())
-            .join("runs/1/worker.sock");
+            .join("runs");
+        let first_run = std::fs::read_dir(&runs_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .next()
+            .expect("fresh launch must create one run artifact directory");
+        let first_run_socket = first_run.join("worker.sock");
         assert!(
             first_run_socket.as_os_str().as_encoded_bytes().len() > 107,
             "test path must exceed Linux sockaddr_un.sun_path capacity: {}",
@@ -3766,10 +3757,11 @@ mod tests {
             diagnostic.code == "worker_execution_restore_failed"
                 && diagnostic.worker_ref.as_ref() == Some(&worker.worker_ref)
         }));
-        let restored_run = runtime_store_dir
-            .join("workers")
-            .join(worker.worker_id.to_string())
-            .join("runs/2");
+        let restored_run = std::fs::read_dir(&runs_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path != &first_run)
+            .expect("restore must create a distinct run artifact directory");
         assert!(!restored_run.join("worker.sock").exists());
         assert!(restored_run.join("worker.out.log").is_file());
         assert!(restored_run.join("worker.err.log").is_file());

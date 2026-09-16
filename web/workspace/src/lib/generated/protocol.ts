@@ -10,16 +10,11 @@ export type CompletionKind = "file";
 
 export type WorkerStatus = "idle" | "running" | "paused" | "stopped";
 
-export type WorkerCommandEnvelope = {
-/**
- * Caller-owned sequence. A controller accepts command ids in strictly
- * increasing order for one execution generation.
- */
-command_id: number, expected_execution_generation: number, expected_worker_state_revision: number, };
+export type WorkerCommandEnvelope = { command_id: number, };
 
 export type WorkerCommandKind = "resume" | "cancel" | "pause" | "compact" | "shutdown";
 
-export type WorkerCommandDisposition = "accepted" | "stale_execution_generation" | "stale_worker_state_revision" | "stale_command_id" | "conflict" | "invalid_state";
+export type WorkerCommandDisposition = "accepted" | "stale_command_id" | "conflict" | "invalid_state";
 
 export type WorkerCommandAcknowledgement = { command_id: number, command: WorkerCommandKind, disposition: WorkerCommandDisposition,
 /**
@@ -35,9 +30,9 @@ export type WorkerBusyState = { "kind": "run", "state": WorkerRunState } | { "ki
 
 export type WorkerState = { "kind": "idle" } | { "kind": "busy", "state": WorkerBusyState };
 
-export type WorkerStateSnapshot = { execution_generation: number, revision: number,
+export type WorkerStateSnapshot = {
 /**
- * Highest lifecycle command id observed by this controller generation.
+ * Highest lifecycle command id observed by this controller instance.
  */
 last_command_id: number, state: WorkerState, };
 
