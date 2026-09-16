@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const SCHEMA_VERSION: u32 = 8;
 const PREVIOUS_SCHEMA_VERSION: u32 = 7;
+const LEGACY_SCHEMA_VERSION: u32 = 6;
 const RUNTIME_FILE: &str = "runtime.json";
 const WORKERS_DIR: &str = "workers";
 const WORKER_FILE: &str = "worker.json";
@@ -542,11 +543,14 @@ fn plan_runtime_store_migration(
         };
         return Ok((plan, Vec::new()));
     }
-    if current_schema_version != PREVIOUS_SCHEMA_VERSION {
+    if !matches!(
+        current_schema_version,
+        LEGACY_SCHEMA_VERSION | PREVIOUS_SCHEMA_VERSION
+    ) {
         return Err(runtime_store_corrupt(
             &runtime_path,
             format!(
-                "unsupported Runtime store schema version {schema_version}; expected {PREVIOUS_SCHEMA_VERSION} or {SCHEMA_VERSION}"
+                "unsupported Runtime store schema version {schema_version}; expected {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
             ),
         ));
     }
@@ -705,17 +709,83 @@ struct MigratedWorkerDocuments {
     execution: serde_json::Value,
 }
 
-fn migrate_worker_document(
+fn migrate_schema_v6_worker_document_to_v7(
     mut document: serde_json::Value,
+    identity_path: &Path,
+) -> Result<serde_json::Value, RuntimeError> {
+    let object = document.as_object_mut().ok_or_else(|| {
+        runtime_store_corrupt(
+            identity_path,
+            "Worker identity must be an object".to_string(),
+        )
+    })?;
+    let execution = object
+        .get_mut("execution")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| {
+            runtime_store_corrupt(
+                identity_path,
+                "Worker execution must be an object".to_string(),
+            )
+        })?;
+    let last_run_generation = execution
+        .remove("last_run_generation")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| {
+            runtime_store_corrupt(
+                identity_path,
+                "Worker execution last_run_generation must be an unsigned integer".to_string(),
+            )
+        })?;
+    if let Some(binding) = execution
+        .get_mut("binding")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        let binding_run_generation = binding
+            .remove("run_generation")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| {
+                runtime_store_corrupt(
+                    identity_path,
+                    "Worker execution binding run_generation must be an unsigned integer"
+                        .to_string(),
+                )
+            })?;
+        if binding_run_generation != last_run_generation {
+            return Err(runtime_store_corrupt(
+                identity_path,
+                format!(
+                    "Worker execution binding run_generation {binding_run_generation} does not match last_run_generation {last_run_generation}"
+                ),
+            ));
+        }
+    }
+    object.insert(
+        "schema_version".to_string(),
+        serde_json::Value::from(PREVIOUS_SCHEMA_VERSION),
+    );
+    Ok(document)
+}
+
+fn migrate_worker_document(
+    document: serde_json::Value,
     source_schema_version: u32,
     _mapping: Option<&LegacyWorkerIdentityMapping>,
     identity_path: &Path,
 ) -> Result<MigratedWorkerDocuments, RuntimeError> {
-    if source_schema_version != PREVIOUS_SCHEMA_VERSION {
+    let mut document = if source_schema_version == LEGACY_SCHEMA_VERSION {
+        migrate_schema_v6_worker_document_to_v7(document, identity_path)?
+    } else {
+        document
+    };
+    if !matches!(
+        source_schema_version,
+        LEGACY_SCHEMA_VERSION | PREVIOUS_SCHEMA_VERSION
+    ) {
         return Err(runtime_store_corrupt(
             identity_path,
             format!(
-                "unsupported Worker identity schema {source_schema_version}; expected {PREVIOUS_SCHEMA_VERSION}"
+                "unsupported Worker identity schema {source_schema_version}; expected {LEGACY_SCHEMA_VERSION} or {PREVIOUS_SCHEMA_VERSION}"
             ),
         ));
     }
@@ -2067,6 +2137,14 @@ mod tests {
         })
     }
 
+    fn schema_v6_worker_document(worker_id: WorkerId) -> serde_json::Value {
+        let mut document = schema_v7_worker_document(worker_id);
+        document["schema_version"] = serde_json::json!(LEGACY_SCHEMA_VERSION);
+        document["execution"]["last_run_generation"] = serde_json::json!(7);
+        document["execution"]["binding"] = serde_json::json!({ "run_generation": 7 });
+        document
+    }
+
     #[test]
     fn startup_recovers_staging_created_before_source_backup() {
         let temp = tempfile::tempdir().unwrap();
@@ -2161,6 +2239,126 @@ mod tests {
 
         assert!(matches!(error, RuntimeError::StoreCorrupt { .. }));
         assert!(error.to_string().contains("exceeds limit"));
+    }
+
+    #[test]
+    fn schema_v6_worker_migrates_through_v7_to_split_v8_records() {
+        let worker_id = WorkerId::now_v7();
+        let root = tempfile::tempdir().unwrap();
+        let identity_path = root
+            .path()
+            .join(WORKERS_DIR)
+            .join(worker_id.to_string())
+            .join(WORKER_FILE);
+        let migrated = migrate_worker_document(
+            schema_v6_worker_document(worker_id),
+            LEGACY_SCHEMA_VERSION,
+            None,
+            &identity_path,
+        )
+        .unwrap();
+
+        assert_eq!(migrated.identity["schema_version"], SCHEMA_VERSION);
+        assert!(migrated.identity.get("request").is_none());
+        assert!(migrated.identity.get("execution").is_none());
+        assert_eq!(migrated.execution["schema_version"], SCHEMA_VERSION);
+        assert_eq!(
+            migrated.execution["request"]["worker_id"],
+            worker_id.to_string()
+        );
+        assert_eq!(migrated.execution["binding"], serde_json::json!({}));
+        assert!(
+            migrated.execution.get("last_run_generation").is_none(),
+            "schema 7 removed the duplicated run generation authority"
+        );
+    }
+
+    #[test]
+    fn schema_v6_stopped_worker_preserves_explicit_restore_without_binding() {
+        let worker_id = WorkerId::now_v7();
+        let root = tempfile::tempdir().unwrap();
+        let identity_path = root
+            .path()
+            .join(WORKERS_DIR)
+            .join(worker_id.to_string())
+            .join(WORKER_FILE);
+        let mut source = schema_v6_worker_document(worker_id);
+        source["status"] = serde_json::json!("stopped");
+        source["execution"]["binding"] = serde_json::Value::Null;
+        source["execution"]["restore_intent"] = serde_json::json!("explicit");
+
+        let migrated =
+            migrate_worker_document(source, LEGACY_SCHEMA_VERSION, None, &identity_path).unwrap();
+
+        assert_eq!(migrated.identity["status"], "stopped");
+        assert_eq!(migrated.execution["binding"], serde_json::Value::Null);
+        assert_eq!(migrated.execution["restore_intent"], "explicit");
+    }
+
+    #[test]
+    fn schema_v6_worker_rejects_mismatched_run_generation_authority() {
+        let worker_id = WorkerId::now_v7();
+        let mut source = schema_v6_worker_document(worker_id);
+        source["execution"]["binding"]["run_generation"] = serde_json::json!(6);
+
+        let error = migrate_worker_document(
+            source,
+            LEGACY_SCHEMA_VERSION,
+            None,
+            Path::new("worker.json"),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not match last_run_generation 7")
+        );
+    }
+
+    #[test]
+    fn schema_v6_runtime_store_is_migrated_in_place() {
+        let root = tempfile::tempdir().unwrap();
+        write_empty_schema_v7_store(root.path());
+        let runtime_path = root.path().join(RUNTIME_FILE);
+        let mut runtime_document: serde_json::Value =
+            read_json(&runtime_path, "read test Runtime").unwrap();
+        runtime_document["schema_version"] = serde_json::json!(LEGACY_SCHEMA_VERSION);
+        atomic_write_json(&runtime_path, &runtime_document, "write test Runtime").unwrap();
+
+        let worker_id = WorkerId::now_v7();
+        let worker_dir = root.path().join(WORKERS_DIR).join(worker_id.to_string());
+        fs::create_dir_all(&worker_dir).unwrap();
+        atomic_write_json(
+            &worker_dir.join(WORKER_FILE),
+            &schema_v6_worker_document(worker_id.clone()),
+            "write test Worker",
+        )
+        .unwrap();
+
+        let opened =
+            FsRuntimeStore::open_or_create(root.path().to_path_buf(), "test-runtime").unwrap();
+
+        assert_eq!(
+            stored_schema_version(root.path()),
+            u64::from(SCHEMA_VERSION)
+        );
+        assert!(
+            opened
+                .store
+                .load_runtime_state()
+                .unwrap()
+                .workers
+                .contains_key(&worker_id)
+        );
+        assert!(worker_dir.join(WORKER_EXECUTION_FILE).exists());
+        let execution: serde_json::Value = read_json(
+            &worker_dir.join(WORKER_EXECUTION_FILE),
+            "read migrated test execution",
+        )
+        .unwrap();
+        assert_eq!(execution["schema_version"], SCHEMA_VERSION);
+        assert_eq!(execution["binding"], serde_json::json!({}));
     }
 
     #[test]

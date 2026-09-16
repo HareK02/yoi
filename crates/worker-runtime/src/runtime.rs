@@ -6998,7 +6998,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("unsupported Runtime store schema version 2; expected 7 or 8")
+                .contains("unsupported Runtime store schema version 2; expected 6, 7, or 8")
         );
 
         let _ = std::fs::remove_dir_all(root);
