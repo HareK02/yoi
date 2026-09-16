@@ -675,6 +675,14 @@ fn migrate_worker_document(
             "Worker snapshot must be an object".to_string(),
         )
     })?;
+    if let Some(run_generation) = object.remove("run_generation")
+        && run_generation.as_u64().is_none()
+    {
+        return Err(runtime_store_corrupt(
+            snapshot_path,
+            "Worker snapshot run_generation must be an unsigned integer".to_string(),
+        ));
+    }
     let execution = object
         .get_mut("execution")
         .and_then(serde_json::Value::as_object_mut)
@@ -1665,6 +1673,7 @@ mod tests {
         let path = Path::new("worker.json");
         let source = serde_json::json!({
             "schema_version": PREVIOUS_SCHEMA_VERSION,
+            "run_generation": 7,
             "status": "running",
             "execution": {
                 "last_run_generation": 7,
@@ -1680,6 +1689,7 @@ mod tests {
         assert_eq!(migrated["status"], "running");
         assert_eq!(migrated["execution"]["binding"], serde_json::json!({}));
         assert_eq!(migrated["execution"]["restore_intent"], "automatic");
+        assert!(migrated.get("run_generation").is_none());
         assert!(migrated["execution"].get("last_run_generation").is_none());
     }
 

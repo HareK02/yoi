@@ -7207,6 +7207,7 @@ mod tests {
         let mut worker_json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&worker_path).unwrap()).unwrap();
         worker_json["schema_version"] = serde_json::json!(6);
+        worker_json["run_generation"] = serde_json::json!(1);
         worker_json["execution"]["last_run_generation"] = serde_json::json!(1);
         worker_json["execution"]["binding"] = serde_json::json!({"run_generation": 1});
         std::fs::write(
@@ -7227,6 +7228,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&worker_path).unwrap()).unwrap();
         assert_eq!(migrated_json["schema_version"], serde_json::json!(7));
         assert_eq!(migrated_json["execution"]["binding"], serde_json::json!({}));
+        assert!(migrated_json.get("run_generation").is_none());
         assert!(
             migrated_json["execution"]
                 .get("last_run_generation")
