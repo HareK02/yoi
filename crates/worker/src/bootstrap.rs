@@ -67,6 +67,7 @@ pub struct PreparedWorker<C: LlmClient, St: Store> {
 pub struct BootstrappedWorker {
     pub handle: WorkerHandle,
     pub shutdown: ShutdownReceiver,
+    pub controller_task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug, Error)]
@@ -227,7 +228,7 @@ where
             runtime_base,
             bash_output_dir,
         } => {
-            WorkerController::spawn_with_transport(
+            WorkerController::spawn_with_transport_owned(
                 worker,
                 &runtime_base,
                 &bash_output_dir,
@@ -239,7 +240,7 @@ where
             run_dir,
             bash_output_dir,
         } => {
-            WorkerController::spawn_runtime_managed_run_with_transport(
+            WorkerController::spawn_runtime_managed_run_with_transport_owned(
                 worker,
                 &run_dir,
                 &bash_output_dir,
@@ -250,7 +251,11 @@ where
     };
 
     match controller {
-        Ok((handle, shutdown)) => Ok(BootstrappedWorker { handle, shutdown }),
+        Ok((handle, shutdown, controller_task)) => Ok(BootstrappedWorker {
+            handle,
+            shutdown,
+            controller_task,
+        }),
         Err(source) => {
             let cleanup_failed = match cleanup_session {
                 Some(session) => session.close().await.is_err(),

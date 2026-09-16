@@ -18,7 +18,7 @@ required-features = ["ws-server", "fs-store"]
 
 [features]
 default = ["ws-server", "fs-store"]
-fs-store = []
+fs-store = ["dep:fs4"]
 http-server = ["dep:axum", "dep:tower", "dep:reqwest"]
 ws-server = ["http-server", "axum/ws", "dep:futures", "tokio/sync"]
 
@@ -29,6 +29,7 @@ axum = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 decodal.workspace = true
 flow = { path = "../flow" }
+fs4 = { workspace = true, optional = true }
 manifest.workspace = true
 protocol.workspace = true
 serde = { workspace = true, features = ["derive"] }

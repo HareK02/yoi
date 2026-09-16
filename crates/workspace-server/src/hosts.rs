@@ -5064,6 +5064,11 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             DiagnosticSeverity::Warning,
             "Embedded Runtime rejected the request".to_string(),
         ),
+        EmbeddedRuntimeError::RuntimeStoreAlreadyOpen { .. } => diagnostic(
+            "embedded_runtime_store_already_open",
+            DiagnosticSeverity::Error,
+            "Embedded Runtime store is already owned by another Runtime process".to_string(),
+        ),
         EmbeddedRuntimeError::StoreIo { .. }
         | EmbeddedRuntimeError::StoreMissing { .. }
         | EmbeddedRuntimeError::StoreCorrupt { .. } => diagnostic(

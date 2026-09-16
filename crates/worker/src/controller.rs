@@ -486,7 +486,7 @@ impl WorkerController {
         C: LlmClient + Clone + 'static,
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
-        Self::spawn_inner(
+        let (handle, shutdown, _task) = Self::spawn_inner(
             worker,
             runtime_base,
             bash_output_dir,
@@ -494,7 +494,8 @@ impl WorkerController {
             None,
             WorkerControllerTransport::UnixSocket,
         )
-        .await
+        .await?;
+        Ok((handle, shutdown))
     }
 
     /// Spawn a direct Worker while letting an in-process host select the
@@ -505,6 +506,22 @@ impl WorkerController {
         bash_output_dir: &Path,
         transport: WorkerControllerTransport,
     ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
+    where
+        C: LlmClient + Clone + 'static,
+        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
+        let (handle, shutdown, _task) =
+            Self::spawn_with_transport_owned(worker, runtime_base, bash_output_dir, transport)
+                .await?;
+        Ok((handle, shutdown))
+    }
+
+    pub(crate) async fn spawn_with_transport_owned<C, St>(
+        worker: Worker<C, St>,
+        runtime_base: &Path,
+        bash_output_dir: &Path,
+        transport: WorkerControllerTransport,
+    ) -> Result<(WorkerHandle, ShutdownReceiver, tokio::task::JoinHandle<()>), std::io::Error>
     where
         C: LlmClient + Clone + 'static,
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
@@ -535,7 +552,7 @@ impl WorkerController {
         C: LlmClient + Clone + 'static,
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
-        Self::spawn_inner(
+        let (handle, shutdown, _task) = Self::spawn_inner(
             worker,
             runtime_base,
             bash_output_dir,
@@ -543,7 +560,8 @@ impl WorkerController {
             None,
             WorkerControllerTransport::UnixSocket,
         )
-        .await
+        .await?;
+        Ok((handle, shutdown))
     }
 
     /// Spawn into an exact persistent `runs/<generation>` directory.
@@ -577,6 +595,26 @@ impl WorkerController {
         C: LlmClient + Clone + 'static,
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
+        let (handle, shutdown, _task) = Self::spawn_runtime_managed_run_with_transport_owned(
+            worker,
+            run_dir,
+            bash_output_dir,
+            transport,
+        )
+        .await?;
+        Ok((handle, shutdown))
+    }
+
+    pub(crate) async fn spawn_runtime_managed_run_with_transport_owned<C, St>(
+        worker: Worker<C, St>,
+        run_dir: &Path,
+        bash_output_dir: &Path,
+        transport: WorkerControllerTransport,
+    ) -> Result<(WorkerHandle, ShutdownReceiver, tokio::task::JoinHandle<()>), std::io::Error>
+    where
+        C: LlmClient + Clone + 'static,
+        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
         let parent = run_dir
             .parent()
             .ok_or_else(|| std::io::Error::other("run path has no parent"))?;
@@ -598,7 +636,7 @@ impl WorkerController {
         runtime_managed: bool,
         runtime_run: Option<&Path>,
         transport: WorkerControllerTransport,
-    ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
+    ) -> Result<(WorkerHandle, ShutdownReceiver, tokio::task::JoinHandle<()>), std::io::Error>
     where
         C: LlmClient + Clone + 'static,
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
@@ -629,7 +667,7 @@ impl WorkerController {
         runtime_managed: bool,
         runtime_run: Option<&Path>,
         transport: WorkerControllerTransport,
-    ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
+    ) -> Result<(WorkerHandle, ShutdownReceiver, tokio::task::JoinHandle<()>), std::io::Error>
     where
         C: LlmClient + Clone + 'static,
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
@@ -729,9 +767,9 @@ impl WorkerController {
             None,
         )
         .await?;
-        if let Some(session) = fs_for_view.as_ref() {
-            wire_workdir_command_events(session, &in_flight);
-        }
+        let command_observer = fs_for_view
+            .as_ref()
+            .and_then(|session| wire_workdir_command_events(session, &in_flight));
 
         // Intake role Workers self-terminate only after a successful
         // TicketIntakeReady turn has fully settled back to Idle. The request
@@ -805,7 +843,7 @@ impl WorkerController {
         let pause_tx = worker.engine_mut().pause_sender();
         let notify_buffer = worker.notify_buffer_handle();
 
-        tokio::spawn(controller_loop(
+        let controller_task = tokio::spawn(controller_loop(
             worker,
             method_rx,
             working_event_tx,
@@ -820,26 +858,27 @@ impl WorkerController {
             shutdown_tx,
             socket_server,
             shutdown_after_idle,
+            command_observer,
         ));
 
-        Ok((handle, shutdown_rx))
+        Ok((handle, shutdown_rx, controller_task))
     }
 }
 
 pub(crate) fn wire_workdir_command_events(
     session: &Arc<dyn WorkdirSession>,
     in_flight: &InFlightEvents,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     in_flight.replace_command_snapshot(protocol_command_snapshots(session.as_ref()));
     let Some(mut events) = session.subscribe_command_events() else {
-        return;
+        return None;
     };
     // Keep only a weak reference in the observer task. Holding the session
     // strongly here would keep its broadcast sender alive forever and prevent
     // the receiver from observing closure during Worker teardown.
     let session = Arc::downgrade(session);
     let in_flight = in_flight.clone();
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         loop {
             match events.recv().await {
                 Ok(event) => in_flight.publish_command_event(protocol_command_event(event)),
@@ -853,7 +892,7 @@ pub(crate) fn wire_workdir_command_events(
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
-    });
+    }))
 }
 
 fn protocol_command_snapshots(session: &dyn WorkdirSession) -> Vec<ProtocolCommandSnapshot> {
@@ -1507,6 +1546,7 @@ async fn controller_loop<C, St>(
     shutdown_tx: oneshot::Sender<()>,
     socket_server: Option<SocketServer>,
     shutdown_after_idle: ShutdownAfterIdleRequest,
+    mut command_observer: Option<tokio::task::JoinHandle<()>>,
 ) where
     C: LlmClient + Clone + 'static,
     St: Store + WorkerMetadataStore + Clone + 'static,
@@ -2343,28 +2383,49 @@ async fn controller_loop<C, St>(
         }
     }
 
-    drop(_socket_server);
-    if let Err(error) = runtime_dir.close_socket().await {
-        tracing::warn!(%error, "Worker runtime socket cleanup failed");
+    let had_socket_server = _socket_server.is_some();
+    if let Some(socket_server) = _socket_server {
+        socket_server.shutdown().await;
+    }
+    while had_socket_server {
+        match runtime_dir.close_socket().await {
+            Ok(()) => break,
+            Err(error) => {
+                tracing::warn!(%error, "Worker runtime socket cleanup failed; retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
     }
 
     // Feature callbacks and tasks share the Worker scope. Stop them before
     // Memory/Workdir teardown so they cannot observe a partially closed Worker.
     worker.stop_feature_runtime("controller shutdown").await;
 
-    let child_cleanup_succeeded = match spawned_registry.shutdown_internal().await {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(%error, "Internal SubWorker cleanup failed before Workdir shutdown");
-            false
+    loop {
+        match spawned_registry.shutdown_internal().await {
+            Ok(()) => break,
+            Err(error) => {
+                tracing::warn!(%error, "Internal SubWorker cleanup failed; retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
         }
-    };
+    }
 
-    if child_cleanup_succeeded
-        && let Some(session) = worker.workdir_session()
-        && let Err(error) = session.close().await
-    {
-        tracing::warn!(%error, "Workdir session close failed");
+    if let Some(session) = worker.workdir_session() {
+        loop {
+            match session.close().await {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::warn!(%error, "Workdir session close failed; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    if let Some(observer) = command_observer.take() {
+        observer.abort();
+        let _ = observer.await;
     }
 
     // Report upward that this Worker is stopping before the controller

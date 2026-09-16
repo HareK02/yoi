@@ -2220,6 +2220,33 @@ async fn status_json_reflects_worker_name() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn shutdown_joins_socket_server_with_active_connection() {
+    use tokio::net::UnixStream;
+
+    let worker = make_worker(MockClient::new(simple_text_events())).await;
+    let runtime_base = tempfile::tempdir().unwrap();
+    let bash_output_dir = runtime_base.path().join("bash-output");
+    let (handle, shutdown_rx) =
+        WorkerController::spawn(worker, runtime_base.path(), &bash_output_dir)
+            .await
+            .unwrap();
+    let socket_path = handle.runtime_dir.socket_path();
+    let _connection = UnixStream::connect(&socket_path).await.unwrap();
+
+    handle
+        .send(Method::Shutdown {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), shutdown_rx)
+        .await
+        .expect("controller should join its socket tasks")
+        .expect("controller shutdown signal should remain open");
+    assert!(!socket_path.exists());
+}
+
+#[tokio::test]
 async fn socket_run_receives_events() {
     use protocol::stream::{JsonLineReader, JsonLineWriter};
     use tokio::net::UnixStream;

@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use protocol::stream::{JsonLineReader, JsonLineWriter};
 use tokio::net::UnixListener;
-use tokio::task::JoinHandle;
+use tokio::sync::oneshot;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::controller::WorkerHandle;
 use crate::ipc::protocol_session::{
@@ -19,7 +20,8 @@ use protocol::{ErrorCode, Event};
 /// - Client writes Method lines → forwarded to WorkerController
 /// - Worker events → written as Event lines to all connected clients
 pub struct SocketServer {
-    _accept_task: JoinHandle<()>,
+    accept_task: Option<JoinHandle<()>>,
+    shutdown: Option<oneshot::Sender<()>>,
     path: PathBuf,
 }
 
@@ -33,20 +35,45 @@ impl SocketServer {
 
         let listener = UnixListener::bind(&path)?;
         let handle = handle.clone();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
-        let _accept_task = tokio::spawn(async move {
+        let accept_task = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
             loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        let handle = handle.clone();
-                        tokio::spawn(handle_connection(stream, handle));
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    accepted = listener.accept() => match accepted {
+                        Ok((stream, _)) => {
+                            let handle = handle.clone();
+                            connections.spawn(handle_connection(stream, handle));
+                        }
+                        Err(_) => break,
+                    },
+                    completed = connections.join_next(), if !connections.is_empty() => {
+                        let _ = completed;
                     }
-                    Err(_) => break,
                 }
             }
+            connections.shutdown().await;
         });
 
-        Ok(Self { _accept_task, path })
+        Ok(Self {
+            accept_task: Some(accept_task),
+            shutdown: Some(shutdown_tx),
+            path,
+        })
+    }
+
+    /// Stop accepting connections and join the server task. Dropping its
+    /// `JoinSet` cancels every active connection task before this returns.
+    pub async fn shutdown(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(task) = self.accept_task.take() {
+            let _ = task.await;
+        }
+        let _ = tokio::fs::remove_file(&self.path).await;
     }
 
     /// The socket file path.
@@ -57,6 +84,10 @@ impl SocketServer {
 
 impl Drop for SocketServer {
     fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let _ = self.accept_task.take();
         let _ = std::fs::remove_file(&self.path);
     }
 }

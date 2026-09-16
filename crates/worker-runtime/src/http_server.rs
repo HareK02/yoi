@@ -2467,6 +2467,7 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
             StatusCode::NOT_FOUND
         }
         RuntimeError::RuntimeStopped
+        | RuntimeError::RuntimeStoreAlreadyOpen { .. }
         | RuntimeError::WorkerExecutionUnavailable { .. }
         | RuntimeError::ExecutionBackendUnavailable { .. }
         | RuntimeError::WorkerExecutionRejected { .. } => StatusCode::CONFLICT,
@@ -2488,6 +2489,7 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
 fn code_for_runtime_error(error: &RuntimeError) -> String {
     match error {
         RuntimeError::RuntimeStopped => "runtime_stopped".to_string(),
+        RuntimeError::RuntimeStoreAlreadyOpen { .. } => "runtime_store_already_open".to_string(),
         RuntimeError::WorkerNotFound { .. } => "worker_not_found".to_string(),
         RuntimeError::WorkerExecutionUnavailable { .. } => {
             "worker_execution_unavailable".to_string()

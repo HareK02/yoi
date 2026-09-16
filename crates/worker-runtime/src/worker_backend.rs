@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::time::Duration;
 
@@ -95,6 +95,7 @@ const USER_INPUT_COMMIT_TIMEOUT: Duration = Duration::from_secs(9);
 pub struct RuntimeWorkerController {
     pub handle: WorkerHandle,
     pub shutdown: Arc<tokio::sync::Mutex<Option<worker::ShutdownReceiver>>>,
+    pub controller_task: tokio::task::JoinHandle<()>,
     pub workspace_client: Arc<dyn WorkspaceClient>,
 }
 
@@ -978,7 +979,8 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 run_dir.display()
             ),
         })?;
-        let (handle, shutdown_rx) = (started.handle, started.shutdown);
+        let (handle, shutdown_rx, controller_task) =
+            (started.handle, started.shutdown, started.controller_task);
         if flow_transition_enabled {
             handle.shared_state.enable_flow_transition();
         }
@@ -990,6 +992,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         Ok(RuntimeWorkerController {
             handle,
             shutdown: Arc::new(tokio::sync::Mutex::new(Some(shutdown_rx))),
+            controller_task,
             workspace_client,
         })
     }
@@ -1172,7 +1175,8 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 run_dir.display()
             ),
         })?;
-        let (handle, shutdown_rx) = (started.handle, started.shutdown);
+        let (handle, shutdown_rx, controller_task) =
+            (started.handle, started.shutdown, started.controller_task);
         if flow_transition_enabled {
             handle.shared_state.enable_flow_transition();
         }
@@ -1184,8 +1188,108 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         Ok(RuntimeWorkerController {
             handle,
             shutdown: Arc::new(tokio::sync::Mutex::new(Some(shutdown_rx))),
+            controller_task,
             workspace_client,
         })
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeExecutionTaskScope {
+    tasks: Arc<Mutex<Vec<RuntimeExecutionTask>>>,
+    terminal_failure: Arc<Mutex<Option<String>>>,
+}
+
+struct RuntimeExecutionTask {
+    name: &'static str,
+    task: tokio::task::JoinHandle<()>,
+    abort_before_join: bool,
+}
+
+impl RuntimeExecutionTaskScope {
+    fn new(controller_task: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            tasks: Arc::new(Mutex::new(vec![RuntimeExecutionTask {
+                name: "controller",
+                task: controller_task,
+                abort_before_join: false,
+            }])),
+            terminal_failure: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn push(&self, name: &'static str, task: tokio::task::JoinHandle<()>, abort_before_join: bool) {
+        let mut tasks = match self.tasks.lock() {
+            Ok(tasks) => tasks,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        tasks.push(RuntimeExecutionTask {
+            name,
+            task,
+            abort_before_join,
+        });
+    }
+
+    fn abort_all(&self) {
+        let mut tasks = match self.tasks.lock() {
+            Ok(tasks) => tasks,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for task in tasks.drain(..) {
+            task.task.abort();
+        }
+    }
+
+    async fn join(&self) -> Result<(), String> {
+        if let Some(message) = self
+            .terminal_failure
+            .lock()
+            .map_err(|_| "execution task failure lock is poisoned".to_string())?
+            .clone()
+        {
+            return Err(message);
+        }
+
+        loop {
+            let next = {
+                let mut tasks = self
+                    .tasks
+                    .lock()
+                    .map_err(|_| "execution task registry lock is poisoned".to_string())?;
+                if tasks.is_empty() {
+                    None
+                } else {
+                    Some(tasks.remove(0))
+                }
+            };
+            let Some(mut task) = next else {
+                return Ok(());
+            };
+            let name = task.name;
+            if task.abort_before_join {
+                task.task.abort();
+            }
+            match tokio::time::timeout(Duration::from_secs(5), &mut task.task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if task.abort_before_join && error.is_cancelled() => {}
+                Ok(Err(error)) => {
+                    let message = format!("{name} task failed while stopping Worker: {error}");
+                    if let Ok(mut failure) = self.terminal_failure.lock() {
+                        *failure = Some(message.clone());
+                    }
+                    return Err(message);
+                }
+                Err(_) => {
+                    self.tasks
+                        .lock()
+                        .map_err(|_| "execution task registry lock is poisoned".to_string())?
+                        .insert(0, task);
+                    return Err(format!(
+                        "{name} task did not stop before timeout; stop remains retryable"
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -1193,6 +1297,8 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
 struct RuntimeWorkerExecution {
     handle: WorkerHandle,
     shutdown: Arc<tokio::sync::Mutex<Option<worker::ShutdownReceiver>>>,
+    shutdown_requested: Arc<AtomicBool>,
+    tasks: RuntimeExecutionTaskScope,
     worker_state: Arc<RwLock<protocol::WorkerStateSnapshot>>,
     workspace_client: Option<Arc<dyn WorkspaceClient>>,
 }
@@ -1261,7 +1367,10 @@ where
             .map_err(|err| format!("worker adapter task did not complete: {err}"))?
     }
 
-    fn spawn_on_adapter_runtime<Fut>(&self, task: Fut) -> Result<(), String>
+    fn spawn_on_adapter_runtime<Fut>(
+        &self,
+        task: Fut,
+    ) -> Result<tokio::task::JoinHandle<()>, String>
     where
         Fut: Future<Output = ()> + Send + 'static,
     {
@@ -1272,8 +1381,7 @@ where
         let runtime = runtime
             .as_ref()
             .ok_or_else(|| "worker adapter runtime is shutting down".to_string())?;
-        runtime.spawn(task);
-        Ok(())
+        Ok(runtime.spawn(task))
     }
 
     fn run_on_adapter_runtime<T, Fut>(&self, task: Fut) -> Result<T, String>
@@ -1461,6 +1569,44 @@ where
         .unwrap_or_else(|message| WorkerExecutionResult::errored(operation, message))
     }
 
+    fn cleanup_unconnected_controller(
+        &self,
+        handle: &WorkerHandle,
+        shutdown: &Arc<tokio::sync::Mutex<Option<worker::ShutdownReceiver>>>,
+        tasks: &RuntimeExecutionTaskScope,
+        worker_state: &Arc<RwLock<protocol::WorkerStateSnapshot>>,
+    ) -> Result<(), String> {
+        let command = next_internal_command(worker_state)?;
+        let handle = handle.clone();
+        let shutdown = shutdown.clone();
+        let tasks_for_join = tasks.clone();
+        let cleanup = self.run_on_adapter_runtime(async move {
+            handle
+                .send(Method::Shutdown { command })
+                .await
+                .map_err(|error| format!("failed to request controller cleanup: {error}"))?;
+            let mut guard = shutdown.lock().await;
+            if let Some(mut receiver) = guard.take() {
+                match tokio::time::timeout(Duration::from_secs(5), &mut receiver).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        return Err("controller cleanup completion channel closed".to_string());
+                    }
+                    Err(_) => {
+                        *guard = Some(receiver);
+                        return Err("controller cleanup confirmation timed out".to_string());
+                    }
+                }
+            }
+            drop(guard);
+            tasks_for_join.join().await
+        });
+        if cleanup.is_err() {
+            tasks.abort_all();
+        }
+        cleanup
+    }
+
     fn connect_handle(
         &self,
         operation: WorkerExecutionOperation,
@@ -1468,17 +1614,19 @@ where
         bridge_context: crate::execution::WorkerExecutionContext,
         handle: WorkerHandle,
         shutdown: Arc<tokio::sync::Mutex<Option<worker::ShutdownReceiver>>>,
+        controller_task: tokio::task::JoinHandle<()>,
         working_directory: Option<WorkingDirectoryBinding>,
         workspace_client: Option<Arc<dyn WorkspaceClient>>,
     ) -> WorkerExecutionSpawnResult {
         let worker_state = Arc::new(RwLock::new(handle.shared_state.snapshot()));
+        let tasks = RuntimeExecutionTaskScope::new(controller_task);
         #[cfg(feature = "ws-server")]
         {
             let streams = subscribe_worker_protocol_session(&handle);
             let mut events = streams.events;
             let mut entry_events = streams.log_entries;
             let bridge_worker_state = worker_state.clone();
-            if let Err(message) = self.spawn_on_adapter_runtime(async move {
+            let bridge_task = match self.spawn_on_adapter_runtime(async move {
                 loop {
                     tokio::select! {
                         event = events.recv() => {
@@ -1516,10 +1664,20 @@ where
                     }
                 }
             }) {
-                return WorkerExecutionSpawnResult::Errored(WorkerExecutionResult::errored(
-                    operation, message,
-                ));
-            }
+                Ok(task) => task,
+                Err(message) => {
+                    let cleanup = self
+                        .cleanup_unconnected_controller(&handle, &shutdown, &tasks, &worker_state)
+                        .err()
+                        .map(|cleanup| format!("; controller cleanup failed: {cleanup}"))
+                        .unwrap_or_default();
+                    return WorkerExecutionSpawnResult::Errored(WorkerExecutionResult::errored(
+                        operation,
+                        format!("{message}{cleanup}"),
+                    ));
+                }
+            };
+            tasks.push("protocol bridge", bridge_task, true);
         }
         #[cfg(not(feature = "ws-server"))]
         {
@@ -1529,12 +1687,29 @@ where
         let mut workers = match self.workers.lock() {
             Ok(workers) => workers,
             Err(_) => {
+                let cleanup = self
+                    .cleanup_unconnected_controller(&handle, &shutdown, &tasks, &worker_state)
+                    .err()
+                    .map(|cleanup| format!("; controller cleanup failed: {cleanup}"))
+                    .unwrap_or_default();
                 return WorkerExecutionSpawnResult::Errored(WorkerExecutionResult::errored(
                     operation,
-                    "worker adapter registry lock is poisoned",
+                    format!("worker adapter registry lock is poisoned{cleanup}"),
                 ));
             }
         };
+        if workers.contains_key(&worker_ref) {
+            drop(workers);
+            let cleanup = self
+                .cleanup_unconnected_controller(&handle, &shutdown, &tasks, &worker_state)
+                .err()
+                .map(|cleanup| format!("; controller cleanup failed: {cleanup}"))
+                .unwrap_or_default();
+            return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::busy(
+                operation,
+                format!("Worker is already connected to execution backend{cleanup}"),
+            ));
+        }
         let connected_worker_state = worker_state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1544,6 +1719,8 @@ where
             RuntimeWorkerExecution {
                 handle,
                 shutdown,
+                shutdown_requested: Arc::new(AtomicBool::new(false)),
+                tasks,
                 worker_state,
                 workspace_client,
             },
@@ -1820,6 +1997,7 @@ where
             bridge_context,
             controller.handle,
             controller.shutdown,
+            controller.controller_task,
             working_directory,
             Some(controller.workspace_client),
         )
@@ -1919,6 +2097,7 @@ where
             bridge_context,
             controller.handle,
             controller.shutdown,
+            controller.controller_task,
             working_directory,
             Some(controller.workspace_client),
         )
@@ -2103,48 +2282,69 @@ where
             }
         };
         let Some(execution) = execution else {
-            return WorkerExecutionResult::rejected(
-                WorkerExecutionOperation::Stop,
-                "execution handle does not reference a live Worker",
-            );
+            // The execution backend cleanup may have committed before the
+            // Runtime catalog commit failed. Treat the retry as converged so
+            // the Runtime can durably finish its Stopped transition.
+            return WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop);
         };
-        let artifact_cleanup = execution.handle.clone();
-        let shutdown = execution.shutdown.clone();
-        let command = match next_internal_command(&execution.worker_state) {
-            Ok(command) => command,
-            Err(error) => {
-                return WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, error);
-            }
-        };
-        let result = self.send_method(
-            WorkerExecutionOperation::Stop,
-            execution.handle.clone(),
-            Method::Shutdown { command },
-        );
-        if result.outcome != crate::execution::WorkerExecutionOutcome::Accepted {
-            return result;
-        }
-        let shutdown_wait = self.run_on_adapter_runtime(async move {
-            let mut guard = shutdown.lock().await;
-            let Some(mut receiver) = guard.take() else {
-                return Ok(());
+
+        let first_request = !execution.shutdown_requested.swap(true, Ordering::AcqRel);
+        let result = if first_request {
+            let command = match next_internal_command(&execution.worker_state) {
+                Ok(command) => command,
+                Err(error) => {
+                    execution.shutdown_requested.store(false, Ordering::Release);
+                    return WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, error);
+                }
             };
-            match tokio::time::timeout(Duration::from_secs(5), &mut receiver).await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(_)) => Err("Worker shutdown completion channel closed".to_string()),
-                Err(_) => {
-                    *guard = Some(receiver);
-                    Err("Worker shutdown confirmation timed out; stop remains retryable".into())
+            let result = self.send_method(
+                WorkerExecutionOperation::Stop,
+                execution.handle.clone(),
+                Method::Shutdown { command },
+            );
+            if result.outcome != crate::execution::WorkerExecutionOutcome::Accepted {
+                execution.shutdown_requested.store(false, Ordering::Release);
+                return result;
+            }
+            result
+        } else {
+            WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop)
+        };
+
+        let shutdown = execution.shutdown.clone();
+        let tasks = execution.tasks.clone();
+        let shutdown_wait = self.run_on_adapter_runtime(async move {
+            {
+                let mut guard = shutdown.lock().await;
+                if let Some(mut receiver) = guard.take() {
+                    match tokio::time::timeout(Duration::from_secs(5), &mut receiver).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => {
+                            return Err("Worker shutdown completion channel closed".to_string());
+                        }
+                        Err(_) => {
+                            *guard = Some(receiver);
+                            return Err(
+                                "Worker shutdown confirmation timed out; stop remains retryable"
+                                    .to_string(),
+                            );
+                        }
+                    }
                 }
             }
+            tasks.join().await
         });
         if let Err(message) = shutdown_wait {
             return WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message);
         }
-        let artifact_cleanup_error = artifact_cleanup
-            .delete_uncommitted_uploaded_files()
-            .err()
-            .map(|error| format!("uploaded_file_cleanup_failed: {error}"));
+
+        if let Err(error) = execution.handle.delete_uncommitted_uploaded_files() {
+            return WorkerExecutionResult::errored(
+                WorkerExecutionOperation::Stop,
+                format!("uploaded_file_cleanup_failed: {error}; stop remains retryable"),
+            );
+        }
+
         match self.workers.lock() {
             Ok(mut workers) => {
                 workers.remove(handle.worker_ref());
@@ -2153,13 +2353,7 @@ where
                 poisoned.into_inner().remove(handle.worker_ref());
             }
         }
-        if let Some(message) = artifact_cleanup_error {
-            let mut result = result;
-            result.message = Some(message);
-            result
-        } else {
-            result
-        }
+        result
     }
 
     fn cancel_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
@@ -2351,14 +2545,6 @@ mod tests {
             claims.path,
             "/api/w/workspace-b/runtime-config?profile=coder"
         );
-    }
-
-    fn test_command() -> WorkerCommandEnvelope {
-        WorkerCommandEnvelope {
-            command_id: 1,
-            expected_execution_generation: 1,
-            expected_worker_state_revision: 0,
-        }
     }
 
     fn adapter_command(
@@ -2828,6 +3014,7 @@ mod tests {
             Ok(RuntimeWorkerController {
                 handle,
                 shutdown: Arc::new(tokio::sync::Mutex::new(Some(shutdown_rx))),
+                controller_task: tokio::spawn(async {}),
                 workspace_client,
             })
         }
@@ -3343,7 +3530,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let long_component = "embedded-workspace-store-segment".repeat(4);
         let runtime_store_dir = root.path().join(long_component);
-        let worker_ref = WorkerRef::new(crate::identity::WorkerId::from_legacy_u64(1));
+        let worker_ref = WorkerRef::new(crate::identity::WorkerId::now_v7());
         let worker_aggregate_dir = runtime_store_dir
             .join("workers")
             .join(worker_ref.worker_id.to_string());
@@ -3417,16 +3604,24 @@ mod tests {
         assert!(!socket_path.exists());
         assert!(run_dir.join("worker.out.log").is_file());
         assert!(run_dir.join("worker.err.log").is_file());
+        let worker_state = Arc::new(RwLock::new(controller.handle.shared_state.snapshot()));
         controller
             .handle
             .send(Method::Shutdown {
-                command: test_command(),
+                command: next_internal_command(&worker_state).unwrap(),
             })
             .await
             .unwrap();
         if let Some(receiver) = controller.shutdown.lock().await.take() {
-            receiver.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), receiver)
+                .await
+                .expect("controller shutdown signal timed out")
+                .unwrap();
         }
+        tokio::time::timeout(Duration::from_secs(5), controller.controller_task)
+            .await
+            .expect("controller task join timed out")
+            .unwrap();
         assert!(!socket_path.exists());
     }
 
@@ -3529,25 +3724,8 @@ mod tests {
         );
         assert!(!first_run_socket.exists());
 
-        let (handle, shutdown) = {
-            let workers = backend.workers.lock().unwrap();
-            let execution = workers.get(&worker.worker_ref).unwrap();
-            (execution.handle.clone(), execution.shutdown.clone())
-        };
-        backend
-            .run_on_adapter_runtime(async move {
-                handle
-                    .send(Method::Shutdown {
-                        command: test_command(),
-                    })
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if let Some(receiver) = shutdown.lock().await.take() {
-                    receiver.await.map_err(|error| error.to_string())?;
-                }
-                Ok(())
-            })
-            .unwrap();
+        let handle = WorkerExecutionHandle::new(worker.worker_ref.clone(), backend.backend_id());
+        assert!(backend.stop_worker(&handle).is_accepted());
         drop(runtime);
         drop(backend);
 

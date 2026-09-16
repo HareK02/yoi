@@ -79,6 +79,9 @@ pub enum RuntimeError {
         name: String,
     },
 
+    #[error("Runtime store is already owned by another process")]
+    RuntimeStoreAlreadyOpen { path: PathBuf },
+
     #[error("runtime store {operation} failed at {}: {source}", path.display())]
     StoreIo {
         operation: &'static str,

@@ -6070,6 +6070,7 @@ dependencies = [
  "base64 0.22.1",
  "decodal",
  "flow",
+ "fs4",
  "futures",
  "manifest",
  "protocol",

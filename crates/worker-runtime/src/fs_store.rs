@@ -8,11 +8,13 @@ use crate::identity::{
     LegacyWorkerIdentityMapping, WorkerId, WorkerRef, legacy_worker_identity_mapping_digest,
 };
 use crate::management::{RuntimeBackendKind, RuntimeStatus};
+use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const SCHEMA_VERSION: u32 = 6;
@@ -50,25 +52,47 @@ impl FsRuntimeStoreOptions {
     }
 }
 
+#[derive(Debug)]
+struct RuntimeStoreOwnerLock {
+    file: File,
+}
+
+impl Drop for RuntimeStoreOwnerLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
 /// Filesystem persistence boundary for one Worker Runtime state.
 ///
 /// Authority is the Workspace-owned typed Worker identity. Legacy pod paths, socket
 /// paths, and session paths are deliberately not part of the layout or lookup API.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct FsRuntimeStore {
     root: PathBuf,
+    _owner_lock: Option<Arc<RuntimeStoreOwnerLock>>,
 }
+
+impl PartialEq for FsRuntimeStore {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root
+    }
+}
+
+impl Eq for FsRuntimeStore {}
 
 impl FsRuntimeStore {
     pub fn migration_plan(
         options: &FsRuntimeStoreOptions,
     ) -> Result<FsRuntimeStoreMigrationPlan, RuntimeError> {
+        let _owner_lock = acquire_runtime_store_owner_lock(&options.root)?;
         plan_runtime_store_migration(&options.root, &options.runtime_id).map(|(plan, _)| plan)
     }
 
     pub fn migrate(
         options: &FsRuntimeStoreOptions,
     ) -> Result<FsRuntimeStoreMigrationPlan, RuntimeError> {
+        let _owner_lock = acquire_runtime_store_owner_lock(&options.root)?;
         migrate_runtime_store(&options.root, &options.runtime_id)
     }
 
@@ -93,6 +117,15 @@ impl FsRuntimeStore {
             });
         }
 
+        if !existed {
+            fs::create_dir_all(&root).map_err(|source| RuntimeError::StoreIo {
+                operation: "create runtime store root",
+                path: root.clone(),
+                source,
+            })?;
+        }
+        let owner_lock = acquire_runtime_store_owner_lock(&root)?;
+
         fs::create_dir_all(root.join(WORKERS_DIR)).map_err(|source| RuntimeError::StoreIo {
             operation: "create runtime store",
             path: root.join(WORKERS_DIR),
@@ -114,7 +147,10 @@ impl FsRuntimeStore {
         if existed {
             migrate_runtime_store(&root, runtime_id)?;
         }
-        let store = Self { root };
+        let store = Self {
+            root,
+            _owner_lock: Some(owner_lock),
+        };
         let state = if existed {
             Some(store.load_runtime_state()?)
         } else {
@@ -253,6 +289,61 @@ impl FsRuntimeStore {
 
     fn worker_dir(&self, worker_id: &WorkerId) -> PathBuf {
         self.root.join(WORKERS_DIR).join(worker_id.to_string())
+    }
+}
+
+fn acquire_runtime_store_owner_lock(
+    root: &Path,
+) -> Result<Arc<RuntimeStoreOwnerLock>, RuntimeError> {
+    let canonical_root = fs::canonicalize(root).map_err(|source| RuntimeError::StoreIo {
+        operation: "resolve runtime store owner lock",
+        path: root.to_path_buf(),
+        source,
+    })?;
+    let parent = canonical_root
+        .parent()
+        .ok_or_else(|| RuntimeError::StoreCorrupt {
+            operation: "resolve runtime store owner lock",
+            path: root.to_path_buf(),
+            message: "runtime store root has no parent".to_string(),
+        })?;
+    let name = canonical_root
+        .file_name()
+        .ok_or_else(|| RuntimeError::StoreCorrupt {
+            operation: "resolve runtime store owner lock",
+            path: root.to_path_buf(),
+            message: "runtime store root has no file name".to_string(),
+        })?;
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(name);
+    lock_name.push(".runtime-owner.lock");
+    let lock_path = parent.join(lock_name);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|source| RuntimeError::StoreIo {
+            operation: "open runtime store owner lock",
+            path: root.to_path_buf(),
+            source,
+        })?;
+    match file.try_lock_exclusive() {
+        Ok(true) => Ok(Arc::new(RuntimeStoreOwnerLock { file })),
+        Ok(false) => Err(RuntimeError::RuntimeStoreAlreadyOpen {
+            path: root.to_path_buf(),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(RuntimeError::RuntimeStoreAlreadyOpen {
+                path: root.to_path_buf(),
+            })
+        }
+        Err(source) => Err(RuntimeError::StoreIo {
+            operation: "acquire runtime store owner lock",
+            path: root.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -1193,6 +1284,7 @@ fn migrate_runtime_store(
     };
     let staged_store = FsRuntimeStore {
         root: staging.clone(),
+        _owner_lock: None,
     };
     if let Err(error) = staged_store.load_runtime_state() {
         let _ = fs::remove_dir_all(&staging);
@@ -1627,6 +1719,62 @@ fn sync_directory(path: &Path, operation: &'static str) -> Result<(), RuntimeErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_store_owner_lock_child_probe() {
+        let Some(root) = std::env::var_os("YOI_TEST_RUNTIME_STORE_LOCK_ROOT") else {
+            return;
+        };
+        assert!(matches!(
+            FsRuntimeStore::open_or_create(PathBuf::from(root), "runtime-test").unwrap_err(),
+            RuntimeError::RuntimeStoreAlreadyOpen { .. }
+        ));
+    }
+
+    #[test]
+    fn second_runtime_store_open_conflicts_before_store_mutation() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("runtime-store");
+        let first = FsRuntimeStore::open_or_create(root.clone(), "runtime-test").unwrap();
+        let legacy_events = root.join("events.jsonl");
+        fs::write(&legacy_events, b"must remain").unwrap();
+
+        let error = FsRuntimeStore::open_or_create(root.clone(), "runtime-test").unwrap_err();
+
+        assert!(matches!(
+            error,
+            RuntimeError::RuntimeStoreAlreadyOpen { path } if path == root
+        ));
+        assert_eq!(fs::read(&legacy_events).unwrap(), b"must remain");
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("fs_store::tests::runtime_store_owner_lock_child_probe")
+            .arg("--exact")
+            .env("YOI_TEST_RUNTIME_STORE_LOCK_ROOT", &root)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "cross-process lock probe failed: {}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("owner.lock")
+        }));
+
+        let retained_clone = first.store.clone();
+        drop(first);
+        assert!(matches!(
+            FsRuntimeStore::open_or_create(root.clone(), "runtime-test").unwrap_err(),
+            RuntimeError::RuntimeStoreAlreadyOpen { .. }
+        ));
+        drop(retained_clone);
+        fs::remove_dir_all(&root).unwrap();
+        FsRuntimeStore::open_or_create(root, "runtime-test").unwrap();
+    }
 
     #[test]
     fn schema_v4_migration_plan_ignores_orphan_worker_directories() {
