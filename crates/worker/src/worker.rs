@@ -3617,6 +3617,21 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .is_some_and(|state| state.pre_run_eligible(self.total_tokens().tokens))
     }
 
+    /// Materialize the initial durable session head without running the model.
+    ///
+    /// Runtime-managed Workers call this before creation is accepted so even a
+    /// zero-input Worker has an authoritative restore snapshot independent of
+    /// operation-owned launch configuration.
+    pub async fn materialize_durable_session_head(&mut self) -> Result<(), WorkerError>
+    where
+        St: Clone + 'static,
+    {
+        self.refresh_prompt_projection_for_future_operations()?;
+        self.ensure_system_prompt_materialized().await?;
+        self.ensure_segment_head().await?;
+        Ok(())
+    }
+
     /// Prelude shared by `run` / `run_for_notification` / `resume`.
     /// Wires up worker hooks, ensures the session is materialized on the
     /// store, and runs pre-run compact (joining any in-flight memory task
@@ -3625,10 +3640,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     where
         St: Clone + 'static,
     {
-        self.refresh_prompt_projection_for_future_operations()?;
+        self.materialize_durable_session_head().await?;
         self.ensure_interceptor_installed();
-        self.ensure_system_prompt_materialized().await?;
-        self.ensure_segment_head().await?;
         if self.should_pre_run_compact() {
             self.try_pre_run_compact().await;
         }
@@ -9443,6 +9456,29 @@ mod build_summary_prompt_tests {
         fn all(enabled: bool) -> Self {
             Self { summary: enabled }
         }
+    }
+
+    #[tokio::test]
+    async fn materialize_durable_session_head_commits_without_model_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store,
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone()),
+            Scope::writable(&cwd).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        worker.materialize_durable_session_head().await.unwrap();
+
+        assert_eq!(worker.segment_state.entries_written(), 1);
+        assert!(worker.history().is_empty());
     }
 
     #[tokio::test]

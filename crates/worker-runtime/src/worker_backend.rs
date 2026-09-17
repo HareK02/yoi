@@ -974,6 +974,10 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             }
         }
 
+        worker
+            .materialize_durable_session_head()
+            .await
+            .map_err(|error| format!("materialize durable Worker session head: {error}"))?;
         let workspace_client = worker.workspace_client_handle();
         let started = prepared.start().await.map_err(|error| match error {
             WorkerBootstrapError::Worker(source) => {

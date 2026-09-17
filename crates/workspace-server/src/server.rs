@@ -10398,6 +10398,17 @@ async fn scoped_capture_worker_observation_session(
     })))
 }
 
+fn diagnostics_indicate_unrecoverable_pending_workspace_restore(
+    diagnostics: &[RuntimeDiagnostic],
+) -> bool {
+    diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "embedded_worker_execution_rejected"
+            && diagnostic.message.to_ascii_lowercase().contains(
+                "pending workspace worker restore requires operation-owned launch material",
+            )
+    })
+}
+
 async fn scoped_start_workspace_orchestrator(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -10414,6 +10425,7 @@ async fn scoped_start_workspace_orchestrator(
         )
     })?;
 
+    let mut disposition = "created";
     if let Some(existing) = find_workspace_orchestrator(&api) {
         if workspace_orchestrator_is_online(&existing) {
             return Ok(Json(workspace_orchestrator_response(&api, "existing")));
@@ -10422,7 +10434,14 @@ async fn scoped_start_workspace_orchestrator(
             .runtime
             .restore_worker(&existing.worker)
             .map_err(|error| error.into_error())?;
-        if restored.state != WorkerOperationState::Accepted {
+        if restored.state == WorkerOperationState::Accepted {
+            *api.orchestrator_attention_fingerprint
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            dispatch_orchestrator_queue_attention(&api);
+            return Ok(Json(workspace_orchestrator_response(&api, "restored")));
+        }
+        if !diagnostics_indicate_unrecoverable_pending_workspace_restore(&restored.diagnostics) {
             return Err(ApiError::with_diagnostics(
                 Error::RuntimeOperationFailed {
                     runtime_id: existing.worker.runtime_id.clone(),
@@ -10432,11 +10451,21 @@ async fn scoped_start_workspace_orchestrator(
                 restored.diagnostics,
             ));
         }
-        *api.orchestrator_attention_fingerprint
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        dispatch_orchestrator_queue_attention(&api);
-        return Ok(Json(workspace_orchestrator_response(&api, "restored")));
+        let deleted = api
+            .runtime
+            .delete_worker(&existing.worker)
+            .map_err(|error| error.into_error())?;
+        if deleted.state != WorkerOperationState::Accepted {
+            return Err(ApiError::with_diagnostics(
+                Error::RuntimeOperationFailed {
+                    runtime_id: existing.worker.runtime_id.clone(),
+                    code: "workspace_orchestrator_replacement_delete_rejected".to_string(),
+                    message: "Embedded Runtime rejected replacement of an unrecoverable pending Workspace Orchestrator".to_string(),
+                },
+                deleted.diagnostics,
+            ));
+        }
+        disposition = "recreated";
     }
 
     let result = api.spawn_workspace_worker(
@@ -10485,7 +10514,7 @@ async fn scoped_start_workspace_orchestrator(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     dispatch_orchestrator_queue_attention(&api);
-    Ok(Json(workspace_orchestrator_response(&api, "created")))
+    Ok(Json(workspace_orchestrator_response(&api, disposition)))
 }
 
 fn worker_launch_worker_summary(worker: WorkerSummary) -> WorkerLaunchWorkerSummary {
@@ -20722,7 +20751,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_profile_backend_rejects_unrecoverable_pending_orchestrator_restore() {
+    async fn production_profile_backend_restores_zero_input_orchestrator() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let config = test_server_config(workspace.path());
@@ -20765,20 +20794,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stopped.state, WorkerOperationState::Accepted);
-        let error = scoped_start_workspace_orchestrator(
+        let Json(restored) = scoped_start_workspace_orchestrator(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
                 workspace_id: workspace_id.clone(),
             }),
         )
         .await
-        .expect_err("pending Workspace Orchestrator restore without durable Prompt must fail");
-        assert!(
-            format!("{error:?}").contains(
-                "pending Workspace Worker restore requires operation-owned launch material"
-            ),
-            "unexpected restore error: {error:?}"
-        );
+        .expect("zero-input Workspace Orchestrator should restore from its durable session head");
+        assert_eq!(restored.disposition, "restored");
+        assert!(restored.online);
+        let restored_worker = restored.worker.expect("restored Orchestrator Worker");
+        assert_eq!(restored_worker.runtime_id, worker.runtime_id);
+        assert_eq!(restored_worker.worker_id, worker.worker_id);
     }
 
     #[tokio::test]
@@ -21697,6 +21725,17 @@ mod tests {
     fn backend_errors_preserve_operation_details() {
         let sanitized = sanitize_backend_error("failed to open server database");
         assert_eq!(sanitized, "failed to open server database");
+    }
+
+    #[test]
+    fn unrecoverable_pending_workspace_restore_is_typed_for_replacement() {
+        let diagnostics = [RuntimeDiagnostic {
+            code: "embedded_worker_execution_rejected".to_string(),
+            severity: DiagnosticSeverity::Error,
+            message: "Restore Errored: pending Workspace Worker restore requires operation-owned launch material; generic restore must not reconstruct it from current Workspace config".to_string(),
+        }];
+
+        assert!(diagnostics_indicate_unrecoverable_pending_workspace_restore(&diagnostics));
     }
 
     #[test]
