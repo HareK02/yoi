@@ -348,11 +348,13 @@ struct RuntimeHttpConfigBundleAvailabilityQuery {
     digest: String,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Default, Deserialize)]
 struct RuntimeHttpWorkersQuery {
     status: Option<RuntimeHttpWorkerStatusFilter>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RuntimeHttpWorkerStatusFilter {
@@ -646,6 +648,7 @@ async fn post_workspace_verification_acknowledgement(
     }))
 }
 
+#[allow(dead_code)]
 async fn get_runtime_ping(
     State(state): State<RuntimeHttpState>,
     Extension(auth): Extension<RuntimeAuthContext>,
@@ -688,6 +691,7 @@ async fn get_runtime_ping(
     }))
 }
 
+#[allow(dead_code)]
 async fn get_runtime(
     State(state): State<RuntimeHttpState>,
 ) -> RestResult<RuntimeHttpSummaryResponse> {
@@ -767,6 +771,7 @@ async fn check_config_bundle(
     }))
 }
 
+#[allow(dead_code)]
 async fn list_workers(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1107,6 +1112,7 @@ async fn cleanup_working_directory(
     }))
 }
 
+#[allow(dead_code)]
 async fn get_worker(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1121,6 +1127,7 @@ async fn get_worker(
     Ok(Json(RuntimeHttpWorkerResponse { worker }))
 }
 
+#[allow(dead_code)]
 async fn delete_worker(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1135,6 +1142,7 @@ async fn delete_worker(
     Ok(Json(RuntimeHttpWorkerDeleteResponse { worker }))
 }
 
+#[allow(dead_code)]
 async fn create_worker(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1149,6 +1157,7 @@ async fn create_worker(
     Ok(Json(RuntimeHttpWorkerResponse { worker }))
 }
 
+#[allow(dead_code)]
 async fn replace_worker_workspace_api(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1171,6 +1180,7 @@ async fn replace_worker_workspace_api(
     Ok(Json(RuntimeHttpWorkerResponse { worker }))
 }
 
+#[allow(dead_code)]
 async fn restore_worker(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1734,6 +1744,7 @@ fn protocol_error_event(message: impl Into<String>) -> protocol::Event {
     }
 }
 
+#[allow(dead_code)]
 async fn worker_retention_inventory(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1754,6 +1765,7 @@ async fn worker_retention_inventory(
         .map_err(RuntimeHttpRestError::runtime)
 }
 
+#[allow(dead_code)]
 async fn execute_worker_retention(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1789,6 +1801,7 @@ async fn execute_worker_retention(
         .map_err(RuntimeHttpRestError::runtime)
 }
 
+#[allow(dead_code)]
 async fn send_worker_input(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1805,6 +1818,7 @@ async fn send_worker_input(
     Ok(Json(RuntimeHttpWorkerInputResponse { ack }))
 }
 
+#[allow(dead_code)]
 async fn worker_completions(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1941,6 +1955,7 @@ async fn delete_worker_uploaded_file(
     }))
 }
 
+#[allow(dead_code)]
 async fn stop_worker(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1959,6 +1974,7 @@ async fn stop_worker(
     Ok(Json(RuntimeHttpWorkerLifecycleResponse { ack }))
 }
 
+#[allow(dead_code)]
 async fn cancel_worker(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -3251,6 +3267,22 @@ mod tests {
             .unwrap();
         let token = "local-token";
         let app = runtime_http_router(runtime.clone(), token.to_string());
+
+        let malformed_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/workers")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed_response.status(), StatusCode::BAD_REQUEST);
+        let malformed: RuntimeHttpErrorResponse = read_json(malformed_response).await;
+        assert_eq!(malformed.error.code, "invalid_json");
 
         let response = authed_json_request(
             app.clone(),

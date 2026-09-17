@@ -638,28 +638,13 @@ pub struct RemainingRuntimeRoute {
 pub const REMAINING_RUNTIME_ROUTES: &[RemainingRuntimeRoute] = &[
     RemainingRuntimeRoute {
         method: "POST",
-        path: "/v1/bootstrap",
-        reason: "bootstrap lifecycle",
-    },
-    RemainingRuntimeRoute {
-        method: "GET",
-        path: "/v1/protocol/ws",
-        reason: "WebSocket protocol transport",
-    },
-    RemainingRuntimeRoute {
-        method: "GET",
-        path: "/v1/workers/{worker_id}/protocol/ws",
-        reason: "WebSocket protocol transport",
+        path: "/v1/workspace-runtime-verification/challenge",
+        reason: "Workspace verification handshake",
     },
     RemainingRuntimeRoute {
         method: "POST",
-        path: "/v1/workers/{worker_id}/attachments",
-        reason: "binary attachment transport",
-    },
-    RemainingRuntimeRoute {
-        method: "DELETE",
-        path: "/v1/workers/{worker_id}/attachments/{artifact_id}",
-        reason: "binary attachment transport",
+        path: "/v1/workspace-runtime-verification/acknowledgement",
+        reason: "Workspace verification handshake",
     },
     RemainingRuntimeRoute {
         method: "GET",
@@ -690,6 +675,56 @@ pub const REMAINING_RUNTIME_ROUTES: &[RemainingRuntimeRoute] = &[
         method: "POST",
         path: "/v1/working-directories",
         reason: "Workdir transport",
+    },
+    RemainingRuntimeRoute {
+        method: "POST",
+        path: "/v1/working-directories/repository-access",
+        reason: "Workdir transport",
+    },
+    RemainingRuntimeRoute {
+        method: "POST",
+        path: "/v1/repositories/ssh/probe",
+        reason: "Repository SSH transport",
+    },
+    RemainingRuntimeRoute {
+        method: "POST",
+        path: "/v1/repository-refs/observe",
+        reason: "Repository observation transport",
+    },
+    RemainingRuntimeRoute {
+        method: "POST",
+        path: "/v1/working-directories/{working_directory_id}/sessions",
+        reason: "Workdir session transport",
+    },
+    RemainingRuntimeRoute {
+        method: "POST",
+        path: "/v1/workdir-sessions/{session_id}/operations",
+        reason: "Workdir session transport",
+    },
+    RemainingRuntimeRoute {
+        method: "DELETE",
+        path: "/v1/workdir-sessions/{session_id}",
+        reason: "Workdir session transport",
+    },
+    RemainingRuntimeRoute {
+        method: "GET",
+        path: "/v1/working-directories/{working_directory_id}",
+        reason: "Workdir transport",
+    },
+    RemainingRuntimeRoute {
+        method: "DELETE",
+        path: "/v1/working-directories/{working_directory_id}",
+        reason: "Workdir transport",
+    },
+    RemainingRuntimeRoute {
+        method: "POST",
+        path: "/v1/workers/{worker_id}/attachments",
+        reason: "Binary attachment transport",
+    },
+    RemainingRuntimeRoute {
+        method: "DELETE",
+        path: "/v1/workers/{worker_id}/attachments/{artifact_id}",
+        reason: "Binary attachment transport",
     },
 ];
 
@@ -866,6 +901,7 @@ mod tests {
 
     #[test]
     fn remaining_route_inventory_does_not_overlap_contract() {
+        assert_eq!(REMAINING_RUNTIME_ROUTES.len(), 18);
         for remaining in REMAINING_RUNTIME_ROUTES {
             assert!(!RuntimeApiMetadata::OPERATIONS.iter().any(|operation| {
                 format!("{:?}", operation.method).eq_ignore_ascii_case(remaining.method)

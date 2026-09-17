@@ -50,7 +50,17 @@ async fn runtime_api_wire_compatibility(
     mut request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+    let is_json_request = !matches!(*request.method(), Method::GET | Method::HEAD);
+    let is_query_request = request.method() == Method::GET;
+    if request.uri().path() == "/v1/ping" && !request.headers().contains_key("x-yoi-workspace-id") {
+        return RuntimeHttpRestError::new(
+            StatusCode::FORBIDDEN,
+            "runtime_ping_workspace_scope_required",
+            "Runtime ping requires an authenticated Workspace scope",
+        )
+        .into_response();
+    }
+    if is_json_request {
         if !request.headers().contains_key(header::CONTENT_TYPE) {
             request.headers_mut().insert(
                 header::CONTENT_TYPE,
@@ -73,11 +83,28 @@ async fn runtime_api_wire_compatibility(
         request = axum::extract::Request::from_parts(parts, Body::from(body));
     }
     let response = next.run(request).await;
-    if response.status() == StatusCode::UNPROCESSABLE_ENTITY {
+    let is_json_error = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    if matches!(
+        response.status(),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+    ) && !is_json_error
+    {
         return RuntimeHttpRestError::new(
             StatusCode::BAD_REQUEST,
-            "invalid_json",
-            "request body must be valid JSON",
+            if is_query_request {
+                "invalid_query"
+            } else {
+                "invalid_json"
+            },
+            if is_query_request {
+                "request query parameters are invalid"
+            } else {
+                "request body must be valid JSON"
+            },
         )
         .into_response();
     }
@@ -125,79 +152,117 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         &self,
         workspace_id: String,
     ) -> Result<runtime_api::RuntimePingResponse, runtime_api::RuntimeApiError> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-yoi-workspace-id",
-            workspace_id.parse().map_err(|error| {
+        let Extension(auth) = required_auth()?;
+        if workspace_id != auth.workspace_id {
+            return Err(runtime_api::RuntimeApiError::new(
+                StatusCode::FORBIDDEN.as_u16(),
+                "runtime_ping_workspace_scope_mismatch",
+                "Runtime ping Workspace scope does not match the authenticated capability",
+            ));
+        }
+        let runtime_id = self
+            .state
+            .workspace_auth
+            .as_ref()
+            .map(|auth| auth.signer.runtime_id().trim())
+            .filter(|runtime_id| !runtime_id.is_empty())
+            .ok_or_else(|| {
                 runtime_api::RuntimeApiError::new(
-                    StatusCode::BAD_REQUEST.as_u16(),
-                    "invalid_workspace_header",
-                    format!("invalid Workspace ping header: {error}"),
+                    StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    "runtime_ping_identity_unavailable",
+                    "Runtime ping identity is not configured",
                 )
-            })?,
-        );
-        let Json(value) = get_runtime_ping(State(self.state.clone()), required_auth()?, headers)
-            .await
-            .map_err(api_error)?;
-        response(value)
+            })?;
+        Ok(runtime_api::RuntimePingResponse {
+            runtime_id: runtime_id.to_string(),
+            protocol_version: RUNTIME_HTTP_PROTOCOL_VERSION,
+        })
     }
 
     async fn runtime_summary(
         &self,
     ) -> Result<runtime_api::RuntimeSummaryResponse, runtime_api::RuntimeApiError> {
-        let Json(value) = get_runtime(State(self.state.clone()))
-            .await
+        let runtime = self
+            .state
+            .runtime
+            .summary()
+            .map_err(RuntimeHttpRestError::runtime)
             .map_err(api_error)?;
-        response(value)
+        let runtime = response(runtime)?;
+        Ok(runtime_api::RuntimeSummaryResponse { runtime })
     }
 
     async fn list_workers(
         &self,
         query: runtime_api::WorkerListQuery,
     ) -> Result<runtime_api::WorkersResponse, runtime_api::RuntimeApiError> {
-        let Json(value) = list_workers(
-            State(self.state.clone()),
-            auth_extension(),
-            Ok(Query(request(query)?)),
-        )
-        .await
+        let scope =
+            auth_workspace_scope(&self.state, auth_extension().as_ref()).map_err(api_error)?;
+        let workers = match (query.status, scope.as_ref()) {
+            (Some(runtime_api::WorkerStatusFilter::Stopped), Some(scope)) => {
+                self.state.runtime.list_stopped_workers_scoped(scope)
+            }
+            (Some(runtime_api::WorkerStatusFilter::Stopped), None) => {
+                self.state.runtime.list_stopped_workers()
+            }
+            (None, Some(scope)) => self.state.runtime.list_workers_scoped(scope),
+            (None, None) => self.state.runtime.list_workers(),
+        }
+        .map_err(RuntimeHttpRestError::runtime)
         .map_err(api_error)?;
-        response(value)
+        let workers = response(workers)?;
+        Ok(runtime_api::WorkersResponse { workers })
     }
 
     async fn get_worker(
         &self,
         worker_id: String,
     ) -> Result<runtime_api::WorkerResponse, runtime_api::RuntimeApiError> {
-        let Json(value) = get_worker(State(self.state.clone()), auth_extension(), Path(worker_id))
-            .await
-            .map_err(api_error)?;
-        response(value)
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let worker = match auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+        {
+            Some(scope) => self.state.runtime.worker_detail_scoped(&scope, &worker_ref),
+            None => self.state.runtime.worker_detail(&worker_ref),
+        }
+        .map_err(RuntimeHttpRestError::runtime)
+        .map_err(api_error)?;
+        let worker = response(worker)?;
+        Ok(runtime_api::WorkerResponse { worker })
     }
 
     async fn create_worker(
         &self,
         value: runtime_api::CreateWorkerRequest,
     ) -> Result<runtime_api::WorkerResponse, runtime_api::RuntimeApiError> {
-        let Json(value) = create_worker(
-            State(self.state.clone()),
-            auth_extension(),
-            Ok(Json(request(value)?)),
-        )
-        .await
+        let request: CreateWorkerRequest = request(value)?;
+        let worker = match auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+        {
+            Some(scope) => self.state.runtime.create_worker_scoped(&scope, request),
+            None => self.state.runtime.create_worker(request),
+        }
+        .map_err(RuntimeHttpRestError::runtime)
         .map_err(api_error)?;
-        response(value)
+        let worker = response(worker)?;
+        Ok(runtime_api::WorkerResponse { worker })
     }
 
     async fn delete_worker(
         &self,
         worker_id: String,
     ) -> Result<runtime_api::WorkerDeleteResponse, runtime_api::RuntimeApiError> {
-        let Json(value) =
-            delete_worker(State(self.state.clone()), auth_extension(), Path(worker_id))
-                .await
-                .map_err(api_error)?;
-        response(value)
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let worker = match auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+        {
+            Some(scope) => self.state.runtime.delete_worker_scoped(&scope, &worker_ref),
+            None => self.state.runtime.delete_worker(&worker_ref),
+        }
+        .map_err(RuntimeHttpRestError::runtime)
+        .map_err(api_error)?;
+        let worker = response(worker)?;
+        Ok(runtime_api::WorkerDeleteResponse { worker })
     }
 
     async fn send_worker_input(
@@ -205,15 +270,21 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         worker_id: String,
         input: runtime_api::WorkerInput,
     ) -> Result<runtime_api::WorkerInputResponse, runtime_api::RuntimeApiError> {
-        let Json(value) = send_worker_input(
-            State(self.state.clone()),
-            auth_extension(),
-            Path(worker_id),
-            Ok(Json(request(input)?)),
-        )
-        .await
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let input: WorkerInput = request(input)?;
+        let ack = match auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+        {
+            Some(scope) => self
+                .state
+                .runtime
+                .send_input_scoped(&scope, &worker_ref, input),
+            None => self.state.runtime.send_input(&worker_ref, input),
+        }
+        .map_err(RuntimeHttpRestError::runtime)
         .map_err(api_error)?;
-        response(value)
+        let ack = response(ack)?;
+        Ok(runtime_api::WorkerInputResponse { ack })
     }
 
     async fn stop_worker(
@@ -221,23 +292,20 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         worker_id: String,
         value: runtime_api::WorkerLifecycleRequest,
     ) -> Result<runtime_api::WorkerLifecycleResponse, runtime_api::RuntimeApiError> {
-        let body = serde_json::to_vec(&request::<_, RuntimeHttpWorkerLifecycleRequest>(value)?)
-            .map_err(|error| {
-                runtime_api::RuntimeApiError::new(
-                    500,
-                    "runtime_request_conversion_failed",
-                    error.to_string(),
-                )
-            })?;
-        let Json(value) = stop_worker(
-            State(self.state.clone()),
-            auth_extension(),
-            Path(worker_id),
-            Bytes::from(body),
-        )
-        .await
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let ack = match auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+        {
+            Some(scope) => self
+                .state
+                .runtime
+                .stop_worker_scoped(&scope, &worker_ref, value.reason),
+            None => self.state.runtime.stop_worker(&worker_ref, value.reason),
+        }
+        .map_err(RuntimeHttpRestError::runtime)
         .map_err(api_error)?;
-        response(value)
+        let ack = response(ack)?;
+        Ok(runtime_api::WorkerLifecycleResponse { ack })
     }
 
     async fn cancel_worker(
@@ -245,23 +313,21 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         worker_id: String,
         value: runtime_api::WorkerLifecycleRequest,
     ) -> Result<runtime_api::WorkerLifecycleResponse, runtime_api::RuntimeApiError> {
-        let body = serde_json::to_vec(&request::<_, RuntimeHttpWorkerLifecycleRequest>(value)?)
-            .map_err(|error| {
-                runtime_api::RuntimeApiError::new(
-                    500,
-                    "runtime_request_conversion_failed",
-                    error.to_string(),
-                )
-            })?;
-        let Json(value) = cancel_worker(
-            State(self.state.clone()),
-            auth_extension(),
-            Path(worker_id),
-            Bytes::from(body),
-        )
-        .await
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let ack = match auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+        {
+            Some(scope) => {
+                self.state
+                    .runtime
+                    .cancel_worker_scoped(&scope, &worker_ref, value.reason)
+            }
+            None => self.state.runtime.cancel_worker(&worker_ref, value.reason),
+        }
+        .map_err(RuntimeHttpRestError::runtime)
         .map_err(api_error)?;
-        response(value)
+        let ack = response(ack)?;
+        Ok(runtime_api::WorkerLifecycleResponse { ack })
     }
 
     async fn restore_worker(
@@ -269,11 +335,20 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         worker_id: String,
         _request: runtime_api::EmptyObjectRequest,
     ) -> Result<runtime_api::WorkerResponse, runtime_api::RuntimeApiError> {
-        let Json(value) =
-            restore_worker(State(self.state.clone()), auth_extension(), Path(worker_id))
-                .await
-                .map_err(api_error)?;
-        response(value)
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let worker = match auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+        {
+            Some(scope) => self
+                .state
+                .runtime
+                .restore_worker_scoped(&scope, &worker_ref),
+            None => self.state.runtime.restore_worker(&worker_ref),
+        }
+        .map_err(RuntimeHttpRestError::runtime)
+        .map_err(api_error)?;
+        let worker = response(worker)?;
+        Ok(runtime_api::WorkerResponse { worker })
     }
 
     async fn replace_worker_workspace_api(
@@ -281,15 +356,25 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         worker_id: String,
         value: runtime_api::WorkerWorkspaceApiRequest,
     ) -> Result<runtime_api::WorkerResponse, runtime_api::RuntimeApiError> {
-        let Json(value) = replace_worker_workspace_api(
-            State(self.state.clone()),
-            auth_extension(),
-            Path(worker_id),
-            Ok(Json(request(value)?)),
-        )
-        .await
+        let workspace_api: WorkspaceApiRef = request(value.workspace_api)?;
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let worker = match auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+        {
+            Some(scope) => self.state.runtime.replace_worker_workspace_api_scoped(
+                &scope,
+                &worker_ref,
+                workspace_api,
+            ),
+            None => self
+                .state
+                .runtime
+                .replace_worker_workspace_api(&worker_ref, workspace_api),
+        }
+        .map_err(RuntimeHttpRestError::runtime)
         .map_err(api_error)?;
-        response(value)
+        let worker = response(worker)?;
+        Ok(runtime_api::WorkerResponse { worker })
     }
 
     async fn complete_worker_arguments(
@@ -297,29 +382,53 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         worker_id: String,
         value: runtime_api::CompletionRequest,
     ) -> Result<runtime_api::CompletionResponse, runtime_api::RuntimeApiError> {
-        let Json(value) = worker_completions(
-            State(self.state.clone()),
-            auth_extension(),
-            Path(worker_id),
-            Ok(Json(request(value)?)),
-        )
-        .await
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let kind = value.kind;
+        let prefix = value.prefix;
+        let entries = match auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+        {
+            Some(scope) => {
+                self.state
+                    .runtime
+                    .worker_completions_scoped(&scope, &worker_ref, kind, &prefix)
+            }
+            None => self
+                .state
+                .runtime
+                .worker_completions(&worker_ref, kind, &prefix),
+        }
+        .map_err(RuntimeHttpRestError::runtime)
         .map_err(api_error)?;
-        response(value)
+        let entries = response(entries)?;
+        Ok(runtime_api::CompletionResponse {
+            kind,
+            prefix,
+            entries,
+        })
     }
 
     async fn retention_inventory(
         &self,
         worker_id: String,
     ) -> Result<runtime_api::WorkerRetentionInventory, runtime_api::RuntimeApiError> {
-        let Json(value) = worker_retention_inventory(
-            State(self.state.clone()),
-            auth_extension(),
-            Path(worker_id),
-        )
-        .await
-        .map_err(api_error)?;
-        response(value)
+        let scope = auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+            .ok_or_else(|| {
+                runtime_api::RuntimeApiError::new(
+                    StatusCode::FORBIDDEN.as_u16(),
+                    "workspace_scope_required",
+                    "Worker retention inventory requires workspace-scoped authorization",
+                )
+            })?;
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let inventory = self
+            .state
+            .runtime
+            .worker_retention_inventory(&scope.workspace_id, &worker_ref)
+            .map_err(RuntimeHttpRestError::runtime)
+            .map_err(api_error)?;
+        response(inventory)
     }
 
     async fn execute_retention(
@@ -327,14 +436,37 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         worker_id: String,
         value: runtime_api::WorkerRetentionExecutionRequest,
     ) -> Result<runtime_api::WorkerRetentionExecutionResult, runtime_api::RuntimeApiError> {
-        let Json(value) = execute_worker_retention(
-            State(self.state.clone()),
-            auth_extension(),
-            Path(worker_id),
-            Ok(Json(request(value)?)),
-        )
-        .await
-        .map_err(api_error)?;
-        response(value)
+        let scope = auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+            .ok_or_else(|| {
+                runtime_api::RuntimeApiError::new(
+                    StatusCode::FORBIDDEN.as_u16(),
+                    "workspace_scope_required",
+                    "Worker retention execution requires workspace-scoped authorization",
+                )
+            })?;
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let request: WorkerRetentionExecutionRequest = request(value)?;
+        if request.workspace_id != scope.workspace_id {
+            return Err(runtime_api::RuntimeApiError::new(
+                StatusCode::FORBIDDEN.as_u16(),
+                "workspace_scope_mismatch",
+                "Worker retention request workspace does not match the authenticated workspace scope",
+            ));
+        }
+        if request.worker_id != worker_ref.worker_id {
+            return Err(runtime_api::RuntimeApiError::new(
+                StatusCode::BAD_REQUEST.as_u16(),
+                "worker_id_mismatch",
+                "Worker retention request worker_id does not match route worker_id",
+            ));
+        }
+        let result = self
+            .state
+            .runtime
+            .execute_worker_retention(&request)
+            .map_err(RuntimeHttpRestError::runtime)
+            .map_err(api_error)?;
+        response(result)
     }
 }

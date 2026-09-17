@@ -46,10 +46,7 @@ use worker_runtime::http_server::{
     RUNTIME_PING_PERMISSION, RUNTIME_WORKSPACE_SCOPE_HEADER,
     RuntimeHttpConfigBundleAvailabilityResponse, RuntimeHttpConfigBundleSyncRequest,
     RuntimeHttpErrorResponse, RuntimeHttpPingResponse, RuntimeHttpRepositoryAccessResponse,
-    RuntimeHttpSummaryResponse, RuntimeHttpUploadedFileDeleteResponse,
-    RuntimeHttpUploadedFileResponse, RuntimeHttpWorkerCompletionsResponse,
-    RuntimeHttpWorkerDeleteResponse, RuntimeHttpWorkerLifecycleResponse, RuntimeHttpWorkerResponse,
-    RuntimeHttpWorkerWorkspaceApiRequest, RuntimeHttpWorkersResponse,
+    RuntimeHttpUploadedFileDeleteResponse, RuntimeHttpUploadedFileResponse,
     RuntimeHttpWorkingDirectoriesResponse, RuntimeHttpWorkingDirectoryResponse,
     RuntimeHttpWorkspacePromptProjectionRequest, RuntimeHttpWorkspacePromptProjectionResponse,
 };
@@ -3981,7 +3978,7 @@ impl RemoteWorkerRuntime {
     fn lifecycle_result_from_response(
         &self,
         worker_id: &str,
-        response: RuntimeHttpWorkerLifecycleResponse,
+        response: worker_runtime::catalog::WorkerLifecycleAck,
     ) -> WorkerLifecycleResult {
         WorkerLifecycleResult {
             state: WorkerOperationState::Accepted,
@@ -3991,7 +3988,7 @@ impl RemoteWorkerRuntime {
                 DiagnosticSeverity::Info,
                 format!(
                     "Remote Runtime acknowledged lifecycle operation for '{worker_id}' with status {}",
-                    embedded_worker_status_label(response.ack.status)
+                    embedded_worker_status_label(response.status)
                 ),
             )],
         }
@@ -4010,25 +4007,27 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
                 |client| async move { client.runtime_summary().await },
             )
-            .and_then(|value| runtime_contract_convert::<_, RuntimeHttpSummaryResponse>(value))
-        {
+            .and_then(|value| {
+                runtime_contract_convert::<_, worker_runtime::management::RuntimeSummary>(
+                    value.runtime,
+                )
+            }) {
             Ok(response) => RuntimeSummary {
                 runtime_id: self.runtime_id.clone(),
                 label: response
-                    .runtime
                     .display_name
                     .unwrap_or_else(|| self.display_name.clone()),
                 kind: "remote_worker_runtime".to_string(),
-                status: embedded_runtime_status_label(response.runtime.status).to_string(),
+                status: embedded_runtime_status_label(response.status).to_string(),
                 source: RuntimeSourceSummary::remote_http(),
                 host_ids: if limit == 0 {
                     Vec::new()
                 } else {
                     vec![self.host_id.clone()]
                 },
-                worker_creation_available: response.runtime.worker_creation_available,
-                os: response.runtime.os,
-                arch: response.runtime.arch,
+                worker_creation_available: response.worker_creation_available,
+                os: response.os,
+                arch: response.arch,
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => RuntimeSummary {
@@ -4162,11 +4161,13 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                         .await
                 },
             )
-            .and_then(|value| runtime_contract_convert::<_, RuntimeHttpWorkersResponse>(value))
-        {
+            .and_then(|value| {
+                runtime_contract_convert::<_, Vec<worker_runtime::catalog::WorkerSummary>>(
+                    value.workers,
+                )
+            }) {
             Ok(response) => RuntimeList::new(
                 response
-                    .workers
                     .into_iter()
                     .take(limit)
                     .map(|worker| self.map_worker_summary(worker))
@@ -4193,11 +4194,13 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                         .await
                 },
             )
-            .and_then(|value| runtime_contract_convert::<_, RuntimeHttpWorkersResponse>(value))
-        {
+            .and_then(|value| {
+                runtime_contract_convert::<_, Vec<worker_runtime::catalog::WorkerSummary>>(
+                    value.workers,
+                )
+            }) {
             Ok(response) => RuntimeList::new(
                 response
-                    .workers
                     .into_iter()
                     .take(limit)
                     .map(|worker| self.map_worker_summary(worker))
@@ -4216,10 +4219,11 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
                 move |client| async move { client.get_worker(worker_id_owned).await },
             )
-            .and_then(|value| runtime_contract_convert::<_, RuntimeHttpWorkerResponse>(value))
-        {
+            .and_then(|value| {
+                runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(value.worker)
+            }) {
             Ok(response) => WorkerLookupResult {
-                worker: Some(self.map_worker_detail(response.worker)),
+                worker: Some(self.map_worker_detail(response)),
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) if diagnostic.code == "worker_not_found" => WorkerLookupResult {
@@ -4245,11 +4249,12 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                         .await
                 },
             )
-            .and_then(|value| runtime_contract_convert::<_, RuntimeHttpWorkerResponse>(value))
-        {
+            .and_then(|value| {
+                runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(value.worker)
+            }) {
             Ok(response) => WorkerRestoreResult {
                 state: WorkerOperationState::Accepted,
-                worker: Some(self.map_worker_detail(response.worker)),
+                worker: Some(self.map_worker_detail(response)),
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => WorkerRestoreResult {
@@ -4265,10 +4270,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         worker_id: &str,
         workspace_api: WorkspaceApiRef,
     ) -> WorkerWorkspaceApiResult {
-        let request = match runtime_contract_convert(RuntimeHttpWorkerWorkspaceApiRequest {
-            workspace_api,
-        }) {
-            Ok(request) => request,
+        let request = match runtime_contract_convert(workspace_api) {
+            Ok(workspace_api) => runtime_api::WorkerWorkspaceApiRequest { workspace_api },
             Err(diagnostic) => {
                 return WorkerWorkspaceApiResult {
                     state: WorkerOperationState::Rejected,
@@ -4288,11 +4291,12 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                         .await
                 },
             )
-            .and_then(|value| runtime_contract_convert::<_, RuntimeHttpWorkerResponse>(value))
-        {
+            .and_then(|value| {
+                runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(value.worker)
+            }) {
             Ok(response) => WorkerWorkspaceApiResult {
                 state: WorkerOperationState::Accepted,
-                worker: Some(self.map_worker_detail(response.worker)),
+                worker: Some(self.map_worker_detail(response)),
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => WorkerWorkspaceApiResult {
@@ -4506,11 +4510,12 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
                 move |client| async move { client.create_worker(create).await },
             )
-            .and_then(|value| runtime_contract_convert::<_, RuntimeHttpWorkerResponse>(value))
-        {
+            .and_then(|value| {
+                runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(value.worker)
+            }) {
             Ok(response) => WorkerSpawnResult {
                 state: WorkerOperationState::Accepted,
-                worker: Some(self.map_worker_detail(response.worker)),
+                worker: Some(self.map_worker_detail(response)),
                 acceptance_evidence: vec![WorkerSpawnAcceptanceEvidence {
                     kind: "remote_runtime_worker_created".to_string(),
                     detail: "worker-runtime REST create endpoint accepted the Worker".to_string(),
@@ -4589,7 +4594,9 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 move |client| async move { client.stop_worker(worker_id_owned, body).await },
             )
             .and_then(|value| {
-                runtime_contract_convert::<_, RuntimeHttpWorkerLifecycleResponse>(value)
+                runtime_contract_convert::<_, worker_runtime::catalog::WorkerLifecycleAck>(
+                    value.ack,
+                )
             }) {
             Ok(response) => self.lifecycle_result_from_response(worker_id, response),
             Err(diagnostic) => remote_lifecycle_rejected(&self.runtime_id, worker_id, diagnostic),
@@ -4612,7 +4619,9 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 move |client| async move { client.cancel_worker(worker_id_owned, body).await },
             )
             .and_then(|value| {
-                runtime_contract_convert::<_, RuntimeHttpWorkerLifecycleResponse>(value)
+                runtime_contract_convert::<_, worker_runtime::catalog::WorkerLifecycleAck>(
+                    value.ack,
+                )
             }) {
             Ok(response) => self.lifecycle_result_from_response(worker_id, response),
             Err(diagnostic) => remote_lifecycle_rejected(&self.runtime_id, worker_id, diagnostic),
@@ -4627,15 +4636,18 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
                 move |client| async move { client.delete_worker(worker_id_owned).await },
             )
-            .and_then(|value| runtime_contract_convert::<_, RuntimeHttpWorkerDeleteResponse>(value))
-        {
+            .and_then(|value| {
+                runtime_contract_convert::<_, worker_runtime::management::WorkerDeleteResult>(
+                    value.worker,
+                )
+            }) {
             Ok(response) => WorkerDeleteResult {
                 state: WorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(
                     self.runtime_id.clone(),
-                    response.worker.worker_id.to_string(),
+                    response.worker_id.to_string(),
                 ),
-                deleted: response.worker.deleted,
+                deleted: response.deleted,
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => WorkerDeleteResult {
@@ -4799,19 +4811,15 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         let failure_kind = request.kind;
         let failure_prefix = request.prefix.clone();
         let worker_id_owned = worker_id.to_string();
-        match self
-            .run_runtime_api(
-                self.request_timeout,
-                MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
-                move |client| async move {
-                    client
-                        .complete_worker_arguments(worker_id_owned, request)
-                        .await
-                },
-            )
-            .and_then(|value| {
-                runtime_contract_convert::<_, RuntimeHttpWorkerCompletionsResponse>(value)
-            }) {
+        match self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move {
+                client
+                    .complete_worker_arguments(worker_id_owned, request)
+                    .await
+            },
+        ) {
             Ok(response) => WorkerCompletionsResult {
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: response.kind,
