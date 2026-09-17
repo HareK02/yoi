@@ -20,10 +20,12 @@ function worker(
   workerId: string,
   revision: number,
   hasRunningInternalWorkers = false,
+  availability: 'observed' | 'unavailable' = 'observed',
 ): SubscriptionWorker {
   return {
     worker_id: workerId,
     runtime_id: runtimeId,
+    availability,
     subject_revision: revision,
     state: 'idle',
     has_running_internal_workers: hasRunningInternalWorkers,
@@ -42,12 +44,23 @@ Deno.test('Worker list state uses the authoritative live snapshot separately fro
   };
   assertEquals(liveWorkerState(active), 'paused');
 
-  const unavailable = worker('runtime-a', 'worker-2', 1);
+  const unavailable = worker('runtime-a', 'worker-2', 1, false, 'unavailable');
+  unavailable.worker_state = {
+    last_command_id: 2,
+    state: { kind: 'busy', state: { kind: 'run', state: 'running' } },
+  };
   assertEquals(liveWorkerState(unavailable), 'unknown');
   assertEquals(
-    liveWorkerState({ ...unavailable, state: 'missing' }),
+    liveWorkerState({
+      ...unavailable,
+      availability: 'observed',
+      worker_state: null,
+      state: 'missing',
+    }),
     'missing',
   );
+  unavailable.availability = 'observed';
+  unavailable.worker_state = null;
   unavailable.state = 'stopped';
   assertEquals(liveWorkerState(unavailable), 'stopped');
 });

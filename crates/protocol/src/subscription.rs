@@ -559,6 +559,19 @@ pub enum SubscriptionWorkerState {
     Stopped,
 }
 
+/// Whether the Workspace Server has a current Runtime observation for a Worker.
+///
+/// `Unavailable` deliberately does not imply `Stopped`: it means the last observed
+/// lifecycle state is retained while the Runtime observation source is unavailable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionWorkerAvailability {
+    #[default]
+    Observed,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct SubscriptionWorker {
@@ -571,6 +584,10 @@ pub struct SubscriptionWorker {
     /// Workspace-facing projections must populate it before publishing the Worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_key: Option<String>,
+    /// Freshness of the Runtime-backed observation carried by this projection.
+    /// `Unavailable` preserves catalog membership without claiming that execution stopped.
+    #[serde(default)]
+    pub availability: SubscriptionWorkerAvailability,
     /// Producer-owned monotonic revision for this Worker subject.
     pub subject_revision: u64,
     /// Latest revisioned foreground state observed from the Worker. This remains
@@ -878,6 +895,7 @@ mod tests {
             worker_id: worker_id(value),
             runtime_id: None,
             resource_key: None,
+            availability: SubscriptionWorkerAvailability::Observed,
             subject_revision: 0,
             worker_state: None,
             state: SubscriptionWorkerState::Idle,

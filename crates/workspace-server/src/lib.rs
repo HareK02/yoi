@@ -30,6 +30,7 @@ pub mod skills;
 pub mod store;
 pub mod workdir_create_operations;
 mod workdir_removal;
+mod worker_projection;
 pub mod worker_source;
 pub mod workspace_catalog;
 mod workspace_deletion;
