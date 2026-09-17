@@ -338,7 +338,7 @@ impl ProfileRuntimeWorkerFactory {
             worker_mutation_identity: None,
             workspace_request_clients: Arc::new(HashMap::new()),
             embedded_worker_mutation_dispatcher: None,
-            controller_transport: WorkerControllerTransport::UnixSocket,
+            controller_transport: WorkerControllerTransport::InProcess,
         }
     }
 
@@ -3520,6 +3520,17 @@ mod tests {
         assert!(error.contains("replacement Worker is required"), "{error}");
     }
 
+    #[test]
+    fn profile_runtime_factory_defaults_to_in_process_controller_transport() {
+        let root = tempfile::tempdir().unwrap();
+        let factory = ProfileRuntimeWorkerFactory::new(root.path());
+
+        assert!(matches!(
+            factory.controller_transport,
+            WorkerControllerTransport::InProcess
+        ));
+    }
+
     #[tokio::test]
     #[serial_test::serial(worker_allocation)]
     async fn in_process_restore_does_not_bind_unix_socket_under_overlong_store_path() {
@@ -3701,8 +3712,7 @@ mod tests {
         let backend = Arc::new(
             WorkerRuntimeExecutionBackend::new(
                 ProfileRuntimeWorkerFactory::new(root.path())
-                    .with_runtime_store_dir(&runtime_store_dir)
-                    .with_controller_transport(WorkerControllerTransport::InProcess),
+                    .with_runtime_store_dir(&runtime_store_dir),
             )
             .unwrap(),
         );
@@ -3740,8 +3750,7 @@ mod tests {
         let restored_backend = Arc::new(
             WorkerRuntimeExecutionBackend::new(
                 ProfileRuntimeWorkerFactory::new(root.path())
-                    .with_runtime_store_dir(&runtime_store_dir)
-                    .with_controller_transport(WorkerControllerTransport::InProcess),
+                    .with_runtime_store_dir(&runtime_store_dir),
             )
             .unwrap(),
         );
