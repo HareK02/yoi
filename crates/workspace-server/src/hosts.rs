@@ -1132,6 +1132,17 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         ))
     }
 
+    fn worker_session(
+        &self,
+        _workspace_id: &str,
+        _worker_ref: &EmbeddedWorkerRef,
+    ) -> Result<runtime_api::WorkerSessionAvailability, String> {
+        Ok(runtime_api::WorkerSessionAvailability::Unavailable {
+            reason: runtime_api::WorkerSessionUnavailableReason::StorageUnavailable,
+            message: "retained session storage is unavailable".to_string(),
+        })
+    }
+
     fn observation_source(
         &self,
         _worker_id: &str,
@@ -1918,6 +1929,29 @@ impl RuntimeRegistry {
             .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
                 runtime_id: worker.runtime_id.clone(),
                 code: "worker_retention_execution_failed".to_string(),
+                message,
+            })
+    }
+
+    pub fn worker_session(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<runtime_api::WorkerSessionAvailability, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        let runtime = self.runtime(&worker.runtime_id)?;
+        let worker_ref =
+            EmbeddedWorkerRef::new(EmbeddedWorkerId::parse(&worker.worker_id).ok_or_else(
+                || RuntimeRegistryError::UnknownWorker {
+                    worker: worker.clone(),
+                },
+            )?);
+        runtime
+            .worker_session(workspace_id, &worker_ref)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: "worker_session_observation_failed".to_string(),
                 message,
             })
     }
@@ -2770,6 +2804,17 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         }
         self.runtime
             .execute_worker_retention(&request)
+            .map_err(|error| error.to_string())
+    }
+
+    fn worker_session(
+        &self,
+        workspace_id: &str,
+        worker_ref: &EmbeddedWorkerRef,
+    ) -> Result<runtime_api::WorkerSessionAvailability, String> {
+        let scope = RuntimeWorkspaceScope::new(workspace_id, "embedded-backend");
+        self.runtime
+            .worker_session_scoped(&scope, worker_ref)
             .map_err(|error| error.to_string())
     }
 
@@ -4709,6 +4754,23 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             move |client| async move { client.execute_retention(worker_id, request).await },
         )
         .and_then(runtime_contract_convert)
+        .map_err(|diagnostic| diagnostic.message)
+    }
+
+    fn worker_session(
+        &self,
+        workspace_id: &str,
+        worker_ref: &EmbeddedWorkerRef,
+    ) -> Result<runtime_api::WorkerSessionAvailability, String> {
+        let worker_id = worker_ref.worker_id.to_string();
+        let request = runtime_api::WorkerSessionRequest {
+            workspace_id: workspace_id.to_string(),
+        };
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.worker_session(worker_id, request).await },
+        )
         .map_err(|diagnostic| diagnostic.message)
     }
 

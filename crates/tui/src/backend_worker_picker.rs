@@ -3,9 +3,8 @@ use std::io;
 use std::time::Duration;
 
 use client::{
-    BackendRuntimeListTarget, BackendWorkerRestoreResponse, BackendWorkerRestoreState,
-    BackendWorkerSummary, list_backend_stopped_workers, list_backend_workers,
-    restore_backend_worker,
+    BackendRuntimeListTarget, BackendWorkerSummary, WorkerSessionAvailability,
+    list_backend_stopped_workers, list_backend_workers, observe_backend_worker_session,
 };
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -81,60 +80,20 @@ pub(crate) async fn run(
             }
             WorkerPickerResult::Selected(selected) => selected,
         };
-        let worker = if selected.state == "stopped" {
-            let restore_target = target
-                .runtime_target(selected.runtime_id.clone(), selected.worker_id.clone())
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            let restore = restore_backend_worker(&restore_target)
-                .await
-                .map_err(|error| {
-                    io::Error::other(format!(
-                        "failed to restore Backend worker {}/{}: {error}",
-                        selected.runtime_id, selected.worker_id
-                    ))
-                })?;
-            restored_worker(restore).map_err(|error| {
+        let mut attach_target = target
+            .runtime_target(selected.runtime_id.clone(), selected.worker_id.clone())
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let response = observe_backend_worker_session(&attach_target)
+            .await
+            .map_err(|error| {
                 io::Error::other(format!(
-                    "failed to restore Backend worker {}/{}: {error}",
+                    "failed to observe Worker Session {}/{}: {error}",
                     selected.runtime_id, selected.worker_id
                 ))
-            })?
-        } else {
-            selected
-        };
-        let attach_target = target
-            .runtime_target(worker.runtime_id, worker.worker_id)
-            .map_err(|error| io::Error::other(error.to_string()))?;
+            })?;
+        apply_worker_session_observation(&mut attach_target, response.observation);
         return console::run_backend_runtime(attach_target).await;
     }
-}
-
-fn restored_worker(response: BackendWorkerRestoreResponse) -> Result<BackendWorkerSummary, String> {
-    if response.result.state != BackendWorkerRestoreState::Accepted {
-        let diagnostics = response
-            .result
-            .diagnostics
-            .iter()
-            .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
-            .collect::<Vec<_>>()
-            .join("; ");
-        let state = match response.result.state {
-            BackendWorkerRestoreState::Accepted => unreachable!(),
-            BackendWorkerRestoreState::Rejected => "rejected",
-            BackendWorkerRestoreState::RolledBack => "rolled back",
-            BackendWorkerRestoreState::ReconciliationRequired => "reconciliation required",
-        };
-        return Err(if diagnostics.is_empty() {
-            format!("restore was {state} without a diagnostic")
-        } else {
-            format!("restore was {state}: {diagnostics}")
-        });
-    }
-
-    response
-        .result
-        .worker
-        .ok_or_else(|| "restore was accepted without a Worker snapshot".to_string())
 }
 
 fn dedup_workers(workers: &mut Vec<BackendWorkerSummary>) {
@@ -145,6 +104,28 @@ fn dedup_workers(workers: &mut Vec<BackendWorkerSummary>) {
 enum WorkerPickerResult {
     Selected(BackendWorkerSummary),
     SwitchWorkspace,
+}
+
+fn apply_worker_session_observation(
+    target: &mut client::BackendRuntimeTarget,
+    observation: WorkerSessionAvailability,
+) {
+    match observation {
+        WorkerSessionAvailability::LiveProtocol => {}
+        WorkerSessionAvailability::RetainedSnapshot { snapshot, .. } => {
+            target.initial_snapshot = Some(snapshot);
+            target.initial_notice = Some("read-only retained Session snapshot".to_string());
+        }
+        WorkerSessionAvailability::Unavailable { message, .. } => {
+            let bounded_message: String = message.chars().take(512).collect();
+            target.initial_snapshot = Some(protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                entries: Vec::new(),
+            });
+            target.initial_notice =
+                Some(format!("retained Session unavailable: {bounded_message}"));
+        }
+    }
 }
 
 fn pick_worker(
@@ -437,8 +418,7 @@ fn working_directory_text(worker: &BackendWorkerSummary) -> String {
 mod tests {
     use super::*;
     use client::{
-        BackendDiagnostic, BackendDiagnosticSeverity, BackendWorkerCapabilitySummary,
-        BackendWorkerImplementationSummary, BackendWorkerRestoreResult,
+        BackendWorkerCapabilitySummary, BackendWorkerImplementationSummary,
         BackendWorkerWorkspaceSummary,
     };
 
@@ -494,65 +474,51 @@ mod tests {
         text_width(&text[..byte_offset])
     }
 
-    fn restore_response(
-        state: BackendWorkerRestoreState,
-        worker: Option<BackendWorkerSummary>,
-        diagnostics: Vec<BackendDiagnostic>,
-    ) -> BackendWorkerRestoreResponse {
-        BackendWorkerRestoreResponse {
-            workspace_id: "workspace-a".to_string(),
-            runtime_id: "runtime-a".to_string(),
-            worker_id: "worker-a".to_string(),
-            result: BackendWorkerRestoreResult {
-                state,
-                worker,
-                diagnostics,
-            },
-        }
-    }
-
     #[test]
-    fn rejected_restore_surfaces_diagnostic_instead_of_attaching_selected_worker() {
-        let error = restored_worker(restore_response(
-            BackendWorkerRestoreState::Rejected,
-            None,
-            vec![BackendDiagnostic {
-                code: "working_directory_not_found".to_string(),
-                severity: BackendDiagnosticSeverity::Error,
-                message: "working directory was not found".to_string(),
-            }],
-        ))
-        .expect_err("rejected restore must not produce a Worker to attach");
-
-        assert_eq!(
-            error,
-            "restore was rejected: working_directory_not_found: working directory was not found"
+    fn authoritative_observation_selects_live_retained_and_unavailable_detail_modes() {
+        let mut live = client::BackendRuntimeTarget::new(
+            "http://127.0.0.1:3000",
+            "workspace-a",
+            "runtime-a",
+            "worker-a",
         );
-    }
+        apply_worker_session_observation(&mut live, WorkerSessionAvailability::LiveProtocol);
+        assert!(live.initial_snapshot.is_none());
 
-    #[test]
-    fn accepted_restore_requires_returned_worker_snapshot() {
-        let error = restored_worker(restore_response(
-            BackendWorkerRestoreState::Accepted,
-            None,
-            Vec::new(),
-        ))
-        .expect_err("accepted restore without a Worker must not attach the stale selection");
+        let snapshot = protocol::SessionSnapshot {
+            pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+            entries: Vec::new(),
+        };
+        let mut retained = live.clone();
+        apply_worker_session_observation(
+            &mut retained,
+            WorkerSessionAvailability::RetainedSnapshot {
+                identity: client::RetainedSessionIdentity {
+                    session_id: "session-a".to_string(),
+                    segment_id: "segment-a".to_string(),
+                    entry_count: 0,
+                },
+                snapshot: snapshot.clone(),
+            },
+        );
+        assert_eq!(retained.initial_snapshot, Some(snapshot));
+        assert!(retained.initial_notice.unwrap().contains("read-only"));
 
-        assert_eq!(error, "restore was accepted without a Worker snapshot");
-    }
-
-    #[test]
-    fn accepted_restore_returns_authoritative_worker_snapshot() {
-        let worker = worker("runtime-a", "worker-a", Some("builtin:companion"));
-        let restored = restored_worker(restore_response(
-            BackendWorkerRestoreState::Accepted,
-            Some(worker.clone()),
-            Vec::new(),
-        ))
-        .expect("accepted restore should return its Worker snapshot");
-
-        assert_eq!(restored, worker);
+        let mut unavailable = live;
+        apply_worker_session_observation(
+            &mut unavailable,
+            WorkerSessionAvailability::Unavailable {
+                reason: client::WorkerSessionUnavailableReason::RetentionMissing,
+                message: "retention expired".to_string(),
+            },
+        );
+        assert!(unavailable.initial_snapshot.is_some());
+        assert!(
+            unavailable
+                .initial_notice
+                .unwrap()
+                .contains("retention expired")
+        );
     }
 
     #[test]

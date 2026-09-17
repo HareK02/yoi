@@ -31,6 +31,36 @@
 //! })?;
 //! ```
 
+use std::io;
+use std::path::Path;
+
+/// Read an existing retained file without updating its access timestamp.
+/// Observation fails closed when the platform cannot provide that guarantee.
+pub(crate) fn read_without_atime(path: &Path) -> io::Result<Vec<u8>> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOATIME)
+            .open(path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "read-only retained observation requires no-atime file reads",
+        ))
+    }
+}
+
 pub mod event_trace;
 pub mod fs_store;
 pub mod history;
@@ -57,6 +87,10 @@ pub use history::{
 };
 pub use logged_item::{LoggedContentPart, LoggedItem, LoggedRole, from_logged, to_logged};
 pub use paste_artifact::PasteArtifactLimits;
+pub use public_snapshot::{
+    DEFAULT_RETAINED_SNAPSHOT_MAX_BYTES, RetainedSessionIdentity, RetainedSessionSnapshot,
+    RetainedSnapshotReadError, project_session_snapshot, read_retained_session_snapshot,
+};
 pub use segment::{
     SegmentStartState, append_entry, append_system_item, classify_logged_history_entry,
     create_compacted_segment, create_segment, create_segment_with_ids, ensure_head_or_fork, fork,

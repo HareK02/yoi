@@ -24,7 +24,8 @@ use crate::config_bundle::{ConfigBundle, workspace_config_etag};
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation,
     WorkerExecutionRestoreRequest, WorkerExecutionResult, WorkerExecutionSpawnRequest,
-    WorkerExecutionSpawnResult, WorkspaceConfigFetchRequest, WorkspaceConfigFetchResult,
+    WorkerExecutionSpawnResult, WorkerSessionObservationRequest, WorkspaceConfigFetchRequest,
+    WorkspaceConfigFetchResult,
 };
 use crate::identity::WorkerRef;
 use crate::interaction::{WorkerInput, WorkerInputKind};
@@ -117,6 +118,14 @@ pub trait RuntimeWorkerFactory: Send + Sync + 'static {
         _request: WorkspaceConfigFetchRequest,
     ) -> Result<WorkspaceConfigFetchResult, String> {
         Err("Runtime Worker factory does not support Workspace Config fetching".to_string())
+    }
+
+    fn retained_session_snapshot(
+        &self,
+        _worker_ref: &WorkerRef,
+    ) -> Result<session_store::RetainedSessionSnapshot, session_store::RetainedSnapshotReadError>
+    {
+        Err(session_store::RetainedSnapshotReadError::RetentionMissing)
     }
 
     async fn spawn_controller(
@@ -805,6 +814,22 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 )
             })?;
         fetch_workspace_config_http(&request, client).await
+    }
+
+    fn retained_session_snapshot(
+        &self,
+        worker_ref: &WorkerRef,
+    ) -> Result<session_store::RetainedSessionSnapshot, session_store::RetainedSnapshotReadError>
+    {
+        let Some(root) = self.worker_aggregate_root.as_ref() else {
+            return Err(session_store::RetainedSnapshotReadError::RetentionMissing);
+        };
+        let worker_name = Self::runtime_worker_name_for_ref(worker_ref);
+        session_store::read_retained_session_snapshot(
+            &root.join(&worker_name),
+            &worker_name,
+            session_store::DEFAULT_RETAINED_SNAPSHOT_MAX_BYTES,
+        )
     }
 
     fn observe_workspace_prompt_projection(
@@ -1921,6 +1946,48 @@ where
     ) -> Result<WorkspaceConfigFetchResult, String> {
         let factory = self.factory.clone();
         self.run_on_adapter_runtime(async move { factory.fetch_workspace_config(request).await })
+    }
+
+    fn worker_session(
+        &self,
+        request: WorkerSessionObservationRequest,
+    ) -> runtime_api::WorkerSessionAvailability {
+        match self.factory.retained_session_snapshot(&request.worker_ref) {
+            Ok(retained) => runtime_api::WorkerSessionAvailability::RetainedSnapshot {
+                identity: runtime_api::RetainedSessionIdentity {
+                    session_id: retained.identity.session_id,
+                    segment_id: retained.identity.segment_id,
+                    entry_count: retained.identity.entry_count,
+                },
+                snapshot: retained.snapshot,
+            },
+            Err(error) => {
+                let reason = match error {
+                    session_store::RetainedSnapshotReadError::RetentionMissing => {
+                        runtime_api::WorkerSessionUnavailableReason::RetentionMissing
+                    }
+                    session_store::RetainedSnapshotReadError::ActivePointerMissing => {
+                        runtime_api::WorkerSessionUnavailableReason::ActivePointerMissing
+                    }
+                    session_store::RetainedSnapshotReadError::MigrationRequired => {
+                        runtime_api::WorkerSessionUnavailableReason::MigrationRequired
+                    }
+                    session_store::RetainedSnapshotReadError::CorruptLog => {
+                        runtime_api::WorkerSessionUnavailableReason::CorruptLog
+                    }
+                    session_store::RetainedSnapshotReadError::StorageUnavailable => {
+                        runtime_api::WorkerSessionUnavailableReason::StorageUnavailable
+                    }
+                    session_store::RetainedSnapshotReadError::SnapshotTooLarge => {
+                        runtime_api::WorkerSessionUnavailableReason::SnapshotTooLarge
+                    }
+                };
+                runtime_api::WorkerSessionAvailability::Unavailable {
+                    reason,
+                    message: error.to_string(),
+                }
+            }
+        }
     }
 
     fn observe_workspace_prompt_projection(

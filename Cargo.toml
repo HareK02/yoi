@@ -14,6 +14,7 @@ members = [
     "crates/worker",
     "crates/worker-runtime",
     "crates/runtime-api",
+    "crates/server-api",
     "crates/plugin-pdk",
     "crates/yoi",
     "crates/protocol",
@@ -49,6 +50,7 @@ default-members = [
     "crates/worker",
     "crates/worker-runtime",
     "crates/runtime-api",
+    "crates/server-api",
     "crates/plugin-pdk",
     "crates/yoi",
     "crates/protocol",
@@ -104,6 +106,7 @@ session-analytics = { path = "crates/session-analytics" }
 session-store = { path = "crates/session-store" }
 standalone = { path = "crates/standalone" }
 runtime-api = { path = "crates/runtime-api" }
+server-api = { path = "crates/server-api" }
 secrets = { path = "crates/secrets" }
 tools = { path = "crates/tools" }
 config-source = { path = "crates/config-source" }

@@ -650,8 +650,10 @@ dependencies = [
  "futures",
  "protocol",
  "reqwest",
+ "runtime-api",
  "serde",
  "serde_json",
+ "server-api",
  "tempfile",
  "thiserror 2.0.18",
  "ticket",
@@ -3714,6 +3716,7 @@ dependencies = [
  "manifest",
  "protocol",
  "serde",
+ "serde_json",
  "tokio",
  "workdir",
  "workspace-api",
@@ -4129,6 +4132,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "server-api"
+version = "0.1.0"
+dependencies = [
+ "api-macros",
+ "runtime-api",
+ "serde",
+ "serde_json",
+ "tokio",
+ "workspace-api",
+]
+
+[[package]]
 name = "session-analytics"
 version = "0.1.0"
 dependencies = [
@@ -4155,8 +4170,10 @@ dependencies = [
  "agen",
  "async-trait",
  "base64 0.22.1",
+ "filetime",
  "fs4",
  "futures",
+ "libc",
  "protocol",
  "serde",
  "serde_json",
@@ -6291,6 +6308,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "server-api",
  "sha2 0.11.0",
  "ssh-key",
  "tempfile",

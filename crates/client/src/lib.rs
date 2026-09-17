@@ -30,7 +30,7 @@ pub use backend_runtime::{
     BackendWorkerRestoreResult, BackendWorkerRestoreState, BackendWorkerSummary,
     BackendWorkerWorkspaceSummary, BackendWorkingDirectorySummary, connect_backend_runtime,
     create_backend_worker, get_backend_worker_launch_options, list_backend_stopped_workers,
-    list_backend_workers, restore_backend_worker,
+    list_backend_workers, observe_backend_worker_session, restore_backend_worker,
 };
 pub use backend_workspace::{
     BackendWorkspace, BackendWorkspaceCatalogTarget, BackendWorkspaceClientError,
@@ -40,6 +40,10 @@ pub use backend_workspace::{
     list_backend_workspaces_blocking,
 };
 pub use client::{Client, ClientError};
+pub use runtime_api::{
+    RetainedSessionIdentity, WorkerSessionAvailability, WorkerSessionUnavailableReason,
+};
+pub use server_api::{ServerApi, ServerApiClient, WorkspaceWorkerSessionResponse};
 pub use target::{
     BackendTarget, BackendWorkerLaunch, Dashboard, ResolvedTarget, StandaloneTarget,
     StandaloneWorkerListIntent, StandaloneWorkerResumeIntent, Target, TargetError, TargetKind,
