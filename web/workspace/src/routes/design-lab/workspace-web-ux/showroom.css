@@ -153,7 +153,7 @@
     font: 600 12px/1 var(--font-mono);
   }
 
-  .ridge-matrix {
+  .border-matrix {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: var(--space-4);
@@ -637,7 +637,7 @@
 
     .showroom-split,
     .line-showcase,
-    .ridge-matrix {
+    .border-matrix {
       grid-template-columns: 1fr;
       gap: var(--space-6);
     }

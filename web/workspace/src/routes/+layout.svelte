@@ -40,7 +40,7 @@
       workspaceError={data.workspaceCatalogError}
     />
   </SidebarFrame>
-  <Bevel as="div" class="app-shell__topbar-bevel" depth="inset" top={false} right={false} left={false} fill>
+  <Bevel as="div" class="app-shell__topbar-bevel" top={false} right={false} left={false} fill>
     <header class="app-shell__topbar">
       <div class="app-shell__topbar-location">
         {#if headerController.content}{@render headerController.content()}{/if}

@@ -16,7 +16,7 @@
 </script>
 
 <div class="sidebar-frame" class:folded>
-  <Bevel as="div" class="sidebar-frame__bevel" depth="inset" top={false} bottom={false} left={false} fill>
+  <Bevel as="div" class="sidebar-frame__bevel" top={false} bottom={false} left={false} fill>
     <aside class="sidebar-frame__surface" aria-label="Sidebar">
       {#if !folded}
         <div class="sidebar-frame-content">

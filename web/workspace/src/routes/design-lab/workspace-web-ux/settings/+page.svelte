@@ -16,14 +16,14 @@
       <div class="form-grid">
         <label class="form-field">
           <span>Runtime label</span>
-          <Bevel profile="edge" depth="inset" fill>
+          <Bevel fill>
             <input name="runtime-label" value="Remote Linux runner" />
           </Bevel>
         </label>
 
         <label class="form-field">
           <span>Endpoint</span>
-          <Bevel profile="edge" depth="inset" fill invalid>
+          <Bevel fill invalid>
             <input
               name="runtime-endpoint"
               value="http://runner.internal.example:8787/api/runtime"
@@ -37,7 +37,7 @@
 
         <label class="form-field">
           <span>Architecture</span>
-          <Bevel profile="edge" depth="inset" fill>
+          <Bevel fill>
             <select name="architecture">
               <option>arm64</option>
               <option selected>x86_64</option>

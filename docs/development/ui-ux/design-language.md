@@ -1,191 +1,85 @@
 # Workspace Web Design Language
 
-この文書は、Workspace Webをどう知覚させ、情報、状態、操作をどの視覚文法で表現するかを定義する。Product固有のresource構成は[`product-ux.md`](product-ux.md)、application shellとSidebar slotの実装構造は[`application-architecture.md`](application-architecture.md)、CSSとsource配置は[`../../../web/workspace/README.md`](../../../web/workspace/README.md)をauthorityとする。
+この文書は、Workspace Webのrendered resultが満たす設計規則を定義する。Product固有のresource構成は[`product-ux.md`](product-ux.md)、application shellとSidebar slotの実装構造は[`application-architecture.md`](application-architecture.md)、CSSとsource配置は[`../../../web/workspace/README.md`](../../../web/workspace/README.md)、visual review手順は[`visual-review.md`](visual-review.md)をauthorityとする。
 
-一つの規則は、以下の各章のうち最も具体的な一箇所だけをauthorityとする。別の章で同じ禁止や手段を再掲せず、必要な場合はauthorityとなる章を参照する。
-
-この文書はrendered resultが満たす設計規則を定義する。実装者自身がbefore/afterをcaptureして完了判定する手順は、[`visual-review.md`](visual-review.md)をauthorityとする。
+一つの規則は最も具体的な一箇所だけをauthorityとする。具体的な二案の一方を棄却できない文は規則として残さない。
 
 ## 1. Principles
 
-この章は具体的な見た目や配置を定めない。複数の規則や要求が競合したときに、どちらを優先するか判断するための原理だけを定める。
+複数の規則や要求が競合した場合だけ、この章の優先原理を使う。
 
 ### Task before explanation
 
-現在のtaskと判断を、網羅的な説明、metadataの露出、装飾より優先する。UIはユーザーが次の有効な操作へ到達するまでの距離を短くする。
+次の有効なactionへ到達する前の操作、scroll、常設説明が少ない案を選ぶ。ただし、説明を省くと対象、結果、permission、不可逆性を誤認する場合は説明をactionより前に置く。
 
 ### Meaning before decoration
 
-視覚上の差は、情報の重要度、関係、操作可能性、または状態の違いを伝えるためにだけ使う。意味を説明できない視覚表現は追加しない。
+情報の関係、重要度、操作可能性、stateのいずれも変えない視覚差を追加しない。
 
 ### Authority before convenience
 
-UIの都合でdata、state、permission、利用可能なactionを推測しない。表示とaffordanceは、現在のauthorityが確定している内容に一致させる。
-
-### Complexity follows need
-
-複雑さを消すのではなく、判断に必要になる位置と時点で開示する。初期表示では、現在のtaskと競合する詳細を前面へ出さない。
+Backend authorityが確定していないdata、state、permission、actionを、UIの都合で補完または推測する案を棄却する。
 
 ## 2. Semantics / Grammar
 
-この章は、Workspace Webで情報、操作、状態を何として扱い、どう表現するかを定める。
-
 ### Information structure
 
-#### Priority and focus
+- pageと、page内で一つのtaskまたは判断を完結させる領域をscopeとする。
+- 各scopeで最も強い視覚要素はheading、現在判断が必要なattention、filled actionのいずれか一つだけにする。同じ強さのheading、attention、filled actionを複数置かない。
+- hierarchyをcolorだけで表現しない。DOMと画面上の配置順を一致させた上で、size、weight、contrastを使う。
+- scopeを識別するprimary titleは、一つのscopeにつき一度だけ表示する。
+- actionは、そのactionが影響するscope内に置く。
+- DTOにfieldが存在するという理由だけで表示せず、current taskの判断またはactionを変える値だけを常設する。
 
-- 情報はprimary、secondary、technicalの順に読む構造にする。
-- 一つのscopeでは、primary resource、current attention、next actionのいずれか一つを最初のfocusにする。
-- 重要度は最初に配置順、次にsize、weight、contrastで示す。colorや装飾だけで重要度を作らない。
-- 同じscopeに最も強いheading、filled action、attention表現を複数置かない。
-- metadataと補助操作は、主要なidentityやcurrent stateより強く見せない。
-- accent、filled action、強いcontrast、motionを複数箇所で競合させない。
-- normal stateは静かに保ち、attention表現は現在判断が必要な例外へ限定する。
-- focusを作るために周囲の情報を過度に薄くしたり、小さくしたりしない。
+**Disclosure**
 
-#### Page and section structure
-
-route titleはshell headerとmain contentを通じて一度だけ表示する。
-
-- 標準headerまたはbreadcrumbが現在routeを十分に識別している場合、main contentは最初の操作対象またはsectionから始める。
-- shell headerがscopeだけを示し、main contentの対象を識別できない場合に限り、main側へ一つのtitleを置く。
-- primary actionは、そのactionがpage全体の主要操作である場合だけtitleと同じrowへ置く。
-- route分類、breadcrumb、header titleをeyebrow、heading、keyで繰り返さない。
-- subtitleとledeは原則として置かない。
-
-一つのsectionは、一つの目的、ownership、または読み順を持つ。目的が異なる内容を同じsectionへ入れず、同じ目的の内容を見た目だけで複数sectionへ分けない。Section間とsection内の関係は次のGrouping and separationに従い、具体的なcueは`Primitives / Tokens`だけから選ぶ。
-
-#### Grouping and separation
-
-- 同じ判断や操作に使う情報は、一つのまとまりとして知覚できるようにする。
-- groupの単位は、共通のownership、behavior、またはユーザーが行う一つの判断から決める。data sourceやDTOが同じという理由だけでgroup化しない。
-- label、value、help、error、actionの対応関係を、別の説明を読まなくても追えるようにする。
-- 異なるgroupの境界を知覚でき、その強さが意味上の距離と一致するようにする。
-- 境界は何と何を分け、どのgroupの開始または終端を示すか説明できるようにする。
-- 一つのgroupまたは境界へ複数の視覚cueを重ねず、異なるhierarchyの境界をすべて同じ強さで表現しない。
-
-#### Metadata
-
-主要表示に置くのは、identity、healthまたはattention、比較、次の操作に必要な値だけとする。
-
-次の値は通常、label付きのdetail、debug、copy affordanceの後ろへ置く。
-
-- 内部ID
-- schema、config、recordのrevision
-- digestとfingerprint
-- provider diagnostics
-- authority source label
-- raw requestまたはresponse payload
-
-機械的な値にはmonospace familyを使う。DTOに値が存在することだけを理由に表示しない。
-
-#### 段階的な開示
-
-- primary viewにはidentity、current state、attention、次の有効なactionを表示する。
-- 副次的な運用情報はplain section、side panel、またはlabel付き`details`へ置く。
-- debug evidenceとraw metadataは、ユーザーが明示的に開いた場合だけ表示する。
-- destructive controlは、ユーザーが該当flowへ入るまでprimary actionより弱く表示する。
-- create formとedit formは明示的なactionの後に表示する。
-- blocking error、permission requirement、validation constraint、unsaved changeを閉じたdisclosureへ隠さない。
+- Raw dataやデバッグ情報など、通常は必要としない詳細な情報は折りたたみ領域に隠す。
+- 作成または編集のformを表示用screenへ常時同居させず、明示的なactionで開く折りたたみ領域または別pageに置く。
 
 ### Interaction and state
 
-#### Affordance
-
-- actionにはbutton、navigationにはlink、選択にはcontrolを使い、役割を見た目とsemantic elementで一致させる。
-- interactive elementは、通常、hover、focus、active、disabledを区別できるようにする。
+- actionにはbutton、navigationにはlink、選択には対応するform controlを使う。
+- interactive elementはhover、focus、active、disabledを視覚的に区別する。
 - staticなstatus、key、metadataをbuttonやpillの形にしない。
-- clickable rowは、click可能な範囲と遷移先を一つにする。
-- permissionがない操作をdisabled controlとして見せることでaffordanceを偽らない。
+- clickable rowは遷移先を一つだけ持ち、row全体で同じ遷移を実行する。
+- permissionがないactionをdisabled controlとして表示しない。
 
-#### State representation
+**State and operation**
 
-- 権威を持つdata sourceのstateをそのまま表示し、UIの都合でunknown、stale、unavailableを推測で埋めない。
-- stateは対象resourceまたはoperationの近くに置き、何のstateかを位置関係で判別できるようにする。
-- stateはmarkerとtextで示し、colorを補助に使う。
-- loading、empty、error、permission denied、unavailable、staleを別の状態として扱う。
-- 非同期operationでは、開始、処理中、完了、失敗を見通せるようにする。
+- stateの違いによってユーザーの判断または利用できるactionが変わる場合、その違いを一つの表示へ統合しない。
+- UI stateはそのstateを所有するauthorityから取得し、別domainやtransportのsignalから推測しない。
+- 非同期mutationでは楽観的更新か悲観的更新を選ぶ。楽観的更新は暫定stateを明示し、failure時のrollbackまたは再取得を定義できる場合だけ使う。それ以外は確定済みstateを維持し、operationのpending stateを別に表示する。
+- loading、failure、unavailableの表示は利用不能になった最小のscopeだけを置き換え、利用可能な親scopeとsibling scopeを残す。
+- destructive actionは対象と結果を明記し、復元できない場合だけconfirmationを要求する。
 
-#### Authority、権限、操作
+### Language / Copy
 
-- permissionはcontrolのenabled状態だけでなく、表示構成そのものへ反映する。
-- readは可能だがmutationできない場合、有用なread viewだけを構成する。
-- endpointからdataを取得できたかどうかでpermissionを推測しない。
-- domain stateとtransport stateを混同しない。
-- current stateで有効なactionだけを利用可能として提示する。
-- destructive actionには対象と結果を明記し、復元できない場合は意図的なconfirmationを要求する。
-- 同じscopeのfilled primary actionは一つだけとする。
+- title、navigation label、control labelで明らかな内容を説明文で繰り返さない。
+- 常設proseは、対象またはactionの選択を変えるwarning、permission、validation constraint、error recoveryに必要な内容だけにする。
+- button labelには具体的なactionを表す動詞を使い、`Submit`と`OK`を使わない。
+- identifier、API名、type名を別の語へ言い換えない。
 
-loading、empty、error、unavailableは同じfallbackへまとめず、それぞれ次の表現を使う。
-
-#### Loading
-
-- page frameとsection位置を維持する。
-- scopeが明らかでない場合は、何を読み込んでいるか示す。
-- page全体を中央spinnerへ置き換えない。
-- spinnerだけに意味を持たせない。
-
-#### Empty
-
-- absenceを直接表現する。
-- permissionがあり、actionが実際に利用できる場合だけ、次のactionを一つ提示する。
-- recordが存在しない状態と、読み込めなかった状態を区別する。
-
-#### Error
-
-- field validationは対象fieldの近くに置く。
-- operation errorは失敗したactionの近くに置く。
-- section load errorは対象section内に置き、利用できるsibling sectionは残す。
-- routeの主要目的を果たせない場合だけroute-level errorにする。
-- diagnosticsはboundedかつactionableにする。
-
-#### Unavailableとpermission
-
-resource unavailable、capability missing、permission deniedを別の状態として扱う。`403`をempty listとして表示したり、別scopeへredirectしたりしない。
-
-## 3. Language / Copy
-
-UI copyの語彙、長さ、説明責任を定める。
-
-- 具体的な名詞と動詞を使う。
-- identifier、API名、type名は正確性が必要な場合に原文を維持する。
-- title、navigation label、明らかなcontrol behavior、componentの存在理由を説明文で繰り返さない。
-- proseを追加するのは、判断を変える具体的な情報、warning、permission、validation constraint、error recoveryに必要な場合だけとする。
-- empty copyとstatus copyは短く、事実を直接書く。
-- buttonは操作を表す。`Submit`、`OK`、装飾的なcategory labelを避ける。
-
-## 4. Cross-cutting requirements
-
-viewport、input modality、支援技術にかかわらず、すべての表現とcomponentが満たす要件を定める。
-
-### Responsive
+### Responsive behavior
 
 - page全体にhorizontal scrollを発生させない。
-- board、table、code view、terminalは、自分の範囲内でbounded horizontal scrollを所有してよい。
-- side-by-side表示が同じ判断を支えなくなった場合、一列にする。
-- stack化によって比較関係が失われる場合、比較面を横方向に維持する。
+- wrappingまたはstack化によって情報の対応関係が失われる場合だけ、その領域内にbounded horizontal scrollを持たせる。それ以外のside-by-side layoutは一列にする。
 - primary actionを初期viewportから追い出さない。
-- touch targetの操作性を維持し、overflow解消のためにtextを縮小しない。
-- 長いkey、ref、diagnosticはwrapまたはtruncateし、完全な値へaccessできる手段を用意する。
+- contentをtruncateする場合、完全な値をcopyまたはdetailで取得できるようにする。
 
 ### Accessibility
 
-- semantic elementを使う。
-- すべてのcontrolに明示的なaccessible nameを与える。
-- 視覚的なfocusとkeyboard focusを一致させ、常に見えるようにする。
-- tab orderを画面上の順序と作業順に合わせる。
-- icon-only controlには具体的な`aria-label`を付ける。
-- stateはcolor以外のtextまたはsemantic distinctionを持つ。
-- 必要なhorizontal scroll regionはfocus可能にし、accessible nameを付ける。
-- lightとdarkで同じsemantic tokenを使う。
+- action、navigation、form controlを非semantic elementだけで実装しない。
+- すべてのcontrolにaccessible nameを与える。
+- keyboard focusを不可視にしない。
+- tab orderを画面上の順序と一致させる。
+- stateをcolorだけで区別しない。
+- horizontal scroll regionをkeyboard focus可能にし、accessible nameを与える。
 
-## 5. Primitives / Tokens
-
-色、文字、間隔、形、motionの最小単位を定義する。
+## 3. Primitives / Tokens
 
 ### Color / Theme
 
-colorはCSS custom propertyをauthorityとし、通常のWorkspace colorはOKLCHで定義する。lightとdarkは同じsemantic tokenを使う。
+colorはCSS custom propertyをauthorityとし、通常のWorkspace colorはOKLCHで定義する。lightとdarkは同じsemantic token名を使う。
 
 ```css
 --bg
@@ -208,28 +102,26 @@ colorはCSS custom propertyをauthorityとし、通常のWorkspace colorはOKLCH
 --shadow-overlay
 ```
 
-- backgroundとlayout surfaceはneutralにする。
-- muted textは新しいhueを増やす前にlightnessとchromaを下げる。
-- accentとstatus colorはstate、focus、navigationへ限定する。
-- componentへraw colorを追加せず、semantic tokenを使う。
-- 意味が重なるtoken aliasを作らない。
-
-ConsoleとterminalのANSI paletteは専用tokenを使い、通常のstatusやformへ流用しない。
+- `--bg`、`--bg-raised`、`--bg-subtle`へhueを持たせない。
+- accentはfocus、current navigation、current selectionだけに使い、通常本文や通常actionの背景へ使わない。
+- success、warning、dangerを、それぞれ対応するstate以外へ使わない。
+- componentへraw colorを追加せず、上記semantic tokenを使う。
+- ConsoleとterminalのANSI paletteを通常のstatusやformへ流用しない。
 
 ### Typography
 
-| 用途                                   | size / line height | 使用箇所                      |
-| -------------------------------------- | ------------------ | ----------------------------- |
-| Route title                            | `24px / 32px`      | shellまたはmainのどちらか一方 |
-| Body、control、row、section title      | `14px / 20px`      | contentとinteraction          |
-| Metadata、table heading、machine value | `12px / 16px`      | 副次情報と機械的な値          |
+font sizeは、その領域でユーザーが行う読み方によって選ぶ。
+
+- defaultは`14px / 20px`とし、個々のtextを読むこと自体がtaskの中心になる領域に使う。
+- 同じ構造の反復を一覧として走査する領域と、位置、順序、形、選択状態を中心に識別するUI chromeには`12px / 16px`を使う。textを読まなければactionの意味や結果を判断できない場合は`14px / 20px`を使う。
+- `24px / 32px`はページまたはdocument内で唯一かつ最大のheadingだけに使う。
+- 収めるため、または情報を弱く見せるためにfont sizeを下げない。`12px`未満と`13px`を使わない。
+- 機械的な値にはmonospace familyを使う。
 
 ```css
 --font-sans
 --font-mono
 ```
-
-別のfont sizeを増やす前に、配置、spacing、weight、muted colorでhierarchyを作る。textを`12px`未満へ縮小しない。
 
 ### Spacing / Shape
 
@@ -243,69 +135,56 @@ ConsoleとterminalのANSI paletteは専用tokenを使い、通常のstatusやfor
 --radius-soft
 ```
 
-- groupingはspacingとalignmentを最初のcueとする。
-- separationにはspacing、line、surface backgroundのいずれか一つをprimary cueとして選ぶ。
-- 汎用的な`Card` primitiveは設けない。
-- nested surfaceはparentと同じ境界表現を繰り返さない。
-- shadowは通常flowから浮くmenu、popover、Tooltipなどの一時的overlayだけが使用できる。
-- radiusはinteractive controlだけが使用できる。
+- 一つの境界にspacing、line、surface backgroundを重ねず、primary cueを一つだけ使う。
+- 汎用的な`Card` primitiveを設けない。
+- nested surfaceでparentと同じ境界表現を繰り返さない。
+- shadowは通常flowから浮くmenu、popover、Tooltipだけに使う。
+- radiusはinteractive controlだけに使う。
 
 ### Motion
 
-- motionは任意かつ短くし、意味の必須条件にしない。
-- 繰り返しまたは連続animationではreduced-motion preferenceを尊重する。
+- motion完了をactionの受付、state change、content理解の条件にしない。
+- 繰り返しまたは連続animationを、`prefers-reduced-motion: reduce`で停止する。
 
-## 6. Components / Patterns
+## 4. Components / Patterns
 
-実際のUIを、上のprinciple、grammar、communication、cross-cutting requirement、tokenから組み立てる。完成pageを固定templateにしない。
+### Border / Structural edge
 
-### Bevel / Structural edge
-
-- raised edgeは、周囲より前にあるcontrolまたはsurfaceを表す場合に使う。
-- inset edgeは、入力を受け取る領域または周囲より奥にあるsurfaceを表す場合に使う。
-- ridgeとgrooveは構造上の境界を表すために使い、status、attention、単なる装飾には使わない。
-- spacingやalignmentだけで関係を十分に示せる場合、Bevelを追加しない。
-- Bevel自体へbackgroundやsurface toneを与えず、必要なbackgroundは内側のsemantic childが持つtext/content areaへ適用する。
-- 隣接するsurfaceでは、実際に境界となる辺だけを見せ、存在しない境界やcornerを装飾目的で追加しない。
-- standaloneな閉じた領域は、領域自体をBevelで囲う。ページ全体を分割するHeaderとSidebarはclosed boxとして隣接させず、DesktopではHeaderのbottom edgeとSidebarのright edgeだけを有効にして内部境界を示す。viewport外周に重なるtop／left edgeは描画しない。
-- `BevelLine`は開いた領域内の構造separatorだけに使う。同じlayerではheading、本文、Lineの端を揃え、Lineだけに端方向のpaddingやmarginを追加しない。
-- 内側のlayerを分離するときは、親layoutがそのlayer全体へinline方向の余白を与え、content、row、Lineを一緒に内側へ移す。Lineだけを短くして階層を表現しない。
-- 外周border、focus ring、status marker、tableの意味的なgridはBevelや`BevelLine`へ置き換えない。
+- `Bevel`は1pxの単色borderを描くvisual wrapperであり、照明、raised／inset、ridge／grooveを表現しない。
+- `Bevel`自体へbackgroundやsurface toneを与えず、必要なbackgroundは内側のsemantic childが持つtext/content areaへ適用する。
+- 隣接するsurfaceでは、実際に境界となる辺だけを有効にする。
+- standaloneな閉じた領域は全辺を`Bevel`で囲う。Desktop shellではHeaderのbottom edgeとSidebarのright edgeだけを有効にし、viewport外周のtop／left edgeを描かない。
+- `BevelLine`は開いた領域内の1px separatorだけに使う。同じlayerではheading、本文、Lineの端を揃え、Lineだけに端方向のpaddingやmarginを追加しない。
+- nested layerでは親layoutがそのlayer全体へinline方向の余白を与え、content、row、Lineを一緒に移動する。Lineだけを短くしない。
+- control自身のborder、focus ring、status marker、table gridを`Bevel`または`BevelLine`で置き換えない。
 
 ### Sidebar
 
-- Sidebarは現在位置と利用可能なscopeを一つのnavigation hierarchyとして示す。
-- desktop幅は`clamp(220px, 20vw, 280px)`を基本とする。
-- navigation contentだけをscrollさせる。Desktopのfold controlはSidebar下部、Mobileのfold controlはHeaderに置く。
-- MobileでSidebarを表示するときはHeader下の残りviewport全体をSidebarに使い、main contentと同時表示しない。
-- navigationとscope controlだけを置く。
-- navigation linkはsidebar幅全体を使うflat rowとする。
-- active stateは一つのcueと`aria-current="page"`で示す。
-- iconだけでlabelを置き換えない。
-- fold controlは一つだけ置き、現在stateに対応するaccessible nameを使う。
-- narrow viewportでも同じSidebarの意味とnavigation hierarchyを維持する。
+- Desktop幅は`clamp(220px, 20vw, 280px)`とする。
+- navigation contentだけをscrollさせる。
+- Desktopのfold controlはSidebar下部、Mobileのfold controlはHeaderに置く。
+- MobileでSidebarを表示するときはHeader下の残りviewport全体を使い、main contentと同時表示しない。
+- navigationとscope control以外を置かない。
+- navigation linkはSidebar幅全体を使うflat rowとする。
+- active routeは一つの視覚cueと`aria-current="page"`で示す。
+- iconだけでnavigation labelを置き換えない。
+- fold controlは一つだけ置き、current stateに対応するaccessible nameを使う。
 
 ### Tooltip / Contextual help
 
-- operationやtable全体を説明する常設proseを置く前に、button labelとcolumn headingを明確にする。
-- labelだけでは表現しきれない補助説明は、対象へbindしたTooltipで表示する。
+- operationやtable全体を説明する常設proseを置く前に、button labelとcolumn headingだけで識別できるようにする。
+- labelだけでは表現できない補助説明だけを、対象へbindしたTooltipに入れる。
 - pointer hoverとkeyboard focusの両方で開く。
-- triggerとTooltipは`aria-describedby`で関連付ける。
-- hoverは短いdelayを持たせ、focusでは直ちに表示する。
-- `Escape`で閉じ、triggerからfocusを奪わない。
+- triggerとTooltipを`aria-describedby`で関連付ける。
+- hoverはdelay後、focusは直ちに表示する。
+- `Escape`で閉じ、triggerからfocusを移動しない。
 - 複数paragraph、form、link、buttonを入れない。
-- error、permission、validation constraint、不可逆操作の結果、current stateをTooltipだけへ隠さない。
-- touch環境でも同じ説明へ到達できるようにする。
+- error、permission、validation constraint、不可逆操作の結果、current stateをTooltipへ入れない。
+- touch環境ではTooltipだけを説明への到達手段にしない。
 
-### 汎用component pattern
+### Generic component patterns
 
-- **Action**: `primary`、`secondary`、`text`、`destructive`、`disabled`を同じ高さ、padding、focus contractで表現する。
 - **Form field**: label、control、constraintまたはhelp、field errorの順に配置する。
-- **Status**: markerと短いtextを一組にする。
-- **Feedback**: loading、empty、operation error、permission boundaryを別の状態として表現する。
-- **Resource row**: keyまたはname、判断に必要なmetadata、attentionまたはstate、一つのdestinationを置く。
-- **Comparable data**: 同じfieldを比較する場合だけtableを使う。
 - **Key-value**: 一つのresourceの属性には`dl`を使う。
-- **Disclosure**: secondary metadataやdiagnosticは具体的なlabelを持つ`details`などへ置く。
 
 Design-labではcomponent名と実際のsampleだけを表示する。規則とrationaleをUIへ書かない。

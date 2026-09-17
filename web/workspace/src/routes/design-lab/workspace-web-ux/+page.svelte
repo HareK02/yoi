@@ -9,7 +9,7 @@
     <h1 id="action-heading" class="showroom-heading">Action</h1>
     <BevelLine direction="x" length="100%" decorative />
     <div class="action-row">
-      <Bevel profile="edge" depth="raised">
+      <Bevel>
         <button class="action action--primary" type="button">Create Worker</button>
       </Bevel>
       <Tooltip id="rerun-help" text="Runs validation against the current Workspace configuration." placement="bottom" align="start">
@@ -28,22 +28,22 @@
       </Bevel>
     </div>
 
-    <div class="ridge-matrix">
-      <Bevel as="div" profile="ridge" depth="raised" fill>
-        <div class="tactile-group" role="group" aria-label="Raised validation controls">
+    <div class="border-matrix">
+      <Bevel as="div" fill>
+        <div class="tactile-group" role="group" aria-label="Bordered validation controls">
           <span>
-            <strong>Raised ridge</strong>
+            <strong>Closed border</strong>
             <small>3 checks passed at 14:32</small>
           </span>
-          <Bevel pressed>
+          <Bevel>
             <button class="compact-control" type="button" aria-pressed="true">Live</button>
           </Bevel>
         </div>
       </Bevel>
-      <Bevel as="div" profile="ridge" depth="inset" fill>
-        <div class="tactile-group" role="group" aria-label="Inset ridge controls">
+      <Bevel as="div" fill>
+        <div class="tactile-group" role="group" aria-label="Read-only bordered controls">
           <span>
-            <strong>Inset ridge</strong>
+            <strong>Read-only border</strong>
             <small>Read-only control group</small>
           </span>
           <span class="status"><span class="status__marker" data-tone="muted"></span>Locked</span>
@@ -57,7 +57,7 @@
           </span>
         </div>
       </Bevel>
-      <Bevel as="div" profile="ridge" depth="inset" top={false} left={false} fill>
+      <Bevel as="div" top={false} left={false} fill>
         <div class="tactile-group" role="group" aria-label="Right and bottom groove">
           <span>
             <strong>Right + bottom</strong>
@@ -73,10 +73,10 @@
     <BevelLine direction="x" length="100%" decorative />
     <div class="line-showcase">
       <div class="line-sample line-sample--horizontal">
-        <span class="line-sample__label">Raised · x · 100%</span>
+        <span class="line-sample__label">Horizontal · 100%</span>
         <BevelLine direction="x" length="100%" />
-        <span class="line-sample__label">Inset · x · 160px</span>
-        <BevelLine direction="x" length="160px" depth="inset" />
+        <span class="line-sample__label">Horizontal · 160px</span>
+        <BevelLine direction="x" length="160px" />
       </div>
       <div class="line-sample line-sample--vertical">
         <span>Before</span>
