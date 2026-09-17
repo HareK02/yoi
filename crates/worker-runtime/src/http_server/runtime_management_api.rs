@@ -449,9 +449,9 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         let request: WorkerRetentionExecutionRequest = request(value)?;
         if request.workspace_id != scope.workspace_id {
             return Err(runtime_api::RuntimeApiError::new(
-                StatusCode::FORBIDDEN.as_u16(),
-                "workspace_scope_mismatch",
-                "Worker retention request workspace does not match the authenticated workspace scope",
+                StatusCode::NOT_FOUND.as_u16(),
+                "worker_not_found",
+                "worker does not belong to the authenticated Workspace",
             ));
         }
         if request.worker_id != worker_ref.worker_id {

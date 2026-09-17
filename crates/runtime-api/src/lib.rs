@@ -717,6 +717,16 @@ pub const REMAINING_RUNTIME_ROUTES: &[RemainingRuntimeRoute] = &[
         reason: "Workdir transport",
     },
     RemainingRuntimeRoute {
+        method: "GET",
+        path: "/v1/protocol/ws",
+        reason: "WebSocket protocol transport (ws-server feature)",
+    },
+    RemainingRuntimeRoute {
+        method: "GET",
+        path: "/v1/workers/{worker_id}/protocol/ws",
+        reason: "WebSocket protocol transport (ws-server feature)",
+    },
+    RemainingRuntimeRoute {
         method: "POST",
         path: "/v1/workers/{worker_id}/attachments",
         reason: "Binary attachment transport",
@@ -901,7 +911,7 @@ mod tests {
 
     #[test]
     fn remaining_route_inventory_does_not_overlap_contract() {
-        assert_eq!(REMAINING_RUNTIME_ROUTES.len(), 18);
+        assert_eq!(REMAINING_RUNTIME_ROUTES.len(), 20);
         for remaining in REMAINING_RUNTIME_ROUTES {
             assert!(!RuntimeApiMetadata::OPERATIONS.iter().any(|operation| {
                 format!("{:?}", operation.method).eq_ignore_ascii_case(remaining.method)

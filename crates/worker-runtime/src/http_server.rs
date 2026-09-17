@@ -2460,6 +2460,11 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         {
             StatusCode::NOT_FOUND
         }
+        RuntimeError::InvalidRequest(message)
+            if message.contains("already created with a different fingerprint") =>
+        {
+            StatusCode::CONFLICT
+        }
         RuntimeError::RuntimeStopped
         | RuntimeError::RuntimeStoreAlreadyOpen { .. }
         | RuntimeError::WorkerExecutionUnavailable { .. }
@@ -2498,6 +2503,11 @@ fn code_for_runtime_error(error: &RuntimeError) -> String {
         RuntimeError::WorkerExecutionRejected { .. } => "worker_execution_rejected".to_string(),
         RuntimeError::WorkspaceOwnerMismatch { .. } => "workspace_owner_mismatch".to_string(),
         RuntimeError::LimitTooLarge { .. } => "limit_too_large".to_string(),
+        RuntimeError::InvalidRequest(message)
+            if message.contains("already created with a different fingerprint") =>
+        {
+            "worker_create_conflict".to_string()
+        }
         RuntimeError::InvalidRequest(_) => "invalid_request".to_string(),
         RuntimeError::WorkingDirectory(diagnostic) => diagnostic.code.clone(),
         RuntimeError::InvalidInitialInputKind { .. } => "invalid_initial_input_kind".to_string(),
@@ -2552,6 +2562,29 @@ mod tests {
     use manifest::{Scope, SharedScope};
     use sha2::Digest as _;
     use tower::ServiceExt;
+
+    #[derive(Clone)]
+    struct TestRuntimeAuthorizer(String);
+
+    impl runtime_api::client_support::RequestAuthorizer for TestRuntimeAuthorizer {
+        fn authorize(
+            &self,
+            _request: runtime_api::client_support::AuthorizerRequest<'_>,
+        ) -> Result<
+            runtime_api::client_support::framework::header::HeaderMap,
+            runtime_api::client_support::AuthorizationError,
+        > {
+            let mut headers = runtime_api::client_support::framework::header::HeaderMap::new();
+            headers.insert(
+                runtime_api::client_support::framework::header::AUTHORIZATION,
+                format!("Bearer {}", self.0)
+                    .parse()
+                    .map_err(|_| runtime_api::client_support::AuthorizationError::new())?,
+            );
+            Ok(headers)
+        }
+    }
+
     use workdir::{
         GrepOutputMode, GrepRequest, LocalWorkdirSession, StatRequest, Workdir, WorkdirPath,
         WorkdirSessionCapabilities,
@@ -2586,6 +2619,38 @@ mod tests {
                     operation.path
                 );
             }
+        }
+    }
+
+    #[test]
+    fn remaining_route_inventory_covers_every_handwritten_router_path() {
+        let inventoried = runtime_api::REMAINING_RUNTIME_ROUTES
+            .iter()
+            .map(|route| route.path)
+            .collect::<std::collections::BTreeSet<_>>();
+        for path in [
+            WORKSPACE_VERIFICATION_CHALLENGE_PATH,
+            WORKSPACE_VERIFICATION_ACK_PATH,
+            "/v1/config-bundles",
+            "/v1/config-bundles/{bundle_id}/availability",
+            "/v1/workspace-prompt-projections",
+            "/v1/working-directories",
+            "/v1/working-directories/repository-access",
+            SSH_HOST_KEY_PROBE_PATH,
+            "/v1/repository-refs/observe",
+            "/v1/working-directories/{working_directory_id}/sessions",
+            "/v1/workdir-sessions/{session_id}/operations",
+            "/v1/workdir-sessions/{session_id}",
+            "/v1/working-directories/{working_directory_id}",
+            "/v1/workers/{worker_id}/attachments",
+            "/v1/workers/{worker_id}/attachments/{artifact_id}",
+            "/v1/protocol/ws",
+            "/v1/workers/{worker_id}/protocol/ws",
+        ] {
+            assert!(
+                inventoried.contains(path),
+                "missing handwritten route inventory for {path}"
+            );
         }
     }
 
@@ -3283,6 +3348,116 @@ mod tests {
         assert_eq!(malformed_response.status(), StatusCode::BAD_REQUEST);
         let malformed: RuntimeHttpErrorResponse = read_json(malformed_response).await;
         assert_eq!(malformed.error.code, "invalid_json");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_app = app.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, server_app).await.unwrap();
+        });
+        let client = runtime_api::RuntimeApiClient::builder(&format!("http://{address}"))
+            .unwrap()
+            .authorizer(TestRuntimeAuthorizer(token.to_string()))
+            .build()
+            .unwrap();
+        let generated_request: runtime_api::CreateWorkerRequest = serde_json::from_value(
+            serde_json::to_value(task_request("generated-roundtrip")).unwrap(),
+        )
+        .unwrap();
+        let generated_worker_id = generated_request.worker_id.to_string();
+        let mut conflicting_request = generated_request.clone();
+        conflicting_request.create_fingerprint = "different-fingerprint".to_string();
+        let generated = client.create_worker(generated_request).await.unwrap();
+        assert_eq!(generated.worker.worker_id.to_string(), generated_worker_id);
+        let generated_input: runtime_api::WorkerInput = serde_json::from_value(
+            serde_json::to_value(WorkerInput::user("generated client input")).unwrap(),
+        )
+        .unwrap();
+        client
+            .send_worker_input(generated_worker_id.clone(), generated_input)
+            .await
+            .unwrap();
+        client
+            .stop_worker(
+                generated_worker_id.clone(),
+                runtime_api::WorkerLifecycleRequest::default(),
+            )
+            .await
+            .unwrap();
+        client
+            .restore_worker(
+                generated_worker_id.clone(),
+                runtime_api::EmptyObjectRequest::default(),
+            )
+            .await
+            .unwrap();
+        let conflict = client.create_worker(conflicting_request).await.unwrap_err();
+        assert!(
+            matches!(
+                &conflict,
+                runtime_api::client_support::ClientError::Public { status, .. }
+                    if *status == StatusCode::CONFLICT
+            ),
+            "{conflict:?}"
+        );
+        client
+            .stop_worker(
+                generated_worker_id.clone(),
+                runtime_api::WorkerLifecycleRequest::default(),
+            )
+            .await
+            .unwrap();
+        client
+            .delete_worker(generated_worker_id.clone())
+            .await
+            .unwrap();
+        let missing = client
+            .get_worker(generated_worker_id.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            missing,
+            runtime_api::client_support::ClientError::Public { status, .. }
+                if status == StatusCode::NOT_FOUND
+        ));
+        let unauthorized = runtime_api::RuntimeApiClient::builder(&format!("http://{address}"))
+            .unwrap()
+            .build()
+            .unwrap()
+            .list_workers(runtime_api::WorkerListQuery::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            unauthorized,
+            runtime_api::client_support::ClientError::Public { status, .. }
+                if status == StatusCode::UNAUTHORIZED
+        ));
+        let forbidden_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/ping")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden_response.status(), StatusCode::FORBIDDEN);
+        let bounded_client = runtime_api::RuntimeApiClient::builder(&format!("http://{address}"))
+            .unwrap()
+            .authorizer(TestRuntimeAuthorizer(token.to_string()))
+            .response_body_limit(1)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            bounded_client.runtime_summary().await.unwrap_err(),
+            runtime_api::client_support::ClientError::Failure(
+                runtime_api::client_support::ClientFailure::ResponseTooLarge { .. }
+            )
+        ));
+        server.abort();
 
         let response = authed_json_request(
             app.clone(),
