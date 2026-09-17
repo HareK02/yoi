@@ -20722,7 +20722,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_profile_backend_reports_uncertain_pending_orchestrator_restore() {
+    async fn production_profile_backend_preflight_rejects_pending_orchestrator_restore() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let config = test_server_config(workspace.path());
@@ -20772,9 +20772,11 @@ mod tests {
             }),
         )
         .await
-        .expect_err("pending Workspace Orchestrator restore without durable Prompt must require reconciliation");
+        .expect_err(
+            "pending Workspace Orchestrator restore without durable Prompt must be rejected",
+        );
         assert!(
-            format!("{error:?}").contains("worker_restore_reconciliation_required"),
+            format!("{error:?}").contains("worker_restore_preflight_rejected"),
             "unexpected restore error: {error:?}"
         );
     }

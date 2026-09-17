@@ -1483,13 +1483,6 @@ impl Runtime {
             let state = self.lock()?;
             state.ensure_running()?;
             let worker = state.worker(worker_ref)?;
-            if worker.execution_bound && !worker.execution_metadata_available {
-                return Ok(RuntimeWorkerRestoreResult::failed(
-                    WorkerRestoreState::ReconciliationRequired,
-                    "worker_restore_reconciliation_pending",
-                    "Worker restore cleanup or reconciliation is still pending",
-                ));
-            }
             if worker.execution_handle.is_some() {
                 if worker.status.is_active() {
                     return Ok(RuntimeWorkerRestoreResult::accepted(worker.detail()));
@@ -7520,11 +7513,12 @@ mod tests {
             runtime.worker_detail(&created.worker_ref).unwrap().status,
             WorkerStatus::Idle
         );
+        backend.restore_result.lock().unwrap().take();
         let retry = runtime
             .restore_worker_operation(&created.worker_ref)
             .unwrap();
-        assert_eq!(retry.state, WorkerRestoreState::ReconciliationRequired);
-        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
+        assert_eq!(retry.state, WorkerRestoreState::Accepted);
+        assert_eq!(*backend.restore_count.lock().unwrap(), 2);
     }
 
     #[cfg(feature = "fs-store")]
@@ -7898,21 +7892,18 @@ mod tests {
         let restored_worker = restored.worker_detail(&worker.worker_ref).unwrap();
         assert_eq!(restored_worker.status, WorkerStatus::Idle);
         assert!(!restored_worker.execution_metadata_available);
+        restoring_backend.restore_result.lock().unwrap().take();
         let retry = restored
             .restore_worker_operation(&worker.worker_ref)
             .unwrap();
-        assert_eq!(retry.state, WorkerRestoreState::ReconciliationRequired);
-        assert_eq!(*restoring_backend.restore_count.lock().unwrap(), 1);
-        let err = restored
+        assert_eq!(retry.state, WorkerRestoreState::Accepted);
+        assert_eq!(*restoring_backend.restore_count.lock().unwrap(), 2);
+        restored
             .send_input(
                 &worker.worker_ref,
-                WorkerInput::user("after failed restore"),
+                WorkerInput::user("after reconciled restore"),
             )
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            RuntimeError::WorkerExecutionUnavailable { .. }
-        ));
+            .unwrap();
 
         let _ = std::fs::remove_dir_all(root);
     }
