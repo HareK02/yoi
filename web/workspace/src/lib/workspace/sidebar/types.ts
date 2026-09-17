@@ -5,6 +5,7 @@ import type {
   WorkerLaunchOptionsResponse as SharedWorkerLaunchOptionsResponse,
   WorkerLaunchProfileCandidate as SharedWorkerLaunchProfileCandidate,
   WorkerLaunchRuntimeOption as SharedWorkerLaunchRuntimeOption,
+  WorkerLaunchWorkerSummary as WorkerSummary,
   WorkingDirectoryRepositoryOption as SharedWorkingDirectoryRepositoryOption,
 } from "$lib/generated/worker-launch-api";
 import type {
