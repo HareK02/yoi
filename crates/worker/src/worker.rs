@@ -156,11 +156,13 @@ where
         Many(VecDeque<PendingNotification>),
     }
 
-    Ok(match <Option<OneOrMany> as serde::Deserialize>::deserialize(deserializer)? {
-        Some(OneOrMany::One(notification)) => VecDeque::from([notification]),
-        Some(OneOrMany::Many(notifications)) => notifications,
-        None => VecDeque::new(),
-    })
+    Ok(
+        match <Option<OneOrMany> as serde::Deserialize>::deserialize(deserializer)? {
+            Some(OneOrMany::One(notification)) => VecDeque::from([notification]),
+            Some(OneOrMany::Many(notifications)) => notifications,
+            None => VecDeque::new(),
+        },
+    )
 }
 
 impl PendingActivationState {
@@ -10239,9 +10241,11 @@ mod build_summary_prompt_tests {
             handle.accept_notification("notification-1".into(), "different".into()),
             Err(PendingSubmissionError::IdempotencyConflict)
         ));
-        assert!(handle
-            .accept_notification("notification-2".into(), "second notice".into())
-            .unwrap());
+        assert!(
+            handle
+                .accept_notification("notification-2".into(), "second notice".into())
+                .unwrap()
+        );
         handle
             .accept("request-1".into(), vec![Segment::text("submit")], false)
             .unwrap();

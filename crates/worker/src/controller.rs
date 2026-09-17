@@ -368,11 +368,7 @@ fn stage_pending_notifications<St: Store + Clone>(
     }
     let count = notifications.len();
     for (notification, extension) in notifications {
-        notify_buffer.push_durable_notify(
-            notification.message,
-            notification.provenance,
-            extension,
-        );
+        notify_buffer.push_durable_notify(notification.message, notification.provenance, extension);
     }
     count
 }
@@ -409,7 +405,8 @@ fn prepare_pending_run<St: Store + Clone>(
         }
         None if allow_notification_run
             && (stage_pending_notifications(pending_submissions, notify_buffer) > 0
-                || notify_buffer.has_notification_pending()) => {
+                || notify_buffer.has_notification_pending()) =>
+        {
             Some(PendingRun::RunForNotification {
                 invoke_kind: protocol::InvokeKind::Notify,
             })
@@ -3149,7 +3146,6 @@ mod tests {
             Some(PendingRun::Submit(_))
         ));
         assert_eq!(notify_buffer.len(), 1);
-
     }
 
     #[test]

@@ -1930,7 +1930,11 @@ async fn repeated_notify_while_idle_coalesces_and_auto_starts_one_turn() {
         .filter_map(|item| item.as_text())
         .filter(|text| text.contains("[Notification]"))
         .collect::<Vec<_>>();
-    assert_eq!(notifications.len(), 2, "duplicate receipt must not duplicate content");
+    assert_eq!(
+        notifications.len(),
+        2,
+        "duplicate receipt must not duplicate content"
+    );
     assert!(notifications[0].contains("progress snapshot"));
     assert!(notifications[1].contains("second coalesced notification"));
 }
@@ -2684,9 +2688,8 @@ async fn pause_then_resume_preserves_notifications_and_history_consistency() {
     let requests = client_for_assert.captured_requests();
     assert_eq!(requests.len(), 2);
     assert!(requests[1].items.iter().any(|item| {
-        item.as_text().is_some_and(|text| {
-            text.contains("[Notification]") && text.contains("resume context")
-        })
+        item.as_text()
+            .is_some_and(|text| text.contains("[Notification]") && text.contains("resume context"))
     }));
 
     // History consistency: the interrupted partial response is absent, while
