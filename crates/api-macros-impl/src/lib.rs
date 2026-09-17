@@ -41,6 +41,7 @@ enum Method {
 struct AdapterConfig {
     reqwest: bool,
     axum: bool,
+    openapi: bool,
 }
 
 impl Parse for AdapterConfig {
@@ -51,13 +52,14 @@ impl Parse for AdapterConfig {
             match adapter.to_string().as_str() {
                 "reqwest" if !config.reqwest => config.reqwest = true,
                 "axum" if !config.axum => config.axum = true,
-                "reqwest" | "axum" => {
+                "openapi" if !config.openapi => config.openapi = true,
+                "reqwest" | "axum" | "openapi" => {
                     return Err(syn::Error::new(adapter.span(), "duplicate API adapter"));
                 }
                 _ => {
                     return Err(syn::Error::new(
                         adapter.span(),
-                        "unsupported API adapter; expected `reqwest` or `axum`",
+                        "unsupported API adapter; expected `reqwest`, `axum`, or `openapi`",
                     ));
                 }
             }
@@ -1270,10 +1272,107 @@ fn axum_adapter_tokens(
     }
 }
 
+fn openapi_adapter_tokens(
+    api: &ApiDefinition,
+    api_crate: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    if !api.adapters.openapi {
+        return proc_macro2::TokenStream::new();
+    }
+
+    let function_ident = format_ident!(
+        "{}_openapi",
+        to_snake_case(&api.item.ident),
+        span = api.item.ident.span()
+    );
+    let operations = api.operations.iter().map(|operation| {
+        let method = method_name(operation.method);
+        let path = &operation.path;
+        let operation_id = &operation.operation_id;
+        let parameters = operation.parameters.iter().filter_map(|parameter| {
+            if matches!(parameter.location, Location::Body) {
+                return None;
+            }
+            let ty = &parameter.ty;
+            let name = &parameter.wire_name;
+            let location = match parameter.location {
+                Location::Path => "path",
+                Location::Query => "query",
+                Location::Header => "header",
+                Location::Body => unreachable!(),
+            };
+            let required = matches!(parameter.location, Location::Path) || !is_option_type(ty);
+            Some(quote! {
+                operation.parameter::<#ty>(#name, #location, #required)?;
+            })
+        });
+        let request = operation.request_body.as_ref().map(|ty| {
+            quote! {
+                operation.request_body::<#ty>("application/json")?;
+            }
+        });
+        let status = operation.response_status;
+        let response = match &operation.response_body {
+            Some(ty) => quote! {
+                operation.response::<#ty>(#status, "application/json", "Successful response")?;
+            },
+            None => quote! {
+                operation.empty_response(#status, "Successful response")?;
+            },
+        };
+        let error = operation
+            .error_status
+            .zip(operation.error_body.as_ref())
+            .map(|(status, ty)| {
+                quote! {
+                    operation.response::<#ty>(#status, "application/json", "Error response")?;
+                }
+            });
+
+        quote! {
+            {
+                let mut operation = builder.operation(#method, #path, #operation_id)?;
+                #(#parameters)*
+                #request
+                #response
+                #error
+                operation.finish()?;
+            }
+        }
+    });
+
+    quote! {
+        #[doc = "Build this trait's deterministic, deployment-independent OpenAPI 3.1 document."]
+        pub fn #function_ident(
+            info: #api_crate::openapi::OpenApiInfo<'_>,
+        ) -> ::core::result::Result<
+            #api_crate::openapi::OpenApiDocument,
+            #api_crate::openapi::OpenApiError,
+        > {
+            let mut builder = #api_crate::openapi::OpenApiBuilder::new(info)?;
+            #(#operations)*
+            ::core::result::Result::Ok(builder.finish())
+        }
+    }
+}
+
+fn is_option_type(ty: &Type) -> bool {
+    let Type::Path(path) = ty else {
+        return false;
+    };
+    path.qself.is_none()
+        && path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "Option")
+}
+
 fn expand_api(api: ApiDefinition) -> syn::Result<proc_macro2::TokenStream> {
     let api_crate = api_crate_path()?;
     let reqwest_adapter = reqwest_adapter_tokens(&api, &api_crate);
     let axum_adapter = axum_adapter_tokens(&api, &api_crate);
+    let openapi_adapter = openapi_adapter_tokens(&api, &api_crate);
     let item = api.item;
     let metadata_ident = api.metadata_ident;
     let module_ident = api.operations_module_ident;
@@ -1353,6 +1452,7 @@ fn expand_api(api: ApiDefinition) -> syn::Result<proc_macro2::TokenStream> {
 
         #reqwest_adapter
         #axum_adapter
+        #openapi_adapter
     })
 }
 
