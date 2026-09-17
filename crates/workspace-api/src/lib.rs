@@ -2327,15 +2327,36 @@ pub enum WorkerOperationState {
     Rejected,
 }
 
+/// Cross-layer outcome of an explicit Worker restore operation.
+///
+/// `Rejected` is reserved for read-only preflight failures. Once live restore
+/// work starts, failure is either a confirmed `RolledBack` operation or a
+/// `ReconciliationRequired` result whose commit state must be reread/retried.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRestoreState {
+    Accepted,
+    Rejected,
+    RolledBack,
+    ReconciliationRequired,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct WorkerRestoreResult {
-    pub state: WorkerOperationState,
+    pub state: WorkerRestoreState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
     pub worker: Option<WorkerSummary>,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct WorkerRestoreResponse {
     pub workspace_id: String,
     pub runtime_id: String,
@@ -3481,6 +3502,42 @@ mod workdir_typescript_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_restore_state_round_trips_and_rejects_unknown_variants() {
+        for (state, wire) in [
+            (WorkerRestoreState::Accepted, "accepted"),
+            (WorkerRestoreState::Rejected, "rejected"),
+            (WorkerRestoreState::RolledBack, "rolled_back"),
+            (
+                WorkerRestoreState::ReconciliationRequired,
+                "reconciliation_required",
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_value(state).unwrap(),
+                serde_json::json!(wire)
+            );
+            assert_eq!(
+                serde_json::from_value::<WorkerRestoreState>(serde_json::json!(wire)).unwrap(),
+                state
+            );
+        }
+        assert!(
+            serde_json::from_value::<WorkerRestoreState>(serde_json::json!("unknown")).is_err()
+        );
+    }
+
+    #[test]
+    fn worker_restore_result_rejects_unknown_fields() {
+        let result = serde_json::from_value::<WorkerRestoreResult>(serde_json::json!({
+            "state": "rejected",
+            "worker": null,
+            "diagnostics": [],
+            "unexpected": true
+        }));
+        assert!(result.is_err());
+    }
 
     #[test]
     fn historical_http_repository_source_kind_decodes_as_invalid_evidence() {

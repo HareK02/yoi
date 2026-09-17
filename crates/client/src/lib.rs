@@ -27,7 +27,7 @@ pub use backend_runtime::{
     BackendWorkerCapabilitySummary, BackendWorkerImplementationSummary, BackendWorkerLaunchOptions,
     BackendWorkerLaunchProfileCandidate, BackendWorkerLaunchRuntimeOption,
     BackendWorkerLaunchTarget, BackendWorkerOperationState, BackendWorkerRestoreResponse,
-    BackendWorkerRestoreResult, BackendWorkerSummary, BackendWorkerWorkspaceSummary,
+    BackendWorkerRestoreResult, BackendWorkerRestoreState, BackendWorkerSummary, BackendWorkerWorkspaceSummary,
     BackendWorkingDirectorySummary, connect_backend_runtime, create_backend_worker,
     get_backend_worker_launch_options, list_backend_stopped_workers, list_backend_workers,
     restore_backend_worker,

@@ -52,6 +52,7 @@ use worker_runtime::http_server::{
     RuntimeHttpWorkerCompletionsResponse, RuntimeHttpWorkerDeleteResponse,
     RuntimeHttpWorkerInputResponse, RuntimeHttpWorkerLifecycleRequest,
     RuntimeHttpWorkerLifecycleResponse, RuntimeHttpWorkerResponse,
+    RuntimeHttpWorkerRestoreResponse,
     RuntimeHttpWorkerWorkspaceApiRequest, RuntimeHttpWorkersResponse,
     RuntimeHttpWorkingDirectoriesResponse, RuntimeHttpWorkingDirectoryResponse,
     RuntimeHttpWorkspacePromptProjectionRequest, RuntimeHttpWorkspacePromptProjectionResponse,
@@ -378,8 +379,9 @@ pub(crate) fn workspace_worker_summary(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerRestoreResult {
-    pub state: WorkerOperationState,
+    pub state: workspace_api::WorkerRestoreState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker: Option<WorkerSummary>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
@@ -882,7 +884,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
 
     fn restore_worker(&self, worker_id: &str) -> WorkerRestoreResult {
         WorkerRestoreResult {
-            state: WorkerOperationState::Unsupported,
+            state: workspace_api::WorkerRestoreState::Rejected,
             worker: None,
             diagnostics: vec![diagnostic(
                 "worker_restore_unsupported",
@@ -2336,7 +2338,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
     fn restore_worker(&self, worker_id: &str) -> WorkerRestoreResult {
         let Some(worker_ref) = self.worker_ref(worker_id) else {
             return WorkerRestoreResult {
-                state: WorkerOperationState::Rejected,
+                state: workspace_api::WorkerRestoreState::Rejected,
                 worker: None,
                 diagnostics: vec![diagnostic(
                     "embedded_worker_id_invalid",
@@ -2345,14 +2347,24 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 )],
             };
         };
-        match self.runtime.restore_worker(&worker_ref) {
-            Ok(detail) => WorkerRestoreResult {
-                state: WorkerOperationState::Accepted,
-                worker: Some(self.map_worker_detail(detail)),
-                diagnostics: Vec::new(),
-            },
+        match self.runtime.restore_worker_operation(&worker_ref) {
+            Ok(result) => {
+                let diagnostics = match (result.reason_code, result.message) {
+                    (Some(code), Some(message)) => vec![diagnostic(
+                        code,
+                        DiagnosticSeverity::Warning,
+                        message,
+                    )],
+                    _ => Vec::new(),
+                };
+                WorkerRestoreResult {
+                    state: result.state,
+                    worker: result.worker.map(|detail| self.map_worker_detail(detail)),
+                    diagnostics,
+                }
+            }
             Err(err) => WorkerRestoreResult {
-                state: WorkerOperationState::Rejected,
+                state: workspace_api::WorkerRestoreState::ReconciliationRequired,
                 worker: None,
                 diagnostics: vec![embedded_runtime_diagnostic(&err)],
             },
@@ -4164,17 +4176,27 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
     }
 
     fn restore_worker(&self, worker_id: &str) -> WorkerRestoreResult {
-        match self.post_json::<_, RuntimeHttpWorkerResponse>(
+        match self.post_json::<_, RuntimeHttpWorkerRestoreResponse>(
             &format!("/v1/workers/{worker_id}/restore"),
             &serde_json::json!({}),
         ) {
-            Ok(response) => WorkerRestoreResult {
-                state: WorkerOperationState::Accepted,
-                worker: Some(self.map_worker_detail(response.worker)),
-                diagnostics: Vec::new(),
-            },
+            Ok(response) => {
+                let diagnostics = match (response.reason_code, response.message) {
+                    (Some(code), Some(message)) => {
+                        vec![diagnostic(code, DiagnosticSeverity::Warning, message)]
+                    }
+                    _ => Vec::new(),
+                };
+                WorkerRestoreResult {
+                    state: response.state,
+                    worker: response.worker.map(|worker| self.map_worker_detail(worker)),
+                    diagnostics,
+                }
+            }
             Err(diagnostic) => WorkerRestoreResult {
-                state: WorkerOperationState::Rejected,
+                // A transport/protocol failure cannot prove that the Runtime
+                // rejected before side effects. Preserve uncertainty.
+                state: workspace_api::WorkerRestoreState::ReconciliationRequired,
                 worker: None,
                 diagnostics: vec![diagnostic],
             },
@@ -5427,6 +5449,38 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    #[test]
+    fn remote_restore_transport_failure_requires_reconciliation() {
+        let provider = RemoteWorkerRuntime::new(
+            RemoteRuntimeConfig {
+                runtime_id: "runtime-remote".to_string(),
+                workspace_id: Some("workspace-a".to_string()),
+                display_name: "Remote Runtime".to_string(),
+                base_url: "http://127.0.0.1:9".to_string(),
+                bearer_token: None,
+                workspace_authorization: None,
+                strict_public_egress: false,
+                cached_worker_creation_available: true,
+                cached_os: "linux".to_string(),
+                cached_arch: "x86_64".to_string(),
+                cached_status: "ready".to_string(),
+                timeout: Duration::from_millis(100),
+            },
+            "workspace-a".to_string(),
+            "http://127.0.0.1:3000".to_string(),
+        )
+        .unwrap();
+
+        let result = provider.restore_worker("worker-transport-uncertain");
+
+        assert_eq!(
+            result.state,
+            workspace_api::WorkerRestoreState::ReconciliationRequired
+        );
+        assert!(result.worker.is_none());
+        assert_eq!(result.diagnostics.len(), 1);
+    }
 
     #[test]
     fn embedded_delete_persistence_failure_diagnostic_is_bounded_and_path_free() {

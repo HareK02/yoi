@@ -60,6 +60,7 @@ use protocol::subscription::{
     SubscriptionTerminationCode,
 };
 use serde::{Deserialize, Serialize};
+use workspace_api::WorkerRestoreState;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
@@ -418,6 +419,20 @@ pub struct RuntimeHttpWorkingDirectoryResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeHttpWorkerResponse {
     pub worker: WorkerDetail,
+}
+
+/// Explicit restore outcome. This envelope is returned for every reachable
+/// Runtime restore attempt, including preflight rejection and uncertain commit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeHttpWorkerRestoreResponse {
+    pub state: WorkerRestoreState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Replace the Workspace API binding for an existing Worker.
@@ -1199,14 +1214,21 @@ async fn restore_worker(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
     Path(worker_id): Path<String>,
-) -> RestResult<RuntimeHttpWorkerResponse> {
+) -> RestResult<RuntimeHttpWorkerRestoreResponse> {
     let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
-    let worker = match auth_workspace_scope(&state, auth.as_ref())? {
-        Some(scope) => state.runtime.restore_worker_scoped(&scope, &worker_ref),
-        None => state.runtime.restore_worker(&worker_ref),
+    let result = match auth_workspace_scope(&state, auth.as_ref())? {
+        Some(scope) => state
+            .runtime
+            .restore_worker_operation_scoped(&scope, &worker_ref),
+        None => state.runtime.restore_worker_operation(&worker_ref),
     }
     .map_err(RuntimeHttpRestError::runtime)?;
-    Ok(Json(RuntimeHttpWorkerResponse { worker }))
+    Ok(Json(RuntimeHttpWorkerRestoreResponse {
+        state: result.state,
+        worker: result.worker,
+        reason_code: result.reason_code,
+        message: result.message,
+    }))
 }
 
 #[cfg(feature = "ws-server")]
@@ -3322,8 +3344,9 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        let restored: RuntimeHttpWorkerResponse = read_json(response).await;
-        assert_eq!(restored.worker.status, WorkerStatus::Idle);
+        let restored: RuntimeHttpWorkerRestoreResponse = read_json(response).await;
+        assert_eq!(restored.state, WorkerRestoreState::Accepted);
+        assert_eq!(restored.worker.unwrap().status, WorkerStatus::Idle);
 
         let response = authed_empty_request(
             app.clone(),

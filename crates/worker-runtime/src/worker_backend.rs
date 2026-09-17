@@ -1666,15 +1666,34 @@ where
             }) {
                 Ok(task) => task,
                 Err(message) => {
-                    let cleanup = self
-                        .cleanup_unconnected_controller(&handle, &shutdown, &tasks, &worker_state)
-                        .err()
-                        .map(|cleanup| format!("; controller cleanup failed: {cleanup}"))
-                        .unwrap_or_default();
-                    return WorkerExecutionSpawnResult::Errored(WorkerExecutionResult::errored(
+                    let cleanup = self.cleanup_unconnected_controller(
+                        &handle,
+                        &shutdown,
+                        &tasks,
+                        &worker_state,
+                    );
+                    let result = WorkerExecutionResult::errored(
                         operation,
-                        format!("{message}{cleanup}"),
-                    ));
+                        match &cleanup {
+                            Ok(()) => message,
+                            Err(cleanup) => {
+                                format!("{message}; controller cleanup failed: {cleanup}")
+                            }
+                        },
+                    );
+                    return if operation == WorkerExecutionOperation::Restore {
+                        match cleanup {
+                            Ok(()) => WorkerExecutionSpawnResult::RolledBack(result),
+                            Err(_) => WorkerExecutionSpawnResult::ReconciliationRequired {
+                                result,
+                                handle: None,
+                                worker_state: None,
+                                working_directory: None,
+                            },
+                        }
+                    } else {
+                        WorkerExecutionSpawnResult::Errored(result)
+                    };
                 }
             };
             tasks.push("protocol bridge", bridge_task, true);
@@ -1687,28 +1706,66 @@ where
         let mut workers = match self.workers.lock() {
             Ok(workers) => workers,
             Err(_) => {
-                let cleanup = self
-                    .cleanup_unconnected_controller(&handle, &shutdown, &tasks, &worker_state)
-                    .err()
-                    .map(|cleanup| format!("; controller cleanup failed: {cleanup}"))
-                    .unwrap_or_default();
-                return WorkerExecutionSpawnResult::Errored(WorkerExecutionResult::errored(
+                let cleanup = self.cleanup_unconnected_controller(
+                    &handle,
+                    &shutdown,
+                    &tasks,
+                    &worker_state,
+                );
+                let result = WorkerExecutionResult::errored(
                     operation,
-                    format!("worker adapter registry lock is poisoned{cleanup}"),
-                ));
+                    match &cleanup {
+                        Ok(()) => "worker adapter registry lock is poisoned".to_string(),
+                        Err(cleanup) => format!(
+                            "worker adapter registry lock is poisoned; controller cleanup failed: {cleanup}"
+                        ),
+                    },
+                );
+                return if operation == WorkerExecutionOperation::Restore {
+                    match cleanup {
+                        Ok(()) => WorkerExecutionSpawnResult::RolledBack(result),
+                        Err(_) => WorkerExecutionSpawnResult::ReconciliationRequired {
+                            result,
+                            handle: None,
+                            worker_state: None,
+                            working_directory: None,
+                        },
+                    }
+                } else {
+                    WorkerExecutionSpawnResult::Errored(result)
+                };
             }
         };
         if workers.contains_key(&worker_ref) {
             drop(workers);
-            let cleanup = self
-                .cleanup_unconnected_controller(&handle, &shutdown, &tasks, &worker_state)
-                .err()
-                .map(|cleanup| format!("; controller cleanup failed: {cleanup}"))
-                .unwrap_or_default();
-            return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::busy(
+            let cleanup = self.cleanup_unconnected_controller(
+                &handle,
+                &shutdown,
+                &tasks,
+                &worker_state,
+            );
+            let result = WorkerExecutionResult::busy(
                 operation,
-                format!("Worker is already connected to execution backend{cleanup}"),
-            ));
+                match &cleanup {
+                    Ok(()) => "Worker is already connected to execution backend".to_string(),
+                    Err(cleanup) => format!(
+                        "Worker is already connected to execution backend; controller cleanup failed: {cleanup}"
+                    ),
+                },
+            );
+            return if operation == WorkerExecutionOperation::Restore {
+                match cleanup {
+                    Ok(()) => WorkerExecutionSpawnResult::RolledBack(result),
+                    Err(_) => WorkerExecutionSpawnResult::ReconciliationRequired {
+                        result,
+                        handle: None,
+                        worker_state: None,
+                        working_directory: None,
+                    },
+                }
+            } else {
+                WorkerExecutionSpawnResult::Rejected(result)
+            };
         }
         let connected_worker_state = worker_state
             .read()
@@ -1995,6 +2052,25 @@ where
         )
     }
 
+    fn preflight_restore(
+        &self,
+        request: &WorkerExecutionRestoreRequest,
+    ) -> Result<(), WorkerExecutionResult> {
+        let workers = self.workers.lock().map_err(|_| {
+            WorkerExecutionResult::errored(
+                WorkerExecutionOperation::Restore,
+                "worker adapter registry lock is poisoned",
+            )
+        })?;
+        if workers.contains_key(&request.worker_ref) {
+            return Err(WorkerExecutionResult::busy(
+                WorkerExecutionOperation::Restore,
+                "Worker is already connected to execution backend",
+            ));
+        }
+        Ok(())
+    }
+
     fn restore_worker(
         &self,
         mut request: WorkerExecutionRestoreRequest,
@@ -2076,10 +2152,15 @@ where
         let controller = match restore_result {
             Ok(controller) => controller,
             Err(message) => {
-                return WorkerExecutionSpawnResult::Errored(WorkerExecutionResult::errored(
-                    WorkerExecutionOperation::Restore,
-                    message,
-                ));
+                return WorkerExecutionSpawnResult::ReconciliationRequired {
+                    result: WorkerExecutionResult::errored(
+                        WorkerExecutionOperation::Restore,
+                        message,
+                    ),
+                    handle: None,
+                    worker_state: None,
+                    working_directory: None,
+                };
             }
         };
 

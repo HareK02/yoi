@@ -17,6 +17,7 @@ pub use workspace_api::{
     WorkerLaunchProfileCandidate as BackendWorkerLaunchProfileCandidate,
     WorkerLaunchRuntimeOption as BackendWorkerLaunchRuntimeOption,
     WorkerOperationState as BackendWorkerOperationState,
+    WorkerRestoreState as BackendWorkerRestoreState,
     WorkerRestoreResponse as BackendWorkerRestoreResponse,
     WorkerRestoreResult as BackendWorkerRestoreResult, WorkerSummary as BackendWorkerSummary,
     WorkerWorkspaceSummary as BackendWorkerWorkspaceSummary,
