@@ -54,10 +54,13 @@ metadata CAS and allocation hand-off.
 
 The metadata CAS is the commit point. Failures before it leave the source Segment
 active. A failure updating allocation after it marks the old in-memory writer
-unusable: further acceptance fails closed and process restart/restore converges from
-the replacement named by metadata. The Worker must likewise remain non-idle while
-terminal compaction-service cleanup is pending; cleanup authority is retained and
-retried until the registry record is gone.
+unusable and retains the machine-wide allocation lock: further acceptance fails
+closed and restore admission cannot register a competing writer until process
+teardown, after which restore converges from the replacement named by metadata.
+The Worker must likewise remain non-idle while terminal compaction-service cleanup
+is pending. Cleanup authority is stored on the Worker (not only on one compaction
+future), retried until the registry record is gone, and cleared exactly once before
+activation or a terminal result.
 
 ## Metrics and comparison procedure
 

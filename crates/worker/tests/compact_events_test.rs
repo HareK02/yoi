@@ -922,7 +922,7 @@ async fn pre_run_compact_publishes_runtime_progress_phases() {
 
     let session_before = worker.session_id();
     let segment_before = worker.segment_id();
-    worker.try_pre_run_compact().await;
+    worker.try_pre_run_compact().await.unwrap();
     assert_eq!(worker.session_id(), session_before);
     assert_ne!(worker.segment_id(), segment_before);
 
@@ -1083,7 +1083,7 @@ async fn pre_run_compact_failure_clears_runtime_progress() {
     let _ = drain(&mut rx);
 
     // Best-effort: returns Ok(()) even on failure and clears runtime progress.
-    worker.try_pre_run_compact().await;
+    worker.try_pre_run_compact().await.unwrap();
 
     let events = drain(&mut rx);
     assert!(events.iter().any(|event| matches!(

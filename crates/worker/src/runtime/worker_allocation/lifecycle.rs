@@ -32,6 +32,29 @@ pub struct SegmentActivationGuard {
     replacement: SegmentId,
 }
 
+/// A failed allocation-table publication together with the still-held machine-wide
+/// activation authority. Callers must retain `authority` until recovery or process
+/// teardown so restore admission cannot register a competing writer.
+pub struct SegmentActivationCommitError {
+    source: ScopeLockError,
+    authority: SegmentActivationGuard,
+}
+
+impl std::fmt::Debug for SegmentActivationCommitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SegmentActivationCommitError")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SegmentActivationCommitError {
+    pub fn into_parts(self) -> (ScopeLockError, SegmentActivationGuard) {
+        (self.source, self.authority)
+    }
+}
+
 impl ScopeAllocationGuard {
     pub fn worker_name(&self) -> &str {
         &self.worker_name
@@ -88,7 +111,7 @@ impl SegmentActivationGuard {
     /// Persist the replacement Segment while retaining exclusive allocation
     /// authority. This is intentionally consumed so a successful metadata CAS
     /// cannot accidentally be followed by an unlocked update.
-    pub fn commit(mut self) -> Result<(), ScopeLockError> {
+    pub fn commit(mut self) -> Result<(), SegmentActivationCommitError> {
         let actual = self
             .guard
             .data()
@@ -103,14 +126,22 @@ impl SegmentActivationGuard {
             .iter_mut()
             .find(|allocation| allocation.worker_name == self.worker_name)
         else {
-            return Err(ScopeLockError::SegmentChanged {
-                worker_name: self.worker_name,
-                expected: self.expected,
-                actual,
+            return Err(SegmentActivationCommitError {
+                source: ScopeLockError::SegmentChanged {
+                    worker_name: self.worker_name.clone(),
+                    expected: self.expected,
+                    actual,
+                },
+                authority: self,
             });
         };
         allocation.segment_id = Some(self.replacement);
-        self.guard.save()?;
+        if let Err(source) = self.guard.save() {
+            return Err(SegmentActivationCommitError {
+                source: ScopeLockError::Io(source),
+                authority: self,
+            });
+        }
         Ok(())
     }
 }
@@ -397,6 +428,56 @@ mod tests {
                 .and_then(|allocation| allocation.segment_id),
             Some(replacement)
         );
+    }
+
+    #[test]
+    fn failed_segment_activation_returns_locked_recovery_authority() {
+        let dir = TempDir::new().unwrap();
+        let _sandbox = RuntimeDirSandbox::new(dir.path());
+        let old_segment = sid();
+        let replacement = sid();
+        let guard = install_top_level(
+            "activation".into(),
+            std::process::id(),
+            sock("activation"),
+            vec![write_rule("/work", true)],
+            old_segment,
+        )
+        .unwrap();
+        let mut activation = guard
+            .begin_segment_activation(old_segment, replacement)
+            .unwrap();
+        activation
+            .guard
+            .data_mut()
+            .allocations
+            .retain(|allocation| allocation.worker_name != "activation");
+
+        let error = activation.commit().unwrap_err();
+        let (source, authority) = error.into_parts();
+        assert!(matches!(
+            source,
+            ScopeLockError::SegmentChanged {
+                expected,
+                actual: None,
+                ..
+            } if expected == old_segment
+        ));
+        // The authority is returned rather than dropped on failure. Production
+        // stores it on SegmentState to keep restore admission blocked.
+        let (sent, received) = std::sync::mpsc::channel();
+        let lookup = std::thread::spawn(move || {
+            sent.send(lookup_segment(replacement).unwrap()).unwrap();
+        });
+        assert!(received
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+        drop(authority);
+        assert!(received
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap()
+            .is_none());
+        lookup.join().unwrap();
     }
 
     #[test]

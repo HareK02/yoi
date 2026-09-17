@@ -360,7 +360,9 @@ use crate::prompt::catalog::{CatalogError, PromptCatalog, WorkspacePromptProject
 use crate::prompt::source::PromptCatalogSource;
 use crate::prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::runtime::dir;
-use crate::runtime::worker_allocation::{self, ScopeAllocationGuard, ScopeLockError};
+use crate::runtime::worker_allocation::{
+    self, ScopeAllocationGuard, ScopeLockError, SegmentActivationGuard,
+};
 use crate::skill::{SkillActivationResponse, SkillClientError};
 #[cfg(test)]
 use async_trait::async_trait;
@@ -1056,6 +1058,7 @@ pub struct SegmentState {
     entries_written: AtomicUsize,
     append_lock: Mutex<()>,
     activation_failed: AtomicBool,
+    activation_failure_authority: Mutex<Option<SegmentActivationGuard>>,
 }
 
 impl SegmentState {
@@ -1068,6 +1071,7 @@ impl SegmentState {
             entries_written: AtomicUsize::new(entries_written),
             append_lock: Mutex::new(()),
             activation_failed: AtomicBool::new(false),
+            activation_failure_authority: Mutex::new(None),
         })
     }
 
@@ -1104,7 +1108,11 @@ impl SegmentState {
         Ok(())
     }
 
-    fn fail_closed_activation(&self) {
+    fn fail_closed_activation(&self, authority: SegmentActivationGuard) {
+        *self
+            .activation_failure_authority
+            .lock()
+            .expect("Segment activation failure authority mutex poisoned") = Some(authority);
         self.activation_failed.store(true, Ordering::Release);
     }
 
@@ -2086,6 +2094,12 @@ pub(crate) trait SystemPromptContributionSource: Send + Sync {
     async fn load(&self) -> Option<String>;
 }
 
+#[derive(Debug, Clone)]
+struct PendingCompactionCleanup {
+    session_id: String,
+    compaction_id: String,
+}
+
 /// An independent agent execution unit.
 ///
 /// Holds a [`Engine`] directly and persists session state via
@@ -2184,6 +2198,8 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// Parent-owned projection/control boundary for observable Internal service Workers.
     /// Service Workers are never exposed through the model-facing SubWorker control surface.
     internal_worker_registry: Option<Arc<crate::spawn::registry::SpawnedWorkerRegistry>>,
+    /// Cleanup authority survives cancellation of an individual compaction future.
+    pending_compaction_cleanup: Mutex<Option<PendingCompactionCleanup>>,
     in_flight: Option<InFlightEvents>,
     /// Monotonic counter incremented by worker event bridges when an
     /// assistant-side execution artifact becomes visible to clients before
@@ -2461,6 +2477,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             alerter: None,
             working_event_tx: None,
             internal_worker_registry: None,
+            pending_compaction_cleanup: Mutex::new(None),
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
@@ -3629,7 +3646,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.ensure_system_prompt_materialized().await?;
         self.ensure_segment_head().await?;
         if self.should_pre_run_compact() {
-            self.try_pre_run_compact().await;
+            self.try_pre_run_compact().await?;
         }
         Ok(())
     }
@@ -4503,8 +4520,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .transpose()?;
         self.compare_and_swap_worker_metadata_segment(loc, new_location)?;
         if let Some(allocation_activation) = allocation_activation {
-            if let Err(source) = allocation_activation.commit() {
-                segment_state.fail_closed_activation();
+            if let Err(error) = allocation_activation.commit() {
+                let (source, authority) = error.into_parts();
+                segment_state.fail_closed_activation(authority);
                 return Err(WorkerError::SegmentActivationIncomplete { source });
             }
         }
@@ -4711,16 +4729,18 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// This used to run in the controller's post-run path. Keeping it here
     /// preserves the ordering requirement that the next turn starts with a
     /// compacted history, without introducing a separate Busy controller state.
-    /// Best-effort: failures are logged and surfaced, but do not abort the
-    /// user turn that triggered the check.
-    pub async fn try_pre_run_compact(&mut self) {
+    /// Fatal activation failures are returned to the controller so it cannot
+    /// publish Idle or start the triggering turn with inconsistent authority.
+    pub async fn try_pre_run_compact(&mut self) -> Result<(), WorkerError> {
         let Some(state) = self.compact_state.clone() else {
-            return;
+            return Ok(());
         };
         let current_tokens = self.total_tokens().tokens;
         match state.evaluate_pre_run(current_tokens) {
             AutomaticCompactDecision::Start(AutomaticCompactTrigger::PreRun) => {}
-            AutomaticCompactDecision::Continue | AutomaticCompactDecision::Block(_) => return,
+            AutomaticCompactDecision::Continue | AutomaticCompactDecision::Block(_) => {
+                return Ok(());
+            }
             AutomaticCompactDecision::Start(AutomaticCompactTrigger::RequestThreshold) => {
                 unreachable!("pre-run evaluation returned request-threshold trigger")
             }
@@ -4741,6 +4761,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     completed,
                     "automatic compaction must complete a claimed attempt"
                 );
+                Ok(())
             }
             Err(e) => {
                 warn!(error = %e, "Proactive pre-run compaction failed");
@@ -4759,6 +4780,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     completed,
                     "automatic compaction must complete a claimed attempt"
                 );
+                if matches!(e, WorkerError::SegmentActivationIncomplete { .. }) {
+                    Err(e)
+                } else {
+                    Ok(())
+                }
             }
         }
     }
@@ -5044,6 +5070,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
         trigger: CompactionTrigger,
     ) -> Result<SegmentId, WorkerError> {
+        self.release_pending_compaction_service().await;
         let _rewrite_guard = self
             .prepare_session_rewrite(SessionRewriteKind::Compact)
             .await?;
@@ -5131,36 +5158,61 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     CompactionLifecycleState::Failed
                 };
                 lifecycle.ended_at_ms = Some(segment_log::now_millis());
-                self.release_compaction_service(&lifecycle).await;
+                self.release_compaction_service(&mut lifecycle).await;
                 self.set_compaction_progress(None);
                 Err(error)
             }
         }
     }
 
-    async fn release_compaction_service(&self, lifecycle: &CompactionLifecycle) {
-        let Some(session_id) = lifecycle
-            .internal_worker
-            .as_ref()
-            .map(|worker| worker.session_id.as_str())
-        else {
+    async fn release_pending_compaction_service(&self) {
+        let cleanup = self
+            .pending_compaction_cleanup
+            .lock()
+            .expect("pending compaction cleanup mutex poisoned")
+            .clone();
+        let Some(cleanup) = cleanup else {
             return;
         };
         let Some(registry) = &self.internal_worker_registry else {
             return;
         };
         loop {
-            match registry.stop_service(session_id).await {
-                Ok(_) => return,
+            match registry.stop_service(&cleanup.session_id).await {
+                Ok(_) => {
+                    let mut pending = self
+                        .pending_compaction_cleanup
+                        .lock()
+                        .expect("pending compaction cleanup mutex poisoned");
+                    if pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.session_id == cleanup.session_id)
+                    {
+                        *pending = None;
+                    }
+                    return;
+                }
                 Err(error) => {
                     warn!(
-                        compaction_id = %lifecycle.compaction_id,
+                        compaction_id = %cleanup.compaction_id,
                         error = %error,
                         "compaction service cleanup failed; retaining cleanup authority and retrying"
                     );
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }
+        }
+    }
+
+    async fn release_compaction_service(&self, lifecycle: &mut CompactionLifecycle) {
+        self.release_pending_compaction_service().await;
+        if self
+            .pending_compaction_cleanup
+            .lock()
+            .expect("pending compaction cleanup mutex poisoned")
+            .is_none()
+        {
+            lifecycle.internal_worker = None;
         }
     }
 
@@ -5399,6 +5451,14 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .map_err(|error| WorkerError::InvalidState(error.to_string()))?;
         lifecycle.revision = lifecycle.revision.saturating_add(1);
         lifecycle.internal_worker = Some(internal_ref);
+        let cleanup = PendingCompactionCleanup {
+            session_id: handle.session_id_string(),
+            compaction_id: lifecycle.compaction_id.clone(),
+        };
+        *self
+            .pending_compaction_cleanup
+            .lock()
+            .expect("pending compaction cleanup mutex poisoned") = Some(cleanup);
         self.set_compaction_progress(Some(InFlightCompaction {
             phase: CompactionPhase::Summarizing,
             started_at_ms: lifecycle.started_at_ms,
@@ -5808,11 +5868,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .transpose()?;
         self.compare_and_swap_worker_metadata_segment(old_loc, new_location)?;
         if let Some(allocation_activation) = allocation_activation {
-            if let Err(source) = allocation_activation.commit() {
+            if let Err(error) = allocation_activation.commit() {
+                let (source, authority) = error.into_parts();
                 // Metadata already names the complete replacement. Do not allow
                 // the old in-memory writer to accept another byte while durable
-                // authorities disagree; restore will converge from metadata.
-                segment_state.fail_closed_activation();
+                // authorities disagree; retain the allocation lock so restore
+                // admission cannot register a competing writer.
+                segment_state.fail_closed_activation(authority);
                 return Err(WorkerError::SegmentActivationIncomplete { source });
             }
         }
@@ -6024,6 +6086,7 @@ where
             alerter: None,
             working_event_tx: None,
             internal_worker_registry: None,
+            pending_compaction_cleanup: Mutex::new(None),
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
@@ -6110,6 +6173,7 @@ where
             alerter: None,
             working_event_tx: None,
             internal_worker_registry: None,
+            pending_compaction_cleanup: Mutex::new(None),
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
@@ -6231,6 +6295,7 @@ where
             alerter: None,
             working_event_tx: None,
             internal_worker_registry: None,
+            pending_compaction_cleanup: Mutex::new(None),
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
@@ -6609,6 +6674,7 @@ where
             alerter: None,
             working_event_tx: None,
             internal_worker_registry: None,
+            pending_compaction_cleanup: Mutex::new(None),
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
