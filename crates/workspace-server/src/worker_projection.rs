@@ -155,6 +155,9 @@ impl WorkerProjectionService {
         let commit = self
             .store
             .publish_worker_registry_removal(self.workspace_id.as_str(), &worker)?;
+        if commit.changed_workers.is_empty() {
+            return Ok(());
+        }
         let _ = self.events.send(WorkerProjectionEvent {
             revision: commit.revision,
             changes: vec![WorkerProjectionChange::Removed(worker)],

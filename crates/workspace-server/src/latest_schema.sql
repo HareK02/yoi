@@ -798,6 +798,13 @@ CREATE TABLE worker_registry_projection_revisions (
     workspace_id TEXT PRIMARY KEY,
     revision INTEGER NOT NULL
 );
+CREATE TABLE worker_registry_projection_removals (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    projection_revision INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, runtime_id, worker_id)
+);
 CREATE TABLE worker_registry_projection_diagnostics (
     diagnostic_id INTEGER PRIMARY KEY AUTOINCREMENT,
     workspace_id TEXT NOT NULL,

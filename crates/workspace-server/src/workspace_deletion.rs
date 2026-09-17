@@ -70,6 +70,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "worker_registry_observations",
     "worker_registry_projection_cursors",
     "worker_registry_projection_diagnostics",
+    "worker_registry_projection_removals",
     "worker_registry_projection_revisions",
     "worker_removal_operations",
     "worker_retention_audit_events",

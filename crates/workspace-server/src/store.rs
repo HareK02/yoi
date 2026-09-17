@@ -68,6 +68,13 @@ CREATE TABLE IF NOT EXISTS worker_registry_projection_revisions (
     workspace_id TEXT PRIMARY KEY,
     revision INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS worker_registry_projection_removals (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    projection_revision INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, runtime_id, worker_id)
+);
 CREATE TABLE IF NOT EXISTS worker_registry_projection_diagnostics (
     diagnostic_id INTEGER PRIMARY KEY AUTOINCREMENT,
     workspace_id TEXT NOT NULL,
@@ -5589,6 +5596,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 &record.worker.worker_id,
                 &record.created_at,
             )?;
+            tx.execute(
+                "DELETE FROM worker_registry_projection_removals WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
+                params![record.workspace_id, record.worker.runtime_id, record.worker.worker_id],
+            )?;
             tx.commit()?;
             Ok(())
         })
@@ -5698,7 +5709,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 worker_projection_cursor(&tx, workspace_id, runtime_id)?;
             if connection_generation < current_generation
                 || (connection_generation == current_generation
-                    && snapshot_revision <= current_snapshot)
+                    && snapshot_revision < current_snapshot)
             {
                 let revision = current_worker_projection_revision(&tx, workspace_id)?;
                 tx.commit()?;
@@ -5903,8 +5914,26 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<WorkerRegistryProjectionCommit> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let published_revision = tx
+                .query_row(
+                    "SELECT projection_revision FROM worker_registry_projection_removals WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
+                    params![workspace_id, worker.runtime_id, worker.worker_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if let Some(revision) = published_revision {
+                tx.commit()?;
+                return Ok(WorkerRegistryProjectionCommit {
+                    revision: revision.max(0) as u64,
+                    changed_workers: Vec::new(),
+                });
+            }
             let changed_workers = vec![worker.clone()];
             let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
+            tx.execute(
+                "INSERT INTO worker_registry_projection_removals (workspace_id, runtime_id, worker_id, projection_revision) VALUES (?1, ?2, ?3, ?4)",
+                params![workspace_id, worker.runtime_id, worker.worker_id, revision as i64],
+            )?;
             tx.commit()?;
             Ok(WorkerRegistryProjectionCommit {
                 revision,
@@ -8714,11 +8743,15 @@ fn upsert_worker_observation(
         params![workspace_id, runtime_id, worker.worker_id.as_str()],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
     ).optional()?;
-    if let Some((_, _, generation, revision)) = existing.as_ref() {
+    if let Some((old_availability, _, generation, revision)) = existing.as_ref() {
         let generation = (*generation).max(0) as u64;
         let revision = (*revision).max(0) as u64;
+        let restores_unavailable = old_availability == "unavailable"
+            && availability == SubscriptionWorkerAvailability::Observed;
         if connection_generation < generation
-            || (connection_generation == generation && worker.subject_revision <= revision)
+            || (connection_generation == generation
+                && (worker.subject_revision < revision
+                    || (worker.subject_revision == revision && !restores_unavailable)))
         {
             return Ok(false);
         }
@@ -14946,6 +14979,31 @@ INSERT INTO worker_registry (
             .reconcile_worker_registry_snapshot("local-dev", "embedded", 1, 11, &[], "4")
             .unwrap();
         assert!(duplicate.changed_workers.is_empty());
+
+        let reconnected = store
+            .reconcile_worker_registry_snapshot(
+                "local-dev",
+                "embedded",
+                1,
+                11,
+                &[observed.clone()],
+                "5",
+            )
+            .unwrap();
+        assert_eq!(reconnected.changed_workers, vec![catalog.worker.clone()]);
+        let projection = store
+            .worker_registry_projection("local-dev", &catalog.worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            projection.observation.unwrap().availability,
+            SubscriptionWorkerAvailability::Observed,
+            "an equal-revision reconnect snapshot must restore availability"
+        );
+        let duplicate_reconnect = store
+            .reconcile_worker_registry_snapshot("local-dev", "embedded", 1, 11, &[observed], "6")
+            .unwrap();
+        assert!(duplicate_reconnect.changed_workers.is_empty());
     }
 
     #[tokio::test]
@@ -14984,6 +15042,15 @@ INSERT INTO worker_registry (
                 .delete_worker_registry("local-dev", &worker_ref)
                 .unwrap()
         );
+        let first_removal = store
+            .publish_worker_registry_removal("local-dev", &worker_ref)
+            .unwrap();
+        assert_eq!(first_removal.changed_workers, vec![worker_ref.clone()]);
+        let duplicate_removal = store
+            .publish_worker_registry_removal("local-dev", &worker_ref)
+            .unwrap();
+        assert!(duplicate_removal.changed_workers.is_empty());
+        assert_eq!(duplicate_removal.revision, first_removal.revision);
         let event = SubscriptionWorker {
             worker_id: SubscriptionWorkerId::new("removed").unwrap(),
             runtime_id: Some("embedded".to_string()),

@@ -314,7 +314,7 @@ async fn run_workspace_workers(
     };
     let mut workers = records
         .into_iter()
-        .filter_map(project_registry_worker)
+        .filter_map(|record| project_registry_worker(&api, record))
         .collect::<Vec<_>>();
     sort_workers(&mut workers);
     if send_frame(
@@ -342,7 +342,7 @@ async fn run_workspace_workers(
                 for change in event.changes {
                     let payload = match change {
                         crate::worker_projection::WorkerProjectionChange::Upsert(record) => {
-                            let Some(mut worker) = project_registry_worker(record) else {
+                            let Some(mut worker) = project_registry_worker(&api, record) else {
                                 continue;
                             };
                             worker.subject_revision = event.revision;
@@ -388,6 +388,7 @@ async fn run_workspace_workers(
 }
 
 fn project_registry_worker(
+    api: &WorkspaceApi,
     record: crate::store::WorkerRegistryProjectionRecord,
 ) -> Option<SubscriptionWorker> {
     let runtime_id = record.registry.worker.runtime_id.clone();
@@ -422,7 +423,25 @@ fn project_registry_worker(
     worker.workspace_id = Some(record.registry.workspace_id);
     worker.display_name = Some(record.registry.display_name);
     worker.profile = record.registry.profile;
+    if !project_repository_key(api, &mut worker) {
+        return None;
+    }
     Some(worker)
+}
+
+fn project_repository_key(api: &WorkspaceApi, worker: &mut SubscriptionWorker) -> bool {
+    let Some(repository_id) = worker.repository_id.take() else {
+        worker.repository_key = None;
+        return true;
+    };
+    let Ok(Some(repository)) = api
+        .store
+        .get_repository(&api.config.workspace_id, &repository_id)
+    else {
+        return false;
+    };
+    worker.repository_key = Some(repository.repository_key);
+    true
 }
 
 fn sort_workers(workers: &mut [SubscriptionWorker]) {
