@@ -2374,7 +2374,6 @@ where
                 Method::NotifyTracked {
                     notification_request_id: notification_request_id.clone(),
                     message: input.content,
-                    auto_run: true,
                     source: protocol::AuthenticatedInputSource::Backend {
                         operation_id: notification_request_id,
                     },

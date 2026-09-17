@@ -111,8 +111,7 @@ pub(crate) struct PendingNotification {
     source_namespace: String,
     pub(crate) message: String,
     payload_digest: String,
-    pub(crate) auto_run: bool,
-    accepted_at_ms: u64,
+    pub(crate) accepted_at_ms: u64,
     activation_sequence: u64,
     pub(crate) provenance: WorkerHistoryProvenance,
 }
@@ -122,7 +121,6 @@ struct NotificationReceipt {
     notification_request_id: String,
     source_namespace: String,
     payload_digest: String,
-    auto_run: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -133,19 +131,41 @@ pub(crate) struct PendingActivationState {
     /// UserInput record commits the clearing checkpoint. Restore puts it back
     /// at the FIFO head.
     activating: Option<PendingSubmission>,
-    activating_notification: Option<PendingNotification>,
+    #[serde(
+        default,
+        rename = "activating_notification",
+        deserialize_with = "deserialize_activating_notifications"
+    )]
+    activating_notifications: VecDeque<PendingNotification>,
     pending: VecDeque<PendingSubmission>,
     pending_notifications: VecDeque<PendingNotification>,
     receipts: VecDeque<SubmissionReceipt>,
     notification_receipts: VecDeque<NotificationReceipt>,
 }
 
+fn deserialize_activating_notifications<'de, D>(
+    deserializer: D,
+) -> Result<VecDeque<PendingNotification>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(PendingNotification),
+        Many(VecDeque<PendingNotification>),
+    }
+
+    Ok(match <Option<OneOrMany> as serde::Deserialize>::deserialize(deserializer)? {
+        Some(OneOrMany::One(notification)) => VecDeque::from([notification]),
+        Some(OneOrMany::Many(notifications)) => notifications,
+        None => VecDeque::new(),
+    })
+}
+
 impl PendingActivationState {
     pub(crate) fn snapshot(&self) -> protocol::PendingSubmissionsSnapshot {
-        let pending_notification = self
-            .pending_notifications
-            .iter()
-            .find(|notification| notification.auto_run);
+        let pending_notification = self.pending_notifications.front();
         let head_id = match (self.pending.front(), pending_notification) {
             (Some(submission), Some(notification))
                 if notification.activation_sequence < submission.activation_sequence =>
@@ -202,14 +222,14 @@ impl PendingActivationState {
     }
 }
 
-fn notification_payload_digest(message: &str, auto_run: bool) -> String {
+pub const DEFAULT_NOTIFICATION_COALESCE_DELAY: Duration = Duration::from_secs(2);
+
+fn notification_payload_digest(message: &str) -> String {
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
-    hasher.update(if auto_run {
-        &b"auto\0"[..]
-    } else {
-        &b"deferred\0"[..]
-    });
+    // Keep the original real-time notification digest domain so receipts
+    // accepted before the delivery-mode field was removed still dedupe.
+    hasher.update(b"auto\0");
     hasher.update(message.as_bytes());
     hasher
         .finalize()
@@ -1233,7 +1253,6 @@ where
 #[derive(Debug, Clone)]
 pub(crate) enum PendingActivation {
     Submission(PendingSubmission),
-    Notification(PendingNotification),
 }
 
 #[derive(Debug, Clone)]
@@ -1530,14 +1549,12 @@ where
         &self,
         notification_request_id: String,
         message: String,
-        auto_run: bool,
     ) -> Result<bool, PendingSubmissionError> {
         self.accept_notification_from_source(
             notification_request_id,
             message,
             self.direct_client_namespace(),
             WorkerHistoryProvenance::LegacyUnknown,
-            auto_run,
         )
     }
 
@@ -1547,7 +1564,6 @@ where
         message: String,
         source_namespace: String,
         provenance: WorkerHistoryProvenance,
-        auto_run: bool,
     ) -> Result<bool, PendingSubmissionError> {
         if notification_request_id.trim().is_empty() {
             return Err(PendingSubmissionError::EmptyRequestId);
@@ -1555,7 +1571,7 @@ where
         if notification_request_id.len() > MAX_ACTIVATION_REQUEST_ID_BYTES {
             return Err(PendingSubmissionError::RequestIdLimit);
         }
-        let payload_digest = notification_payload_digest(&message, auto_run);
+        let payload_digest = notification_payload_digest(&message);
         let _append_guard = self
             .writer
             .state
@@ -1570,7 +1586,7 @@ where
             receipt.notification_request_id == notification_request_id
                 && receipt.source_namespace == source_namespace
         }) {
-            if receipt.payload_digest != payload_digest || receipt.auto_run != auto_run {
+            if receipt.payload_digest != payload_digest {
                 return Err(PendingSubmissionError::IdempotencyConflict);
             }
             return Ok(false);
@@ -1607,7 +1623,6 @@ where
             source_namespace: source_namespace.clone(),
             message,
             payload_digest: payload_digest.clone(),
-            auto_run,
             accepted_at_ms: segment_log::now_millis(),
             activation_sequence,
             provenance,
@@ -1616,7 +1631,6 @@ where
             notification_request_id,
             source_namespace,
             payload_digest,
-            auto_run,
         });
         state.revision = state.revision.saturating_add(1);
         if let Err(error) = self.persist_locked(&state) {
@@ -1626,57 +1640,53 @@ where
         Ok(true)
     }
 
-    pub(crate) fn activating_passive_notification_id(&self) -> Option<String> {
-        self.state
+    pub(crate) fn oldest_pending_notification_accepted_at_ms(&self) -> Option<u64> {
+        let state = self
+            .state
             .lock()
-            .expect("pending activation state poisoned")
-            .activating_notification
-            .as_ref()
-            .filter(|notification| !notification.auto_run)
-            .map(|notification| notification.notification_request_id.clone())
+            .expect("pending activation state poisoned");
+        state
+            .activating_notifications
+            .front()
+            .into_iter()
+            .chain(state.pending_notifications.front())
+            .map(|notification| notification.accepted_at_ms)
+            .min()
     }
 
-    pub(crate) fn next_passive_notification_identity(&self) -> Option<(String, String)> {
-        self.state
-            .lock()
-            .expect("pending activation state poisoned")
-            .pending_notifications
-            .iter()
-            .find(|notification| !notification.auto_run)
-            .map(|notification| {
-                (
-                    notification.source_namespace.clone(),
-                    notification.notification_request_id.clone(),
-                )
-            })
-    }
-
-    pub(crate) fn prepare_notification(
+    pub(crate) fn prepare_notification_batch(
         &self,
-        source_namespace: &str,
-        notification_request_id: &str,
-    ) -> Option<PendingNotification> {
+    ) -> Vec<(PendingNotification, SessionExtension)> {
         let mut state = self
             .state
             .lock()
             .expect("pending activation state poisoned");
-        if state.activating_notification.is_some() {
-            return None;
+        let notifications = state.pending_notifications.drain(..).collect::<Vec<_>>();
+        if notifications.is_empty() {
+            return Vec::new();
         }
-        let index = state
-            .pending_notifications
-            .iter()
-            .position(|notification| {
-                notification.notification_request_id == notification_request_id
-                    && notification.source_namespace == source_namespace
-            })?;
-        let notification = state
-            .pending_notifications
-            .remove(index)
-            .expect("located pending notification must exist");
-        state.activating_notification = Some(notification.clone());
+        state
+            .activating_notifications
+            .extend(notifications.iter().cloned());
         state.revision = state.revision.saturating_add(1);
-        Some(notification)
+
+        notifications
+            .into_iter()
+            .map(|notification| {
+                let index = state
+                    .activating_notifications
+                    .iter()
+                    .position(|active| {
+                        active.notification_request_id == notification.notification_request_id
+                            && active.source_namespace == notification.source_namespace
+                    })
+                    .expect("newly staged notification must be active");
+                let mut committed = state.clone();
+                committed.activating_notifications.drain(..=index);
+                committed.revision = committed.revision.saturating_add(1);
+                (notification, pending_activation_extension(&committed))
+            })
+            .collect()
     }
 
     pub(crate) fn prepare_next_activation(
@@ -1696,48 +1706,15 @@ where
         if let Some((expected_revision, expected_head_id)) = fence {
             Self::validate_fence(&state, expected_revision, Some(expected_head_id))?;
         }
-        if state.activating.is_some()
-            || state
-                .activating_notification
-                .as_ref()
-                .is_some_and(|notification| notification.auto_run)
-        {
+        if state.activating.is_some() {
             return Ok(None);
         }
-        let has_staged_passive_notification = state.activating_notification.is_some();
-        let submission_sequence = state.pending.front().map(|item| item.activation_sequence);
-        let notification_index = if has_staged_passive_notification {
-            None
-        } else {
-            state
-                .pending_notifications
-                .iter()
-                .position(|item| item.auto_run)
+        let Some(pending) = state.pending.pop_front() else {
+            return Ok(None);
         };
-        let notification_sequence = notification_index
-            .and_then(|index| state.pending_notifications.get(index))
-            .map(|item| item.activation_sequence);
-        if notification_sequence.is_some()
-            && (submission_sequence.is_none() || notification_sequence < submission_sequence)
-        {
-            let notification = state
-                .pending_notifications
-                .remove(notification_index.expect("notification sequence came from an item"))
-                .expect("notification sequence came from an existing item");
-            state.activating_notification = Some(notification.clone());
-            state.revision = state.revision.saturating_add(1);
-            return Ok(Some(PendingActivation::Notification(notification)));
-        }
-        if submission_sequence.is_some() {
-            let pending = state
-                .pending
-                .pop_front()
-                .expect("submission sequence came from queue head");
-            state.activating = Some(pending.clone());
-            state.revision = state.revision.saturating_add(1);
-            return Ok(Some(PendingActivation::Submission(pending)));
-        }
-        Ok(None)
+        state.activating = Some(pending.clone());
+        state.revision = state.revision.saturating_add(1);
+        Ok(Some(PendingActivation::Submission(pending)))
     }
 
     pub(crate) fn abort_activation(&self, pending: PendingSubmission) {
@@ -1811,30 +1788,13 @@ where
         }
     }
 
-    pub(crate) fn notification_activation_extension(&self) -> SessionExtension {
-        let state = self
-            .state
-            .lock()
-            .expect("pending activation state poisoned");
-        let mut committed = state.clone();
-        committed.activating = None;
-        committed.activating_notification = None;
-        committed.revision = committed.revision.saturating_add(1);
-        pending_activation_extension(&committed)
-    }
-
-    pub(crate) fn finish_notification_activation(&self, notification_request_id: &str) {
+    pub(crate) fn finish_notification_batch(&self) {
         let mut state = self
             .state
             .lock()
             .expect("pending activation state poisoned");
-        if state
-            .activating_notification
-            .as_ref()
-            .map(|item| item.notification_request_id.as_str())
-            == Some(notification_request_id)
-        {
-            state.activating_notification = None;
+        if !state.activating_notifications.is_empty() {
+            state.activating_notifications.clear();
             state.revision = state.revision.saturating_add(1);
         }
     }
@@ -2055,8 +2015,10 @@ impl WorkerSession {
                 state.pending.push_front(activating);
                 state.revision = state.revision.saturating_add(1);
             }
-            if let Some(activating) = state.activating_notification.take() {
-                state.pending_notifications.push_front(activating);
+            if !state.activating_notifications.is_empty() {
+                let mut restored = std::mem::take(&mut state.activating_notifications);
+                restored.append(&mut state.pending_notifications);
+                state.pending_notifications = restored;
                 state.revision = state.revision.saturating_add(1);
             }
             *self
@@ -2213,6 +2175,9 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// injection into the next LLM request. Shared with the
     /// WorkerInterceptor installed in `ensure_interceptor_installed`.
     pending_notifies: NotifyBuffer,
+    /// Maximum time an idle Worker waits from the first accepted notification
+    /// so a burst can be delivered as one FIFO batch.
+    notification_coalesce_delay: Duration,
     /// Submit-scoped stash for resolver-produced system messages
     /// (currently `@<path>` file content). `Worker::run` fills this
     /// before handing off to the worker; `WorkerInterceptor::on_prompt_submit`
@@ -2479,6 +2444,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
+            notification_coalesce_delay: DEFAULT_NOTIFICATION_COALESCE_DELAY,
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             scope_allocation: None,
@@ -3004,7 +2970,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         if !pending_state.pending.is_empty()
             || !pending_state.pending_notifications.is_empty()
             || pending_state.activating.is_some()
-            || pending_state.activating_notification.is_some()
+            || !pending_state.activating_notifications.is_empty()
             || !pending_state.receipts.is_empty()
             || !pending_state.notification_receipts.is_empty()
         {
@@ -3381,8 +3347,21 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// `Item::system_message` just before the next LLM request, via
     /// `WorkerInterceptor::pending_history_appends`. See [`NotifyBuffer`]
     /// for overflow behaviour and the lane-of-record rationale.
-    pub fn push_notify(&self, message: String, auto_run: bool) {
-        self.pending_notifies.push_notify(message, auto_run);
+    /// Configure the fixed idle notification coalescing window.
+    ///
+    /// The deadline is derived from the oldest durable notification receipt,
+    /// so restart restores the remaining window rather than starting it over.
+    pub fn with_notification_coalesce_delay(mut self, delay: Duration) -> Self {
+        self.notification_coalesce_delay = delay;
+        self
+    }
+
+    pub(crate) fn notification_coalesce_delay(&self) -> Duration {
+        self.notification_coalesce_delay
+    }
+
+    pub fn push_notify(&self, message: String) {
+        self.pending_notifies.push_notify(message);
     }
 
     /// Push an agent-visible typed `WorkerEvent` entry onto the pending buffer.
@@ -5964,6 +5943,7 @@ where
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
+            notification_coalesce_delay: DEFAULT_NOTIFICATION_COALESCE_DELAY,
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             scope_allocation: Some(scope_allocation),
@@ -6049,6 +6029,7 @@ where
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
+            notification_coalesce_delay: DEFAULT_NOTIFICATION_COALESCE_DELAY,
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             scope_allocation: None,
@@ -6169,6 +6150,7 @@ where
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
+            notification_coalesce_delay: DEFAULT_NOTIFICATION_COALESCE_DELAY,
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             scope_allocation: Some(scope_allocation),
@@ -6546,6 +6528,7 @@ where
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
+            notification_coalesce_delay: DEFAULT_NOTIFICATION_COALESCE_DELAY,
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             scope_allocation: Some(scope_allocation),
@@ -6626,7 +6609,6 @@ where
         self.push_notify(
             "Restored Worker state contained missing or unreachable delegated child Workers; their delegated write scopes were reclaimed before resume."
                 .to_string(),
-            false,
         );
         Ok(())
     }
@@ -8981,7 +8963,7 @@ mod build_summary_prompt_tests {
         append_user_turn(&worker, 20, "second message");
         worker
             .pending_submission_handle()
-            .accept_notification("notification-1".into(), "keep me".into(), true)
+            .accept_notification("notification-1".into(), "keep me".into())
             .unwrap();
         let (head_entries, targets) = worker.list_rewind_targets().unwrap();
 
@@ -10211,7 +10193,6 @@ mod build_summary_prompt_tests {
                     "notice".into(),
                     "account:account-a".into(),
                     account_a.clone(),
-                    false,
                 )
                 .unwrap()
         );
@@ -10222,7 +10203,6 @@ mod build_summary_prompt_tests {
                     "notice".into(),
                     "account:account-a".into(),
                     account_a.clone(),
-                    false,
                 )
                 .unwrap()
         );
@@ -10233,7 +10213,6 @@ mod build_summary_prompt_tests {
                     "notice".into(),
                     "account:account-b".into(),
                     account_b.clone(),
-                    false,
                 )
                 .unwrap()
         );
@@ -10243,45 +10222,41 @@ mod build_summary_prompt_tests {
     }
 
     #[test]
-    fn notification_and_submit_share_activation_order_and_notification_dedupes() {
+    fn notification_batch_preserves_fifo_order_and_notification_dedupes() {
         let temp = tempfile::tempdir().unwrap();
         let handle = PendingSubmissionHandle::for_test(temp.path());
         assert!(
             handle
-                .accept_notification("notification-1".into(), "notice".into(), true)
+                .accept_notification("notification-1".into(), "notice".into())
                 .unwrap()
         );
         assert!(
             !handle
-                .accept_notification("notification-1".into(), "notice".into(), true)
+                .accept_notification("notification-1".into(), "notice".into())
                 .unwrap()
         );
         assert!(matches!(
-            handle.accept_notification("notification-1".into(), "different".into(), true),
+            handle.accept_notification("notification-1".into(), "different".into()),
             Err(PendingSubmissionError::IdempotencyConflict)
         ));
-        assert!(matches!(
-            handle.accept_notification("notification-1".into(), "notice".into(), false),
-            Err(PendingSubmissionError::IdempotencyConflict)
-        ));
+        assert!(handle
+            .accept_notification("notification-2".into(), "second notice".into())
+            .unwrap());
         handle
             .accept("request-1".into(), vec![Segment::text("submit")], false)
             .unwrap();
 
-        let first = handle.prepare_next_activation(None).unwrap().unwrap();
-        assert!(matches!(
-            first,
-            PendingActivation::Notification(PendingNotification { ref message, .. })
-                if message == "notice"
-        ));
-        let committed = handle.notification_activation_extension();
+        let notifications = handle.prepare_notification_batch();
+        assert_eq!(notifications.len(), 2);
+        assert_eq!(notifications[0].0.message, "notice");
+        assert_eq!(notifications[1].0.message, "second notice");
         let committed_state: PendingActivationState =
-            serde_json::from_value(committed.payload).unwrap();
+            serde_json::from_value(notifications[1].1.payload.clone()).unwrap();
         assert!(committed_state.pending_notifications.is_empty());
-        assert!(committed_state.activating_notification.is_none());
-        handle.finish_notification_activation("notification-1");
-        let second = handle.prepare_next_activation(None).unwrap().unwrap();
-        assert!(matches!(second, PendingActivation::Submission(_)));
+        assert!(committed_state.activating_notifications.is_empty());
+        handle.finish_notification_batch();
+        let submission = handle.prepare_next_activation(None).unwrap().unwrap();
+        assert!(matches!(submission, PendingActivation::Submission(_)));
     }
 
     #[test]
@@ -10301,18 +10276,17 @@ mod build_summary_prompt_tests {
                 was_queued: false,
                 input: vec![Segment::text("first")],
             }),
-            activating_notification: Some(PendingNotification {
+            activating_notifications: VecDeque::from([PendingNotification {
                 notification_request_id: "notification-1".into(),
                 source_namespace: "account:account-1".into(),
                 message: "deferred notice".into(),
-                payload_digest: notification_payload_digest("deferred notice", false),
-                auto_run: false,
+                payload_digest: notification_payload_digest("deferred notice"),
                 accepted_at_ms: 3,
                 activation_sequence: 2,
                 provenance: WorkerHistoryProvenance::HumanInput {
                     account_id: "account-1".into(),
                 },
-            }),
+            }]),
             pending: VecDeque::from([PendingSubmission {
                 submission_request_id: "request-2".into(),
                 source_namespace: "direct:test".into(),
@@ -10329,13 +10303,19 @@ mod build_summary_prompt_tests {
             notification_receipts: VecDeque::from([NotificationReceipt {
                 notification_request_id: "notification-1".into(),
                 source_namespace: "account:account-1".into(),
-                payload_digest: notification_payload_digest("deferred notice", false),
-                auto_run: false,
+                payload_digest: notification_payload_digest("deferred notice"),
             }]),
         };
+        let mut payload = serde_json::to_value(state).unwrap();
+        let legacy_activating = payload["activating_notification"]
+            .as_array_mut()
+            .expect("new state serializes an activating notification array")
+            .pop()
+            .expect("one activating notification");
+        payload["activating_notification"] = legacy_activating;
         session.restore_pending_activations(&[(
             SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN.into(),
-            serde_json::to_value(state).unwrap(),
+            payload,
         )]);
         let state = session
             .pending_activations
@@ -10345,9 +10325,8 @@ mod build_summary_prompt_tests {
         assert_eq!(state.pending.len(), 2);
         assert_eq!(state.pending[0].submission_id, "submission-1");
         assert_eq!(state.pending[1].submission_id, "submission-2");
-        assert!(state.activating_notification.is_none());
+        assert!(state.activating_notifications.is_empty());
         assert_eq!(state.pending_notifications.len(), 1);
-        assert!(!state.pending_notifications[0].auto_run);
         assert!(matches!(
             state.pending_notifications[0].provenance,
             WorkerHistoryProvenance::HumanInput { ref account_id } if account_id == "account-1"

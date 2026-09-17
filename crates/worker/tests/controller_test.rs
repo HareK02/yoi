@@ -1783,7 +1783,9 @@ async fn run_with_unresolved_segment_emits_alert_and_placeholder() {
 async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
     let client = MockClient::new(simple_text_events());
     let client_for_assert = client.clone();
-    let worker = make_worker(client).await;
+    let worker = make_worker(client)
+        .await
+        .with_notification_coalesce_delay(std::time::Duration::from_millis(20));
     let handle = spawn_controller(worker).await;
     let mut rx = handle.subscribe();
 
@@ -1791,7 +1793,6 @@ async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
         .send(Method::Notify {
             notification_request_id: protocol::new_submission_request_id(),
             message: "turn finished".into(),
-            auto_run: true,
         })
         .await
         .unwrap();
@@ -1883,10 +1884,12 @@ async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
 }
 
 #[tokio::test]
-async fn notify_while_idle_with_auto_run_false_waits_for_explicit_run() {
+async fn repeated_notify_while_idle_coalesces_and_auto_starts_one_turn() {
     let client = MockClient::new(simple_text_events());
     let client_for_assert = client.clone();
-    let worker = make_worker(client).await;
+    let worker = make_worker(client)
+        .await
+        .with_notification_coalesce_delay(std::time::Duration::from_millis(50));
     let handle = spawn_controller(worker).await;
     let notification_request_id = protocol::new_submission_request_id();
 
@@ -1895,26 +1898,18 @@ async fn notify_while_idle_with_auto_run_false_waits_for_explicit_run() {
             .send(Method::Notify {
                 notification_request_id: notification_request_id.clone(),
                 message: "progress snapshot".into(),
-                auto_run: false,
             })
             .await
             .unwrap();
     }
-
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Idle);
-    assert!(
-        client_for_assert.captured_requests().is_empty(),
-        "weak Notify must not stage RunForNotification while idle"
-    );
-
     handle
-        .send(Method::submit_text(
-            protocol::new_submission_request_id(),
-            "continue",
-        ))
+        .send(Method::Notify {
+            notification_request_id: "notify-coalesced-2".into(),
+            message: "second coalesced notification".into(),
+        })
         .await
         .unwrap();
+
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         if !client_for_assert.captured_requests().is_empty() {
@@ -1922,30 +1917,22 @@ async fn notify_while_idle_with_auto_run_false_waits_for_explicit_run() {
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "explicit run did not reach the mock LLM"
+            "coalescing deadline did not start a notification turn"
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     wait_for_status(&handle, WorkerStatus::Idle).await;
     let requests = client_for_assert.captured_requests();
-    assert_eq!(
-        requests.len(),
-        1,
-        "explicit run should drain the queued notification"
-    );
-    let notify_in_request = requests[0].items.iter().any(|i| {
-        i.as_text()
-            .is_some_and(|t| t.contains("[Notification]") && t.contains("progress snapshot"))
-    });
-    assert!(
-        notify_in_request,
-        "queued weak notification must be history-backed on the next explicit run; got items: {:?}",
-        requests[0]
-            .items
-            .iter()
-            .filter_map(|i| i.as_text())
-            .collect::<Vec<_>>()
-    );
+    assert_eq!(requests.len(), 1, "coalesced notifications need one turn");
+    let notifications = requests[0]
+        .items
+        .iter()
+        .filter_map(|item| item.as_text())
+        .filter(|text| text.contains("[Notification]"))
+        .collect::<Vec<_>>();
+    assert_eq!(notifications.len(), 2, "duplicate receipt must not duplicate content");
+    assert!(notifications[0].contains("progress snapshot"));
+    assert!(notifications[1].contains("second coalesced notification"));
 }
 
 #[tokio::test]
@@ -2105,7 +2092,6 @@ async fn notify_while_running_does_not_emit_already_running_error() {
         .send(Method::Notify {
             notification_request_id: protocol::new_submission_request_id(),
             message: "ping".into(),
-            auto_run: true,
         })
         .await
         .unwrap();
@@ -2137,7 +2123,7 @@ async fn notify_while_running_does_not_emit_already_running_error() {
 }
 
 #[tokio::test]
-async fn weak_notify_while_running_is_deduped_and_survives_until_next_submit() {
+async fn notify_while_running_is_deduped_and_survives_until_next_model_boundary() {
     let client = MockClient::sequential(vec![
         MockResponse::Hang(Vec::new()),
         MockResponse::Complete(simple_text_events()),
@@ -2160,7 +2146,6 @@ async fn weak_notify_while_running_is_deduped_and_survives_until_next_submit() {
             .send(Method::Notify {
                 notification_request_id: notification_request_id.clone(),
                 message: "durable weak notice".into(),
-                auto_run: false,
             })
             .await
             .unwrap();

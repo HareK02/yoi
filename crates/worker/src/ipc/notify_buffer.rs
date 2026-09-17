@@ -26,12 +26,8 @@ use std::sync::{Arc, Mutex};
 
 use protocol::WorkerEvent;
 use session_store::{LoggedSessionHistoryOrigin, SessionExtension, SystemItem};
-use tracing::warn;
 
 use crate::prompt::catalog::{CatalogError, PromptCatalog};
-
-/// Maximum queued pending entries. Oldest entries are dropped beyond this.
-const CAPACITY: usize = 128;
 
 /// One pending entry awaiting drain into the next LLM request.
 ///
@@ -43,7 +39,6 @@ const CAPACITY: usize = 128;
 pub enum PendingNotify {
     Notify {
         message: String,
-        auto_run: bool,
         extensions: Vec<SessionExtension>,
         history_provenance: Option<LoggedSessionHistoryOrigin>,
     },
@@ -76,6 +71,7 @@ impl PendingNotify {
 #[derive(Clone, Default)]
 pub struct NotifyBuffer {
     inner: Arc<Mutex<VecDeque<PendingNotify>>>,
+    wake: Arc<tokio::sync::Notify>,
 }
 
 impl NotifyBuffer {
@@ -86,10 +82,9 @@ impl NotifyBuffer {
     /// Push a notify entry onto the queue. If the queue is full, the
     /// oldest entry is dropped and a `tracing::warn` is emitted — the
     /// caller should never hit this in normal operation.
-    pub fn push_notify(&self, message: String, auto_run: bool) {
+    pub fn push_notify(&self, message: String) {
         self.push_entry(PendingNotify::Notify {
             message,
-            auto_run,
             extensions: Vec::new(),
             history_provenance: None,
         });
@@ -98,35 +93,14 @@ impl NotifyBuffer {
     pub fn push_durable_notify(
         &self,
         message: String,
-        auto_run: bool,
         history_provenance: LoggedSessionHistoryOrigin,
         extension: SessionExtension,
     ) {
         self.push_entry(PendingNotify::Notify {
             message,
-            auto_run,
             extensions: vec![extension],
             history_provenance: Some(history_provenance),
         });
-    }
-
-    pub(crate) fn replace_durable_notification_extension(
-        &self,
-        extension: SessionExtension,
-    ) -> bool {
-        let mut queue = self.inner.lock().expect("notify buffer poisoned");
-        let Some(extensions) = queue.iter_mut().rev().find_map(|pending| match pending {
-            PendingNotify::Notify {
-                auto_run: false,
-                extensions,
-                ..
-            } if !extensions.is_empty() => Some(extensions),
-            _ => None,
-        }) else {
-            return false;
-        };
-        *extensions = vec![extension];
-        true
     }
 
     /// Push a typed worker-event entry onto the queue.
@@ -135,16 +109,16 @@ impl NotifyBuffer {
     }
 
     fn push_entry(&self, entry: PendingNotify) {
-        let mut q = self.inner.lock().expect("notify buffer poisoned");
-        if q.len() >= CAPACITY {
-            let dropped = q.pop_front();
-            warn!(
-                capacity = CAPACITY,
-                dropped = ?dropped,
-                "notify buffer overflow; dropped oldest"
-            );
-        }
-        q.push_back(entry);
+        self.inner
+            .lock()
+            .expect("notify buffer poisoned")
+            .push_back(entry);
+        self.wake.notify_one();
+    }
+
+    /// Wait until a producer adds work outside the controller method channel.
+    pub async fn notified(&self) {
+        self.wake.notified().await;
     }
 
     /// Remove and return all pending entries in FIFO order.
@@ -160,23 +134,17 @@ impl NotifyBuffer {
         for entry in entries.into_iter().rev() {
             q.push_front(entry);
         }
-        while q.len() > CAPACITY {
-            let dropped = q.pop_front();
-            warn!(
-                capacity = CAPACITY,
-                dropped = ?dropped,
-                "notify buffer overflow while restoring failed drain; dropped oldest"
-            );
-        }
+        drop(q);
+        self.wake.notify_one();
     }
 
-    /// Whether an undrained `Method::Notify { auto_run: true }` remains.
-    pub fn has_auto_run_pending(&self) -> bool {
+    /// Whether an undrained notification remains.
+    pub fn has_notification_pending(&self) -> bool {
         self.inner
             .lock()
             .expect("notify buffer poisoned")
             .iter()
-            .any(|entry| matches!(entry, PendingNotify::Notify { auto_run: true, .. }))
+            .any(|entry| matches!(entry, PendingNotify::Notify { .. }))
     }
 
     /// Number of pending entries. Primarily for tests.
@@ -233,12 +201,12 @@ mod tests {
     #[test]
     fn push_then_drain_preserves_order() {
         let buf = NotifyBuffer::new();
-        buf.push_notify("one".into(), false);
-        assert!(!buf.has_auto_run_pending());
-        buf.push_notify("two".into(), true);
-        assert!(buf.has_auto_run_pending());
+        buf.push_notify("one".into());
+        assert!(buf.has_notification_pending());
+        buf.push_notify("two".into());
+        assert!(buf.has_notification_pending());
         let drained = buf.drain();
-        assert!(!buf.has_auto_run_pending());
+        assert!(!buf.has_notification_pending());
         assert_eq!(drained.len(), 2);
         match &drained[0] {
             PendingNotify::Notify { message, .. } => assert_eq!(message, "one"),
@@ -248,15 +216,15 @@ mod tests {
     }
 
     #[test]
-    fn capacity_drops_oldest() {
+    fn notification_burst_is_not_truncated() {
         let buf = NotifyBuffer::new();
-        for i in 0..(CAPACITY + 5) {
-            buf.push_notify(format!("msg{i}"), false);
+        for i in 0..300 {
+            buf.push_notify(format!("msg{i}"));
         }
         let drained = buf.drain();
-        assert_eq!(drained.len(), CAPACITY);
+        assert_eq!(drained.len(), 300);
         match &drained[0] {
-            PendingNotify::Notify { message, .. } => assert_eq!(message, "msg5"),
+            PendingNotify::Notify { message, .. } => assert_eq!(message, "msg0"),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -265,7 +233,6 @@ mod tests {
     fn build_system_item_for_notify_carries_wrapper_body() {
         let entry = PendingNotify::Notify {
             message: "hello".into(),
-            auto_run: false,
             extensions: Vec::new(),
             history_provenance: None,
         };

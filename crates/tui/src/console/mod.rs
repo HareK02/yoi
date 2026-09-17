@@ -2009,7 +2009,6 @@ mod tests {
             method,
             Some(Method::Notify {
                 ref message,
-                auto_run: true,
                 ..
             }) if message == "progress"
         ));

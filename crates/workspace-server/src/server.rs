@@ -16008,11 +16008,9 @@ pub(crate) fn authorize_browser_worker_method(
         protocol::Method::Notify {
             notification_request_id,
             message,
-            auto_run,
         } => Ok(protocol::Method::NotifyTracked {
             notification_request_id,
             message,
-            auto_run,
             source: source.clone(),
         }),
         protocol::Method::SubmitTracked { .. } | protocol::Method::NotifyTracked { .. } => {

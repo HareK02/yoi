@@ -16,14 +16,6 @@ pub fn new_submission_request_id() -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
-fn default_true() -> bool {
-    true
-}
-
-fn is_true(value: &bool) -> bool {
-    *value
-}
-
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -231,25 +223,20 @@ pub enum Method {
         #[serde(skip_deserializing, default)]
         source: AuthenticatedInputSource,
     },
-    /// Human-readable text injected into the target Worker's LLM context
-    /// as a non-blocking system message. `auto_run` controls whether an
-    /// idle target is kicked into `RunForNotification`; weak notifications
-    /// (`auto_run: false`) are only queued for the next turn/resume/run.
-    /// No side effects beyond LLM context; use `WorkerEvent` for typed
-    /// lifecycle reports.
+    /// Human-readable text injected into the target Worker's LLM context as a
+    /// non-blocking system message. Accepted notifications are delivered at the
+    /// next between-turn boundary, or start a coalesced notification run while
+    /// the Worker is idle. No side effects beyond LLM context; use
+    /// `WorkerEvent` for typed lifecycle reports.
     Notify {
         notification_request_id: String,
         message: String,
-        #[serde(default = "default_true", skip_serializing_if = "is_true")]
-        auto_run: bool,
     },
     /// Authenticated transport form of Notify.
     #[cfg_attr(feature = "typescript", ts(skip))]
     NotifyTracked {
         notification_request_id: String,
         message: String,
-        #[serde(default = "default_true", skip_serializing_if = "is_true")]
-        auto_run: bool,
         #[serde(skip_deserializing, default)]
         source: AuthenticatedInputSource,
     },
@@ -2040,26 +2027,16 @@ mod tests {
     }
 
     #[test]
-    fn method_notify_json_roundtrip_defaults_to_auto_run() {
+    fn method_notify_json_roundtrip_has_no_delivery_mode() {
         let json = r#"{"method":"notify","params":{"notification_request_id":"notification-1","message":"turn done"}}"#;
         let method: Method = serde_json::from_str(json).unwrap();
         assert!(matches!(
             method,
-            Method::Notify { ref message, auto_run: true, .. } if message == "turn done"
+            Method::Notify { ref message, .. } if message == "turn done"
         ));
         let serialized = serde_json::to_string(&method).unwrap();
         assert_eq!(serialized, json);
-    }
-
-    #[test]
-    fn method_notify_weak_json_roundtrip_serializes_auto_run_false() {
-        let json = r#"{"method":"notify","params":{"notification_request_id":"notification-1","message":"progress","auto_run":false}}"#;
-        let method: Method = serde_json::from_str(json).unwrap();
-        assert!(matches!(
-            method,
-            Method::Notify { ref message, auto_run: false, .. } if message == "progress"
-        ));
-        assert_eq!(serde_json::to_string(&method).unwrap(), json);
+        assert!(!serialized.contains("auto_run"));
     }
 
     #[test]

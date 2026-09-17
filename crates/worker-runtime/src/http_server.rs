@@ -1565,7 +1565,6 @@ fn authorize_runtime_protocol_method(
         protocol::Method::NotifyTracked {
             notification_request_id,
             message,
-            auto_run,
             ..
         } => protocol::Method::NotifyTracked {
             source: transport_source.cloned().unwrap_or_else(|| {
@@ -1575,7 +1574,6 @@ fn authorize_runtime_protocol_method(
             }),
             notification_request_id,
             message,
-            auto_run,
         },
         other => other,
     }
@@ -2987,7 +2985,6 @@ mod tests {
         let wire = serde_json::to_string(&protocol::Method::NotifyTracked {
             notification_request_id: "notification-1".into(),
             message: "hello".into(),
-            auto_run: true,
             source: protocol::AuthenticatedInputSource::Account {
                 account_id: "forged".into(),
             },

@@ -262,11 +262,10 @@ impl ParentNotificationTarget {
         Self::Controller { sender, fallback }
     }
 
-    pub(crate) fn notify(&self, child_session_id: String, message: String, auto_run: bool) {
+    pub(crate) fn notify(&self, child_session_id: String, message: String) {
         let method = Method::NotifyTracked {
             notification_request_id: protocol::new_submission_request_id(),
             message,
-            auto_run,
             source: protocol::AuthenticatedInputSource::SubWorker {
                 session_id: child_session_id,
             },
@@ -588,7 +587,7 @@ impl Tool for SubWorkerSpawnTool {
                 let message = format!(
                     "SubWorker `{child_name}` turn ended with status {status:?}. Inspect its committed session with worker-observation tools before making completion decisions."
                 );
-                parent_notifications.notify(child_name.clone(), message, true);
+                parent_notifications.notify(child_name.clone(), message);
             })),
             Some(child_workdir_tool_broker.clone()),
         )
@@ -1198,7 +1197,7 @@ enabled = false
         drop(parent_method_tx);
 
         assert!(parent_method_rx.recv().await.is_none());
-        target.notify("child-session".into(), "late completion".to_string(), true);
+        target.notify("child-session".into(), "late completion".to_string());
         assert!(*captured.lock().unwrap());
     }
 
@@ -1210,13 +1209,12 @@ enabled = false
             *captured_for_target.lock().unwrap() = Some(method);
         }));
 
-        target.notify("child-session".into(), "completed".into(), true);
+        target.notify("child-session".into(), "completed".into());
 
         assert!(matches!(
             captured.lock().unwrap().take(),
             Some(Method::NotifyTracked {
                 message,
-                auto_run: true,
                 source: protocol::AuthenticatedInputSource::SubWorker { session_id },
                 ..
             }) if session_id == "child-session" && message == "completed"
@@ -1360,7 +1358,6 @@ enabled = false
             completion,
             Method::NotifyTracked {
                 message,
-                auto_run: true,
                 source: protocol::AuthenticatedInputSource::SubWorker { session_id },
                 ..
             } if session_id == "reviewer-child"

@@ -647,7 +647,6 @@
                     params: {
                         notification_request_id: crypto.randomUUID(),
                         message: request.content,
-                        auto_run: true,
                     },
                 };
             case "compact": {
