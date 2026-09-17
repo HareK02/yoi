@@ -21,6 +21,7 @@
         type ComposerCompletionToken,
     } from "$lib/workspace/console/composer-completion";
     import WorkerRunStatus from "$lib/workspace/console/WorkerRunStatus.svelte";
+    import { visibleCompactionProgress } from "$lib/workspace/console/run-status";
     import { resolveWorkerControlShortcut } from "$lib/workspace/console/worker-control-shortcuts";
     import {
         consoleWorkerViews,
@@ -248,18 +249,12 @@
         liveWorkerState ?? (worker?.state === "stopped" ? "stopped" : "loading"),
     );
     const workerRunning = $derived(workerState === "running");
-    const compactionProgress = $derived.by(() => {
-        const state = consoleProjection.workerState?.state;
-        if (!state || typeof state !== "object" || !("busy" in state)) return null;
-        const progress = consoleProjection.compaction;
-        if (!progress) return null;
-        const busy = state.busy;
-        if (!busy || typeof busy !== "object") return null;
-        const valid = progress.trigger === "manual"
-            ? "maintenance" in busy && busy.maintenance === "compacting"
-            : "run" in busy;
-        return valid ? progress : null;
-    });
+    const compactionProgress = $derived(
+        visibleCompactionProgress(
+            consoleProjection.compaction,
+            consoleProjection.workerState,
+        ),
+    );
     const workerPaused = $derived(workerState === "paused");
     const composerEditable = $derived(protocolState === "open" && !sending);
     const draftHasText = $derived(draft.content.trim().length > 0);

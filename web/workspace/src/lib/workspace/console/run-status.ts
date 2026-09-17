@@ -1,4 +1,8 @@
-import type { Event as ProtocolEvent } from "$lib/generated/protocol";
+import type {
+  Event as ProtocolEvent,
+  InFlightCompaction,
+  WorkerStateSnapshot,
+} from "$lib/generated/protocol";
 
 export type RunActivityStats = {
   startedAtMs: number | null;
@@ -70,4 +74,21 @@ export function formatRunTokens(tokens: number): string {
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
   if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}k`;
   return String(tokens);
+}
+
+export function visibleCompactionProgress(
+  compaction: InFlightCompaction | null,
+  workerState: WorkerStateSnapshot | null,
+): InFlightCompaction | null {
+  if (!compaction || workerState?.state.kind !== "busy") {
+    return null;
+  }
+
+  const busyState = workerState.state.state;
+  const triggerMatches = compaction.trigger === "manual"
+    ? busyState.kind === "maintenance" &&
+      busyState.state === "compacting"
+    : busyState.kind === "run";
+
+  return triggerMatches ? compaction : null;
 }

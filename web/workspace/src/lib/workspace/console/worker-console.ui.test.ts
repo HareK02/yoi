@@ -1116,3 +1116,28 @@ Deno.test("Web Console uses Notify while running and exposes durable pending con
     "ordinary text must remain Submit instead of being implicitly converted to Notify",
   );
 });
+
+Deno.test("Web Console gates compaction progress before rendering run status", async () => {
+  const consolePage = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const runStatus = await Deno.readTextFile(
+    new URL("./WorkerRunStatus.svelte", import.meta.url),
+  );
+
+  assert(
+    consolePage.includes("visibleCompactionProgress(") &&
+      consolePage.includes("consoleProjection.compaction") &&
+      consolePage.includes("consoleProjection.workerState") &&
+      consolePage.includes("compaction={compactionProgress}"),
+    "Console page should pass only state-consistent compaction progress to the status component",
+  );
+  assert(
+    runStatus.includes("compaction?.started_at_ms ?? startedAtMs") &&
+      runStatus.includes("Compacting · {compaction.phase}"),
+    "run status should render the compaction phase and derive elapsed time from the authoritative start timestamp",
+  );
+});
