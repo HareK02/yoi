@@ -18,7 +18,7 @@ use crate::auth::{BACKEND_RESOURCE_FETCH_PERMISSION, RuntimeIdentityMaterial};
 use crate::catalog::{
     CreateWorkerRequest, ProfileSourceArchiveSource, RepositoryRefObservation,
     RepositoryRefObservationRequest, WorkingDirectoryRepositoryAccessRequest,
-    WorkingDirectoryRequest, WorkingDirectoryStatus,
+    WorkingDirectoryRequest, WorkingDirectoryStatus, WorkingDirectoryStatusKind,
 };
 use crate::config_bundle::{ConfigBundle, workspace_config_etag};
 use crate::execution::{
@@ -60,7 +60,7 @@ fn next_internal_command(
     Ok(WorkerCommandEnvelope::new(command_id))
 }
 use session_store::{
-    CombinedStore, WorkerAggregateStore, WorkerMetadataStore, WorkerSessionStore,
+    CombinedStore, Store, WorkerAggregateStore, WorkerMetadataStore, WorkerSessionStore,
 };
 #[cfg(test)]
 use session_store::{FsStore, FsWorkerStore};
@@ -1025,12 +1025,27 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         if !worker_aggregate_dir.join("session").is_dir() {
             return Err("Persisted Worker Session metadata is unavailable".to_string());
         }
-        let metadata_store = WorkerAggregateStore::new(worker_aggregate_dir, &worker_name)
+        let metadata_store = WorkerAggregateStore::new(&worker_aggregate_dir, &worker_name)
             .map_err(|error| format!("failed to read Worker aggregate metadata: {error}"))?;
         let metadata = metadata_store
             .read_by_name(&worker_name)
             .map_err(|error| format!("failed to read Worker metadata: {error}"))?
             .ok_or_else(|| "Persisted Worker metadata is unavailable".to_string())?;
+        if let Some(active) = metadata.active.as_ref()
+            && let Some(segment_id) = active.segment_id
+        {
+            let session_store = WorkerSessionStore::new(worker_aggregate_dir.join("session"))
+                .map_err(|error| format!("failed to read Worker Session store: {error}"))?;
+            if !session_store
+                .exists(active.session_id, segment_id)
+                .map_err(|error| format!("failed to inspect Worker Session segment: {error}"))?
+            {
+                return Err("Persisted Worker Session segment is unavailable".to_string());
+            }
+            session_store
+                .read_all(active.session_id, segment_id)
+                .map_err(|error| format!("failed to read Worker Session segment: {error}"))?;
+        }
         if request.request.workspace_api.is_some()
             && metadata
                 .active
@@ -2023,11 +2038,15 @@ where
     }
 
     fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
+        let _start_guard = self
+            .restore_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self
             .workers
             .lock()
-            .map(|workers| workers.contains_key(&request.worker_ref))
-            .unwrap_or(false)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&request.worker_ref)
         {
             return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::busy(
                 WorkerExecutionOperation::Spawn,
@@ -2138,12 +2157,10 @@ where
         &self,
         request: &WorkerExecutionRestoreRequest,
     ) -> Result<(), WorkerExecutionResult> {
-        let workers = self.workers.lock().map_err(|_| {
-            WorkerExecutionResult::errored(
-                WorkerExecutionOperation::Restore,
-                "worker adapter registry lock is poisoned",
-            )
-        })?;
+        let workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if workers.contains_key(&request.worker_ref) {
             return Err(WorkerExecutionResult::busy(
                 WorkerExecutionOperation::Restore,
@@ -2152,13 +2169,27 @@ where
         }
         drop(workers);
 
-        if request.previous_working_directory.is_some()
-            && self.working_directory_materializer.is_none()
-        {
-            return Err(WorkerExecutionResult::rejected(
-                WorkerExecutionOperation::Restore,
-                "Persisted Worker Workdir binding cannot be restored by this Runtime",
-            ));
+        if let Some(previous) = request.previous_working_directory.as_ref() {
+            let materializer = self.working_directory_materializer.as_ref().ok_or_else(|| {
+                WorkerExecutionResult::rejected(
+                    WorkerExecutionOperation::Restore,
+                    "Persisted Worker Workdir binding cannot be restored by this Runtime",
+                )
+            })?;
+            let current = materializer
+                .working_directory_status(&previous.summary.working_directory_id)
+                .map_err(|message| {
+                    WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::Restore,
+                        format!("Persisted Worker Workdir is unavailable: {message}"),
+                    )
+                })?;
+            if current.summary.status != WorkingDirectoryStatusKind::Active {
+                return Err(WorkerExecutionResult::rejected(
+                    WorkerExecutionOperation::Restore,
+                    "Persisted Worker Workdir is not active",
+                ));
+            }
         }
         if request.previous_working_directory.is_none()
             && request.request.working_directory_request.is_some()
