@@ -5,6 +5,8 @@ import {
   formatRunElapsed,
   formatRunElapsedCompact,
   formatRunTokens,
+  resolveCompactionStatusPresentation,
+  visibleCompactionProgress,
 } from "./run-status.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
@@ -97,4 +99,58 @@ Deno.test("run status formatting matches the compact TUI shape", () => {
   assertEquals(formatRunTokens(25_000), "25.0k");
   assertEquals(formatRunTokens(3_000), "3.0k");
   assertEquals(formatRunTokens(999), "999");
+});
+
+Deno.test("WorkerRunStatus presentation follows compaction and busy state", () => {
+  const manual = {
+    phase: "preparing",
+    started_at_ms: 1_700_000_000_000,
+    trigger: "manual",
+  } as const;
+  const automatic = {
+    phase: "summarizing",
+    started_at_ms: 1_700_000_000_000,
+    trigger: "request_threshold",
+  } as const;
+  const maintenance = {
+    last_command_id: 7,
+    state: {
+      kind: "busy",
+      state: { kind: "maintenance", state: "compacting" },
+    },
+  } as const;
+  const run = {
+    last_command_id: 7,
+    state: {
+      kind: "busy",
+      state: { kind: "run", state: "running" },
+    },
+  } as const;
+  const idle = {
+    last_command_id: 7,
+    state: { kind: "idle" },
+  } as const;
+
+  assertEquals(visibleCompactionProgress(manual, maintenance), manual);
+  assertEquals(visibleCompactionProgress(automatic, run), automatic);
+  assertEquals(visibleCompactionProgress(manual, run), null);
+  assertEquals(visibleCompactionProgress(automatic, maintenance), null);
+  assertEquals(visibleCompactionProgress(manual, idle), null);
+  assertEquals(visibleCompactionProgress(manual, null), null);
+  assertEquals(visibleCompactionProgress(null, maintenance), null);
+
+  assertEquals(resolveCompactionStatusPresentation(manual, maintenance), {
+    progress: manual,
+    label: "Compacting · preparing",
+  });
+  assertEquals(resolveCompactionStatusPresentation(automatic, run), {
+    progress: automatic,
+    label: "Compacting · summarizing",
+  });
+  assertEquals(resolveCompactionStatusPresentation(manual, run), null);
+  assertEquals(
+    resolveCompactionStatusPresentation(automatic, maintenance),
+    null,
+  );
+  assertEquals(resolveCompactionStatusPresentation(manual, idle), null);
 });
