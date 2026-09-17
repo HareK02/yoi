@@ -28,6 +28,14 @@ pub struct Widget {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PublicError {
     message: String,
+    #[serde(skip)]
+    status: u16,
+}
+
+impl api_macros::HttpError for PublicError {
+    fn status_code(&self) -> u16 {
+        self.status
+    }
 }
 
 #[api(reqwest, axum)]
@@ -65,6 +73,7 @@ impl WidgetApi for WidgetService {
         if request.name == "bad" {
             return Err(PublicError {
                 message: "sensitive-public-detail".to_owned(),
+                status: 409,
             });
         }
         Ok(Widget {
@@ -210,10 +219,16 @@ async fn generated_client_and_router_follow_the_normalized_contract() {
         .await
         .expect_err("typed public error");
     assert!(!format!("{public_error:?}").contains("sensitive-public-detail"));
+    assert!(matches!(
+        &public_error,
+        api_reqwest::ClientError::Public { status, .. }
+            if *status == api_reqwest::framework::StatusCode::CONFLICT
+    ));
     assert_eq!(
         public_error.into_public_error(),
         Some(PublicError {
             message: "sensitive-public-detail".to_owned(),
+            status: 0,
         })
     );
 

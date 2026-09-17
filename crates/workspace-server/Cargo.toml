@@ -23,6 +23,7 @@ config-source.workspace = true
 flow = { path = "../flow" }
 manifest.workspace = true
 protocol = { workspace = true }
+runtime-api.workspace = true
 project-record.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls"] }
 ring.workspace = true

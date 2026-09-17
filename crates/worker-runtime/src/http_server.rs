@@ -6,6 +6,8 @@
 //! Runtime process directly; a backend is expected to own any browser-facing
 //! credentials, registration, and policy.
 
+mod runtime_management_api;
+
 use crate::auth::{RuntimeAuthContext, new_token_id, unix_now_seconds};
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, RepositoryRefObservationRequest, WorkerDetail,
@@ -209,7 +211,6 @@ fn runtime_http_router_with_auth_and_ssh_keyscan_program(
     };
 
     let router = Router::new()
-        .route("/v1/ping", get(get_runtime_ping))
         .route(
             WORKSPACE_VERIFICATION_CHALLENGE_PATH,
             post(post_workspace_verification_challenge),
@@ -218,7 +219,6 @@ fn runtime_http_router_with_auth_and_ssh_keyscan_program(
             WORKSPACE_VERIFICATION_ACK_PATH,
             post(post_workspace_verification_acknowledgement),
         )
-        .route("/v1/runtime", get(get_runtime))
         .route(
             "/v1/config-bundles",
             get(list_config_bundles).post(store_config_bundle),
@@ -260,20 +260,6 @@ fn runtime_http_router_with_auth_and_ssh_keyscan_program(
             "/v1/working-directories/{working_directory_id}",
             get(get_working_directory).delete(cleanup_working_directory),
         )
-        .route("/v1/workers", get(list_workers).post(create_worker))
-        .route(
-            "/v1/workers/{worker_id}",
-            get(get_worker).delete(delete_worker),
-        )
-        .route(
-            "/v1/workers/{worker_id}/retention/inventory",
-            get(worker_retention_inventory),
-        )
-        .route(
-            "/v1/workers/{worker_id}/retention/execute",
-            post(execute_worker_retention),
-        )
-        .route("/v1/workers/{worker_id}/input", post(send_worker_input))
         .route(
             "/v1/workers/{worker_id}/attachments",
             post(upload_worker_file).layer(DefaultBodyLimit::max(MAX_WORKER_FILE_UPLOAD_BYTES)),
@@ -282,17 +268,10 @@ fn runtime_http_router_with_auth_and_ssh_keyscan_program(
             "/v1/workers/{worker_id}/attachments/{artifact_id}",
             delete(delete_worker_uploaded_file),
         )
-        .route("/v1/workers/{worker_id}/restore", post(restore_worker))
         .route(
             "/v1/workers/{worker_id}/workspace-api",
             post(replace_worker_workspace_api),
-        )
-        .route(
-            "/v1/workers/{worker_id}/completions",
-            post(worker_completions),
-        )
-        .route("/v1/workers/{worker_id}/stop", post(stop_worker))
-        .route("/v1/workers/{worker_id}/cancel", post(cancel_worker));
+        );
 
     #[cfg(feature = "ws-server")]
     let router = router
@@ -304,6 +283,7 @@ fn runtime_http_router_with_auth_and_ssh_keyscan_program(
 
     router
         .with_state(state.clone())
+        .merge(runtime_management_api::router(state.clone()))
         .layer(middleware::from_fn_with_state(state, require_runtime_auth))
 }
 
@@ -2130,7 +2110,8 @@ async fn require_runtime_auth(
                     token_id: verified.token_id,
                     expires_at: u64::try_from(verified.expires_at).unwrap_or(0),
                 });
-                return next.run(request).await;
+                let context = request.extensions().get::<RuntimeAuthContext>().cloned();
+                return runtime_management_api::scope_auth(context, next.run(request)).await;
             }
             Err(error) => {
                 return RuntimeHttpRestError::new(
@@ -2180,7 +2161,8 @@ async fn require_runtime_auth(
             expires_at: 0,
         });
     }
-    next.run(request).await
+    let context = request.extensions().get::<RuntimeAuthContext>().cloned();
+    runtime_management_api::scope_auth(context, next.run(request)).await
 }
 
 fn auth_workspace_scope(
@@ -2562,6 +2544,38 @@ mod tests {
         GrepOutputMode, GrepRequest, LocalWorkdirSession, StatRequest, Workdir, WorkdirPath,
         WorkdirSessionCapabilities,
     };
+
+    #[test]
+    fn generated_runtime_routes_are_classified_by_permission_authority() {
+        for operation in <runtime_api::RuntimeApiMetadata as runtime_api::ApiContract>::OPERATIONS {
+            let method = match operation.method {
+                runtime_api::HttpMethod::Get => Method::GET,
+                runtime_api::HttpMethod::Post => Method::POST,
+                runtime_api::HttpMethod::Put => Method::PUT,
+                runtime_api::HttpMethod::Patch => Method::PATCH,
+                runtime_api::HttpMethod::Delete => Method::DELETE,
+                runtime_api::HttpMethod::Head | runtime_api::HttpMethod::Options => {
+                    panic!("unexpected management contract method")
+                }
+            };
+            let path = operation.path.replace("{worker_id}", "worker-1");
+            let permission = required_runtime_permission(&method, &path);
+            if operation.operation_id == "runtime_summary" {
+                assert_eq!(
+                    permission, None,
+                    "{:?} {}",
+                    operation.method, operation.path
+                );
+            } else {
+                assert!(
+                    permission.is_some(),
+                    "unclassified generated route: {:?} {}",
+                    operation.method,
+                    operation.path
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn workspace_signed_verification_requires_exact_request_and_acknowledges_response() {

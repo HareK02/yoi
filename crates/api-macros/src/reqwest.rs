@@ -352,6 +352,8 @@ impl<A: RequestAuthorizer> ClientCore<A> {
         let response = request.send().await.map_err(|error| {
             if error.is_timeout() {
                 ClientFailure::Timeout
+            } else if error.is_connect() {
+                ClientFailure::Connect
             } else {
                 ClientFailure::Transport
             }
@@ -461,10 +463,12 @@ pub enum DecodeKind {
 pub enum ClientFailure {
     Authorization,
     RequestEncoding,
+    Connect,
     Transport,
     Timeout,
     ResponseTooLarge { limit: usize },
     UnexpectedStatus { expected: u16, actual: u16 },
+    ErrorResponseDecode { status: u16 },
     Decode { kind: DecodeKind },
     UnexpectedBody,
 }
@@ -480,6 +484,7 @@ impl fmt::Display for ClientFailure {
         match self {
             Self::Authorization => formatter.write_str("request authorization failed"),
             Self::RequestEncoding => formatter.write_str("request encoding failed"),
+            Self::Connect => formatter.write_str("HTTP connection failed"),
             Self::Transport => formatter.write_str("HTTP transport failed"),
             Self::Timeout => formatter.write_str("HTTP request timed out"),
             Self::ResponseTooLarge { limit } => {
@@ -490,6 +495,9 @@ impl fmt::Display for ClientFailure {
                     formatter,
                     "expected HTTP status {expected}, received {actual}"
                 )
+            }
+            Self::ErrorResponseDecode { status } => {
+                write!(formatter, "HTTP {status} error response JSON was malformed")
             }
             Self::Decode {
                 kind: DecodeKind::Success,

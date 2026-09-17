@@ -3707,6 +3707,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-api"
+version = "0.1.0"
+dependencies = [
+ "api-macros",
+ "manifest",
+ "protocol",
+ "serde",
+ "tokio",
+ "workdir",
+ "workspace-api",
+]
+
+[[package]]
 name = "rusqlite"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6126,6 +6139,7 @@ dependencies = [
  "protocol",
  "reqwest",
  "ring",
+ "runtime-api",
  "serde",
  "serde_json",
  "serial_test",
@@ -6272,6 +6286,7 @@ dependencies = [
  "protocol",
  "reqwest",
  "ring",
+ "runtime-api",
  "rusqlite",
  "serde",
  "serde_json",
