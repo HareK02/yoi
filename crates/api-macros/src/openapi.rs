@@ -26,6 +26,12 @@ const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 /// The default component name delegates to [`JsonSchema::schema_name`]; types
 /// may override it to provide a stable public wire name.
 pub trait OpenApiSchema: JsonSchema {
+    /// Whether a parameter of this type must be present on the wire.
+    ///
+    /// This semantic hook intentionally lives on the resolved type, so aliases
+    /// such as `type Header = Option<String>` retain optionality.
+    const PARAMETER_REQUIRED: bool = true;
+
     fn openapi_schema_name() -> Cow<'static, str> {
         Self::schema_name()
     }
@@ -39,7 +45,9 @@ macro_rules! impl_openapi_schema {
 
 impl_openapi_schema!((), bool, String, char, i8, i16, i32, u8, u16, u32, f32, f64);
 
-impl<T: OpenApiSchema> OpenApiSchema for Option<T> {}
+impl<T: OpenApiSchema> OpenApiSchema for Option<T> {
+    const PARAMETER_REQUIRED: bool = false;
+}
 impl<T: OpenApiSchema> OpenApiSchema for Vec<T> {}
 impl<T: OpenApiSchema> OpenApiSchema for Box<T> {}
 impl<T: OpenApiSchema> OpenApiSchema for std::sync::Arc<T> {}
@@ -184,7 +192,7 @@ impl OpenApiBuilder {
         })
     }
 
-    pub fn finish(self) -> OpenApiDocument {
+    pub fn finish(self) -> Result<OpenApiDocument, OpenApiError> {
         let paths = self
             .paths
             .into_iter()
@@ -195,12 +203,14 @@ impl OpenApiBuilder {
             .collect::<Map<_, _>>();
         let schemas = self.schemas.into_iter().collect::<Map<_, _>>();
 
-        OpenApiDocument(canonicalize(json!({
+        let document = canonicalize(json!({
             "openapi": "3.1.0",
             "info": self.info,
             "paths": paths,
             "components": { "schemas": schemas },
-        })))
+        }));
+        validate_component_references(&document)?;
+        Ok(OpenApiDocument(document))
     }
 
     fn schema_ref<T: OpenApiSchema>(&mut self) -> Result<Value, OpenApiError> {
@@ -268,7 +278,6 @@ impl OpenApiOperation<'_> {
         &mut self,
         name: &'static str,
         location: &'static str,
-        required: bool,
     ) -> Result<(), OpenApiError> {
         if !matches!(location, "path" | "query" | "header") {
             return Err(OpenApiError::InvalidContract(format!(
@@ -276,12 +285,7 @@ impl OpenApiOperation<'_> {
                 self.operation_id
             )));
         }
-        if location == "path" && !required {
-            return Err(OpenApiError::InvalidContract(format!(
-                "path parameter `{name}` for `{}` must be required",
-                self.operation_id
-            )));
-        }
+        let required = location == "path" || T::PARAMETER_REQUIRED;
         let schema = self.parent.schema_ref::<T>()?;
         self.parameters.push(json!({
             "name": name,
@@ -396,6 +400,46 @@ fn validate_component_name(name: &str) -> Result<(), OpenApiError> {
     Ok(())
 }
 
+fn validate_component_references(document: &Value) -> Result<(), OpenApiError> {
+    let schemas = document["components"]["schemas"]
+        .as_object()
+        .ok_or_else(|| OpenApiError::InvalidContract("missing component schema map".to_owned()))?;
+    let mut references = Vec::new();
+    collect_references(document, &mut references);
+    for reference in references {
+        let Some(name) = reference.strip_prefix("#/components/schemas/") else {
+            return Err(OpenApiError::InvalidContract(format!(
+                "unsupported non-component schema reference `{reference}`"
+            )));
+        };
+        if !schemas.contains_key(name) {
+            return Err(OpenApiError::InvalidContract(format!(
+                "unresolved OpenAPI component reference `{reference}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn collect_references<'a>(value: &'a Value, references: &mut Vec<&'a str>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+                references.push(reference);
+            }
+            for value in object.values() {
+                collect_references(value, references);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_references(value, references);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn rewrite_definition_refs(value: &mut Value) {
     match value {
         Value::Object(object) => {
@@ -421,11 +465,11 @@ fn validate_schema(value: &Value, component: &str) -> Result<(), OpenApiError> {
                     object.get("format").and_then(Value::as_str),
                     Some("int8" | "uint8" | "int16" | "uint16" | "int32" | "uint32")
                 );
-                let minimum = object.get("minimum").and_then(Value::as_i64);
-                let maximum = object.get("maximum").and_then(Value::as_u64);
+                let minimum = object.get("minimum").and_then(Value::as_f64);
+                let maximum = object.get("maximum").and_then(Value::as_f64);
                 if !safe_format
-                    && (minimum.is_none_or(|value| value < -MAX_SAFE_INTEGER)
-                        || maximum.is_none_or(|value| value > MAX_SAFE_INTEGER as u64))
+                    && (minimum.is_none_or(|value| value < -(MAX_SAFE_INTEGER as f64))
+                        || maximum.is_none_or(|value| value > MAX_SAFE_INTEGER as f64))
                 {
                     return Err(OpenApiError::InvalidContract(format!(
                         "integer schema in `{component}` exceeds the JSON safe-integer range; expose a bounded wire integer"

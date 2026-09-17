@@ -1301,9 +1301,8 @@ fn openapi_adapter_tokens(
                 Location::Header => "header",
                 Location::Body => unreachable!(),
             };
-            let required = matches!(parameter.location, Location::Path) || !is_option_type(ty);
             Some(quote! {
-                operation.parameter::<#ty>(#name, #location, #required)?;
+                operation.parameter::<#ty>(#name, #location)?;
             })
         });
         let request = operation.request_body.as_ref().map(|ty| {
@@ -1351,21 +1350,9 @@ fn openapi_adapter_tokens(
         > {
             let mut builder = #api_crate::openapi::OpenApiBuilder::new(info)?;
             #(#operations)*
-            ::core::result::Result::Ok(builder.finish())
+            builder.finish()
         }
     }
-}
-
-fn is_option_type(ty: &Type) -> bool {
-    let Type::Path(path) = ty else {
-        return false;
-    };
-    path.qself.is_none()
-        && path
-            .path
-            .segments
-            .last()
-            .is_some_and(|segment| segment.ident == "Option")
 }
 
 fn expand_api(api: ApiDefinition) -> syn::Result<proc_macro2::TokenStream> {

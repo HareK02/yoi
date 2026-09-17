@@ -6,7 +6,7 @@ use api_macros::{
     openapi::{OpenApiInfo, OpenApiSchema},
 };
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 
 fn nullable_string_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
@@ -20,10 +20,36 @@ pub struct GeoPoint {
 }
 impl OpenApiSchema for GeoPoint {}
 
+/// A custom Serde wire representation admitted only after an explicit,
+/// matching schema hook and `OpenApiSchema` attestation.
+#[derive(Debug, JsonSchema)]
+#[schemars(transparent)]
+pub struct WireSlug(String);
+
+impl Serialize for WireSlug {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for WireSlug {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self)
+    }
+}
+impl OpenApiSchema for WireSlug {}
+
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
 pub struct CreateWidget {
+    #[schemars(length(min = 1, max = 64))]
     name: String,
+    #[schemars(range(min = 1, max = 1_000))]
     count: u32,
+    #[schemars(range(min = -100, max = 100))]
+    bounded_balance: i64,
+    #[schemars(length(min = 1, max = 8))]
+    tags: Vec<String>,
+    slug: WireSlug,
     /// Missing and explicit null are separate wire states.
     #[schemars(default, schema_with = "nullable_string_schema")]
     optional_label: Option<String>,
@@ -47,10 +73,13 @@ pub struct Widget {
 impl OpenApiSchema for Widget {}
 
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(tag = "code", content = "details")]
 pub enum PublicError {
     Invalid { message: String },
 }
 impl OpenApiSchema for PublicError {}
+
+type OptionalRequestId = Option<String>;
 
 #[api(openapi)]
 pub trait FixtureApi {
@@ -64,7 +93,7 @@ pub trait FixtureApi {
         &self,
         #[path] widget_id: u32,
         #[query] lookup: Lookup,
-        #[header("x-request-id")] request_id: Option<String>,
+        #[header("x-request-id")] request_id: OptionalRequestId,
         #[body] request: CreateWidget,
     ) -> Result<Widget, PublicError>;
 
@@ -105,6 +134,41 @@ fn output_is_deterministic_and_accepted_by_an_independent_parser() {
     );
     assert!(!first.contains("generatedAt"));
     assert!(!first.contains("#/$defs/"));
+
+    let schemas = value["components"]["schemas"]
+        .as_object()
+        .expect("component map");
+    let mut references = Vec::new();
+    collect_schema_references(&value, &mut references);
+    assert!(!references.is_empty());
+    for reference in references {
+        let name = reference
+            .strip_prefix("#/components/schemas/")
+            .expect("only local component references are emitted");
+        assert!(
+            schemas.contains_key(name),
+            "unresolved reference {reference}"
+        );
+    }
+}
+
+fn collect_schema_references<'a>(value: &'a Value, references: &mut Vec<&'a str>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+                references.push(reference);
+            }
+            for value in object.values() {
+                collect_schema_references(value, references);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_schema_references(value, references);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[test]
@@ -156,6 +220,7 @@ fn operations_and_components_preserve_the_wire_contract() {
         "Lookup",
         "PublicError",
         "Widget",
+        "WireSlug",
         "uint32",
         "Nullable_string",
     ] {
@@ -169,6 +234,33 @@ fn operations_and_components_preserve_the_wire_contract() {
         schemas["CreateWidget"]["properties"]["location"]["$ref"],
         "#/components/schemas/GeoPoint"
     );
+    assert_eq!(
+        schemas["CreateWidget"]["properties"]["slug"]["$ref"],
+        "#/components/schemas/WireSlug"
+    );
+    assert_eq!(
+        schemas["CreateWidget"]["properties"]["name"]["minLength"],
+        1
+    );
+    assert_eq!(
+        schemas["CreateWidget"]["properties"]["name"]["maxLength"],
+        64
+    );
+    assert_eq!(
+        schemas["CreateWidget"]["properties"]["count"]["maximum"],
+        1_000
+    );
+    assert_eq!(
+        schemas["CreateWidget"]["properties"]["bounded_balance"]["minimum"],
+        -100
+    );
+    assert_eq!(
+        schemas["CreateWidget"]["properties"]["bounded_balance"]["maximum"],
+        100
+    );
+    assert_eq!(schemas["CreateWidget"]["properties"]["tags"]["minItems"], 1);
+    assert_eq!(schemas["CreateWidget"]["properties"]["tags"]["maxItems"], 8);
+    assert!(schemas["PublicError"]["oneOf"].is_array());
 
     let required = schemas["CreateWidget"]["required"]
         .as_array()
@@ -220,6 +312,20 @@ pub enum AmbiguousWireEnum {
 }
 impl OpenApiSchema for AmbiguousWireEnum {}
 
+#[derive(Debug)]
+pub struct DanglingReference;
+
+impl JsonSchema for DanglingReference {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "DanglingReference".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "$ref": "#/$defs/Missing" })
+    }
+}
+impl OpenApiSchema for DanglingReference {}
+
 #[test]
 fn schema_name_collisions_and_ambiguous_wire_shapes_fail_closed() {
     use api_macros::openapi::{OpenApiBuilder, OpenApiError};
@@ -254,6 +360,21 @@ fn schema_name_collisions_and_ambiguous_wire_shapes_fail_closed() {
         .response::<AmbiguousWireEnum>(200, "application/json", "ok")
         .expect_err("untagged/ambiguous unions must fail closed");
     assert!(error.to_string().contains("untagged"));
+
+    let mut dangling = OpenApiBuilder::new(info).expect("builder");
+    {
+        let mut operation = dangling
+            .operation("GET", "/dangling", "dangling")
+            .expect("operation");
+        operation
+            .response::<DanglingReference>(200, "application/json", "ok")
+            .expect("schema registration succeeds before graph validation");
+        operation.finish().expect("operation");
+    }
+    let error = dangling
+        .finish()
+        .expect_err("dangling component references must fail closed");
+    assert!(error.to_string().contains("unresolved"));
 }
 
 #[test]
