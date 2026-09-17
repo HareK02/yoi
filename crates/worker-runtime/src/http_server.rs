@@ -2697,7 +2697,14 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_signed_verification_requires_exact_request_and_acknowledges_response() {
-        let runtime = Runtime::new_memory();
+        let runtime =
+            Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(AcceptingBackend))
+                .unwrap();
+        runtime
+            .store_config_bundle(test_bundle(ProfileSelector::Builtin(
+                "builtin:coder".to_string(),
+            )))
+            .unwrap();
         let workspace_identity = RuntimeIdentityMaterial::generate("workspace-key").unwrap();
         let runtime_identity = RuntimeIdentityMaterial::generate("runtime-test").unwrap();
         let workspace_public_key =
@@ -2730,7 +2737,7 @@ mod tests {
         )
         .unwrap();
         let app = runtime_http_router_with_workspace_auth(
-            runtime,
+            runtime.clone(),
             None,
             WorkspaceRuntimeHttpAuth {
                 verifier,
@@ -2896,7 +2903,13 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let retention_worker_id = task_request("retention-scope").worker_id;
+        let mut retention_create = task_request("retention-scope");
+        retention_create.workspace_api = Some(WorkspaceApiRef {
+            workspace_id: "workspace-a".to_string(),
+            base_url: "https://backend.test".to_string(),
+        });
+        let retention_worker_id = retention_create.worker_id.clone();
+        runtime.create_worker(retention_create).unwrap();
         let retention_path = format!("/v1/workers/{retention_worker_id}/retention/execute");
         let retention_request = WorkerRetentionExecutionRequest {
             operation_id: "retention-op".to_string(),
