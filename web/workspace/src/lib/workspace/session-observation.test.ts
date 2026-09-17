@@ -2,6 +2,7 @@ import {
   isCurrentWorkerSessionRequest,
   workerSessionAction,
   type WorkerSessionRequestIdentity,
+  workerSessionRequestInit,
 } from "./session-observation";
 import type { SessionSnapshot } from "$lib/generated/protocol";
 
@@ -22,6 +23,19 @@ const snapshot: SessionSnapshot = {
   },
   entries: [],
 };
+
+Deno.test("worker session request includes same-origin credentials", () => {
+  const controller = new AbortController();
+  const init = workerSessionRequestInit(controller.signal);
+  assert(
+    init.credentials === "same-origin",
+    "session observation must use the Workspace auth cookie boundary",
+  );
+  assert(
+    init.signal === controller.signal,
+    "request must retain its abort fence",
+  );
+});
 
 Deno.test("worker session observation selects live, retained, and unavailable behavior", () => {
   assert(

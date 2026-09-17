@@ -55,6 +55,7 @@
     import {
         isCurrentWorkerSessionRequest,
         workerSessionAction,
+        workerSessionRequestInit,
         type WorkerSessionObservation,
         type WorkerSessionRequestIdentity,
     } from "$lib/workspace/session-observation";
@@ -951,7 +952,7 @@
             workerApiPath(
                 `/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(target.workerId)}/session`,
             ),
-            { signal: controller.signal, headers: { accept: "application/json" } },
+            workerSessionRequestInit(controller.signal),
         )
             .then(async (response) => {
                 if (!response.ok) {

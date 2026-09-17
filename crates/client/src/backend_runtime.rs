@@ -278,6 +278,7 @@ impl BackendRuntimeListTarget {
 pub enum BackendRuntimeClientError {
     InvalidTarget(String),
     Api(BackendApiClientError),
+    SessionApi(server_api::ServerApiClientError),
     Http(reqwest::Error),
     Protocol(String),
 }
@@ -287,6 +288,7 @@ impl fmt::Display for BackendRuntimeClientError {
         match self {
             Self::InvalidTarget(message) => f.write_str(message),
             Self::Api(error) => write!(f, "{error}"),
+            Self::SessionApi(error) => write!(f, "{error}"),
             Self::Http(error) => write!(f, "{error}"),
             Self::Protocol(message) => f.write_str(message),
         }
@@ -294,6 +296,12 @@ impl fmt::Display for BackendRuntimeClientError {
 }
 
 impl std::error::Error for BackendRuntimeClientError {}
+
+impl From<server_api::ServerApiClientError> for BackendRuntimeClientError {
+    fn from(value: server_api::ServerApiClientError) -> Self {
+        Self::SessionApi(value)
+    }
+}
 
 impl From<BackendApiClientError> for BackendRuntimeClientError {
     fn from(error: BackendApiClientError) -> Self {
@@ -305,6 +313,59 @@ impl From<reqwest::Error> for BackendRuntimeClientError {
     fn from(error: reqwest::Error) -> Self {
         Self::Http(error)
     }
+}
+
+const WORKER_SESSION_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
+struct StoredBearerAuthorizer {
+    authorization: String,
+}
+
+impl server_api::client_support::RequestAuthorizer for StoredBearerAuthorizer {
+    fn authorize(
+        &self,
+        _request: server_api::client_support::AuthorizerRequest<'_>,
+    ) -> Result<reqwest::header::HeaderMap, server_api::client_support::AuthorizationError> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            self.authorization
+                .parse()
+                .map_err(|_| server_api::client_support::AuthorizationError::new())?,
+        );
+        Ok(headers)
+    }
+}
+
+pub async fn observe_backend_worker_session(
+    target: &BackendRuntimeTarget,
+) -> Result<server_api::WorkspaceWorkerSessionResponse, BackendRuntimeClientError> {
+    validate_target(target)?;
+    let backend = BackendApiClient::from_stored_token(&target.base_url)?;
+    observe_backend_worker_session_with_client(target, &backend).await
+}
+
+async fn observe_backend_worker_session_with_client(
+    target: &BackendRuntimeTarget,
+    backend: &BackendApiClient,
+) -> Result<server_api::WorkspaceWorkerSessionResponse, BackendRuntimeClientError> {
+    let client = server_api::ServerApiClient::builder(&target.base_url)
+        .map_err(|error| BackendRuntimeClientError::Protocol(error.to_string()))?
+        .authorizer(StoredBearerAuthorizer {
+            authorization: backend.authorization_header_value(),
+        })
+        .response_body_limit(WORKER_SESSION_RESPONSE_LIMIT)
+        .build()
+        .map_err(|error| BackendRuntimeClientError::Protocol(error.to_string()))?;
+    client
+        .worker_session(
+            target.workspace_id.clone(),
+            target.runtime_id.clone(),
+            target.worker_id.clone(),
+        )
+        .await
+        .map_err(Into::into)
 }
 
 pub async fn get_backend_worker_launch_options(
@@ -763,6 +824,43 @@ mod tests {
             String::from_utf8(request).unwrap()
         });
         (base_url, task)
+    }
+
+    #[tokio::test]
+    async fn worker_session_request_uses_bearer_and_sixteen_mib_response_limit() {
+        let large_message = "x".repeat(2 * 1024 * 1024);
+        let (base_url, server) = serve_json_once(serde_json::json!({
+            "subject": {
+                "kind": "runtime_worker",
+                "runtime_id": "runtime-a",
+                "worker_id": "worker-a"
+            },
+            "availability": "unavailable",
+            "reason": "storage_unavailable",
+            "message": large_message
+        }))
+        .await;
+        let target = BackendRuntimeTarget::new(&base_url, "workspace-a", "runtime-a", "worker-a");
+        let api =
+            BackendApiClient::from_access_token_for_test(&base_url, "session-secret").unwrap();
+
+        let response = observe_backend_worker_session_with_client(&target, &api)
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.observation,
+            runtime_api::WorkerSessionAvailability::Unavailable { ref message, .. }
+                if message.len() == 2 * 1024 * 1024
+        ));
+        let request = server.await.unwrap();
+        assert!(request.starts_with(
+            "GET /api/w/workspace-a/runtimes/runtime-a/workers/worker-a/session HTTP/1.1\r\n"
+        ));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer session-secret\r\n")
+        );
     }
 
     #[tokio::test]

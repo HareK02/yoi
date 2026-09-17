@@ -17,6 +17,14 @@ export interface WorkerSessionRequestIdentity {
   workerId: string;
 }
 
+export function workerSessionRequestInit(signal: AbortSignal): RequestInit {
+  return {
+    signal,
+    credentials: "same-origin",
+    headers: { accept: "application/json" },
+  };
+}
+
 export function workerSessionAction(
   observation: WorkerSessionObservation,
 ): WorkerSessionAction {

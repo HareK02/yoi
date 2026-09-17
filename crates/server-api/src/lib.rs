@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use workspace_api::WorkspaceWorkerSubject;
 
 pub type ServerApiError = runtime_api::RuntimeApiError;
+pub type ServerApiClientError = client_support::ClientError<ServerApiError>;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceWorkerSessionResponse {

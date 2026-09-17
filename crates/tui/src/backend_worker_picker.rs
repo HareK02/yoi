@@ -3,8 +3,8 @@ use std::io;
 use std::time::Duration;
 
 use client::{
-    BackendRuntimeListTarget, BackendWorkerSummary, ServerApiClient, WorkerSessionAvailability,
-    list_backend_stopped_workers, list_backend_workers,
+    BackendRuntimeListTarget, BackendWorkerSummary, WorkerSessionAvailability,
+    list_backend_stopped_workers, list_backend_workers, observe_backend_worker_session,
 };
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -83,16 +83,7 @@ pub(crate) async fn run(
         let mut attach_target = target
             .runtime_target(selected.runtime_id.clone(), selected.worker_id.clone())
             .map_err(|error| io::Error::other(error.to_string()))?;
-        let api = ServerApiClient::builder(&target.base_url)
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .build()
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        let response = api
-            .worker_session(
-                attach_target.workspace_id.clone(),
-                selected.runtime_id.clone(),
-                selected.worker_id.clone(),
-            )
+        let response = observe_backend_worker_session(&attach_target)
             .await
             .map_err(|error| {
                 io::Error::other(format!(
