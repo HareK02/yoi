@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use proc_macro::TokenStream;
+use proc_macro_crate::{FoundCrate, crate_name};
 use proc_macro2::Span;
 use quote::{format_ident, quote};
 use syn::{
@@ -49,7 +50,7 @@ impl Method {
         }
     }
 
-    fn tokens(self) -> proc_macro2::TokenStream {
+    fn tokens(self, api_crate: &proc_macro2::TokenStream) -> proc_macro2::TokenStream {
         let variant = match self {
             Self::Get => quote!(Get),
             Self::Post => quote!(Post),
@@ -59,7 +60,7 @@ impl Method {
             Self::Head => quote!(Head),
             Self::Options => quote!(Options),
         };
-        quote!(::api_macros::HttpMethod::#variant)
+        quote!(#api_crate::HttpMethod::#variant)
     }
 
     fn permits_request_body(self) -> bool {
@@ -137,14 +138,14 @@ enum Location {
 }
 
 impl Location {
-    fn tokens(self) -> proc_macro2::TokenStream {
+    fn tokens(self, api_crate: &proc_macro2::TokenStream) -> proc_macro2::TokenStream {
         let variant = match self {
             Self::Path => quote!(Path),
             Self::Query => quote!(Query),
             Self::Header => quote!(Header),
             Self::Body => quote!(Body),
         };
-        quote!(::api_macros::ParameterLocation::#variant)
+        quote!(#api_crate::ParameterLocation::#variant)
     }
 }
 
@@ -200,11 +201,12 @@ fn normalize_api(
     }
 
     let trait_ident = item.ident.clone();
-    let metadata_ident = format_ident!("{}Metadata", trait_ident);
+    let metadata_ident = format_ident!("{}Metadata", ident_text(&trait_ident));
     let operations_module_ident = format_ident!("{}_operations", to_snake_case(&trait_ident));
     let mut operations = Vec::new();
     let mut operation_ids = BTreeMap::<String, Span>::new();
     let mut routes = BTreeMap::<(Method, String), Span>::new();
+    let mut marker_names = BTreeMap::<String, (String, Span)>::new();
 
     for trait_item in &mut item.items {
         let TraitItem::Fn(method) = trait_item else {
@@ -214,6 +216,24 @@ fn normalize_api(
             ));
         };
         let operation = normalize_operation(method)?;
+
+        let marker_name = operation.marker_ident.to_string();
+        if let Some((first_method, first_span)) = marker_names.insert(
+            marker_name.clone(),
+            (ident_text(&method.sig.ident), method.sig.ident.span()),
+        ) {
+            let mut error = syn::Error::new(
+                method.sig.ident.span(),
+                format!(
+                    "generated operation marker `{marker_name}` collides with method `{first_method}`"
+                ),
+            );
+            error.combine(syn::Error::new(
+                first_span,
+                format!("first method generating marker `{marker_name}`"),
+            ));
+            return Err(error);
+        }
 
         if operation_ids
             .insert(operation.operation_id.clone(), method.sig.ident.span())
@@ -295,7 +315,7 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
         .operation_id
         .as_ref()
         .map(LitStr::value)
-        .unwrap_or_else(|| method.sig.ident.to_string());
+        .unwrap_or_else(|| ident_text(&method.sig.ident));
     validate_operation_id(
         &operation_id,
         route.operation_id.as_ref().unwrap_or(&route.path),
@@ -358,7 +378,7 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
             continue;
         };
         let ident = argument_ident(&input.pat)?;
-        let rust_name = ident.to_string();
+        let rust_name = ident_text(ident);
         let explicit = take_location(&mut input.attrs)?;
         let (location, wire_name) = match explicit {
             Some((Location::Path, wire_name)) => {
@@ -736,7 +756,22 @@ fn argument_ident(pat: &Pat) -> syn::Result<&Ident> {
     Ok(&ident.ident)
 }
 
+fn api_crate_path() -> syn::Result<proc_macro2::TokenStream> {
+    match crate_name("api-macros") {
+        Ok(FoundCrate::Itself) => Ok(quote!(::api_macros)),
+        Ok(FoundCrate::Name(name)) => {
+            let ident = Ident::new(&name, Span::call_site());
+            Ok(quote!(::#ident))
+        }
+        Err(error) => Err(syn::Error::new(
+            Span::call_site(),
+            format!("could not resolve the api-macros support crate: {error}"),
+        )),
+    }
+}
+
 fn expand_api(api: ApiDefinition) -> syn::Result<proc_macro2::TokenStream> {
+    let api_crate = api_crate_path()?;
     let item = api.item;
     let metadata_ident = api.metadata_ident;
     let module_ident = api.operations_module_ident;
@@ -759,36 +794,40 @@ fn expand_api(api: ApiDefinition) -> syn::Result<proc_macro2::TokenStream> {
         .iter()
         .map(|operation| {
             let marker_ident = &operation.marker_ident;
-            let metadata = metadata_tokens(operation);
+            let metadata = metadata_tokens(operation, &api_crate);
             let parameter_types = operation.parameters.iter().map(|parameter| &parameter.ty);
             let request_type = operation
                 .request_body
                 .as_ref()
                 .map(|ty| quote!(#ty))
-                .unwrap_or_else(|| quote!(::api_macros::NoBody));
+                .unwrap_or_else(|| quote!(#api_crate::NoBody));
             let response_type = operation
                 .response_body
                 .as_ref()
                 .map(|ty| quote!(#ty))
-                .unwrap_or_else(|| quote!(::api_macros::NoBody));
+                .unwrap_or_else(|| quote!(#api_crate::NoBody));
             let error_type = operation
                 .error_body
                 .as_ref()
                 .map(|ty| quote!(#ty))
-                .unwrap_or_else(|| quote!(::api_macros::NoBody));
+                .unwrap_or_else(|| quote!(#api_crate::NoBody));
             quote! {
-                impl ::api_macros::Operation for #module_ident::#marker_ident {
+                impl #api_crate::Operation for #module_ident::#marker_ident {
                     type Parameters = (#(#parameter_types,)*);
                     type RequestBody = #request_type;
                     type ResponseBody = #response_type;
                     type ErrorBody = #error_type;
 
-                    const METADATA: ::api_macros::OperationMetadata = #metadata;
+                    const METADATA: #api_crate::OperationMetadata = #metadata;
                 }
             }
         })
         .collect();
-    let inventory: Vec<_> = api.operations.iter().map(metadata_tokens).collect();
+    let inventory: Vec<_> = api
+        .operations
+        .iter()
+        .map(|operation| metadata_tokens(operation, &api_crate))
+        .collect();
 
     Ok(quote! {
         #item
@@ -797,8 +836,8 @@ fn expand_api(api: ApiDefinition) -> syn::Result<proc_macro2::TokenStream> {
         #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
         pub struct #metadata_ident;
 
-        impl ::api_macros::ApiContract for #metadata_ident {
-            const OPERATIONS: &'static [::api_macros::OperationMetadata] = &[
+        impl #api_crate::ApiContract for #metadata_ident {
+            const OPERATIONS: &'static [#api_crate::OperationMetadata] = &[
                 #(#inventory),*
             ];
         }
@@ -812,27 +851,30 @@ fn expand_api(api: ApiDefinition) -> syn::Result<proc_macro2::TokenStream> {
     })
 }
 
-fn metadata_tokens(operation: &Operation) -> proc_macro2::TokenStream {
+fn metadata_tokens(
+    operation: &Operation,
+    api_crate: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
     let operation_id = &operation.operation_id;
-    let method = operation.method.tokens();
+    let method = operation.method.tokens(api_crate);
     let path = &operation.path;
     let request_kind = if operation.request_body.is_some() {
-        quote!(::api_macros::WireKind::Json)
+        quote!(#api_crate::WireKind::Json)
     } else {
-        quote!(::api_macros::WireKind::Empty)
+        quote!(#api_crate::WireKind::Empty)
     };
     let response_kind = if operation.response_body.is_some() {
-        quote!(::api_macros::WireKind::Json)
+        quote!(#api_crate::WireKind::Json)
     } else {
-        quote!(::api_macros::WireKind::Empty)
+        quote!(#api_crate::WireKind::Empty)
     };
     let response_status = operation.response_status;
     let error = match operation.error_status {
         Some(status) => quote! {
-            ::core::option::Option::Some(::api_macros::ResponseMetadata {
+            ::core::option::Option::Some(#api_crate::ResponseMetadata {
                 status: #status,
-                body: ::api_macros::BodyMetadata {
-                    wire_kind: ::api_macros::WireKind::Json,
+                body: #api_crate::BodyMetadata {
+                    wire_kind: #api_crate::WireKind::Json,
                 },
             })
         },
@@ -841,10 +883,9 @@ fn metadata_tokens(operation: &Operation) -> proc_macro2::TokenStream {
     let parameters = operation.parameters.iter().map(|parameter| {
         let rust_name = &parameter.rust_name;
         let wire_name = &parameter.wire_name;
-        let location = parameter.location.tokens();
-        let _type_connection = &parameter.ty;
+        let location = parameter.location.tokens(api_crate);
         quote! {
-            ::api_macros::ParameterMetadata {
+            #api_crate::ParameterMetadata {
                 rust_name: #rust_name,
                 wire_name: #wire_name,
                 location: #location,
@@ -853,15 +894,15 @@ fn metadata_tokens(operation: &Operation) -> proc_macro2::TokenStream {
     });
 
     quote! {
-        ::api_macros::OperationMetadata {
+        #api_crate::OperationMetadata {
             operation_id: #operation_id,
             method: #method,
             path: #path,
             parameters: &[#(#parameters),*],
-            request_body: ::api_macros::BodyMetadata { wire_kind: #request_kind },
-            response: ::api_macros::ResponseMetadata {
+            request_body: #api_crate::BodyMetadata { wire_kind: #request_kind },
+            response: #api_crate::ResponseMetadata {
                 status: #response_status,
-                body: ::api_macros::BodyMetadata { wire_kind: #response_kind },
+                body: #api_crate::BodyMetadata { wire_kind: #response_kind },
             },
             error_response: #error,
         }
@@ -880,9 +921,13 @@ fn method_name(method: Method) -> &'static str {
     }
 }
 
+fn ident_text(ident: &Ident) -> String {
+    let value = ident.to_string();
+    value.strip_prefix("r#").unwrap_or(&value).to_owned()
+}
+
 fn to_pascal_case(ident: &Ident) -> String {
-    ident
-        .to_string()
+    ident_text(ident)
         .split('_')
         .filter(|part| !part.is_empty())
         .map(|part| {
@@ -896,7 +941,7 @@ fn to_pascal_case(ident: &Ident) -> String {
 }
 
 fn to_snake_case(ident: &Ident) -> String {
-    let value = ident.to_string();
+    let value = ident_text(ident);
     let mut result = String::new();
     for (index, ch) in value.chars().enumerate() {
         if ch.is_ascii_uppercase() {

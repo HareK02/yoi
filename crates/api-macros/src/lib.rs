@@ -58,6 +58,8 @@
 //! explicit variants for future transport work; accepting one requires a deliberate macro and
 //! adapter change rather than silently treating it as JSON.
 
+extern crate self as api_macros;
+
 pub use api_macros_impl::api;
 
 /// A transport-neutral HTTP method.

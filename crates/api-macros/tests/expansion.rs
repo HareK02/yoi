@@ -35,6 +35,12 @@ pub trait WrapperApi {
     async fn search(&self) -> SearchResult<Widget>;
 }
 
+#[api]
+pub trait RawIdentifierApi {
+    #[get("/type", operation_id = "raw.type")]
+    async fn r#type(&self) -> Widget;
+}
+
 fn assert_operation_types<O>()
 where
     O: Operation<
@@ -52,6 +58,8 @@ fn expansion_exposes_deterministic_metadata_and_type_connections() {
 
     fn assert_named_wrapper<O: Operation<ResponseBody = SearchResult<Widget>>>() {}
     assert_named_wrapper::<wrapper_api_operations::Search>();
+    let raw = <raw_identifier_api_operations::Type as Operation>::METADATA;
+    assert_eq!(raw.operation_id, "raw.type");
 
     let operations = <WidgetApiMetadata as ApiContract>::OPERATIONS;
     assert_eq!(operations.len(), 3);
