@@ -458,17 +458,78 @@ async fn run_standalone_host(
 pub(crate) async fn run_backend_runtime(
     target: BackendRuntimeTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(snapshot) = target.initial_snapshot.clone() {
+        let client = Client::new(RetainedSnapshotSocket::new(snapshot)?);
+        return run_backend_console(target, client, false).await;
+    }
+    let client = connect_backend_runtime(target.clone()).await?;
+    run_backend_console(target, client, true).await
+}
+
+async fn run_backend_console<T: Socket>(
+    target: BackendRuntimeTarget,
+    client: Client<T>,
+    connected: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let worker_label = target.display_label();
-    let attachment_target = target.clone();
-    let client = connect_backend_runtime(target).await?;
     let mut terminal = enter_fullscreen()?;
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut app = App::new_with_persistent_input_history(worker_label, &workspace_root);
-    app.connected = true;
-    let mut connection = ConsoleConnection::with_backend_target(client, attachment_target);
+    app.connected = connected;
+    let mut connection = ConsoleConnection::with_backend_target(client, target);
     let result = run_loop(&mut terminal, &mut app, &mut connection).await;
     let _ = leave_fullscreen(&mut terminal);
     result
+}
+
+struct RetainedSnapshotSocket {
+    event: Option<String>,
+}
+
+impl RetainedSnapshotSocket {
+    fn new(snapshot: protocol::SessionSnapshot) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            event: Some(serde_json::to_string(&Event::Snapshot {
+                session: snapshot,
+                greeting: protocol::Greeting {
+                    worker_name: "retained worker".to_string(),
+                    cwd: String::new(),
+                    provider: "retained session".to_string(),
+                    model: String::new(),
+                    scope_summary: "read-only retained session".to_string(),
+                    tools: Vec::new(),
+                    context_window: 0,
+                    context_tokens: 0,
+                },
+                state: protocol::WorkerStateSnapshot {
+                    last_command_id: 0,
+                    state: protocol::WorkerState::Idle,
+                },
+                in_flight: protocol::InFlightSnapshot::default(),
+                internal_workers: Vec::new(),
+            })?),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Socket for RetainedSnapshotSocket {
+    type Error = std::convert::Infallible;
+
+    async fn send(&mut self, _message: String) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn next(&mut self) -> Result<Option<String>, Self::Error> {
+        if self.event.is_some() {
+            return Ok(self.event.take());
+        }
+        std::future::pending::<Result<Option<String>, Self::Error>>().await
+    }
+
+    fn try_next(&mut self) -> Result<Option<String>, Self::Error> {
+        Ok(self.event.take())
+    }
 }
 
 fn enter_fullscreen() -> Result<ConsoleTerminal, Box<dyn std::error::Error>> {

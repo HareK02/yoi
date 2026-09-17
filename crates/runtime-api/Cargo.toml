@@ -14,4 +14,5 @@ workspace-api.workspace = true
 workdir.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }

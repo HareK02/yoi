@@ -231,6 +231,35 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         Ok(runtime_api::WorkerResponse { worker })
     }
 
+    async fn worker_session(
+        &self,
+        worker_id: String,
+        request: runtime_api::WorkerSessionRequest,
+    ) -> Result<runtime_api::WorkerSessionAvailability, runtime_api::RuntimeApiError> {
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let scope = auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+            .ok_or_else(|| {
+                runtime_api::RuntimeApiError::new(
+                    StatusCode::FORBIDDEN.as_u16(),
+                    "runtime_worker_session_scope_required",
+                    "Worker Session observation requires a Workspace-scoped capability",
+                )
+            })?;
+        if scope.workspace_id != request.workspace_id {
+            return Err(runtime_api::RuntimeApiError::new(
+                StatusCode::FORBIDDEN.as_u16(),
+                "runtime_worker_session_workspace_scope_mismatch",
+                "Worker Session Workspace scope does not match the authenticated capability",
+            ));
+        }
+        self.state
+            .runtime
+            .worker_session_scoped(&scope, &worker_ref)
+            .map_err(RuntimeHttpRestError::runtime)
+            .map_err(api_error)
+    }
+
     async fn create_worker(
         &self,
         value: runtime_api::CreateWorkerRequest,

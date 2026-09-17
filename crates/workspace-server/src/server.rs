@@ -3040,6 +3040,42 @@ fn build_server_auth_router(api: ServerAuthApi) -> Router {
         .with_state(api)
 }
 
+impl server_api::ServerApi for WorkspaceApi {
+    async fn worker_session(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+    ) -> std::result::Result<server_api::WorkspaceWorkerSessionResponse, server_api::ServerApiError>
+    {
+        if workspace_id != self.config.workspace_id {
+            return Err(runtime_api::RuntimeApiError::new(
+                StatusCode::NOT_FOUND.as_u16(),
+                "workspace_not_found",
+                "Workspace was not found",
+            ));
+        }
+        let worker = RuntimeWorkerRef::new(runtime_id.clone(), worker_id.clone());
+        let observation = self
+            .runtime
+            .worker_session(&workspace_id, &worker)
+            .map_err(|_error| {
+                runtime_api::RuntimeApiError::new(
+                    StatusCode::BAD_GATEWAY.as_u16(),
+                    "worker_session_observation_failed",
+                    "Worker Session observation failed",
+                )
+            })?;
+        Ok(server_api::WorkspaceWorkerSessionResponse {
+            subject: workspace_api::WorkspaceWorkerSubject::RuntimeWorker {
+                runtime_id,
+                worker_id,
+            },
+            observation,
+        })
+    }
+}
+
 fn build_inner_router(api: WorkspaceApi) -> Router {
     let auth = build_server_auth_router(ServerAuthApi::from(&api));
     let scoped_ticket_relations_query_path =
@@ -3631,6 +3667,9 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/hosts/{host_id}/workers",
             get(scoped_list_host_workers),
+        )
+        .merge(
+            server_api::ServerApiAxum::router(api.clone()).with_state::<WorkspaceApi>(()),
         )
         .fallback(get(static_or_spa_fallback))
         .with_state(api);

@@ -28,7 +28,7 @@ pub use workspace_api::{
     WorkingDirectorySummary as BackendWorkingDirectorySummary,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BackendRuntimeTarget {
     /// Workspace Backend API root URL, for example `http://127.0.0.1:8787`.
     /// This is intentionally the Backend endpoint, not a Runtime endpoint.
@@ -39,6 +39,7 @@ pub struct BackendRuntimeTarget {
     pub runtime_id: String,
     /// Backend-owned Worker identity used as path authority.
     pub worker_id: String,
+    pub initial_snapshot: Option<protocol::SessionSnapshot>,
 }
 
 impl BackendRuntimeTarget {
@@ -53,6 +54,7 @@ impl BackendRuntimeTarget {
             workspace_id: workspace_id.into(),
             runtime_id: runtime_id.into(),
             worker_id: worker_id.into(),
+            initial_snapshot: None,
         }
     }
 

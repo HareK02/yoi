@@ -2566,7 +2566,7 @@ pub enum RuntimeHttpServerError {
 mod tests {
     use super::*;
     use crate::auth::RuntimeIdentityMaterial;
-    use crate::catalog::{ConfigBundleRef, ProfileSelector, WorkerStatus, WorkspaceApiRef};
+    use crate::catalog::{ConfigBundleRef, ProfileSelector, WorkspaceApiRef};
     use crate::config_bundle::{
         ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigProfileDescriptor,
     };
@@ -2588,6 +2588,7 @@ mod tests {
     use manifest::{Scope, SharedScope};
     use sha2::Digest as _;
     use tower::ServiceExt;
+    use workspace_api::WorkerRestoreState;
 
     #[derive(Clone)]
     struct TestRuntimeAuthorizer(String);

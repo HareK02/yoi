@@ -650,8 +650,10 @@ dependencies = [
  "futures",
  "protocol",
  "reqwest",
+ "runtime-api",
  "serde",
  "serde_json",
+ "server-api",
  "tempfile",
  "thiserror 2.0.18",
  "ticket",
@@ -3714,6 +3716,7 @@ dependencies = [
  "manifest",
  "protocol",
  "serde",
+ "serde_json",
  "tokio",
  "workdir",
  "workspace-api",
@@ -4126,6 +4129,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "server-api"
+version = "0.1.0"
+dependencies = [
+ "api-macros",
+ "runtime-api",
+ "serde",
+ "serde_json",
+ "tokio",
+ "workspace-api",
 ]
 
 [[package]]
@@ -6291,6 +6306,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "server-api",
  "sha2 0.11.0",
  "ssh-key",
  "tempfile",

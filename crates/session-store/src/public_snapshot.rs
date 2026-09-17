@@ -7,10 +7,118 @@ use protocol::{
     SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment,
 };
 
+use std::path::Path;
+
+use thiserror::Error;
+
 use crate::{
     LogEntry, LoggedContentPart, LoggedHistoryEntry, LoggedItem, LoggedRole,
-    LoggedSessionHistoryOrigin, SessionId, SystemItem,
+    LoggedSessionHistoryOrigin, SessionId, Store, StoreError, SystemItem, WorkerAggregateStore,
+    WorkerMetadataStore, WorkerSessionStore, WorkerStoreError,
 };
+
+/// Projection limit leaves one MiB for the typed API envelope so a public
+/// retained-session response remains below the 16 MiB response ceiling.
+pub const DEFAULT_RETAINED_SNAPSHOT_MAX_BYTES: u64 = 15 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedSessionIdentity {
+    pub session_id: String,
+    pub segment_id: String,
+    pub entry_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetainedSessionSnapshot {
+    pub identity: RetainedSessionIdentity,
+    pub snapshot: SessionSnapshot,
+}
+
+#[derive(Debug, Error)]
+pub enum RetainedSnapshotReadError {
+    #[error("retained worker state is unavailable")]
+    RetentionMissing,
+    #[error("retained worker state has no active session pointer")]
+    ActivePointerMissing,
+    #[error("retained session requires migration")]
+    MigrationRequired,
+    #[error("retained session log is corrupt")]
+    CorruptLog,
+    #[error("retained session snapshot exceeds the observation limit")]
+    SnapshotTooLarge,
+}
+
+/// Read the active retained Session without creating, migrating, restoring, or
+/// rewriting any persisted state.
+pub fn read_retained_session_snapshot(
+    aggregate_root: &Path,
+    worker_name: &str,
+    max_bytes: u64,
+) -> Result<RetainedSessionSnapshot, RetainedSnapshotReadError> {
+    let aggregate = WorkerAggregateStore::open_read_only(aggregate_root, worker_name)
+        .map_err(map_worker_store_error)?;
+    let metadata = aggregate
+        .read_by_name(worker_name)
+        .map_err(map_worker_store_error)?
+        .ok_or(RetainedSnapshotReadError::RetentionMissing)?;
+    let active = metadata
+        .active
+        .ok_or(RetainedSnapshotReadError::ActivePointerMissing)?;
+    let segment_id = active
+        .segment_id
+        .ok_or(RetainedSnapshotReadError::ActivePointerMissing)?;
+    let store = WorkerSessionStore::open_read_only(aggregate_root.join("session"))
+        .map_err(map_store_error)?;
+    if store.segment_log_len(segment_id).map_err(map_store_error)? > max_bytes {
+        return Err(RetainedSnapshotReadError::SnapshotTooLarge);
+    }
+    let entries = store
+        .read_all(active.session_id, segment_id)
+        .map_err(map_store_error)?;
+    let snapshot = project_session_snapshot(active.session_id, &entries);
+    if serde_json::to_vec(&snapshot)
+        .map_err(|_| RetainedSnapshotReadError::CorruptLog)?
+        .len() as u64
+        > max_bytes
+    {
+        return Err(RetainedSnapshotReadError::SnapshotTooLarge);
+    }
+    Ok(RetainedSessionSnapshot {
+        identity: RetainedSessionIdentity {
+            session_id: active.session_id.to_string(),
+            segment_id: segment_id.to_string(),
+            entry_count: entries.len() as u64,
+        },
+        snapshot,
+    })
+}
+
+fn map_worker_store_error(error: WorkerStoreError) -> RetainedSnapshotReadError {
+    match error {
+        WorkerStoreError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            RetainedSnapshotReadError::RetentionMissing
+        }
+        WorkerStoreError::Serde(_) | WorkerStoreError::InvalidWorkerName(_) => {
+            RetainedSnapshotReadError::CorruptLog
+        }
+        WorkerStoreError::Io(_) => RetainedSnapshotReadError::CorruptLog,
+    }
+}
+
+fn map_store_error(error: StoreError) -> RetainedSnapshotReadError {
+    match error {
+        StoreError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            RetainedSnapshotReadError::RetentionMissing
+        }
+        StoreError::Corrupt { message, .. } if message.contains("requires migration") => {
+            RetainedSnapshotReadError::MigrationRequired
+        }
+        StoreError::Io(_) | StoreError::Serde(_) | StoreError::Corrupt { .. } => {
+            RetainedSnapshotReadError::CorruptLog
+        }
+        _ => RetainedSnapshotReadError::CorruptLog,
+    }
+}
 
 /// Project a complete current-segment log. A valid segment starts with one
 /// canonical annotated SegmentStart record; malformed partial input uses the
@@ -558,5 +666,66 @@ mod tests {
             snapshot.entries[0].provenance,
             SessionEntryProvenance::ModelOutput
         );
+    }
+
+    #[test]
+    fn retained_snapshot_read_projects_active_segment_without_rewriting_files() {
+        let root = tempfile::tempdir().unwrap();
+        let aggregate_root = root.path().join("worker-a");
+        let aggregate = WorkerAggregateStore::new(&aggregate_root, "worker-a").unwrap();
+        let session_id = crate::new_session_id();
+        let segment_id = crate::new_segment_id();
+        aggregate
+            .write(&crate::WorkerMetadata::new(
+                "worker-a",
+                Some(crate::WorkerActiveSegmentRef::active_segment(
+                    session_id, segment_id,
+                )),
+            ))
+            .unwrap();
+        let session = WorkerSessionStore::new(aggregate_root.join("session")).unwrap();
+        session.create_segment(session_id, segment_id, &[]).unwrap();
+        let metadata_before = std::fs::read(aggregate_root.join("metadata.json")).unwrap();
+        let manifest_before = std::fs::read(aggregate_root.join("session/session.json")).unwrap();
+
+        let retained = read_retained_session_snapshot(
+            &aggregate_root,
+            "worker-a",
+            DEFAULT_RETAINED_SNAPSHOT_MAX_BYTES,
+        )
+        .unwrap();
+
+        assert_eq!(retained.identity.session_id, session_id.to_string());
+        assert_eq!(retained.identity.segment_id, segment_id.to_string());
+        assert_eq!(retained.identity.entry_count, 0);
+        assert!(retained.snapshot.entries.is_empty());
+        assert_eq!(
+            std::fs::read(aggregate_root.join("metadata.json")).unwrap(),
+            metadata_before
+        );
+        assert_eq!(
+            std::fs::read(aggregate_root.join("session/session.json")).unwrap(),
+            manifest_before
+        );
+        assert!(matches!(
+            read_retained_session_snapshot(&aggregate_root, "worker-a", 0),
+            Err(RetainedSnapshotReadError::SnapshotTooLarge)
+        ));
+    }
+
+    #[test]
+    fn retained_snapshot_read_does_not_create_missing_aggregate() {
+        let root = tempfile::tempdir().unwrap();
+        let aggregate = root.path().join("missing-worker");
+
+        let error = read_retained_session_snapshot(
+            &aggregate,
+            "missing-worker",
+            DEFAULT_RETAINED_SNAPSHOT_MAX_BYTES,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, RetainedSnapshotReadError::RetentionMissing));
+        assert!(!aggregate.exists());
     }
 }

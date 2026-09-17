@@ -532,6 +532,44 @@ pub struct WorkerRetentionExecutionResult {
     pub diagnostics_retained: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerSessionRequest {
+    pub workspace_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetainedSessionIdentity {
+    pub session_id: String,
+    pub segment_id: String,
+    pub entry_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerSessionUnavailableReason {
+    RetentionMissing,
+    ActivePointerMissing,
+    CorruptLog,
+    MigrationRequired,
+    RetentionExpired,
+    SnapshotTooLarge,
+    StorageUnavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+pub enum WorkerSessionAvailability {
+    LiveProtocol,
+    RetainedSnapshot {
+        identity: RetainedSessionIdentity,
+        snapshot: protocol::SessionSnapshot,
+    },
+    Unavailable {
+        reason: WorkerSessionUnavailableReason,
+        message: String,
+    },
+}
+
 #[api(reqwest, axum)]
 pub trait RuntimeApi {
     #[get("/v1/ping", status = 200, error_status = 400)]
@@ -554,6 +592,13 @@ pub trait RuntimeApi {
         &self,
         #[path] worker_id: String,
     ) -> Result<WorkerResponse, RuntimeApiError>;
+
+    #[get("/v1/workers/{worker_id}/session", status = 200, error_status = 400)]
+    async fn worker_session(
+        &self,
+        #[path] worker_id: String,
+        #[query] request: WorkerSessionRequest,
+    ) -> Result<WorkerSessionAvailability, RuntimeApiError>;
 
     #[post("/v1/workers", status = 200, error_status = 400)]
     async fn create_worker(
@@ -827,6 +872,14 @@ mod tests {
             Err(test_error(404))
         }
 
+        async fn worker_session(
+            &self,
+            _worker_id: String,
+            _request: WorkerSessionRequest,
+        ) -> Result<WorkerSessionAvailability, RuntimeApiError> {
+            Ok(WorkerSessionAvailability::LiveProtocol)
+        }
+
         async fn create_worker(
             &self,
             _request: CreateWorkerRequest,
@@ -930,9 +983,21 @@ mod tests {
     }
 
     #[test]
+    fn worker_session_availability_has_closed_tagged_wire_shape() {
+        let value = serde_json::to_value(WorkerSessionAvailability::Unavailable {
+            reason: WorkerSessionUnavailableReason::SnapshotTooLarge,
+            message: "snapshot exceeds limit".to_string(),
+        })
+        .unwrap();
+        assert_eq!(value["availability"], "unavailable");
+        assert_eq!(value["reason"], "snapshot_too_large");
+        assert_eq!(value["message"], "snapshot exceeds limit");
+    }
+
+    #[test]
     fn contract_inventory_is_complete_and_unique() {
         let operations = RuntimeApiMetadata::OPERATIONS;
-        assert_eq!(operations.len(), 14);
+        assert_eq!(operations.len(), 15);
         let mut routes = operations
             .iter()
             .map(|operation| (format!("{:?}", operation.method), operation.path))

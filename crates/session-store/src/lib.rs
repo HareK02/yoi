@@ -57,6 +57,10 @@ pub use history::{
 };
 pub use logged_item::{LoggedContentPart, LoggedItem, LoggedRole, from_logged, to_logged};
 pub use paste_artifact::PasteArtifactLimits;
+pub use public_snapshot::{
+    DEFAULT_RETAINED_SNAPSHOT_MAX_BYTES, RetainedSessionIdentity, RetainedSessionSnapshot,
+    RetainedSnapshotReadError, project_session_snapshot, read_retained_session_snapshot,
+};
 pub use segment::{
     SegmentStartState, append_entry, append_system_item, classify_logged_history_entry,
     create_compacted_segment, create_segment, create_segment_with_ids, ensure_head_or_fork, fork,

@@ -42,6 +42,7 @@
         PendingSubmissionsSnapshot,
         RewindTarget,
         Segment,
+        SessionSnapshot,
     } from "$lib/generated/protocol";
     import {
         MAX_FILES_PER_SUBMISSION,
@@ -933,8 +934,73 @@
         target: ConsoleTarget,
     ) {
         if (!targetWorker || targetWorker.state === "stopped") {
-            protocolState = "closed";
-            return;
+            protocolState = "connecting";
+            const controller = new AbortController();
+            void fetch(
+                workerApiPath(
+                    `/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(target.workerId)}/session`,
+                ),
+                { signal: controller.signal, headers: { accept: "application/json" } },
+            )
+                .then(async (response) => {
+                    if (!response.ok) {
+                        throw new Error(`failed to load retained Worker Session (${response.status})`);
+                    }
+                    return (await response.json()) as
+                        | { availability: "live_protocol" }
+                        | { availability: "retained_snapshot"; snapshot: SessionSnapshot }
+                        | { availability: "unavailable"; message: string };
+                })
+                .then((observation) => {
+                    if (token !== reloadToken || controller.signal.aborted) return;
+                    if (observation.availability === "unavailable") {
+                        throw new Error(observation.message);
+                    }
+                    if (observation.availability === "live_protocol") {
+                        throw new Error("Worker became live; reload to connect to its protocol stream.");
+                    }
+                    handleIncomingProtocolEvent({
+                        event: "snapshot",
+                        data: {
+                            session: observation.snapshot,
+                            greeting: {
+                                worker_name: "retained worker",
+                                cwd: "",
+                                provider: "retained session",
+                                model: "",
+                                scope_summary: "read-only retained session",
+                                tools: [],
+                                context_window: 0,
+                                context_tokens: 0,
+                            },
+                            state: { last_command_id: 0, state: { kind: "idle" } },
+                            in_flight: { responses: [], commands: [] },
+                            internal_workers: [],
+                        },
+                    } as ProtocolEvent);
+                    protocolState = "closed";
+                    streamDiagnostics = [
+                        ...streamDiagnostics,
+                        {
+                            code: "retained_session_read_only",
+                            severity: "info",
+                            message: "Showing a read-only retained Session snapshot.",
+                        },
+                    ];
+                })
+                .catch((error) => {
+                    if (token !== reloadToken || controller.signal.aborted) return;
+                    protocolState = "error";
+                    streamDiagnostics = [
+                        ...streamDiagnostics,
+                        {
+                            code: "retained_session_unavailable",
+                            severity: "warning",
+                            message: error instanceof Error ? error.message : String(error),
+                        },
+                    ];
+                });
+            return () => controller.abort();
         }
         protocolState = "connecting";
         const subscription = workspaceMultiplexer(target.workspaceId).subscribe(

@@ -318,6 +318,11 @@ impl WorkerExecutionSpawnResult {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerSessionObservationRequest {
+    pub worker_ref: WorkerRef,
+}
+
 pub trait WorkerExecutionBackend: Send + Sync + 'static {
     fn backend_id(&self) -> &str;
 
@@ -326,6 +331,16 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         _request: WorkspaceConfigFetchRequest,
     ) -> Result<WorkspaceConfigFetchResult, String> {
         Err("execution backend does not support Workspace Config fetching".to_string())
+    }
+
+    fn worker_session(
+        &self,
+        _request: WorkerSessionObservationRequest,
+    ) -> runtime_api::WorkerSessionAvailability {
+        runtime_api::WorkerSessionAvailability::Unavailable {
+            reason: runtime_api::WorkerSessionUnavailableReason::StorageUnavailable,
+            message: "retained session storage is unavailable".to_string(),
+        }
     }
 
     fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult;
@@ -523,6 +538,13 @@ impl WorkerExecutionBackendRef {
         request: WorkspaceConfigFetchRequest,
     ) -> Result<WorkspaceConfigFetchResult, String> {
         self.backend.fetch_workspace_config(request)
+    }
+
+    pub(crate) fn worker_session(
+        &self,
+        request: WorkerSessionObservationRequest,
+    ) -> runtime_api::WorkerSessionAvailability {
+        self.backend.worker_session(request)
     }
 
     pub(crate) fn spawn_worker(

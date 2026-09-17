@@ -84,6 +84,32 @@ impl WorkerSessionStore {
         })
     }
 
+    /// Open an already-retained Session without creating directories or migrating
+    /// persisted data. Observation paths must never mutate retained state.
+    pub fn open_read_only(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        let root = root.into();
+        let bytes = fs::read(root.join(SESSION_FILE))?;
+        let manifest: SessionManifest = serde_json::from_slice(&bytes)?;
+        if manifest.schema_version != SESSION_SCHEMA_VERSION {
+            return Err(StoreError::Corrupt {
+                line: 0,
+                message: format!(
+                    "Worker Session schema version {} requires migration; expected {}",
+                    manifest.schema_version, SESSION_SCHEMA_VERSION
+                ),
+            });
+        }
+        Ok(Self {
+            root,
+            session_id: Arc::new(Mutex::new(Some(manifest.session_id))),
+            append_lock: Arc::new(Mutex::new(())),
+        })
+    }
+
+    pub fn segment_log_len(&self, segment_id: SegmentId) -> Result<u64, StoreError> {
+        Ok(fs::metadata(self.log_path(segment_id))?.len())
+    }
+
     pub fn root_dir(&self) -> &Path {
         &self.root
     }

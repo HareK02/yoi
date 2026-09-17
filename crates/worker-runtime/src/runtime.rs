@@ -15,7 +15,8 @@ use crate::execution::WorkerExecutionRestoreRequest;
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionBackendRef, WorkerExecutionHandle,
     WorkerExecutionOperation, WorkerExecutionResult, WorkerExecutionSpawnRequest,
-    WorkerExecutionSpawnResult, WorkspaceConfigFetchRequest, WorkspaceConfigFetchResult,
+    WorkerExecutionSpawnResult, WorkerSessionObservationRequest, WorkspaceConfigFetchRequest,
+    WorkspaceConfigFetchResult,
 };
 #[cfg(feature = "fs-store")]
 use crate::fs_store::{
@@ -1422,6 +1423,37 @@ impl Runtime {
 
         let state = self.lock()?;
         Ok(state.worker(worker_ref)?.detail())
+    }
+
+    /// Observe a Worker's live protocol availability or its retained Session.
+    /// The same lifecycle lock used by stop/restore fences the decision and read.
+    pub fn worker_session_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        worker_ref: &WorkerRef,
+    ) -> Result<runtime_api::WorkerSessionAvailability, RuntimeError> {
+        let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
+        let _operation_guard = operation_lock
+            .lock()
+            .map_err(|_| RuntimeError::StatePoisoned)?;
+        self.ensure_worker_in_workspace(scope, worker_ref)?;
+        let backend = {
+            let state = self.lock()?;
+            let worker = state.worker(worker_ref)?;
+            if worker.execution_handle.is_some() && worker.status.is_active() {
+                return Ok(runtime_api::WorkerSessionAvailability::LiveProtocol);
+            }
+            state.execution_backend.clone()
+        };
+        Ok(match backend {
+            Some(backend) => backend.worker_session(WorkerSessionObservationRequest {
+                worker_ref: worker_ref.clone(),
+            }),
+            None => runtime_api::WorkerSessionAvailability::Unavailable {
+                reason: runtime_api::WorkerSessionUnavailableReason::StorageUnavailable,
+                message: "retained session storage is unavailable".to_string(),
+            },
+        })
     }
 
     /// Attach a live execution through a workspace-scoped Runtime authorization context.
@@ -6741,6 +6773,40 @@ mod tests {
             runtime.worker_detail(&detail.worker_ref).unwrap().status,
             WorkerStatus::Stopped
         );
+    }
+
+    #[test]
+    fn session_observation_distinguishes_live_and_retained_without_restore() {
+        let (runtime, backend) = runtime_and_backend();
+        let scope = scope("local", "server-a");
+        let detail = runtime
+            .create_worker_scoped(&scope, task_request("observe without restore"))
+            .unwrap();
+
+        assert!(matches!(
+            runtime
+                .worker_session_scoped(&scope, &detail.worker_ref)
+                .unwrap(),
+            runtime_api::WorkerSessionAvailability::LiveProtocol
+        ));
+
+        runtime
+            .send_protocol_method(
+                &detail.worker_ref,
+                Method::Shutdown {
+                    command: test_command(),
+                },
+            )
+            .unwrap();
+        let observation = runtime
+            .worker_session_scoped(&scope, &detail.worker_ref)
+            .unwrap();
+
+        assert!(matches!(
+            observation,
+            runtime_api::WorkerSessionAvailability::Unavailable { .. }
+        ));
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
     }
 
     #[test]

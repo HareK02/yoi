@@ -383,6 +383,27 @@ impl WorkerAggregateStore {
         })
     }
 
+    /// Open an existing aggregate without creating or rewriting retained files.
+    pub fn open_read_only(
+        root: impl Into<PathBuf>,
+        worker_name: impl Into<String>,
+    ) -> Result<Self, WorkerStoreError> {
+        let root = root.into();
+        let worker_name = worker_name.into();
+        validate_worker_name(&worker_name)?;
+        if !root.is_dir() {
+            return Err(WorkerStoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "worker aggregate is not retained",
+            )));
+        }
+        Ok(Self {
+            update_lock: metadata_lock(&root),
+            root,
+            worker_name,
+        })
+    }
+
     fn validate_name(&self, worker_name: &str) -> Result<(), WorkerStoreError> {
         validate_worker_name(worker_name)?;
         if worker_name == self.worker_name {

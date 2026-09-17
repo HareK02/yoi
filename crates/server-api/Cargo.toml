@@ -1,0 +1,14 @@
+[package]
+name = "server-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+api-macros = { workspace = true, features = ["reqwest", "axum"] }
+runtime-api.workspace = true
+serde = { workspace = true, features = ["derive"] }
+workspace-api.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { workspace = true }

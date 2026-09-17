@@ -134,7 +134,7 @@ pub struct WorkerList {
     pub include_stopped: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WorkerConnection {
     pub target: BackendRuntimeTarget,
 }
