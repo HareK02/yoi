@@ -19,8 +19,8 @@ pub use conflict::{
 };
 pub use error::ScopeLockError;
 pub use lifecycle::{
-    ScopeAllocationGuard, SegmentLockInfo, adopt_allocation, install_top_level,
-    install_top_level_with_deny, lookup_segment, update_segment,
+    ScopeAllocationGuard, SegmentActivationGuard, SegmentLockInfo, adopt_allocation,
+    install_top_level, install_top_level_with_deny, lookup_segment,
 };
 pub use mutate::{
     delegate_scope, reclaim_delegated_scope, reclaim_stale, reclaim_stale_with, register_worker,

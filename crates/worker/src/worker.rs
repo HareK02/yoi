@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1055,6 +1055,7 @@ pub struct SegmentState {
     location: ArcSwap<SegmentLocation>,
     entries_written: AtomicUsize,
     append_lock: Mutex<()>,
+    activation_failed: AtomicBool,
 }
 
 impl SegmentState {
@@ -1066,6 +1067,7 @@ impl SegmentState {
             }),
             entries_written: AtomicUsize::new(entries_written),
             append_lock: Mutex::new(()),
+            activation_failed: AtomicBool::new(false),
         })
     }
 
@@ -1091,6 +1093,19 @@ impl SegmentState {
 
     pub fn set_entries_written(&self, n: usize) {
         self.entries_written.store(n, Ordering::Release);
+    }
+
+    fn ensure_append_allowed(&self) -> Result<(), StoreError> {
+        if self.activation_failed.load(Ordering::Acquire) {
+            return Err(StoreError::Io(std::io::Error::other(
+                "Segment activation is incomplete; restore the Worker before accepting more input",
+            )));
+        }
+        Ok(())
+    }
+
+    fn fail_closed_activation(&self) {
+        self.activation_failed.store(true, Ordering::Release);
     }
 
     fn increment_entries(&self) {
@@ -1223,6 +1238,7 @@ where
     }
 
     fn append_entry_locked(&self, entry: LogEntry) -> Result<(), StoreError> {
+        self.state.ensure_append_allowed()?;
         let loc = self.state.location();
         self.store.append(loc.session_id, loc.segment_id, &entry)?;
         self.state.increment_entries();
@@ -1439,6 +1455,7 @@ where
             .append_lock
             .lock()
             .expect("segment append lock poisoned");
+        self.writer.state.ensure_append_allowed()?;
         let mut current = self
             .state
             .lock()
@@ -1580,6 +1597,7 @@ where
             .append_lock
             .lock()
             .expect("segment append lock poisoned");
+        self.writer.state.ensure_append_allowed()?;
         let mut state = self
             .state
             .lock()
@@ -4414,8 +4432,15 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let _rewrite_guard = self
             .prepare_session_rewrite(SessionRewriteKind::Fork)
             .await?;
-        let w = self.engine.as_ref().unwrap();
+        let segment_state = Arc::clone(&self.segment_state);
+        let _append_guard = segment_state
+            .append_lock
+            .lock()
+            .expect("segment append lock poisoned");
+        segment_state.ensure_append_allowed()?;
+        let loc = segment_state.location();
         let fork_segment_id = session_store::new_segment_id();
+        let w = self.engine.as_ref().unwrap();
         let entry = LogEntry::AnnotatedSegmentStart {
             ts: segment_log::now_millis(),
             session_id: loc.session_id,
@@ -4446,24 +4471,48 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         {
             initial_entries.push(checkpoint);
         }
+        initial_entries.push(LogEntry::Extension {
+            ts: segment_log::now_millis(),
+            domain: SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN.to_owned(),
+            payload: serde_json::to_value(
+                &*self
+                    .session
+                    .pending_activations
+                    .lock()
+                    .expect("pending activation state poisoned"),
+            )
+            .map_err(|error| {
+                WorkerError::InvalidState(format!(
+                    "serialize pending submissions during automatic fork: {error}"
+                ))
+            })?,
+        });
         self.store
             .create_segment(loc.session_id, fork_segment_id, &initial_entries)
             .map_err(WorkerError::from)?;
-        self.segment_state.set_location(SegmentLocation {
+        let new_location = SegmentLocation {
             session_id: loc.session_id,
             segment_id: fork_segment_id,
-        });
+        };
+        let allocation_activation = self
+            .scope_allocation
+            .as_ref()
+            .map(|allocation| {
+                allocation.begin_segment_activation(loc.segment_id, fork_segment_id)
+            })
+            .transpose()?;
+        self.compare_and_swap_worker_metadata_segment(loc, new_location)?;
+        if let Some(allocation_activation) = allocation_activation {
+            if let Err(source) = allocation_activation.commit() {
+                segment_state.fail_closed_activation();
+                return Err(WorkerError::SegmentActivationIncomplete { source });
+            }
+        }
+        self.segment_state.set_location(new_location);
         self.segment_state
             .set_entries_written(initial_entries.len());
         self.sink
             .reset_with_initial_entries(initial_entries.clone());
-        if self.scope_allocation.is_some() {
-            worker_allocation::update_segment(&self.manifest.worker.name, fork_segment_id)?;
-        }
-        self.write_worker_metadata_active(SegmentLocation {
-            session_id: loc.session_id,
-            segment_id: fork_segment_id,
-        })?;
         Ok(())
     }
 
@@ -5058,12 +5107,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         match outcome {
             Ok((new_segment_id, _summary, stats)) => {
                 debug_assert_eq!(lifecycle.state, CompactionLifecycleState::Done);
+                self.set_compaction_progress(None);
                 for metric in attempt.success_metrics(new_segment_id, started.elapsed(), &stats) {
                     self.try_record_metric(&metric);
                 }
                 self.usage_tracker
                     .note_compaction_correlation_id(attempt.correlation_id().to_string());
-                self.release_compaction_service(&lifecycle).await;
                 Ok(new_segment_id)
             }
             Err(error) => {
@@ -5082,8 +5131,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     CompactionLifecycleState::Failed
                 };
                 lifecycle.ended_at_ms = Some(segment_log::now_millis());
-                self.set_compaction_progress(None);
                 self.release_compaction_service(&lifecycle).await;
+                self.set_compaction_progress(None);
                 Err(error)
             }
         }
@@ -5100,13 +5149,18 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let Some(registry) = &self.internal_worker_registry else {
             return;
         };
-        if let Err(error) = registry.stop_service(session_id).await {
-            warn!(
-                compaction_id = %lifecycle.compaction_id,
-                internal_worker_session_id = %session_id,
-                error = %error,
-                "failed to release terminal compaction Internal Worker"
-            );
+        loop {
+            match registry.stop_service(session_id).await {
+                Ok(_) => return,
+                Err(error) => {
+                    warn!(
+                        compaction_id = %lifecycle.compaction_id,
+                        error = %error,
+                        "compaction service cleanup failed; retaining cleanup authority and retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
         }
     }
 
@@ -5643,8 +5697,31 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // rotate: create on disk, swap location, reset the broadcast
         // sink so existing subscribers see the new `SegmentStart
         // { compacted_from }` and reset their view.
+        // The Compactor has produced and validated its output. Retire it before
+        // activation so no internal process or registry authority survives into
+        // the replacement's live lifetime. Cleanup failures retain this future
+        // (and Busy state) until a retry succeeds.
+        self.release_compaction_service(lifecycle).await;
+
+        self.set_compaction_progress(Some(InFlightCompaction {
+            phase: CompactionPhase::Committing,
+            started_at_ms: lifecycle.started_at_ms,
+            trigger,
+        }));
+
+        // Activation lock order is append barrier -> allocation table -> metadata.
+        // From this point through live publication, every accepted Submit/Notify
+        // either completed on the source Segment or waits to observe the fully
+        // activated replacement.
+        let segment_state = Arc::clone(&self.segment_state);
+        let _append_guard = segment_state
+            .append_lock
+            .lock()
+            .expect("segment append lock poisoned");
+        segment_state.ensure_append_allowed()?;
+
         let new_segment_id = session_store::new_segment_id();
-        let old_loc = self.segment_state.location();
+        let old_loc = segment_state.location();
         let source_turn_count = self.engine.as_ref().unwrap().turn_count();
         let w = self.engine.as_ref().unwrap();
         let entry = LogEntry::AnnotatedSegmentStart {
@@ -5706,11 +5783,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 })?,
             });
         }
-        self.set_compaction_progress(Some(InFlightCompaction {
-            phase: CompactionPhase::Committing,
-            started_at_ms: lifecycle.started_at_ms,
-            trigger,
-        }));
         self.store
             .create_segment(old_loc.session_id, new_segment_id, &initial_entries)?;
 
@@ -5724,21 +5796,32 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             session_id: old_loc.session_id,
             segment_id: new_segment_id,
         };
-        // The writer lease is stable for the Worker lifetime and is keyed by
-        // worker name. Compaction must not transfer or rewrite that lease: the
-        // active Segment is derived exclusively from the CAS-protected Worker
-        // metadata pointer below. A lost CAS therefore leaves every live and
-        // durable authority on the previous Segment.
+        // The machine-wide allocation lock is acquired only after staging, but
+        // before the durable commit point. Restore admission therefore cannot
+        // race the metadata CAS and allocation hand-off.
+        let allocation_activation = self
+            .scope_allocation
+            .as_ref()
+            .map(|allocation| {
+                allocation.begin_segment_activation(old_loc.segment_id, new_segment_id)
+            })
+            .transpose()?;
         self.compare_and_swap_worker_metadata_segment(old_loc, new_location)?;
+        if let Some(allocation_activation) = allocation_activation {
+            if let Err(source) = allocation_activation.commit() {
+                // Metadata already names the complete replacement. Do not allow
+                // the old in-memory writer to accept another byte while durable
+                // authorities disagree; restore will converge from metadata.
+                segment_state.fail_closed_activation();
+                return Err(WorkerError::SegmentActivationIncomplete { source });
+            }
+        }
 
         // All live mutations after the durable commit are infallible and happen
         // before the replacement SegmentStart is broadcast. This keeps the
         // append destination, Session projection, Engine cache identity, and
         // reconnect snapshot on one side of the same activation boundary.
-        self.segment_state.set_location(SegmentLocation {
-            session_id: old_loc.session_id,
-            segment_id: new_segment_id,
-        });
+        self.segment_state.set_location(new_location);
         self.segment_state
             .set_entries_written(initial_entries.len());
         self.user_segments = retained_user_segments;
@@ -5764,7 +5847,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         lifecycle.revision = lifecycle.revision.saturating_add(1);
         lifecycle.state = CompactionLifecycleState::Done;
         lifecycle.ended_at_ms = Some(segment_log::now_millis());
-        self.set_compaction_progress(None);
         Ok((
             new_segment_id,
             summary_text,
@@ -7169,7 +7251,9 @@ fn compact_failure_category(error: &WorkerError) -> CompactFailureCategory {
         WorkerError::CompactResultContextTooLarge { .. } => {
             CompactFailureCategory::ResultContextTooLarge
         }
-        WorkerError::WorkerStore(_) | WorkerError::CompactActiveSegmentChanged => {
+        WorkerError::WorkerStore(_)
+        | WorkerError::CompactActiveSegmentChanged
+        | WorkerError::SegmentActivationIncomplete { .. } => {
             CompactFailureCategory::ActiveSegmentCommit
         }
         WorkerError::Store(_) => CompactFailureCategory::Storage,
@@ -7274,6 +7358,14 @@ pub enum WorkerError {
 
     #[error(transparent)]
     ScopeLock(#[from] ScopeLockError),
+
+    #[error(
+        "Segment activation could not be completed; the Worker must be restored before accepting more input"
+    )]
+    SegmentActivationIncomplete {
+        #[source]
+        source: ScopeLockError,
+    },
 
     #[error(transparent)]
     PromptCatalog(#[from] CatalogError),
@@ -8373,8 +8465,9 @@ mod build_summary_prompt_tests {
                     active_turn_count: 3,
                     total_turn_count: 7,
                     ..
-                }
-            ]
+                },
+                LogEntry::Extension { domain, .. }
+            ] if domain == SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN
         ));
         let restored = session_store::collect_state(&fork_entries);
         assert!(restored.last_run_interrupted);

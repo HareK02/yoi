@@ -2147,6 +2147,7 @@ async fn controller_loop<C, St>(
                     Err(WorkerError::Store(_))
                         | Err(WorkerError::WorkerStore(_))
                         | Err(WorkerError::InvalidState(_))
+                        | Err(WorkerError::SegmentActivationIncomplete { .. })
                 ) {
                     set_controller_state(
                         &shared_state,
