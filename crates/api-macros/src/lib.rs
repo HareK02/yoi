@@ -73,7 +73,9 @@
 //! public component-name contract. Different schemas claiming one name, unsafe-width integer
 //! schemas, and ambiguous non-null `anyOf`/untagged representations fail closed. Use bounded
 //! integers (for example `u32`) for JSON numeric fields, and model optionality separately from
-//! nullability through object `required` membership and nullable schemas.
+//! nullability through object `required` membership and nullable schemas. A normalized
+//! `#[header("authorization")]` string (or optional string) is projected as an HTTP bearer
+//! security scheme and operation requirement rather than as a raw header parameter.
 //!
 //! # Optional HTTP adapters
 //!

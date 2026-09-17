@@ -93,6 +93,7 @@ pub trait FixtureApi {
         &self,
         #[path] widget_id: u32,
         #[query] lookup: Lookup,
+        #[header("authorization")] authorization: String,
         #[header("x-request-id")] request_id: OptionalRequestId,
         #[body] request: CreateWidget,
     ) -> Result<Widget, PublicError>;
@@ -176,6 +177,7 @@ fn operations_and_components_preserve_the_wire_contract() {
     let value = document().as_value().clone();
     let create = &value["paths"]["/widgets/{widget_id}"]["post"];
     assert_eq!(create["operationId"], "widgets.create");
+    assert_eq!(create["security"], json!([{ "bearerAuth": [] }]));
     assert_eq!(
         create["responses"]["201"]["content"]["application/json"]["schema"],
         json!({
@@ -214,6 +216,10 @@ fn operations_and_components_preserve_the_wire_contract() {
     let schemas = value["components"]["schemas"]
         .as_object()
         .expect("components");
+    assert_eq!(
+        value["components"]["securitySchemes"]["bearerAuth"],
+        json!({ "type": "http", "scheme": "bearer" })
+    );
     for name in [
         "CreateWidget",
         "GeoPoint",
@@ -278,6 +284,7 @@ fn operations_and_components_preserve_the_wire_contract() {
 
     let delete = &value["paths"]["/widgets/{widget_id}"]["delete"];
     assert_eq!(delete["operationId"], "widgets.delete");
+    assert!(delete.get("security").is_none());
     assert_eq!(
         delete["responses"]["204"],
         json!({ "description": "Successful response" })

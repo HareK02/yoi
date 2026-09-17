@@ -31,6 +31,8 @@ pub trait OpenApiSchema: JsonSchema {
     /// This semantic hook intentionally lives on the resolved type, so aliases
     /// such as `type Header = Option<String>` retain optionality.
     const PARAMETER_REQUIRED: bool = true;
+    /// Whether an `Authorization` header of this type is a bearer credential.
+    const BEARER_CREDENTIAL: bool = false;
 
     fn openapi_schema_name() -> Cow<'static, str> {
         Self::schema_name()
@@ -43,10 +45,15 @@ macro_rules! impl_openapi_schema {
     };
 }
 
-impl_openapi_schema!((), bool, String, char, i8, i16, i32, u8, u16, u32, f32, f64);
+impl_openapi_schema!((), bool, char, i8, i16, i32, u8, u16, u32, f32, f64);
+
+impl OpenApiSchema for String {
+    const BEARER_CREDENTIAL: bool = true;
+}
 
 impl<T: OpenApiSchema> OpenApiSchema for Option<T> {
     const PARAMETER_REQUIRED: bool = false;
+    const BEARER_CREDENTIAL: bool = T::BEARER_CREDENTIAL;
 }
 impl<T: OpenApiSchema> OpenApiSchema for Vec<T> {}
 impl<T: OpenApiSchema> OpenApiSchema for Box<T> {}
@@ -123,6 +130,7 @@ pub struct OpenApiBuilder {
     paths: BTreeMap<String, BTreeMap<String, Value>>,
     schemas: BTreeMap<String, Value>,
     operation_ids: BTreeSet<String>,
+    uses_bearer_auth: bool,
 }
 
 impl OpenApiBuilder {
@@ -148,6 +156,7 @@ impl OpenApiBuilder {
             paths: BTreeMap::new(),
             schemas: BTreeMap::new(),
             operation_ids: BTreeSet::new(),
+            uses_bearer_auth: false,
         })
     }
 
@@ -189,6 +198,7 @@ impl OpenApiBuilder {
             parameters: Vec::new(),
             request_body: None,
             responses: BTreeMap::new(),
+            bearer_security_required: None,
         })
     }
 
@@ -202,12 +212,25 @@ impl OpenApiBuilder {
             })
             .collect::<Map<_, _>>();
         let schemas = self.schemas.into_iter().collect::<Map<_, _>>();
+        let mut components = Map::new();
+        components.insert("schemas".to_owned(), Value::Object(schemas));
+        if self.uses_bearer_auth {
+            components.insert(
+                "securitySchemes".to_owned(),
+                json!({
+                    "bearerAuth": {
+                        "type": "http",
+                        "scheme": "bearer"
+                    }
+                }),
+            );
+        }
 
         let document = canonicalize(json!({
             "openapi": "3.1.0",
             "info": self.info,
             "paths": paths,
-            "components": { "schemas": schemas },
+            "components": components,
         }));
         validate_component_references(&document)?;
         Ok(OpenApiDocument(document))
@@ -271,6 +294,7 @@ pub struct OpenApiOperation<'a> {
     parameters: Vec<Value>,
     request_body: Option<Value>,
     responses: BTreeMap<String, Value>,
+    bearer_security_required: Option<bool>,
 }
 
 impl OpenApiOperation<'_> {
@@ -286,6 +310,22 @@ impl OpenApiOperation<'_> {
             )));
         }
         let required = location == "path" || T::PARAMETER_REQUIRED;
+        if location == "header" && name.eq_ignore_ascii_case("authorization") {
+            if !T::BEARER_CREDENTIAL {
+                return Err(OpenApiError::InvalidContract(format!(
+                    "Authorization header for `{}` must use a bearer credential schema",
+                    self.operation_id
+                )));
+            }
+            if self.bearer_security_required.replace(required).is_some() {
+                return Err(OpenApiError::InvalidContract(format!(
+                    "multiple Authorization headers for `{}`",
+                    self.operation_id
+                )));
+            }
+            self.parent.uses_bearer_auth = true;
+            return Ok(());
+        }
         let schema = self.parent.schema_ref::<T>()?;
         self.parameters.push(json!({
             "name": name,
@@ -377,6 +417,16 @@ impl OpenApiOperation<'_> {
         }
         if let Some(request_body) = self.request_body {
             operation.insert("requestBody".to_owned(), request_body);
+        }
+        if let Some(required) = self.bearer_security_required {
+            operation.insert(
+                "security".to_owned(),
+                if required {
+                    json!([{ "bearerAuth": [] }])
+                } else {
+                    json!([{}, { "bearerAuth": [] }])
+                },
+            );
         }
         self.parent
             .paths
