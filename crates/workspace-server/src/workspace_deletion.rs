@@ -1,7 +1,6 @@
 use chrono::Utc;
 use rusqlite::{OptionalExtension, params};
-use sha2::{Digest, Sha256};
-use workspace_api::{
+use server_api::{
     WORKSPACE_DELETION_MAX_BLOCKER_MESSAGE_BYTES, WORKSPACE_DELETION_MAX_BLOCKERS,
     WORKSPACE_DELETION_MAX_CHILD_OPERATION_IDS, WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES,
     WORKSPACE_DELETION_MAX_RESOURCE_VALUE_BYTES, WORKSPACE_DELETION_MAX_REVISION_BYTES,
@@ -9,6 +8,7 @@ use workspace_api::{
     WorkspaceDeletionPreflightResponse, WorkspaceDeletionRequest, WorkspaceDeletionResourceCounts,
     WorkspaceDeletionState,
 };
+use sha2::{Digest, Sha256};
 
 use crate::store::{SqliteWorkspaceStore, WorkspaceRecord};
 use crate::{Error, Result};
@@ -200,7 +200,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
     ) -> Result<WorkspaceDeletionReservation> {
         validate_operation_id(&request.operation_id)?;
         if request.expected_revision.len() > WORKSPACE_DELETION_MAX_REVISION_BYTES
-            || request.confirmation.len() > workspace_api::WORKSPACE_DELETION_MAX_CONFIRMATION_BYTES
+            || request.confirmation.len() > server_api::WORKSPACE_DELETION_MAX_CONFIRMATION_BYTES
         {
             return Err(Error::InvalidInput(
                 "Workspace deletion request exceeds bounded field limits".to_string(),

@@ -275,12 +275,12 @@ pub struct WorkerSummary {
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
-impl From<RuntimeDiagnostic> for workspace_api::Diagnostic {
+impl From<RuntimeDiagnostic> for server_api::Diagnostic {
     fn from(diagnostic: RuntimeDiagnostic) -> Self {
         let severity = match diagnostic.severity {
-            DiagnosticSeverity::Info => workspace_api::DiagnosticSeverity::Info,
-            DiagnosticSeverity::Warning => workspace_api::DiagnosticSeverity::Warning,
-            DiagnosticSeverity::Error => workspace_api::DiagnosticSeverity::Error,
+            DiagnosticSeverity::Info => server_api::DiagnosticSeverity::Info,
+            DiagnosticSeverity::Warning => server_api::DiagnosticSeverity::Warning,
+            DiagnosticSeverity::Error => server_api::DiagnosticSeverity::Error,
         };
         Self {
             code: diagnostic.code,
@@ -290,21 +290,21 @@ impl From<RuntimeDiagnostic> for workspace_api::Diagnostic {
     }
 }
 
-impl From<RuntimeSourceSummary> for workspace_api::RuntimeSourceSummary {
+impl From<RuntimeSourceSummary> for server_api::RuntimeSourceSummary {
     fn from(source: RuntimeSourceSummary) -> Self {
         let kind = match source.kind {
             RuntimeSourceKind::EmbeddedWorkerRuntime => {
-                workspace_api::RuntimeSourceKind::EmbeddedWorkerRuntime
+                server_api::RuntimeSourceKind::EmbeddedWorkerRuntime
             }
-            RuntimeSourceKind::RemoteHttp => workspace_api::RuntimeSourceKind::RemoteHttp,
+            RuntimeSourceKind::RemoteHttp => server_api::RuntimeSourceKind::RemoteHttp,
         };
         let status = match source.status {
-            RuntimeSourceStatus::Active => workspace_api::RuntimeSourceStatus::Active,
-            RuntimeSourceStatus::Reserved => workspace_api::RuntimeSourceStatus::Reserved,
+            RuntimeSourceStatus::Active => server_api::RuntimeSourceStatus::Active,
+            RuntimeSourceStatus::Reserved => server_api::RuntimeSourceStatus::Reserved,
         };
         let identity_authority = match source.identity_authority {
             RuntimeIdentityAuthority::RuntimeRegistryProjection => {
-                workspace_api::RuntimeIdentityAuthority::RuntimeRegistryProjection
+                server_api::RuntimeIdentityAuthority::RuntimeRegistryProjection
             }
         };
         Self {
@@ -316,7 +316,7 @@ impl From<RuntimeSourceSummary> for workspace_api::RuntimeSourceSummary {
     }
 }
 
-impl From<RuntimeSummary> for workspace_api::RuntimeSummary {
+impl From<RuntimeSummary> for server_api::RuntimeSummary {
     fn from(runtime: RuntimeSummary) -> Self {
         Self {
             runtime_id: runtime.runtime_id,
@@ -336,9 +336,9 @@ impl From<RuntimeSummary> for workspace_api::RuntimeSummary {
 pub(crate) fn workspace_worker_summary(
     summary: WorkerSummary,
     resource_key: String,
-    working_directory: Option<workspace_api::WorkingDirectorySummary>,
-) -> workspace_api::WorkerSummary {
-    workspace_api::WorkerSummary {
+    working_directory: Option<server_api::WorkingDirectorySummary>,
+) -> server_api::WorkerSummary {
+    server_api::WorkerSummary {
         runtime_id: summary.worker.runtime_id,
         worker_id: summary.worker.worker_id,
         resource_key,
@@ -348,7 +348,7 @@ pub(crate) fn workspace_worker_summary(
         profile: summary.profile,
         singleton_key: summary.singleton_key,
         tags: summary.tags,
-        workspace: workspace_api::WorkerWorkspaceSummary {
+        workspace: server_api::WorkerWorkspaceSummary {
             visibility: summary.workspace.visibility,
             identity: summary.workspace.identity,
             workspace_id: summary.workspace.workspace_id,
@@ -358,11 +358,11 @@ pub(crate) fn workspace_worker_summary(
         last_seen_at: summary.last_seen_at,
         pinned: summary.pinned,
         retention_state: summary.retention_state,
-        implementation: workspace_api::WorkerImplementationSummary {
+        implementation: server_api::WorkerImplementationSummary {
             kind: summary.implementation.kind,
             display_hint: summary.implementation.display_hint,
         },
-        capabilities: workspace_api::WorkerCapabilitySummary {
+        capabilities: server_api::WorkerCapabilitySummary {
             can_stop: summary.capabilities.can_stop,
             can_spawn_followup: summary.capabilities.can_spawn_followup,
         },
@@ -374,7 +374,7 @@ pub(crate) fn workspace_worker_summary(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerRestoreResult {
-    pub state: workspace_api::WorkerRestoreState,
+    pub state: server_api::WorkerRestoreState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker: Option<WorkerSummary>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
@@ -613,7 +613,7 @@ pub enum WorkerOperationState {
     Rejected,
 }
 
-impl From<WorkerOperationState> for workspace_api::WorkerOperationState {
+impl From<WorkerOperationState> for server_api::WorkerOperationState {
     fn from(state: WorkerOperationState) -> Self {
         match state {
             WorkerOperationState::Accepted => Self::Accepted,
@@ -877,7 +877,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
 
     fn restore_worker(&self, worker_id: &str) -> WorkerRestoreResult {
         WorkerRestoreResult {
-            state: workspace_api::WorkerRestoreState::Rejected,
+            state: server_api::WorkerRestoreState::Rejected,
             worker: None,
             diagnostics: vec![diagnostic(
                 "worker_restore_unsupported",
@@ -2365,7 +2365,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
     fn restore_worker(&self, worker_id: &str) -> WorkerRestoreResult {
         let Some(worker_ref) = self.worker_ref(worker_id) else {
             return WorkerRestoreResult {
-                state: workspace_api::WorkerRestoreState::Rejected,
+                state: server_api::WorkerRestoreState::Rejected,
                 worker: None,
                 diagnostics: vec![diagnostic(
                     "embedded_worker_id_invalid",
@@ -2389,7 +2389,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 }
             }
             Err(err) => WorkerRestoreResult {
-                state: workspace_api::WorkerRestoreState::ReconciliationRequired,
+                state: server_api::WorkerRestoreState::ReconciliationRequired,
                 worker: None,
                 diagnostics: vec![embedded_runtime_diagnostic(&err)],
             },
@@ -4318,7 +4318,20 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                     _ => Vec::new(),
                 };
                 WorkerRestoreResult {
-                    state,
+                    state: match state {
+                        runtime_api::WorkerRestoreState::Accepted => {
+                            server_api::WorkerRestoreState::Accepted
+                        }
+                        runtime_api::WorkerRestoreState::Rejected => {
+                            server_api::WorkerRestoreState::Rejected
+                        }
+                        runtime_api::WorkerRestoreState::RolledBack => {
+                            server_api::WorkerRestoreState::RolledBack
+                        }
+                        runtime_api::WorkerRestoreState::ReconciliationRequired => {
+                            server_api::WorkerRestoreState::ReconciliationRequired
+                        }
+                    },
                     worker: worker.map(|worker| self.map_worker_detail(worker)),
                     diagnostics,
                 }
@@ -4326,7 +4339,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Err(diagnostic) => WorkerRestoreResult {
                 // A transport/protocol failure cannot prove that the Runtime
                 // rejected before side effects. Preserve uncertainty.
-                state: workspace_api::WorkerRestoreState::ReconciliationRequired,
+                state: server_api::WorkerRestoreState::ReconciliationRequired,
                 worker: None,
                 diagnostics: vec![diagnostic],
             },
@@ -5769,7 +5782,7 @@ mod tests {
 
         assert_eq!(
             result.state,
-            workspace_api::WorkerRestoreState::ReconciliationRequired
+            server_api::WorkerRestoreState::ReconciliationRequired
         );
         assert!(result.worker.is_none());
         assert_eq!(result.diagnostics.len(), 1);
@@ -6206,8 +6219,8 @@ mod tests {
             repository: worker_runtime::catalog::WorkingDirectoryRepository {
                 id: "repository-1".to_string(),
                 provider: "git".to_string(),
-                source: workspace_api::RepositorySource {
-                    kind: workspace_api::RepositorySourceKind::LocalPath,
+                source: server_api::RepositorySource {
+                    kind: server_api::RepositorySourceKind::LocalPath,
                     uri: "/provider/repository.git".to_string(),
                 },
                 source_revision: 7,

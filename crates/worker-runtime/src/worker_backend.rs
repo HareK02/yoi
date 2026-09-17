@@ -3583,8 +3583,8 @@ mod tests {
             repository: WorkingDirectoryRepository {
                 id: "repo-main".to_string(),
                 provider: "git".to_string(),
-                source: workspace_api::RepositorySource {
-                    kind: workspace_api::RepositorySourceKind::LocalPath,
+                source: server_api::RepositorySource {
+                    kind: server_api::RepositorySourceKind::LocalPath,
                     uri: repo.display().to_string(),
                 },
                 source_revision: 1,

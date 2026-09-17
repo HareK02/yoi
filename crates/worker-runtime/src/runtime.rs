@@ -46,6 +46,7 @@ use protocol::subscription::{
     SubscriptionWorkerState,
 };
 use protocol::{Event, Method};
+use server_api::WorkerRestoreState;
 use std::collections::BTreeMap;
 #[cfg(feature = "ws-server")]
 use std::collections::VecDeque;
@@ -55,7 +56,6 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use workspace_api::WorkerRestoreState;
 
 /// Workspace-scoped Runtime authorization context supplied by a trusted backend.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4835,8 +4835,8 @@ mod tests {
             repository: WorkingDirectoryRepository {
                 id: "repository-1".to_string(),
                 provider: "git".to_string(),
-                source: workspace_api::RepositorySource {
-                    kind: workspace_api::RepositorySourceKind::Ssh,
+                source: server_api::RepositorySource {
+                    kind: server_api::RepositorySourceKind::Ssh,
                     uri: "ssh://git@example.test/repo.git".to_string(),
                 },
                 source_revision: 1,
@@ -4859,7 +4859,7 @@ mod tests {
                     }],
                     host_trust_id: "host-trust-1".to_string(),
                     host_trust_revision: 1,
-                    access: workspace_api::RepositoryAccessMode::ReadOnly,
+                    access: server_api::RepositoryAccessMode::ReadOnly,
                     expires_at_epoch_seconds: u64::MAX,
                     repository_id: "repository-1".to_string(),
                     repository_source_fingerprint: "sha256:source".to_string(),
@@ -4977,7 +4977,7 @@ mod tests {
                     ],
                     host_trust_id: "host-trust-1".to_string(),
                     host_trust_revision: 1,
-                    access: workspace_api::RepositoryAccessMode::ReadOnly,
+                    access: server_api::RepositoryAccessMode::ReadOnly,
                     expires_at_epoch_seconds: u64::MAX,
                     repository_id: "repository-1".to_string(),
                     repository_source_fingerprint: "sha256:source".to_string(),
@@ -5066,8 +5066,8 @@ mod tests {
             repository: WorkingDirectoryRepository {
                 id: "repository-1".to_string(),
                 provider: "git".to_string(),
-                source: workspace_api::RepositorySource {
-                    kind: workspace_api::RepositorySourceKind::Ssh,
+                source: server_api::RepositorySource {
+                    kind: server_api::RepositorySourceKind::Ssh,
                     uri: "ssh://git@example.test/repo.git".to_string(),
                 },
                 source_revision: 1,
@@ -5097,7 +5097,7 @@ mod tests {
                     ],
                     host_trust_id: "host-trust-1".to_string(),
                     host_trust_revision: 1,
-                    access: workspace_api::RepositoryAccessMode::ReadOnly,
+                    access: server_api::RepositoryAccessMode::ReadOnly,
                     expires_at_epoch_seconds: u64::MAX,
                     repository_id: "repository-1".to_string(),
                     repository_source_fingerprint: "sha256:source".to_string(),

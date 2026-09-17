@@ -879,7 +879,7 @@ fn hex_sha256(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::store::{AccountRecord, ControlPlaneStore, RepositoryRecord, WorkspaceRecord};
-    use workspace_api::{RepositoryObservedStatus, RepositorySource, RepositorySourceKind};
+    use server_api::{RepositoryObservedStatus, RepositorySource, RepositorySourceKind};
 
     fn attempt_owner() -> WorkdirRemovalAttemptOwner {
         WorkdirRemovalAttemptOwner {

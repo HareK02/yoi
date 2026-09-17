@@ -1,6 +1,6 @@
-import type { Diagnostic as WorkspaceApiDiagnostic } from "$lib/generated/workspace-api";
+import type { Diagnostic as ServerApiDiagnostic } from "$lib/generated/legacy-server-api";
 
-export type Diagnostic = WorkspaceApiDiagnostic;
+export type Diagnostic = ServerApiDiagnostic;
 
 export type SettingsSectionId =
   | "runtimes"

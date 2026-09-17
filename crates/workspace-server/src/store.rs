@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use server_api::{RepositoryObservedStatus, RepositorySource};
 use worker_runtime::identity::{RuntimeWorkerRef, WorkerId};
-use workspace_api::{RepositoryObservedStatus, RepositorySource};
 
 use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
@@ -7496,15 +7496,15 @@ fn repository_registration_intent_matches(
 }
 
 fn validate_repository_record_identity(record: &RepositoryRecord) -> Result<()> {
-    workspace_api::validate_repository_key(&record.repository_key)
+    server_api::validate_repository_key(&record.repository_key)
         .map_err(|error| Error::InvalidInput(format!("invalid Repository key: {error}")))?;
     Ok(())
 }
 
 fn read_repository_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepositoryRecord> {
     let source_kind_value = row.get::<_, String>(5)?;
-    let source_kind = workspace_api::RepositorySourceKind::parse(&source_kind_value)
-        .unwrap_or(workspace_api::RepositorySourceKind::Invalid);
+    let source_kind = server_api::RepositorySourceKind::parse(&source_kind_value)
+        .unwrap_or(server_api::RepositorySourceKind::Invalid);
     let source_revision = row.get::<_, u64>(8)?;
     let source_fingerprint = row.get::<_, String>(9)?;
     let mut source = RepositorySource {
@@ -7517,7 +7517,7 @@ fn read_repository_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Repositor
     if source_revision == 0
         || crate::repository_source::repository_source_fingerprint(&source) != source_fingerprint
     {
-        source.kind = workspace_api::RepositorySourceKind::Invalid;
+        source.kind = server_api::RepositorySourceKind::Invalid;
         observed_status = RepositoryObservedStatus::Invalid;
     }
     Ok(RepositoryRecord {
@@ -12411,7 +12411,7 @@ mod tests {
                 kind: "git".to_string(),
                 provider: Some("git".to_string()),
                 source: RepositorySource {
-                    kind: workspace_api::RepositorySourceKind::LocalPath,
+                    kind: server_api::RepositorySourceKind::LocalPath,
                     uri: "/repo-a".to_string(),
                 },
                 default_ref: Some("HEAD".to_string()),
@@ -13255,7 +13255,7 @@ INSERT INTO worker_registry (
                 kind: "git".to_string(),
                 provider: Some("git".to_string()),
                 source: RepositorySource {
-                    kind: workspace_api::RepositorySourceKind::File,
+                    kind: server_api::RepositorySourceKind::File,
                     uri: "file:///tmp/main".to_string(),
                 },
                 default_ref: Some("develop".to_string()),
@@ -13672,8 +13672,8 @@ INSERT INTO worker_registry (
             repository_key: "Invalid_Key".to_string(),
             kind: "git".to_string(),
             provider: Some("git".to_string()),
-            source: workspace_api::RepositorySource {
-                kind: workspace_api::RepositorySourceKind::LocalPath,
+            source: server_api::RepositorySource {
+                kind: server_api::RepositorySourceKind::LocalPath,
                 uri: "/repo".to_string(),
             },
             default_ref: Some("develop".to_string()),
@@ -13723,8 +13723,8 @@ INSERT INTO worker_registry (
             repository_key: "main".to_string(),
             kind: "git".to_string(),
             provider: Some("git".to_string()),
-            source: workspace_api::RepositorySource {
-                kind: workspace_api::RepositorySourceKind::LocalPath,
+            source: server_api::RepositorySource {
+                kind: server_api::RepositorySourceKind::LocalPath,
                 uri: "/repo".to_string(),
             },
             default_ref: Some("develop".to_string()),
@@ -13798,14 +13798,14 @@ INSERT INTO worker_registry (
             kind: "git".to_string(),
             provider: Some("git".to_string()),
             source: RepositorySource {
-                kind: workspace_api::RepositorySourceKind::LocalPath,
+                kind: server_api::RepositorySourceKind::LocalPath,
                 uri: "/repo".to_string(),
             },
             default_ref: Some("HEAD".to_string()),
             source_revision: 1,
             source_fingerprint: crate::repository_source::repository_source_fingerprint(
                 &RepositorySource {
-                    kind: workspace_api::RepositorySourceKind::LocalPath,
+                    kind: server_api::RepositorySourceKind::LocalPath,
                     uri: "/repo".to_string(),
                 },
             ),
@@ -13955,7 +13955,7 @@ INSERT INTO worker_registry (
                 kind: "git".to_string(),
                 provider: Some("git".to_string()),
                 source: RepositorySource {
-                    kind: workspace_api::RepositorySourceKind::LocalPath,
+                    kind: server_api::RepositorySourceKind::LocalPath,
                     uri: "/repo".to_string(),
                 },
                 default_ref: Some("HEAD".to_string()),

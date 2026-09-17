@@ -32,7 +32,6 @@ members = [
     "crates/ticket",
     "crates/merge-request",
     "crates/project-record",
-    "crates/workspace-api",
     "crates/workspace-server",
     "tests/e2e",
 ]
@@ -68,7 +67,6 @@ default-members = [
     "crates/ticket",
     "crates/merge-request",
     "crates/project-record",
-    "crates/workspace-api",
     "crates/workspace-server",
 ]
 
@@ -97,7 +95,6 @@ ticket = { path = "crates/ticket" }
 project-record = { path = "crates/project-record" }
 worker = { path = "crates/worker" }
 worker-runtime = { path = "crates/worker-runtime" }
-workspace-api = { path = "crates/workspace-api" }
 yoi-plugin-pdk = { path = "crates/plugin-pdk" }
 yoi = { path = "crates/yoi" }
 protocol = { path = "crates/protocol" }

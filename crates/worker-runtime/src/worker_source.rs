@@ -455,7 +455,7 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
     fn list_workspace_workers(
         &self,
         request: worker::WorkspaceWorkerDiscoveryRequest,
-    ) -> Result<workspace_api::WorkspaceWorkerDiscoveryPage, WorkspaceClientError> {
+    ) -> Result<server_api::WorkspaceWorkerDiscoveryPage, WorkspaceClientError> {
         let mut path = format!(
             "/api/w/{}/worker-discovery/workers?limit={}",
             self.workspace_id, request.limit

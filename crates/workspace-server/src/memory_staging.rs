@@ -1,6 +1,6 @@
 use memory::extract::{CandidateKind, StagingRecord};
 use memory::schema::{EvidenceOrigin, EvidenceOriginKind, SourceEvidenceRef, SourceRef};
-use workspace_api::{
+use server_api::{
     Diagnostic, DiagnosticSeverity, MemoryCandidateKind, MemoryEvidenceOrigin,
     MemoryEvidenceOriginKind, MemorySourceEvidenceRef, MemorySourceRef, MemoryStagingEntry,
     MemoryStagingEvidence, MemoryStagingListResponse, MemoryStagingRecord,

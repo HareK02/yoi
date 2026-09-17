@@ -842,8 +842,8 @@ impl RuntimeGitMaterializer {
         binding.command_environment.insert(
             "YOI_REPOSITORY_ACCESS".to_string(),
             match access.access {
-                workspace_api::RepositoryAccessMode::ReadOnly => "read_only",
-                workspace_api::RepositoryAccessMode::ReadWrite => "read_write",
+                server_api::RepositoryAccessMode::ReadOnly => "read_only",
+                server_api::RepositoryAccessMode::ReadWrite => "read_write",
             }
             .to_string(),
         );
@@ -884,7 +884,7 @@ impl RuntimeGitMaterializer {
         Self::validate_plain_http_source(request)?;
         if matches!(
             request.repository.source.kind,
-            workspace_api::RepositorySourceKind::Https | workspace_api::RepositorySourceKind::Ssh
+            server_api::RepositorySourceKind::Https | server_api::RepositorySourceKind::Ssh
         ) {
             validate_remote_source_uri(request)?;
             let materialization = request.materialization.as_ref().ok_or_else(|| {
@@ -906,10 +906,10 @@ impl RuntimeGitMaterializer {
             }
         }
         match request.repository.source.kind {
-            workspace_api::RepositorySourceKind::LocalPath
-            | workspace_api::RepositorySourceKind::File
-            | workspace_api::RepositorySourceKind::Https => {}
-            workspace_api::RepositorySourceKind::Ssh => {
+            server_api::RepositorySourceKind::LocalPath
+            | server_api::RepositorySourceKind::File
+            | server_api::RepositorySourceKind::Https => {}
+            server_api::RepositorySourceKind::Ssh => {
                 let ssh = request
                     .materialization
                     .as_ref()
@@ -922,7 +922,7 @@ impl RuntimeGitMaterializer {
                     })?;
                 validate_ssh_materialization_access(ssh)?;
             }
-            workspace_api::RepositorySourceKind::Invalid => {
+            server_api::RepositorySourceKind::Invalid => {
                 return Err(WorkingDirectoryDiagnostic::new(
                     "working_directory_repository_source_invalid",
                     "configured Repository source is invalid and cannot be materialized",
@@ -939,7 +939,7 @@ impl RuntimeGitMaterializer {
     ) -> Result<WorkingDirectoryRequest, WorkingDirectoryDiagnostic> {
         let mut request = request.clone();
         if request.repository.provider != "git"
-            || request.repository.source.kind != workspace_api::RepositorySourceKind::Ssh
+            || request.repository.source.kind != server_api::RepositorySourceKind::Ssh
         {
             return Ok(request);
         }
@@ -1911,7 +1911,7 @@ struct RepositorySshCommandPolicy {
     username: Option<String>,
     port: Option<u16>,
     repository_path: String,
-    access: workspace_api::RepositoryAccessMode,
+    access: server_api::RepositoryAccessMode,
 }
 
 impl RepositorySshCommandPolicy {
@@ -2053,9 +2053,7 @@ fn repository_command_matches(command: &str, policy: &RepositorySshCommandPolicy
     } else {
         return false;
     };
-    if operation == "receive-pack"
-        && policy.access != workspace_api::RepositoryAccessMode::ReadWrite
-    {
+    if operation == "receive-pack" && policy.access != server_api::RepositoryAccessMode::ReadWrite {
         return false;
     }
     let argument = argument
@@ -2218,7 +2216,7 @@ impl RepositoryCommandAccess {
         runtime_root: &Path,
         request: &WorkingDirectoryRequest,
     ) -> Result<Option<Self>, WorkingDirectoryDiagnostic> {
-        if request.repository.source.kind != workspace_api::RepositorySourceKind::Ssh {
+        if request.repository.source.kind != server_api::RepositorySourceKind::Ssh {
             return Ok(None);
         }
         let Some(ssh) = request
@@ -2403,7 +2401,7 @@ fn validate_ssh_materialization_access(
 fn validate_remote_source_uri(
     request: &WorkingDirectoryRequest,
 ) -> Result<(), WorkingDirectoryDiagnostic> {
-    if request.repository.source.kind == workspace_api::RepositorySourceKind::Ssh {
+    if request.repository.source.kind == server_api::RepositorySourceKind::Ssh {
         let source =
             parse_repository_ssh_source(&request.repository.source.uri).ok_or_else(|| {
                 WorkingDirectoryDiagnostic::new(
@@ -2441,7 +2439,7 @@ fn validate_remote_source_uri(
             "remote Repository source URI is invalid",
         )
     })?;
-    if request.repository.source.kind != workspace_api::RepositorySourceKind::Https {
+    if request.repository.source.kind != server_api::RepositorySourceKind::Https {
         return Ok(());
     }
     if url.scheme() != "https"
@@ -2512,7 +2510,7 @@ fn repository_git_command(
     let mut command = isolated_git_command();
     let file_policy = if matches!(
         request.repository.source.kind,
-        workspace_api::RepositorySourceKind::LocalPath | workspace_api::RepositorySourceKind::File
+        server_api::RepositorySourceKind::LocalPath | server_api::RepositorySourceKind::File
     ) {
         "always"
     } else {
@@ -2589,7 +2587,7 @@ fn test_repository_git_invocation_count() -> usize {
 
 fn run_repository_git_stdout(
     mut command: Command,
-    source_kind: workspace_api::RepositorySourceKind,
+    source_kind: server_api::RepositorySourceKind,
 ) -> Result<String, WorkingDirectoryDiagnostic> {
     #[cfg(test)]
     TEST_REPOSITORY_GIT_INVOCATIONS.with(|count| count.set(count.get().saturating_add(1)));
@@ -2837,10 +2835,10 @@ fn resolve_cloned_commit(
 
 fn apply_repository_access_policy(
     repository_root: &Path,
-    access: workspace_api::RepositoryAccessMode,
+    access: server_api::RepositoryAccessMode,
 ) -> Result<(), WorkingDirectoryDiagnostic> {
     match access {
-        workspace_api::RepositoryAccessMode::ReadOnly => {
+        server_api::RepositoryAccessMode::ReadOnly => {
             let mut disable_push = isolated_git_command();
             disable_push.arg("-C").arg(repository_root).args([
                 "remote",
@@ -2851,7 +2849,7 @@ fn apply_repository_access_policy(
             ]);
             run_repository_git(disable_push, "working_directory_repository_policy_failed")
         }
-        workspace_api::RepositoryAccessMode::ReadWrite => {
+        server_api::RepositoryAccessMode::ReadWrite => {
             if git_stdout(
                 repository_root,
                 ["config", "--get-all", "remote.origin.pushurl"],
@@ -3122,7 +3120,7 @@ mod tests {
             }],
             host_trust_id: "trust-1".to_string(),
             host_trust_revision: 4,
-            access: workspace_api::RepositoryAccessMode::ReadOnly,
+            access: server_api::RepositoryAccessMode::ReadOnly,
             expires_at_epoch_seconds: u64::MAX,
             repository_id: "repo-main".to_string(),
             repository_source_fingerprint: "sha256:test".to_string(),
@@ -3310,8 +3308,8 @@ mod tests {
             repository: WorkingDirectoryRepository {
                 id: "repo-main".to_string(),
                 provider: "git".to_string(),
-                source: workspace_api::RepositorySource {
-                    kind: workspace_api::RepositorySourceKind::LocalPath,
+                source: server_api::RepositorySource {
+                    kind: server_api::RepositorySourceKind::LocalPath,
                     uri: repo.display().to_string(),
                 },
                 source_revision: 1,
@@ -3594,7 +3592,7 @@ mod tests {
         assert!(!runtime_root.path().join(".repository-cache").exists());
 
         let mut file_request = request(repo.path());
-        file_request.repository.source.kind = workspace_api::RepositorySourceKind::File;
+        file_request.repository.source.kind = server_api::RepositorySourceKind::File;
         file_request.repository.source.uri = format!("file://{}", repo.path().display());
         file_request.repository.source_revision = 2;
         file_request.repository.source_fingerprint = "sha256:file-source".to_string();
@@ -3723,7 +3721,7 @@ mod tests {
                 ],
                 host_trust_id: "trust-1".to_string(),
                 host_trust_revision: 1,
-                access: workspace_api::RepositoryAccessMode::ReadWrite,
+                access: server_api::RepositoryAccessMode::ReadWrite,
                 expires_at_epoch_seconds: u64::MAX,
                 repository_id: "repo-main".to_string(),
                 repository_source_fingerprint: "sha256:test".to_string(),
@@ -3735,8 +3733,8 @@ mod tests {
             }),
         });
         let mut ssh_operation = request.clone();
-        ssh_operation.repository.source = workspace_api::RepositorySource {
-            kind: workspace_api::RepositorySourceKind::Ssh,
+        ssh_operation.repository.source = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::Ssh,
             uri: "ssh://git@example.test/repo.git".to_string(),
         };
         let command_access = RepositoryCommandAccess::prepare(runtime_root.path(), &ssh_operation)
@@ -3810,8 +3808,8 @@ mod tests {
         request.backend_workdir_id = Some(working_directory_id.clone());
         request.materialization.as_mut().unwrap().ssh = None;
         let mut authorized_ssh_request = request.clone();
-        authorized_ssh_request.repository.source = workspace_api::RepositorySource {
-            kind: workspace_api::RepositorySourceKind::Ssh,
+        authorized_ssh_request.repository.source = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::Ssh,
             uri: "ssh://git@example.test/repo.git".to_string(),
         };
         assert!(
@@ -3910,7 +3908,7 @@ mod tests {
         let mut rotated = initial_materialization.clone();
         rotated.operation_id = "operation-agent-rotated".to_string();
         rotated.ssh.as_mut().unwrap().credential_candidates[0].credential_revision = 2;
-        rotated.ssh.as_mut().unwrap().access = workspace_api::RepositoryAccessMode::ReadOnly;
+        rotated.ssh.as_mut().unwrap().access = server_api::RepositoryAccessMode::ReadOnly;
         materializer
             .authorize_repository_access(&WorkingDirectoryRepositoryAccessRequest {
                 working_directory_id: id.clone(),
@@ -4028,7 +4026,7 @@ mod tests {
         let mut read_write = rotated;
         read_write.operation_id = "operation-agent-read-write".to_string();
         read_write.ssh.as_mut().unwrap().credential_candidates[0].credential_revision = 3;
-        read_write.ssh.as_mut().unwrap().access = workspace_api::RepositoryAccessMode::ReadWrite;
+        read_write.ssh.as_mut().unwrap().access = server_api::RepositoryAccessMode::ReadWrite;
         let read_write_command_policy =
             RepositorySshCommandPolicy::from_access(read_write.ssh.as_ref().unwrap()).unwrap();
         materializer
@@ -4099,7 +4097,7 @@ mod tests {
                 }],
                 host_trust_id: "trust-1".to_string(),
                 host_trust_revision: 1,
-                access: workspace_api::RepositoryAccessMode::ReadOnly,
+                access: server_api::RepositoryAccessMode::ReadOnly,
                 expires_at_epoch_seconds: u64::MAX,
                 repository_id: "repo-main".to_string(),
                 repository_source_fingerprint: "sha256:test".to_string(),
@@ -4251,8 +4249,8 @@ mod tests {
         assert_eq!(policy.repository_path, "team/repo.git");
 
         let mut request = request(Path::new("."));
-        request.repository.source = workspace_api::RepositorySource {
-            kind: workspace_api::RepositorySourceKind::Ssh,
+        request.repository.source = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::Ssh,
             uri: uri.to_string(),
         };
         request.materialization = Some(crate::catalog::RepositoryMaterializationContext {
@@ -4294,8 +4292,8 @@ mod tests {
         };
 
         let mut https = request(repo.path());
-        https.repository.source = workspace_api::RepositorySource {
-            kind: workspace_api::RepositorySourceKind::Https,
+        https.repository.source = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::Https,
             uri: "https://token@example.test/repo.git".to_string(),
         };
         https.materialization = Some(context(None));
@@ -4330,15 +4328,15 @@ mod tests {
         );
 
         for (offset, kind) in [
-            workspace_api::RepositorySourceKind::LocalPath,
-            workspace_api::RepositorySourceKind::File,
-            workspace_api::RepositorySourceKind::Https,
+            server_api::RepositorySourceKind::LocalPath,
+            server_api::RepositorySourceKind::File,
+            server_api::RepositorySourceKind::Https,
         ]
         .into_iter()
         .enumerate()
         {
             let mut mismatched_http = request(repo.path());
-            mismatched_http.repository.source = workspace_api::RepositorySource {
+            mismatched_http.repository.source = server_api::RepositorySource {
                 kind,
                 uri: "http://example.test/repo.git".to_string(),
             };
@@ -4358,8 +4356,8 @@ mod tests {
         }
 
         let mut ssh = request(repo.path());
-        ssh.repository.source = workspace_api::RepositorySource {
-            kind: workspace_api::RepositorySourceKind::Ssh,
+        ssh.repository.source = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::Ssh,
             uri: "ssh://git@example.test/repo.git".to_string(),
         };
         ssh.materialization = Some(context(Some(
@@ -4371,7 +4369,7 @@ mod tests {
                 }],
                 host_trust_id: "trust-1".to_string(),
                 host_trust_revision: 1,
-                access: workspace_api::RepositoryAccessMode::ReadOnly,
+                access: server_api::RepositoryAccessMode::ReadOnly,
                 expires_at_epoch_seconds: u64::MAX,
                 repository_id: "repo-main".to_string(),
                 repository_source_fingerprint: "sha256:test".to_string(),
@@ -4396,8 +4394,8 @@ mod tests {
         let runtime_root = tempfile::tempdir().unwrap();
         let materializer = RuntimeGitMaterializer::new(runtime_root.path());
         let mut remote = request(Path::new("."));
-        remote.repository.source = workspace_api::RepositorySource {
-            kind: workspace_api::RepositorySourceKind::Ssh,
+        remote.repository.source = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::Ssh,
             uri: "ssh://git@example.invalid/repo.git".to_string(),
         };
         remote.materialization = Some(crate::catalog::RepositoryMaterializationContext {

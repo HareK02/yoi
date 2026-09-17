@@ -29,7 +29,7 @@ import type {
   WorkspaceRepositoryRecord,
   WorkspaceResponse,
   WorkspaceSummary,
-} from "$lib/generated/workspace-api.ts";
+} from "$lib/generated/legacy-server-api.ts";
 
 export type {
   GitCommitSummary,
@@ -48,7 +48,7 @@ export type {
   WorkspacePermissionSummary,
   WorkspaceResponse,
   WorkspaceSummary,
-} from "$lib/generated/workspace-api.ts";
+} from "$lib/generated/legacy-server-api.ts";
 
 type JsonObject = Record<string, unknown>;
 

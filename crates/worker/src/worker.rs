@@ -559,7 +559,7 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
     fn list_workspace_workers(
         &self,
         _request: WorkspaceWorkerDiscoveryRequest,
-    ) -> Result<workspace_api::WorkspaceWorkerDiscoveryPage, WorkspaceClientError> {
+    ) -> Result<server_api::WorkspaceWorkerDiscoveryPage, WorkspaceClientError> {
         Err(WorkspaceClientError::Unavailable(
             "Workspace Worker discovery authority is unavailable".to_string(),
         ))

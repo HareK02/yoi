@@ -13,10 +13,85 @@ pub use api_macros::{ApiContract, HttpMethod};
 use protocol::{CompletionEntry, CompletionKind, Segment, WorkerId, WorkerStateSnapshot};
 use serde::{Deserialize, Serialize};
 use workdir::workspace::{MaterializerKind, RuntimeWorkerRef, RuntimeWorkingDirectorySummary};
-use workspace_api::{RepositoryAccessMode, RepositorySource};
 
 pub const RUNTIME_API_VERSION: &str = "v1";
 pub const RUNTIME_API_BASE_PATH: &str = "/v1";
+/// Runtime transport classification for a materialized Repository source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositorySourceKind {
+    LocalPath,
+    File,
+    Ssh,
+    Https,
+    Invalid,
+}
+
+impl RepositorySourceKind {
+    pub const fn is_remote(self) -> bool {
+        matches!(self, Self::Ssh | Self::Https)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalPath => "local_path",
+            Self::File => "file",
+            Self::Ssh => "ssh",
+            Self::Https => "https",
+            Self::Invalid => "invalid",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "local_path" => Self::LocalPath,
+            "file" => Self::File,
+            "ssh" => Self::Ssh,
+            "https" => Self::Https,
+            "http" | "invalid" => Self::Invalid,
+            _ => return None,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for RepositorySourceKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).ok_or_else(|| {
+            serde::de::Error::unknown_variant(
+                &value,
+                &["local_path", "file", "ssh", "https", "invalid"],
+            )
+        })
+    }
+}
+
+/// Runtime transport identity for one Repository source.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepositorySource {
+    pub kind: RepositorySourceKind,
+    pub uri: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryAccessMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+/// Runtime transport outcome for an explicit Worker restore operation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRestoreState {
+    Accepted,
+    Rejected,
+    RolledBack,
+    ReconciliationRequired,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuntimeApiError {
@@ -364,7 +439,7 @@ pub struct WorkerResponse {
 /// including preflight rejection and uncertain post-side-effect reconciliation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerRestoreResponse {
-    pub state: workspace_api::WorkerRestoreState,
+    pub state: WorkerRestoreState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker: Option<WorkerDetail>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

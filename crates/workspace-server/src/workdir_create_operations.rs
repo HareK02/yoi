@@ -549,14 +549,14 @@ mod tests {
                 repository_key: "main".to_string(),
                 kind: "git".to_string(),
                 provider: Some("git".to_string()),
-                source: workspace_api::RepositorySource {
-                    kind: workspace_api::RepositorySourceKind::LocalPath,
+                source: server_api::RepositorySource {
+                    kind: server_api::RepositorySourceKind::LocalPath,
                     uri: "/tmp/main".to_string(),
                 },
                 default_ref: Some("develop".to_string()),
                 source_revision: 1,
                 source_fingerprint: "sha256:test".to_string(),
-                observed_status: workspace_api::RepositoryObservedStatus::Unverified,
+                observed_status: server_api::RepositoryObservedStatus::Unverified,
                 observed_at: None,
                 created_at: "2026-08-24T00:00:00Z".to_string(),
                 updated_at: "2026-08-24T00:00:00Z".to_string(),
