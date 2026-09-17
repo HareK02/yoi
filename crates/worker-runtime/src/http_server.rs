@@ -27,13 +27,11 @@ use crate::retention::{
 #[cfg(feature = "ws-server")]
 use crate::runtime::RuntimeSubscriptionRecvError;
 use crate::ssh_host_key_probe::{
-    SSH_HOST_KEY_PROBE_OPERATION, SSH_HOST_KEY_PROBE_PATH, SSH_KEYSCAN_TIMEOUT,
-    SshHostKeyProbeError, SshHostKeyProbeRequest, SshHostKeyProbeResponse,
-    probe_ssh_host_keys_with_program,
+    SSH_HOST_KEY_PROBE_OPERATION, SSH_KEYSCAN_TIMEOUT, SshHostKeyProbeError,
+    SshHostKeyProbeRequest, SshHostKeyProbeResponse, probe_ssh_host_keys_with_program,
 };
 use crate::workspace_issuer::{
-    RuntimeVerificationSigner, VerifiedWorkspaceCapability, WORKSPACE_VERIFICATION_ACK_PATH,
-    WORKSPACE_VERIFICATION_CHALLENGE_PATH, WORKSPACE_VERIFICATION_OPERATION,
+    RuntimeVerificationSigner, VerifiedWorkspaceCapability, WORKSPACE_VERIFICATION_OPERATION,
     WorkspaceCapabilityExpectation, WorkspaceCapabilityVerifier,
     WorkspaceRuntimeVerificationAcknowledgement, WorkspaceRuntimeVerificationAuthority,
     WorkspaceRuntimeVerificationChallenge, WorkspaceRuntimeVerificationReceipt,
@@ -166,6 +164,18 @@ pub async fn serve_runtime_http_with_workspace_auth(
     Ok(())
 }
 
+fn remaining_route(path: &'static str, methods: &[&str]) -> &'static str {
+    for method in methods {
+        assert!(
+            runtime_api::REMAINING_RUNTIME_ROUTES
+                .iter()
+                .any(|route| route.method == *method && route.path == path),
+            "handwritten Runtime route {method} {path} is missing from runtime-api inventory",
+        );
+    }
+    path
+}
+
 /// Build the REST router for an existing Runtime.
 ///
 /// Handlers delegate to [`Runtime`] methods and keep Worker authority Runtime-local.
@@ -212,68 +222,95 @@ fn runtime_http_router_with_auth_and_ssh_keyscan_program(
 
     let router = Router::new()
         .route(
-            WORKSPACE_VERIFICATION_CHALLENGE_PATH,
+            remaining_route(runtime_api::RUNTIME_ROUTE_VERIFICATION_CHALLENGE, &["POST"]),
             post(post_workspace_verification_challenge),
         )
         .route(
-            WORKSPACE_VERIFICATION_ACK_PATH,
+            remaining_route(runtime_api::RUNTIME_ROUTE_VERIFICATION_ACK, &["POST"]),
             post(post_workspace_verification_acknowledgement),
         )
         .route(
-            "/v1/config-bundles",
+            remaining_route(runtime_api::RUNTIME_ROUTE_CONFIG_BUNDLES, &["GET", "POST"]),
             get(list_config_bundles).post(store_config_bundle),
         )
         .route(
-            "/v1/config-bundles/{bundle_id}/availability",
+            remaining_route(
+                runtime_api::RUNTIME_ROUTE_CONFIG_BUNDLE_AVAILABILITY,
+                &["GET"],
+            ),
             get(check_config_bundle),
         )
         .route(
-            "/v1/workspace-prompt-projections",
+            remaining_route(
+                runtime_api::RUNTIME_ROUTE_WORKSPACE_PROMPT_PROJECTIONS,
+                &["POST"],
+            ),
             post(observe_workspace_prompt_projection),
         )
         .route(
-            "/v1/working-directories",
+            remaining_route(
+                runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORIES,
+                &["GET", "POST"],
+            ),
             get(list_working_directories).post(create_working_directory),
         )
         .route(
-            "/v1/working-directories/repository-access",
+            remaining_route(
+                runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORY_REPOSITORY_ACCESS,
+                &["POST"],
+            ),
             post(authorize_working_directory_repository_access),
         )
         .route(
-            SSH_HOST_KEY_PROBE_PATH,
+            remaining_route(runtime_api::RUNTIME_ROUTE_SSH_PROBE, &["POST"]),
             post(probe_repository_ssh_host_keys),
         )
-        .route("/v1/repository-refs/observe", post(observe_repository_ref))
         .route(
-            "/v1/working-directories/{working_directory_id}/sessions",
+            remaining_route(
+                runtime_api::RUNTIME_ROUTE_REPOSITORY_REFS_OBSERVE,
+                &["POST"],
+            ),
+            post(observe_repository_ref),
+        )
+        .route(
+            remaining_route(runtime_api::RUNTIME_ROUTE_WORKDIR_SESSIONS, &["POST"]),
             post(open_workdir_session),
         )
         .route(
-            "/v1/workdir-sessions/{session_id}/operations",
+            remaining_route(
+                runtime_api::RUNTIME_ROUTE_WORKDIR_SESSION_OPERATIONS,
+                &["POST"],
+            ),
             post(run_workdir_session_operation),
         )
         .route(
-            "/v1/workdir-sessions/{session_id}",
+            remaining_route(runtime_api::RUNTIME_ROUTE_WORKDIR_SESSION, &["DELETE"]),
             delete(close_workdir_session),
         )
         .route(
-            "/v1/working-directories/{working_directory_id}",
+            remaining_route(
+                runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORY,
+                &["GET", "DELETE"],
+            ),
             get(get_working_directory).delete(cleanup_working_directory),
         )
         .route(
-            "/v1/workers/{worker_id}/attachments",
+            remaining_route(runtime_api::RUNTIME_ROUTE_WORKER_ATTACHMENTS, &["POST"]),
             post(upload_worker_file).layer(DefaultBodyLimit::max(MAX_WORKER_FILE_UPLOAD_BYTES)),
         )
         .route(
-            "/v1/workers/{worker_id}/attachments/{artifact_id}",
+            remaining_route(runtime_api::RUNTIME_ROUTE_WORKER_ATTACHMENT, &["DELETE"]),
             delete(delete_worker_uploaded_file),
         );
 
     #[cfg(feature = "ws-server")]
     let router = router
-        .route("/v1/protocol/ws", get(runtime_protocol_ws))
         .route(
-            "/v1/workers/{worker_id}/protocol/ws",
+            remaining_route(runtime_api::RUNTIME_ROUTE_PROTOCOL_WS, &["GET"]),
+            get(runtime_protocol_ws),
+        )
+        .route(
+            remaining_route(runtime_api::RUNTIME_ROUTE_WORKER_PROTOCOL_WS, &["GET"]),
             get(worker_protocol_ws),
         );
 
@@ -2072,8 +2109,9 @@ async fn require_runtime_auth(
         };
         match workspace_auth.verifier.verify(token, &expected) {
             Ok(verified) => {
-                let is_verification = path_and_query == WORKSPACE_VERIFICATION_CHALLENGE_PATH
-                    || path_and_query == WORKSPACE_VERIFICATION_ACK_PATH;
+                let is_verification = path_and_query
+                    == runtime_api::RUNTIME_ROUTE_VERIFICATION_CHALLENGE
+                    || path_and_query == runtime_api::RUNTIME_ROUTE_VERIFICATION_ACK;
                 if !is_verification {
                     let record = match workspace_auth
                         .verifications
@@ -2139,7 +2177,8 @@ async fn require_runtime_auth(
     let workspace_bootstrap_request = request.method() == Method::POST
         && matches!(
             request.uri().path(),
-            WORKSPACE_VERIFICATION_CHALLENGE_PATH | WORKSPACE_VERIFICATION_ACK_PATH
+            runtime_api::RUNTIME_ROUTE_VERIFICATION_CHALLENGE
+                | runtime_api::RUNTIME_ROUTE_VERIFICATION_ACK
         );
     if state.workspace_auth.is_some() && !workspace_bootstrap_request {
         let local_token_matches = state
@@ -2211,7 +2250,8 @@ fn auth_workspace_scope(
 }
 
 fn workspace_runtime_operation(method: &Method, path: &str) -> &'static str {
-    if (path == WORKSPACE_VERIFICATION_CHALLENGE_PATH || path == WORKSPACE_VERIFICATION_ACK_PATH)
+    if (path == runtime_api::RUNTIME_ROUTE_VERIFICATION_CHALLENGE
+        || path == runtime_api::RUNTIME_ROUTE_VERIFICATION_ACK)
         && *method == Method::POST
     {
         return WORKSPACE_VERIFICATION_OPERATION;
@@ -2238,9 +2278,9 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     if path == "/v1/workers" && *method == Method::POST {
         return Some("workers:create");
     }
-    if (path == "/v1/working-directories/repository-access"
-        || path == "/v1/repository-refs/observe"
-        || path == SSH_HOST_KEY_PROBE_PATH)
+    if (path == runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORY_REPOSITORY_ACCESS
+        || path == runtime_api::RUNTIME_ROUTE_REPOSITORY_REFS_OBSERVE
+        || path == runtime_api::RUNTIME_ROUTE_SSH_PROBE)
         && *method == Method::POST
     {
         return Some(SSH_HOST_KEY_PROBE_OPERATION);
@@ -2250,9 +2290,9 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     {
         return Some("workdirs:operate");
     }
-    if path.starts_with("/v1/config-bundles")
-        || path.starts_with("/v1/workspace-prompt-projections")
-        || path.starts_with("/v1/working-directories")
+    if path.starts_with(runtime_api::RUNTIME_ROUTE_CONFIG_BUNDLES)
+        || path.starts_with(runtime_api::RUNTIME_ROUTE_WORKSPACE_PROMPT_PROJECTIONS)
+        || path.starts_with(runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORIES)
     {
         return Some("workers:create");
     }
@@ -2265,7 +2305,7 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     if path.ends_with("/stop") || path.ends_with("/cancel") {
         return Some("workers:stop");
     }
-    if path == "/v1/protocol/ws" {
+    if path == runtime_api::RUNTIME_ROUTE_PROTOCOL_WS {
         return Some("workers:list");
     }
     if path.ends_with("/protocol") || path.ends_with("/protocol/ws") {
@@ -2551,6 +2591,7 @@ mod tests {
         WorkerExecutionSpawnResult,
     };
     use crate::management::RuntimeOptions;
+    use crate::retention::{DiagnosticsDisposition, SessionDisposition};
     use crate::workspace_issuer::{
         InMemoryWorkspaceClaimReplayProtection, InMemoryWorkspaceRuntimeVerificationAuthority,
         WorkspaceCapabilityClaims, WorkspaceCapabilityVerifier, WorkspaceIssuerTrustRecord,
@@ -2629,23 +2670,23 @@ mod tests {
             .map(|route| route.path)
             .collect::<std::collections::BTreeSet<_>>();
         for path in [
-            WORKSPACE_VERIFICATION_CHALLENGE_PATH,
-            WORKSPACE_VERIFICATION_ACK_PATH,
-            "/v1/config-bundles",
-            "/v1/config-bundles/{bundle_id}/availability",
-            "/v1/workspace-prompt-projections",
-            "/v1/working-directories",
-            "/v1/working-directories/repository-access",
-            SSH_HOST_KEY_PROBE_PATH,
-            "/v1/repository-refs/observe",
-            "/v1/working-directories/{working_directory_id}/sessions",
-            "/v1/workdir-sessions/{session_id}/operations",
-            "/v1/workdir-sessions/{session_id}",
-            "/v1/working-directories/{working_directory_id}",
-            "/v1/workers/{worker_id}/attachments",
-            "/v1/workers/{worker_id}/attachments/{artifact_id}",
-            "/v1/protocol/ws",
-            "/v1/workers/{worker_id}/protocol/ws",
+            runtime_api::RUNTIME_ROUTE_VERIFICATION_CHALLENGE,
+            runtime_api::RUNTIME_ROUTE_VERIFICATION_ACK,
+            runtime_api::RUNTIME_ROUTE_CONFIG_BUNDLES,
+            runtime_api::RUNTIME_ROUTE_CONFIG_BUNDLE_AVAILABILITY,
+            runtime_api::RUNTIME_ROUTE_WORKSPACE_PROMPT_PROJECTIONS,
+            runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORIES,
+            runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORY_REPOSITORY_ACCESS,
+            runtime_api::RUNTIME_ROUTE_SSH_PROBE,
+            runtime_api::RUNTIME_ROUTE_REPOSITORY_REFS_OBSERVE,
+            runtime_api::RUNTIME_ROUTE_WORKDIR_SESSIONS,
+            runtime_api::RUNTIME_ROUTE_WORKDIR_SESSION_OPERATIONS,
+            runtime_api::RUNTIME_ROUTE_WORKDIR_SESSION,
+            runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORY,
+            runtime_api::RUNTIME_ROUTE_WORKER_ATTACHMENTS,
+            runtime_api::RUNTIME_ROUTE_WORKER_ATTACHMENT,
+            runtime_api::RUNTIME_ROUTE_PROTOCOL_WS,
+            runtime_api::RUNTIME_ROUTE_WORKER_PROTOCOL_WS,
         ] {
             assert!(
                 inventoried.contains(path),
@@ -2722,7 +2763,7 @@ mod tests {
             worker_id: None,
             operation: WORKSPACE_VERIFICATION_OPERATION.to_string(),
             method: "POST".to_string(),
-            path_and_query: WORKSPACE_VERIFICATION_CHALLENGE_PATH.to_string(),
+            path_and_query: runtime_api::RUNTIME_ROUTE_VERIFICATION_CHALLENGE.to_string(),
             body_digest: workspace_request_body_digest(&body),
             iat: unix_now_i64(),
             exp: challenge.expires_at,
@@ -2736,7 +2777,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri(WORKSPACE_VERIFICATION_CHALLENGE_PATH)
+                    .uri(runtime_api::RUNTIME_ROUTE_VERIFICATION_CHALLENGE)
                     .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(body))
@@ -2782,7 +2823,7 @@ mod tests {
         };
         let acknowledgement_body = serde_json::to_vec(&acknowledgement).unwrap();
         let acknowledgement_claims = WorkspaceCapabilityClaims {
-            path_and_query: WORKSPACE_VERIFICATION_ACK_PATH.to_string(),
+            path_and_query: runtime_api::RUNTIME_ROUTE_VERIFICATION_ACK.to_string(),
             body_digest: workspace_request_body_digest(&acknowledgement_body),
             jti: "ack-token".to_string(),
             ..claims
@@ -2797,7 +2838,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri(WORKSPACE_VERIFICATION_ACK_PATH)
+                    .uri(runtime_api::RUNTIME_ROUTE_VERIFICATION_ACK)
                     .header(
                         header::AUTHORIZATION,
                         format!("Bearer {acknowledgement_token}"),
@@ -2815,7 +2856,7 @@ mod tests {
         for authorization in [None, Some("Bearer malformed")] {
             let mut request = Request::builder()
                 .method(Method::POST)
-                .uri("/v1/config-bundles");
+                .uri(runtime_api::RUNTIME_ROUTE_CONFIG_BUNDLES);
             if let Some(authorization) = authorization {
                 request = request.header(header::AUTHORIZATION, authorization);
             }
@@ -2841,6 +2882,7 @@ mod tests {
         )
         .unwrap();
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -2853,6 +2895,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+
+        let retention_worker_id = task_request("retention-scope").worker_id;
+        let retention_path = format!("/v1/workers/{retention_worker_id}/retention/execute");
+        let retention_request = WorkerRetentionExecutionRequest {
+            operation_id: "retention-op".to_string(),
+            input_fingerprint: "fingerprint".to_string(),
+            archive_id: None,
+            workspace_id: "workspace-b".to_string(),
+            source_runtime_id: "runtime-a".to_string(),
+            worker_id: retention_worker_id,
+            expected_worker_revision: "revision".to_string(),
+            source_created_at: "2025-01-01T00:00:00Z".to_string(),
+            removed_at: "2025-01-02T00:00:00Z".to_string(),
+            effective_profile: None,
+            retention_class: None,
+            policy_id: "policy".to_string(),
+            policy_revision: 1,
+            session_disposition: SessionDisposition::Purge,
+            diagnostics_disposition: DiagnosticsDisposition::Retain,
+        };
+        let retention_body = serde_json::to_vec(&retention_request).unwrap();
+        let retention_claims = WorkspaceCapabilityClaims {
+            operation: required_runtime_permission(&Method::POST, &retention_path)
+                .unwrap()
+                .to_string(),
+            method: "POST".to_string(),
+            path_and_query: retention_path.clone(),
+            worker_id: Some(retention_worker_id.to_string()),
+            body_digest: workspace_request_body_digest(&retention_body),
+            jti: "retention-scope-token".to_string(),
+            ..ping_claims
+        };
+        let retention_token = issue_workspace_capability_token(
+            &workspace_identity.signing_key().unwrap(),
+            &retention_claims,
+        )
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(retention_path)
+                    .header(header::AUTHORIZATION, format!("Bearer {retention_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(retention_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let error: RuntimeHttpErrorResponse = read_json(response).await;
+        assert_eq!(error.error.code, "worker_not_found");
     }
 
     #[test]
@@ -3010,15 +3104,21 @@ mod tests {
     #[test]
     fn workdir_routes_require_dedicated_operation_permission() {
         assert_eq!(
-            required_runtime_permission(&Method::POST, "/v1/working-directories/repository-access",),
+            required_runtime_permission(
+                &Method::POST,
+                runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORY_REPOSITORY_ACCESS,
+            ),
             Some("workdirs:operate")
         );
         assert_eq!(
-            required_runtime_permission(&Method::POST, "/v1/repository-refs/observe"),
+            required_runtime_permission(
+                &Method::POST,
+                runtime_api::RUNTIME_ROUTE_REPOSITORY_REFS_OBSERVE
+            ),
             Some("workdirs:operate")
         );
         assert_eq!(
-            required_runtime_permission(&Method::POST, SSH_HOST_KEY_PROBE_PATH),
+            required_runtime_permission(&Method::POST, runtime_api::RUNTIME_ROUTE_SSH_PROBE),
             Some(SSH_HOST_KEY_PROBE_OPERATION)
         );
         assert_eq!(
@@ -3600,11 +3700,11 @@ mod tests {
     #[test]
     fn ssh_probe_uses_workdir_operation_capability() {
         assert_eq!(
-            required_runtime_permission(&Method::POST, SSH_HOST_KEY_PROBE_PATH),
+            required_runtime_permission(&Method::POST, runtime_api::RUNTIME_ROUTE_SSH_PROBE),
             Some(SSH_HOST_KEY_PROBE_OPERATION)
         );
         assert_eq!(
-            workspace_runtime_operation(&Method::POST, SSH_HOST_KEY_PROBE_PATH),
+            workspace_runtime_operation(&Method::POST, runtime_api::RUNTIME_ROUTE_SSH_PROBE),
             SSH_HOST_KEY_PROBE_OPERATION
         );
     }
@@ -3621,7 +3721,7 @@ mod tests {
         let response = authed_json_request(
             app,
             Method::POST,
-            SSH_HOST_KEY_PROBE_PATH,
+            runtime_api::RUNTIME_ROUTE_SSH_PROBE,
             token,
             &SshHostKeyProbeRequest {
                 hostname: "-oProxyCommand=malicious".to_string(),
@@ -3686,8 +3786,14 @@ mod tests {
             .unwrap();
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
 
-        let response =
-            authed_json_request(app, Method::POST, SSH_HOST_KEY_PROBE_PATH, token, &body).await;
+        let response = authed_json_request(
+            app,
+            Method::POST,
+            runtime_api::RUNTIME_ROUTE_SSH_PROBE,
+            token,
+            &body,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             std::fs::read_to_string(recorded_arguments).unwrap(),

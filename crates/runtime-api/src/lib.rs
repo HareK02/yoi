@@ -633,107 +633,132 @@ pub struct RemainingRuntimeRoute {
     pub reason: &'static str,
 }
 
+pub const RUNTIME_ROUTE_VERIFICATION_CHALLENGE: &str =
+    "/v1/workspace-runtime-verification/challenge";
+pub const RUNTIME_ROUTE_VERIFICATION_ACK: &str =
+    "/v1/workspace-runtime-verification/acknowledgement";
+pub const RUNTIME_ROUTE_CONFIG_BUNDLES: &str = "/v1/config-bundles";
+pub const RUNTIME_ROUTE_CONFIG_BUNDLE_AVAILABILITY: &str =
+    "/v1/config-bundles/{bundle_id}/availability";
+pub const RUNTIME_ROUTE_WORKSPACE_PROMPT_PROJECTIONS: &str = "/v1/workspace-prompt-projections";
+pub const RUNTIME_ROUTE_WORKING_DIRECTORIES: &str = "/v1/working-directories";
+pub const RUNTIME_ROUTE_WORKING_DIRECTORY_REPOSITORY_ACCESS: &str =
+    "/v1/working-directories/repository-access";
+pub const RUNTIME_ROUTE_SSH_PROBE: &str = "/v1/repositories/ssh/probe";
+pub const RUNTIME_ROUTE_REPOSITORY_REFS_OBSERVE: &str = "/v1/repository-refs/observe";
+pub const RUNTIME_ROUTE_WORKDIR_SESSIONS: &str =
+    "/v1/working-directories/{working_directory_id}/sessions";
+pub const RUNTIME_ROUTE_WORKDIR_SESSION_OPERATIONS: &str =
+    "/v1/workdir-sessions/{session_id}/operations";
+pub const RUNTIME_ROUTE_WORKDIR_SESSION: &str = "/v1/workdir-sessions/{session_id}";
+pub const RUNTIME_ROUTE_WORKING_DIRECTORY: &str = "/v1/working-directories/{working_directory_id}";
+pub const RUNTIME_ROUTE_PROTOCOL_WS: &str = "/v1/protocol/ws";
+pub const RUNTIME_ROUTE_WORKER_PROTOCOL_WS: &str = "/v1/workers/{worker_id}/protocol/ws";
+pub const RUNTIME_ROUTE_WORKER_ATTACHMENTS: &str = "/v1/workers/{worker_id}/attachments";
+pub const RUNTIME_ROUTE_WORKER_ATTACHMENT: &str =
+    "/v1/workers/{worker_id}/attachments/{artifact_id}";
+
 /// Intentionally out-of-contract Runtime routes. This inventory keeps manual paths visible rather
 /// than letting them be mistaken for management-contract omissions.
 pub const REMAINING_RUNTIME_ROUTES: &[RemainingRuntimeRoute] = &[
     RemainingRuntimeRoute {
         method: "POST",
-        path: "/v1/workspace-runtime-verification/challenge",
+        path: RUNTIME_ROUTE_VERIFICATION_CHALLENGE,
         reason: "Workspace verification handshake",
     },
     RemainingRuntimeRoute {
         method: "POST",
-        path: "/v1/workspace-runtime-verification/acknowledgement",
+        path: RUNTIME_ROUTE_VERIFICATION_ACK,
         reason: "Workspace verification handshake",
     },
     RemainingRuntimeRoute {
         method: "GET",
-        path: "/v1/config-bundles",
+        path: RUNTIME_ROUTE_CONFIG_BUNDLES,
         reason: "Workspace Config transport",
     },
     RemainingRuntimeRoute {
         method: "POST",
-        path: "/v1/config-bundles",
-        reason: "Workspace Config transport",
-    },
-    RemainingRuntimeRoute {
-        method: "GET",
-        path: "/v1/config-bundles/{bundle_id}/availability",
-        reason: "Workspace Config transport",
-    },
-    RemainingRuntimeRoute {
-        method: "POST",
-        path: "/v1/workspace-prompt-projections",
+        path: RUNTIME_ROUTE_CONFIG_BUNDLES,
         reason: "Workspace Config transport",
     },
     RemainingRuntimeRoute {
         method: "GET",
-        path: "/v1/working-directories",
+        path: RUNTIME_ROUTE_CONFIG_BUNDLE_AVAILABILITY,
+        reason: "Workspace Config transport",
+    },
+    RemainingRuntimeRoute {
+        method: "POST",
+        path: RUNTIME_ROUTE_WORKSPACE_PROMPT_PROJECTIONS,
+        reason: "Workspace Config transport",
+    },
+    RemainingRuntimeRoute {
+        method: "GET",
+        path: RUNTIME_ROUTE_WORKING_DIRECTORIES,
         reason: "Workdir transport",
     },
     RemainingRuntimeRoute {
         method: "POST",
-        path: "/v1/working-directories",
+        path: RUNTIME_ROUTE_WORKING_DIRECTORIES,
         reason: "Workdir transport",
     },
     RemainingRuntimeRoute {
         method: "POST",
-        path: "/v1/working-directories/repository-access",
+        path: RUNTIME_ROUTE_WORKING_DIRECTORY_REPOSITORY_ACCESS,
         reason: "Workdir transport",
     },
     RemainingRuntimeRoute {
         method: "POST",
-        path: "/v1/repositories/ssh/probe",
+        path: RUNTIME_ROUTE_SSH_PROBE,
         reason: "Repository SSH transport",
     },
     RemainingRuntimeRoute {
         method: "POST",
-        path: "/v1/repository-refs/observe",
+        path: RUNTIME_ROUTE_REPOSITORY_REFS_OBSERVE,
         reason: "Repository observation transport",
     },
     RemainingRuntimeRoute {
         method: "POST",
-        path: "/v1/working-directories/{working_directory_id}/sessions",
+        path: RUNTIME_ROUTE_WORKDIR_SESSIONS,
         reason: "Workdir session transport",
     },
     RemainingRuntimeRoute {
         method: "POST",
-        path: "/v1/workdir-sessions/{session_id}/operations",
+        path: RUNTIME_ROUTE_WORKDIR_SESSION_OPERATIONS,
         reason: "Workdir session transport",
     },
     RemainingRuntimeRoute {
         method: "DELETE",
-        path: "/v1/workdir-sessions/{session_id}",
+        path: RUNTIME_ROUTE_WORKDIR_SESSION,
         reason: "Workdir session transport",
     },
     RemainingRuntimeRoute {
         method: "GET",
-        path: "/v1/working-directories/{working_directory_id}",
+        path: RUNTIME_ROUTE_WORKING_DIRECTORY,
         reason: "Workdir transport",
     },
     RemainingRuntimeRoute {
         method: "DELETE",
-        path: "/v1/working-directories/{working_directory_id}",
+        path: RUNTIME_ROUTE_WORKING_DIRECTORY,
         reason: "Workdir transport",
     },
     RemainingRuntimeRoute {
         method: "GET",
-        path: "/v1/protocol/ws",
+        path: RUNTIME_ROUTE_PROTOCOL_WS,
         reason: "WebSocket protocol transport (ws-server feature)",
     },
     RemainingRuntimeRoute {
         method: "GET",
-        path: "/v1/workers/{worker_id}/protocol/ws",
+        path: RUNTIME_ROUTE_WORKER_PROTOCOL_WS,
         reason: "WebSocket protocol transport (ws-server feature)",
     },
     RemainingRuntimeRoute {
         method: "POST",
-        path: "/v1/workers/{worker_id}/attachments",
+        path: RUNTIME_ROUTE_WORKER_ATTACHMENTS,
         reason: "Binary attachment transport",
     },
     RemainingRuntimeRoute {
         method: "DELETE",
-        path: "/v1/workers/{worker_id}/attachments/{artifact_id}",
+        path: RUNTIME_ROUTE_WORKER_ATTACHMENT,
         reason: "Binary attachment transport",
     },
 ];
