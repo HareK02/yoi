@@ -473,7 +473,7 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
     }
 
     Ok(Operation {
-        marker_ident: format_ident!("{}", to_pascal_case(&method.sig.ident)),
+        marker_ident: operation_marker_ident(&method.sig.ident),
         method_ident: method.sig.ident.clone(),
         operation_id,
         method: http_method,
@@ -924,6 +924,21 @@ fn method_name(method: Method) -> &'static str {
 fn ident_text(ident: &Ident) -> String {
     let value = ident.to_string();
     value.strip_prefix("r#").unwrap_or(&value).to_owned()
+}
+
+fn operation_marker_ident(method: &Ident) -> Ident {
+    let candidate = to_pascal_case(method);
+    if let Ok(mut marker) = syn::parse_str::<Ident>(&candidate) {
+        marker.set_span(method.span());
+        return marker;
+    }
+
+    let encoded = ident_text(method)
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ident::new(&format!("Operation{encoded}"), method.span())
 }
 
 fn to_pascal_case(ident: &Ident) -> String {

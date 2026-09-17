@@ -41,6 +41,15 @@ pub trait RawIdentifierApi {
     async fn r#type(&self) -> Widget;
 }
 
+#[api]
+pub trait UnusualIdentifierApi {
+    #[get("/underscores", operation_id = "unusual.underscores")]
+    async fn __(&self) -> Widget;
+
+    #[get("/underscore-digit", operation_id = "unusual.underscore_digit")]
+    async fn _0(&self) -> Widget;
+}
+
 fn assert_operation_types<O>()
 where
     O: Operation<
@@ -60,6 +69,11 @@ fn expansion_exposes_deterministic_metadata_and_type_connections() {
     assert_named_wrapper::<wrapper_api_operations::Search>();
     let raw = <raw_identifier_api_operations::Type as Operation>::METADATA;
     assert_eq!(raw.operation_id, "raw.type");
+    let underscores = <unusual_identifier_api_operations::Operation5f5f as Operation>::METADATA;
+    assert_eq!(underscores.operation_id, "unusual.underscores");
+    let underscore_digit =
+        <unusual_identifier_api_operations::Operation5f30 as Operation>::METADATA;
+    assert_eq!(underscore_digit.operation_id, "unusual.underscore_digit");
 
     let operations = <WidgetApiMetadata as ApiContract>::OPERATIONS;
     assert_eq!(operations.len(), 3);

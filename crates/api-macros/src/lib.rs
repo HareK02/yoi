@@ -51,8 +51,9 @@
 //! For `WidgetApi`, the macro emits `WidgetApiMetadata`, which implements [`ApiContract`],
 //! plus a `widget_api_operations` module. That module contains one marker per Rust method
 //! (`Create`, `Get`, ...), each implementing [`Operation`] and connecting metadata to concrete
-//! body types at compile time. The `ApiContract::OPERATIONS` inventory is sorted by operation
-//! ID, so its ordering is independent of source method order.
+//! body types at compile time. Unusual method names which have no valid PascalCase form use the
+//! deterministic `Operation<utf8-hex>` fallback. The `ApiContract::OPERATIONS` inventory is
+//! sorted by operation ID, so its ordering is independent of source method order.
 //!
 //! Only empty and JSON bodies are accepted by this first contract. [`WireKind`] reserves
 //! explicit variants for future transport work; accepting one requires a deliberate macro and
