@@ -4,22 +4,16 @@ import {
   canonicalResourceReference,
   resourceKey,
 } from "$lib/workspace/resource-links";
-import type {
-  ObjectiveDetail,
-  ObjectiveListResponse,
-} from "$lib/workspace/sidebar/types";
+import type { ObjectiveDetail } from "$lib/workspace/sidebar/types";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {
   const apiPath = (path: string) => workspaceApiPath(params.workspaceId, path);
   const objectiveId = resourceKey(params.objectiveId);
-  const [objectives, objective] = await Promise.all([
-    loadJson<ObjectiveListResponse>(fetch, apiPath("/objectives")),
-    loadJson<ObjectiveDetail>(
-      fetch,
-      apiPath(`/objectives/${encodeURIComponent(objectiveId)}`),
-    ),
-  ]);
+  const objective = await loadJson<ObjectiveDetail>(
+    fetch,
+    apiPath(`/objectives/${encodeURIComponent(objectiveId)}`),
+  );
 
   if (objective.data) {
     const canonical = canonicalResourceReference(
@@ -29,7 +23,9 @@ export const load: PageLoad = async ({ fetch, params }) => {
     if (params.objectiveId !== canonical) {
       redirect(
         308,
-        `/w/${encodeURIComponent(params.workspaceId)}/objectives/${encodeURIComponent(canonical)}`,
+        `/w/${encodeURIComponent(params.workspaceId)}/objectives/${
+          encodeURIComponent(canonical)
+        }`,
       );
     }
   }
@@ -37,8 +33,6 @@ export const load: PageLoad = async ({ fetch, params }) => {
   return {
     workspaceId: params.workspaceId,
     objectiveId,
-    objectives: objectives.data,
-    objectivesError: objectives.error,
     objective: objective.data,
     objectiveError: objective.error,
   };
