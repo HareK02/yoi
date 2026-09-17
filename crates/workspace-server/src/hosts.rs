@@ -15,7 +15,6 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    error::Error as _,
     future::Future,
     io::Read as _,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
@@ -47,15 +46,9 @@ use worker_runtime::http_server::{
     RUNTIME_PING_PERMISSION, RUNTIME_WORKSPACE_SCOPE_HEADER,
     RuntimeHttpConfigBundleAvailabilityResponse, RuntimeHttpConfigBundleSyncRequest,
     RuntimeHttpErrorResponse, RuntimeHttpPingResponse, RuntimeHttpRepositoryAccessResponse,
-    RuntimeHttpSummaryResponse, RuntimeHttpUploadedFileDeleteResponse,
-    RuntimeHttpUploadedFileResponse, RuntimeHttpWorkerCompletionsRequest,
-    RuntimeHttpWorkerCompletionsResponse, RuntimeHttpWorkerDeleteResponse,
-    RuntimeHttpWorkerInputResponse, RuntimeHttpWorkerLifecycleRequest,
-    RuntimeHttpWorkerLifecycleResponse, RuntimeHttpWorkerResponse,
-    RuntimeHttpWorkerRestoreResponse, RuntimeHttpWorkerWorkspaceApiRequest,
-    RuntimeHttpWorkersResponse, RuntimeHttpWorkingDirectoriesResponse,
-    RuntimeHttpWorkingDirectoryResponse, RuntimeHttpWorkspacePromptProjectionRequest,
-    RuntimeHttpWorkspacePromptProjectionResponse,
+    RuntimeHttpUploadedFileDeleteResponse, RuntimeHttpUploadedFileResponse,
+    RuntimeHttpWorkingDirectoriesResponse, RuntimeHttpWorkingDirectoryResponse,
+    RuntimeHttpWorkspacePromptProjectionRequest, RuntimeHttpWorkspacePromptProjectionResponse,
 };
 use worker_runtime::identity::{
     RuntimeWorkerRef, WorkerId as EmbeddedWorkerId, WorkerRef as EmbeddedWorkerRef,
@@ -3411,49 +3404,7 @@ pub struct RemoteWorkerRuntime {
     resource_broker: BackendResourceBroker,
     http: BlockingHttpClient,
     async_http: AsyncHttpClient,
-}
-
-fn remote_runtime_ping_transport_failure(error: reqwest::Error) -> RuntimePingFailure {
-    if error.is_timeout() {
-        return RuntimePingFailure::new(
-            RuntimePingFailureKind::Timeout,
-            "runtime_ping_timeout",
-            "Runtime ping timed out",
-        );
-    }
-    let mut source = error.source();
-    let mut tls_error = false;
-    while let Some(current) = source {
-        let message = current.to_string().to_ascii_lowercase();
-        if message.contains("tls")
-            || message.contains("certificate")
-            || message.contains("unknownissuer")
-            || message.contains("handshake")
-        {
-            tls_error = true;
-            break;
-        }
-        source = current.source();
-    }
-    if tls_error {
-        return RuntimePingFailure::new(
-            RuntimePingFailureKind::TlsOrTransport,
-            "runtime_ping_tls_failed",
-            "Runtime TLS connection failed",
-        );
-    }
-    if error.is_connect() {
-        return RuntimePingFailure::new(
-            RuntimePingFailureKind::NetworkUnreachable,
-            "runtime_ping_network_unreachable",
-            "Runtime could not be reached",
-        );
-    }
-    RuntimePingFailure::new(
-        RuntimePingFailureKind::TlsOrTransport,
-        "runtime_ping_transport_failed",
-        "Runtime ping transport failed",
-    )
+    request_timeout: Duration,
 }
 
 fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static str {
@@ -3517,6 +3468,54 @@ fn worker_id_from_remote_path(path_and_query: &str) -> Option<String> {
     let rest = path.strip_prefix("/v1/workers/")?;
     let worker_id = rest.split('/').next()?;
     (!worker_id.is_empty()).then(|| worker_id.to_string())
+}
+
+#[derive(Clone)]
+struct RemoteRuntimeApiAuthorizer {
+    workspace_id: String,
+    bearer_token: Option<String>,
+    workspace_authorization: Option<WorkspaceRuntimeAuthorization>,
+}
+
+impl runtime_api::client_support::RequestAuthorizer for RemoteRuntimeApiAuthorizer {
+    fn authorize(
+        &self,
+        request: runtime_api::client_support::AuthorizerRequest<'_>,
+    ) -> Result<reqwest::header::HeaderMap, runtime_api::client_support::AuthorizationError> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-yoi-workspace-id",
+            self.workspace_id
+                .parse()
+                .map_err(|_| runtime_api::client_support::AuthorizationError::new())?,
+        );
+        let authorization = if let Some(authorizer) = &self.workspace_authorization {
+            let operation =
+                workspace_runtime_operation(request.method.as_str(), request.path_and_query);
+            let worker_id = worker_id_from_remote_path(request.path_and_query);
+            let token = authorizer
+                .issue(
+                    request.method.as_str(),
+                    request.path_and_query,
+                    operation,
+                    worker_id.as_deref(),
+                    request.body,
+                )
+                .map_err(|_| runtime_api::client_support::AuthorizationError::new())?;
+            format!("Bearer {token}")
+        } else if let Some(token) = self.bearer_token.as_deref() {
+            format!("Bearer {token}")
+        } else {
+            return Ok(headers);
+        };
+        headers.insert(
+            AUTHORIZATION,
+            authorization
+                .parse()
+                .map_err(|_| runtime_api::client_support::AuthorizationError::new())?,
+        );
+        Ok(headers)
+    }
 }
 
 impl RemoteWorkerRuntime {
@@ -3590,6 +3589,7 @@ impl RemoteWorkerRuntime {
             resource_broker: BackendResourceBroker::default(),
             http,
             async_http,
+            request_timeout: timeout,
         })
     }
 
@@ -3621,6 +3621,72 @@ impl RemoteWorkerRuntime {
             },
         )
         .await
+    }
+
+    fn runtime_api_client(
+        &self,
+        timeout: Duration,
+        response_body_limit: usize,
+    ) -> Result<runtime_api::RuntimeApiClient<RemoteRuntimeApiAuthorizer>, RuntimeDiagnostic> {
+        runtime_api::RuntimeApiClient::builder(&self.base_url)
+            .map_err(|error| {
+                diagnostic(
+                    "remote_runtime_client_build_failed",
+                    DiagnosticSeverity::Error,
+                    error.to_string(),
+                )
+            })?
+            .client(self.async_http.clone())
+            .authorizer(RemoteRuntimeApiAuthorizer {
+                workspace_id: self.workspace_id.clone(),
+                bearer_token: self.bearer_token.clone(),
+                workspace_authorization: self.workspace_authorization.clone(),
+            })
+            .request_timeout(timeout)
+            .response_body_limit(response_body_limit)
+            .build()
+            .map_err(|error| {
+                diagnostic(
+                    "remote_runtime_client_build_failed",
+                    DiagnosticSeverity::Error,
+                    error.to_string(),
+                )
+            })
+    }
+
+    fn run_runtime_api<T, F, Fut>(
+        &self,
+        timeout: Duration,
+        response_body_limit: usize,
+        operation: F,
+    ) -> Result<T, RuntimeDiagnostic>
+    where
+        T: Send + 'static,
+        F: FnOnce(runtime_api::RuntimeApiClient<RemoteRuntimeApiAuthorizer>) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<
+                Output = Result<
+                    T,
+                    runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
+                >,
+            > + Send
+            + 'static,
+    {
+        let client = self.runtime_api_client(timeout, response_body_limit)?;
+        let runtime_id = self.runtime_id.clone();
+        run_blocking_http(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| {
+                    runtime_api::client_support::ClientError::failure(
+                        runtime_api::client_support::ClientFailure::Transport,
+                    )
+                })?
+                .block_on(operation(client))
+        })
+        .map_err(|error| runtime_api_diagnostic(&runtime_id, error))
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -3751,88 +3817,6 @@ impl RemoteWorkerRuntime {
         T: DeserializeOwned + Send + 'static,
     {
         self.send_json(path, "DELETE", &[], self.http.delete(self.endpoint(path)))
-    }
-
-    fn ping_http(&self) -> Result<RuntimeHttpPingResponse, RuntimePingFailure> {
-        const PATH: &str = "/v1/ping";
-        let workspace_id = self.workspace_id.clone();
-        let bearer_token = self.bearer_token.clone();
-        let capability_token = match &self.workspace_authorization {
-            Some(authorization) => Some(
-                authorization
-                    .issue("GET", PATH, RUNTIME_PING_PERMISSION, None, &[])
-                    .map_err(|diagnostic| {
-                        RuntimePingFailure::new(
-                            RuntimePingFailureKind::Authentication,
-                            diagnostic.code,
-                            diagnostic.message,
-                        )
-                    })?,
-            ),
-            None => None,
-        };
-        let request = self
-            .http
-            .get(self.endpoint(PATH))
-            .header(RUNTIME_WORKSPACE_SCOPE_HEADER, &workspace_id);
-        run_blocking_http(move || {
-            let request = match capability_token.as_deref().or(bearer_token.as_deref()) {
-                Some(token) => request.header(AUTHORIZATION, format!("Bearer {token}")),
-                None => request,
-            };
-            let response = request
-                .send()
-                .map_err(remote_runtime_ping_transport_failure)?;
-            match response.status() {
-                StatusCode::UNAUTHORIZED => {
-                    return Err(RuntimePingFailure::new(
-                        RuntimePingFailureKind::Authentication,
-                        "runtime_ping_authentication_failed",
-                        "Runtime rejected the connection-test credential",
-                    ));
-                }
-                StatusCode::FORBIDDEN => {
-                    return Err(RuntimePingFailure::new(
-                        RuntimePingFailureKind::Authorization,
-                        "runtime_ping_authorization_failed",
-                        "Runtime rejected the connection-test scope or permission",
-                    ));
-                }
-                status if !status.is_success() => {
-                    return Err(RuntimePingFailure::new(
-                        RuntimePingFailureKind::TlsOrTransport,
-                        "runtime_ping_http_failed",
-                        "Runtime ping returned an unsuccessful HTTP response",
-                    ));
-                }
-                _ => {}
-            }
-            let mut body = Vec::new();
-            response
-                .take((MAX_RUNTIME_PING_RESPONSE_BYTES + 1) as u64)
-                .read_to_end(&mut body)
-                .map_err(|_| {
-                    RuntimePingFailure::new(
-                        RuntimePingFailureKind::TlsOrTransport,
-                        "runtime_ping_response_read_failed",
-                        "Runtime ping response could not be read",
-                    )
-                })?;
-            if body.len() > MAX_RUNTIME_PING_RESPONSE_BYTES {
-                return Err(RuntimePingFailure::new(
-                    RuntimePingFailureKind::MalformedResponse,
-                    "runtime_ping_response_too_large",
-                    "Runtime ping response exceeded the allowed size",
-                ));
-            }
-            serde_json::from_slice::<RuntimeHttpPingResponse>(&body).map_err(|_| {
-                RuntimePingFailure::new(
-                    RuntimePingFailureKind::MalformedResponse,
-                    "runtime_ping_malformed_response",
-                    "Runtime ping returned an unrecognized response",
-                )
-            })
-        })
     }
 
     fn send_json<T>(
@@ -4003,7 +3987,7 @@ impl RemoteWorkerRuntime {
     fn lifecycle_result_from_response(
         &self,
         worker_id: &str,
-        response: RuntimeHttpWorkerLifecycleResponse,
+        response: worker_runtime::catalog::WorkerLifecycleAck,
     ) -> WorkerLifecycleResult {
         WorkerLifecycleResult {
             state: WorkerOperationState::Accepted,
@@ -4013,7 +3997,7 @@ impl RemoteWorkerRuntime {
                 DiagnosticSeverity::Info,
                 format!(
                     "Remote Runtime acknowledged lifecycle operation for '{worker_id}' with status {}",
-                    embedded_worker_status_label(response.ack.status)
+                    embedded_worker_status_label(response.status)
                 ),
             )],
         }
@@ -4026,24 +4010,33 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
     }
 
     fn runtime_summary(&self, limit: usize) -> RuntimeSummary {
-        match self.get_json::<RuntimeHttpSummaryResponse>("/v1/runtime") {
+        match self
+            .run_runtime_api(
+                self.request_timeout,
+                MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+                |client| async move { client.runtime_summary().await },
+            )
+            .and_then(|value| {
+                runtime_contract_convert::<_, worker_runtime::management::RuntimeSummary>(
+                    value.runtime,
+                )
+            }) {
             Ok(response) => RuntimeSummary {
                 runtime_id: self.runtime_id.clone(),
                 label: response
-                    .runtime
                     .display_name
                     .unwrap_or_else(|| self.display_name.clone()),
                 kind: "remote_worker_runtime".to_string(),
-                status: embedded_runtime_status_label(response.runtime.status).to_string(),
+                status: embedded_runtime_status_label(response.status).to_string(),
                 source: RuntimeSourceSummary::remote_http(),
                 host_ids: if limit == 0 {
                     Vec::new()
                 } else {
                     vec![self.host_id.clone()]
                 },
-                worker_creation_available: response.runtime.worker_creation_available,
-                os: response.runtime.os,
-                arch: response.runtime.arch,
+                worker_creation_available: response.worker_creation_available,
+                os: response.os,
+                arch: response.arch,
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => RuntimeSummary {
@@ -4066,7 +4059,50 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
     }
 
     fn ping(&self) -> Result<RuntimeHttpPingResponse, RuntimePingFailure> {
-        self.ping_http()
+        let workspace_id = self.workspace_id.clone();
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_RUNTIME_PING_RESPONSE_BYTES,
+            move |client| async move { client.ping(workspace_id).await },
+        )
+        .and_then(runtime_contract_convert)
+        .map_err(|diagnostic| {
+            let kind = if diagnostic.code.contains("auth") {
+                RuntimePingFailureKind::Authentication
+            } else if diagnostic.code.contains("network_unreachable") {
+                RuntimePingFailureKind::NetworkUnreachable
+            } else if diagnostic.code.contains("timeout") {
+                RuntimePingFailureKind::Timeout
+            } else if diagnostic.code.contains("invalid_response")
+                || diagnostic.code.contains("response_too_large")
+            {
+                RuntimePingFailureKind::MalformedResponse
+            } else {
+                RuntimePingFailureKind::TlsOrTransport
+            };
+            let (code, message) = match kind {
+                RuntimePingFailureKind::Authentication => (
+                    "runtime_ping_authentication_failed",
+                    "Runtime rejected ping authentication",
+                ),
+                RuntimePingFailureKind::NetworkUnreachable => (
+                    "runtime_ping_network_unreachable",
+                    "Runtime could not be reached",
+                ),
+                RuntimePingFailureKind::Timeout => {
+                    ("runtime_ping_timeout", "Runtime ping timed out")
+                }
+                RuntimePingFailureKind::MalformedResponse => (
+                    "runtime_ping_malformed_response",
+                    "Runtime ping returned a malformed response",
+                ),
+                _ => (
+                    "runtime_ping_transport_failed",
+                    "Runtime ping transport failed",
+                ),
+            };
+            RuntimePingFailure::new(kind, code, message)
+        })
     }
 
     fn activate_workspace_authorization(&self, binding: crate::store::WorkspaceRuntimeBinding) {
@@ -4124,10 +4160,23 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         if limit == 0 {
             return RuntimeList::new(Vec::new(), Vec::new());
         }
-        match self.get_json::<RuntimeHttpWorkersResponse>("/v1/workers") {
+        match self
+            .run_runtime_api(
+                self.request_timeout,
+                MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+                |client| async move {
+                    client
+                        .list_workers(runtime_api::WorkerListQuery::default())
+                        .await
+                },
+            )
+            .and_then(|value| {
+                runtime_contract_convert::<_, Vec<worker_runtime::catalog::WorkerSummary>>(
+                    value.workers,
+                )
+            }) {
             Ok(response) => RuntimeList::new(
                 response
-                    .workers
                     .into_iter()
                     .take(limit)
                     .map(|worker| self.map_worker_summary(worker))
@@ -4142,10 +4191,25 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         if limit == 0 {
             return RuntimeList::new(Vec::new(), Vec::new());
         }
-        match self.get_json::<RuntimeHttpWorkersResponse>("/v1/workers?status=stopped") {
+        match self
+            .run_runtime_api(
+                self.request_timeout,
+                MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+                |client| async move {
+                    client
+                        .list_workers(runtime_api::WorkerListQuery {
+                            status: Some(runtime_api::WorkerStatusFilter::Stopped),
+                        })
+                        .await
+                },
+            )
+            .and_then(|value| {
+                runtime_contract_convert::<_, Vec<worker_runtime::catalog::WorkerSummary>>(
+                    value.workers,
+                )
+            }) {
             Ok(response) => RuntimeList::new(
                 response
-                    .workers
                     .into_iter()
                     .take(limit)
                     .map(|worker| self.map_worker_summary(worker))
@@ -4157,9 +4221,18 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
     }
 
     fn worker(&self, worker_id: &str) -> WorkerLookupResult {
-        match self.get_json::<RuntimeHttpWorkerResponse>(&format!("/v1/workers/{worker_id}")) {
+        let worker_id_owned = worker_id.to_string();
+        match self
+            .run_runtime_api(
+                self.request_timeout,
+                MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+                move |client| async move { client.get_worker(worker_id_owned).await },
+            )
+            .and_then(|value| {
+                runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(value.worker)
+            }) {
             Ok(response) => WorkerLookupResult {
-                worker: Some(self.map_worker_detail(response.worker)),
+                worker: Some(self.map_worker_detail(response)),
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) if diagnostic.code == "worker_not_found" => WorkerLookupResult {
@@ -4174,20 +4247,34 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
     }
 
     fn restore_worker(&self, worker_id: &str) -> WorkerRestoreResult {
-        match self.post_json::<_, RuntimeHttpWorkerRestoreResponse>(
-            &format!("/v1/workers/{worker_id}/restore"),
-            &serde_json::json!({}),
-        ) {
-            Ok(response) => {
-                let diagnostics = match (response.reason_code, response.message) {
+        let worker_id_owned = worker_id.to_string();
+        match self
+            .run_runtime_api(
+                self.request_timeout,
+                MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+                move |client| async move {
+                    client
+                        .restore_worker(worker_id_owned, runtime_api::EmptyObjectRequest::default())
+                        .await
+                },
+            )
+            .and_then(|value| {
+                let worker = value
+                    .worker
+                    .map(runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>)
+                    .transpose()?;
+                Ok((value.state, worker, value.reason_code, value.message))
+            }) {
+            Ok((state, worker, reason_code, message)) => {
+                let diagnostics = match (reason_code, message) {
                     (Some(code), Some(message)) => {
                         vec![diagnostic(code, DiagnosticSeverity::Warning, message)]
                     }
                     _ => Vec::new(),
                 };
                 WorkerRestoreResult {
-                    state: response.state,
-                    worker: response.worker.map(|worker| self.map_worker_detail(worker)),
+                    state,
+                    worker: worker.map(|worker| self.map_worker_detail(worker)),
                     diagnostics,
                 }
             }
@@ -4206,13 +4293,33 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         worker_id: &str,
         workspace_api: WorkspaceApiRef,
     ) -> WorkerWorkspaceApiResult {
-        match self.post_json::<_, RuntimeHttpWorkerResponse>(
-            &format!("/v1/workers/{worker_id}/workspace-api"),
-            &RuntimeHttpWorkerWorkspaceApiRequest { workspace_api },
-        ) {
+        let request = match runtime_contract_convert(workspace_api) {
+            Ok(workspace_api) => runtime_api::WorkerWorkspaceApiRequest { workspace_api },
+            Err(diagnostic) => {
+                return WorkerWorkspaceApiResult {
+                    state: WorkerOperationState::Rejected,
+                    worker: None,
+                    diagnostics: vec![diagnostic],
+                };
+            }
+        };
+        let worker_id = worker_id.to_string();
+        match self
+            .run_runtime_api(
+                self.request_timeout,
+                MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+                move |client| async move {
+                    client
+                        .replace_worker_workspace_api(worker_id, request)
+                        .await
+                },
+            )
+            .and_then(|value| {
+                runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(value.worker)
+            }) {
             Ok(response) => WorkerWorkspaceApiResult {
                 state: WorkerOperationState::Accepted,
-                worker: Some(self.map_worker_detail(response.worker)),
+                worker: Some(self.map_worker_detail(response)),
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => WorkerWorkspaceApiResult {
@@ -4409,34 +4516,29 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             workspace_api: Some(workspace_api),
             memory_settings: request.resolved_memory_settings.clone(),
         };
-        let create_body = match serde_json::to_vec(&create) {
-            Ok(body) => body,
-            Err(error) => {
+        let create = match runtime_contract_convert(create) {
+            Ok(create) => create,
+            Err(diagnostic) => {
                 return WorkerSpawnResult {
                     state: WorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
-                    diagnostics: vec![diagnostic(
-                        "remote_runtime_request_encode_failed",
-                        DiagnosticSeverity::Error,
-                        error.to_string(),
-                    )],
+                    diagnostics: vec![diagnostic],
                 };
             }
         };
-        match self.send_json::<RuntimeHttpWorkerResponse>(
-            "/v1/workers",
-            "POST",
-            &create_body,
-            self.http
-                .post(self.endpoint("/v1/workers"))
-                .timeout(REMOTE_WORKER_CREATE_TIMEOUT)
-                .header(CONTENT_TYPE, "application/json")
-                .body(create_body.clone()),
-        ) {
+        match self
+            .run_runtime_api(
+                REMOTE_WORKER_CREATE_TIMEOUT,
+                MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+                move |client| async move { client.create_worker(create).await },
+            )
+            .and_then(|value| {
+                runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(value.worker)
+            }) {
             Ok(response) => WorkerSpawnResult {
                 state: WorkerOperationState::Accepted,
-                worker: Some(self.map_worker_detail(response.worker)),
+                worker: Some(self.map_worker_detail(response)),
                 acceptance_evidence: vec![WorkerSpawnAcceptanceEvidence {
                     kind: "remote_runtime_worker_created".to_string(),
                     detail: "worker-runtime REST create endpoint accepted the Worker".to_string(),
@@ -4504,13 +4606,21 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         worker_id: &str,
         request: WorkerLifecycleRequest,
     ) -> WorkerLifecycleResult {
-        let body = RuntimeHttpWorkerLifecycleRequest {
+        let body = runtime_api::WorkerLifecycleRequest {
             reason: request.reason,
         };
-        match self.post_json::<_, RuntimeHttpWorkerLifecycleResponse>(
-            &format!("/v1/workers/{worker_id}/stop"),
-            &body,
-        ) {
+        let worker_id_owned = worker_id.to_string();
+        match self
+            .run_runtime_api(
+                self.request_timeout,
+                MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+                move |client| async move { client.stop_worker(worker_id_owned, body).await },
+            )
+            .and_then(|value| {
+                runtime_contract_convert::<_, worker_runtime::catalog::WorkerLifecycleAck>(
+                    value.ack,
+                )
+            }) {
             Ok(response) => self.lifecycle_result_from_response(worker_id, response),
             Err(diagnostic) => remote_lifecycle_rejected(&self.runtime_id, worker_id, diagnostic),
         }
@@ -4521,29 +4631,46 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         worker_id: &str,
         request: WorkerLifecycleRequest,
     ) -> WorkerLifecycleResult {
-        let body = RuntimeHttpWorkerLifecycleRequest {
+        let body = runtime_api::WorkerLifecycleRequest {
             reason: request.reason,
         };
-        match self.post_json::<_, RuntimeHttpWorkerLifecycleResponse>(
-            &format!("/v1/workers/{worker_id}/cancel"),
-            &body,
-        ) {
+        let worker_id_owned = worker_id.to_string();
+        match self
+            .run_runtime_api(
+                self.request_timeout,
+                MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+                move |client| async move { client.cancel_worker(worker_id_owned, body).await },
+            )
+            .and_then(|value| {
+                runtime_contract_convert::<_, worker_runtime::catalog::WorkerLifecycleAck>(
+                    value.ack,
+                )
+            }) {
             Ok(response) => self.lifecycle_result_from_response(worker_id, response),
             Err(diagnostic) => remote_lifecycle_rejected(&self.runtime_id, worker_id, diagnostic),
         }
     }
 
     fn delete_worker(&self, worker_id: &str) -> WorkerDeleteResult {
+        let worker_id_owned = worker_id.to_string();
         match self
-            .delete_json::<RuntimeHttpWorkerDeleteResponse>(&format!("/v1/workers/{worker_id}"))
-        {
+            .run_runtime_api(
+                self.request_timeout,
+                MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+                move |client| async move { client.delete_worker(worker_id_owned).await },
+            )
+            .and_then(|value| {
+                runtime_contract_convert::<_, worker_runtime::management::WorkerDeleteResult>(
+                    value.worker,
+                )
+            }) {
             Ok(response) => WorkerDeleteResult {
                 state: WorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(
                     self.runtime_id.clone(),
-                    response.worker.worker_id.to_string(),
+                    response.worker_id.to_string(),
                 ),
-                deleted: response.worker.deleted,
+                deleted: response.deleted,
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => WorkerDeleteResult {
@@ -4559,9 +4686,13 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         &self,
         worker_id: &str,
     ) -> Result<WorkerRetentionInventory, String> {
-        self.get_json::<WorkerRetentionInventory>(&format!(
-            "/v1/workers/{worker_id}/retention/inventory"
-        ))
+        let worker_id = worker_id.to_string();
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.retention_inventory(worker_id).await },
+        )
+        .and_then(runtime_contract_convert)
         .map_err(|diagnostic| diagnostic.message)
     }
 
@@ -4570,10 +4701,14 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         request: WorkerRetentionExecutionRequest,
     ) -> Result<WorkerRetentionExecutionResult, String> {
         let worker_id = request.worker_id.to_string();
-        self.post_json::<_, WorkerRetentionExecutionResult>(
-            &format!("/v1/workers/{worker_id}/retention/execute"),
-            &request,
+        let request = runtime_contract_convert(request).map_err(|diagnostic| diagnostic.message)?;
+        let worker_id = worker_id.to_string();
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.execute_retention(worker_id, request).await },
         )
+        .and_then(runtime_contract_convert)
         .map_err(|diagnostic| diagnostic.message)
     }
 
@@ -4610,9 +4745,21 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             submission_request_id: None,
             segments: request.segments,
         };
-        match self.post_json::<_, RuntimeHttpWorkerInputResponse>(
-            &format!("/v1/workers/{worker_id}/input"),
-            &input,
+        let input = match runtime_contract_convert(input) {
+            Ok(input) => input,
+            Err(diagnostic) => {
+                return WorkerInputResult {
+                    state: WorkerOperationState::Rejected,
+                    worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
+                    diagnostics: vec![diagnostic],
+                };
+            }
+        };
+        let worker_id_owned = worker_id.to_string();
+        match self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.send_worker_input(worker_id_owned, input).await },
         ) {
             Ok(_) => WorkerInputResult {
                 state: WorkerOperationState::Accepted,
@@ -4680,13 +4827,21 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         worker_id: &str,
         request: WorkerCompletionsRequest,
     ) -> WorkerCompletionsResult {
-        let request = RuntimeHttpWorkerCompletionsRequest {
+        let request = runtime_api::CompletionRequest {
             kind: request.kind,
             prefix: request.prefix,
         };
-        match self.post_json::<_, RuntimeHttpWorkerCompletionsResponse>(
-            &format!("/v1/workers/{worker_id}/completions"),
-            &request,
+        let failure_kind = request.kind;
+        let failure_prefix = request.prefix.clone();
+        let worker_id_owned = worker_id.to_string();
+        match self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move {
+                client
+                    .complete_worker_arguments(worker_id_owned, request)
+                    .await
+            },
         ) {
             Ok(response) => WorkerCompletionsResult {
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
@@ -4697,8 +4852,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             },
             Err(diagnostic) => WorkerCompletionsResult {
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
-                kind: request.kind,
-                prefix: request.prefix,
+                kind: failure_kind,
+                prefix: failure_prefix,
                 entries: Vec::new(),
                 diagnostics: vec![diagnostic],
             },
@@ -5208,6 +5363,84 @@ fn remote_reqwest_diagnostic(runtime_id: &str, err: reqwest::Error) -> RuntimeDi
             DiagnosticSeverity::Error,
             format!("Remote Runtime client error for '{runtime_id}'"),
         )
+    }
+}
+
+fn runtime_contract_convert<T, U>(value: T) -> Result<U, RuntimeDiagnostic>
+where
+    T: Serialize,
+    U: DeserializeOwned,
+{
+    serde_json::to_value(value)
+        .and_then(serde_json::from_value)
+        .map_err(|error| {
+            diagnostic(
+                "remote_runtime_contract_conversion_failed",
+                DiagnosticSeverity::Error,
+                error.to_string(),
+            )
+        })
+}
+
+fn runtime_api_diagnostic(
+    runtime_id: &str,
+    error: runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
+) -> RuntimeDiagnostic {
+    match error {
+        runtime_api::client_support::ClientError::Public { status, error } => {
+            let remote_code = error.error.code;
+            let message = sanitize_remote_runtime_message(&remote_code, &error.error.message);
+            let (code, severity) = match status {
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => (
+                    "remote_runtime_auth_failed".to_string(),
+                    DiagnosticSeverity::Error,
+                ),
+                _ => (
+                    remote_code,
+                    if status.is_server_error() {
+                        DiagnosticSeverity::Error
+                    } else {
+                        DiagnosticSeverity::Warning
+                    },
+                ),
+            };
+            diagnostic(
+                code,
+                severity,
+                format!(
+                    "Remote Runtime '{runtime_id}' rejected request (HTTP {status}): {message}"
+                ),
+            )
+        }
+        runtime_api::client_support::ClientError::Failure(failure) => {
+            let code = match failure {
+                runtime_api::client_support::ClientFailure::Timeout => "remote_runtime_timeout",
+                runtime_api::client_support::ClientFailure::Connect => {
+                    "remote_runtime_network_unreachable"
+                }
+                runtime_api::client_support::ClientFailure::Authorization => {
+                    "remote_runtime_authorization_failed"
+                }
+                runtime_api::client_support::ClientFailure::ErrorResponseDecode { status }
+                    if status == StatusCode::UNAUTHORIZED.as_u16()
+                        || status == StatusCode::FORBIDDEN.as_u16() =>
+                {
+                    "remote_runtime_auth_failed"
+                }
+                runtime_api::client_support::ClientFailure::ResponseTooLarge { .. } => {
+                    "remote_runtime_response_too_large"
+                }
+                runtime_api::client_support::ClientFailure::Decode { .. } => {
+                    "remote_runtime_invalid_response"
+                }
+                _ => "remote_runtime_client_error",
+            };
+            diagnostic(
+                code,
+                DiagnosticSeverity::Error,
+                format!("Remote Runtime client error for '{runtime_id}': {failure}"),
+            )
+        }
     }
 }
 

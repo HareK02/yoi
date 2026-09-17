@@ -949,18 +949,23 @@ fn reqwest_adapter_tokens(
                     .map_err(#api_crate::reqwest::ClientError::from);
             }
         };
-        let public_error = match (operation.error_status, operation.error_body.as_ref()) {
-            (Some(status), Some(error)) => quote! {
-                if __actual == #status {
+        let public_error = match operation.error_body.as_ref() {
+            Some(error) => quote! {
+                if (400..=599).contains(&__actual) {
+                    let __status = __response.status();
                     let __error = __response
                         .decode_json::<#error>(#api_crate::reqwest::DecodeKind::PublicError)
-                        .map_err(#api_crate::reqwest::ClientError::from)?;
+                        .map_err(|_| #api_crate::reqwest::ClientError::failure(
+                            #api_crate::reqwest::ClientFailure::ErrorResponseDecode {
+                                status: __status.as_u16(),
+                            },
+                        ))?;
                     return ::core::result::Result::Err(
-                        #api_crate::reqwest::ClientError::public(__response.status(), __error),
+                        #api_crate::reqwest::ClientError::public(__status, __error),
                     );
                 }
             },
-            _ => quote!(),
+            None => quote!(),
         };
         quote! {
             pub async fn #method_ident(
@@ -1192,7 +1197,10 @@ fn axum_adapter_tokens(
         let invocation = quote!(#trait_ident::#method_ident(&*__service, #(#call_arguments),*).await);
         let mapped = if operation.fallible {
             let error = match operation.error_status {
-                Some(status) => quote!(#api_crate::axum::json_response(#api_crate::axum::status(#status), error)),
+                Some(_) => quote!({
+                    let status = #api_crate::HttpError::status_code(&error);
+                    #api_crate::axum::json_response(#api_crate::axum::status(status), error)
+                }),
                 None => quote!({ let _ = error; #api_crate::axum::empty_response(#api_crate::axum::framework::StatusCode::INTERNAL_SERVER_ERROR) }),
             };
             quote! {

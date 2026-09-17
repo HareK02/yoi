@@ -6,6 +6,8 @@
 //! Runtime process directly; a backend is expected to own any browser-facing
 //! credentials, registration, and policy.
 
+mod runtime_management_api;
+
 use crate::auth::{RuntimeAuthContext, new_token_id, unix_now_seconds};
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, RepositoryRefObservationRequest, WorkerDetail,
@@ -25,13 +27,11 @@ use crate::retention::{
 #[cfg(feature = "ws-server")]
 use crate::runtime::RuntimeSubscriptionRecvError;
 use crate::ssh_host_key_probe::{
-    SSH_HOST_KEY_PROBE_OPERATION, SSH_HOST_KEY_PROBE_PATH, SSH_KEYSCAN_TIMEOUT,
-    SshHostKeyProbeError, SshHostKeyProbeRequest, SshHostKeyProbeResponse,
-    probe_ssh_host_keys_with_program,
+    SSH_HOST_KEY_PROBE_OPERATION, SSH_KEYSCAN_TIMEOUT, SshHostKeyProbeError,
+    SshHostKeyProbeRequest, SshHostKeyProbeResponse, probe_ssh_host_keys_with_program,
 };
 use crate::workspace_issuer::{
-    RuntimeVerificationSigner, VerifiedWorkspaceCapability, WORKSPACE_VERIFICATION_ACK_PATH,
-    WORKSPACE_VERIFICATION_CHALLENGE_PATH, WORKSPACE_VERIFICATION_OPERATION,
+    RuntimeVerificationSigner, VerifiedWorkspaceCapability, WORKSPACE_VERIFICATION_OPERATION,
     WorkspaceCapabilityExpectation, WorkspaceCapabilityVerifier,
     WorkspaceRuntimeVerificationAcknowledgement, WorkspaceRuntimeVerificationAuthority,
     WorkspaceRuntimeVerificationChallenge, WorkspaceRuntimeVerificationReceipt,
@@ -74,7 +74,6 @@ use workdir::{
         WorkdirTransportError, WorkdirTransportErrorCode,
     },
 };
-use workspace_api::WorkerRestoreState;
 
 const DEFAULT_RUNTIME_HTTP_PORT: u16 = 38800;
 pub const RUNTIME_HTTP_PROTOCOL_MIN_VERSION: u32 = 1;
@@ -165,6 +164,18 @@ pub async fn serve_runtime_http_with_workspace_auth(
     Ok(())
 }
 
+fn remaining_route(path: &'static str, methods: &[&str]) -> &'static str {
+    for method in methods {
+        assert!(
+            runtime_api::REMAINING_RUNTIME_ROUTES
+                .iter()
+                .any(|route| route.method == *method && route.path == path),
+            "handwritten Runtime route {method} {path} is missing from runtime-api inventory",
+        );
+    }
+    path
+}
+
 /// Build the REST router for an existing Runtime.
 ///
 /// Handlers delegate to [`Runtime`] methods and keep Worker authority Runtime-local.
@@ -210,101 +221,102 @@ fn runtime_http_router_with_auth_and_ssh_keyscan_program(
     };
 
     let router = Router::new()
-        .route("/v1/ping", get(get_runtime_ping))
         .route(
-            WORKSPACE_VERIFICATION_CHALLENGE_PATH,
+            remaining_route(runtime_api::RUNTIME_ROUTE_VERIFICATION_CHALLENGE, &["POST"]),
             post(post_workspace_verification_challenge),
         )
         .route(
-            WORKSPACE_VERIFICATION_ACK_PATH,
+            remaining_route(runtime_api::RUNTIME_ROUTE_VERIFICATION_ACK, &["POST"]),
             post(post_workspace_verification_acknowledgement),
         )
-        .route("/v1/runtime", get(get_runtime))
         .route(
-            "/v1/config-bundles",
+            remaining_route(runtime_api::RUNTIME_ROUTE_CONFIG_BUNDLES, &["GET", "POST"]),
             get(list_config_bundles).post(store_config_bundle),
         )
         .route(
-            "/v1/config-bundles/{bundle_id}/availability",
+            remaining_route(
+                runtime_api::RUNTIME_ROUTE_CONFIG_BUNDLE_AVAILABILITY,
+                &["GET"],
+            ),
             get(check_config_bundle),
         )
         .route(
-            "/v1/workspace-prompt-projections",
+            remaining_route(
+                runtime_api::RUNTIME_ROUTE_WORKSPACE_PROMPT_PROJECTIONS,
+                &["POST"],
+            ),
             post(observe_workspace_prompt_projection),
         )
         .route(
-            "/v1/working-directories",
+            remaining_route(
+                runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORIES,
+                &["GET", "POST"],
+            ),
             get(list_working_directories).post(create_working_directory),
         )
         .route(
-            "/v1/working-directories/repository-access",
+            remaining_route(
+                runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORY_REPOSITORY_ACCESS,
+                &["POST"],
+            ),
             post(authorize_working_directory_repository_access),
         )
         .route(
-            SSH_HOST_KEY_PROBE_PATH,
+            remaining_route(runtime_api::RUNTIME_ROUTE_SSH_PROBE, &["POST"]),
             post(probe_repository_ssh_host_keys),
         )
-        .route("/v1/repository-refs/observe", post(observe_repository_ref))
         .route(
-            "/v1/working-directories/{working_directory_id}/sessions",
+            remaining_route(
+                runtime_api::RUNTIME_ROUTE_REPOSITORY_REFS_OBSERVE,
+                &["POST"],
+            ),
+            post(observe_repository_ref),
+        )
+        .route(
+            remaining_route(runtime_api::RUNTIME_ROUTE_WORKDIR_SESSIONS, &["POST"]),
             post(open_workdir_session),
         )
         .route(
-            "/v1/workdir-sessions/{session_id}/operations",
+            remaining_route(
+                runtime_api::RUNTIME_ROUTE_WORKDIR_SESSION_OPERATIONS,
+                &["POST"],
+            ),
             post(run_workdir_session_operation),
         )
         .route(
-            "/v1/workdir-sessions/{session_id}",
+            remaining_route(runtime_api::RUNTIME_ROUTE_WORKDIR_SESSION, &["DELETE"]),
             delete(close_workdir_session),
         )
         .route(
-            "/v1/working-directories/{working_directory_id}",
+            remaining_route(
+                runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORY,
+                &["GET", "DELETE"],
+            ),
             get(get_working_directory).delete(cleanup_working_directory),
         )
-        .route("/v1/workers", get(list_workers).post(create_worker))
         .route(
-            "/v1/workers/{worker_id}",
-            get(get_worker).delete(delete_worker),
-        )
-        .route(
-            "/v1/workers/{worker_id}/retention/inventory",
-            get(worker_retention_inventory),
-        )
-        .route(
-            "/v1/workers/{worker_id}/retention/execute",
-            post(execute_worker_retention),
-        )
-        .route("/v1/workers/{worker_id}/input", post(send_worker_input))
-        .route(
-            "/v1/workers/{worker_id}/attachments",
+            remaining_route(runtime_api::RUNTIME_ROUTE_WORKER_ATTACHMENTS, &["POST"]),
             post(upload_worker_file).layer(DefaultBodyLimit::max(MAX_WORKER_FILE_UPLOAD_BYTES)),
         )
         .route(
-            "/v1/workers/{worker_id}/attachments/{artifact_id}",
+            remaining_route(runtime_api::RUNTIME_ROUTE_WORKER_ATTACHMENT, &["DELETE"]),
             delete(delete_worker_uploaded_file),
-        )
-        .route("/v1/workers/{worker_id}/restore", post(restore_worker))
-        .route(
-            "/v1/workers/{worker_id}/workspace-api",
-            post(replace_worker_workspace_api),
-        )
-        .route(
-            "/v1/workers/{worker_id}/completions",
-            post(worker_completions),
-        )
-        .route("/v1/workers/{worker_id}/stop", post(stop_worker))
-        .route("/v1/workers/{worker_id}/cancel", post(cancel_worker));
+        );
 
     #[cfg(feature = "ws-server")]
     let router = router
-        .route("/v1/protocol/ws", get(runtime_protocol_ws))
         .route(
-            "/v1/workers/{worker_id}/protocol/ws",
+            remaining_route(runtime_api::RUNTIME_ROUTE_PROTOCOL_WS, &["GET"]),
+            get(runtime_protocol_ws),
+        )
+        .route(
+            remaining_route(runtime_api::RUNTIME_ROUTE_WORKER_PROTOCOL_WS, &["GET"]),
             get(worker_protocol_ws),
         );
 
     router
         .with_state(state.clone())
+        .merge(runtime_management_api::router(state.clone()))
         .layer(middleware::from_fn_with_state(state, require_runtime_auth))
 }
 
@@ -373,11 +385,13 @@ struct RuntimeHttpConfigBundleAvailabilityQuery {
     digest: String,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Default, Deserialize)]
 struct RuntimeHttpWorkersQuery {
     status: Option<RuntimeHttpWorkerStatusFilter>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RuntimeHttpWorkerStatusFilter {
@@ -419,20 +433,6 @@ pub struct RuntimeHttpWorkingDirectoryResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeHttpWorkerResponse {
     pub worker: WorkerDetail,
-}
-
-/// Explicit restore outcome. This envelope is returned for every reachable
-/// Runtime restore attempt, including preflight rejection and uncertain commit.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeHttpWorkerRestoreResponse {
-    pub state: WorkerRestoreState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker: Option<WorkerDetail>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason_code: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
 }
 
 /// Replace the Workspace API binding for an existing Worker.
@@ -685,6 +685,7 @@ async fn post_workspace_verification_acknowledgement(
     }))
 }
 
+#[allow(dead_code)]
 async fn get_runtime_ping(
     State(state): State<RuntimeHttpState>,
     Extension(auth): Extension<RuntimeAuthContext>,
@@ -727,6 +728,7 @@ async fn get_runtime_ping(
     }))
 }
 
+#[allow(dead_code)]
 async fn get_runtime(
     State(state): State<RuntimeHttpState>,
 ) -> RestResult<RuntimeHttpSummaryResponse> {
@@ -806,6 +808,7 @@ async fn check_config_bundle(
     }))
 }
 
+#[allow(dead_code)]
 async fn list_workers(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1146,6 +1149,7 @@ async fn cleanup_working_directory(
     }))
 }
 
+#[allow(dead_code)]
 async fn get_worker(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1160,6 +1164,7 @@ async fn get_worker(
     Ok(Json(RuntimeHttpWorkerResponse { worker }))
 }
 
+#[allow(dead_code)]
 async fn delete_worker(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1174,6 +1179,7 @@ async fn delete_worker(
     Ok(Json(RuntimeHttpWorkerDeleteResponse { worker }))
 }
 
+#[allow(dead_code)]
 async fn create_worker(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1188,6 +1194,7 @@ async fn create_worker(
     Ok(Json(RuntimeHttpWorkerResponse { worker }))
 }
 
+#[allow(dead_code)]
 async fn replace_worker_workspace_api(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1208,27 +1215,6 @@ async fn replace_worker_workspace_api(
     }
     .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkerResponse { worker }))
-}
-
-async fn restore_worker(
-    State(state): State<RuntimeHttpState>,
-    auth: Option<Extension<RuntimeAuthContext>>,
-    Path(worker_id): Path<String>,
-) -> RestResult<RuntimeHttpWorkerRestoreResponse> {
-    let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
-    let result = match auth_workspace_scope(&state, auth.as_ref())? {
-        Some(scope) => state
-            .runtime
-            .restore_worker_operation_scoped(&scope, &worker_ref),
-        None => state.runtime.restore_worker_operation(&worker_ref),
-    }
-    .map_err(RuntimeHttpRestError::runtime)?;
-    Ok(Json(RuntimeHttpWorkerRestoreResponse {
-        state: result.state,
-        worker: result.worker,
-        reason_code: result.reason_code,
-        message: result.message,
-    }))
 }
 
 #[cfg(feature = "ws-server")]
@@ -1780,6 +1766,7 @@ fn protocol_error_event(message: impl Into<String>) -> protocol::Event {
     }
 }
 
+#[allow(dead_code)]
 async fn worker_retention_inventory(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1800,6 +1787,7 @@ async fn worker_retention_inventory(
         .map_err(RuntimeHttpRestError::runtime)
 }
 
+#[allow(dead_code)]
 async fn execute_worker_retention(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1835,6 +1823,7 @@ async fn execute_worker_retention(
         .map_err(RuntimeHttpRestError::runtime)
 }
 
+#[allow(dead_code)]
 async fn send_worker_input(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1851,6 +1840,7 @@ async fn send_worker_input(
     Ok(Json(RuntimeHttpWorkerInputResponse { ack }))
 }
 
+#[allow(dead_code)]
 async fn worker_completions(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1987,6 +1977,7 @@ async fn delete_worker_uploaded_file(
     }))
 }
 
+#[allow(dead_code)]
 async fn stop_worker(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -2005,6 +1996,7 @@ async fn stop_worker(
     Ok(Json(RuntimeHttpWorkerLifecycleResponse { ack }))
 }
 
+#[allow(dead_code)]
 async fn cancel_worker(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -2102,8 +2094,9 @@ async fn require_runtime_auth(
         };
         match workspace_auth.verifier.verify(token, &expected) {
             Ok(verified) => {
-                let is_verification = path_and_query == WORKSPACE_VERIFICATION_CHALLENGE_PATH
-                    || path_and_query == WORKSPACE_VERIFICATION_ACK_PATH;
+                let is_verification = path_and_query
+                    == runtime_api::RUNTIME_ROUTE_VERIFICATION_CHALLENGE
+                    || path_and_query == runtime_api::RUNTIME_ROUTE_VERIFICATION_ACK;
                 if !is_verification {
                     let record = match workspace_auth
                         .verifications
@@ -2152,7 +2145,8 @@ async fn require_runtime_auth(
                     token_id: verified.token_id,
                     expires_at: u64::try_from(verified.expires_at).unwrap_or(0),
                 });
-                return next.run(request).await;
+                let context = request.extensions().get::<RuntimeAuthContext>().cloned();
+                return runtime_management_api::scope_auth(context, next.run(request)).await;
             }
             Err(error) => {
                 return RuntimeHttpRestError::new(
@@ -2168,7 +2162,8 @@ async fn require_runtime_auth(
     let workspace_bootstrap_request = request.method() == Method::POST
         && matches!(
             request.uri().path(),
-            WORKSPACE_VERIFICATION_CHALLENGE_PATH | WORKSPACE_VERIFICATION_ACK_PATH
+            runtime_api::RUNTIME_ROUTE_VERIFICATION_CHALLENGE
+                | runtime_api::RUNTIME_ROUTE_VERIFICATION_ACK
         );
     if state.workspace_auth.is_some() && !workspace_bootstrap_request {
         let local_token_matches = state
@@ -2202,7 +2197,8 @@ async fn require_runtime_auth(
             expires_at: 0,
         });
     }
-    next.run(request).await
+    let context = request.extensions().get::<RuntimeAuthContext>().cloned();
+    runtime_management_api::scope_auth(context, next.run(request)).await
 }
 
 fn auth_workspace_scope(
@@ -2239,7 +2235,8 @@ fn auth_workspace_scope(
 }
 
 fn workspace_runtime_operation(method: &Method, path: &str) -> &'static str {
-    if (path == WORKSPACE_VERIFICATION_CHALLENGE_PATH || path == WORKSPACE_VERIFICATION_ACK_PATH)
+    if (path == runtime_api::RUNTIME_ROUTE_VERIFICATION_CHALLENGE
+        || path == runtime_api::RUNTIME_ROUTE_VERIFICATION_ACK)
         && *method == Method::POST
     {
         return WORKSPACE_VERIFICATION_OPERATION;
@@ -2266,9 +2263,9 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     if path == "/v1/workers" && *method == Method::POST {
         return Some("workers:create");
     }
-    if (path == "/v1/working-directories/repository-access"
-        || path == "/v1/repository-refs/observe"
-        || path == SSH_HOST_KEY_PROBE_PATH)
+    if (path == runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORY_REPOSITORY_ACCESS
+        || path == runtime_api::RUNTIME_ROUTE_REPOSITORY_REFS_OBSERVE
+        || path == runtime_api::RUNTIME_ROUTE_SSH_PROBE)
         && *method == Method::POST
     {
         return Some(SSH_HOST_KEY_PROBE_OPERATION);
@@ -2278,9 +2275,9 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     {
         return Some("workdirs:operate");
     }
-    if path.starts_with("/v1/config-bundles")
-        || path.starts_with("/v1/workspace-prompt-projections")
-        || path.starts_with("/v1/working-directories")
+    if path.starts_with(runtime_api::RUNTIME_ROUTE_CONFIG_BUNDLES)
+        || path.starts_with(runtime_api::RUNTIME_ROUTE_WORKSPACE_PROMPT_PROJECTIONS)
+        || path.starts_with(runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORIES)
     {
         return Some("workers:create");
     }
@@ -2293,7 +2290,7 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     if path.ends_with("/stop") || path.ends_with("/cancel") {
         return Some("workers:stop");
     }
-    if path == "/v1/protocol/ws" {
+    if path == runtime_api::RUNTIME_ROUTE_PROTOCOL_WS {
         return Some("workers:list");
     }
     if path.ends_with("/protocol") || path.ends_with("/protocol/ws") {
@@ -2488,6 +2485,11 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         {
             StatusCode::NOT_FOUND
         }
+        RuntimeError::InvalidRequest(message)
+            if message.contains("already created with a different fingerprint") =>
+        {
+            StatusCode::CONFLICT
+        }
         RuntimeError::RuntimeStopped
         | RuntimeError::RuntimeStoreAlreadyOpen { .. }
         | RuntimeError::WorkerExecutionUnavailable { .. }
@@ -2526,6 +2528,11 @@ fn code_for_runtime_error(error: &RuntimeError) -> String {
         RuntimeError::WorkerExecutionRejected { .. } => "worker_execution_rejected".to_string(),
         RuntimeError::WorkspaceOwnerMismatch { .. } => "workspace_owner_mismatch".to_string(),
         RuntimeError::LimitTooLarge { .. } => "limit_too_large".to_string(),
+        RuntimeError::InvalidRequest(message)
+            if message.contains("already created with a different fingerprint") =>
+        {
+            "worker_create_conflict".to_string()
+        }
         RuntimeError::InvalidRequest(_) => "invalid_request".to_string(),
         RuntimeError::WorkingDirectory(diagnostic) => diagnostic.code.clone(),
         RuntimeError::InvalidInitialInputKind { .. } => "invalid_initial_input_kind".to_string(),
@@ -2569,6 +2576,7 @@ mod tests {
         WorkerExecutionSpawnResult,
     };
     use crate::management::RuntimeOptions;
+    use crate::retention::{DiagnosticsDisposition, SessionDisposition};
     use crate::workspace_issuer::{
         InMemoryWorkspaceClaimReplayProtection, InMemoryWorkspaceRuntimeVerificationAuthority,
         WorkspaceCapabilityClaims, WorkspaceCapabilityVerifier, WorkspaceIssuerTrustRecord,
@@ -2580,14 +2588,108 @@ mod tests {
     use manifest::{Scope, SharedScope};
     use sha2::Digest as _;
     use tower::ServiceExt;
+
+    #[derive(Clone)]
+    struct TestRuntimeAuthorizer(String);
+
+    impl runtime_api::client_support::RequestAuthorizer for TestRuntimeAuthorizer {
+        fn authorize(
+            &self,
+            _request: runtime_api::client_support::AuthorizerRequest<'_>,
+        ) -> Result<
+            runtime_api::client_support::framework::header::HeaderMap,
+            runtime_api::client_support::AuthorizationError,
+        > {
+            let mut headers = runtime_api::client_support::framework::header::HeaderMap::new();
+            headers.insert(
+                runtime_api::client_support::framework::header::AUTHORIZATION,
+                format!("Bearer {}", self.0)
+                    .parse()
+                    .map_err(|_| runtime_api::client_support::AuthorizationError::new())?,
+            );
+            Ok(headers)
+        }
+    }
+
     use workdir::{
         GrepOutputMode, GrepRequest, LocalWorkdirSession, StatRequest, Workdir, WorkdirPath,
         WorkdirSessionCapabilities,
     };
 
+    #[test]
+    fn generated_runtime_routes_are_classified_by_permission_authority() {
+        for operation in <runtime_api::RuntimeApiMetadata as runtime_api::ApiContract>::OPERATIONS {
+            let method = match operation.method {
+                runtime_api::HttpMethod::Get => Method::GET,
+                runtime_api::HttpMethod::Post => Method::POST,
+                runtime_api::HttpMethod::Put => Method::PUT,
+                runtime_api::HttpMethod::Patch => Method::PATCH,
+                runtime_api::HttpMethod::Delete => Method::DELETE,
+                runtime_api::HttpMethod::Head | runtime_api::HttpMethod::Options => {
+                    panic!("unexpected management contract method")
+                }
+            };
+            let path = operation.path.replace("{worker_id}", "worker-1");
+            let permission = required_runtime_permission(&method, &path);
+            if operation.operation_id == "runtime_summary" {
+                assert_eq!(
+                    permission, None,
+                    "{:?} {}",
+                    operation.method, operation.path
+                );
+            } else {
+                assert!(
+                    permission.is_some(),
+                    "unclassified generated route: {:?} {}",
+                    operation.method,
+                    operation.path
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remaining_route_inventory_covers_every_handwritten_router_path() {
+        let inventoried = runtime_api::REMAINING_RUNTIME_ROUTES
+            .iter()
+            .map(|route| route.path)
+            .collect::<std::collections::BTreeSet<_>>();
+        for path in [
+            runtime_api::RUNTIME_ROUTE_VERIFICATION_CHALLENGE,
+            runtime_api::RUNTIME_ROUTE_VERIFICATION_ACK,
+            runtime_api::RUNTIME_ROUTE_CONFIG_BUNDLES,
+            runtime_api::RUNTIME_ROUTE_CONFIG_BUNDLE_AVAILABILITY,
+            runtime_api::RUNTIME_ROUTE_WORKSPACE_PROMPT_PROJECTIONS,
+            runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORIES,
+            runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORY_REPOSITORY_ACCESS,
+            runtime_api::RUNTIME_ROUTE_SSH_PROBE,
+            runtime_api::RUNTIME_ROUTE_REPOSITORY_REFS_OBSERVE,
+            runtime_api::RUNTIME_ROUTE_WORKDIR_SESSIONS,
+            runtime_api::RUNTIME_ROUTE_WORKDIR_SESSION_OPERATIONS,
+            runtime_api::RUNTIME_ROUTE_WORKDIR_SESSION,
+            runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORY,
+            runtime_api::RUNTIME_ROUTE_WORKER_ATTACHMENTS,
+            runtime_api::RUNTIME_ROUTE_WORKER_ATTACHMENT,
+            runtime_api::RUNTIME_ROUTE_PROTOCOL_WS,
+            runtime_api::RUNTIME_ROUTE_WORKER_PROTOCOL_WS,
+        ] {
+            assert!(
+                inventoried.contains(path),
+                "missing handwritten route inventory for {path}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn workspace_signed_verification_requires_exact_request_and_acknowledges_response() {
-        let runtime = Runtime::new_memory();
+        let runtime =
+            Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(AcceptingBackend))
+                .unwrap();
+        runtime
+            .store_config_bundle(test_bundle(ProfileSelector::Builtin(
+                "builtin:coder".to_string(),
+            )))
+            .unwrap();
         let workspace_identity = RuntimeIdentityMaterial::generate("workspace-key").unwrap();
         let runtime_identity = RuntimeIdentityMaterial::generate("runtime-test").unwrap();
         let workspace_public_key =
@@ -2620,7 +2722,7 @@ mod tests {
         )
         .unwrap();
         let app = runtime_http_router_with_workspace_auth(
-            runtime,
+            runtime.clone(),
             None,
             WorkspaceRuntimeHttpAuth {
                 verifier,
@@ -2653,7 +2755,7 @@ mod tests {
             worker_id: None,
             operation: WORKSPACE_VERIFICATION_OPERATION.to_string(),
             method: "POST".to_string(),
-            path_and_query: WORKSPACE_VERIFICATION_CHALLENGE_PATH.to_string(),
+            path_and_query: runtime_api::RUNTIME_ROUTE_VERIFICATION_CHALLENGE.to_string(),
             body_digest: workspace_request_body_digest(&body),
             iat: unix_now_i64(),
             exp: challenge.expires_at,
@@ -2667,7 +2769,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri(WORKSPACE_VERIFICATION_CHALLENGE_PATH)
+                    .uri(runtime_api::RUNTIME_ROUTE_VERIFICATION_CHALLENGE)
                     .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(body))
@@ -2713,7 +2815,7 @@ mod tests {
         };
         let acknowledgement_body = serde_json::to_vec(&acknowledgement).unwrap();
         let acknowledgement_claims = WorkspaceCapabilityClaims {
-            path_and_query: WORKSPACE_VERIFICATION_ACK_PATH.to_string(),
+            path_and_query: runtime_api::RUNTIME_ROUTE_VERIFICATION_ACK.to_string(),
             body_digest: workspace_request_body_digest(&acknowledgement_body),
             jti: "ack-token".to_string(),
             ..claims
@@ -2728,7 +2830,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri(WORKSPACE_VERIFICATION_ACK_PATH)
+                    .uri(runtime_api::RUNTIME_ROUTE_VERIFICATION_ACK)
                     .header(
                         header::AUTHORIZATION,
                         format!("Bearer {acknowledgement_token}"),
@@ -2746,7 +2848,7 @@ mod tests {
         for authorization in [None, Some("Bearer malformed")] {
             let mut request = Request::builder()
                 .method(Method::POST)
-                .uri("/v1/config-bundles");
+                .uri(runtime_api::RUNTIME_ROUTE_CONFIG_BUNDLES);
             if let Some(authorization) = authorization {
                 request = request.header(header::AUTHORIZATION, authorization);
             }
@@ -2772,6 +2874,7 @@ mod tests {
         )
         .unwrap();
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -2784,6 +2887,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+
+        let mut retention_create = task_request("retention-scope");
+        retention_create.workspace_api = Some(WorkspaceApiRef {
+            workspace_id: "workspace-a".to_string(),
+            base_url: "https://backend.test".to_string(),
+        });
+        let retention_worker_id = retention_create.worker_id.clone();
+        runtime.create_worker(retention_create).unwrap();
+        let retention_path = format!("/v1/workers/{retention_worker_id}/retention/execute");
+        let retention_request = WorkerRetentionExecutionRequest {
+            operation_id: "retention-op".to_string(),
+            input_fingerprint: "fingerprint".to_string(),
+            archive_id: None,
+            workspace_id: "workspace-b".to_string(),
+            source_runtime_id: "runtime-a".to_string(),
+            worker_id: retention_worker_id,
+            expected_worker_revision: "revision".to_string(),
+            source_created_at: "2025-01-01T00:00:00Z".to_string(),
+            removed_at: "2025-01-02T00:00:00Z".to_string(),
+            effective_profile: None,
+            retention_class: None,
+            policy_id: "policy".to_string(),
+            policy_revision: 1,
+            session_disposition: SessionDisposition::Purge,
+            diagnostics_disposition: DiagnosticsDisposition::Retain,
+        };
+        let retention_body = serde_json::to_vec(&retention_request).unwrap();
+        let retention_claims = WorkspaceCapabilityClaims {
+            operation: required_runtime_permission(&Method::POST, &retention_path)
+                .unwrap()
+                .to_string(),
+            method: "POST".to_string(),
+            path_and_query: retention_path.clone(),
+            worker_id: Some(retention_worker_id.to_string()),
+            body_digest: workspace_request_body_digest(&retention_body),
+            jti: "retention-scope-token".to_string(),
+            ..ping_claims
+        };
+        let retention_token = issue_workspace_capability_token(
+            &workspace_identity.signing_key().unwrap(),
+            &retention_claims,
+        )
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(retention_path)
+                    .header(header::AUTHORIZATION, format!("Bearer {retention_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(retention_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let error: RuntimeHttpErrorResponse = read_json(response).await;
+        assert_eq!(error.error.code, "worker_not_found");
     }
 
     #[test]
@@ -2941,15 +3102,21 @@ mod tests {
     #[test]
     fn workdir_routes_require_dedicated_operation_permission() {
         assert_eq!(
-            required_runtime_permission(&Method::POST, "/v1/working-directories/repository-access",),
+            required_runtime_permission(
+                &Method::POST,
+                runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORY_REPOSITORY_ACCESS,
+            ),
             Some("workdirs:operate")
         );
         assert_eq!(
-            required_runtime_permission(&Method::POST, "/v1/repository-refs/observe"),
+            required_runtime_permission(
+                &Method::POST,
+                runtime_api::RUNTIME_ROUTE_REPOSITORY_REFS_OBSERVE
+            ),
             Some("workdirs:operate")
         );
         assert_eq!(
-            required_runtime_permission(&Method::POST, SSH_HOST_KEY_PROBE_PATH),
+            required_runtime_permission(&Method::POST, runtime_api::RUNTIME_ROUTE_SSH_PROBE),
             Some(SSH_HOST_KEY_PROBE_OPERATION)
         );
         assert_eq!(
@@ -3264,6 +3431,132 @@ mod tests {
         let token = "local-token";
         let app = runtime_http_router(runtime.clone(), token.to_string());
 
+        let malformed_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/workers")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed_response.status(), StatusCode::BAD_REQUEST);
+        let malformed: RuntimeHttpErrorResponse = read_json(malformed_response).await;
+        assert_eq!(malformed.error.code, "invalid_json");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_app = app.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, server_app).await.unwrap();
+        });
+        let client = runtime_api::RuntimeApiClient::builder(&format!("http://{address}"))
+            .unwrap()
+            .authorizer(TestRuntimeAuthorizer(token.to_string()))
+            .build()
+            .unwrap();
+        let generated_request: runtime_api::CreateWorkerRequest = serde_json::from_value(
+            serde_json::to_value(task_request("generated-roundtrip")).unwrap(),
+        )
+        .unwrap();
+        let generated_worker_id = generated_request.worker_id.to_string();
+        let mut conflicting_request = generated_request.clone();
+        conflicting_request.create_fingerprint = "different-fingerprint".to_string();
+        let generated = client.create_worker(generated_request).await.unwrap();
+        assert_eq!(generated.worker.worker_id.to_string(), generated_worker_id);
+        let generated_input: runtime_api::WorkerInput = serde_json::from_value(
+            serde_json::to_value(WorkerInput::user("generated client input")).unwrap(),
+        )
+        .unwrap();
+        client
+            .send_worker_input(generated_worker_id.clone(), generated_input)
+            .await
+            .unwrap();
+        client
+            .stop_worker(
+                generated_worker_id.clone(),
+                runtime_api::WorkerLifecycleRequest::default(),
+            )
+            .await
+            .unwrap();
+        client
+            .restore_worker(
+                generated_worker_id.clone(),
+                runtime_api::EmptyObjectRequest::default(),
+            )
+            .await
+            .unwrap();
+        let conflict = client.create_worker(conflicting_request).await.unwrap_err();
+        assert!(
+            matches!(
+                &conflict,
+                runtime_api::client_support::ClientError::Public { status, .. }
+                    if *status == StatusCode::CONFLICT
+            ),
+            "{conflict:?}"
+        );
+        client
+            .stop_worker(
+                generated_worker_id.clone(),
+                runtime_api::WorkerLifecycleRequest::default(),
+            )
+            .await
+            .unwrap();
+        client
+            .delete_worker(generated_worker_id.clone())
+            .await
+            .unwrap();
+        let missing = client
+            .get_worker(generated_worker_id.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            missing,
+            runtime_api::client_support::ClientError::Public { status, .. }
+                if status == StatusCode::NOT_FOUND
+        ));
+        let unauthorized = runtime_api::RuntimeApiClient::builder(&format!("http://{address}"))
+            .unwrap()
+            .build()
+            .unwrap()
+            .list_workers(runtime_api::WorkerListQuery::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            unauthorized,
+            runtime_api::client_support::ClientError::Public { status, .. }
+                if status == StatusCode::UNAUTHORIZED
+        ));
+        let forbidden_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/ping")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden_response.status(), StatusCode::FORBIDDEN);
+        let bounded_client = runtime_api::RuntimeApiClient::builder(&format!("http://{address}"))
+            .unwrap()
+            .authorizer(TestRuntimeAuthorizer(token.to_string()))
+            .response_body_limit(1)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            bounded_client.runtime_summary().await.unwrap_err(),
+            runtime_api::client_support::ClientError::Failure(
+                runtime_api::client_support::ClientFailure::ResponseTooLarge { .. }
+            )
+        ));
+        server.abort();
+
         let response = authed_json_request(
             app.clone(),
             Method::POST,
@@ -3344,9 +3637,12 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        let restored: RuntimeHttpWorkerRestoreResponse = read_json(response).await;
+        let restored: runtime_api::WorkerRestoreResponse = read_json(response).await;
         assert_eq!(restored.state, WorkerRestoreState::Accepted);
-        assert_eq!(restored.worker.unwrap().status, WorkerStatus::Idle);
+        assert_eq!(
+            restored.worker.unwrap().status,
+            runtime_api::WorkerStatus::Idle
+        );
 
         let response = authed_empty_request(
             app.clone(),
@@ -3406,11 +3702,11 @@ mod tests {
     #[test]
     fn ssh_probe_uses_workdir_operation_capability() {
         assert_eq!(
-            required_runtime_permission(&Method::POST, SSH_HOST_KEY_PROBE_PATH),
+            required_runtime_permission(&Method::POST, runtime_api::RUNTIME_ROUTE_SSH_PROBE),
             Some(SSH_HOST_KEY_PROBE_OPERATION)
         );
         assert_eq!(
-            workspace_runtime_operation(&Method::POST, SSH_HOST_KEY_PROBE_PATH),
+            workspace_runtime_operation(&Method::POST, runtime_api::RUNTIME_ROUTE_SSH_PROBE),
             SSH_HOST_KEY_PROBE_OPERATION
         );
     }
@@ -3427,7 +3723,7 @@ mod tests {
         let response = authed_json_request(
             app,
             Method::POST,
-            SSH_HOST_KEY_PROBE_PATH,
+            runtime_api::RUNTIME_ROUTE_SSH_PROBE,
             token,
             &SshHostKeyProbeRequest {
                 hostname: "-oProxyCommand=malicious".to_string(),
@@ -3492,8 +3788,14 @@ mod tests {
             .unwrap();
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
 
-        let response =
-            authed_json_request(app, Method::POST, SSH_HOST_KEY_PROBE_PATH, token, &body).await;
+        let response = authed_json_request(
+            app,
+            Method::POST,
+            runtime_api::RUNTIME_ROUTE_SSH_PROBE,
+            token,
+            &body,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             std::fs::read_to_string(recorded_arguments).unwrap(),

@@ -171,6 +171,15 @@ pub trait Operation {
     const METADATA: OperationMetadata;
 }
 
+/// Public JSON error that can select its concrete HTTP status at the server boundary.
+///
+/// `error_status` remains the contract's default/documented status. Implementations may return a
+/// different 4xx/5xx status for one named error shape, allowing a generated client to preserve a
+/// service's typed 401/403/404/409 responses without introducing duplicate route handlers.
+pub trait HttpError {
+    fn status_code(&self) -> u16;
+}
+
 /// Marker used when an operation has no request, response, or public error body.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum NoBody {}
