@@ -1489,6 +1489,44 @@ where
     Ok(workdir_for_view)
 }
 
+fn reject_method_while_attention_locked(
+    method: &Method,
+    working_event_tx: &broadcast::Sender<Event>,
+    message: &str,
+) -> bool {
+    match method {
+        Method::Shutdown { .. } | Method::ListPendingSubmissions => false,
+        Method::Submit {
+            submission_request_id,
+            ..
+        }
+        | Method::SubmitTracked {
+            submission_request_id,
+            ..
+        } => {
+            let _ = working_event_tx.send(Event::SubmissionRejected {
+                submission_request_id: submission_request_id.clone(),
+                message: message.to_owned(),
+            });
+            true
+        }
+        Method::Notify { .. } | Method::NotifyTracked { .. } => {
+            let _ = working_event_tx.send(Event::Error {
+                code: ErrorCode::InvalidRequest,
+                message: message.to_owned(),
+            });
+            true
+        }
+        _ => {
+            let _ = working_event_tx.send(Event::Error {
+                code: ErrorCode::InvalidRequest,
+                message: message.to_owned(),
+            });
+            true
+        }
+    }
+}
+
 /// Idle/Paused event loop. Each iteration either fires a staged
 /// `PendingRun` (delegating to [`drive_turn`] for the Running phase) or
 /// waits for the next `Method`. Method handlers stop at "update state +
@@ -1551,6 +1589,12 @@ async fn controller_loop<C, St>(
     let mut deferred_methods = VecDeque::new();
 
     'controller: loop {
+        if worker.has_failed_segment_activation() || worker.has_pending_compaction_cleanup() {
+            // A queued activation may have been accepted while the failing turn
+            // was still running. Preserve its durable queue entry, but never
+            // start it while repair/cleanup attention is required.
+            pending = None;
+        }
         // here so the status flip → drive_turn → finish sequence lives
         // in one place, regardless of which Method caused it.
         if let Some(run) = pending.take() {
@@ -1700,7 +1744,15 @@ async fn controller_loop<C, St>(
             tokio::select! {
                 method = method_rx.recv() => match method {
                     Some(method) => method,
-                    None => break,
+                    None => {
+                        while worker.has_pending_compaction_cleanup() {
+                            if let Err(error) = worker.retry_pending_compaction_cleanup().await {
+                                tracing::warn!(error = %error, "shutdown waiting for compaction cleanup");
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                        }
+                        break 'controller;
+                    }
                 },
                 _ = notify_buffer.notified() => continue,
                 _ = tokio::time::sleep(remaining) => {
@@ -1726,11 +1778,62 @@ async fn controller_loop<C, St>(
             tokio::select! {
                 method = method_rx.recv() => match method {
                     Some(method) => method,
-                    None => break,
+                    None => {
+                        while worker.has_pending_compaction_cleanup() {
+                            if let Err(error) = worker.retry_pending_compaction_cleanup().await {
+                                tracing::warn!(error = %error, "shutdown waiting for compaction cleanup");
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                        }
+                        break 'controller;
+                    }
                 },
                 _ = notify_buffer.notified() => continue,
             }
         };
+
+        if worker.has_pending_compaction_cleanup() {
+            match worker.retry_pending_compaction_cleanup().await {
+                Ok(()) => {
+                    set_controller_state(
+                        &shared_state,
+                        &runtime_dir,
+                        &working_event_tx,
+                        WorkerState::Idle,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    let _ = working_event_tx.send(Event::Error {
+                        code: worker_error_code(&error),
+                        message: message.clone(),
+                    });
+                    if reject_method_while_attention_locked(
+                        &method,
+                        &working_event_tx,
+                        &message,
+                    ) {
+                        continue;
+                    }
+                    // Shutdown is an explicit cleanup barrier: it is not allowed
+                    // to complete while the service remains unconfirmed.
+                    if matches!(&method, Method::Shutdown { .. }) {
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if worker.has_failed_segment_activation()
+            && reject_method_while_attention_locked(
+                &method,
+                &working_event_tx,
+                "Segment activation is incomplete; restore or shut down the Worker",
+            )
+        {
+            continue;
+        }
 
         match method {
             Method::Submit {
@@ -2165,6 +2268,15 @@ async fn controller_loop<C, St>(
                     });
                 }
                 if shutdown_after_compaction {
+                    while worker.has_pending_compaction_cleanup() {
+                        if let Err(error) = worker.retry_pending_compaction_cleanup().await {
+                            let _ = working_event_tx.send(Event::Error {
+                                code: worker_error_code(&error),
+                                message: error.to_string(),
+                            });
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
                     let _ = working_event_tx.send(Event::Shutdown);
                     break 'controller;
                 }
@@ -3331,6 +3443,28 @@ mod tests {
             WorkerEvent::TurnEnded { worker_name } => assert_eq!(worker_name, "child-worker"),
             other => panic!("expected TurnEnded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn attention_gate_rejects_submit_before_dispatch() {
+        let (event_tx, mut event_rx) = broadcast::channel(4);
+        let method = Method::Submit {
+            submission_request_id: "request-1".into(),
+            input: Vec::new(),
+        };
+
+        assert!(reject_method_while_attention_locked(
+            &method,
+            &event_tx,
+            "repair required",
+        ));
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            Event::SubmissionRejected {
+                submission_request_id,
+                message,
+            } if submission_request_id == "request-1" && message == "repair required"
+        ));
     }
 
     #[tokio::test]

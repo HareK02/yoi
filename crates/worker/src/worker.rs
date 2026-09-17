@@ -5178,6 +5178,21 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         }
     }
 
+    pub(crate) fn has_pending_compaction_cleanup(&self) -> bool {
+        self.pending_compaction_cleanup
+            .lock()
+            .expect("pending compaction cleanup mutex poisoned")
+            .is_some()
+    }
+
+    pub(crate) fn has_failed_segment_activation(&self) -> bool {
+        self.segment_state.activation_failed.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn retry_pending_compaction_cleanup(&self) -> Result<(), WorkerError> {
+        self.release_pending_compaction_service().await
+    }
+
     async fn release_pending_compaction_service(&self) -> Result<(), WorkerError> {
         let cleanup = self
             .pending_compaction_cleanup
@@ -5480,7 +5495,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         }));
 
         if let Err(error) = handle.send(summary_input.text).await {
-            let _ = registry.remove_service(&handle.session_id_string());
+            // Keep the registry record and Worker-owned cleanup authority. The
+            // outer compaction boundary performs the single stop attempt.
             return Err(WorkerError::InvalidState(error.to_string()));
         }
         match handle.wait_until_idle().await {

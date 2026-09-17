@@ -62,7 +62,10 @@ is pending. Cleanup authority is stored on the Worker (not only on one compactio
 future). A failed stop returns a typed cleanup-pending outcome without clearing that
 authority; the next compaction boundary retries it. The authority and lifecycle
 reference are cleared exactly once after the registry record is gone, before
-activation or a terminal idle-capable result.
+activation or a terminal idle-capable result. While either activation repair or
+cleanup attention is outstanding, the controller fences Submit/Notify dispatch and
+does not start queued work. Shutdown is itself a cleanup barrier: it is not emitted
+until the retained service record has been stopped successfully.
 
 ## Metrics and comparison procedure
 
