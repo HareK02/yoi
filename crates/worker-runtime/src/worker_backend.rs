@@ -1569,6 +1569,39 @@ where
         .unwrap_or_else(|message| WorkerExecutionResult::errored(operation, message))
     }
 
+    fn retain_uncertain_unconnected_controller(
+        &self,
+        worker_ref: &crate::identity::WorkerRef,
+        handle: WorkerHandle,
+        shutdown: Arc<tokio::sync::Mutex<Option<worker::ShutdownReceiver>>>,
+        tasks: RuntimeExecutionTaskScope,
+        worker_state: Arc<RwLock<protocol::WorkerStateSnapshot>>,
+        workspace_client: Option<Arc<dyn WorkspaceClient>>,
+    ) -> Result<WorkerExecutionHandle, String> {
+        let mut workers = self
+            .workers
+            .lock()
+            .map_err(|_| "worker adapter registry lock is poisoned".to_string())?;
+        if workers.contains_key(worker_ref) {
+            return Err("Worker already has a retained execution handle".to_string());
+        }
+        workers.insert(
+            worker_ref.clone(),
+            RuntimeWorkerExecution {
+                handle,
+                shutdown,
+                shutdown_requested: Arc::new(AtomicBool::new(false)),
+                tasks,
+                worker_state,
+                workspace_client,
+            },
+        );
+        Ok(WorkerExecutionHandle::new(
+            worker_ref.clone(),
+            self.backend_id(),
+        ))
+    }
+
     fn cleanup_unconnected_controller(
         &self,
         handle: &WorkerHandle,
@@ -1618,11 +1651,19 @@ where
         working_directory: Option<WorkingDirectoryBinding>,
         workspace_client: Option<Arc<dyn WorkspaceClient>>,
     ) -> WorkerExecutionSpawnResult {
-        let worker_state = Arc::new(RwLock::new(handle.shared_state.snapshot()));
+        #[cfg(feature = "ws-server")]
+        let streams = subscribe_worker_protocol_session(&handle);
+        #[cfg(feature = "ws-server")]
+        let worker_state_snapshot = match &streams.snapshot_event {
+            Event::Snapshot { state, .. } => state.clone(),
+            _ => unreachable!("Worker protocol subscription snapshot must be a snapshot event"),
+        };
+        #[cfg(not(feature = "ws-server"))]
+        let worker_state_snapshot = handle.shared_state.snapshot();
+        let worker_state = Arc::new(RwLock::new(worker_state_snapshot));
         let tasks = RuntimeExecutionTaskScope::new(controller_task);
         #[cfg(feature = "ws-server")]
         {
-            let streams = subscribe_worker_protocol_session(&handle);
             let mut events = streams.events;
             let mut entry_events = streams.log_entries;
             let bridge_worker_state = worker_state.clone();
@@ -1684,12 +1725,28 @@ where
                     return if operation == WorkerExecutionOperation::Restore {
                         match cleanup {
                             Ok(()) => WorkerExecutionSpawnResult::RolledBack(result),
-                            Err(_) => WorkerExecutionSpawnResult::ReconciliationRequired {
-                                result,
-                                handle: None,
-                                worker_state: None,
-                                working_directory: None,
-                            },
+                            Err(_) => {
+                                let retained_state =
+                                    worker_state.read().ok().map(|state| state.clone());
+                                let retained_working_directory =
+                                    working_directory.as_ref().map(|binding| binding.status());
+                                let retained_handle = self
+                                    .retain_uncertain_unconnected_controller(
+                                        &worker_ref,
+                                        handle,
+                                        shutdown,
+                                        tasks,
+                                        worker_state,
+                                        workspace_client,
+                                    )
+                                    .ok();
+                                WorkerExecutionSpawnResult::ReconciliationRequired {
+                                    result,
+                                    handle: retained_handle,
+                                    worker_state: retained_state,
+                                    working_directory: retained_working_directory,
+                                }
+                            }
                         }
                     } else {
                         WorkerExecutionSpawnResult::Errored(result)

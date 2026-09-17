@@ -1622,10 +1622,10 @@ impl Runtime {
                     "Worker restore was rejected before live work started",
                 ))
             }
-            WorkerExecutionSpawnResult::RolledBack(result) => {
+            WorkerExecutionSpawnResult::RolledBack(_result) => {
                 #[cfg(feature = "fs-store")]
                 self.lock()?
-                    .record_restore_failure(worker_ref, result)?;
+                    .record_restore_failure(worker_ref, _result)?;
                 Ok(RuntimeWorkerRestoreResult::failed(
                     WorkerRestoreState::RolledBack,
                     "worker_restore_rolled_back",
