@@ -18,7 +18,7 @@ use crate::auth::{BACKEND_RESOURCE_FETCH_PERMISSION, RuntimeIdentityMaterial};
 use crate::catalog::{
     CreateWorkerRequest, ProfileSourceArchiveSource, RepositoryRefObservation,
     RepositoryRefObservationRequest, WorkingDirectoryRepositoryAccessRequest,
-    WorkingDirectoryRequest, WorkingDirectoryStatus,
+    WorkingDirectoryRequest, WorkingDirectoryStatus, WorkingDirectoryStatusKind,
 };
 use crate::config_bundle::{ConfigBundle, workspace_config_etag};
 use crate::execution::{
@@ -59,7 +59,9 @@ fn next_internal_command(
         .max(floor);
     Ok(WorkerCommandEnvelope::new(command_id))
 }
-use session_store::{CombinedStore, WorkerAggregateStore, WorkerSessionStore};
+use session_store::{
+    CombinedStore, Store, WorkerAggregateStore, WorkerMetadataStore, WorkerSessionStore,
+};
 #[cfg(test)]
 use session_store::{FsStore, FsWorkerStore};
 use tokio::runtime::Runtime;
@@ -121,6 +123,13 @@ pub trait RuntimeWorkerFactory: Send + Sync + 'static {
         &self,
         request: WorkerExecutionSpawnRequest,
     ) -> Result<RuntimeWorkerController, String>;
+
+    async fn preflight_restore(
+        &self,
+        _request: &WorkerExecutionRestoreRequest,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 
     async fn restore_controller(
         &self,
@@ -1002,6 +1011,56 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         })
     }
 
+    async fn preflight_restore(
+        &self,
+        request: &WorkerExecutionRestoreRequest,
+    ) -> Result<(), String> {
+        let worker_name = Self::runtime_worker_name_for_ref(&request.worker_ref);
+        let (mut manifest, _) = Self::restore_fallback_manifest(&worker_name)?;
+        bind_workspace_memory_settings(&mut manifest, &request.request)?;
+        let worker_aggregate_dir = self.worker_aggregate_dir(&request.worker_ref)?;
+        if !worker_aggregate_dir.is_dir() {
+            return Err("Persisted Worker aggregate metadata is unavailable".to_string());
+        }
+        if !worker_aggregate_dir.join("session").is_dir() {
+            return Err("Persisted Worker Session metadata is unavailable".to_string());
+        }
+        let metadata_store = WorkerAggregateStore::new(&worker_aggregate_dir, &worker_name)
+            .map_err(|error| format!("failed to read Worker aggregate metadata: {error}"))?;
+        let metadata = metadata_store
+            .read_by_name(&worker_name)
+            .map_err(|error| format!("failed to read Worker metadata: {error}"))?
+            .ok_or_else(|| "Persisted Worker metadata is unavailable".to_string())?;
+        if let Some(active) = metadata.active.as_ref()
+            && let Some(segment_id) = active.segment_id
+        {
+            let session_store = WorkerSessionStore::new(worker_aggregate_dir.join("session"))
+                .map_err(|error| format!("failed to read Worker Session store: {error}"))?;
+            if !session_store
+                .exists(active.session_id, segment_id)
+                .map_err(|error| format!("failed to inspect Worker Session segment: {error}"))?
+            {
+                return Err("Persisted Worker Session segment is unavailable".to_string());
+            }
+            session_store
+                .read_all(active.session_id, segment_id)
+                .map_err(|error| format!("failed to read Worker Session segment: {error}"))?;
+        }
+        if request.request.workspace_api.is_some()
+            && metadata
+                .active
+                .as_ref()
+                .is_some_and(|active| active.segment_id.is_none())
+            && request.config_bundle.is_none()
+        {
+            return Err(
+                "Pending Workspace Worker restore requires current profile launch authority"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     async fn restore_controller(
         &self,
         request: WorkerExecutionRestoreRequest,
@@ -1310,6 +1369,7 @@ pub struct WorkerRuntimeExecutionBackend<F = ProfileRuntimeWorkerFactory> {
     working_directory_materializer: Option<Arc<dyn WorkingDirectoryMaterializer>>,
     runtime: Mutex<Option<Runtime>>,
     workers: Mutex<HashMap<crate::identity::WorkerRef, RuntimeWorkerExecution>>,
+    restore_lock: Mutex<()>,
     spawn_restore_timeout: Duration,
 }
 
@@ -1338,6 +1398,7 @@ where
             working_directory_materializer: None,
             runtime: Mutex::new(Some(runtime)),
             workers: Mutex::new(HashMap::new()),
+            restore_lock: Mutex::new(()),
             spawn_restore_timeout: SPAWN_RESTORE_TASK_TIMEOUT,
         })
     }
@@ -1569,6 +1630,39 @@ where
         .unwrap_or_else(|message| WorkerExecutionResult::errored(operation, message))
     }
 
+    fn retain_uncertain_unconnected_controller(
+        &self,
+        worker_ref: &crate::identity::WorkerRef,
+        handle: WorkerHandle,
+        shutdown: Arc<tokio::sync::Mutex<Option<worker::ShutdownReceiver>>>,
+        tasks: RuntimeExecutionTaskScope,
+        worker_state: Arc<RwLock<protocol::WorkerStateSnapshot>>,
+        workspace_client: Option<Arc<dyn WorkspaceClient>>,
+    ) -> Result<WorkerExecutionHandle, String> {
+        let mut workers = self
+            .workers
+            .lock()
+            .map_err(|_| "worker adapter registry lock is poisoned".to_string())?;
+        if workers.contains_key(worker_ref) {
+            return Err("Worker already has a retained execution handle".to_string());
+        }
+        workers.insert(
+            worker_ref.clone(),
+            RuntimeWorkerExecution {
+                handle,
+                shutdown,
+                shutdown_requested: Arc::new(AtomicBool::new(false)),
+                tasks,
+                worker_state,
+                workspace_client,
+            },
+        );
+        Ok(WorkerExecutionHandle::new(
+            worker_ref.clone(),
+            self.backend_id(),
+        ))
+    }
+
     fn cleanup_unconnected_controller(
         &self,
         handle: &WorkerHandle,
@@ -1618,11 +1712,19 @@ where
         working_directory: Option<WorkingDirectoryBinding>,
         workspace_client: Option<Arc<dyn WorkspaceClient>>,
     ) -> WorkerExecutionSpawnResult {
-        let worker_state = Arc::new(RwLock::new(handle.shared_state.snapshot()));
+        #[cfg(feature = "ws-server")]
+        let streams = subscribe_worker_protocol_session(&handle);
+        #[cfg(feature = "ws-server")]
+        let worker_state_snapshot = match &streams.snapshot_event {
+            Event::Snapshot { state, .. } => state.clone(),
+            _ => unreachable!("Worker protocol subscription snapshot must be a snapshot event"),
+        };
+        #[cfg(not(feature = "ws-server"))]
+        let worker_state_snapshot = handle.shared_state.snapshot();
+        let worker_state = Arc::new(RwLock::new(worker_state_snapshot));
         let tasks = RuntimeExecutionTaskScope::new(controller_task);
         #[cfg(feature = "ws-server")]
         {
-            let streams = subscribe_worker_protocol_session(&handle);
             let mut events = streams.events;
             let mut entry_events = streams.log_entries;
             let bridge_worker_state = worker_state.clone();
@@ -1666,15 +1768,50 @@ where
             }) {
                 Ok(task) => task,
                 Err(message) => {
-                    let cleanup = self
-                        .cleanup_unconnected_controller(&handle, &shutdown, &tasks, &worker_state)
-                        .err()
-                        .map(|cleanup| format!("; controller cleanup failed: {cleanup}"))
-                        .unwrap_or_default();
-                    return WorkerExecutionSpawnResult::Errored(WorkerExecutionResult::errored(
+                    let cleanup = self.cleanup_unconnected_controller(
+                        &handle,
+                        &shutdown,
+                        &tasks,
+                        &worker_state,
+                    );
+                    let result = WorkerExecutionResult::errored(
                         operation,
-                        format!("{message}{cleanup}"),
-                    ));
+                        match &cleanup {
+                            Ok(()) => message,
+                            Err(cleanup) => {
+                                format!("{message}; controller cleanup failed: {cleanup}")
+                            }
+                        },
+                    );
+                    return if operation == WorkerExecutionOperation::Restore {
+                        match cleanup {
+                            Ok(()) => WorkerExecutionSpawnResult::RolledBack(result),
+                            Err(_) => {
+                                let retained_state =
+                                    worker_state.read().ok().map(|state| state.clone());
+                                let retained_working_directory =
+                                    working_directory.as_ref().map(|binding| binding.status());
+                                let retained_handle = self
+                                    .retain_uncertain_unconnected_controller(
+                                        &worker_ref,
+                                        handle,
+                                        shutdown,
+                                        tasks,
+                                        worker_state,
+                                        workspace_client,
+                                    )
+                                    .ok();
+                                WorkerExecutionSpawnResult::ReconciliationRequired {
+                                    result,
+                                    handle: retained_handle,
+                                    worker_state: retained_state,
+                                    working_directory: retained_working_directory,
+                                }
+                            }
+                        }
+                    } else {
+                        WorkerExecutionSpawnResult::Errored(result)
+                    };
                 }
             };
             tasks.push("protocol bridge", bridge_task, true);
@@ -1684,31 +1821,40 @@ where
             let _ = bridge_context;
         }
 
-        let mut workers = match self.workers.lock() {
-            Ok(workers) => workers,
-            Err(_) => {
-                let cleanup = self
-                    .cleanup_unconnected_controller(&handle, &shutdown, &tasks, &worker_state)
-                    .err()
-                    .map(|cleanup| format!("; controller cleanup failed: {cleanup}"))
-                    .unwrap_or_default();
-                return WorkerExecutionSpawnResult::Errored(WorkerExecutionResult::errored(
-                    operation,
-                    format!("worker adapter registry lock is poisoned{cleanup}"),
-                ));
-            }
-        };
+        let mut workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if workers.contains_key(&worker_ref) {
+            let existing_worker_state = workers
+                .get(&worker_ref)
+                .and_then(|worker| worker.worker_state.read().ok().map(|state| state.clone()));
+            let existing_handle = WorkerExecutionHandle::new(worker_ref.clone(), self.backend_id());
             drop(workers);
-            let cleanup = self
-                .cleanup_unconnected_controller(&handle, &shutdown, &tasks, &worker_state)
-                .err()
-                .map(|cleanup| format!("; controller cleanup failed: {cleanup}"))
-                .unwrap_or_default();
-            return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::busy(
+            let cleanup =
+                self.cleanup_unconnected_controller(&handle, &shutdown, &tasks, &worker_state);
+            let result = WorkerExecutionResult::busy(
                 operation,
-                format!("Worker is already connected to execution backend{cleanup}"),
-            ));
+                match &cleanup {
+                    Ok(()) => "Worker is already connected to execution backend".to_string(),
+                    Err(cleanup) => format!(
+                        "Worker is already connected to execution backend; controller cleanup failed: {cleanup}"
+                    ),
+                },
+            );
+            return if operation == WorkerExecutionOperation::Restore {
+                match cleanup {
+                    Ok(()) => WorkerExecutionSpawnResult::RolledBack(result),
+                    Err(_) => WorkerExecutionSpawnResult::ReconciliationRequired {
+                        result,
+                        handle: Some(existing_handle),
+                        worker_state: existing_worker_state,
+                        working_directory: None,
+                    },
+                }
+            } else {
+                WorkerExecutionSpawnResult::Rejected(result)
+            };
         }
         let connected_worker_state = worker_state
             .read()
@@ -1884,11 +2030,15 @@ where
     }
 
     fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
+        let _start_guard = self
+            .restore_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self
             .workers
             .lock()
-            .map(|workers| workers.contains_key(&request.worker_ref))
-            .unwrap_or(false)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&request.worker_ref)
         {
             return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::busy(
                 WorkerExecutionOperation::Spawn,
@@ -1995,10 +2145,111 @@ where
         )
     }
 
+    fn preflight_restore(
+        &self,
+        request: &WorkerExecutionRestoreRequest,
+    ) -> Result<(), WorkerExecutionResult> {
+        let workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if workers.contains_key(&request.worker_ref) {
+            return Err(WorkerExecutionResult::busy(
+                WorkerExecutionOperation::Restore,
+                "Worker is already connected to execution backend",
+            ));
+        }
+        drop(workers);
+
+        if let Some(previous) = request.previous_working_directory.as_ref() {
+            let materializer = self
+                .working_directory_materializer
+                .as_ref()
+                .ok_or_else(|| {
+                    WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::Restore,
+                        "Persisted Worker Workdir binding cannot be restored by this Runtime",
+                    )
+                })?;
+            let current = materializer
+                .working_directory_status(&previous.summary.working_directory_id)
+                .map_err(|message| {
+                    WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::Restore,
+                        format!("Persisted Worker Workdir is unavailable: {message}"),
+                    )
+                })?;
+            if current.summary.status != WorkingDirectoryStatusKind::Active {
+                return Err(WorkerExecutionResult::rejected(
+                    WorkerExecutionOperation::Restore,
+                    "Persisted Worker Workdir is not active",
+                ));
+            }
+        }
+        if request.previous_working_directory.is_none()
+            && request.request.working_directory_request.is_some()
+        {
+            return Err(WorkerExecutionResult::rejected(
+                WorkerExecutionOperation::Restore,
+                "Persisted Worker Workdir allocation is unavailable",
+            ));
+        }
+        if request.previous_working_directory.is_none()
+            && request.request.working_directory.is_some()
+            && self.working_directory_materializer.is_none()
+        {
+            return Err(WorkerExecutionResult::rejected(
+                WorkerExecutionOperation::Restore,
+                "Persisted Worker Workdir claim cannot be restored by this Runtime",
+            ));
+        }
+        if let Some(workspace_api) = request.request.workspace_api.as_ref() {
+            let Some(scope) = request.workspace_scope.as_ref() else {
+                return Err(WorkerExecutionResult::rejected(
+                    WorkerExecutionOperation::Restore,
+                    "Persisted Workspace restore authorization is unavailable",
+                ));
+            };
+            if scope.workspace_id != workspace_api.workspace_id {
+                return Err(WorkerExecutionResult::rejected(
+                    WorkerExecutionOperation::Restore,
+                    "Persisted Workspace restore authorization does not match Worker authority",
+                ));
+            }
+        }
+
+        let factory = Arc::clone(&self.factory);
+        let request = request.clone();
+        self.run_on_adapter_runtime(async move { factory.preflight_restore(&request).await })
+            .map_err(|message| {
+                WorkerExecutionResult::rejected(WorkerExecutionOperation::Restore, message)
+            })?;
+        Ok(())
+    }
+
     fn restore_worker(
         &self,
         mut request: WorkerExecutionRestoreRequest,
     ) -> WorkerExecutionSpawnResult {
+        // Serialize backend restore starts so duplicate detection is completed
+        // before any controller or bridge side effect. Runtime also serializes
+        // per Worker; this guard protects direct/concurrent backend callers.
+        let _restore_guard = self
+            .restore_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if workers.contains_key(&request.worker_ref) {
+            return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::busy(
+                WorkerExecutionOperation::Restore,
+                "Worker is already connected to execution backend",
+            ));
+        }
+        drop(workers);
+
         let working_directory = match request.previous_working_directory.clone() {
             Some(status) => {
                 let Some(materializer) = self.working_directory_materializer.as_ref() else {
@@ -2076,10 +2327,15 @@ where
         let controller = match restore_result {
             Ok(controller) => controller,
             Err(message) => {
-                return WorkerExecutionSpawnResult::Errored(WorkerExecutionResult::errored(
-                    WorkerExecutionOperation::Restore,
-                    message,
-                ));
+                return WorkerExecutionSpawnResult::ReconciliationRequired {
+                    result: WorkerExecutionResult::errored(
+                        WorkerExecutionOperation::Restore,
+                        message,
+                    ),
+                    handle: None,
+                    worker_state: None,
+                    working_directory: None,
+                };
             }
         };
 

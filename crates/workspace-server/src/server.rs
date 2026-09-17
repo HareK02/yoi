@@ -2814,7 +2814,7 @@ impl WorkspaceApi {
             .map_err(|error| error.into_error())?;
         if binding.state != WorkerOperationState::Accepted {
             return Ok(WorkerRestoreResult {
-                state: binding.state,
+                state: workspace_api::WorkerRestoreState::Rejected,
                 worker: binding.worker,
                 diagnostics: binding.diagnostics,
             });
@@ -10422,7 +10422,7 @@ async fn scoped_start_workspace_orchestrator(
             .runtime
             .restore_worker(&existing.worker)
             .map_err(|error| error.into_error())?;
-        if restored.state != WorkerOperationState::Accepted {
+        if restored.state != workspace_api::WorkerRestoreState::Accepted {
             return Err(ApiError::with_diagnostics(
                 Error::RuntimeOperationFailed {
                     runtime_id: existing.worker.runtime_id.clone(),
@@ -12501,7 +12501,7 @@ async fn scoped_restore_runtime_worker(
                 runtime_id: runtime_id.clone(),
                 worker_id: worker_id.clone(),
                 result: workspace_api::WorkerRestoreResult {
-                    state: workspace_api::WorkerOperationState::Accepted,
+                    state: workspace_api::WorkerRestoreState::Accepted,
                     worker: Some(worker),
                     diagnostics: Vec::new(),
                 },
@@ -15213,7 +15213,7 @@ async fn restore_runtime_worker(
         runtime_id: runtime_id.clone(),
         worker_id: worker_id.clone(),
         result: workspace_api::WorkerRestoreResult {
-            state: result.state.into(),
+            state: result.state,
             worker: projected_worker,
             diagnostics: result.diagnostics.into_iter().map(Into::into).collect(),
         },
@@ -20722,7 +20722,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_profile_backend_rejects_unrecoverable_pending_orchestrator_restore() {
+    async fn production_profile_backend_preflight_rejects_pending_orchestrator_restore() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let config = test_server_config(workspace.path());
@@ -20772,11 +20772,11 @@ mod tests {
             }),
         )
         .await
-        .expect_err("pending Workspace Orchestrator restore without durable Prompt must fail");
+        .expect_err(
+            "pending Workspace Orchestrator restore without durable Prompt must be rejected",
+        );
         assert!(
-            format!("{error:?}").contains(
-                "pending Workspace Worker restore requires operation-owned launch material"
-            ),
+            format!("{error:?}").contains("worker_restore_preflight_rejected"),
             "unexpected restore error: {error:?}"
         );
     }
@@ -25277,7 +25277,7 @@ mod tests {
         assert_eq!(retried_restore.worker_id, first_worker.worker.worker_id);
         assert_eq!(
             retried_restore.result.state,
-            workspace_api::WorkerOperationState::Accepted
+            workspace_api::WorkerRestoreState::Accepted
         );
         let restored_assignment = api
             .store

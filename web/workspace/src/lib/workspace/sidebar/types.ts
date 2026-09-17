@@ -112,6 +112,19 @@ export type Worker = {
 
 export type WorkerOperationState = "accepted" | "unsupported" | "rejected";
 
+/** Typed result of restore across Runtime, Workspace, Web, and TUI clients. */
+export type WorkerRestoreState =
+  | "accepted"
+  | "rejected"
+  | "rolled_back"
+  | "reconciliation_required";
+
+export type WorkerRestoreResult = {
+  state: WorkerRestoreState;
+  worker?: WorkerSummary | null;
+  diagnostics: Diagnostic[];
+};
+
 export type WorkerLaunchRuntimeOption = SharedWorkerLaunchRuntimeOption;
 export type WorkerLaunchProfileCandidate = SharedWorkerLaunchProfileCandidate;
 export type WorkingDirectoryRepositoryOption =

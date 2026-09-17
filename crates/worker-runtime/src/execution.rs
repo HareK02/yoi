@@ -286,7 +286,21 @@ pub enum WorkerExecutionSpawnResult {
         worker_state: protocol::WorkerStateSnapshot,
         working_directory: Option<WorkingDirectoryStatus>,
     },
+    /// A read-only preflight rejected the operation before live work started.
     Rejected(WorkerExecutionResult),
+    /// Live work started, failed, and all operation-owned resources were joined/released.
+    RolledBack(WorkerExecutionResult),
+    /// The operation crossed the live side-effect boundary and could not prove
+    /// either commit or complete cleanup. Optional handle/state fields preserve
+    /// concrete execution evidence for retry reconciliation.
+    ReconciliationRequired {
+        result: WorkerExecutionResult,
+        handle: Option<WorkerExecutionHandle>,
+        worker_state: Option<protocol::WorkerStateSnapshot>,
+        working_directory: Option<WorkingDirectoryStatus>,
+    },
+    /// Legacy spawn failure. Restore implementations must use `RolledBack` or
+    /// `ReconciliationRequired` after crossing their live side-effect boundary.
     Errored(WorkerExecutionResult),
 }
 
@@ -315,6 +329,15 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
     }
 
     fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult;
+
+    /// Read-only restore validation performed before any live controller,
+    /// bridge, task, or external registration is created.
+    fn preflight_restore(
+        &self,
+        _request: &WorkerExecutionRestoreRequest,
+    ) -> Result<(), WorkerExecutionResult> {
+        Ok(())
+    }
 
     fn restore_worker(
         &self,
@@ -507,6 +530,13 @@ impl WorkerExecutionBackendRef {
         request: WorkerExecutionSpawnRequest,
     ) -> WorkerExecutionSpawnResult {
         self.backend.spawn_worker(request)
+    }
+
+    pub(crate) fn preflight_restore(
+        &self,
+        request: &WorkerExecutionRestoreRequest,
+    ) -> Result<(), WorkerExecutionResult> {
+        self.backend.preflight_restore(request)
     }
 
     pub(crate) fn restore_worker(

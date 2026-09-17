@@ -3,7 +3,7 @@ use std::io;
 use std::time::Duration;
 
 use client::{
-    BackendRuntimeListTarget, BackendWorkerOperationState, BackendWorkerRestoreResponse,
+    BackendRuntimeListTarget, BackendWorkerRestoreResponse, BackendWorkerRestoreState,
     BackendWorkerSummary, list_backend_stopped_workers, list_backend_workers,
     restore_backend_worker,
 };
@@ -110,7 +110,7 @@ pub(crate) async fn run(
 }
 
 fn restored_worker(response: BackendWorkerRestoreResponse) -> Result<BackendWorkerSummary, String> {
-    if response.result.state != BackendWorkerOperationState::Accepted {
+    if response.result.state != BackendWorkerRestoreState::Accepted {
         let diagnostics = response
             .result
             .diagnostics
@@ -119,9 +119,10 @@ fn restored_worker(response: BackendWorkerRestoreResponse) -> Result<BackendWork
             .collect::<Vec<_>>()
             .join("; ");
         let state = match response.result.state {
-            BackendWorkerOperationState::Accepted => unreachable!(),
-            BackendWorkerOperationState::Rejected => "rejected",
-            BackendWorkerOperationState::Unsupported => "unsupported",
+            BackendWorkerRestoreState::Accepted => unreachable!(),
+            BackendWorkerRestoreState::Rejected => "rejected",
+            BackendWorkerRestoreState::RolledBack => "rolled back",
+            BackendWorkerRestoreState::ReconciliationRequired => "reconciliation required",
         };
         return Err(if diagnostics.is_empty() {
             format!("restore was {state} without a diagnostic")
@@ -494,7 +495,7 @@ mod tests {
     }
 
     fn restore_response(
-        state: BackendWorkerOperationState,
+        state: BackendWorkerRestoreState,
         worker: Option<BackendWorkerSummary>,
         diagnostics: Vec<BackendDiagnostic>,
     ) -> BackendWorkerRestoreResponse {
@@ -513,7 +514,7 @@ mod tests {
     #[test]
     fn rejected_restore_surfaces_diagnostic_instead_of_attaching_selected_worker() {
         let error = restored_worker(restore_response(
-            BackendWorkerOperationState::Rejected,
+            BackendWorkerRestoreState::Rejected,
             None,
             vec![BackendDiagnostic {
                 code: "working_directory_not_found".to_string(),
@@ -532,7 +533,7 @@ mod tests {
     #[test]
     fn accepted_restore_requires_returned_worker_snapshot() {
         let error = restored_worker(restore_response(
-            BackendWorkerOperationState::Accepted,
+            BackendWorkerRestoreState::Accepted,
             None,
             Vec::new(),
         ))
@@ -545,7 +546,7 @@ mod tests {
     fn accepted_restore_returns_authoritative_worker_snapshot() {
         let worker = worker("runtime-a", "worker-a", Some("builtin:companion"));
         let restored = restored_worker(restore_response(
-            BackendWorkerOperationState::Accepted,
+            BackendWorkerRestoreState::Accepted,
             Some(worker.clone()),
             Vec::new(),
         ))
