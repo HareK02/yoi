@@ -3970,6 +3970,68 @@ fn runtime_worker_create_failure_fields(
     }
 }
 
+const WORKER_CREATE_FAILURE_MESSAGE_LIMIT: usize = 512;
+
+fn sanitize_worker_create_failure_message(message: &str) -> String {
+    let mut redact_next = false;
+    let detail = message
+        .split_whitespace()
+        .map(|part| {
+            if redact_next {
+                redact_next = false;
+                return "[redacted]";
+            }
+            let lowercase = part.to_ascii_lowercase();
+            let label =
+                lowercase.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+            let redact_following = matches!(
+                label,
+                "bearer" | "credential" | "key" | "password" | "secret" | "session" | "token"
+            );
+            if redact_following {
+                redact_next = true;
+            }
+            if part.contains('/')
+                || part.contains('\\')
+                || (!redact_following
+                    && ["credential", "password", "secret", "session", "token"]
+                        .iter()
+                        .any(|marker| label.contains(marker)))
+                || lowercase.contains("credential=")
+                || lowercase.contains("key=")
+                || lowercase.contains("password=")
+                || lowercase.contains("secret=")
+                || lowercase.contains("session=")
+                || lowercase.contains("session_id=")
+                || lowercase.contains("token=")
+            {
+                "[redacted]"
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let truncated = detail.chars().count() > WORKER_CREATE_FAILURE_MESSAGE_LIMIT;
+    let mut detail = detail
+        .chars()
+        .take(WORKER_CREATE_FAILURE_MESSAGE_LIMIT)
+        .collect::<String>();
+    if truncated {
+        detail.push('…');
+    }
+    detail
+}
+
+fn runtime_worker_create_failure_message(error: &RuntimeError) -> Option<String> {
+    match error {
+        RuntimeError::WorkerExecutionRejected { message, .. } => {
+            Some(sanitize_worker_create_failure_message(message))
+        }
+        _ => None,
+    }
+}
+
 fn write_runtime_worker_create_failure(
     worker_id: WorkerId,
     workspace_id: Option<&str>,
@@ -3983,6 +4045,7 @@ fn write_runtime_worker_create_failure(
         }
         _ => "",
     };
+    let execution_failure_message = runtime_worker_create_failure_message(error);
     tracing::error!(
         target: "yoi::worker_create",
         event = "worker_create_failed",
@@ -3993,6 +4056,7 @@ fn write_runtime_worker_create_failure(
         operation = operation.as_deref().unwrap_or(""),
         outcome = outcome.as_deref().unwrap_or(""),
         execution_failure_code,
+        execution_failure_message = execution_failure_message.as_deref().unwrap_or(""),
         duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
         "Worker creation failed"
     );
@@ -4123,13 +4187,46 @@ mod tests {
     use std::sync::{Arc, Barrier, Condvar, Mutex};
 
     #[test]
-    fn worker_create_failure_fields_exclude_raw_error_messages() {
-        let (error_kind, operation, outcome) = runtime_worker_create_failure_fields(
-            &RuntimeError::InvalidRequest("private-token".to_string()),
-        );
+    fn worker_create_failure_fields_only_include_sanitized_execution_detail() {
+        let invalid_request = RuntimeError::InvalidRequest("private-token".to_string());
+        let (error_kind, operation, outcome) =
+            runtime_worker_create_failure_fields(&invalid_request);
         assert_eq!(error_kind, "invalid_request");
         assert_eq!(operation, None);
         assert_eq!(outcome, None);
+        assert_eq!(
+            runtime_worker_create_failure_message(&invalid_request),
+            None
+        );
+
+        let result = WorkerExecutionResult::errored(
+            WorkerExecutionOperation::Spawn,
+            "failed to spawn controller in /private/path: File exists; token super-secret",
+        );
+        let error = RuntimeError::WorkerExecutionRejected {
+            worker_id: WorkerId::now_v7(),
+            operation: result.operation,
+            outcome: result.outcome,
+            message: result.message_or_default(),
+            result,
+        };
+        assert_eq!(
+            runtime_worker_create_failure_message(&error).as_deref(),
+            Some("failed to spawn controller in [redacted] File exists; token [redacted]")
+        );
+
+        assert_eq!(
+            sanitize_worker_create_failure_message("backend private-token failed"),
+            "backend [redacted] failed"
+        );
+
+        let truncated = sanitize_worker_create_failure_message(&"x".repeat(513));
+        assert_eq!(truncated.chars().count(), 513);
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn worker_create_failure_code_classifies_durable_acceptance_timeout() {
         let timeout = WorkerExecutionResult::errored(
             WorkerExecutionOperation::Input,
             "timed out waiting for durable Worker Submit acceptance; private-token",
