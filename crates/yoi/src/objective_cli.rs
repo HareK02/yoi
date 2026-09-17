@@ -148,7 +148,7 @@ fn run_with_backend(
                 return Err(ObjectiveCliError::new("create --title must not be empty"));
             }
             let objective = backend
-                .create_objective(&workspace_api::ObjectiveCreateRequest {
+                .create_objective(&server_api::ObjectiveCreateRequest {
                     title: title.to_string(),
                     body_md: objective_body_template(),
                     state: "active".to_string(),

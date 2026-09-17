@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invalidateAll } from '$app/navigation';
   import { workspaceApiPath, workspaceRoute } from '$lib/workspace/api/http';
-  import type { RepositorySourceKind } from '$lib/generated/workspace-api';
+  import type { RepositorySourceKind } from '$lib/generated/legacy-server-api';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

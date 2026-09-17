@@ -4,7 +4,7 @@
     RuntimeConnectionTestResponse,
     RuntimePublicIdentityBundle,
     WorkspaceRuntimeResource,
-  } from '$lib/generated/workspace-api';
+  } from '$lib/generated/legacy-server-api';
   import {
     createRemoteRuntime,
     previewRuntimePublicKeyFingerprint,

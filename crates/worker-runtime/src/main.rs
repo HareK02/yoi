@@ -1355,8 +1355,8 @@ mod tests {
 
     #[test]
     fn workspace_issuer_trust_cli_persists_across_reload_and_writes_private_mode() {
+        use server_api::WorkspacePublicIdentityBundle;
         use sha2::{Digest as _, Sha256};
-        use workspace_api::WorkspacePublicIdentityBundle;
 
         let temp = tempfile::tempdir().unwrap();
         let identity = RuntimeIdentityMaterial::generate("WK-1").unwrap();

@@ -48,11 +48,11 @@ pub use server::{
     AuthConfig, ServerConfig, WorkspaceApi, WorkspaceServerApi, build_router,
     build_workspace_server_router, serve, serve_workspace_catalog,
 };
-pub use store::{ControlPlaneStore, SqliteWorkspaceStore, WorkspaceRecord};
-pub use workspace_api::{
+pub use server_api::{
     GitCommitSummary, GitRemoteSummary, GitRepositorySummary, RepositorySummary,
     WorkspaceCreateResponse,
 };
+pub use store::{ControlPlaneStore, SqliteWorkspaceStore, WorkspaceRecord};
 pub use workspace_catalog::{
     InitialRepositoryIntent, WorkspaceCatalogService, WorkspaceCreateRequest, WorkspaceCreateResult,
 };

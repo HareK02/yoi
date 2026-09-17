@@ -1,11 +1,11 @@
 use crate::{BackendApiClient, BackendApiClientError};
 use reqwest::Method;
-use std::fmt;
-use workspace_api::{
+use server_api::{
     InitialRepositoryIntent, RepositoryListResponse, RepositorySummary,
     WorkspaceCatalogListResponse, WorkspaceCreateRequest, WorkspaceCreateResponse,
     WorkspaceSummary,
 };
+use std::fmt;
 
 const DEFAULT_WORKSPACE_LIMIT: usize = 200;
 

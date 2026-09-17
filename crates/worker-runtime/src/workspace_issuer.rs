@@ -8,8 +8,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::signature::Ed25519KeyPair;
 use serde::{Deserialize, Serialize};
+use server_api::WorkspacePublicIdentityBundle;
 use sha2::{Digest, Sha256};
-use workspace_api::WorkspacePublicIdentityBundle;
 
 use crate::auth::RuntimeAuthError;
 

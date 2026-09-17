@@ -2584,9 +2584,9 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Method;
     use manifest::{Scope, SharedScope};
+    use runtime_api::WorkerRestoreState;
     use sha2::Digest as _;
     use tower::ServiceExt;
-    use workspace_api::WorkerRestoreState;
 
     #[derive(Clone)]
     struct TestRuntimeAuthorizer(String);

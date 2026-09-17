@@ -377,7 +377,20 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         .map_err(RuntimeHttpRestError::runtime)
         .map_err(api_error)?;
         Ok(runtime_api::WorkerRestoreResponse {
-            state: result.state,
+            state: match result.state {
+                server_api::WorkerRestoreState::Accepted => {
+                    runtime_api::WorkerRestoreState::Accepted
+                }
+                server_api::WorkerRestoreState::Rejected => {
+                    runtime_api::WorkerRestoreState::Rejected
+                }
+                server_api::WorkerRestoreState::RolledBack => {
+                    runtime_api::WorkerRestoreState::RolledBack
+                }
+                server_api::WorkerRestoreState::ReconciliationRequired => {
+                    runtime_api::WorkerRestoreState::ReconciliationRequired
+                }
+            },
             worker: result.worker.map(response).transpose()?,
             reason_code: result.reason_code,
             message: result.message,

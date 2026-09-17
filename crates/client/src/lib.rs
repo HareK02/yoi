@@ -43,16 +43,16 @@ pub use client::{Client, ClientError};
 pub use runtime_api::{
     RetainedSessionIdentity, WorkerSessionAvailability, WorkerSessionUnavailableReason,
 };
+pub use server_api::{
+    CompanionCancelRequest, CompanionLifecycleState, CompanionMessageDisposition,
+    CompanionMessageRequest, CompanionMessageResponse, CompanionStatusResponse,
+    CompanionTranscriptItem, CompanionTranscriptProjection, CompanionTranscriptRole,
+    CompanionTransportSummary, ObjectiveDetail, ObjectiveSummary,
+};
 pub use server_api::{ServerApi, ServerApiClient, WorkspaceWorkerSessionResponse};
 pub use target::{
     BackendTarget, BackendWorkerLaunch, Dashboard, ResolvedTarget, StandaloneTarget,
     StandaloneWorkerListIntent, StandaloneWorkerResumeIntent, Target, TargetError, TargetKind,
     WorkerConnection, WorkerConnectionSelector, WorkerList, WorkerListRequest, WorkerSpawn,
-};
-pub use workspace_api::{
-    CompanionCancelRequest, CompanionLifecycleState, CompanionMessageDisposition,
-    CompanionMessageRequest, CompanionMessageResponse, CompanionStatusResponse,
-    CompanionTranscriptItem, CompanionTranscriptProjection, CompanionTranscriptRole,
-    CompanionTransportSummary, ObjectiveDetail, ObjectiveSummary,
 };
 pub use workspace_product::BackendWorkspaceProductClient;

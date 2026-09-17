@@ -3,7 +3,7 @@
   import type {
     RevokeRuntimeTrustKeyRequest,
     RuntimeTrustKeyStatus,
-  } from '$lib/generated/workspace-api';
+  } from '$lib/generated/legacy-server-api';
   import {
     createRemoteRuntime,
     removeRemoteRuntime,

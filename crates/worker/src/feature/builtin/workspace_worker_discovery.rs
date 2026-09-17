@@ -168,7 +168,7 @@ fn input_schema() -> serde_json::Value {
 mod tests {
     use std::sync::Mutex;
 
-    use workspace_api::{
+    use server_api::{
         WorkspaceWorkerDiscoveryItem, WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
     };
 

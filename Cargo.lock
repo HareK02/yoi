@@ -660,7 +660,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.29.0",
  "uuid",
- "workspace-api",
 ]
 
 [[package]]
@@ -3719,7 +3718,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "workdir",
- "workspace-api",
 ]
 
 [[package]]
@@ -4136,11 +4134,14 @@ name = "server-api"
 version = "0.1.0"
 dependencies = [
  "api-macros",
+ "protocol",
  "runtime-api",
  "serde",
  "serde_json",
  "tokio",
- "workspace-api",
+ "ts-rs",
+ "webauthn-rs-proto",
+ "workdir",
 ]
 
 [[package]]
@@ -6090,7 +6091,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "workspace-api",
 ]
 
 [[package]]
@@ -6123,6 +6123,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "server-api",
  "session-metrics",
  "session-store",
  "sha2 0.11.0",
@@ -6137,7 +6138,6 @@ dependencies = [
  "tungstenite 0.28.0",
  "uuid",
  "workdir",
- "workspace-api",
 ]
 
 [[package]]
@@ -6160,6 +6160,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "server-api",
  "session-store",
  "sha2 0.11.0",
  "tar",
@@ -6175,19 +6176,7 @@ dependencies = [
  "uuid",
  "workdir",
  "worker",
- "workspace-api",
  "zeroize",
-]
-
-[[package]]
-name = "workspace-api"
-version = "0.1.0"
-dependencies = [
- "protocol",
- "serde",
- "serde_json",
- "ts-rs",
- "webauthn-rs-proto",
 ]
 
 [[package]]
@@ -6252,6 +6241,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "server-api",
  "session-analytics",
  "session-store",
  "tempfile",
@@ -6261,7 +6251,6 @@ dependencies = [
  "tui",
  "uuid",
  "worker",
- "workspace-api",
 ]
 
 [[package]]
@@ -6327,7 +6316,6 @@ dependencies = [
  "workdir",
  "worker",
  "worker-runtime",
- "workspace-api",
  "zeroize",
 ]
 

@@ -2,11 +2,7 @@ use crate::transport::websocket::{Socket as WebSocket, SocketError as WebSocketE
 use crate::{BackendApiClient, BackendApiClientError, Client};
 use reqwest::Method as HttpMethod;
 use serde::Deserialize;
-use std::fmt;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
-pub use workspace_api::{
+pub use server_api::{
     BrowserCreateWorkerResponse as BackendCreateWorkerResponse,
     CreateWorkspaceWorkerRequest as BackendCreateWorkerRequest, Diagnostic as BackendDiagnostic,
     DiagnosticSeverity as BackendDiagnosticSeverity, ListResponse as BackendRuntimeListResponse,
@@ -27,6 +23,10 @@ pub use workspace_api::{
     WorkingDirectoryListResponse as BackendWorkingDirectoryListResponse,
     WorkingDirectorySummary as BackendWorkingDirectorySummary,
 };
+use std::fmt;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BackendRuntimeTarget {

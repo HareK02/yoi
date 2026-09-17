@@ -11,16 +11,16 @@ use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use ssh_key::private::Ed25519Keypair;
-use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, PublicKey};
-use workspace_api::{
+use server_api::{
     CreateRepositorySshCredentialRequest, DeleteRepositorySshCredentialRequest,
     DeleteRepositorySshHostTrustRequest, GenerateRepositorySshCredentialRequest,
     PutRepositorySshHostTrustRequest, RepositoryAccessMode, RepositoryAccessProjection,
     RepositorySshAccessBinding, RepositorySshCredential, RepositorySshHostTrust,
     RepositorySshPublicKey, RotateRepositorySshCredentialRequest,
 };
+use sha2::{Digest, Sha256};
+use ssh_key::private::Ed25519Keypair;
+use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, PublicKey};
 
 use crate::config_source::{
     EvaluatedConfigCandidate, WorkspaceConfigSchemaProvider, WorkspaceConfigState,
@@ -138,7 +138,7 @@ pub fn project_repository_access_state(
 
 fn validate_repository_access_source(
     repository_key: &str,
-    source: &workspace_api::RepositorySource,
+    source: &server_api::RepositorySource,
 ) -> Result<()> {
     if crate::repository_source::is_plain_http_repository_source(source) {
         return Err(Error::InvalidInput(format!(
@@ -205,7 +205,7 @@ fn project_repository_access_evaluation(
     }
     let mut bindings = Vec::with_capacity(config.repository_access.len());
     for (repository_key, access) in config.repository_access {
-        workspace_api::validate_repository_key(&repository_key)
+        server_api::validate_repository_key(&repository_key)
             .map_err(|error| Error::InvalidInput(format!("invalid Repository key: {error}")))?;
         validate_identifier("credential_id", &access.ssh.credential)?;
         validate_identifier("host_trust_id", &access.ssh.host_trust)?;
@@ -213,7 +213,7 @@ fn project_repository_access_evaluation(
             .get_repository_by_key(workspace_id, &repository_key)?
             .ok_or_else(|| Error::InvalidInput(format!("unknown Repository `{repository_key}`")))?;
         validate_repository_access_source(&repository_key, &repository.source)?;
-        if repository.source.kind != workspace_api::RepositorySourceKind::Ssh {
+        if repository.source.kind != server_api::RepositorySourceKind::Ssh {
             return Err(Error::InvalidInput(format!(
                 "Repository `{repository_key}` is not an ssh:// Repository"
             )));
@@ -1940,8 +1940,8 @@ mod tests {
         DEFAULT_SCHEMA_VERSION, SnapshotEnvironment, ToolchainContract, VirtualPath,
         WorkspaceConfigSchemaBundle,
     };
+    use server_api::{RepositoryObservedStatus, RepositorySource, RepositorySourceKind};
     use ssh_key::private::Ed25519Keypair;
-    use workspace_api::{RepositoryObservedStatus, RepositorySource, RepositorySourceKind};
 
     fn test_private_key(seed: u8) -> (String, String) {
         let key = PrivateKey::from(Ed25519Keypair::from_seed(&[seed; 32]));
@@ -1995,8 +1995,8 @@ mod tests {
         assert!(error.to_string().contains("unsupported plain HTTP"));
         assert!(error.to_string().contains("HTTPS or SSH"));
 
-        let mismatched = workspace_api::RepositorySource {
-            kind: workspace_api::RepositorySourceKind::Https,
+        let mismatched = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::Https,
             uri: "http://git.example.test/team/project.git".to_string(),
         };
         let error = validate_repository_access_source("remote", &mismatched).unwrap_err();

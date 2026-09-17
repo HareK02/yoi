@@ -10,7 +10,6 @@ api-macros = { workspace = true, features = ["reqwest", "axum"] }
 manifest.workspace = true
 protocol.workspace = true
 serde = { workspace = true, features = ["derive"] }
-workspace-api.workspace = true
 workdir.workspace = true
 
 [dev-dependencies]

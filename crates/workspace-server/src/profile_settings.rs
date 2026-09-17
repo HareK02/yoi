@@ -4,16 +4,16 @@ use std::path::{Component, Path, PathBuf};
 use config_source::{ConfigContentType, ConfigSchemaContribution, VirtualPath};
 use manifest::{ProfileSource, builtin_profile_catalog_snapshot, resolve_profile_artifact_value};
 use serde::Deserialize;
+use server_api::{
+    ProfileSettingsResponse, WorkspaceMetadataSettingsResponse, WorkspaceProfileSourceProvenance,
+    WorkspaceProfileSourceSummary, WorkspaceProfileSummary,
+};
 use sha2::{Digest, Sha256};
 use worker::EffectivePromptCatalog;
 use worker_runtime::config_bundle::{
     ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigProfileDescriptor,
 };
 use worker_runtime::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveInput};
-use workspace_api::{
-    ProfileSettingsResponse, WorkspaceMetadataSettingsResponse, WorkspaceProfileSourceProvenance,
-    WorkspaceProfileSourceSummary, WorkspaceProfileSummary,
-};
 
 use crate::config_source::{
     WorkspaceConfigSchemaProvider, WorkspaceConfigState, evaluate_workspace_config_state,

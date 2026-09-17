@@ -26,48 +26,7 @@ use memory::backend::{
 use protocol::Segment;
 use protocol::stream::{decode_method, encode_event};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use ticket::{
-    MarkdownText, NewTicketEvent, TicketBackend, TicketBodyReplacement, TicketEventKind,
-    TicketIdOrSlug, TicketItemEdit, TicketStateChange, TicketTargetEdit, TicketWorkflowState,
-};
-use ticket::{
-    SqliteTicketBackend, TicketBackendOperation, TicketBackendOperationResult,
-    execute_ticket_backend_operation,
-};
-use tokio::net::TcpListener;
-use tokio::sync::Mutex as AsyncMutex;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tower::ServiceExt;
-use url::Url;
-use uuid::Uuid;
-use webauthn_rs::prelude::{
-    Passkey, PasskeyAuthentication, PasskeyRegistration, Webauthn, WebauthnBuilder,
-};
-use workdir::http::{
-    WorkdirSessionOperation, WorkdirSessionOperationResult, WorkdirTransportError,
-};
-use workdir::workspace::{
-    MaterializerKind, WorkingDirectoryCleanupTarget, WorkingDirectoryOccupancy,
-    WorkingDirectoryStatusKind, WorkingDirectorySummary, WorkspaceWorkdirSessionOperationRequest,
-};
-use workdir::{CommandHandle, WorkdirSessionHandle};
-use worker::feature::builtin::{WorkerObservationSubject, WorkerObservationSubjectRef};
-use worker_runtime::http_server::{
-    RUNTIME_HTTP_PROTOCOL_MAX_VERSION, RUNTIME_HTTP_PROTOCOL_MIN_VERSION,
-    RUNTIME_HTTP_PROTOCOL_VERSION,
-};
-use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
-use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
-use worker_runtime::workspace_issuer::{
-    WORKSPACE_VERIFICATION_ACK_PATH, WORKSPACE_VERIFICATION_CHALLENGE_PATH,
-    WORKSPACE_VERIFICATION_OPERATION, WorkspaceCapabilityClaims,
-    WorkspaceRuntimeVerificationAcknowledgement, WorkspaceRuntimeVerificationChallenge,
-    verify_runtime_verification_response, workspace_request_body_digest,
-};
-use workspace_api::{
+use server_api::{
     ActorAuthMethod, AuthBootstrapUserRequest, AuthPublicConfig, AuthUserResponse,
     AuthenticatedUser, BrowserCreateWorkerResponse, BrowserWorkspaceOrchestratorResponse,
     ConfirmRepositorySshHostTrustRequest, CreateRemoteRuntimeRequest,
@@ -113,6 +72,47 @@ use workspace_api::{
     WorkspaceSigningIdentityPublic, WorkspaceSigningIdentityResponse,
     WorkspaceSigningIdentityState, WorkspaceSummary, WorkspaceWorkerDiscoveryItem,
     WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
+};
+use sha2::{Digest, Sha256};
+use ticket::{
+    MarkdownText, NewTicketEvent, TicketBackend, TicketBodyReplacement, TicketEventKind,
+    TicketIdOrSlug, TicketItemEdit, TicketStateChange, TicketTargetEdit, TicketWorkflowState,
+};
+use ticket::{
+    SqliteTicketBackend, TicketBackendOperation, TicketBackendOperationResult,
+    execute_ticket_backend_operation,
+};
+use tokio::net::TcpListener;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tower::ServiceExt;
+use url::Url;
+use uuid::Uuid;
+use webauthn_rs::prelude::{
+    Passkey, PasskeyAuthentication, PasskeyRegistration, Webauthn, WebauthnBuilder,
+};
+use workdir::http::{
+    WorkdirSessionOperation, WorkdirSessionOperationResult, WorkdirTransportError,
+};
+use workdir::workspace::{
+    MaterializerKind, WorkingDirectoryCleanupTarget, WorkingDirectoryOccupancy,
+    WorkingDirectoryStatusKind, WorkingDirectorySummary, WorkspaceWorkdirSessionOperationRequest,
+};
+use workdir::{CommandHandle, WorkdirSessionHandle};
+use worker::feature::builtin::{WorkerObservationSubject, WorkerObservationSubjectRef};
+use worker_runtime::http_server::{
+    RUNTIME_HTTP_PROTOCOL_MAX_VERSION, RUNTIME_HTTP_PROTOCOL_MIN_VERSION,
+    RUNTIME_HTTP_PROTOCOL_VERSION,
+};
+use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
+use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
+use worker_runtime::workspace_issuer::{
+    WORKSPACE_VERIFICATION_ACK_PATH, WORKSPACE_VERIFICATION_CHALLENGE_PATH,
+    WORKSPACE_VERIFICATION_OPERATION, WorkspaceCapabilityClaims,
+    WorkspaceRuntimeVerificationAcknowledgement, WorkspaceRuntimeVerificationChallenge,
+    verify_runtime_verification_response, workspace_request_body_digest,
 };
 
 use crate::auth::{
@@ -203,7 +203,7 @@ use worker_runtime::identity::{RuntimeWorkerRef, WorkerId};
 
 const EMBEDDED_WORKER_RUNTIME_ID: &str = "embedded-worker-runtime";
 
-pub use workspace_api::WorkspaceAuthConfig as AuthConfig;
+pub use server_api::WorkspaceAuthConfig as AuthConfig;
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -360,15 +360,15 @@ impl ServerConfig {
     }
 }
 
-fn repository_local_path(source: &workspace_api::RepositorySource) -> Option<PathBuf> {
+fn repository_local_path(source: &server_api::RepositorySource) -> Option<PathBuf> {
     match source.kind {
-        workspace_api::RepositorySourceKind::LocalPath => Some(PathBuf::from(&source.uri)),
-        workspace_api::RepositorySourceKind::File => url::Url::parse(&source.uri)
+        server_api::RepositorySourceKind::LocalPath => Some(PathBuf::from(&source.uri)),
+        server_api::RepositorySourceKind::File => url::Url::parse(&source.uri)
             .ok()
             .and_then(|uri| uri.to_file_path().ok()),
-        workspace_api::RepositorySourceKind::Ssh
-        | workspace_api::RepositorySourceKind::Https
-        | workspace_api::RepositorySourceKind::Invalid => None,
+        server_api::RepositorySourceKind::Ssh
+        | server_api::RepositorySourceKind::Https
+        | server_api::RepositorySourceKind::Invalid => None,
     }
 }
 
@@ -2814,7 +2814,7 @@ impl WorkspaceApi {
             .map_err(|error| error.into_error())?;
         if binding.state != WorkerOperationState::Accepted {
             return Ok(WorkerRestoreResult {
-                state: workspace_api::WorkerRestoreState::Rejected,
+                state: server_api::WorkerRestoreState::Rejected,
                 worker: binding.worker,
                 diagnostics: binding.diagnostics,
             });
@@ -2858,7 +2858,7 @@ impl WorkspaceApi {
         &self,
         repository_key: &str,
     ) -> ApiResult<ConfiguredRepository> {
-        workspace_api::validate_repository_key(repository_key).map_err(|error| {
+        server_api::validate_repository_key(repository_key).map_err(|error| {
             ApiError::from(Error::InvalidInput(format!(
                 "invalid Repository key: {error}"
             )))
@@ -3067,7 +3067,7 @@ impl server_api::ServerApi for WorkspaceApi {
                 )
             })?;
         Ok(server_api::WorkspaceWorkerSessionResponse {
-            subject: workspace_api::WorkspaceWorkerSubject::RuntimeWorker {
+            subject: server_api::WorkspaceWorkerSubject::RuntimeWorker {
                 runtime_id,
                 worker_id,
             },
@@ -4291,9 +4291,9 @@ async fn scoped_update_workspace_settings(
     let workspace = crate::profile_settings::workspace_metadata_settings(&workspace);
     Ok(Json(WorkspaceMetadataMutationResponse {
         workspace,
-        diagnostics: vec![workspace_api::Diagnostic {
+        diagnostics: vec![server_api::Diagnostic {
             code: "workspace_metadata_updated".to_string(),
-            severity: workspace_api::DiagnosticSeverity::Info,
+            severity: server_api::DiagnosticSeverity::Info,
             message: "Workspace display metadata was updated.".to_string(),
         }],
     }))
@@ -4453,13 +4453,13 @@ struct WorkspaceConfigTreeResponse {
 async fn scoped_get_workspace_memory_settings(
     State(api): State<WorkspaceApi>,
     AxumPath(workspace_id): AxumPath<String>,
-) -> ApiResult<Json<workspace_api::WorkspaceMemorySettings>> {
+) -> ApiResult<Json<server_api::WorkspaceMemorySettings>> {
     validate_workspace_scope(&api, &workspace_id)?;
     let settings = api
         .config_store
         .get_workspace_memory_settings(&workspace_id)
         .map_err(ApiError::from)?;
-    Ok(Json(workspace_api::WorkspaceMemorySettings {
+    Ok(Json(server_api::WorkspaceMemorySettings {
         workspace_id: settings.workspace_id,
         settings_revision: settings.settings_revision,
         language: settings.language,
@@ -4469,8 +4469,8 @@ async fn scoped_get_workspace_memory_settings(
 async fn scoped_update_workspace_memory_settings(
     State(api): State<WorkspaceApi>,
     AxumPath(workspace_id): AxumPath<String>,
-    Json(request): Json<workspace_api::UpdateWorkspaceMemorySettingsRequest>,
-) -> ApiResult<Json<workspace_api::WorkspaceMemorySettings>> {
+    Json(request): Json<server_api::UpdateWorkspaceMemorySettingsRequest>,
+) -> ApiResult<Json<server_api::WorkspaceMemorySettings>> {
     validate_workspace_scope(&api, &workspace_id)?;
     let settings = api
         .config_store
@@ -4480,7 +4480,7 @@ async fn scoped_update_workspace_memory_settings(
             &request.language,
         )
         .map_err(ApiError::from)?;
-    Ok(Json(workspace_api::WorkspaceMemorySettings {
+    Ok(Json(server_api::WorkspaceMemorySettings {
         workspace_id: settings.workspace_id,
         settings_revision: settings.settings_revision,
         language: settings.language,
@@ -5617,7 +5617,7 @@ async fn scoped_edit_ticket_item(
     validate_workspace_scope(&api, &path.workspace_id)?;
     let mut target = request.target;
     if let Some(TicketTargetEdit::Set { repository_id, .. }) = target.as_mut() {
-        workspace_api::validate_repository_key(repository_id).map_err(|_| {
+        server_api::validate_repository_key(repository_id).map_err(|_| {
             settings_bad_request(
                 "repository_key_invalid",
                 "Repository key must contain 1-64 lowercase ASCII letters, digits, or hyphens without a leading or trailing hyphen",
@@ -5816,7 +5816,7 @@ fn resolve_ticket_operation_repository_keys(
     let Some(repository_key) = submitted_key else {
         return Ok(());
     };
-    workspace_api::validate_repository_key(repository_key).map_err(|error| {
+    server_api::validate_repository_key(repository_key).map_err(|error| {
         ApiError::from(Error::InvalidInput(format!(
             "invalid Repository key: {error}"
         )))
@@ -8213,7 +8213,7 @@ async fn open_current_worker_workdir_session_locked(
         .require_configured_workspace_repository(&workdir.repository_id)
         .map_err(|error| error.error)?;
     let repository_requires_access =
-        repository.source.kind == workspace_api::RepositorySourceKind::Ssh;
+        repository.source.kind == server_api::RepositorySourceKind::Ssh;
     if repository_requires_access {
         close_current_worker_attachment_session_locked(api, worker).await?;
         let access = repository_access_request_for_workdir(
@@ -9343,7 +9343,7 @@ async fn scoped_create_repository(
 ) -> ApiResult<(StatusCode, Json<CreateWorkspaceRepositoryResponse>)> {
     require_workspace_owner(&api, &path.workspace_id, &actor, "ManageRepositories").await?;
 
-    workspace_api::validate_repository_key(&request.repository_key)
+    server_api::validate_repository_key(&request.repository_key)
         .map_err(|error| Error::InvalidInput(format!("invalid Repository key: {error}")))?;
     let repository_key = request.repository_key;
     let default_ref = request
@@ -9364,7 +9364,7 @@ async fn scoped_create_repository(
         source,
         default_ref,
         source_revision: 1,
-        observed_status: workspace_api::RepositoryObservedStatus::Unverified,
+        observed_status: server_api::RepositoryObservedStatus::Unverified,
         observed_at: None,
         created_at: now.clone(),
         updated_at: now,
@@ -9684,7 +9684,7 @@ async fn get_latest_workspace_runtime_config(
 async fn scoped_list_runtimes(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
-) -> ApiResult<Json<workspace_api::ListResponse<WorkspaceRuntimeResource>>> {
+) -> ApiResult<Json<server_api::ListResponse<WorkspaceRuntimeResource>>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     Ok(Json(
         workspace_runtime_resources_response(&api, &api.config.workspace_id).await?,
@@ -9876,7 +9876,7 @@ async fn scoped_worker_remove_source_boundary(
 async fn scoped_get_workspace_worker(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspaceWorkerReferencePath>,
-) -> ApiResult<Json<workspace_api::WorkerSummary>> {
+) -> ApiResult<Json<server_api::WorkerSummary>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let worker_id = api
         .store
@@ -9972,7 +9972,7 @@ async fn scoped_discover_workspace_workers(
 }
 
 fn workspace_worker_discovery_page(
-    workers: Vec<workspace_api::WorkerSummary>,
+    workers: Vec<server_api::WorkerSummary>,
     query: Option<&str>,
     offset: usize,
     limit: usize,
@@ -10043,7 +10043,7 @@ fn workspace_worker_discovery_filter_fingerprint(query: Option<&str>) -> u64 {
 async fn scoped_list_workers(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
-) -> ApiResult<Json<workspace_api::ListResponse<workspace_api::WorkerSummary>>> {
+) -> ApiResult<Json<server_api::ListResponse<server_api::WorkerSummary>>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     list_workers(State(api)).await
 }
@@ -10309,7 +10309,7 @@ async fn restore_known_worker(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
     headers: HeaderMap,
-) -> ApiResult<Json<workspace_api::WorkerRestoreResponse>> {
+) -> ApiResult<Json<server_api::WorkerRestoreResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
     let subject = path.worker.clone();
@@ -10461,7 +10461,7 @@ async fn scoped_start_workspace_orchestrator(
             .runtime
             .restore_worker(&existing.worker)
             .map_err(|error| error.into_error())?;
-        if restored.state != workspace_api::WorkerRestoreState::Accepted {
+        if restored.state != server_api::WorkerRestoreState::Accepted {
             return Err(ApiError::with_diagnostics(
                 Error::RuntimeOperationFailed {
                     runtime_id: existing.worker.runtime_id.clone(),
@@ -10537,7 +10537,7 @@ fn worker_launch_worker_summary(worker: WorkerSummary) -> WorkerLaunchWorkerSumm
         profile: worker.profile,
         singleton_key: worker.singleton_key,
         tags: worker.tags,
-        workspace: workspace_api::WorkerWorkspaceSummary {
+        workspace: server_api::WorkerWorkspaceSummary {
             visibility: worker.workspace.visibility,
             identity: worker.workspace.identity,
             workspace_id: worker.workspace.workspace_id,
@@ -10546,19 +10546,19 @@ fn worker_launch_worker_summary(worker: WorkerSummary) -> WorkerLaunchWorkerSumm
         last_seen_at: worker.last_seen_at,
         pinned: worker.pinned,
         retention_state: worker.retention_state,
-        implementation: workspace_api::WorkerImplementationSummary {
+        implementation: server_api::WorkerImplementationSummary {
             kind: worker.implementation.kind,
             display_hint: worker.implementation.display_hint,
         },
-        capabilities: workspace_api::WorkerCapabilitySummary {
+        capabilities: server_api::WorkerCapabilitySummary {
             can_stop: worker.capabilities.can_stop,
             can_spawn_followup: worker.capabilities.can_spawn_followup,
         },
-        working_directory: worker.working_directory,
+        working_directory: worker.working_directory.map(Into::into),
         diagnostics: worker
             .diagnostics
             .into_iter()
-            .map(workspace_api::Diagnostic::from)
+            .map(server_api::Diagnostic::from)
             .collect(),
     }
 }
@@ -10578,7 +10578,7 @@ fn workspace_orchestrator_response(
                 .diagnostics
                 .iter()
                 .cloned()
-                .map(workspace_api::Diagnostic::from)
+                .map(server_api::Diagnostic::from)
                 .collect()
         })
         .unwrap_or_default();
@@ -10615,15 +10615,15 @@ async fn scoped_get_worker_launch_options(
 
 fn working_directory_diagnostics(
     diagnostics: Vec<RuntimeDiagnostic>,
-) -> Vec<workspace_api::Diagnostic> {
+) -> Vec<server_api::Diagnostic> {
     diagnostics
         .into_iter()
-        .map(|diagnostic| workspace_api::Diagnostic {
+        .map(|diagnostic| server_api::Diagnostic {
             code: diagnostic.code,
             severity: match diagnostic.severity {
-                DiagnosticSeverity::Info => workspace_api::DiagnosticSeverity::Info,
-                DiagnosticSeverity::Warning => workspace_api::DiagnosticSeverity::Warning,
-                DiagnosticSeverity::Error => workspace_api::DiagnosticSeverity::Error,
+                DiagnosticSeverity::Info => server_api::DiagnosticSeverity::Info,
+                DiagnosticSeverity::Warning => server_api::DiagnosticSeverity::Warning,
+                DiagnosticSeverity::Error => server_api::DiagnosticSeverity::Error,
             },
             message: diagnostic.message,
         })
@@ -10652,6 +10652,7 @@ async fn scoped_list_runtime_working_directories(
     validate_workspace_scope(&api, &path.workspace_id)?;
     require_active_workspace_runtime_binding(&api, &path.runtime_id).await?;
     let (items, diagnostics) = runtime_working_directory_summaries(&api, &path.runtime_id)?;
+    let items = items.into_iter().map(Into::into).collect();
     Ok(Json(BrowserWorkingDirectoryListResponse {
         workspace_id: api.config.workspace_id.clone(),
         items,
@@ -10723,6 +10724,7 @@ async fn scoped_list_working_directories(
 ) -> ApiResult<Json<BrowserWorkingDirectoryListResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let items = working_directory_summaries(&api)?;
+    let items = items.into_iter().map(Into::into).collect();
     Ok(Json(BrowserWorkingDirectoryListResponse {
         workspace_id: api.config.workspace_id.clone(),
         items,
@@ -10889,11 +10891,11 @@ async fn create_workspace_working_directory(
             existing.source_fingerprint.clone(),
         ) {
             let kind = match kind {
-                "local_path" => workspace_api::RepositorySourceKind::LocalPath,
-                "file" => workspace_api::RepositorySourceKind::File,
-                "https" => workspace_api::RepositorySourceKind::Https,
-                "http" | "invalid" => workspace_api::RepositorySourceKind::Invalid,
-                "ssh" => workspace_api::RepositorySourceKind::Ssh,
+                "local_path" => server_api::RepositorySourceKind::LocalPath,
+                "file" => server_api::RepositorySourceKind::File,
+                "https" => server_api::RepositorySourceKind::Https,
+                "http" | "invalid" => server_api::RepositorySourceKind::Invalid,
+                "ssh" => server_api::RepositorySourceKind::Ssh,
                 _ => {
                     return Err(settings_bad_request(
                         "working_directory_repository_source_invalid",
@@ -10902,7 +10904,7 @@ async fn create_workspace_working_directory(
                 }
             };
             working_directory_request.repository.source =
-                workspace_api::RepositorySource { kind, uri };
+                server_api::RepositorySource { kind, uri };
             working_directory_request.repository.source_revision = revision;
             working_directory_request.repository.source_fingerprint = fingerprint;
         }
@@ -11208,7 +11210,7 @@ async fn create_workspace_working_directory(
         Json(BrowserWorkingDirectoryCreateResponse {
             workspace_id: workspace_id.to_string(),
             runtime_id: reserved.resolved_runtime_id,
-            item: summary,
+            item: summary.into(),
             diagnostics: working_directory_diagnostics(result.diagnostics),
         }),
     ))
@@ -11249,14 +11251,14 @@ fn working_directory_detail_for_runtime(
         return Ok(Json(BrowserWorkingDirectoryDetailResponse {
             workspace_id: api.config.workspace_id.clone(),
             runtime_id: runtime_id.to_string(),
-            item: summary,
+            item: summary.into(),
             diagnostics: working_directory_diagnostics(result.diagnostics),
         }));
     }
     Ok(Json(BrowserWorkingDirectoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
         runtime_id: runtime_id.to_string(),
-        item: projected_workdir_summary_from_record(&api, &existing)?,
+        item: projected_workdir_summary_from_record(&api, &existing)?.into(),
         diagnostics: working_directory_diagnostics(result.diagnostics),
     }))
 }
@@ -12369,7 +12371,7 @@ async fn scoped_test_runtime_connection(
     }
     if binding.authentication_mode == StoredRuntimeAuthenticationMode::WorkspaceIdentity {
         validate_runtime_connection_request(&CreateRemoteRuntimeRequest {
-            public_bundle: workspace_api::RuntimePublicIdentityBundle {
+            public_bundle: server_api::RuntimePublicIdentityBundle {
                 identity_id: binding.runtime_id.clone(),
                 public_key: binding.public_key.clone(),
             },
@@ -12421,7 +12423,7 @@ async fn scoped_list_runtime_workers(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
     Query(query): Query<RuntimeWorkersQuery>,
-) -> ApiResult<Json<workspace_api::ListResponse<workspace_api::WorkerSummary>>> {
+) -> ApiResult<Json<server_api::ListResponse<server_api::WorkerSummary>>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     list_runtime_workers(State(api), AxumPath(path.runtime_id), Query(query)).await
 }
@@ -12480,7 +12482,7 @@ async fn scoped_restore_runtime_worker(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
     Query(query): Query<RestoreTicketAssignmentQuery>,
-) -> ApiResult<Json<workspace_api::WorkerRestoreResponse>> {
+) -> ApiResult<Json<server_api::WorkerRestoreResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let workspace_id = path.workspace_id.clone();
     let runtime_id = path.worker.runtime_id.clone();
@@ -12535,12 +12537,12 @@ async fn scoped_restore_runtime_worker(
             assign_ticket_worker_from_lifecycle(&api, assignment, &runtime_id, &worker_id)?;
             accept_queued_ticket_after_worker_spawn(&api, assignment)?;
             let worker = project_workspace_worker(&api, worker)?;
-            return Ok(Json(workspace_api::WorkerRestoreResponse {
+            return Ok(Json(server_api::WorkerRestoreResponse {
                 workspace_id,
                 runtime_id: runtime_id.clone(),
                 worker_id: worker_id.clone(),
-                result: workspace_api::WorkerRestoreResult {
-                    state: workspace_api::WorkerRestoreState::Accepted,
+                result: server_api::WorkerRestoreResult {
+                    state: server_api::WorkerRestoreState::Accepted,
                     worker: Some(worker),
                     diagnostics: Vec::new(),
                 },
@@ -12924,7 +12926,7 @@ async fn scoped_worker_protocol_ws(
 async fn scoped_list_host_workers(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedHostPath>,
-) -> ApiResult<Json<workspace_api::ListResponse<workspace_api::WorkerSummary>>> {
+) -> ApiResult<Json<server_api::ListResponse<server_api::WorkerSummary>>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     list_host_workers(State(api), AxumPath(path.host_id)).await
 }
@@ -13645,9 +13647,9 @@ fn companion_console_extension_point(
     status: &CompanionStatusResponse,
 ) -> WorkspaceExtensionPointState {
     let extension_status = match status.state {
-        workspace_api::CompanionLifecycleState::Idle => "idle",
-        workspace_api::CompanionLifecycleState::Running => "running",
-        workspace_api::CompanionLifecycleState::Stopped => "stopped",
+        server_api::CompanionLifecycleState::Idle => "idle",
+        server_api::CompanionLifecycleState::Running => "running",
+        server_api::CompanionLifecycleState::Stopped => "stopped",
     }
     .to_string();
     let diagnostic_codes = status
@@ -13759,7 +13761,7 @@ async fn repository_detail(
     State(api): State<WorkspaceApi>,
     AxumPath(repository_key): AxumPath<String>,
 ) -> ApiResult<Json<RepositoryDetailResponse>> {
-    workspace_api::validate_repository_key(&repository_key).map_err(|error| {
+    server_api::validate_repository_key(&repository_key).map_err(|error| {
         ApiError::from(Error::InvalidInput(format!(
             "invalid Repository key: {error}"
         )))
@@ -13780,7 +13782,7 @@ async fn repository_log(
     AxumPath(repository_key): AxumPath<String>,
     Query(query): Query<LogQuery>,
 ) -> ApiResult<Json<RepositoryLogResponse>> {
-    workspace_api::validate_repository_key(&repository_key).map_err(|error| {
+    server_api::validate_repository_key(&repository_key).map_err(|error| {
         ApiError::from(Error::InvalidInput(format!(
             "invalid Repository key: {error}"
         )))
@@ -13821,10 +13823,10 @@ async fn list_hosts(
 
 async fn list_runtimes(
     State(api): State<WorkspaceApi>,
-) -> ApiResult<Json<workspace_api::ListResponse<workspace_api::RuntimeSummary>>> {
+) -> ApiResult<Json<server_api::ListResponse<server_api::RuntimeSummary>>> {
     let limit = api.config.max_records.min(200);
     let runtimes = api.runtime.list_runtimes(limit);
-    Ok(Json(workspace_api::ListResponse {
+    Ok(Json(server_api::ListResponse {
         workspace_id: api.config.workspace_id,
         limit,
         items: runtimes.items.into_iter().map(Into::into).collect(),
@@ -13835,7 +13837,7 @@ async fn list_runtimes(
 
 async fn list_workers(
     State(api): State<WorkspaceApi>,
-) -> ApiResult<Json<workspace_api::ListResponse<workspace_api::WorkerSummary>>> {
+) -> ApiResult<Json<server_api::ListResponse<server_api::WorkerSummary>>> {
     workers_response(api).map(Json)
 }
 
@@ -15030,7 +15032,7 @@ fn browser_worker_response_from_summary(
         worker,
         diagnostics: diagnostics
             .into_iter()
-            .map(workspace_api::Diagnostic::from)
+            .map(server_api::Diagnostic::from)
             .collect(),
     })
 }
@@ -15177,7 +15179,7 @@ async fn post_companion_cancel(
 #[derive(Debug, Serialize)]
 struct WorkerShowProjection {
     #[serde(flatten)]
-    worker: workspace_api::WorkerSummary,
+    worker: server_api::WorkerSummary,
     updated_at: String,
 }
 
@@ -15231,7 +15233,7 @@ async fn get_runtime_worker(
 async fn restore_runtime_worker(
     State(api): State<WorkspaceApi>,
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
-) -> ApiResult<Json<workspace_api::WorkerRestoreResponse>> {
+) -> ApiResult<Json<server_api::WorkerRestoreResponse>> {
     let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
     let result = api.restore_workspace_worker(&worker)?;
     let projected_worker = if let Some(worker) = result.worker.as_ref() {
@@ -15247,11 +15249,11 @@ async fn restore_runtime_worker(
     } else {
         None
     };
-    Ok(Json(workspace_api::WorkerRestoreResponse {
+    Ok(Json(server_api::WorkerRestoreResponse {
         workspace_id: api.workspace_id().to_string(),
         runtime_id: runtime_id.clone(),
         worker_id: worker_id.clone(),
-        result: workspace_api::WorkerRestoreResult {
+        result: server_api::WorkerRestoreResult {
             state: result.state,
             worker: projected_worker,
             diagnostics: result.diagnostics.into_iter().map(Into::into).collect(),
@@ -15311,7 +15313,7 @@ async fn list_runtime_workers(
     State(api): State<WorkspaceApi>,
     AxumPath(runtime_id): AxumPath<String>,
     Query(query): Query<RuntimeWorkersQuery>,
-) -> ApiResult<Json<workspace_api::ListResponse<workspace_api::WorkerSummary>>> {
+) -> ApiResult<Json<server_api::ListResponse<server_api::WorkerSummary>>> {
     let limit = api.config.max_records.min(200);
     let (runtime_workers, source) = match query.status {
         Some(RuntimeWorkersStatusFilter::Stopped) => (
@@ -15328,7 +15330,7 @@ async fn list_runtime_workers(
         ),
     };
     let items = project_observed_workspace_workers(&api, runtime_workers.items)?;
-    Ok(Json(workspace_api::ListResponse {
+    Ok(Json(server_api::ListResponse {
         workspace_id: api.workspace_id().to_string(),
         limit,
         items,
@@ -16505,14 +16507,14 @@ fn protocol_error_event(message: impl Into<String>) -> protocol::Event {
 async fn list_host_workers(
     State(api): State<WorkspaceApi>,
     AxumPath(host_id): AxumPath<String>,
-) -> ApiResult<Json<workspace_api::ListResponse<workspace_api::WorkerSummary>>> {
+) -> ApiResult<Json<server_api::ListResponse<server_api::WorkerSummary>>> {
     let limit = api.config.max_records.min(200);
     let runtime_workers = api
         .runtime
         .list_workers_for_host(&host_id, limit)
         .map_err(|err| err.into_error())?;
     let items = project_observed_workspace_workers(&api, runtime_workers.items)?;
-    Ok(Json(workspace_api::ListResponse {
+    Ok(Json(server_api::ListResponse {
         workspace_id: api.workspace_id().to_string(),
         limit,
         items,
@@ -16528,7 +16530,7 @@ async fn list_host_workers(
 fn project_workspace_worker(
     api: &WorkspaceApi,
     summary: WorkerSummary,
-) -> ApiResult<workspace_api::WorkerSummary> {
+) -> ApiResult<server_api::WorkerSummary> {
     let resource_key = api
         .store
         .resource_key(
@@ -16554,14 +16556,14 @@ fn project_workspace_worker(
     Ok(workspace_worker_summary(
         summary,
         resource_key,
-        working_directory,
+        working_directory.map(Into::into),
     ))
 }
 
 fn project_observed_workspace_workers(
     api: &WorkspaceApi,
     workers: Vec<WorkerSummary>,
-) -> ApiResult<Vec<workspace_api::WorkerSummary>> {
+) -> ApiResult<Vec<server_api::WorkerSummary>> {
     let workdirs = api
         .store
         .list_workdir_registry(&api.config.workspace_id, 500)?;
@@ -16581,7 +16583,7 @@ fn project_observed_workspace_workers(
 
 fn workers_response(
     api: WorkspaceApi,
-) -> ApiResult<workspace_api::ListResponse<workspace_api::WorkerSummary>> {
+) -> ApiResult<server_api::ListResponse<server_api::WorkerSummary>> {
     let limit = api.config.max_records.min(200);
     let runtime_workers = api.runtime.list_workers(limit);
     let mut observed = std::collections::BTreeMap::new();
@@ -16628,7 +16630,7 @@ fn workers_response(
         );
         items.push(project_workspace_worker(&api, summary)?);
     }
-    Ok(workspace_api::ListResponse {
+    Ok(server_api::ListResponse {
         workspace_id: api.config.workspace_id,
         limit,
         items,
@@ -16640,7 +16642,7 @@ fn workers_response(
 async fn workspace_runtime_resources_response(
     api: &WorkspaceApi,
     workspace_id: &str,
-) -> ApiResult<workspace_api::ListResponse<WorkspaceRuntimeResource>> {
+) -> ApiResult<server_api::ListResponse<WorkspaceRuntimeResource>> {
     let limit = api.config.max_records.min(200);
     let runtimes = api.runtime.list_runtimes(limit);
     let bindings = api
@@ -16665,7 +16667,7 @@ async fn workspace_runtime_resources_response(
                 .iter()
                 .find(|binding| binding.runtime_id == runtime.runtime_id);
             let built_in = runtime.runtime_id == EMBEDDED_WORKER_RUNTIME_ID;
-            let mut runtime: workspace_api::RuntimeSummary = runtime.into();
+            let mut runtime: server_api::RuntimeSummary = runtime.into();
             if binding.is_some_and(|binding| binding.state != StoredRuntimeBindingState::Verified) {
                 runtime.worker_creation_available = false;
             }
@@ -16694,16 +16696,16 @@ async fn workspace_runtime_resources_response(
             continue;
         }
         items.push(WorkspaceRuntimeResource {
-            runtime: workspace_api::RuntimeSummary {
+            runtime: server_api::RuntimeSummary {
                 runtime_id: binding.runtime_id.clone(),
                 label: binding.display_name.clone(),
                 kind: "remote_http".to_string(),
                 status: "unavailable".to_string(),
-                source: workspace_api::RuntimeSourceSummary {
-                    kind: workspace_api::RuntimeSourceKind::RemoteHttp,
-                    status: workspace_api::RuntimeSourceStatus::Reserved,
+                source: server_api::RuntimeSourceSummary {
+                    kind: server_api::RuntimeSourceKind::RemoteHttp,
+                    status: server_api::RuntimeSourceStatus::Reserved,
                     identity_authority:
-                        workspace_api::RuntimeIdentityAuthority::ServerRuntimeConfiguration,
+                        server_api::RuntimeIdentityAuthority::ServerRuntimeConfiguration,
                     note: "The registered Runtime is not present in the active Runtime registry."
                         .to_string(),
                 },
@@ -16734,7 +16736,7 @@ async fn workspace_runtime_resources_response(
         });
     }
 
-    Ok(workspace_api::ListResponse {
+    Ok(server_api::ListResponse {
         workspace_id: workspace_id.to_string(),
         limit,
         items,
@@ -16788,15 +16790,15 @@ fn runtime_binding_summary(
 
 fn runtime_verification_summary(
     verification: &crate::store::WorkspaceRuntimeVerificationEvidence,
-) -> Option<workspace_api::RuntimeVerificationEvidenceSummary> {
+) -> Option<server_api::RuntimeVerificationEvidenceSummary> {
     let last_outcome = match verification.last_outcome.as_str() {
-        "verified" => workspace_api::RuntimeVerificationOutcome::Verified,
-        "challenge_issued" => workspace_api::RuntimeVerificationOutcome::ChallengeIssued,
-        "verification_failed" => workspace_api::RuntimeVerificationOutcome::VerificationFailed,
-        "connectivity_failed" => workspace_api::RuntimeVerificationOutcome::ConnectivityFailed,
+        "verified" => server_api::RuntimeVerificationOutcome::Verified,
+        "challenge_issued" => server_api::RuntimeVerificationOutcome::ChallengeIssued,
+        "verification_failed" => server_api::RuntimeVerificationOutcome::VerificationFailed,
+        "connectivity_failed" => server_api::RuntimeVerificationOutcome::ConnectivityFailed,
         _ => return None,
     };
-    Some(workspace_api::RuntimeVerificationEvidenceSummary {
+    Some(server_api::RuntimeVerificationEvidenceSummary {
         verified_at: verification.verified_at.clone(),
         last_checked_at: verification.checked_at.clone(),
         last_outcome,
@@ -16825,16 +16827,16 @@ async fn workspace_runtime_detail(
         .find(|resource| resource.runtime.runtime_id == runtime_id);
     if resource.is_none() {
         resource = binding.as_ref().map(|binding| WorkspaceRuntimeResource {
-            runtime: workspace_api::RuntimeSummary {
+            runtime: server_api::RuntimeSummary {
                 runtime_id: binding.runtime_id.clone(),
                 label: binding.display_name.clone(),
                 kind: "remote_http".to_string(),
                 status: "unavailable".to_string(),
-                source: workspace_api::RuntimeSourceSummary {
-                    kind: workspace_api::RuntimeSourceKind::RemoteHttp,
-                    status: workspace_api::RuntimeSourceStatus::Reserved,
+                source: server_api::RuntimeSourceSummary {
+                    kind: server_api::RuntimeSourceKind::RemoteHttp,
+                    status: server_api::RuntimeSourceStatus::Reserved,
                     identity_authority:
-                        workspace_api::RuntimeIdentityAuthority::ServerRuntimeConfiguration,
+                        server_api::RuntimeIdentityAuthority::ServerRuntimeConfiguration,
                     note: "The Runtime trust binding is not active in the Runtime registry."
                         .to_string(),
                 },
@@ -17186,7 +17188,7 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> ApiResult<WorkerLaunchO
                 diagnostics: runtime
                     .diagnostics
                     .into_iter()
-                    .map(workspace_api::Diagnostic::from)
+                    .map(server_api::Diagnostic::from)
                     .collect(),
             }
         })
@@ -17209,7 +17211,7 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> ApiResult<WorkerLaunchO
             !profile
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.severity == workspace_api::DiagnosticSeverity::Error)
+                .any(|diagnostic| diagnostic.severity == server_api::DiagnosticSeverity::Error)
         })
         .map(|profile| WorkerLaunchProfileCandidate {
             id: profile.profile_id,
@@ -17225,7 +17227,11 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> ApiResult<WorkerLaunchO
         default_profile: profile_settings.default_profile,
         profiles,
         repositories: working_directory_repository_options(api),
-        working_directories: available_working_directory_summaries(api).unwrap_or_default(),
+        working_directories: available_working_directory_summaries(api)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Into::into)
+            .collect(),
         diagnostics: Vec::new(),
     })
 }
@@ -17919,7 +17925,7 @@ fn authorize_repository_materialization_operation(
     request_fingerprint: &str,
     request: &mut WorkingDirectoryRequest,
 ) -> ApiResult<()> {
-    let context = if request.repository.source.kind == workspace_api::RepositorySourceKind::Ssh {
+    let context = if request.repository.source.kind == server_api::RepositorySourceKind::Ssh {
         if let (
             Some(_credential_id),
             Some(_credential_revision),
@@ -17944,8 +17950,8 @@ fn authorize_repository_materialization_operation(
             let primary_host_trust_revision = primary_lease.host_trust_revision;
             let known_hosts_entry = primary_lease.known_hosts_entry.clone();
             let access = match access_mode {
-                "read_only" => workspace_api::RepositoryAccessMode::ReadOnly,
-                "read_write" => workspace_api::RepositoryAccessMode::ReadWrite,
+                "read_only" => server_api::RepositoryAccessMode::ReadOnly,
+                "read_write" => server_api::RepositoryAccessMode::ReadWrite,
                 _ => {
                     return Err(settings_bad_request(
                         "working_directory_repository_access_invalid",
@@ -18077,8 +18083,8 @@ fn authorize_repository_materialization_operation(
                 &ssh.host_trust_id,
                 ssh.host_trust_revision,
                 match ssh.access {
-                    workspace_api::RepositoryAccessMode::ReadOnly => "read_only",
-                    workspace_api::RepositoryAccessMode::ReadWrite => "read_write",
+                    server_api::RepositoryAccessMode::ReadOnly => "read_only",
+                    server_api::RepositoryAccessMode::ReadWrite => "read_write",
                 },
                 &credential_candidates,
                 &now_registry_timestamp(),
@@ -18179,8 +18185,8 @@ fn repository_ssh_lease_candidates_from_operation(
         .repository_access_mode
         .as_deref()
         .map(|access_mode| match access_mode {
-            "read_only" => Ok(workspace_api::RepositoryAccessMode::ReadOnly),
-            "read_write" => Ok(workspace_api::RepositoryAccessMode::ReadWrite),
+            "read_only" => Ok(server_api::RepositoryAccessMode::ReadOnly),
+            "read_write" => Ok(server_api::RepositoryAccessMode::ReadWrite),
             _other => Err(settings_bad_request(
                 "working_directory_repository_access_snapshot_invalid",
                 "persisted Repository access mode is invalid",
@@ -18237,7 +18243,7 @@ fn authorize_repository_materialization(
         .find(|repository| repository.id == request.repository.id)
         .map(|repository| repository.repository_key.as_str())
         .ok_or_else(|| Error::UnknownRepository(request.repository.id.clone()))?;
-    let ssh = if request.repository.source.kind == workspace_api::RepositorySourceKind::Ssh {
+    let ssh = if request.repository.source.kind == server_api::RepositorySourceKind::Ssh {
         let binding = match projection
             .bindings
             .iter()
@@ -18367,7 +18373,7 @@ fn repository_access_request_for_workdir(
         ));
     }
     let repository = api.require_configured_workspace_repository(&record.repository_id)?;
-    if repository.source.kind != workspace_api::RepositorySourceKind::Ssh {
+    if repository.source.kind != server_api::RepositorySourceKind::Ssh {
         return Ok(None);
     }
     let projection = active_repository_access_projection(api, &api.config.workspace_id)?;
@@ -19176,7 +19182,8 @@ mod tests {
             current_ref: Some("abc123".to_string()),
             current_tree: None,
             observed_at_epoch_seconds: Some(1_767_225_600),
-            materializer_kind: workspace_api::WorkingDirectoryMaterializerKind::RuntimeGitClone,
+            materializer_kind:
+                workdir::workspace::WorkingDirectoryMaterializerKind::RuntimeGitClone,
             cleanup_target: None,
             status: worker_runtime::catalog::WorkingDirectoryStatusKind::Active,
             cleanliness: Some("clean".to_string()),
@@ -20054,11 +20061,11 @@ mod tests {
                 "owner-account",
             )
             .unwrap();
-        let binding = workspace_api::RepositorySshAccessBinding {
+        let binding = server_api::RepositorySshAccessBinding {
             repository_key: "test-repository".to_string(),
             credential_id: specific.credential_id.clone(),
             host_trust_id: host_trust.host_trust_id,
-            access: workspace_api::RepositoryAccessMode::ReadOnly,
+            access: server_api::RepositoryAccessMode::ReadOnly,
         };
         let primary = api
             .repository_secrets
@@ -20082,8 +20089,8 @@ mod tests {
             candidates[1].known_hosts_entry
         );
 
-        let source = workspace_api::RepositorySource {
-            kind: workspace_api::RepositorySourceKind::Ssh,
+        let source = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::Ssh,
             uri: "ssh://git@example.test/org/repository.git".to_string(),
         };
         let source_fingerprint = repository_source_fingerprint(&source);
@@ -20165,7 +20172,7 @@ mod tests {
                 .is_err()
         );
 
-        let default_binding = workspace_api::RepositorySshAccessBinding {
+        let default_binding = server_api::RepositorySshAccessBinding {
             credential_id: crate::repository_access::WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID
                 .to_string(),
             ..binding
@@ -20198,14 +20205,14 @@ mod tests {
                 repository_key: "foreign".to_string(),
                 kind: "git".to_string(),
                 provider: Some("git".to_string()),
-                source: workspace_api::RepositorySource {
-                    kind: workspace_api::RepositorySourceKind::LocalPath,
+                source: server_api::RepositorySource {
+                    kind: server_api::RepositorySourceKind::LocalPath,
                     uri: dir.path().join("foreign").display().to_string(),
                 },
                 default_ref: Some("HEAD".to_string()),
                 source_revision: 1,
                 source_fingerprint: "sha256:test".to_string(),
-                observed_status: workspace_api::RepositoryObservedStatus::Unverified,
+                observed_status: server_api::RepositoryObservedStatus::Unverified,
                 observed_at: None,
                 created_at: "1".to_string(),
                 updated_at: "1".to_string(),
@@ -20321,7 +20328,7 @@ mod tests {
                         ],
                         host_trust_id: "host-trust-1".to_string(),
                         host_trust_revision: 1,
-                        access: workspace_api::RepositoryAccessMode::ReadOnly,
+                        access: server_api::RepositoryAccessMode::ReadOnly,
                         expires_at_epoch_seconds: u64::MAX,
                         repository_id: working_directory.repository.id.clone(),
                         repository_source_fingerprint: working_directory
@@ -21519,7 +21526,7 @@ mod tests {
             State(api),
             Extension(actor),
             Json(CreateRemoteRuntimeRequest {
-                public_bundle: workspace_api::RuntimePublicIdentityBundle {
+                public_bundle: server_api::RuntimePublicIdentityBundle {
                     identity_id: "verified-runtime".to_string(),
                     public_key: replacement.public_key,
                 },
@@ -21556,7 +21563,7 @@ mod tests {
         );
         let runtime_identity = RuntimeIdentityMaterial::generate("configured-runtime").unwrap();
         let request = CreateRemoteRuntimeRequest {
-            public_bundle: workspace_api::RuntimePublicIdentityBundle {
+            public_bundle: server_api::RuntimePublicIdentityBundle {
                 identity_id: "configured-runtime".to_string(),
                 public_key: runtime_identity.public_key,
             },
@@ -21659,7 +21666,7 @@ mod tests {
             State(api.clone()),
             Extension(test_owner_actor()),
             Json(CreateRemoteRuntimeRequest {
-                public_bundle: workspace_api::RuntimePublicIdentityBundle {
+                public_bundle: server_api::RuntimePublicIdentityBundle {
                     identity_id: "unknown-runtime".to_string(),
                     public_key: unknown_identity.public_key,
                 },
@@ -21695,7 +21702,7 @@ mod tests {
     async fn runtime_connection_request_validation_bounds_browser_input() {
         let identity = RuntimeIdentityMaterial::generate("team-runtime_1").unwrap();
         let ok = CreateRemoteRuntimeRequest {
-            public_bundle: workspace_api::RuntimePublicIdentityBundle {
+            public_bundle: server_api::RuntimePublicIdentityBundle {
                 identity_id: "team-runtime_1".to_string(),
                 public_key: identity.public_key,
             },
@@ -22034,8 +22041,8 @@ mod tests {
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
         };
-        let source = workspace_api::RepositorySource {
-            kind: workspace_api::RepositorySourceKind::Https,
+        let source = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::Https,
             uri: "https://example.test/org/repository.git".to_string(),
         };
         let repositories = vec![RepositoryRecord {
@@ -22048,7 +22055,7 @@ mod tests {
             source,
             default_ref: Some("main".to_string()),
             source_revision: 1,
-            observed_status: workspace_api::RepositoryObservedStatus::Unverified,
+            observed_status: server_api::RepositoryObservedStatus::Unverified,
             observed_at: None,
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
@@ -22060,7 +22067,7 @@ mod tests {
         assert!(scoped.repositories[0].path.is_none());
         assert_eq!(
             scoped.repositories[0].source.kind,
-            workspace_api::RepositorySourceKind::Https
+            server_api::RepositorySourceKind::Https
         );
         assert_eq!(
             scoped.workspace_execution_root,
@@ -22085,8 +22092,8 @@ mod tests {
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
         };
-        let source = workspace_api::RepositorySource {
-            kind: workspace_api::RepositorySourceKind::Https,
+        let source = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::Https,
             uri: "https://example.test/org/repository.git".to_string(),
         };
         let repositories = vec![RepositoryRecord {
@@ -22099,7 +22106,7 @@ mod tests {
             source,
             default_ref: Some("main".to_string()),
             source_revision: 1,
-            observed_status: workspace_api::RepositoryObservedStatus::Unverified,
+            observed_status: server_api::RepositoryObservedStatus::Unverified,
             observed_at: None,
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
@@ -22122,8 +22129,8 @@ mod tests {
             .with_embedded_runtime_store_root(store_root);
         config.database_path = workspace_root.join(".test-yoi-server.db");
         config.backend_base_url = Some("http://127.0.0.1:8787".to_string());
-        let source = workspace_api::RepositorySource {
-            kind: workspace_api::RepositorySourceKind::LocalPath,
+        let source = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::LocalPath,
             uri: workspace_root.display().to_string(),
         };
         config.repositories = vec![ConfiguredRepository {
@@ -22133,7 +22140,7 @@ mod tests {
             source_fingerprint: crate::repository_source::repository_source_fingerprint(&source),
             source,
             source_revision: 1,
-            observed_status: workspace_api::RepositoryObservedStatus::Unverified,
+            observed_status: server_api::RepositoryObservedStatus::Unverified,
             observed_at: None,
             path: Some(workspace_root),
             default_selector: Some("HEAD".to_string()),
@@ -22286,8 +22293,8 @@ mod tests {
             .unwrap();
         assert_eq!(persisted.source, config.repositories[0].source);
 
-        let changed_source = workspace_api::RepositorySource {
-            kind: workspace_api::RepositorySourceKind::LocalPath,
+        let changed_source = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::LocalPath,
             uri: dir.path().join("different-source").display().to_string(),
         };
         config.repositories[0].source_fingerprint =
@@ -22536,7 +22543,7 @@ mod tests {
         let workspace_body = to_bytes(authenticated_legacy.into_body(), usize::MAX)
             .await
             .unwrap();
-        let typed_workspace: workspace_api::WorkspaceResponse =
+        let typed_workspace: server_api::WorkspaceResponse =
             serde_json::from_slice(&workspace_body).unwrap();
         assert!(typed_workspace.permissions.manage_repositories);
 
@@ -22566,7 +22573,7 @@ mod tests {
         let catalog_body = to_bytes(authenticated_catalog.into_body(), usize::MAX)
             .await
             .unwrap();
-        let typed_catalog: workspace_api::WorkspaceCatalogListResponse =
+        let typed_catalog: server_api::WorkspaceCatalogListResponse =
             serde_json::from_slice(&catalog_body).unwrap();
         assert_eq!(
             typed_catalog.0[0].workspace_id,
@@ -22602,7 +22609,7 @@ mod tests {
         let created_body = to_bytes(created_response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let created: workspace_api::WorkspaceCreateResponse =
+        let created: server_api::WorkspaceCreateResponse =
             serde_json::from_slice(&created_body).unwrap();
         assert_eq!(created.workspace.owner_account_id, "account-auth");
 
@@ -25314,7 +25321,7 @@ mod tests {
         assert_eq!(retried_restore.worker_id, first_worker.worker.worker_id);
         assert_eq!(
             retried_restore.result.state,
-            workspace_api::WorkerRestoreState::Accepted
+            server_api::WorkerRestoreState::Accepted
         );
         let restored_assignment = api
             .store
@@ -26230,7 +26237,7 @@ mod tests {
             scoped_update_workspace_memory_settings(
                 State(api),
                 AxumPath("workspace-foreign".to_string()),
-                Json(workspace_api::UpdateWorkspaceMemorySettingsRequest {
+                Json(server_api::UpdateWorkspaceMemorySettingsRequest {
                     expected_revision: 1,
                     language: "English".to_string(),
                 }),
@@ -27039,14 +27046,14 @@ mod tests {
                 repository_key: repository_id.to_string(),
                 kind: "git".to_string(),
                 provider: Some("git".to_string()),
-                source: workspace_api::RepositorySource {
-                    kind: workspace_api::RepositorySourceKind::LocalPath,
+                source: server_api::RepositorySource {
+                    kind: server_api::RepositorySourceKind::LocalPath,
                     uri: api.config.workspace_execution_root.display().to_string(),
                 },
                 default_ref: Some("HEAD".to_string()),
                 source_revision: 1,
                 source_fingerprint: "sha256:test".to_string(),
-                observed_status: workspace_api::RepositoryObservedStatus::Unverified,
+                observed_status: server_api::RepositoryObservedStatus::Unverified,
                 observed_at: None,
                 created_at: "1".to_string(),
                 updated_at: "1".to_string(),
@@ -28412,8 +28419,8 @@ mod tests {
             worker_id: &str,
             name: &str,
             visibility: &str,
-        ) -> workspace_api::WorkerSummary {
-            workspace_api::WorkerSummary {
+        ) -> server_api::WorkerSummary {
+            server_api::WorkerSummary {
                 runtime_id: "runtime-test".to_string(),
                 worker_id: worker_id.to_string(),
                 resource_key: key.to_string(),
@@ -28423,7 +28430,7 @@ mod tests {
                 profile: Some("builtin:coder".to_string()),
                 singleton_key: None,
                 tags: Vec::new(),
-                workspace: workspace_api::WorkerWorkspaceSummary {
+                workspace: server_api::WorkerWorkspaceSummary {
                     visibility: visibility.to_string(),
                     identity: "workspace-test".to_string(),
                     workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
@@ -28433,11 +28440,11 @@ mod tests {
                 last_seen_at: None,
                 pinned: false,
                 retention_state: "normal".to_string(),
-                implementation: workspace_api::WorkerImplementationSummary {
+                implementation: server_api::WorkerImplementationSummary {
                     kind: "remote".to_string(),
                     display_hint: "remote".to_string(),
                 },
-                capabilities: workspace_api::WorkerCapabilitySummary {
+                capabilities: server_api::WorkerCapabilitySummary {
                     can_stop: true,
                     can_spawn_followup: false,
                 },
@@ -28510,7 +28517,7 @@ mod tests {
         assert!(before.is_empty());
 
         let discovered = workspace_worker_discovery_page(
-            vec![workspace_api::WorkerSummary {
+            vec![server_api::WorkerSummary {
                 runtime_id: target.runtime_id.clone(),
                 worker_id: target.worker_id.clone(),
                 resource_key: "W-2".to_string(),
@@ -28520,7 +28527,7 @@ mod tests {
                 profile: Some("builtin:coder".to_string()),
                 singleton_key: None,
                 tags: Vec::new(),
-                workspace: workspace_api::WorkerWorkspaceSummary {
+                workspace: server_api::WorkerWorkspaceSummary {
                     visibility: "workspace_scoped".to_string(),
                     identity: "workspace-test".to_string(),
                     workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
@@ -28530,11 +28537,11 @@ mod tests {
                 last_seen_at: None,
                 pinned: false,
                 retention_state: "normal".to_string(),
-                implementation: workspace_api::WorkerImplementationSummary {
+                implementation: server_api::WorkerImplementationSummary {
                     kind: "remote".to_string(),
                     display_hint: "remote".to_string(),
                 },
-                capabilities: workspace_api::WorkerCapabilitySummary {
+                capabilities: server_api::WorkerCapabilitySummary {
                     can_stop: true,
                     can_spawn_followup: false,
                 },
@@ -29966,7 +29973,7 @@ mod tests {
         let runtime_workers =
             get_json(app.clone(), "/api/runtimes/embedded-worker-runtime/workers").await;
         let runtime_workers = serde_json::from_value::<
-            workspace_api::ListResponse<workspace_api::WorkerSummary>,
+            server_api::ListResponse<server_api::WorkerSummary>,
         >(runtime_workers)
         .expect("Runtime-scoped Worker list must use the shared Workspace API contract");
         assert!(
@@ -30288,7 +30295,7 @@ mod tests {
         let workspace = get_json(app.clone(), "/api/workspace").await;
         assert_eq!(workspace["workspace_id"], TEST_WORKSPACE_ID);
         assert_eq!(workspace["display_name"], "Test Workspace");
-        let typed_workspace: workspace_api::WorkspaceResponse =
+        let typed_workspace: server_api::WorkspaceResponse =
             serde_json::from_value(workspace.clone()).unwrap();
         assert!(!typed_workspace.permissions.manage_repositories);
         assert_eq!(workspace["record_authority"], "server_db");
@@ -30449,7 +30456,7 @@ mod tests {
 
         let memory_document =
             get_json(app.clone(), &format!("/api/w/{TEST_WORKSPACE_ID}/memory")).await;
-        let _: workspace_api::MemoryDocumentResponse =
+        let _: server_api::MemoryDocumentResponse =
             serde_json::from_value(memory_document.clone()).unwrap();
         assert_eq!(memory_document["created_at"], "2026-01-01T00:00:00Z");
         assert_eq!(memory_document["updated_at"], "2026-01-02T00:00:00Z");
@@ -30467,7 +30474,7 @@ mod tests {
             &format!("/api/w/{TEST_WORKSPACE_ID}/memory/staging?limit=10"),
         )
         .await;
-        let _: workspace_api::MemoryStagingListResponse =
+        let _: server_api::MemoryStagingListResponse =
             serde_json::from_value(memory_staging.clone()).unwrap();
         assert_eq!(
             memory_staging["record_authority"],
@@ -30481,7 +30488,7 @@ mod tests {
         );
 
         let repositories = get_json(app.clone(), "/api/repositories").await;
-        let typed_repositories: workspace_api::RepositoryListResponse =
+        let typed_repositories: server_api::RepositoryListResponse =
             serde_json::from_value(repositories.clone()).unwrap();
         assert_eq!(
             typed_repositories.items[0].repository_key,
@@ -30500,7 +30507,7 @@ mod tests {
         );
 
         let repository_detail = get_json(app.clone(), "/api/repositories/test-repository").await;
-        let _: workspace_api::RepositoryDetailResponse =
+        let _: server_api::RepositoryDetailResponse =
             serde_json::from_value(repository_detail.clone()).unwrap();
         assert_eq!(
             repository_detail["item"]["repository_key"],
@@ -30520,7 +30527,7 @@ mod tests {
 
         let repository_log =
             get_json(app.clone(), "/api/repositories/test-repository/log?limit=3").await;
-        let _: workspace_api::RepositoryLogResponse =
+        let _: server_api::RepositoryLogResponse =
             serde_json::from_value(repository_log.clone()).unwrap();
         assert_eq!(repository_log["repository_key"], "test-repository");
         assert!(repository_log.get("repository_id").is_none());
@@ -30968,13 +30975,13 @@ mod tests {
             id: "files".to_string(),
             repository_key: "files".to_string(),
             provider: "local_fs".to_string(),
-            source: workspace_api::RepositorySource {
-                kind: workspace_api::RepositorySourceKind::LocalPath,
+            source: server_api::RepositorySource {
+                kind: server_api::RepositorySourceKind::LocalPath,
                 uri: root.path().display().to_string(),
             },
             source_revision: 1,
             source_fingerprint: "sha256:test".to_string(),
-            observed_status: workspace_api::RepositoryObservedStatus::Unverified,
+            observed_status: server_api::RepositoryObservedStatus::Unverified,
             observed_at: None,
             path: Some(root.path().to_path_buf()),
             default_selector: None,
@@ -31929,28 +31936,31 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
     fn workspace_workdir_response_serializes_shared_occupied_contract() {
         let response = BrowserWorkingDirectoryListResponse {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
-            items: vec![WorkingDirectorySummary {
-                working_directory_id: "wd-1".to_string(),
-                repository_key: "main".to_string(),
-                creation_selector: None,
-                creation_ref: None,
-                creation_tree: None,
-                current_selector: Some("work/ticket".to_string()),
-                current_ref: Some("abc123".to_string()),
-                current_tree: Some("tree123".to_string()),
-                observed_at_epoch_seconds: Some(1_777_777_777),
-                materializer_kind: MaterializerKind::RuntimeGitClone,
-                cleanup_target: None,
-                status: WorkingDirectoryStatusKind::Active,
-                cleanliness: Some("clean".to_string()),
-                primary_worker_id: None,
-                occupied_by: Some(WorkingDirectoryOccupancy {
-                    runtime_id: "arcadia".to_string(),
-                    worker_id: "worker-opaque-64".to_string(),
-                    display_name: "Coder".to_string(),
-                    linked_at: "2026-08-12T00:00:00Z".to_string(),
-                }),
-            }],
+            items: vec![
+                WorkingDirectorySummary {
+                    working_directory_id: "wd-1".to_string(),
+                    repository_key: "main".to_string(),
+                    creation_selector: None,
+                    creation_ref: None,
+                    creation_tree: None,
+                    current_selector: Some("work/ticket".to_string()),
+                    current_ref: Some("abc123".to_string()),
+                    current_tree: Some("tree123".to_string()),
+                    observed_at_epoch_seconds: Some(1_777_777_777),
+                    materializer_kind: MaterializerKind::RuntimeGitClone,
+                    cleanup_target: None,
+                    status: WorkingDirectoryStatusKind::Active,
+                    cleanliness: Some("clean".to_string()),
+                    primary_worker_id: None,
+                    occupied_by: Some(WorkingDirectoryOccupancy {
+                        runtime_id: "arcadia".to_string(),
+                        worker_id: "worker-opaque-64".to_string(),
+                        display_name: "Coder".to_string(),
+                        linked_at: "2026-08-12T00:00:00Z".to_string(),
+                    }),
+                }
+                .into(),
+            ],
             diagnostics: vec![],
         };
 

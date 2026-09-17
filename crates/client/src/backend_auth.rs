@@ -3,8 +3,8 @@ use serde::Deserialize;
 use std::fmt;
 use std::time::Duration;
 
-use workspace_api::{DeviceLoginPollRequest, DeviceLoginPollStatus, DeviceLoginStartRequest};
-pub use workspace_api::{DeviceLoginPollResponse, DeviceLoginStartResponse};
+use server_api::{DeviceLoginPollRequest, DeviceLoginPollStatus, DeviceLoginStartRequest};
+pub use server_api::{DeviceLoginPollResponse, DeviceLoginStartResponse};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendAuthTarget {
@@ -153,7 +153,7 @@ async fn parse_json_response<T: for<'de> Deserialize<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use workspace_api::DeviceAccessTokenType;
+    use server_api::DeviceAccessTokenType;
 
     fn poll_response(status: DeviceLoginPollStatus) -> DeviceLoginPollResponse {
         DeviceLoginPollResponse {

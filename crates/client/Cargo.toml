@@ -19,7 +19,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "sync", "time"] }
 tokio-tungstenite = { workspace = true }
 uuid = { workspace = true }
-workspace-api.workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }

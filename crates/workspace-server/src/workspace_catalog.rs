@@ -4,8 +4,8 @@ use chrono::{SecondsFormat, Utc};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub use workspace_api::{InitialRepositoryIntent, WorkspaceCreateRequest};
-use workspace_api::{RepositoryObservedStatus, RepositorySource};
+pub use server_api::{InitialRepositoryIntent, WorkspaceCreateRequest};
+use server_api::{RepositoryObservedStatus, RepositorySource};
 
 use crate::repository_source::{parse_repository_source, repository_source_fingerprint};
 use crate::store::{
@@ -96,7 +96,7 @@ impl WorkspaceCatalogService {
             normalize_required("display_name", request.display_name, MAX_DISPLAY_NAME_BYTES)?;
         let repository_source = validate_repository_source(&request.repository.uri)?;
         let repository_uri = repository_source.uri.clone();
-        workspace_api::validate_repository_key(&request.repository.repository_key)
+        server_api::validate_repository_key(&request.repository.repository_key)
             .map_err(|error| Error::InvalidInput(format!("invalid Repository key: {error}")))?;
         let repository_key = request.repository.repository_key.clone();
         let default_ref = request
@@ -228,7 +228,7 @@ mod tests {
         InMemoryWorkspaceSigningMaterialStore, WorkspaceSigningMaterialStore,
         WorkspaceSigningPrivateMaterial, identity_error,
     };
-    use workspace_api::RepositorySourceKind;
+    use server_api::RepositorySourceKind;
 
     struct FailFirstMaterialWrite {
         inner: Arc<InMemoryWorkspaceSigningMaterialStore>,
