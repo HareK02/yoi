@@ -59,8 +59,10 @@ closed and restore admission cannot register a competing writer until process
 teardown, after which restore converges from the replacement named by metadata.
 The Worker must likewise remain non-idle while terminal compaction-service cleanup
 is pending. Cleanup authority is stored on the Worker (not only on one compaction
-future), retried until the registry record is gone, and cleared exactly once before
-activation or a terminal result.
+future). A failed stop returns a typed cleanup-pending outcome without clearing that
+authority; the next compaction boundary retries it. The authority and lifecycle
+reference are cleared exactly once after the registry record is gone, before
+activation or a terminal idle-capable result.
 
 ## Metrics and comparison procedure
 

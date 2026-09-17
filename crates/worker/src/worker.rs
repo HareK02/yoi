@@ -4780,7 +4780,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     completed,
                     "automatic compaction must complete a claimed attempt"
                 );
-                if matches!(e, WorkerError::SegmentActivationIncomplete { .. }) {
+                if matches!(
+                    &e,
+                    WorkerError::SegmentActivationIncomplete { .. }
+                        | WorkerError::CompactionCleanupPending { .. }
+                ) {
                     Err(e)
                 } else {
                     Ok(())
@@ -5070,7 +5074,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
         trigger: CompactionTrigger,
     ) -> Result<SegmentId, WorkerError> {
-        self.release_pending_compaction_service().await;
+        self.release_pending_compaction_service().await?;
         let _rewrite_guard = self
             .prepare_session_rewrite(SessionRewriteKind::Compact)
             .await?;
@@ -5143,6 +5147,14 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 Ok(new_segment_id)
             }
             Err(error) => {
+                let error = if matches!(&error, WorkerError::CompactionCleanupPending { .. }) {
+                    error
+                } else {
+                    match self.release_compaction_service(&mut lifecycle).await {
+                        Ok(()) => error,
+                        Err(cleanup_error) => cleanup_error,
+                    }
+                };
                 let observed_segment_id = self.segment_state.location().segment_id;
                 for metric in attempt.failure_metrics(
                     observed_segment_id,
@@ -5152,68 +5164,70 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     self.try_record_metric(&metric);
                 }
                 lifecycle.revision = lifecycle.revision.saturating_add(1);
-                lifecycle.state = if matches!(error, WorkerError::CompactCancelled) {
+                lifecycle.state = if matches!(&error, WorkerError::CompactCancelled) {
                     CompactionLifecycleState::Interrupted
                 } else {
                     CompactionLifecycleState::Failed
                 };
                 lifecycle.ended_at_ms = Some(segment_log::now_millis());
-                self.release_compaction_service(&mut lifecycle).await;
-                self.set_compaction_progress(None);
+                if !matches!(&error, WorkerError::CompactionCleanupPending { .. }) {
+                    self.set_compaction_progress(None);
+                }
                 Err(error)
             }
         }
     }
 
-    async fn release_pending_compaction_service(&self) {
+    async fn release_pending_compaction_service(&self) -> Result<(), WorkerError> {
         let cleanup = self
             .pending_compaction_cleanup
             .lock()
             .expect("pending compaction cleanup mutex poisoned")
             .clone();
         let Some(cleanup) = cleanup else {
-            return;
+            return Ok(());
         };
         let Some(registry) = &self.internal_worker_registry else {
-            return;
+            return Err(WorkerError::CompactionCleanupPending {
+                source: ScopeLockError::Io(std::io::Error::other(
+                    "compaction registry unavailable during cleanup",
+                )),
+            });
         };
-        loop {
-            match registry.stop_service(&cleanup.session_id).await {
-                Ok(_) => {
-                    let mut pending = self
-                        .pending_compaction_cleanup
-                        .lock()
-                        .expect("pending compaction cleanup mutex poisoned");
-                    if pending
-                        .as_ref()
-                        .is_some_and(|pending| pending.session_id == cleanup.session_id)
-                    {
-                        *pending = None;
-                    }
-                    return;
+        match registry.stop_service(&cleanup.session_id).await {
+            Ok(_) => {
+                let mut pending = self
+                    .pending_compaction_cleanup
+                    .lock()
+                    .expect("pending compaction cleanup mutex poisoned");
+                if pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.session_id == cleanup.session_id)
+                {
+                    *pending = None;
                 }
-                Err(error) => {
-                    warn!(
-                        compaction_id = %cleanup.compaction_id,
-                        error = %error,
-                        "compaction service cleanup failed; retaining cleanup authority and retrying"
-                    );
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+                Ok(())
+            }
+            Err(source) => {
+                warn!(
+                    compaction_id = %cleanup.compaction_id,
+                    error = %source,
+                    "compaction service cleanup failed; retaining cleanup authority"
+                );
+                Err(WorkerError::CompactionCleanupPending {
+                    source: ScopeLockError::Io(source),
+                })
             }
         }
     }
 
-    async fn release_compaction_service(&self, lifecycle: &mut CompactionLifecycle) {
-        self.release_pending_compaction_service().await;
-        if self
-            .pending_compaction_cleanup
-            .lock()
-            .expect("pending compaction cleanup mutex poisoned")
-            .is_none()
-        {
-            lifecycle.internal_worker = None;
-        }
+    async fn release_compaction_service(
+        &self,
+        lifecycle: &mut CompactionLifecycle,
+    ) -> Result<(), WorkerError> {
+        self.release_pending_compaction_service().await?;
+        lifecycle.internal_worker = None;
+        Ok(())
     }
 
     async fn compact_impl(
@@ -5761,7 +5775,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // activation so no internal process or registry authority survives into
         // the replacement's live lifetime. Cleanup failures retain this future
         // (and Busy state) until a retry succeeds.
-        self.release_compaction_service(lifecycle).await;
+        self.release_compaction_service(lifecycle).await?;
 
         self.set_compaction_progress(Some(InFlightCompaction {
             phase: CompactionPhase::Committing,
@@ -7429,6 +7443,12 @@ pub enum WorkerError {
         "Segment activation could not be completed; the Worker must be restored before accepting more input"
     )]
     SegmentActivationIncomplete {
+        #[source]
+        source: ScopeLockError,
+    },
+
+    #[error("compaction cleanup is pending; retry or shut down the Worker")]
+    CompactionCleanupPending {
         #[source]
         source: ScopeLockError,
     },

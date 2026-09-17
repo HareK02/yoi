@@ -2148,6 +2148,7 @@ async fn controller_loop<C, St>(
                         | Err(WorkerError::WorkerStore(_))
                         | Err(WorkerError::InvalidState(_))
                         | Err(WorkerError::SegmentActivationIncomplete { .. })
+                        | Err(WorkerError::CompactionCleanupPending { .. })
                 ) {
                     set_controller_state(
                         &shared_state,
@@ -2566,6 +2567,19 @@ where
                         (WorkerStatus::Paused, shutdown_requested, false)
                     }
                     Err(e) => {
+                        let status = if matches!(
+                            &e,
+                            WorkerError::SegmentActivationIncomplete { .. }
+                                | WorkerError::CompactionCleanupPending { .. }
+                        ) {
+                            // Metadata has already committed the replacement, but
+                            // one live authority failed to publish. Keep the
+                            // controller visibly busy/fail-closed; publishing Idle
+                            // would admit another turn against inconsistent state.
+                            WorkerStatus::Running
+                        } else {
+                            WorkerStatus::Idle
+                        };
                         let code = worker_error_code(&e);
                         let message = e.to_string();
                         let _ = working_event_tx.send(Event::Error {
@@ -2581,7 +2595,7 @@ where
                                 },
                             );
                         }
-                        (WorkerStatus::Idle, shutdown_requested, false)
+                        (status, shutdown_requested, false)
                     }
                 };
             }
@@ -3317,6 +3331,74 @@ mod tests {
             WorkerEvent::TurnEnded { worker_name } => assert_eq!(worker_name, "child-worker"),
             other => panic!("expected TurnEnded, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn segment_activation_failure_from_run_never_publishes_idle() {
+        let mut env = make_env().await;
+        let worker_future = async {
+            Err::<WorkerRunResult, _>(WorkerError::SegmentActivationIncomplete {
+                source: crate::runtime::worker_allocation::ScopeLockError::UnknownWorker(
+                    "worker".into(),
+                ),
+            })
+        };
+
+        let (status, shutdown, may_drain_pending) = drive_turn(
+            worker_future,
+            &mut env.method_rx,
+            &env.working_event_tx,
+            &env.cancel_tx,
+            &env.pause_tx,
+            &env.shared_state,
+            &env.runtime_dir,
+            None,
+            &env.notify_buffer,
+            &env.pending_submissions,
+            None,
+            "worker",
+            &env.spawned_registry,
+            false,
+        )
+        .await;
+
+        assert_eq!(status, WorkerStatus::Running);
+        assert!(!shutdown);
+        assert!(!may_drain_pending);
+    }
+
+    #[tokio::test]
+    async fn pending_compaction_cleanup_from_run_never_publishes_idle() {
+        let mut env = make_env().await;
+        let worker_future = async {
+            Err::<WorkerRunResult, _>(WorkerError::CompactionCleanupPending {
+                source: crate::runtime::worker_allocation::ScopeLockError::UnknownWorker(
+                    "worker".into(),
+                ),
+            })
+        };
+
+        let (status, shutdown, may_drain_pending) = drive_turn(
+            worker_future,
+            &mut env.method_rx,
+            &env.working_event_tx,
+            &env.cancel_tx,
+            &env.pause_tx,
+            &env.shared_state,
+            &env.runtime_dir,
+            None,
+            &env.notify_buffer,
+            &env.pending_submissions,
+            None,
+            "worker",
+            &env.spawned_registry,
+            false,
+        )
+        .await;
+
+        assert_eq!(status, WorkerStatus::Running);
+        assert!(!shutdown);
+        assert!(!may_drain_pending);
     }
 
     #[tokio::test]
