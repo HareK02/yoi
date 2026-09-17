@@ -1,0 +1,10 @@
+error[E0446]: private type `PrivateRequest` in public interface
+ --> tests/ui/private_body.rs:8:1
+  |
+5 | struct PrivateRequest;
+  | --------------------- `PrivateRequest` declared as private
+...
+8 | #[api]
+  | ^^^^^^ can't leak private type
+  |
+  = note: this error originates in the attribute macro `api` (in Nightly builds, run with -Z macro-backtrace for more info)

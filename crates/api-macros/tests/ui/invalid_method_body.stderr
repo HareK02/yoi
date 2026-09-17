@@ -1,0 +1,5 @@
+error: GET operations cannot declare a request body
+ --> tests/ui/invalid_method_body.rs:9:14
+  |
+9 |     async fn list(&self, #[body] request: Request) -> Response;
+  |              ^^^^

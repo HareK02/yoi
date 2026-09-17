@@ -1,0 +1,5 @@
+error: path placeholder(s) have no matching path parameter: widget_id
+ --> tests/ui/path_mismatch.rs:7:11
+  |
+7 |     #[get("/widgets/{widget_id}")]
+  |           ^^^^^^^^^^^^^^^^^^^^^^
