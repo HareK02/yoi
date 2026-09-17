@@ -173,7 +173,15 @@ name = "api-macros"
 version = "0.1.0"
 dependencies = [
  "api-macros-impl",
+ "axum",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "tokio",
  "trybuild",
+ "url",
 ]
 
 [[package]]

@@ -58,10 +58,34 @@
 //! Only empty and JSON bodies are accepted by this first contract. [`WireKind`] reserves
 //! explicit variants for future transport work; accepting one requires a deliberate macro and
 //! adapter change rather than silently treating it as JSON.
+//!
+//! # Optional HTTP adapters
+//!
+//! `#[api(reqwest)]` generates `TraitNameClient` and enables a typed Reqwest client when this
+//! crate's `reqwest` feature is enabled. `#[api(axum)]` generates `TraitNameAxum` plus one public
+//! router per operation when the `axum` feature is enabled. `#[api(reqwest, axum)]` emits both
+//! from the same normalized definition. A plain `#[api]` remains framework-independent and pulls
+//! neither framework into DTO/contract-only builds.
+//!
+//! Generated clients use a fallible `try_new` constructor and builder. The builder validates an
+//! absolute credential-free HTTP(S) base URL and configures request timeout and response byte
+//! limit. A prevalidated [`reqwest::BaseUrl`] and policy-configured `reqwest::framework::Client`
+//! may be injected instead. Request authorizers receive the final method, encoded path/query, and
+//! exact serialized body bytes; credential headers and all body content are redacted from normal
+//! diagnostics.
+//!
+//! Generated Axum adapters keep authentication, authorization, application state, body limits,
+//! and timeout layers outside the adapter. Callers may layer the complete router or an individual
+//! generated operation router before merging it into their application.
 
 extern crate self as api_macros;
 
 pub use api_macros_impl::api;
+
+#[cfg(feature = "axum")]
+pub mod axum;
+#[cfg(feature = "reqwest")]
+pub mod reqwest;
 
 /// A transport-neutral HTTP method.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
