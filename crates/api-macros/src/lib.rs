@@ -59,6 +59,24 @@
 //! explicit variants for future transport work; accepting one requires a deliberate macro and
 //! adapter change rather than silently treating it as JSON.
 //!
+//! # OpenAPI 3.1 export
+//!
+//! With the `openapi` feature, `#[api(openapi)]` emits a `<trait_name>_openapi` function from the
+//! same normalized operation model used by the HTTP adapters. The caller supplies title, version,
+//! and an opaque source digest through [`openapi::OpenApiInfo`], then either serves
+//! [`openapi::OpenApiDocument::to_json`] or writes exactly those canonical bytes with
+//! [`openapi::OpenApiDocument::write_json`] from a CLI. Documents contain no server URLs,
+//! environment names, timestamps, or other deployment topology.
+//!
+//! Every exposed wire type must implement [`openapi::OpenApiSchema`] as an explicit assertion that
+//! its `schemars::JsonSchema` contract matches Serde serialization. The trait's naming hook is the
+//! public component-name contract. Different schemas claiming one name, unsafe-width integer
+//! schemas, and ambiguous non-null `anyOf`/untagged representations fail closed. Use bounded
+//! integers (for example `u32`) for JSON numeric fields, and model optionality separately from
+//! nullability through object `required` membership and nullable schemas. A normalized
+//! `#[header("authorization")]` string (or optional string) is projected as an HTTP bearer
+//! security scheme and operation requirement rather than as a raw header parameter.
+//!
 //! # Optional HTTP adapters
 //!
 //! `#[api(reqwest)]` generates `TraitNameClient` and enables a typed Reqwest client when this
@@ -84,6 +102,8 @@ pub use api_macros_impl::api;
 
 #[cfg(feature = "axum")]
 pub mod axum;
+#[cfg(feature = "openapi")]
+pub mod openapi;
 #[cfg(feature = "reqwest")]
 pub mod reqwest;
 

@@ -8,6 +8,10 @@ publish = false
 [lib]
 proc-macro = true
 
+[features]
+default = []
+openapi = []
+
 [dependencies]
 proc-macro-crate = "3"
 proc-macro2 = "1"
