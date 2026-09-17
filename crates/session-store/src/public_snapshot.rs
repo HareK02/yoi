@@ -13,8 +13,8 @@ use thiserror::Error;
 
 use crate::{
     LogEntry, LoggedContentPart, LoggedHistoryEntry, LoggedItem, LoggedRole,
-    LoggedSessionHistoryOrigin, SessionId, Store, StoreError, SystemItem, WorkerAggregateStore,
-    WorkerMetadataStore, WorkerSessionStore, WorkerStoreError,
+    LoggedSessionHistoryOrigin, SessionId, StoreError, SystemItem, WorkerAggregateStore,
+    WorkerSessionStore, WorkerStoreError,
 };
 
 /// Projection limit leaves one MiB for the typed API envelope so a public
@@ -44,6 +44,8 @@ pub enum RetainedSnapshotReadError {
     MigrationRequired,
     #[error("retained session log is corrupt")]
     CorruptLog,
+    #[error("retained session storage is unavailable")]
+    StorageUnavailable,
     #[error("retained session snapshot exceeds the observation limit")]
     SnapshotTooLarge,
 }
@@ -58,7 +60,7 @@ pub fn read_retained_session_snapshot(
     let aggregate = WorkerAggregateStore::open_read_only(aggregate_root, worker_name)
         .map_err(map_worker_store_error)?;
     let metadata = aggregate
-        .read_by_name(worker_name)
+        .read_read_only()
         .map_err(map_worker_store_error)?
         .ok_or(RetainedSnapshotReadError::RetentionMissing)?;
     let active = metadata
@@ -73,7 +75,7 @@ pub fn read_retained_session_snapshot(
         return Err(RetainedSnapshotReadError::SnapshotTooLarge);
     }
     let entries = store
-        .read_all(active.session_id, segment_id)
+        .read_all_read_only(active.session_id, segment_id)
         .map_err(map_store_error)?;
     let snapshot = project_session_snapshot(active.session_id, &entries);
     if serde_json::to_vec(&snapshot)
@@ -101,7 +103,7 @@ fn map_worker_store_error(error: WorkerStoreError) -> RetainedSnapshotReadError 
         WorkerStoreError::Serde(_) | WorkerStoreError::InvalidWorkerName(_) => {
             RetainedSnapshotReadError::CorruptLog
         }
-        WorkerStoreError::Io(_) => RetainedSnapshotReadError::CorruptLog,
+        WorkerStoreError::Io(_) => RetainedSnapshotReadError::StorageUnavailable,
     }
 }
 
@@ -113,9 +115,8 @@ fn map_store_error(error: StoreError) -> RetainedSnapshotReadError {
         StoreError::Corrupt { message, .. } if message.contains("requires migration") => {
             RetainedSnapshotReadError::MigrationRequired
         }
-        StoreError::Io(_) | StoreError::Serde(_) | StoreError::Corrupt { .. } => {
-            RetainedSnapshotReadError::CorruptLog
-        }
+        StoreError::Io(_) => RetainedSnapshotReadError::StorageUnavailable,
+        StoreError::Serde(_) | StoreError::Corrupt { .. } => RetainedSnapshotReadError::CorruptLog,
         _ => RetainedSnapshotReadError::CorruptLog,
     }
 }
@@ -426,7 +427,7 @@ mod tests {
     use super::*;
     use crate::{
         LoggedHistoryDerivation, LoggedSessionHistoryEntryId, LoggedSessionHistoryMetadata,
-        LoggedWorkerSubject,
+        LoggedWorkerSubject, Store, WorkerMetadataStore,
     };
 
     #[test]
@@ -685,8 +686,20 @@ mod tests {
             .unwrap();
         let session = WorkerSessionStore::new(aggregate_root.join("session")).unwrap();
         session.create_segment(session_id, segment_id, &[]).unwrap();
-        let metadata_before = std::fs::read(aggregate_root.join("metadata.json")).unwrap();
-        let manifest_before = std::fs::read(aggregate_root.join("session/session.json")).unwrap();
+        let metadata_path = aggregate_root.join("metadata.json");
+        let manifest_path = aggregate_root.join("session/session.json");
+        let segment_path = aggregate_root
+            .join("session/segments")
+            .join(format!("{segment_id}.jsonl"));
+        let metadata_before = std::fs::read(&metadata_path).unwrap();
+        let manifest_before = std::fs::read(&manifest_path).unwrap();
+        let old_atime = filetime::FileTime::from_unix_time(946_684_800, 0);
+        for path in [&metadata_path, &manifest_path, &segment_path] {
+            filetime::set_file_atime(path, old_atime).unwrap();
+        }
+        let mtimes_before = [&metadata_path, &manifest_path, &segment_path].map(|path| {
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(path).unwrap())
+        });
 
         let retained = read_retained_session_snapshot(
             &aggregate_root,
@@ -699,14 +712,26 @@ mod tests {
         assert_eq!(retained.identity.segment_id, segment_id.to_string());
         assert_eq!(retained.identity.entry_count, 0);
         assert!(retained.snapshot.entries.is_empty());
-        assert_eq!(
-            std::fs::read(aggregate_root.join("metadata.json")).unwrap(),
-            metadata_before
-        );
-        assert_eq!(
-            std::fs::read(aggregate_root.join("session/session.json")).unwrap(),
-            manifest_before
-        );
+        for (index, path) in [&metadata_path, &manifest_path, &segment_path]
+            .into_iter()
+            .enumerate()
+        {
+            let metadata = std::fs::metadata(path).unwrap();
+            assert_eq!(
+                filetime::FileTime::from_last_access_time(&metadata),
+                old_atime,
+                "retained observation changed access time for {}",
+                path.display()
+            );
+            assert_eq!(
+                filetime::FileTime::from_last_modification_time(&metadata),
+                mtimes_before[index],
+                "retained observation changed modification time for {}",
+                path.display()
+            );
+        }
+        assert_eq!(std::fs::read(&metadata_path).unwrap(), metadata_before);
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest_before);
         assert!(matches!(
             read_retained_session_snapshot(&aggregate_root, "worker-a", 0),
             Err(RetainedSnapshotReadError::SnapshotTooLarge)

@@ -404,6 +404,22 @@ impl WorkerAggregateStore {
         })
     }
 
+    pub fn read_read_only(&self) -> Result<Option<WorkerMetadata>, WorkerStoreError> {
+        let content = match crate::read_without_atime(&self.metadata_path()) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let metadata: WorkerMetadata = serde_json::from_slice(&content)?;
+        if metadata.worker_name != self.worker_name {
+            return Err(WorkerStoreError::InvalidWorkerName(format!(
+                "aggregate identity mismatch: expected `{}`, found `{}`",
+                self.worker_name, metadata.worker_name
+            )));
+        }
+        Ok(Some(metadata))
+    }
+
     fn validate_name(&self, worker_name: &str) -> Result<(), WorkerStoreError> {
         validate_worker_name(worker_name)?;
         if worker_name == self.worker_name {

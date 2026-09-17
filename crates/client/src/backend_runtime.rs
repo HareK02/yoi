@@ -40,6 +40,7 @@ pub struct BackendRuntimeTarget {
     /// Backend-owned Worker identity used as path authority.
     pub worker_id: String,
     pub initial_snapshot: Option<protocol::SessionSnapshot>,
+    pub initial_notice: Option<String>,
 }
 
 impl BackendRuntimeTarget {
@@ -55,6 +56,7 @@ impl BackendRuntimeTarget {
             runtime_id: runtime_id.into(),
             worker_id: worker_id.into(),
             initial_snapshot: None,
+            initial_notice: None,
         }
     }
 

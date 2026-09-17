@@ -83,32 +83,24 @@ pub(crate) async fn run(
         let mut attach_target = target
             .runtime_target(selected.runtime_id.clone(), selected.worker_id.clone())
             .map_err(|error| io::Error::other(error.to_string()))?;
-        if selected.state == "stopped" {
-            let api = ServerApiClient::builder(&target.base_url)
-                .map_err(|error| io::Error::other(error.to_string()))?
-                .build()
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            let response = api
-                .worker_session(
-                    attach_target.workspace_id.clone(),
-                    selected.runtime_id.clone(),
-                    selected.worker_id.clone(),
-                )
-                .await
-                .map_err(|error| {
-                    io::Error::other(format!(
-                        "failed to observe retained Worker Session {}/{}: {error}",
-                        selected.runtime_id, selected.worker_id
-                    ))
-                })?;
-            attach_target.initial_snapshot = match response.observation {
-                WorkerSessionAvailability::RetainedSnapshot { snapshot, .. } => Some(snapshot),
-                WorkerSessionAvailability::LiveProtocol => None,
-                WorkerSessionAvailability::Unavailable { message, .. } => {
-                    return Err(io::Error::other(message).into());
-                }
-            };
-        }
+        let api = ServerApiClient::builder(&target.base_url)
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .build()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let response = api
+            .worker_session(
+                attach_target.workspace_id.clone(),
+                selected.runtime_id.clone(),
+                selected.worker_id.clone(),
+            )
+            .await
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to observe Worker Session {}/{}: {error}",
+                    selected.runtime_id, selected.worker_id
+                ))
+            })?;
+        apply_worker_session_observation(&mut attach_target, response.observation);
         return console::run_backend_runtime(attach_target).await;
     }
 }
@@ -121,6 +113,28 @@ fn dedup_workers(workers: &mut Vec<BackendWorkerSummary>) {
 enum WorkerPickerResult {
     Selected(BackendWorkerSummary),
     SwitchWorkspace,
+}
+
+fn apply_worker_session_observation(
+    target: &mut client::BackendRuntimeTarget,
+    observation: WorkerSessionAvailability,
+) {
+    match observation {
+        WorkerSessionAvailability::LiveProtocol => {}
+        WorkerSessionAvailability::RetainedSnapshot { snapshot, .. } => {
+            target.initial_snapshot = Some(snapshot);
+            target.initial_notice = Some("read-only retained Session snapshot".to_string());
+        }
+        WorkerSessionAvailability::Unavailable { message, .. } => {
+            let bounded_message: String = message.chars().take(512).collect();
+            target.initial_snapshot = Some(protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                entries: Vec::new(),
+            });
+            target.initial_notice =
+                Some(format!("retained Session unavailable: {bounded_message}"));
+        }
+    }
 }
 
 fn pick_worker(
@@ -467,6 +481,53 @@ mod tests {
     fn display_column(text: &str, value: &str) -> usize {
         let byte_offset = text.find(value).expect("value in rendered row");
         text_width(&text[..byte_offset])
+    }
+
+    #[test]
+    fn authoritative_observation_selects_live_retained_and_unavailable_detail_modes() {
+        let mut live = client::BackendRuntimeTarget::new(
+            "http://127.0.0.1:3000",
+            "workspace-a",
+            "runtime-a",
+            "worker-a",
+        );
+        apply_worker_session_observation(&mut live, WorkerSessionAvailability::LiveProtocol);
+        assert!(live.initial_snapshot.is_none());
+
+        let snapshot = protocol::SessionSnapshot {
+            pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+            entries: Vec::new(),
+        };
+        let mut retained = live.clone();
+        apply_worker_session_observation(
+            &mut retained,
+            WorkerSessionAvailability::RetainedSnapshot {
+                identity: client::RetainedSessionIdentity {
+                    session_id: "session-a".to_string(),
+                    segment_id: "segment-a".to_string(),
+                    entry_count: 0,
+                },
+                snapshot: snapshot.clone(),
+            },
+        );
+        assert_eq!(retained.initial_snapshot, Some(snapshot));
+        assert!(retained.initial_notice.unwrap().contains("read-only"));
+
+        let mut unavailable = live;
+        apply_worker_session_observation(
+            &mut unavailable,
+            WorkerSessionAvailability::Unavailable {
+                reason: client::WorkerSessionUnavailableReason::RetentionMissing,
+                message: "retention expired".to_string(),
+            },
+        );
+        assert!(unavailable.initial_snapshot.is_some());
+        assert!(
+            unavailable
+                .initial_notice
+                .unwrap()
+                .contains("retention expired")
+        );
     }
 
     #[test]

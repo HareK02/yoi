@@ -20,8 +20,12 @@ unicode-normalization = "0.1.25"
 unicode-properties = { version = "0.1.4", features = ["general-category"] }
 unicode-security = "0.1.2"
 
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = { workspace = true }
+filetime = "0.2"
 futures = { workspace = true }

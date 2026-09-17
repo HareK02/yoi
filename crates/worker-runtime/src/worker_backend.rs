@@ -1975,6 +1975,9 @@ where
                     session_store::RetainedSnapshotReadError::CorruptLog => {
                         runtime_api::WorkerSessionUnavailableReason::CorruptLog
                     }
+                    session_store::RetainedSnapshotReadError::StorageUnavailable => {
+                        runtime_api::WorkerSessionUnavailableReason::StorageUnavailable
+                    }
                     session_store::RetainedSnapshotReadError::SnapshotTooLarge => {
                         runtime_api::WorkerSessionUnavailableReason::SnapshotTooLarge
                     }

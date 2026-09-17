@@ -471,7 +471,10 @@ async fn run_backend_console<T: Socket>(
     client: Client<T>,
     connected: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let worker_label = target.display_label();
+    let worker_label = match target.initial_notice.as_deref() {
+        Some(notice) => format!("{} — {notice}", target.display_label()),
+        None => target.display_label(),
+    };
     let mut terminal = enter_fullscreen()?;
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut app = App::new_with_persistent_input_history(worker_label, &workspace_root);

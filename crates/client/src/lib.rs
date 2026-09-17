@@ -40,7 +40,9 @@ pub use backend_workspace::{
     list_backend_workspaces_blocking,
 };
 pub use client::{Client, ClientError};
-pub use runtime_api::{WorkerSessionAvailability, WorkerSessionUnavailableReason};
+pub use runtime_api::{
+    RetainedSessionIdentity, WorkerSessionAvailability, WorkerSessionUnavailableReason,
+};
 pub use server_api::{ServerApi, ServerApiClient, WorkspaceWorkerSessionResponse};
 pub use target::{
     BackendTarget, BackendWorkerLaunch, Dashboard, ResolvedTarget, StandaloneTarget,
