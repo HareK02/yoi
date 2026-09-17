@@ -76,6 +76,21 @@ export function formatRunTokens(tokens: number): string {
   return String(tokens);
 }
 
+export type CompactionStatusPresentation = {
+  progress: InFlightCompaction;
+  label: string;
+};
+
+export function resolveCompactionStatusPresentation(
+  compaction: InFlightCompaction | null,
+  workerState: WorkerStateSnapshot | null,
+): CompactionStatusPresentation | null {
+  const progress = visibleCompactionProgress(compaction, workerState);
+  return progress
+    ? { progress, label: `Compacting · ${progress.phase}` }
+    : null;
+}
+
 export function visibleCompactionProgress(
   compaction: InFlightCompaction | null,
   workerState: WorkerStateSnapshot | null,

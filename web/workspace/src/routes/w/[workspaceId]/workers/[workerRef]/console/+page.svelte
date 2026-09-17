@@ -21,7 +21,6 @@
         type ComposerCompletionToken,
     } from "$lib/workspace/console/composer-completion";
     import WorkerRunStatus from "$lib/workspace/console/WorkerRunStatus.svelte";
-    import { visibleCompactionProgress } from "$lib/workspace/console/run-status";
     import { resolveWorkerControlShortcut } from "$lib/workspace/console/worker-control-shortcuts";
     import {
         consoleWorkerViews,
@@ -249,12 +248,6 @@
         liveWorkerState ?? (worker?.state === "stopped" ? "stopped" : "loading"),
     );
     const workerRunning = $derived(workerState === "running");
-    const compactionProgress = $derived(
-        visibleCompactionProgress(
-            consoleProjection.compaction,
-            consoleProjection.workerState,
-        ),
-    );
     const workerPaused = $derived(workerState === "paused");
     const composerEditable = $derived(protocolState === "open" && !sending);
     const draftHasText = $derived(draft.content.trim().length > 0);
@@ -1912,7 +1905,8 @@
             requests={consoleProjection.runActivity.requests}
             uploadTokens={consoleProjection.runActivity.uploadTokens}
             outputTokens={consoleProjection.runActivity.outputTokens}
-            compaction={compactionProgress}
+            compaction={consoleProjection.compaction}
+            workerState={consoleProjection.workerState}
         />
     {/if}
 

@@ -5,6 +5,7 @@ import {
   formatRunElapsed,
   formatRunElapsedCompact,
   formatRunTokens,
+  resolveCompactionStatusPresentation,
   visibleCompactionProgress,
 } from "./run-status.ts";
 
@@ -100,7 +101,7 @@ Deno.test("run status formatting matches the compact TUI shape", () => {
   assertEquals(formatRunTokens(999), "999");
 });
 
-Deno.test("visible compaction requires a matching busy worker state", () => {
+Deno.test("WorkerRunStatus presentation follows compaction and busy state", () => {
   const manual = {
     phase: "preparing",
     started_at_ms: 1_700_000_000_000,
@@ -137,4 +138,19 @@ Deno.test("visible compaction requires a matching busy worker state", () => {
   assertEquals(visibleCompactionProgress(manual, idle), null);
   assertEquals(visibleCompactionProgress(manual, null), null);
   assertEquals(visibleCompactionProgress(null, maintenance), null);
+
+  assertEquals(resolveCompactionStatusPresentation(manual, maintenance), {
+    progress: manual,
+    label: "Compacting · preparing",
+  });
+  assertEquals(resolveCompactionStatusPresentation(automatic, run), {
+    progress: automatic,
+    label: "Compacting · summarizing",
+  });
+  assertEquals(resolveCompactionStatusPresentation(manual, run), null);
+  assertEquals(
+    resolveCompactionStatusPresentation(automatic, maintenance),
+    null,
+  );
+  assertEquals(resolveCompactionStatusPresentation(manual, idle), null);
 });

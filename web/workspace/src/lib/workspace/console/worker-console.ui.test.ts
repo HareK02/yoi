@@ -1129,15 +1129,16 @@ Deno.test("Web Console gates compaction progress before rendering run status", a
   );
 
   assert(
-    consolePage.includes("visibleCompactionProgress(") &&
-      consolePage.includes("consoleProjection.compaction") &&
-      consolePage.includes("consoleProjection.workerState") &&
-      consolePage.includes("compaction={compactionProgress}"),
-    "Console page should pass only state-consistent compaction progress to the status component",
+    consolePage.includes("compaction={consoleProjection.compaction}") &&
+      consolePage.includes("workerState={consoleProjection.workerState}"),
+    "Console page should pass compaction metadata with authoritative worker state to the status component",
   );
   assert(
-    runStatus.includes("compaction?.started_at_ms ?? startedAtMs") &&
-      runStatus.includes("Compacting · {compaction.phase}"),
-    "run status should render the compaction phase and derive elapsed time from the authoritative start timestamp",
+    runStatus.includes("resolveCompactionStatusPresentation(") &&
+      runStatus.includes("{compactionStatus.label}") &&
+      runStatus.includes(
+        "compactionStatus?.progress.started_at_ms ?? startedAtMs",
+      ),
+    "run status should render the guarded presentation and derive elapsed time from its authoritative start timestamp",
   );
 });
