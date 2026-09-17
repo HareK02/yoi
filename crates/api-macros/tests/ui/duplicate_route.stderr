@@ -1,0 +1,5 @@
+error: duplicate route for GET `/widgets`
+  --> tests/ui/duplicate_route.rs:11:14
+   |
+11 |     async fn second(&self) -> Response;
+   |              ^^^^^^

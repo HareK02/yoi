@@ -1,0 +1,5 @@
+error: an API operation may declare only one request body
+  --> tests/ui/multiple_bodies.rs:13:17
+   |
+13 |         #[body] second: SecondBody,
+   |                 ^^^^^^

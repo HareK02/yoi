@@ -4,6 +4,8 @@ members = [
     "crates/client",
     "crates/agen",
     "crates/agen-macros",
+    "crates/api-macros",
+    "crates/api-macros-impl",
     "crates/session-store",
     "crates/standalone",
     "crates/secrets",
@@ -36,6 +38,8 @@ default-members = [
     "crates/client",
     "crates/agen",
     "crates/agen-macros",
+    "crates/api-macros",
+    "crates/api-macros-impl",
     "crates/session-store",
     "crates/standalone",
     "crates/secrets",
@@ -79,6 +83,7 @@ debug = false
 client = { path = "crates/client" }
 agen = { path = "crates/agen", version = "0.2" }
 agen-macros = { path = "crates/agen-macros", version = "0.2" }
+api-macros = { path = "crates/api-macros" }
 manifest = { path = "crates/manifest" }
 mcp = { path = "crates/mcp" }
 lint-common = { path = "crates/lint-common" }
