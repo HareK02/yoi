@@ -1826,21 +1826,13 @@ where
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if workers.contains_key(&worker_ref) {
-            let existing_worker_state = workers.get(&worker_ref).and_then(|worker| {
-                worker
-                    .worker_state
-                    .read()
-                    .ok()
-                    .map(|state| state.clone())
-            });
+            let existing_worker_state = workers
+                .get(&worker_ref)
+                .and_then(|worker| worker.worker_state.read().ok().map(|state| state.clone()));
             let existing_handle = WorkerExecutionHandle::new(worker_ref.clone(), self.backend_id());
             drop(workers);
-            let cleanup = self.cleanup_unconnected_controller(
-                &handle,
-                &shutdown,
-                &tasks,
-                &worker_state,
-            );
+            let cleanup =
+                self.cleanup_unconnected_controller(&handle, &shutdown, &tasks, &worker_state);
             let result = WorkerExecutionResult::busy(
                 operation,
                 match &cleanup {
@@ -2170,12 +2162,15 @@ where
         drop(workers);
 
         if let Some(previous) = request.previous_working_directory.as_ref() {
-            let materializer = self.working_directory_materializer.as_ref().ok_or_else(|| {
-                WorkerExecutionResult::rejected(
-                    WorkerExecutionOperation::Restore,
-                    "Persisted Worker Workdir binding cannot be restored by this Runtime",
-                )
-            })?;
+            let materializer = self
+                .working_directory_materializer
+                .as_ref()
+                .ok_or_else(|| {
+                    WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::Restore,
+                        "Persisted Worker Workdir binding cannot be restored by this Runtime",
+                    )
+                })?;
             let current = materializer
                 .working_directory_status(&previous.summary.working_directory_id)
                 .map_err(|message| {

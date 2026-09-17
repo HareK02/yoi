@@ -60,7 +60,6 @@ use protocol::subscription::{
     SubscriptionTerminationCode,
 };
 use serde::{Deserialize, Serialize};
-use workspace_api::WorkerRestoreState;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
@@ -75,6 +74,7 @@ use workdir::{
         WorkdirTransportError, WorkdirTransportErrorCode,
     },
 };
+use workspace_api::WorkerRestoreState;
 
 const DEFAULT_RUNTIME_HTTP_PORT: u16 = 38800;
 pub const RUNTIME_HTTP_PROTOCOL_MIN_VERSION: u32 = 1;

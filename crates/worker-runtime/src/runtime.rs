@@ -1449,7 +1449,8 @@ impl Runtime {
     /// converges on its already-installed execution rather than spawning another
     /// controller.
     pub fn restore_worker(&self, worker_ref: &WorkerRef) -> Result<WorkerDetail, RuntimeError> {
-        self.restore_worker_operation(worker_ref)?.into_legacy_result()
+        self.restore_worker_operation(worker_ref)?
+            .into_legacy_result()
     }
 
     pub fn restore_worker_operation(
@@ -1567,45 +1568,47 @@ impl Runtime {
                 );
                 match commit {
                     Ok(worker) => Ok(RuntimeWorkerRestoreResult::accepted(worker)),
-                    Err(error) => match self.cleanup_failed_restore(&backend, worker_ref, &handle) {
-                        Ok(()) => {
-                            tracing::warn!(
-                                worker_id = %worker_ref.worker_id,
-                                error = %error,
-                                "Worker restore commit failed and was rolled back"
-                            );
-                            Ok(RuntimeWorkerRestoreResult::failed(
-                                WorkerRestoreState::RolledBack,
-                                "worker_restore_commit_rolled_back",
-                                "Worker restore commit failed and cleanup completed",
-                            ))
-                        }
-                        Err(cleanup_error) => {
-                            tracing::error!(
-                                worker_id = %worker_ref.worker_id,
-                                error = %error,
-                                cleanup_error = %cleanup_error,
-                                "Worker restore requires reconciliation after commit and cleanup failures"
-                            );
-                            if let Err(retain_error) = self.retain_restore_execution_evidence(
-                                worker_ref,
-                                handle,
-                                worker_state,
-                                working_directory,
-                            ) {
+                    Err(error) => {
+                        match self.cleanup_failed_restore(&backend, worker_ref, &handle) {
+                            Ok(()) => {
+                                tracing::warn!(
+                                    worker_id = %worker_ref.worker_id,
+                                    error = %error,
+                                    "Worker restore commit failed and was rolled back"
+                                );
+                                Ok(RuntimeWorkerRestoreResult::failed(
+                                    WorkerRestoreState::RolledBack,
+                                    "worker_restore_commit_rolled_back",
+                                    "Worker restore commit failed and cleanup completed",
+                                ))
+                            }
+                            Err(cleanup_error) => {
                                 tracing::error!(
                                     worker_id = %worker_ref.worker_id,
-                                    error = %retain_error,
-                                    "failed to persist restore execution evidence; in-process reconciliation remains required"
+                                    error = %error,
+                                    cleanup_error = %cleanup_error,
+                                    "Worker restore requires reconciliation after commit and cleanup failures"
                                 );
+                                if let Err(retain_error) = self.retain_restore_execution_evidence(
+                                    worker_ref,
+                                    handle,
+                                    worker_state,
+                                    working_directory,
+                                ) {
+                                    tracing::error!(
+                                        worker_id = %worker_ref.worker_id,
+                                        error = %retain_error,
+                                        "failed to persist restore execution evidence; in-process reconciliation remains required"
+                                    );
+                                }
+                                Ok(RuntimeWorkerRestoreResult::failed(
+                                    WorkerRestoreState::ReconciliationRequired,
+                                    "worker_restore_reconciliation_required",
+                                    "Worker restore result is uncertain; reread or retry the Worker restore",
+                                ))
                             }
-                            Ok(RuntimeWorkerRestoreResult::failed(
-                                WorkerRestoreState::ReconciliationRequired,
-                                "worker_restore_reconciliation_required",
-                                "Worker restore result is uncertain; reread or retry the Worker restore",
-                            ))
                         }
-                    },
+                    }
                 }
             }
             WorkerExecutionSpawnResult::Rejected(_result) => {
@@ -1617,8 +1620,7 @@ impl Runtime {
             }
             WorkerExecutionSpawnResult::RolledBack(_result) => {
                 #[cfg(feature = "fs-store")]
-                self.lock()?
-                    .record_restore_failure(worker_ref, _result)?;
+                self.lock()?.record_restore_failure(worker_ref, _result)?;
                 Ok(RuntimeWorkerRestoreResult::failed(
                     WorkerRestoreState::RolledBack,
                     "worker_restore_rolled_back",
@@ -7466,12 +7468,14 @@ mod tests {
             .unwrap();
         runtime.stop_worker(&created.worker_ref, None).unwrap();
         let before = runtime.worker_detail(&created.worker_ref).unwrap();
-        backend.preflight_restore_result.lock().unwrap().replace(
-            WorkerExecutionResult::rejected(
+        backend
+            .preflight_restore_result
+            .lock()
+            .unwrap()
+            .replace(WorkerExecutionResult::rejected(
                 WorkerExecutionOperation::Restore,
                 "profile is no longer permitted",
-            ),
-        );
+            ));
 
         let result = runtime
             .restore_worker_operation(&created.worker_ref)

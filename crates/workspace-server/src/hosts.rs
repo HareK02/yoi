@@ -52,10 +52,10 @@ use worker_runtime::http_server::{
     RuntimeHttpWorkerCompletionsResponse, RuntimeHttpWorkerDeleteResponse,
     RuntimeHttpWorkerInputResponse, RuntimeHttpWorkerLifecycleRequest,
     RuntimeHttpWorkerLifecycleResponse, RuntimeHttpWorkerResponse,
-    RuntimeHttpWorkerRestoreResponse,
-    RuntimeHttpWorkerWorkspaceApiRequest, RuntimeHttpWorkersResponse,
-    RuntimeHttpWorkingDirectoriesResponse, RuntimeHttpWorkingDirectoryResponse,
-    RuntimeHttpWorkspacePromptProjectionRequest, RuntimeHttpWorkspacePromptProjectionResponse,
+    RuntimeHttpWorkerRestoreResponse, RuntimeHttpWorkerWorkspaceApiRequest,
+    RuntimeHttpWorkersResponse, RuntimeHttpWorkingDirectoriesResponse,
+    RuntimeHttpWorkingDirectoryResponse, RuntimeHttpWorkspacePromptProjectionRequest,
+    RuntimeHttpWorkspacePromptProjectionResponse,
 };
 use worker_runtime::identity::{
     RuntimeWorkerRef, WorkerId as EmbeddedWorkerId, WorkerRef as EmbeddedWorkerRef,
@@ -2350,11 +2350,9 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         match self.runtime.restore_worker_operation(&worker_ref) {
             Ok(result) => {
                 let diagnostics = match (result.reason_code, result.message) {
-                    (Some(code), Some(message)) => vec![diagnostic(
-                        code,
-                        DiagnosticSeverity::Warning,
-                        message,
-                    )],
+                    (Some(code), Some(message)) => {
+                        vec![diagnostic(code, DiagnosticSeverity::Warning, message)]
+                    }
                     _ => Vec::new(),
                 };
                 WorkerRestoreResult {
