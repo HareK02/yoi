@@ -2571,11 +2571,11 @@ async fn drain_until<F: FnMut(&Event) -> bool>(
     }
 }
 
-/// Pause mid-stream, then Resume: status round-trips Running →
-/// Paused → Running → Idle, and the final history contains exactly
-/// one user turn plus the assistant reply produced by the resume call.
+/// Paused → Running → Idle. A notification accepted while Paused must not
+/// auto-resume the Worker, and explicit Resume must inject it while preserving
+/// the interrupted turn's history consistency.
 #[tokio::test]
-async fn pause_then_resume_transitions_and_preserves_history_consistency() {
+async fn pause_then_resume_preserves_notifications_and_history_consistency() {
     // Response 1: hang after opening a text block (no stop / completed),
     // so the Engine is parked inside the stream read and `cancel_rx`
     // races it cleanly on Method::Pause.
@@ -2593,7 +2593,10 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
         }),
     ]);
     let client = MockClient::sequential(vec![hang, ok]);
-    let worker = make_worker(client).await;
+    let client_for_assert = client.clone();
+    let worker = make_worker(client)
+        .await
+        .with_notification_coalesce_delay(std::time::Duration::from_millis(20));
     let handle = spawn_controller(worker).await;
     let mut rx = handle.subscribe();
 
@@ -2640,6 +2643,25 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
     assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Paused);
 
     handle
+        .send(Method::Notify {
+            notification_request_id: "notify-while-paused".into(),
+            message: "resume context".into(),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    assert_eq!(
+        handle.shared_state.catalog_status(),
+        WorkerStatus::Paused,
+        "notification deadline must not auto-resume a paused Worker"
+    );
+    assert_eq!(
+        client_for_assert.captured_requests().len(),
+        1,
+        "paused notification must wait for an explicit resume"
+    );
+
+    handle
         .send(Method::Resume {
             command: worker_command(&handle),
         })
@@ -2659,10 +2681,16 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Idle);
+    let requests = client_for_assert.captured_requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].items.iter().any(|item| {
+        item.as_text().is_some_and(|text| {
+            text.contains("[Notification]") && text.contains("resume context")
+        })
+    }));
 
-    // History consistency: exactly [user "hello", assistant
-    // "resumed output"]. No artifacts from the aborted stream
-    // (partial text is not committed), no orphan tool_use.
+    // History consistency: the interrupted partial response is absent, while
+    // the queued notification is committed on the explicit resume.
     let history = history_from_sink(&handle);
     let roles: Vec<&str> = history
         .iter()
@@ -2677,8 +2705,8 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
         .collect();
     assert_eq!(
         roles,
-        vec!["user", "assistant"],
-        "history = user + assistant only; got {history:?}"
+        vec!["user", "system", "assistant"],
+        "history should retain user input, queued notification, and resumed output; got {history:?}"
     );
     let assistant_text = history
         .iter()

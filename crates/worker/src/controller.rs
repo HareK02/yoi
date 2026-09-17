@@ -1688,15 +1688,18 @@ async fn controller_loop<C, St>(
             continue;
         }
 
+        let notification_delay = (shared_state.catalog_status() == WorkerStatus::Idle)
+            .then(|| {
+                notification_coalesce_remaining(
+                    &pending_submissions,
+                    &notify_buffer,
+                    notification_coalesce_delay,
+                )
+            })
+            .flatten();
         let method = if let Some(method) = deferred_methods.pop_front() {
             method
-        } else if let Some(remaining) =
-            notification_coalesce_remaining(
-                &pending_submissions,
-                &notify_buffer,
-                notification_coalesce_delay,
-            )
-        {
+        } else if let Some(remaining) = notification_delay {
             tokio::select! {
                 method = method_rx.recv() => match method {
                     Some(method) => method,
