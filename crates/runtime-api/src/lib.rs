@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use api_macros::api;
+pub use api_macros::axum as server_support;
 pub use api_macros::reqwest as client_support;
 pub use api_macros::{ApiContract, HttpMethod};
 use protocol::{CompletionEntry, CompletionKind, Segment, WorkerId, WorkerStateSnapshot};
@@ -110,6 +111,11 @@ pub struct WorkspaceApiRef {
     pub base_url: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkerWorkspaceApiRequest {
+    pub workspace_api: WorkspaceApiRef,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerStatus {
@@ -176,13 +182,49 @@ pub struct WorkingDirectoryRepository {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendResourceKind {
+    ProfileSourceArchive,
+    RepositorySshAccess,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendResourceOperation {
+    FetchArchive,
+    FetchOnce,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceRedactionPolicy {
+    RuntimeInternalOnly,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BackendResourceHandle {
+    pub kind: BackendResourceKind,
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
     pub resource_id: String,
-    pub resource_kind: String,
-    pub resource_version: u64,
-    pub resource_fingerprint: String,
-    pub secret_handle: String,
-    pub expires_at_epoch_seconds: Option<u64>,
+    pub digest: String,
+    pub operation: BackendResourceOperation,
+    pub expires_at_unix_seconds: i64,
+    pub nonce: String,
+    pub revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    pub max_bytes: u64,
+    pub content_type: String,
+    pub redaction: ResourceRedactionPolicy,
+    pub audit_correlation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_source_graph: Option<ProfileSourceGraphSummary>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -541,6 +583,17 @@ pub trait RuntimeApi {
     ) -> Result<WorkerResponse, RuntimeApiError>;
 
     #[post(
+        "/v1/workers/{worker_id}/workspace-api",
+        status = 200,
+        error_status = 400
+    )]
+    async fn replace_worker_workspace_api(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerWorkspaceApiRequest,
+    ) -> Result<WorkerResponse, RuntimeApiError>;
+
+    #[post(
         "/v1/workers/{worker_id}/completions",
         status = 200,
         error_status = 400
@@ -587,11 +640,6 @@ pub const REMAINING_RUNTIME_ROUTES: &[RemainingRuntimeRoute] = &[
         method: "POST",
         path: "/v1/bootstrap",
         reason: "bootstrap lifecycle",
-    },
-    RemainingRuntimeRoute {
-        method: "POST",
-        path: "/v1/workers/{worker_id}/workspace-api",
-        reason: "Workspace API rebinding",
     },
     RemainingRuntimeRoute {
         method: "GET",
@@ -649,10 +697,159 @@ pub const REMAINING_RUNTIME_ROUTES: &[RemainingRuntimeRoute] = &[
 mod tests {
     use super::*;
 
+    #[derive(Clone)]
+    struct RoundTripService;
+
+    fn test_error(status: u16) -> RuntimeApiError {
+        RuntimeApiError::new(status, "test_error", "test error")
+    }
+
+    impl RuntimeApi for RoundTripService {
+        async fn ping(
+            &self,
+            _workspace_id: String,
+        ) -> Result<RuntimePingResponse, RuntimeApiError> {
+            Err(test_error(501))
+        }
+
+        async fn runtime_summary(&self) -> Result<RuntimeSummaryResponse, RuntimeApiError> {
+            Ok(RuntimeSummaryResponse {
+                runtime: RuntimeSummary {
+                    display_name: Some("round-trip".to_string()),
+                    backend: RuntimeBackendKind::Memory,
+                    status: RuntimeStatus::Running,
+                    worker_count: 0,
+                    active_worker_count: 0,
+                    stopped_worker_count: 0,
+                    diagnostic_count: 0,
+                    os: "test".to_string(),
+                    arch: "test".to_string(),
+                    worker_creation_available: true,
+                },
+            })
+        }
+
+        async fn list_workers(
+            &self,
+            query: WorkerListQuery,
+        ) -> Result<WorkersResponse, RuntimeApiError> {
+            assert_eq!(query.status, Some(WorkerStatusFilter::Stopped));
+            Ok(WorkersResponse {
+                workers: Vec::new(),
+            })
+        }
+
+        async fn get_worker(&self, worker_id: String) -> Result<WorkerResponse, RuntimeApiError> {
+            assert_eq!(worker_id, "missing worker");
+            Err(test_error(404))
+        }
+
+        async fn create_worker(
+            &self,
+            _request: CreateWorkerRequest,
+        ) -> Result<WorkerResponse, RuntimeApiError> {
+            Err(test_error(501))
+        }
+        async fn delete_worker(
+            &self,
+            _worker_id: String,
+        ) -> Result<WorkerDeleteResponse, RuntimeApiError> {
+            Err(test_error(501))
+        }
+        async fn send_worker_input(
+            &self,
+            _worker_id: String,
+            _input: WorkerInput,
+        ) -> Result<WorkerInputResponse, RuntimeApiError> {
+            Err(test_error(501))
+        }
+        async fn stop_worker(
+            &self,
+            _worker_id: String,
+            _request: WorkerLifecycleRequest,
+        ) -> Result<WorkerLifecycleResponse, RuntimeApiError> {
+            Err(test_error(501))
+        }
+        async fn cancel_worker(
+            &self,
+            _worker_id: String,
+            _request: WorkerLifecycleRequest,
+        ) -> Result<WorkerLifecycleResponse, RuntimeApiError> {
+            Err(test_error(501))
+        }
+        async fn restore_worker(
+            &self,
+            _worker_id: String,
+            _request: EmptyObjectRequest,
+        ) -> Result<WorkerResponse, RuntimeApiError> {
+            Err(test_error(501))
+        }
+        async fn replace_worker_workspace_api(
+            &self,
+            _worker_id: String,
+            _request: WorkerWorkspaceApiRequest,
+        ) -> Result<WorkerResponse, RuntimeApiError> {
+            Err(test_error(501))
+        }
+        async fn complete_worker_arguments(
+            &self,
+            _worker_id: String,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, RuntimeApiError> {
+            Err(test_error(501))
+        }
+        async fn retention_inventory(
+            &self,
+            _worker_id: String,
+        ) -> Result<WorkerRetentionInventory, RuntimeApiError> {
+            Err(test_error(501))
+        }
+        async fn execute_retention(
+            &self,
+            _worker_id: String,
+            _request: WorkerRetentionExecutionRequest,
+        ) -> Result<WorkerRetentionExecutionResult, RuntimeApiError> {
+            Err(test_error(501))
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_client_and_router_round_trip_paths_queries_and_errors() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            server_support::framework::serve(listener, RuntimeApiAxum::router(RoundTripService))
+                .await
+                .unwrap();
+        });
+        let client = RuntimeApiClient::builder(&format!("http://{address}"))
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let summary = client.runtime_summary().await.unwrap();
+        assert_eq!(summary.runtime.display_name.as_deref(), Some("round-trip"));
+        let workers = client
+            .list_workers(WorkerListQuery {
+                status: Some(WorkerStatusFilter::Stopped),
+            })
+            .await
+            .unwrap();
+        assert!(workers.workers.is_empty());
+        let error = client
+            .get_worker("missing worker".to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, client_support::ClientError::Public { status, .. } if status.as_u16() == 404)
+        );
+        server.abort();
+    }
+
     #[test]
     fn contract_inventory_is_complete_and_unique() {
         let operations = RuntimeApiMetadata::OPERATIONS;
-        assert_eq!(operations.len(), 13);
+        assert_eq!(operations.len(), 14);
         let mut routes = operations
             .iter()
             .map(|operation| (format!("{:?}", operation.method), operation.path))

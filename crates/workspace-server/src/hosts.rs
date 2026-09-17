@@ -4265,10 +4265,31 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         worker_id: &str,
         workspace_api: WorkspaceApiRef,
     ) -> WorkerWorkspaceApiResult {
-        match self.post_json::<_, RuntimeHttpWorkerResponse>(
-            &format!("/v1/workers/{worker_id}/workspace-api"),
-            &RuntimeHttpWorkerWorkspaceApiRequest { workspace_api },
-        ) {
+        let request = match runtime_contract_convert(RuntimeHttpWorkerWorkspaceApiRequest {
+            workspace_api,
+        }) {
+            Ok(request) => request,
+            Err(diagnostic) => {
+                return WorkerWorkspaceApiResult {
+                    state: WorkerOperationState::Rejected,
+                    worker: None,
+                    diagnostics: vec![diagnostic],
+                };
+            }
+        };
+        let worker_id = worker_id.to_string();
+        match self
+            .run_runtime_api(
+                self.request_timeout,
+                MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+                move |client| async move {
+                    client
+                        .replace_worker_workspace_api(worker_id, request)
+                        .await
+                },
+            )
+            .and_then(|value| runtime_contract_convert::<_, RuntimeHttpWorkerResponse>(value))
+        {
             Ok(response) => WorkerWorkspaceApiResult {
                 state: WorkerOperationState::Accepted,
                 worker: Some(self.map_worker_detail(response.worker)),

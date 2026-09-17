@@ -267,10 +267,6 @@ fn runtime_http_router_with_auth_and_ssh_keyscan_program(
         .route(
             "/v1/workers/{worker_id}/attachments/{artifact_id}",
             delete(delete_worker_uploaded_file),
-        )
-        .route(
-            "/v1/workers/{worker_id}/workspace-api",
-            post(replace_worker_workspace_api),
         );
 
     #[cfg(feature = "ws-server")]

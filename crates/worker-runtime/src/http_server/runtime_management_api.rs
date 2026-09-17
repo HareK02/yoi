@@ -276,6 +276,22 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         response(value)
     }
 
+    async fn replace_worker_workspace_api(
+        &self,
+        worker_id: String,
+        value: runtime_api::WorkerWorkspaceApiRequest,
+    ) -> Result<runtime_api::WorkerResponse, runtime_api::RuntimeApiError> {
+        let Json(value) = replace_worker_workspace_api(
+            State(self.state.clone()),
+            auth_extension(),
+            Path(worker_id),
+            Ok(Json(request(value)?)),
+        )
+        .await
+        .map_err(api_error)?;
+        response(value)
+    }
+
     async fn complete_worker_arguments(
         &self,
         worker_id: String,
