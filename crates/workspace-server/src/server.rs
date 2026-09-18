@@ -1640,7 +1640,13 @@ async fn authorize_scoped_workspace_request(
         let body = std::mem::take(request.body_mut());
         let body = axum::body::to_bytes(body, 16 * 1024 * 1024)
             .await
-            .map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+            .map_err(|_| {
+                repository_api_rejection(
+                    &request_path,
+                    StatusCode::BAD_REQUEST,
+                    "invalid request body",
+                )
+            })?;
         let digest = worker_runtime::auth::request_body_digest(&body);
         *request.body_mut() = axum::body::Body::from(body);
         let permission = if path
@@ -1738,11 +1744,11 @@ async fn authorize_scoped_workspace_request(
             .map_err(server_error_response)?
             .is_some_and(|workspace| workspace.state == "active")
     {
-        return Err((
+        return Err(repository_api_rejection(
+            &request_path,
             StatusCode::CONFLICT,
             "Workspace is deleting and no longer accepts mutations",
-        )
-            .into_response());
+        ));
     }
     Ok(())
 }
@@ -1768,7 +1774,11 @@ async fn authorize_workspace_api_request(
         let path = signed_request_target(request.uri()).to_owned();
         let body = std::mem::take(request.body_mut());
         let Ok(body) = axum::body::to_bytes(body, 16 * 1024 * 1024).await else {
-            return StatusCode::BAD_REQUEST.into_response();
+            return repository_api_rejection(
+                &request_path,
+                StatusCode::BAD_REQUEST,
+                "invalid request body",
+            );
         };
         let digest = worker_runtime::auth::request_body_digest(&body);
         *request.body_mut() = axum::body::Body::from(body);
@@ -1817,11 +1827,11 @@ async fn authorize_workspace_api_request(
             .flatten()
             .is_some_and(|workspace| workspace.state == "active")
         {
-            return (
+            return repository_api_rejection(
+                &request_path,
                 StatusCode::CONFLICT,
                 "Workspace is deleting and no longer accepts mutations",
-            )
-                .into_response();
+            );
         }
         return next.run(request).await;
     }
@@ -1875,11 +1885,11 @@ async fn authorize_workspace_api_request(
             .flatten()
             .is_some_and(|workspace| workspace.state == "active")
     {
-        return (
+        return repository_api_rejection(
+            &request_path,
             StatusCode::CONFLICT,
             "Workspace is deleting and no longer accepts mutations",
-        )
-            .into_response();
+        );
     }
     next.run(request).await
 }
@@ -23384,6 +23394,7 @@ mod tests {
             .unwrap();
         assert_eq!(mixed_auth_csrf_rejected.status(), StatusCode::FORBIDDEN);
 
+        let deleting_app = app.clone();
         let csrf_accepted = app
             .oneshot(
                 Request::builder()
@@ -23401,6 +23412,48 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(csrf_accepted.status(), StatusCode::FORBIDDEN);
+
+        let preflight = store
+            .workspace_deletion_preflight("account-auth", &workspace.workspace.workspace_id)
+            .unwrap();
+        store
+            .reserve_workspace_deletion(
+                "account-auth",
+                &workspace.workspace.workspace_id,
+                &server_api::WorkspaceDeletionRequest {
+                    operation_id: "repository-conflict-test".to_owned(),
+                    expected_revision: preflight.expected_revision,
+                    confirmation: preflight.display_name,
+                },
+            )
+            .unwrap();
+        let deleting_conflict = deleting_app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&repositories_uri)
+                    .header(axum::http::header::AUTHORIZATION, "Bearer api-token-auth")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "repository_key": "blocked-by-deletion",
+                            "source": temp.path().join("blocked-by-deletion").display().to_string()
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleting_conflict.status(), StatusCode::CONFLICT);
+        let deleting_body: server_api::RepositoryApiError = serde_json::from_slice(
+            &to_bytes(deleting_conflict.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(deleting_body.error, "Conflict");
+        assert!(deleting_body.message.contains("deleting"));
     }
 
     #[tokio::test]
