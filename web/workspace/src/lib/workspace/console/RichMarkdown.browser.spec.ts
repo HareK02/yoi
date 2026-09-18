@@ -43,6 +43,23 @@ test("keeps completed block nodes while a trailing inline token grows", async ()
   ];
 
   await rerender({
+    text: `${initial} emphasis** and a [safe link](https://exam`,
+    streamId: "message-1",
+  });
+  await waitFor(() => {
+    expect(container.querySelector("strong")?.textContent).toBe(
+      "partial emphasis",
+    );
+    expect(container.textContent).toContain("[safe link](https://exam");
+  });
+  expect(container.querySelector('a[href="https://example.com"]')).toBeNull();
+  expect(container.querySelector("h1")).toBe(stableNodes[0]);
+  expect(container.querySelector("p")).toBe(stableNodes[1]);
+  expect(container.querySelector("ul")).toBe(stableNodes[2]);
+  expect(container.querySelector("blockquote")).toBe(stableNodes[3]);
+  expect(container.querySelector("pre")).toBe(stableNodes[4]);
+
+  await rerender({
     text: `${initial} emphasis** and a [safe link](https://example.com).`,
     streamId: "message-1",
   });
