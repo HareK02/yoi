@@ -16,7 +16,7 @@ export type ApiResult<T> = {
 
 export type { SkillCatalogResponse, SkillDetailResponse };
 
-type JsonLoadPolicy = {
+export type JsonLoadPolicy = {
   diagnosticLabel: string;
   maxResponseBytes: number;
 };
@@ -133,7 +133,7 @@ export async function loadJson<T>(
   }
 }
 
-async function readBoundedJson(
+export async function readBoundedJson(
   response: Response,
   maxBytes: number,
 ): Promise<unknown> {

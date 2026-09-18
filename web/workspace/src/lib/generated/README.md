@@ -1,19 +1,20 @@
-# Generated TypeScript inventory
+# Generated frontend contracts
 
-`server-api` is the Rust source authority for the checked-in Server HTTP DTO projections in this directory.
-Regenerate them from the repository root with:
+Checked-in files in this directory are generated API contracts. Do not edit them by hand.
+
+## Repository list/detail/create API
+
+`repository-api.ts` is the only TypeScript declaration authority for the Repository list, detail, and create request/response/error wire types. It is generated from the schema closure of the five Repository operations in the canonical `openapi/server-api.json` artifact. The generated header pins the in-repository generator name/version/options, canonical input path and digest, and output path.
+
+Regenerate or verify it from the repository root:
 
 ```sh
-cargo run -q -p server-api --features typescript --example generate_legacy_typescript > web/workspace/src/lib/generated/legacy-server-api.ts
-cargo run -q -p server-api --features typescript --example generate_workdir_api_types > web/workspace/src/lib/generated/workdir-api.ts
-cargo run -q -p server-api --features typescript --example generate_worker_launch_api_types > web/workspace/src/lib/generated/worker-launch-api.ts
-cargo run -q -p server-api --features typescript --example generate_companion_api_types > web/workspace/src/lib/generated/companion-api.ts
-cargo run -q -p server-api --features typescript --example generate_memory_api_types > web/workspace/src/lib/generated/memory-api.ts
-cargo run -q -p server-api --features typescript --example generate_skill_api_types > web/workspace/src/lib/generated/skill-api.ts
-cargo run -q -p server-api --features typescript --example generate_auth_api_types > web/workspace/src/lib/generated/auth-api.ts
-cargo run -q -p server-api --features typescript --example generate_repository_access_types > web/workspace/src/lib/generated/repository-access-api.ts
+cargo run -q -p server-api --example generate_repository_openapi_types
+cargo run -q -p server-api --example generate_repository_openapi_types -- --check
 ```
 
-`legacy-server-api.ts` is the bounded aggregate projection retained during the OpenAPI migration. It is not the final OpenAPI-derived Frontend artifact and must not become a second contract authority. The other files are narrower projections generated from the same Rust source.
+The generator fails closed on unsupported or lossy OpenAPI constructs, including ambiguous nullable unions, external references, unsupported enum literals, and integer ranges that cannot be represented safely by JavaScript numbers. The legacy TypeScript generator imports the two shared Repository source projection types it still needs and no longer declares the migrated Repository list/detail types.
 
-`ticket-api.ts` and `protocol.ts` are owned by the separate `ticket` and `protocol` authorities respectively.
+## Other generated contracts
+
+The remaining files retain their generator command in their header. `legacy-server-api.ts` is transitional: new bounded domain slices should use a focused contract artifact instead of adding another API surface to it.

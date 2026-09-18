@@ -1,11 +1,11 @@
 import {
-  parseRepositoryListResponse,
   parseWorkspaceCatalogResponse,
   parseWorkspaceCreateResponse,
   type RepositorySummary,
   type WorkspaceCreateResponse,
   type WorkspaceSummary,
 } from "$lib/workspace/api/workspace-model";
+import { loadWorkspaceRepositoryList } from "$lib/workspace/api/repositories.ts";
 
 export type WorkspaceCatalogRecord = WorkspaceSummary;
 export type WorkspaceCatalogItem = WorkspaceCatalogRecord & {
@@ -48,12 +48,14 @@ export async function listWorkspaceRepositories(
   fetcher: Fetch,
   workspaceId: string,
 ): Promise<RepositorySummary[]> {
-  return parseRepositoryListResponse(
-    await fetchJson(
-      fetcher,
-      `/api/w/${encodeURIComponent(workspaceId)}/repositories`,
-    ),
-  ).items;
+  const result = await loadWorkspaceRepositoryList(fetcher, workspaceId);
+  if (result.data === null) {
+    throw new WorkspaceCatalogError(
+      null,
+      result.error ?? "Repository API request failed",
+    );
+  }
+  return result.data.items;
 }
 
 export async function loadWorkspaceCatalog(

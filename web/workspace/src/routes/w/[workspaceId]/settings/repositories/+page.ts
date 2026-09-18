@@ -1,13 +1,10 @@
-import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
-import { parseRepositoryListResponse } from "$lib/workspace/api/workspace-model";
+import { loadWorkspaceRepositoryList } from "$lib/workspace/api/repositories";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {
-  const repositories = await loadJson(
+  const repositories = await loadWorkspaceRepositoryList(
     fetch,
-    workspaceApiPath(params.workspaceId, "/repositories"),
-    undefined,
-    parseRepositoryListResponse,
+    params.workspaceId,
   );
   return {
     workspaceId: params.workspaceId,

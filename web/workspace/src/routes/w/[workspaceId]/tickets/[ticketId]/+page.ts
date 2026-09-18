@@ -1,6 +1,6 @@
 import { redirect } from "@sveltejs/kit";
 import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
-import { parseRepositoryListApiResult } from "$lib/workspace/api/workspace-model";
+import { loadWorkspaceRepositoryList } from "$lib/workspace/api/repositories";
 import {
   canonicalResourceReference,
   resourceKey,
@@ -17,10 +17,7 @@ export const load = (async ({ fetch, params }) => {
   );
   const [ticket, repositoriesRaw, orchestrator] = await Promise.all([
     loadJson<TicketDetail>(fetch, ticketPath),
-    loadJson<unknown>(
-      fetch,
-      workspaceApiPath(params.workspaceId, "/repositories"),
-    ),
+    loadWorkspaceRepositoryList(fetch, params.workspaceId),
     loadJson<WorkspaceOrchestratorStatus>(
       fetch,
       workspaceApiPath(params.workspaceId, "/orchestrator"),
@@ -40,7 +37,7 @@ export const load = (async ({ fetch, params }) => {
       );
     }
   }
-  const repositories = parseRepositoryListApiResult(repositoriesRaw);
+  const repositories = repositoriesRaw;
 
   return {
     workspaceId: params.workspaceId,

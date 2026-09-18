@@ -20,29 +20,39 @@ const loadSource = await Deno.readTextFile(
   ),
 );
 
+const apiSource = await Deno.readTextFile(
+  new URL("../../src/lib/workspace/api/repositories.ts", import.meta.url),
+);
+
 test("Repository settings use the scoped list and typed create collection", () => {
-  for (const token of [
-    "workspaceApiPath(params.workspaceId, \"/repositories\")",
-    "workspaceApiPath(data.workspaceId, '/repositories')",
-    "method: 'POST'",
-    "repository_key: repositoryKey",
-    "default_ref: defaultRef || null",
-    "await invalidateAll()",
-  ]) {
+  const source = `${pageSource}\n${loadSource}\n${apiSource}`;
+  for (
+    const token of [
+      "loadWorkspaceRepositoryList",
+      "createWorkspaceRepository",
+      "workspaceRepositoryListPath(workspaceId)",
+      'method: "POST"',
+      "repository_key: repositoryKey",
+      "default_ref: defaultRef || null",
+      "await invalidateAll()",
+    ]
+  ) {
     assert(
-      pageSource.includes(token) || loadSource.includes(token),
+      source.includes(token),
       `Repository settings should include ${token}`,
     );
   }
 });
 
 test("Repository Add form keeps access secrets outside registration input", () => {
-  for (const forbidden of [
-    "private_key",
-    "passphrase",
-    "credential_id",
-    "host_trust_id",
-  ]) {
+  for (
+    const forbidden of [
+      "private_key",
+      "passphrase",
+      "credential_id",
+      "host_trust_id",
+    ]
+  ) {
     assert(
       !pageSource.includes(forbidden),
       `Repository registration must not accept ${forbidden}`,
