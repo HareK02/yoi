@@ -684,9 +684,9 @@ impl WorkerRemovalService {
         }
     }
 
-    /// Terminal catalog deletion shared by cleanup and spawn compensation.
-    /// The Store atomically commits membership, reservation, link and projection
-    /// state; this service owns the only production-side publication step.
+    /// Terminal catalog deletion for rollback-style compensation. Normal cleanup
+    /// and WorkerRemove use the retention commit below; compensation preserves
+    /// its pre-create semantics while sharing the atomic catalog contract.
     fn commit_catalog_removal(&self, target: &RuntimeWorkerRef) -> crate::Result<()> {
         let commit = self
             .store
@@ -699,76 +699,31 @@ impl WorkerRemovalService {
             candidate.runtime_id.clone(),
             candidate.runtime_worker_id.clone(),
         );
-        let remove_lock = {
-            let mut locks = self
-                .worker_remove_locks
-                .lock()
-                .map_err(|_| Error::Store("Worker removal lock registry was poisoned".into()))?;
-            locks
-                .entry(target.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
-        let _remove_guard = remove_lock.lock().await;
-        let session_lock = {
-            let mut locks = self
-                .workdir_session_locks
-                .lock()
-                .map_err(|_| Error::Store("Workdir session lock registry was poisoned".into()))?;
-            locks
-                .entry(target.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
-        let _session_guard = session_lock.lock().await;
-        close_worker_workdir_sessions(&self.workdir_sessions, &target)
-            .await
-            .map_err(|message| Error::RuntimeOperationFailed {
-                runtime_id: target.runtime_id.clone(),
-                code: "workdir_session_close_failed".to_string(),
-                message,
-            })?;
         let runtime = self.runtime.upgrade().ok_or_else(|| {
             Error::Store("Workspace Runtime registry is unavailable during cleanup".to_string())
         })?;
-        match runtime.stop_worker(
-            &target,
-            WorkerLifecycleRequest {
-                reason: Some("cleanup worker before deletion".to_string()),
-                ticket_assignment: None,
-            },
-        ) {
-            Ok(result) if result.state == WorkerOperationState::Accepted => {}
-            Ok(result) => {
-                return Err(ApiError::with_diagnostics(
-                    Error::RuntimeOperationFailed {
-                        runtime_id: target.runtime_id.clone(),
-                        code: "workspace_cleanup_worker_runtime_stop_rejected".to_string(),
-                        message: "Runtime did not stop selected Worker before deletion".to_string(),
-                    },
-                    result.diagnostics,
-                ));
-            }
-            Err(RuntimeRegistryError::UnknownWorker { .. }) => {}
-            Err(error) => return Err(error.into_error().into()),
+        let response = self
+            .execute_target_removal(
+                runtime.as_ref(),
+                &target,
+                &format!("Browser cleanup: {}", candidate.reason),
+                None,
+            )
+            .await
+            .map_err(|message| {
+                cleanup_api_error(
+                    candidate.runtime_id.as_str(),
+                    "workspace_cleanup_worker_removal_failed",
+                    message.as_str(),
+                )
+            })?;
+        if response.status != StatusCode::OK.as_u16() {
+            return Err(cleanup_api_error(
+                candidate.runtime_id.as_str(),
+                "workspace_cleanup_worker_removal_rejected",
+                response.body.as_str(),
+            ));
         }
-        match runtime.delete_worker(&target) {
-            Ok(result) if result.deleted && result.state == WorkerOperationState::Accepted => {}
-            Ok(result) => {
-                return Err(ApiError::with_diagnostics(
-                    Error::RuntimeOperationFailed {
-                        runtime_id: target.runtime_id.clone(),
-                        code: "workspace_cleanup_worker_runtime_delete_rejected".to_string(),
-                        message: "Runtime did not delete selected Worker after stopping it"
-                            .to_string(),
-                    },
-                    result.diagnostics,
-                ));
-            }
-            Err(RuntimeRegistryError::UnknownWorker { .. }) => {}
-            Err(error) => return Err(error.into_error().into()),
-        }
-        self.commit_catalog_removal(&target)?;
         Ok(())
     }
 
@@ -12146,6 +12101,11 @@ fn build_runtime_cleanup_plan(
             &record.worker,
         )?;
         let is_running = live_running_worker_ids.contains(&record.worker);
+        let is_internal = api
+            .runtime
+            .worker(&record.worker)
+            .ok()
+            .is_some_and(|worker| worker.singleton_key.is_some());
         let pinned = record.retention_state == "pinned";
         let blocking_reason = if let Some(assignment) = current_assignment {
             Some(format!(
@@ -12155,6 +12115,8 @@ fn build_runtime_cleanup_plan(
             ))
         } else if pinned {
             Some("worker is pinned".to_string())
+        } else if is_internal {
+            Some("internal service Worker cannot be deleted".to_string())
         } else if is_running {
             Some("worker is running".to_string())
         } else {
@@ -27288,6 +27250,14 @@ mod tests {
         .await
         .expect("spawn compensation catalog removal broadcast");
         assert!(removal.revision > 0);
+        sync_worker_observation(&api, &summary).unwrap();
+        assert!(
+            api.store
+                .get_worker_registry(TEST_WORKSPACE_ID, &worker)
+                .unwrap()
+                .is_none(),
+            "a late pre-compensation observation must not clear the removal fence"
+        );
     }
 
     #[tokio::test]
@@ -28666,6 +28636,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_service_rejects_internal_worker_before_runtime_removal() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let Json(orchestrator) = scoped_start_workspace_orchestrator(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let worker = orchestrator.worker.unwrap();
+        let worker = RuntimeWorkerRef::new(worker.runtime_id, worker.worker_id);
+        api.runtime
+            .stop_worker(
+                &worker,
+                WorkerLifecycleRequest {
+                    reason: Some("prepare internal cleanup guard".to_string()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        let plan = build_runtime_cleanup_plan(&api, worker.runtime_id.as_str())
+            .unwrap_or_else(|error| panic!("cleanup plan: {}", error.error));
+        let candidate = plan
+            .workers
+            .iter()
+            .find(|candidate| candidate.runtime_worker_id == worker.worker_id)
+            .expect("internal Worker cleanup candidate")
+            .clone();
+        assert_eq!(
+            candidate.blocking_reason.as_deref(),
+            Some("internal service Worker cannot be deleted")
+        );
+        let mut subscriber = api.worker_projection.subscribe();
+
+        let error = WorkerRemovalService::new(&api)
+            .execute_cleanup_removal(&candidate)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.error,
+            Error::RuntimeOperationFailed { ref code, .. }
+                if code == "workspace_cleanup_worker_removal_rejected"
+        ));
+        assert!(api.runtime.worker(&worker).is_ok());
+        assert!(
+            api.store
+                .get_worker_registry(TEST_WORKSPACE_ID, &worker)
+                .unwrap()
+                .is_some()
+        );
+        assert!(matches!(
+            subscriber.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn cleanup_http_entry_publishes_atomic_catalog_removal_without_runtime_event() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
@@ -28708,9 +28738,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stopped.state, WorkerOperationState::Accepted);
+        let worker_root = workspace
+            .path()
+            .join(".test-embedded-runtime-store/workers")
+            .join(&worker.worker_id);
+        fs::create_dir_all(worker_root.join("session/segments")).unwrap();
+        fs::write(
+            worker_root.join("session/session.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "session_id": "cleanup-removal-session"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            worker_root.join("session/segments/segment-a.jsonl"),
+            b"cleanup retention evidence\n",
+        )
+        .unwrap();
         let summary = api.runtime.worker(&worker).unwrap();
         sync_worker_observation(&api, &summary).unwrap();
+        // Deliberately drop Runtime observation delivery: catalog removal itself
+        // must drive every connected Workspace subscription.
+        api.worker_projection.shutdown();
         let worker_id = worker.worker_id.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = build_inner_router(api.clone()).layer(Extension(test_browser_request_actor()));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let subscription_url = format!("ws://{address}/api/w/{TEST_WORKSPACE_ID}/protocol/ws");
+        let (mut acting_socket, _) = connect_async(subscription_url.as_str()).await.unwrap();
+        let (mut observing_socket, _) = connect_async(subscription_url.as_str()).await.unwrap();
+        let acting_snapshot =
+            subscribe_workspace_worker_snapshot(&mut acting_socket, "cleanup-acting").await;
+        let observing_snapshot =
+            subscribe_workspace_worker_snapshot(&mut observing_socket, "cleanup-observing").await;
+        assert!(
+            acting_snapshot
+                .iter()
+                .any(|item| item.worker_id.as_str() == worker_id)
+        );
+        assert!(
+            observing_snapshot
+                .iter()
+                .any(|item| item.worker_id.as_str() == worker_id)
+        );
         let mut subscriber = api.worker_projection.subscribe();
         let plan = build_runtime_cleanup_plan(&api, EMBEDDED_WORKER_RUNTIME_ID)
             .unwrap_or_else(|error| panic!("cleanup plan: {}", error.error));
@@ -28739,19 +28814,50 @@ mod tests {
         .unwrap();
         assert_eq!(response.results[0].status, "deleted");
 
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), subscriber.recv())
-            .await
-            .expect("catalog removal broadcast")
-            .expect("projection event");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let event = subscriber.recv().await.expect("projection event");
+                if event.changes.iter().any(|change| {
+                    matches!(change, crate::store::WorkerCatalogChange::Removed(removed) if removed == &worker)
+                }) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("catalog removal broadcast");
         assert!(matches!(
             event.changes.as_slice(),
             [crate::store::WorkerCatalogChange::Removed(removed)] if removed == &worker
         ));
+        let acting_revision = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_workspace_worker_removal(&mut acting_socket, worker_id.as_str()),
+        )
+        .await
+        .expect("acting Workspace Worker subscription removal");
+        let observing_revision = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_workspace_worker_removal(&mut observing_socket, worker_id.as_str()),
+        )
+        .await
+        .expect("independent Workspace Worker subscription removal");
+        assert_eq!(acting_revision, event.revision);
+        assert_eq!(observing_revision, event.revision);
         assert!(
             api.store
                 .get_worker_registry(&api.config.workspace_id, &worker)
                 .unwrap()
                 .is_none()
+        );
+        let recovered = api
+            .store
+            .recover_worker_removal_execution(&api.config.workspace_id, &worker)
+            .unwrap()
+            .expect("Browser cleanup uses durable retention removal");
+        assert_eq!(
+            recovered.plan.state,
+            crate::retention::WorkerRemovalPlanState::Succeeded
         );
         let (snapshot_revision, snapshot) = api
             .store
@@ -28762,6 +28868,21 @@ mod tests {
             snapshot
                 .iter()
                 .all(|record| record.registry.worker != worker)
+        );
+        let rest_workers = workers_response(api.clone()).unwrap();
+        assert!(
+            rest_workers
+                .items
+                .iter()
+                .all(|item| item.worker_id != worker_id)
+        );
+        let (mut fresh_socket, _) = connect_async(subscription_url.as_str()).await.unwrap();
+        let fresh_snapshot =
+            subscribe_workspace_worker_snapshot(&mut fresh_socket, "cleanup-fresh").await;
+        assert!(
+            fresh_snapshot
+                .iter()
+                .all(|item| item.worker_id.as_str() != worker_id)
         );
 
         // A retry replays the durable fence at the same revision, healing an
@@ -28778,6 +28899,7 @@ mod tests {
             replay.changes.as_slice(),
             [crate::store::WorkerCatalogChange::Removed(removed)] if removed == &worker
         ));
+        server.abort();
     }
 
     #[tokio::test]
@@ -32121,6 +32243,74 @@ mod tests {
             panic!("expected text frame");
         };
         serde_json::from_str(&text).unwrap()
+    }
+
+    type TestWebSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn subscribe_workspace_worker_snapshot(
+        socket: &mut TestWebSocket,
+        request_id: &str,
+    ) -> Vec<protocol::subscription::SubscriptionWorker> {
+        let frame = protocol::subscription::SubscriptionFrame::new(
+            protocol::subscription::SubscriptionFramePayload::Request(
+                protocol::subscription::SubscriptionRequest::SubscribeEvents {
+                    request_id: protocol::subscription::SubscriptionRequestId::new(request_id)
+                        .unwrap(),
+                    selector: protocol::subscription::EventSubscriptionSelector::WorkspaceWorkers,
+                },
+            ),
+        );
+        socket
+            .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+            .await
+            .unwrap();
+        loop {
+            let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                continue;
+            };
+            let frame: protocol::subscription::SubscriptionFrame =
+                serde_json::from_str(text.as_str()).unwrap();
+            if let protocol::subscription::SubscriptionFramePayload::Response(
+                protocol::subscription::SubscriptionResponse::Subscribed {
+                    selector: protocol::subscription::EventSubscriptionSelector::WorkspaceWorkers,
+                    snapshot: protocol::subscription::SubscriptionSnapshot::Workers { workers },
+                    ..
+                },
+            ) = frame.payload
+            {
+                return workers;
+            }
+        }
+    }
+
+    async fn next_workspace_worker_removal(
+        socket: &mut TestWebSocket,
+        expected_worker_id: &str,
+    ) -> u64 {
+        loop {
+            let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                continue;
+            };
+            let frame: protocol::subscription::SubscriptionFrame =
+                serde_json::from_str(text.as_str()).unwrap();
+            if let protocol::subscription::SubscriptionFramePayload::Event(
+                protocol::subscription::SubscriptionEvent::Event {
+                    subject_revision,
+                    payload:
+                        protocol::subscription::SubscriptionEventPayload::WorkerRemoved {
+                            worker_id,
+                            ..
+                        },
+                    ..
+                },
+            ) = frame.payload
+                && worker_id.as_str() == expected_worker_id
+            {
+                return subject_revision;
+            }
+        }
     }
 
     async fn spawn_runtime_worker() -> (

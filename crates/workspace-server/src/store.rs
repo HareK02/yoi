@@ -5576,14 +5576,17 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         &self,
         record: &WorkerRegistryRecord,
     ) -> Result<WorkerRegistryProjectionCommit> {
-        self.with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let removal_blocks_upsert: bool = tx.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM worker_removal_operations
                     WHERE workspace_id = ?1 AND runtime_id = ?2
                       AND worker_id = ?3
                       AND state IN ('executing', 'failed', 'succeeded')
+                    UNION ALL
+                    SELECT 1 FROM worker_registry_projection_removals
+                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
                 )",
                 params![
                     record.workspace_id,
@@ -5646,10 +5649,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 WorkspaceResourceKind::Worker,
                 &record.worker.worker_id,
                 &record.created_at,
-            )?;
-            tx.execute(
-                "DELETE FROM worker_registry_projection_removals WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
-                params![record.workspace_id, record.worker.runtime_id, record.worker.worker_id],
             )?;
             let changed_workers = if changed == 0 {
                 Vec::new()
@@ -15171,6 +15170,29 @@ INSERT INTO worker_registry (
             [WorkerCatalogChange::Removed(worker)] if worker == &worker_ref
         ));
         assert_eq!(duplicate_removal.revision, first_removal.revision);
+        let stale_upsert = store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: "local-dev".to_string(),
+                worker: worker_ref.clone(),
+                display_name: "Stale Removed Worker".to_string(),
+                profile: None,
+                retention_state: "normal".to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: "1".to_string(),
+                updated_at: "stale-after-removal".to_string(),
+            })
+            .unwrap();
+        assert!(stale_upsert.changes.is_empty());
+        assert_eq!(stale_upsert.revision, first_removal.revision);
+        assert!(
+            store
+                .get_worker_registry("local-dev", &worker_ref)
+                .unwrap()
+                .is_none()
+        );
         let event = SubscriptionWorker {
             worker_id: SubscriptionWorkerId::new("removed").unwrap(),
             runtime_id: Some("embedded".to_string()),
