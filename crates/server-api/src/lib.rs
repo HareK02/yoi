@@ -159,7 +159,7 @@ pub trait ServerApi {
         status = 201,
         alternate_status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 413, 422, 500],
+        additional_error_statuses = [401, 403, 404, 409, 413, 415, 422, 500],
         bearer_auth = true,
         browser_auth = true,
         normalize_body_errors = true
@@ -5236,7 +5236,7 @@ mod openapi_artifact_tests {
             serde_json::json!([])
         );
         for status in [
-            "200", "201", "400", "401", "403", "404", "409", "413", "422", "500",
+            "200", "201", "400", "401", "403", "404", "409", "413", "415", "422", "500",
         ] {
             assert!(
                 repository_create["responses"][status].is_object(),

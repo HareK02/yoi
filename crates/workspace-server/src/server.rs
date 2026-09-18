@@ -1688,11 +1688,11 @@ async fn authorize_scoped_workspace_request(
             .map_err(server_error_response)?
             .is_some_and(|workspace| workspace.state == "active")
         {
-            return Err((
+            return Err(repository_api_rejection(
+                &request_path,
                 StatusCode::CONFLICT,
                 "Workspace is deleting and no longer accepts mutations",
-            )
-                .into_response());
+            ));
         }
         return Ok(());
     }
@@ -19113,6 +19113,24 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn repository_conflict_rejections_use_the_typed_error_contract() {
+        let response = repository_api_rejection(
+            "/api/w/workspace-test/repositories",
+            StatusCode::CONFLICT,
+            "Workspace is deleting and no longer accepts mutations",
+        );
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: server_api::RepositoryApiError =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body.error, "Conflict");
+        assert_eq!(
+            body.message,
+            "Workspace is deleting and no longer accepts mutations"
+        );
+    }
+
     #[test]
     fn backend_resource_timeout_maps_to_gateway_timeout() {
         assert_eq!(
@@ -22964,6 +22982,35 @@ mod tests {
         assert!(
             serde_json::from_slice::<server_api::RepositoryApiError>(
                 &to_bytes(malformed.into_body(), usize::MAX).await.unwrap()
+            )
+            .is_ok()
+        );
+
+        let unsupported_media_type = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&repositories_uri)
+                    .header(
+                        axum::http::header::COOKIE,
+                        "yoi_workspace_session=browser-session-auth",
+                    )
+                    .header(ORIGIN, &expected_origin)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            unsupported_media_type.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert!(
+            serde_json::from_slice::<server_api::RepositoryApiError>(
+                &to_bytes(unsupported_media_type.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
             )
             .is_ok()
         );
