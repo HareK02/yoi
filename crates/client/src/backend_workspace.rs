@@ -223,6 +223,38 @@ mod tests {
         handle.join().unwrap();
     }
 
+    #[tokio::test]
+    async fn repository_catalog_uses_generated_path_and_bearer_authorizer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = vec![0; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            assert!(request.starts_with("get /api/w/workspace-test/repositories "));
+            assert!(request.contains("authorization: bearer repository-secret\r\n"));
+            let body = r#"{"workspace_id":"workspace-test","items":[],"source":"workspace","diagnostics":[]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let client =
+            BackendApiClient::from_access_token_for_test(&base_url, "repository-secret").unwrap();
+
+        assert!(
+            list_backend_workspace_repositories_with_client(&client, "workspace-test")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        handle.join().unwrap();
+    }
+
     #[test]
     fn create_request_keeps_operation_key_for_exact_retry() {
         let request = CreateBackendWorkspaceRequest {
