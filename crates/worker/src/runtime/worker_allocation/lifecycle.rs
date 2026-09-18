@@ -201,6 +201,31 @@ pub fn install_top_level_with_deny(
     })
 }
 
+#[cfg(test)]
+pub(crate) fn install_top_level_at_for_test(
+    lock_path: PathBuf,
+    worker_name: String,
+    pid: u32,
+    socket: PathBuf,
+    scope_allow: Vec<ScopeRule>,
+    segment_id: SegmentId,
+) -> Result<ScopeAllocationGuard, ScopeLockError> {
+    let mut guard = LockFileGuard::open(&lock_path)?;
+    super::mutate::register_worker_with_deny(
+        &mut guard,
+        worker_name.clone(),
+        pid,
+        socket,
+        scope_allow,
+        Vec::new(),
+        segment_id,
+    )?;
+    Ok(ScopeAllocationGuard {
+        worker_name,
+        lock_path,
+    })
+}
+
 /// Take ownership of an existing allocation that was pre-registered by
 /// a spawning Worker.
 ///
@@ -260,7 +285,7 @@ pub fn lookup_segment(segment_id: SegmentId) -> Result<Option<SegmentLockInfo>, 
 
 #[cfg(test)]
 mod tests {
-    use super::super::table::Allocation;
+    use super::super::table::{Allocation, LockFile};
     use super::super::test_util::*;
     use super::*;
     use tempfile::TempDir;
@@ -464,7 +489,7 @@ mod tests {
             } if expected == old_segment
         ));
         // The authority is returned rather than dropped on failure. Production
-        // stores it on SegmentState to keep restore admission blocked.
+        // stores it on Worker to keep restore admission blocked.
         let (sent, received) = std::sync::mpsc::channel();
         let lookup = std::thread::spawn(move || {
             sent.send(lookup_segment(replacement).unwrap()).unwrap();
@@ -478,6 +503,39 @@ mod tests {
             .unwrap()
             .is_none());
         lookup.join().unwrap();
+    }
+
+    #[test]
+    fn allocation_save_failure_preserves_source_table_and_returns_authority() {
+        let dir = TempDir::new().unwrap();
+        let _sandbox = RuntimeDirSandbox::new(dir.path());
+        let lock_path = dir.path().join("workers.json");
+        let old_segment = sid();
+        let replacement = sid();
+        let guard = install_top_level(
+            "activation".into(),
+            std::process::id(),
+            sock("activation"),
+            vec![write_rule("/work", true)],
+            old_segment,
+        )
+        .unwrap();
+        let activation = guard
+            .begin_segment_activation(old_segment, replacement)
+            .unwrap();
+        crate::runtime::worker_allocation::table::fail_next_save_for_test(&lock_path);
+
+        let error = activation.commit().unwrap_err();
+        let (source, authority) = error.into_parts();
+        assert!(matches!(source, ScopeLockError::Io(_)));
+        let persisted: LockFile = serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted
+                .find("activation")
+                .and_then(|allocation| allocation.segment_id),
+            Some(old_segment)
+        );
+        drop(authority);
     }
 
     #[test]

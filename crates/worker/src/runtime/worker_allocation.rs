@@ -22,6 +22,10 @@ pub use lifecycle::{
     ScopeAllocationGuard, SegmentActivationCommitError, SegmentActivationGuard, SegmentLockInfo,
     adopt_allocation, install_top_level, install_top_level_with_deny, lookup_segment,
 };
+#[cfg(test)]
+pub(crate) use lifecycle::install_top_level_at_for_test;
+#[cfg(test)]
+pub(crate) use table::fail_next_save_for_test;
 pub use mutate::{
     delegate_scope, reclaim_delegated_scope, reclaim_stale, reclaim_stale_with, register_worker,
     register_worker_with_deny, release_worker,

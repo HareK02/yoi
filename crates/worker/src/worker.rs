@@ -8585,6 +8585,100 @@ mod build_summary_prompt_tests {
     }
 
     #[tokio::test]
+    async fn failed_activation_worker_drop_releases_nested_authority_before_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store,
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        worker.ensure_segment_head().await.unwrap();
+        let old_segment = worker.segment_id();
+        let replacement = session_store::new_segment_id();
+        let lock_path = dir.path().join("workers.json");
+        let allocation = worker_allocation::install_top_level_at_for_test(
+            lock_path.clone(),
+            "test-worker".into(),
+            std::process::id(),
+            dir.path().join("worker.sock"),
+            Vec::new(),
+            old_segment,
+        )
+        .unwrap();
+        let activation = allocation
+            .begin_segment_activation(old_segment, replacement)
+            .unwrap();
+        worker.scope_allocation = Some(allocation);
+        worker_allocation::fail_next_save_for_test(&lock_path);
+        let (source, authority) = activation.commit().unwrap_err().into_parts();
+        assert!(matches!(source, ScopeLockError::Io(_)));
+        worker.fail_closed_segment_activation(authority);
+        assert!(worker.segment_state.ensure_append_allowed().is_err());
+
+        let (sent, received) = std::sync::mpsc::channel();
+        let teardown = std::thread::spawn(move || {
+            drop(worker);
+            sent.send(()).unwrap();
+        });
+        received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Worker teardown must not deadlock on nested allocation locks");
+        teardown.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleanup_failures_transfer_service_authority_to_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store,
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        let registry =
+            crate::spawn::registry::SpawnedWorkerRegistry::new_for_internal_services();
+        registry.fail_service_stops_for_test("cleanup-session", 3);
+        worker.internal_worker_registry = Some(Arc::clone(&registry));
+        *worker
+            .pending_compaction_cleanup
+            .lock()
+            .expect("pending cleanup lock poisoned") = Some(PendingCompactionCleanup {
+            session_id: "cleanup-session".into(),
+            compaction_id: "compaction".into(),
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.finish_pending_compaction_cleanup_for_shutdown(),
+        )
+        .await
+        .expect("shutdown cleanup must be bounded")
+        .unwrap();
+        assert!(!worker.has_pending_compaction_cleanup());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !registry.is_service_cleanup_quarantined_for_test("cleanup-session") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn auto_fork_checkpoints_interrupted_run_budget_for_restore() {
         let dir = tempfile::tempdir().unwrap();
         let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();

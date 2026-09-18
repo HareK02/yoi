@@ -9,6 +9,8 @@
 //! rules to the parent scope.
 
 use std::collections::{BTreeMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
 use std::io;
 use std::sync::{
     Arc, Mutex,
@@ -312,6 +314,8 @@ pub struct SpawnedWorkerRegistry {
     internal_records: std::sync::Mutex<Vec<InternalSpawnedWorkerRecord>>,
     service_records: std::sync::Mutex<Vec<InternalServiceWorkerRecord>>,
     quarantined_service_cleanup: std::sync::Mutex<HashSet<String>>,
+    #[cfg(test)]
+    fail_service_stops: std::sync::Mutex<HashMap<String, usize>>,
     internal_names: std::sync::Mutex<HashSet<String>>,
     internal_shutting_down: AtomicBool,
     pending_internal_spawns: AtomicUsize,
@@ -333,6 +337,8 @@ impl SpawnedWorkerRegistry {
             internal_records: std::sync::Mutex::new(Vec::new()),
             service_records: std::sync::Mutex::new(Vec::new()),
             quarantined_service_cleanup: std::sync::Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            fail_service_stops: std::sync::Mutex::new(HashMap::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
             internal_shutting_down: AtomicBool::new(false),
             pending_internal_spawns: AtomicUsize::new(0),
@@ -349,6 +355,8 @@ impl SpawnedWorkerRegistry {
             internal_records: std::sync::Mutex::new(Vec::new()),
             service_records: std::sync::Mutex::new(Vec::new()),
             quarantined_service_cleanup: std::sync::Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            fail_service_stops: std::sync::Mutex::new(HashMap::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
             internal_shutting_down: AtomicBool::new(false),
             pending_internal_spawns: AtomicUsize::new(0),
@@ -364,6 +372,8 @@ impl SpawnedWorkerRegistry {
             internal_records: std::sync::Mutex::new(Vec::new()),
             service_records: std::sync::Mutex::new(Vec::new()),
             quarantined_service_cleanup: std::sync::Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            fail_service_stops: std::sync::Mutex::new(HashMap::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
             internal_shutting_down: AtomicBool::new(false),
             pending_internal_spawns: AtomicUsize::new(0),
@@ -448,6 +458,8 @@ impl SpawnedWorkerRegistry {
                 internal_records: std::sync::Mutex::new(Vec::new()),
                 service_records: std::sync::Mutex::new(Vec::new()),
             quarantined_service_cleanup: std::sync::Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            fail_service_stops: std::sync::Mutex::new(HashMap::new()),
                 internal_names: std::sync::Mutex::new(HashSet::new()),
                 internal_shutting_down: AtomicBool::new(false),
                 pending_internal_spawns: AtomicUsize::new(0),
@@ -540,9 +552,35 @@ impl SpawnedWorkerRegistry {
         Ok(worker_ref)
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_service_stops_for_test(&self, session_id: &str, count: usize) {
+        self.fail_service_stops
+            .lock()
+            .unwrap()
+            .insert(session_id.to_owned(), count);
+    }
+
     /// Stop and remove one parent-owned service Worker. This is host-only and is
     /// intentionally separate from the SubWorker control surface.
+    #[cfg(test)]
+    pub(crate) fn is_service_cleanup_quarantined_for_test(&self, session_id: &str) -> bool {
+        self.quarantined_service_cleanup
+            .lock()
+            .unwrap()
+            .contains(session_id)
+    }
+
     pub(crate) async fn stop_service(&self, session_id: &str) -> io::Result<bool> {
+        #[cfg(test)]
+        {
+            let mut failures = self.fail_service_stops.lock().unwrap();
+            if let Some(remaining) = failures.get_mut(session_id) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Err(io::Error::other("injected service stop failure"));
+                }
+            }
+        }
         let record = self
             .service_records
             .lock()

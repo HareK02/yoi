@@ -7,6 +7,14 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+static FAIL_NEXT_SAVE_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn fail_next_save_for_test(path: &Path) {
+    *FAIL_NEXT_SAVE_PATH.lock().unwrap() = Some(path.to_path_buf());
+}
+
 use fs4::fs_std::FileExt;
 use manifest::{ScopeRule, paths};
 use serde::{Deserialize, Serialize};
@@ -209,6 +217,14 @@ impl LockFileGuard {
     /// Persist with atomic replacement while the separate allocation lock stays
     /// held. A crash exposes either the old complete table or the new one.
     pub fn save(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let mut fail_path = FAIL_NEXT_SAVE_PATH.lock().unwrap();
+            if fail_path.as_ref() == Some(&self.data_path) {
+                *fail_path = None;
+                return Err(io::Error::other("injected allocation save failure"));
+            }
+        }
         let json = serde_json::to_vec_pretty(&self.data).map_err(io::Error::other)?;
         let mut temp_os = self.data_path.as_os_str().to_owned();
         temp_os.push(".tmp");
