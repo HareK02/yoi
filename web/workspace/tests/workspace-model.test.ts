@@ -4,11 +4,14 @@ declare const Deno: {
 };
 
 import {
+  parseCreateWorkspaceRepositoryResponse,
+  parseRepositoryApiError,
   parseRepositoryListApiResult,
   parseRepositoryListResponse,
   parseWorkspaceDeletionOperationResponse,
   parseWorkspaceDeletionPreflightResponse,
   parseWorkspaceResponse,
+  REPOSITORY_API_LIMITS,
 } from "../src/lib/workspace/api/workspace-model.ts";
 
 function assertThrows(operation: () => unknown, expected: string): void {
@@ -68,6 +71,81 @@ Deno.test("stale repository aliases fail closed at the JSON boundary", () => {
   assertThrows(
     () => parseRepositoryListResponse(stale),
     ".id is not part",
+  );
+});
+
+Deno.test("repository source revisions enforce the OpenAPI integer range", () => {
+  const negative = structuredClone(repositoryList) as Record<string, unknown>;
+  const negativeItems = negative.items as Array<Record<string, unknown>>;
+  negativeItems[0].source_revision = -1;
+  assertThrows(
+    () => parseRepositoryListResponse(negative),
+    "must be between 0 and Number.MAX_SAFE_INTEGER",
+  );
+
+  const unsafe = structuredClone(repositoryList) as Record<string, unknown>;
+  const unsafeItems = unsafe.items as Array<Record<string, unknown>>;
+  unsafeItems[0].source_revision = Number.MAX_SAFE_INTEGER + 1;
+  assertThrows(
+    () => parseRepositoryListResponse(unsafe),
+    "must be a safe integer",
+  );
+});
+
+Deno.test("repository create/error responses use the generated strict contract", () => {
+  const created = parseCreateWorkspaceRepositoryResponse({
+    workspace_id: repositoryList.workspace_id,
+    repository_key: "main",
+    replayed: false,
+  });
+  if (created.replayed || created.repository_key !== "main") {
+    throw new Error("create response fields were not preserved");
+  }
+  const error = parseRepositoryApiError({
+    error: "invalid_request",
+    message: "source is invalid",
+  });
+  if (error.error !== "invalid_request") {
+    throw new Error("error response fields were not preserved");
+  }
+  assertThrows(
+    () =>
+      parseCreateWorkspaceRepositoryResponse({
+        workspace_id: repositoryList.workspace_id,
+        repository_key: "main",
+        replayed: null,
+      }),
+    ".replayed must be a boolean",
+  );
+  assertThrows(
+    () =>
+      parseRepositoryApiError({
+        error: "invalid_request",
+        message: "source is invalid",
+        context: {},
+      }),
+    ".context is not part",
+  );
+});
+
+Deno.test("repository responses retain bounded strings and collections", () => {
+  const oversizedString = structuredClone(repositoryList);
+  oversizedString.items[0].provider = "x".repeat(
+    REPOSITORY_API_LIMITS.maxStringCodeUnits + 1,
+  );
+  assertThrows(
+    () => parseRepositoryListResponse(oversizedString),
+    "string limit",
+  );
+
+  const oversizedCollection = structuredClone(repositoryList);
+  oversizedCollection.items = Array.from(
+    { length: REPOSITORY_API_LIMITS.maxCollectionEntries + 1 },
+    () => repositoryList.items[0],
+  );
+  assertThrows(
+    () => parseRepositoryListResponse(oversizedCollection),
+    "collection limit",
   );
 });
 
@@ -227,7 +305,7 @@ Deno.test("Workspace settings exposes owner-gated typed destructive confirmation
 });
 
 Deno.test("Repository settings consume the validated shared wire shape", async () => {
-  const [loadSource, pageSource] = await Promise.all([
+  const [loadSource, pageSource, apiSource, modelSource] = await Promise.all([
     Deno.readTextFile(
       new URL(
         "../src/routes/w/[workspaceId]/settings/repositories/+page.ts",
@@ -240,20 +318,40 @@ Deno.test("Repository settings consume the validated shared wire shape", async (
         import.meta.url,
       ),
     ),
+    Deno.readTextFile(
+      new URL("../src/lib/workspace/api/repositories.ts", import.meta.url),
+    ),
+    Deno.readTextFile(
+      new URL("../src/lib/workspace/api/workspace-model.ts", import.meta.url),
+    ),
   ]);
+  const targetSources = `${loadSource}\n${pageSource}\n${apiSource}`;
 
   for (
     const token of [
+      "loadWorkspaceRepositoryList",
+      "createWorkspaceRepository",
       "parseRepositoryListResponse",
+      "parseCreateWorkspaceRepositoryResponse",
+      "parseRepositoryApiError",
       "repository.repository_key",
       "repository.observed_status",
       "sourceLabel(repository.source.kind)",
       "supportsRepositoryAccess(repository.source.kind)",
     ]
   ) {
-    if (!loadSource.includes(token) && !pageSource.includes(token)) {
+    if (!targetSources.includes(token) && !modelSource.includes(token)) {
       throw new Error(`Repository settings should include ${token}`);
     }
+  }
+  if (
+    pageSource.includes("generated/legacy-server-api") ||
+    pageSource.includes("response.json()") ||
+    pageSource.includes(" as CreateWorkspaceRepository")
+  ) {
+    throw new Error(
+      "Repository create UI must use the generated contract and strict API client",
+    );
   }
   for (const kind of ["ssh", "https"]) {
     if (!pageSource.includes(`kind === '${kind}'`)) {

@@ -15,13 +15,13 @@ protocol.workspace = true
 runtime-api.workspace = true
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 sha2.workspace = true
 ts-rs = { version = "12.0.1", optional = true }
 webauthn-rs-proto = "0.5.5"
 workdir.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tokio.workspace = true
 
 [[example]]

@@ -1,7 +1,11 @@
 <script lang="ts">
   import { invalidateAll } from '$app/navigation';
-  import { workspaceApiPath, workspaceRoute } from '$lib/workspace/api/http';
-  import type { RepositorySourceKind } from '$lib/generated/legacy-server-api';
+  import { workspaceRoute } from '$lib/workspace/api/http';
+  import { createWorkspaceRepository } from '$lib/workspace/api/repositories';
+  import type {
+    CreateWorkspaceRepositoryRequest,
+    RepositorySourceKind,
+  } from '$lib/generated/repository-api';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
@@ -22,38 +26,27 @@
   let pending = $state(false);
   let requestError = $state<string | null>(null);
 
-  async function responseError(response: Response): Promise<string> {
-    const payload = await response.json().catch(() => null) as
-      | { message?: string; error?: string }
-      | null;
-    return payload?.message ?? payload?.error ?? `Request failed (${response.status})`;
-  }
-
   async function addRepository(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     pending = true;
     requestError = null;
-    try {
-      const response = await fetch(workspaceApiPath(data.workspaceId, '/repositories'), {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          repository_key: repositoryKey,
-          source,
-          default_ref: defaultRef || null,
-        }),
-      });
-      if (!response.ok) throw new Error(await responseError(response));
-      repositoryKey = '';
-      source = '';
-      defaultRef = '';
-      showAddRepository = false;
-      await invalidateAll();
-    } catch (error) {
-      requestError = error instanceof Error ? error.message : String(error);
-    } finally {
+    const request: CreateWorkspaceRepositoryRequest = {
+      repository_key: repositoryKey,
+      source,
+      default_ref: defaultRef || null,
+    };
+    const result = await createWorkspaceRepository(fetch, data.workspaceId, request);
+    if (result.data === null) {
+      requestError = result.error ?? 'Repository creation failed';
       pending = false;
+      return;
     }
+    repositoryKey = '';
+    source = '';
+    defaultRef = '';
+    showAddRepository = false;
+    await invalidateAll();
+    pending = false;
   }
 </script>
 
