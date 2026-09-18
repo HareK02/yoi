@@ -1604,11 +1604,31 @@ fn signed_request_target(uri: &Uri) -> &str {
         .unwrap_or_else(|| uri.path())
 }
 
+fn repository_api_rejection(path: &str, status: StatusCode, message: &str) -> Response {
+    if path == "/api/repositories"
+        || path.starts_with("/api/repositories/")
+        || (path.starts_with("/api/w/") && path.contains("/repositories"))
+    {
+        return (
+            status,
+            Json(server_api::RepositoryApiError::new(
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("error"),
+                message,
+                Vec::new(),
+            )),
+        )
+            .into_response();
+    }
+    status.into_response()
+}
+
 async fn authorize_scoped_workspace_request(
     api: &WorkspaceServerApi,
     workspace_id: &str,
     request: &mut Request,
 ) -> std::result::Result<(), Response> {
+    let request_path = request.uri().path().to_owned();
     let proof = request
         .headers()
         .get(worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER)
@@ -1650,7 +1670,13 @@ async fn authorize_scoped_workspace_request(
             &digest,
         )
         .await
-        .map_err(|_| StatusCode::UNAUTHORIZED.into_response())?;
+        .map_err(|_| {
+            repository_api_rejection(
+                &request_path,
+                StatusCode::UNAUTHORIZED,
+                "invalid runtime request proof",
+            )
+        })?;
         request.extensions_mut().insert(source);
         if !matches!(
             *request.method(),
@@ -1674,7 +1700,13 @@ async fn authorize_scoped_workspace_request(
     let actor = resolve_server_actor(api, request.headers())
         .await
         .map_err(server_error_response)?
-        .ok_or_else(|| StatusCode::UNAUTHORIZED.into_response())?;
+        .ok_or_else(|| {
+            repository_api_rejection(
+                &request_path,
+                StatusCode::UNAUTHORIZED,
+                "authentication required",
+            )
+        })?;
 
     let cookie_authenticated = matches!(actor.auth_method, ActorAuthMethod::BrowserSession);
     let mutating = !matches!(
@@ -1690,7 +1722,11 @@ async fn authorize_scoped_workspace_request(
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
         {
-            return Err(StatusCode::FORBIDDEN.into_response());
+            return Err(repository_api_rejection(
+                &request_path,
+                StatusCode::FORBIDDEN,
+                "cross-origin browser mutation denied",
+            ));
         }
     }
     request.extensions_mut().insert(actor);
@@ -1719,6 +1755,7 @@ async fn authorize_workspace_api_request(
     if !request.uri().path().starts_with("/api/") {
         return next.run(request).await;
     }
+    let request_path = request.uri().path().to_owned();
     let public_server_api = is_server_global_forward(request.uri().path());
     let workspace_id = api.workspace_id().to_owned();
     let proof = request
@@ -1762,7 +1799,11 @@ async fn authorize_workspace_api_request(
         )
         .await
         else {
-            return StatusCode::UNAUTHORIZED.into_response();
+            return repository_api_rejection(
+                &request_path,
+                StatusCode::UNAUTHORIZED,
+                "invalid runtime request proof",
+            );
         };
         request.extensions_mut().insert(source);
         if !matches!(
@@ -1795,7 +1836,13 @@ async fn authorize_workspace_api_request(
     {
         Ok(Some(actor)) => actor,
         Ok(None) if public_server_api => return next.run(request).await,
-        Ok(None) | Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        Ok(None) | Err(_) => {
+            return repository_api_rejection(
+                &request_path,
+                StatusCode::UNAUTHORIZED,
+                "authentication required",
+            );
+        }
     };
     let cookie_authenticated = matches!(actor.auth_method, ActorAuthMethod::BrowserSession);
     let mutating = !matches!(
@@ -1811,7 +1858,11 @@ async fn authorize_workspace_api_request(
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
         {
-            return StatusCode::FORBIDDEN.into_response();
+            return repository_api_rejection(
+                &request_path,
+                StatusCode::FORBIDDEN,
+                "cross-origin browser mutation denied",
+            );
         }
     }
     request.extensions_mut().insert(actor);
@@ -1939,7 +1990,7 @@ async fn dispatch_workspace_request(
         }
     };
     let Some(router) = router else {
-        return StatusCode::NOT_FOUND.into_response();
+        return repository_api_rejection(&path, StatusCode::NOT_FOUND, "workspace was not found");
     };
     match router.oneshot(request).await {
         Ok(response) => response,
@@ -18844,38 +18895,8 @@ impl ApiError {
     }
 
     fn into_repository_api_error(self) -> server_api::RepositoryApiError {
-        let status = match &self.error {
-            Error::WorkspacePermissionDenied(_) | Error::BrowserReopenConfirmationRequired => {
-                StatusCode::FORBIDDEN
-            }
-            Error::RepositoryConflict(_) => StatusCode::CONFLICT,
-            Error::InvalidInput(_)
-            | Error::WorkerSourceIdentity(_)
-            | Error::InvalidRuntimeIdentifier { .. }
-            | Error::ReservedWorkerName(_) => StatusCode::BAD_REQUEST,
-            Error::RuntimeOperationFailed { code, .. } if code == "repository_not_configured" => {
-                StatusCode::NOT_FOUND
-            }
-            Error::RuntimeOperationFailed { code, .. }
-                if code == "repository_provider_unsupported" =>
-            {
-                StatusCode::BAD_REQUEST
-            }
-            Error::InvalidRecordId(_)
-            | Error::MissingFrontmatter(_)
-            | Error::UnknownRepository(_)
-            | Error::UnknownRuntime(_)
-            | Error::UnknownWorker { .. }
-            | Error::RuntimeBindingNotFound { .. }
-            | Error::UnknownHost(_)
-            | Error::WorkspaceIdMismatch => StatusCode::NOT_FOUND,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
-            "internal server error".to_owned()
-        } else {
-            self.error.to_string()
-        };
+        let status = api_error_status(&self.error);
+        let message = api_error_response_message(&self.error);
         server_api::RepositoryApiError::new(
             status.as_u16(),
             status.canonical_reason().unwrap_or("error"),
@@ -18885,125 +18906,129 @@ impl ApiError {
     }
 }
 
+fn api_error_status(error: &Error) -> StatusCode {
+    match error {
+        Error::BrowserReopenConfirmationRequired | Error::WorkspacePermissionDenied(_) => {
+            StatusCode::FORBIDDEN
+        }
+        Error::TicketAssignmentConflict(_)
+        | Error::WorkdirAttachmentConflict(_)
+        | Error::WorkspaceConfigConflict(_)
+        | Error::RuntimeBindingConflict(_)
+        | Error::RuntimeBindingRevisionConflict { .. }
+        | Error::RuntimeBindingFingerprintConflict { .. }
+        | Error::RepositoryConflict(_) => StatusCode::CONFLICT,
+        Error::WorkerSourceIdentity(_) | Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
+        Error::InvalidRuntimeIdentifier { .. } | Error::ReservedWorkerName(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        Error::Ticket(ticket::TicketError::NotFound(_))
+        | Error::MergeRequest(merge_request::MergeRequestError::NotFound) => StatusCode::NOT_FOUND,
+        Error::MergeRequest(merge_request::MergeRequestError::Validation(_)) => {
+            StatusCode::BAD_REQUEST
+        }
+        Error::MergeRequest(_) => StatusCode::CONFLICT,
+        Error::Ticket(
+            ticket::TicketError::Ambiguous { .. }
+            | ticket::TicketError::Locked { .. }
+            | ticket::TicketError::Conflict(_),
+        ) => StatusCode::CONFLICT,
+        Error::Ticket(
+            ticket::TicketError::InvalidPathComponent(_)
+            | ticket::TicketError::PathEscapesRoot { .. },
+        ) => StatusCode::BAD_REQUEST,
+        Error::InvalidRecordId(_)
+        | Error::MissingFrontmatter(_)
+        | Error::UnknownHost(_)
+        | Error::UnknownRuntime(_)
+        | Error::UnknownWorker { .. }
+        | Error::UnknownRepository(_)
+        | Error::RuntimeBindingNotFound { .. }
+        | Error::WorkspaceIdMismatch => StatusCode::NOT_FOUND,
+        Error::RuntimeOperationFailed { code, .. } if code == "skill_not_found" => {
+            StatusCode::NOT_FOUND
+        }
+        Error::RuntimeCapabilityUnsupported { .. } => StatusCode::NOT_IMPLEMENTED,
+        Error::RuntimeOperationFailed { code, .. } if code == "repository_not_configured" => {
+            StatusCode::NOT_FOUND
+        }
+        Error::RuntimeOperationFailed { code, .. } if code == "repository_provider_unsupported" => {
+            StatusCode::BAD_REQUEST
+        }
+        Error::RuntimeOperationFailed { code, .. } if code == "remote_runtime_auth_failed" => {
+            StatusCode::UNAUTHORIZED
+        }
+        Error::RuntimeOperationFailed { code, .. } if code == "remote_runtime_timeout" => {
+            StatusCode::GATEWAY_TIMEOUT
+        }
+        Error::RuntimeOperationFailed { code, .. } if code == "remote_runtime_unsupported" => {
+            StatusCode::NOT_IMPLEMENTED
+        }
+        Error::RuntimeOperationFailed { code, .. }
+            if code == "profile_registry_revision_conflict"
+                || code == "profile_source_revision_conflict"
+                || code == "workspace_metadata_revision_conflict"
+                || code == "workspace_cleanup_plan_stale"
+                || code == "workspace_cleanup_worker_blocked"
+                || code == "workspace_cleanup_workdir_blocked"
+                || code == "workspace_cleanup_worker_pinned" =>
+        {
+            StatusCode::CONFLICT
+        }
+        Error::RuntimeOperationFailed { code, .. }
+            if code == "unknown_profile_source"
+                || code == "unknown_profile_selector"
+                || code == "unknown_objective" =>
+        {
+            StatusCode::NOT_FOUND
+        }
+        Error::RuntimeOperationFailed { code, .. }
+            if code == "workspace_display_name_invalid" || code.starts_with("profile_") =>
+        {
+            StatusCode::BAD_REQUEST
+        }
+        Error::RuntimeOperationFailed { code, .. } if code.ends_with("_blocked") => {
+            StatusCode::CONFLICT
+        }
+        Error::RuntimeOperationFailed { code, .. }
+            if code.starts_with("workspace_settings_")
+                || code.starts_with("invalid_")
+                || code.starts_with("unsupported_worker_profile")
+                || code.starts_with("working_directory_")
+                || code.starts_with("workspace_cleanup_")
+                || code == "default_runtime_not_configured"
+                || code == "workspace_worker_workdir_required"
+                || code.ends_with("_already_exists")
+                || code.ends_with("_not_config_managed")
+                || code.ends_with("_unsupported") =>
+        {
+            StatusCode::BAD_REQUEST
+        }
+        Error::RuntimeOperationFailed { code, .. }
+            if code == "runtime_capacity_unavailable"
+                || code == "runtime_workdir_capacity_unavailable" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        Error::WorkspaceSigningIdentity { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        Error::RuntimeOperationFailed { .. } => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn api_error_response_message(error: &Error) -> String {
+    match error {
+        Error::RuntimeOperationFailed { code, message, .. } => {
+            format!("{code}: {}", sanitize_backend_error(message))
+        }
+        _ => sanitize_backend_error(&error.to_string()),
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = match &self.error {
-            Error::BrowserReopenConfirmationRequired | Error::WorkspacePermissionDenied(_) => {
-                StatusCode::FORBIDDEN
-            }
-            Error::TicketAssignmentConflict(_)
-            | Error::WorkdirAttachmentConflict(_)
-            | Error::WorkspaceConfigConflict(_)
-            | Error::RuntimeBindingConflict(_)
-            | Error::RuntimeBindingRevisionConflict { .. }
-            | Error::RuntimeBindingFingerprintConflict { .. }
-            | Error::RepositoryConflict(_) => StatusCode::CONFLICT,
-            Error::WorkerSourceIdentity(_) | Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
-            Error::InvalidRuntimeIdentifier { .. } | Error::ReservedWorkerName(_) => {
-                StatusCode::BAD_REQUEST
-            }
-            Error::Ticket(ticket::TicketError::NotFound(_))
-            | Error::MergeRequest(merge_request::MergeRequestError::NotFound) => {
-                StatusCode::NOT_FOUND
-            }
-            Error::MergeRequest(merge_request::MergeRequestError::Validation(_)) => {
-                StatusCode::BAD_REQUEST
-            }
-            Error::MergeRequest(_) => StatusCode::CONFLICT,
-            Error::Ticket(
-                ticket::TicketError::Ambiguous { .. }
-                | ticket::TicketError::Locked { .. }
-                | ticket::TicketError::Conflict(_),
-            ) => StatusCode::CONFLICT,
-            Error::Ticket(
-                ticket::TicketError::InvalidPathComponent(_)
-                | ticket::TicketError::PathEscapesRoot { .. },
-            ) => StatusCode::BAD_REQUEST,
-            Error::InvalidRecordId(_)
-            | Error::MissingFrontmatter(_)
-            | Error::UnknownHost(_)
-            | Error::UnknownRuntime(_)
-            | Error::UnknownWorker { .. }
-            | Error::UnknownRepository(_)
-            | Error::RuntimeBindingNotFound { .. }
-            | Error::WorkspaceIdMismatch => StatusCode::NOT_FOUND,
-            Error::RuntimeOperationFailed { code, .. } if code == "skill_not_found" => {
-                StatusCode::NOT_FOUND
-            }
-            Error::RuntimeCapabilityUnsupported { .. } => StatusCode::NOT_IMPLEMENTED,
-            Error::RuntimeOperationFailed { code, .. } if code == "repository_not_configured" => {
-                StatusCode::NOT_FOUND
-            }
-            Error::RuntimeOperationFailed { code, .. }
-                if code == "repository_provider_unsupported" =>
-            {
-                StatusCode::BAD_REQUEST
-            }
-            Error::RuntimeOperationFailed { code, .. } if code == "remote_runtime_auth_failed" => {
-                StatusCode::UNAUTHORIZED
-            }
-            Error::RuntimeOperationFailed { code, .. } if code == "remote_runtime_timeout" => {
-                StatusCode::GATEWAY_TIMEOUT
-            }
-            Error::RuntimeOperationFailed { code, .. } if code == "remote_runtime_unsupported" => {
-                StatusCode::NOT_IMPLEMENTED
-            }
-            Error::RuntimeOperationFailed { code, .. }
-                if code == "profile_registry_revision_conflict"
-                    || code == "profile_source_revision_conflict"
-                    || code == "workspace_metadata_revision_conflict"
-                    || code == "workspace_cleanup_plan_stale"
-                    || code == "workspace_cleanup_worker_blocked"
-                    || code == "workspace_cleanup_workdir_blocked"
-                    || code == "workspace_cleanup_worker_pinned" =>
-            {
-                StatusCode::CONFLICT
-            }
-            Error::RuntimeOperationFailed { code, .. }
-                if code == "unknown_profile_source"
-                    || code == "unknown_profile_selector"
-                    || code == "unknown_objective" =>
-            {
-                StatusCode::NOT_FOUND
-            }
-            Error::RuntimeOperationFailed { code, .. }
-                if code == "workspace_display_name_invalid" || code.starts_with("profile_") =>
-            {
-                StatusCode::BAD_REQUEST
-            }
-            Error::RuntimeOperationFailed { code, .. } if code.ends_with("_blocked") => {
-                StatusCode::CONFLICT
-            }
-            Error::RuntimeOperationFailed { code, .. }
-                if code.starts_with("workspace_settings_")
-                    || code.starts_with("invalid_")
-                    || code.starts_with("unsupported_worker_profile")
-                    || code.starts_with("working_directory_")
-                    || code.starts_with("workspace_cleanup_")
-                    || code == "default_runtime_not_configured"
-                    || code == "workspace_worker_workdir_required"
-                    || code.ends_with("_already_exists")
-                    || code.ends_with("_not_config_managed")
-                    || code.ends_with("_unsupported") =>
-            {
-                StatusCode::BAD_REQUEST
-            }
-            Error::RuntimeOperationFailed { code, .. }
-                if code == "runtime_capacity_unavailable"
-                    || code == "runtime_workdir_capacity_unavailable" =>
-            {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
-            Error::WorkspaceSigningIdentity { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            Error::RuntimeOperationFailed { .. } => StatusCode::BAD_GATEWAY,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        let response_message = match &self.error {
-            Error::RuntimeOperationFailed { code, message, .. } => {
-                format!("{code}: {}", sanitize_backend_error(message))
-            }
-            _ => sanitize_backend_error(&self.error.to_string()),
-        };
+        let status = api_error_status(&self.error);
+        let response_message = api_error_response_message(&self.error);
         let log = ApiErrorLog {
             kind: self
                 .diagnostics
@@ -22881,6 +22906,93 @@ mod tests {
                 .body(Body::from(body.to_string()))
                 .unwrap()
         };
+        let anonymous_repository = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&repositories_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous_repository.status(), StatusCode::UNAUTHORIZED);
+        let anonymous_body: Value = serde_json::from_slice(
+            &to_bytes(anonymous_repository.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(anonymous_body["error"], "Unauthorized");
+
+        let unknown_field = app
+            .clone()
+            .oneshot(create_repository(serde_json::json!({
+                "repository_key": "unknown-field",
+                "source": temp.path().join("unknown-field").display().to_string(),
+                "unexpected": true
+            })))
+            .await
+            .unwrap();
+        assert_eq!(unknown_field.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let unknown_field_body: Value = serde_json::from_slice(
+            &to_bytes(unknown_field.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unknown_field_body["error"], "Unprocessable Entity");
+
+        let malformed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&repositories_uri)
+                    .header(
+                        axum::http::header::COOKIE,
+                        "yoi_workspace_session=browser-session-auth",
+                    )
+                    .header(ORIGIN, &expected_origin)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            serde_json::from_slice::<server_api::RepositoryApiError>(
+                &to_bytes(malformed.into_body(), usize::MAX).await.unwrap()
+            )
+            .is_ok()
+        );
+
+        let oversized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&repositories_uri)
+                    .header(
+                        axum::http::header::COOKIE,
+                        "yoi_workspace_session=browser-session-auth",
+                    )
+                    .header(ORIGIN, &expected_origin)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(vec![b' '; 5 * 1024 * 1024 + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            serde_json::from_slice::<server_api::RepositoryApiError>(
+                &to_bytes(oversized.into_body(), usize::MAX).await.unwrap()
+            )
+            .is_ok()
+        );
+
         let created = app
             .clone()
             .oneshot(create_repository(repository_request.clone()))

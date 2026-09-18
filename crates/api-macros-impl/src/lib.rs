@@ -106,6 +106,10 @@ struct RouteArgs {
     status: Option<LitInt>,
     alternate_status: Option<LitInt>,
     error_status: Option<LitInt>,
+    additional_error_statuses: Vec<LitInt>,
+    bearer_auth: Option<syn::LitBool>,
+    browser_auth: Option<syn::LitBool>,
+    normalize_body_errors: Option<syn::LitBool>,
     openapi: Option<syn::LitBool>,
 }
 
@@ -118,6 +122,10 @@ impl Parse for RouteArgs {
             status: None,
             alternate_status: None,
             error_status: None,
+            additional_error_statuses: Vec::new(),
+            bearer_auth: None,
+            browser_auth: None,
+            normalize_body_errors: None,
             openapi: None,
         };
 
@@ -147,6 +155,40 @@ impl Parse for RouteArgs {
                     input.parse::<LitInt>()?,
                     &key,
                     "error_status",
+                )?,
+                "additional_error_statuses" => {
+                    if !result.additional_error_statuses.is_empty() {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "duplicate `additional_error_statuses` route option",
+                        ));
+                    }
+                    let content;
+                    syn::bracketed!(content in input);
+                    while !content.is_empty() {
+                        result.additional_error_statuses.push(content.parse()?);
+                        if !content.is_empty() {
+                            content.parse::<Token![,]>()?;
+                        }
+                    }
+                }
+                "bearer_auth" => set_once(
+                    &mut result.bearer_auth,
+                    input.parse::<syn::LitBool>()?,
+                    &key,
+                    "bearer_auth",
+                )?,
+                "browser_auth" => set_once(
+                    &mut result.browser_auth,
+                    input.parse::<syn::LitBool>()?,
+                    &key,
+                    "browser_auth",
+                )?,
+                "normalize_body_errors" => set_once(
+                    &mut result.normalize_body_errors,
+                    input.parse::<syn::LitBool>()?,
+                    &key,
+                    "normalize_body_errors",
                 )?,
                 "openapi" => set_once(
                     &mut result.openapi,
@@ -223,6 +265,10 @@ struct Operation {
     response_status: u16,
     alternate_status: Option<u16>,
     error_status: Option<u16>,
+    additional_error_statuses: Vec<u16>,
+    bearer_auth: bool,
+    browser_auth: bool,
+    normalize_body_errors: bool,
     openapi_skip: bool,
 }
 
@@ -445,6 +491,34 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
         ));
     }
     let error_status = error_body.as_ref().map(|_| error_status.unwrap_or(400));
+    let mut additional_error_statuses = Vec::new();
+    for status in &route.additional_error_statuses {
+        let value = status.base10_parse::<u16>().map_err(|_| {
+            syn::Error::new(
+                status.span(),
+                "HTTP status must be an unsigned 16-bit integer",
+            )
+        })?;
+        if !(400..=599).contains(&value) {
+            return Err(syn::Error::new(
+                status.span(),
+                "additional error statuses must be between 400 and 599",
+            ));
+        }
+        if error_status == Some(value) || additional_error_statuses.contains(&value) {
+            return Err(syn::Error::new(
+                status.span(),
+                "additional error statuses must be distinct",
+            ));
+        }
+        additional_error_statuses.push(value);
+    }
+    if !additional_error_statuses.is_empty() && error_body.is_none() {
+        return Err(syn::Error::new_spanned(
+            &route.path,
+            "additional_error_statuses require a public error response type",
+        ));
+    }
 
     if http_method == Method::Head && response_body.is_some() {
         return Err(syn::Error::new_spanned(
@@ -585,6 +659,13 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
         response_status,
         alternate_status,
         error_status,
+        additional_error_statuses,
+        bearer_auth: route.bearer_auth.as_ref().is_some_and(|value| value.value),
+        browser_auth: route.browser_auth.as_ref().is_some_and(|value| value.value),
+        normalize_body_errors: route
+            .normalize_body_errors
+            .as_ref()
+            .is_some_and(|value| value.value),
         openapi_skip: route.openapi.as_ref().is_some_and(|value| !value.value),
     })
 }
@@ -1245,14 +1326,49 @@ fn axum_adapter_tokens(
             let ty = &parameter.ty;
             Some(quote!(#api_crate::axum::framework::Extension(#ident): #api_crate::axum::framework::Extension<#ty>,))
         });
-        let body_extractor = operation.parameters.iter().find_map(|parameter| {
-            if !matches!(parameter.location, Location::Body) {
-                return None;
-            }
-            let ident = &parameter.rust_ident;
-            let ty = &parameter.ty;
-            Some(quote!(#api_crate::axum::framework::Json(#ident): #api_crate::axum::framework::Json<#ty>,))
-        });
+        let (body_extractor, body_rejection) = operation
+            .parameters
+            .iter()
+            .find(|parameter| matches!(parameter.location, Location::Body))
+            .map(|parameter| {
+                let ident = &parameter.rust_ident;
+                let ty = &parameter.ty;
+                if !operation.normalize_body_errors {
+                    return (
+                        Some(quote!(#api_crate::axum::framework::Json(#ident): #api_crate::axum::framework::Json<#ty>,)),
+                        None,
+                    );
+                }
+                let error = operation
+                    .error_body
+                    .as_ref()
+                    .expect("body operations require an error type");
+                (
+                    Some(quote!(
+                        __body: ::core::result::Result<
+                            #api_crate::axum::framework::Json<#ty>,
+                            #api_crate::axum::framework::JsonRejection,
+                        >,
+                    )),
+                    Some(quote! {
+                        let #ident = match __body {
+                            ::core::result::Result::Ok(#api_crate::axum::framework::Json(value)) => value,
+                            ::core::result::Result::Err(rejection) => {
+                                let status = rejection.status().as_u16();
+                                let error = <#error as #api_crate::HttpRequestError>::from_request_rejection(
+                                    status,
+                                    rejection.body_text(),
+                                );
+                                return #api_crate::axum::json_response(
+                                    #api_crate::axum::status(status),
+                                    error,
+                                );
+                            }
+                        };
+                    }),
+                )
+            })
+            .unwrap_or((None, None));
         let call_arguments = operation.parameters.iter().map(|parameter| &parameter.rust_ident);
         let response_status = operation.response_status;
         let success = if let Some(alternate_status) = operation.alternate_status {
@@ -1312,6 +1428,7 @@ fn axum_adapter_tokens(
                 S: super::#trait_ident + Send + Sync + 'static,
             {
                 #(#header_parsers)*
+                #body_rejection
                 #mapped
             }
         }
@@ -1415,15 +1532,39 @@ fn openapi_adapter_tokens(
                     operation.response::<#ty>(#status, "application/json", "Error response")?;
                 }
             });
+        let additional_errors = operation
+            .error_body
+            .as_ref()
+            .map(|ty| {
+                operation
+                    .additional_error_statuses
+                    .iter()
+                    .map(|status| {
+                        quote! {
+                            operation.response::<#ty>(#status, "application/json", "Error response")?;
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let bearer_auth = operation.bearer_auth.then(|| {
+            quote! { operation.bearer_authentication(); }
+        });
+        let browser_auth = operation.browser_auth.then(|| {
+            quote! { operation.browser_authentication(); }
+        });
 
         quote! {
             {
                 let mut operation = builder.operation(#method, #path, #operation_id)?;
                 #(#parameters)*
+                #bearer_auth
+                #browser_auth
                 #request
                 #response
                 #alternate_response
                 #error
+                #(#additional_errors)*
                 operation.finish()?;
             }
         }

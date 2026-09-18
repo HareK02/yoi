@@ -56,6 +56,18 @@ impl api_macros::HttpError for RepositoryApiError {
     }
 }
 
+impl api_macros::HttpRequestError for RepositoryApiError {
+    fn from_request_rejection(status: u16, message: String) -> Self {
+        let reason = match status {
+            413 => "Payload Too Large",
+            415 => "Unsupported Media Type",
+            422 => "Unprocessable Entity",
+            _ => "Bad Request",
+        };
+        Self::new(status, reason, message, Vec::new())
+    }
+}
+
 macro_rules! impl_openapi_schema {
     ($($ty:ty),+ $(,)?) => {
         $(impl api_macros::openapi::OpenApiSchema for $ty {})+
@@ -92,19 +104,36 @@ pub trait ServerApi {
         #[path] worker_id: String,
     ) -> Result<WorkspaceWorkerSessionResponse, ServerApiError>;
 
-    #[get("/api/w/{workspace_id}/repositories", status = 200, error_status = 400)]
+    #[get(
+        "/api/w/{workspace_id}/repositories",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
     async fn repository_list(
         &self,
         #[path] workspace_id: String,
     ) -> Result<RepositoryListResponse, RepositoryApiError>;
 
-    #[get("/api/repositories", status = 200, error_status = 400)]
+    #[get(
+        "/api/repositories",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
     async fn repository_list_alias(&self) -> Result<RepositoryListResponse, RepositoryApiError>;
 
     #[get(
         "/api/w/{workspace_id}/repositories/{repository_key}",
         status = 200,
-        error_status = 404
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true
     )]
     async fn repository_detail(
         &self,
@@ -112,7 +141,14 @@ pub trait ServerApi {
         #[path] repository_key: String,
     ) -> Result<RepositoryDetailResponse, RepositoryApiError>;
 
-    #[get("/api/repositories/{repository_key}", status = 200, error_status = 404)]
+    #[get(
+        "/api/repositories/{repository_key}",
+        status = 200,
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
     async fn repository_detail_alias(
         &self,
         #[path] repository_key: String,
@@ -122,7 +158,11 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/repositories",
         status = 201,
         alternate_status = 200,
-        error_status = 400
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 413, 422, 500],
+        bearer_auth = true,
+        browser_auth = true,
+        normalize_body_errors = true
     )]
     async fn repository_create(
         &self,
@@ -132,9 +172,19 @@ pub trait ServerApi {
     ) -> Result<CreateWorkspaceRepositoryResponse, RepositoryApiError>;
 }
 
-/// Digest of the authoritative ServerApi Rust contract source used for artifact provenance.
+/// Digest of every authoritative input used to derive the canonical OpenAPI artifact.
 pub fn canonical_openapi_source_digest() -> String {
-    let digest = Sha256::digest(include_bytes!("lib.rs"));
+    let mut hasher = Sha256::new();
+    for source in [
+        include_bytes!("lib.rs").as_slice(),
+        include_bytes!("../../api-macros-impl/src/lib.rs").as_slice(),
+        include_bytes!("../../api-macros/src/lib.rs").as_slice(),
+        include_bytes!("../../api-macros/src/openapi.rs").as_slice(),
+    ] {
+        hasher.update((source.len() as u64).to_le_bytes());
+        hasher.update(source);
+    }
+    let digest = hasher.finalize();
     let mut encoded = String::with_capacity("sha256:".len() + digest.len() * 2);
     encoded.push_str("sha256:");
     for byte in digest {
@@ -5154,13 +5204,58 @@ mod openapi_artifact_tests {
         );
         assert!(value["paths"]["/api/repositories"]["get"].is_object());
         assert!(value["paths"]["/api/repositories/{repository_key}"]["get"].is_object());
-        assert!(
-            value["paths"]["/api/w/{workspace_id}/repositories"]["post"]["responses"]["200"]
-                .is_object()
+        for (path, method) in [
+            ("/api/w/{workspace_id}/repositories", "get"),
+            ("/api/w/{workspace_id}/repositories", "post"),
+            ("/api/w/{workspace_id}/repositories/{repository_key}", "get"),
+            ("/api/repositories", "get"),
+            ("/api/repositories/{repository_key}", "get"),
+        ] {
+            let operation = &value["paths"][path][method];
+            assert_eq!(
+                operation["security"][0]["bearerAuth"],
+                serde_json::json!([])
+            );
+            assert_eq!(
+                operation["security"][1]["browserSession"],
+                serde_json::json!([])
+            );
+            for status in ["401", "403", "500"] {
+                assert!(
+                    operation["responses"][status].is_object(),
+                    "missing {method} {path} response {status}"
+                );
+            }
+        }
+        let repository_collection = &value["paths"]["/api/w/{workspace_id}/repositories"];
+        let repository_create = &repository_collection["post"];
+        assert_eq!(
+            repository_create["security"][0]["bearerAuth"],
+            serde_json::json!([])
         );
-        assert!(
-            value["paths"]["/api/w/{workspace_id}/repositories"]["post"]["responses"]["201"]
-                .is_object()
+        assert_eq!(
+            repository_create["security"][1]["browserSession"],
+            serde_json::json!([])
+        );
+        for status in [
+            "200", "201", "400", "401", "403", "404", "409", "413", "422", "500",
+        ] {
+            assert!(
+                repository_create["responses"][status].is_object(),
+                "missing repository-create response {status}"
+            );
+        }
+        assert_eq!(
+            repository_create["responses"]["422"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/RepositoryApiError"
+        );
+        assert_eq!(
+            value["components"]["securitySchemes"]["bearerAuth"]["scheme"],
+            "bearer"
+        );
+        assert_eq!(
+            value["components"]["securitySchemes"]["browserSession"]["in"],
+            "cookie"
         );
         assert!(value["paths"]["/api/w/{workspace_id}/repositories/{repository_key}"]
             ["get"]["responses"]["404"]
