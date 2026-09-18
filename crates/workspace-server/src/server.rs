@@ -3089,6 +3089,16 @@ impl server_api::ServerApi for WorkspaceApi {
         .map_err(ApiError::into_repository_api_error)
     }
 
+    async fn repository_list_alias(
+        &self,
+    ) -> std::result::Result<server_api::RepositoryListResponse, server_api::RepositoryApiError>
+    {
+        list_repositories(State(self.clone()))
+            .await
+            .map(|Json(response)| response)
+            .map_err(ApiError::into_repository_api_error)
+    }
+
     async fn repository_detail(
         &self,
         workspace_id: String,
@@ -3105,6 +3115,17 @@ impl server_api::ServerApi for WorkspaceApi {
         .await
         .map(|Json(response)| response)
         .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn repository_detail_alias(
+        &self,
+        repository_key: String,
+    ) -> std::result::Result<server_api::RepositoryDetailResponse, server_api::RepositoryApiError>
+    {
+        repository_detail(State(self.clone()), AxumPath(repository_key))
+            .await
+            .map(|Json(response)| response)
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn repository_create(
@@ -3448,8 +3469,6 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
             "/api/w/{workspace_id}/objectives/{objective_id}/ticket-links/{ticket_id}",
             delete(scoped_unlink_objective_ticket),
         )
-        .route("/api/repositories", get(list_repositories))
-        .route("/api/repositories/{repository_key}", get(repository_detail))
         .route(
             "/api/w/{workspace_id}/repositories/{repository_key}/ssh-connection-test",
             post(scoped_probe_repository_ssh_connection)
@@ -19047,6 +19066,28 @@ mod tests {
         SqliteWorkspaceStore, UserRecord, WorkspaceRecord, WorkspaceRuntimeBinding,
     };
 
+    #[derive(Clone)]
+    struct TestBearerAuthorizer(&'static str);
+
+    impl server_api::client_support::RequestAuthorizer for TestBearerAuthorizer {
+        fn authorize(
+            &self,
+            _request: server_api::client_support::AuthorizerRequest<'_>,
+        ) -> std::result::Result<
+            axum::http::HeaderMap,
+            server_api::client_support::AuthorizationError,
+        > {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {}", self.0)
+                    .parse()
+                    .map_err(|_| server_api::client_support::AuthorizationError::new())?,
+            );
+            Ok(headers)
+        }
+    }
+
     #[test]
     fn backend_resource_timeout_maps_to_gateway_timeout() {
         assert_eq!(
@@ -22967,6 +23008,54 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&missing_body)
         );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base_url = format!("http://{}", listener.local_addr().unwrap());
+        let network_app = app.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, network_app).await.unwrap();
+        });
+        let generated = server_api::ServerApiClient::builder(&api_base_url)
+            .unwrap()
+            .authorizer(TestBearerAuthorizer("api-token-auth"))
+            .build()
+            .unwrap();
+        let generated_workspace_id = workspace.workspace.workspace_id.clone();
+        let generated_list = generated
+            .repository_list(generated_workspace_id.clone())
+            .await
+            .unwrap();
+        assert!(
+            generated_list
+                .items
+                .iter()
+                .any(|repository| repository.repository_key == "documentation")
+        );
+        assert_eq!(
+            generated
+                .repository_detail(generated_workspace_id.clone(), "documentation".to_owned())
+                .await
+                .unwrap()
+                .item
+                .repository_key,
+            "documentation"
+        );
+        let generated_request = CreateWorkspaceRepositoryRequest {
+            repository_key: "generated-client".to_owned(),
+            source: "/srv/repos/generated-client".to_owned(),
+            default_ref: Some("main".to_owned()),
+        };
+        let created = generated
+            .repository_create(generated_workspace_id.clone(), generated_request.clone())
+            .await
+            .unwrap();
+        assert!(!created.replayed);
+        let replayed = generated
+            .repository_create(generated_workspace_id, generated_request)
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        server.abort();
 
         let identity_uri = format!(
             "/api/w/{}/settings/signing-identity",

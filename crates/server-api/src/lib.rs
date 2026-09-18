@@ -98,6 +98,9 @@ pub trait ServerApi {
         #[path] workspace_id: String,
     ) -> Result<RepositoryListResponse, RepositoryApiError>;
 
+    #[get("/api/repositories", status = 200, error_status = 400)]
+    async fn repository_list_alias(&self) -> Result<RepositoryListResponse, RepositoryApiError>;
+
     #[get(
         "/api/w/{workspace_id}/repositories/{repository_key}",
         status = 200,
@@ -106,6 +109,12 @@ pub trait ServerApi {
     async fn repository_detail(
         &self,
         #[path] workspace_id: String,
+        #[path] repository_key: String,
+    ) -> Result<RepositoryDetailResponse, RepositoryApiError>;
+
+    #[get("/api/repositories/{repository_key}", status = 200, error_status = 404)]
+    async fn repository_detail_alias(
+        &self,
         #[path] repository_key: String,
     ) -> Result<RepositoryDetailResponse, RepositoryApiError>;
 
@@ -3759,7 +3768,7 @@ mod tests {
     #[test]
     fn worker_session_contract_and_flattened_availability_are_stable() {
         let operations = ServerApiMetadata::OPERATIONS;
-        assert_eq!(operations.len(), 4);
+        assert_eq!(operations.len(), 6);
         let operation = operations
             .iter()
             .find(|operation| operation.operation_id == "worker_session")
@@ -5143,6 +5152,8 @@ mod openapi_artifact_tests {
                 ["application/json"]["schema"]["$ref"],
             "#/components/schemas/RepositoryListResponse"
         );
+        assert!(value["paths"]["/api/repositories"]["get"].is_object());
+        assert!(value["paths"]["/api/repositories/{repository_key}"]["get"].is_object());
         assert!(
             value["paths"]["/api/w/{workspace_id}/repositories"]["post"]["responses"]["200"]
                 .is_object()

@@ -342,10 +342,76 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:c7a6b25e1a071ab9a6831e6cd53daf51acdf8aaac20746b0b6db35c12428836f"
+    "x-yoi-source-digest": "sha256:317cc65b39674bd229abc364d2daea3e909215471da5828313b3cf3ee2142600"
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/repositories": {
+      "get": {
+        "operationId": "repository_list_alias",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryListResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
+    "/api/repositories/{repository_key}": {
+      "get": {
+        "operationId": "repository_detail_alias",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "repository_key",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryDetailResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
     "/api/w/{workspace_id}/repositories": {
       "get": {
         "operationId": "repository_list",
