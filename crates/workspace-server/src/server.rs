@@ -8529,6 +8529,9 @@ async fn scoped_attach_current_worker_workdir(
         );
         return Err(error.into());
     }
+    api.worker_projection
+        .publish_catalog_change(&worker)
+        .map_err(ApiError::from)?;
     Ok(Json(CurrentWorkerWorkdirAttachmentResponse {
         workspace_id: api.config.workspace_id.clone(),
         workdir_id: workdir_id.to_string(),
@@ -8553,6 +8556,9 @@ async fn scoped_detach_current_worker_workdir(
         Some(&link.workdir_id),
         &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
     )?;
+    api.worker_projection
+        .publish_catalog_change(&worker)
+        .map_err(ApiError::from)?;
     Ok(Json(CurrentWorkerWorkdirAttachmentResponse {
         workspace_id: api.config.workspace_id.clone(),
         workdir_id: link.workdir_id,
@@ -18126,6 +18132,9 @@ fn link_worker_to_workdir(
     } else {
         api.store.attach_worker_workdir(&record)?;
     }
+    api.worker_projection
+        .publish_catalog_change(&worker_record.worker)
+        .map_err(ApiError::from)?;
     Ok(())
 }
 
@@ -31982,9 +31991,52 @@ mod tests {
             .unwrap();
         assert_eq!(spawned.state, WorkerOperationState::Accepted);
         let worker_id = spawned.worker.unwrap().worker.worker_id;
+        let (_, projections) = api
+            .store
+            .worker_registry_projection_snapshot(TEST_WORKSPACE_ID, 10)
+            .unwrap();
+        let observation = projections
+            .iter()
+            .find(|projection| projection.registry.worker.worker_id == worker_id)
+            .and_then(|projection| projection.observation.as_ref())
+            .expect("spawned Worker observation exists");
+        assert!(observation.worker.repository_id.is_none());
+        assert!(observation.worker.working_directory_id.is_none());
+
+        let workdir_id = "001a0b415233500000c";
+        api.store
+            .upsert_workdir_registry(&WorkdirRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                workdir_id: workdir_id.to_string(),
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                repository_id: test_repository_id(&api),
+                creation_selector: Some("HEAD".to_string()),
+                creation_ref: None,
+                creation_tree: None,
+                current_selector: Some("work/sidebar-projection".to_string()),
+                current_ref: None,
+                current_tree: None,
+                observed_at_epoch_seconds: None,
+                materialization_status: "present".to_string(),
+                cleanliness: "clean".to_string(),
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .unwrap();
+        api.store
+            .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                worker: RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, &worker_id),
+                workdir_id: workdir_id.to_string(),
+                role: "attachment".to_string(),
+                linked_at: "1".to_string(),
+                unlinked_at: None,
+            })
+            .unwrap();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let projection_api = api.clone();
         let app = build_inner_router(api).layer(Extension(test_browser_request_actor()));
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -32022,13 +32074,57 @@ mod tests {
             ) => workers,
             other => panic!("expected Workspace Worker snapshot, got {other:?}"),
         };
+        let projected_worker = workers
+            .iter()
+            .find(|worker| worker.worker_id.as_str() == worker_id)
+            .expect("spawned Worker is projected");
+        assert_eq!(projected_worker.resource_key.as_deref(), Some("W-1"));
         assert_eq!(
-            workers
-                .iter()
-                .find(|worker| worker.worker_id.as_str() == worker_id)
-                .and_then(|worker| worker.resource_key.as_deref()),
-            Some("W-1")
+            projected_worker.repository_key.as_deref(),
+            Some("test-repository")
         );
+        assert_eq!(
+            projected_worker
+                .working_directory_id
+                .as_ref()
+                .map(|workdir_id| workdir_id.as_str()),
+            Some(workdir_id)
+        );
+
+        projection_api
+            .store
+            .detach_worker_workdir(
+                TEST_WORKSPACE_ID,
+                &RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, &worker_id),
+                Some(workdir_id),
+                "2",
+            )
+            .unwrap();
+        projection_api
+            .worker_projection
+            .publish_catalog_change(&RuntimeWorkerRef::new(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                &worker_id,
+            ))
+            .unwrap();
+        let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+            panic!("expected Worker projection update");
+        };
+        let update: protocol::subscription::SubscriptionFrame =
+            serde_json::from_str(text.as_str()).unwrap();
+        let detached_worker = match update.payload {
+            protocol::subscription::SubscriptionFramePayload::Event(
+                protocol::subscription::SubscriptionEvent::Event {
+                    payload:
+                        protocol::subscription::SubscriptionEventPayload::WorkerUpserted { worker },
+                    ..
+                },
+            ) => worker,
+            other => panic!("expected Worker upsert after Workdir detach, got {other:?}"),
+        };
+        assert_eq!(detached_worker.worker_id.as_str(), worker_id);
+        assert!(detached_worker.repository_key.is_none());
+        assert!(detached_worker.working_directory_id.is_none());
 
         let subscribe_protocol = protocol::subscription::SubscriptionFrame::new(
             protocol::subscription::SubscriptionFramePayload::Request(

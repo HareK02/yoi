@@ -423,10 +423,54 @@ fn project_registry_worker(
     worker.workspace_id = Some(record.registry.workspace_id);
     worker.display_name = Some(record.registry.display_name);
     worker.profile = record.registry.profile;
-    if !project_repository_key(api, &mut worker) {
+    if !project_working_directory(api, &record.registry.worker, &mut worker) {
         return None;
     }
     Some(worker)
+}
+
+fn project_working_directory(
+    api: &WorkspaceApi,
+    worker_ref: &RuntimeWorkerRef,
+    worker: &mut SubscriptionWorker,
+) -> bool {
+    let Ok(links) = api
+        .store
+        .list_worker_workdir_links(&api.config.workspace_id, worker_ref)
+    else {
+        return false;
+    };
+    if let Some(link) = links.first() {
+        let Ok(Some(workdir)) = api
+            .store
+            .get_workdir_registry(&api.config.workspace_id, &link.workdir_id)
+        else {
+            return false;
+        };
+        if workdir.runtime_id != worker_ref.runtime_id {
+            return false;
+        }
+        let Ok(working_directory_id) =
+            protocol::subscription::SubscriptionWorkdirId::new(workdir.workdir_id)
+        else {
+            return false;
+        };
+        worker.repository_id = Some(workdir.repository_id);
+        worker.working_directory_id = Some(working_directory_id);
+    } else {
+        let Ok(has_link_history) = api
+            .store
+            .worker_workdir_link_history_exists(&api.config.workspace_id, worker_ref)
+        else {
+            return false;
+        };
+        if has_link_history {
+            worker.repository_id = None;
+            worker.repository_key = None;
+            worker.working_directory_id = None;
+        }
+    }
+    project_repository_key(api, worker)
 }
 
 fn project_repository_key(api: &WorkspaceApi, worker: &mut SubscriptionWorker) -> bool {
