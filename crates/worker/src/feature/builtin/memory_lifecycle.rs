@@ -163,6 +163,17 @@ fn memory_lifecycle_task_spec() -> BackgroundTaskSpec {
 }
 
 impl MemoryLifecycleTask {
+    fn extraction_manifest(&self) -> WorkerManifest {
+        let mut manifest = self.manifest.clone();
+        if let Some(model) = self.config.profile.extraction.model.clone() {
+            manifest.model = model;
+        }
+        if let Some(reasoning) = self.config.profile.extraction.reasoning.clone() {
+            manifest.engine.reasoning = Some(reasoning);
+        }
+        manifest
+    }
+
     async fn run_extraction(
         &self,
         context: BackgroundTaskContext,
@@ -365,10 +376,7 @@ impl MemoryLifecycleTask {
                 return Ok(());
             }
         };
-        let mut manifest = self.manifest.clone();
-        if let Some(model) = self.config.profile.extraction.model.clone() {
-            manifest.model = model;
-        }
+        let manifest = self.extraction_manifest();
 
         let cancel_observer = move |sender: tokio::sync::mpsc::Sender<()>| {
             tokio::spawn(async move {
@@ -1112,6 +1120,40 @@ permission = "write"
         .await
         .expect("memory lifecycle background task should finish");
         registry.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn extraction_manifest_applies_memory_model_and_reasoning_overrides() {
+        use agen::llm_client::capability::{ReasoningControl, ReasoningEffort};
+
+        let client = ScriptClient::new(Vec::new());
+        let extension_writes = Arc::new(Mutex::new(Vec::new()));
+        let (event_tx, _) = broadcast::channel(16);
+        let workspace_client: Arc<dyn WorkspaceClient> =
+            Arc::new(RecordingWorkspaceClient::default());
+        let mut task = test_task(
+            capture(2, 250),
+            Box::new(client),
+            extension_writes,
+            event_tx,
+            workspace_client,
+        );
+        task.config.profile.extraction.model = Some(manifest::ModelManifest {
+            ref_: Some("codex-oauth/gpt-5.6-luna".to_string()),
+            ..Default::default()
+        });
+        task.config.profile.extraction.reasoning =
+            Some(ReasoningControl::Effort(ReasoningEffort::Medium));
+
+        let manifest = task.extraction_manifest();
+        assert_eq!(
+            manifest.model.ref_.as_deref(),
+            Some("codex-oauth/gpt-5.6-luna")
+        );
+        assert_eq!(
+            manifest.engine.reasoning,
+            Some(ReasoningControl::Effort(ReasoningEffort::Medium))
+        );
     }
 
     #[tokio::test]

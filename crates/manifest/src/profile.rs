@@ -1231,6 +1231,66 @@ mod tests {
     }
 
     #[test]
+    fn builtin_profiles_pin_role_models_and_reasoning() {
+        use crate::model::{ReasoningControl, ReasoningEffort};
+
+        let tmp = TempDir::new().unwrap();
+        let resolve = |name: &str| {
+            ProfileResolver::new()
+                .with_workspace_base(tmp.path())
+                .resolve(
+                    &ProfileSelector::source_named(ProfileRegistrySource::Builtin, name),
+                    ProfileResolveOptions::with_worker_name(format!("{name}-worker")),
+                )
+                .unwrap()
+        };
+
+        let companion = resolve("companion");
+        assert_eq!(
+            companion.manifest.model.ref_.as_deref(),
+            Some("codex-oauth/gpt-6-astra")
+        );
+        assert_eq!(
+            companion.manifest.engine.reasoning,
+            Some(ReasoningControl::Effort(ReasoningEffort::High))
+        );
+
+        for name in ["coder", "reviewer"] {
+            let role = resolve(name);
+            assert_eq!(
+                role.manifest.model.ref_.as_deref(),
+                Some("codex-oauth/gpt-5.6-sol")
+            );
+            assert_eq!(
+                role.manifest.engine.reasoning,
+                Some(ReasoningControl::Effort(ReasoningEffort::High))
+            );
+            let extraction = &role.manifest.feature.memory.profile.extraction;
+            assert_eq!(
+                extraction
+                    .model
+                    .as_ref()
+                    .and_then(|model| model.ref_.as_deref()),
+                Some("codex-oauth/gpt-5.6-luna")
+            );
+            assert_eq!(
+                extraction.reasoning,
+                Some(ReasoningControl::Effort(ReasoningEffort::Medium))
+            );
+        }
+
+        let consolidation = resolve("memory-consolidation");
+        assert_eq!(
+            consolidation.manifest.model.ref_.as_deref(),
+            Some("codex-oauth/gpt-5.6-luna")
+        );
+        assert_eq!(
+            consolidation.manifest.engine.reasoning,
+            Some(ReasoningControl::Effort(ReasoningEffort::Medium))
+        );
+    }
+
+    #[test]
     fn profile_rejects_workspace_memory_snapshot_authority_fields() {
         let tmp = TempDir::new().unwrap();
         for (field, value) in [

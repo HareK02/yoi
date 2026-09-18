@@ -2,7 +2,11 @@ import "./base.dcdl" // {
     slug = "reviewer";
     description = "Ticket review profile.";
     scope = "workspace_read";
-    engine = { instruction = "role.reviewer"; };
+    model = { ref = "codex-oauth/gpt-5.6-sol"; };
+    engine = {
+        instruction = "role.reviewer";
+        reasoning = "high";
+    };
 
     feature = {
         task = { enabled = true; };

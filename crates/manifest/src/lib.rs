@@ -267,6 +267,7 @@ impl Default for MemoryResidentProfileConfig {
 pub struct MemoryExtractionProfileConfig {
     pub enabled: bool,
     pub model: Option<ModelManifest>,
+    pub reasoning: Option<ReasoningControl>,
     pub threshold: Option<u64>,
     pub worker_max_turns: Option<u32>,
 }
@@ -276,6 +277,7 @@ impl Default for MemoryExtractionProfileConfig {
         Self {
             enabled: true,
             model: None,
+            reasoning: None,
             threshold: Some(50_000),
             worker_max_turns: defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS,
         }

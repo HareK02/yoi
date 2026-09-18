@@ -2,6 +2,7 @@ import "./base.dcdl" // {
     slug = "companion";
     description = "Workspace companion profile.";
     scope = "workspace_write";
+    model = { ref = "codex-oauth/gpt-6-astra"; };
 
     feature = {
         task = { enabled = true; };

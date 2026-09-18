@@ -239,12 +239,13 @@ permission = "write"
 #
 # [feature.memory.profile.extraction]
 # enabled = true
+# reasoning = "medium"
 # threshold = 30000
 # worker_max_turns = 8
 #
-# # 任意。省略時はmain modelをcloneする。
+# # modelは任意。省略時はmain modelをcloneする。
 # # [feature.memory.profile.extraction.model]
-# # ref = "anthropic/claude-haiku-4-5"
+# # ref = "codex-oauth/gpt-5.6-luna"
 #
 # [feature.memory.profile.consolidation]
 # request_enabled = true

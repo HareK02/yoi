@@ -213,6 +213,8 @@ pub struct MemoryExtractionProfileConfigPartial {
     #[serde(default)]
     pub model: Option<ModelManifest>,
     #[serde(default)]
+    pub reasoning: Option<ReasoningControl>,
+    #[serde(default)]
     pub threshold: Option<u64>,
     #[serde(default)]
     pub worker_max_turns: Option<u32>,
@@ -262,6 +264,7 @@ impl MemoryExtractionProfileConfigPartial {
         Self {
             enabled: other.enabled.or(self.enabled),
             model: other.model.or(self.model),
+            reasoning: other.reasoning.or(self.reasoning),
             threshold: other.threshold.or(self.threshold),
             worker_max_turns: other.worker_max_turns.or(self.worker_max_turns),
         }
@@ -407,6 +410,7 @@ impl From<MemoryFeatureConfigPartial> for ResolvedMemoryFeatureConfig {
                 extraction: MemoryExtractionProfileConfig {
                     enabled: extraction.enabled.unwrap_or(true),
                     model: extraction.model,
+                    reasoning: extraction.reasoning,
                     threshold: extraction.threshold.or(Some(50_000)),
                     worker_max_turns: extraction
                         .worker_max_turns
@@ -432,6 +436,7 @@ impl From<ResolvedMemoryFeatureConfig> for MemoryFeatureConfigPartial {
             extraction: Some(MemoryExtractionProfileConfigPartial {
                 enabled: Some(value.profile.extraction.enabled),
                 model: value.profile.extraction.model,
+                reasoning: value.profile.extraction.reasoning,
                 threshold: value.profile.extraction.threshold,
                 worker_max_turns: value.profile.extraction.worker_max_turns,
             }),
@@ -1920,8 +1925,12 @@ inject_summary = false
 
 [feature.memory.extraction]
 enabled = true
+reasoning = "medium"
 threshold = 42000
 worker_max_turns = 2
+
+[feature.memory.extraction.model]
+ref = "codex-oauth/gpt-5.6-luna"
 
 [feature.memory.consolidation]
 request_enabled = false
@@ -1935,6 +1944,14 @@ request_enabled = false
         assert_eq!(memory.consolidation.unwrap().request_enabled, Some(false));
         let extraction = memory.extraction.unwrap();
         assert_eq!(extraction.enabled, Some(true));
+        assert_eq!(
+            extraction.reasoning,
+            Some(ReasoningControl::Effort(ReasoningEffort::Medium))
+        );
+        assert_eq!(
+            extraction.model.and_then(|model| model.ref_),
+            Some("codex-oauth/gpt-5.6-luna".to_string())
+        );
         assert_eq!(extraction.threshold, Some(42_000));
         assert_eq!(extraction.worker_max_turns, Some(2));
     }

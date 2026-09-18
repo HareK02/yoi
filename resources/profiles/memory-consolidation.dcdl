@@ -2,6 +2,8 @@ import "./base.dcdl" // {
     slug = "memory-consolidation";
     description = "Memory staging consolidation profile.";
     scope = "workspace_read";
+    model = { ref = "codex-oauth/gpt-5.6-luna"; };
+    engine = { reasoning = "medium"; };
 
     feature = {
         task = { enabled = false; };
