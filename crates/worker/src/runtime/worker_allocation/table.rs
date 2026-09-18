@@ -1,11 +1,47 @@
 //! On-disk allocation table and the `flock`-protected guard.
 
-use std::fs::{DirBuilder, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaveFaultPoint {
+    BeforeRename,
+    AfterRename,
+}
+
+#[cfg(test)]
+static SAVE_FAULTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, SaveFaultPoint>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn fail_next_save_for_test(path: &Path) {
+    fail_next_save_at_for_test(path, SaveFaultPoint::BeforeRename);
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_save_at_for_test(path: &Path, point: SaveFaultPoint) {
+    SAVE_FAULTS
+        .lock()
+        .unwrap()
+        .insert(path.to_path_buf(), point);
+}
+
+#[cfg(test)]
+fn take_save_fault(path: &Path, point: SaveFaultPoint) -> bool {
+    let mut faults = SAVE_FAULTS.lock().unwrap();
+    if faults.get(path) == Some(&point) {
+        faults.remove(path);
+        true
+    } else {
+        false
+    }
+}
 
 use fs4::fs_std::FileExt;
 use manifest::{ScopeRule, paths};
@@ -101,7 +137,9 @@ pub fn default_allocation_path() -> io::Result<PathBuf> {
 /// never call `save` leave the table unchanged, which is the right
 /// behaviour for error paths.
 pub struct LockFileGuard {
-    file: File,
+    data_file: File,
+    lock_file: File,
+    data_path: PathBuf,
     data: LockFile,
 }
 
@@ -121,16 +159,19 @@ impl LockFileGuard {
                 .mode(0o700)
                 .create(parent)?;
         }
-        let file = OpenOptions::new()
+        let mut lock_os = path.as_os_str().to_owned();
+        lock_os.push(".lock");
+        let lock_path = PathBuf::from(lock_os);
+        let lock_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .open(path)?;
+            .open(&lock_path)?;
         let started = Instant::now();
         loop {
-            match FileExt::try_lock_exclusive(&file) {
+            match FileExt::try_lock_exclusive(&lock_file) {
                 Ok(true) => break,
                 Ok(false) => {
                     if started.elapsed() >= LOCK_WAIT_TIMEOUT {
@@ -159,8 +200,17 @@ impl LockFileGuard {
                 Err(error) => return Err(error),
             }
         }
+        let data_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
         let mut this = Self {
-            file,
+            data_file,
+            lock_file,
+            data_path: path.to_path_buf(),
             data: LockFile::default(),
         };
         this.reload()?;
@@ -168,9 +218,9 @@ impl LockFileGuard {
     }
 
     fn reload(&mut self) -> io::Result<()> {
-        self.file.seek(SeekFrom::Start(0))?;
+        self.data_file.seek(SeekFrom::Start(0))?;
         let mut buf = String::new();
-        self.file.read_to_string(&mut buf)?;
+        self.data_file.read_to_string(&mut buf)?;
         self.data = if buf.trim().is_empty() {
             LockFile::default()
         } else {
@@ -192,20 +242,49 @@ impl LockFileGuard {
         &mut self.data
     }
 
-    /// Serialise `self.data` back to the file (truncate + rewrite).
+    /// Persist with atomic replacement while the separate allocation lock stays
+    /// held. A crash exposes either the old complete table or the new one.
     pub fn save(&mut self) -> io::Result<()> {
         let json = serde_json::to_vec_pretty(&self.data).map_err(io::Error::other)?;
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.set_len(0)?;
-        self.file.write_all(&json)?;
-        self.file.sync_data()?;
+        let mut temp_os = self.data_path.as_os_str().to_owned();
+        temp_os.push(".tmp");
+        let temp_path = PathBuf::from(temp_os);
+        let mut temp_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temp_path)?;
+        temp_file.write_all(&json)?;
+        temp_file.sync_all()?;
+        #[cfg(test)]
+        if take_save_fault(&self.data_path, SaveFaultPoint::BeforeRename) {
+            return Err(io::Error::other(
+                "injected allocation save failure before rename",
+            ));
+        }
+        fs::rename(&temp_path, &self.data_path)?;
+        #[cfg(test)]
+        if take_save_fault(&self.data_path, SaveFaultPoint::AfterRename) {
+            return Err(io::Error::other(
+                "injected allocation save failure after rename",
+            ));
+        }
+        if let Some(parent) = self.data_path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        self.data_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&self.data_path)?;
         Ok(())
     }
 }
 
 impl Drop for LockFileGuard {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        let _ = FileExt::unlock(&self.lock_file);
     }
 }
 
@@ -257,6 +336,76 @@ mod tests {
         let guard = LockFileGuard::open(&path).unwrap();
         assert_eq!(guard.data().allocations.len(), 1);
         assert_eq!(guard.data().allocations[0].worker_name, "a");
+    }
+
+    #[test]
+    fn atomic_save_reopens_complete_table_at_both_rename_boundaries() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("workers.json");
+        let old_segment = sid();
+        let replacement = sid();
+        {
+            let mut guard = open_empty(&path);
+            register_worker(
+                &mut guard,
+                "a".into(),
+                std::process::id(),
+                sock("a"),
+                vec![write_rule("/src", true)],
+                old_segment,
+            )
+            .unwrap();
+        }
+
+        {
+            let mut guard = LockFileGuard::open(&path).unwrap();
+            guard.data_mut().find_mut("a").unwrap().segment_id = Some(replacement);
+            fail_next_save_at_for_test(&path, SaveFaultPoint::BeforeRename);
+            assert!(guard.save().is_err());
+        }
+        let guard = LockFileGuard::open(&path).unwrap();
+        assert_eq!(
+            guard
+                .data()
+                .find("a")
+                .and_then(|allocation| allocation.segment_id),
+            Some(old_segment)
+        );
+        drop(guard);
+
+        {
+            let mut guard = LockFileGuard::open(&path).unwrap();
+            guard.data_mut().find_mut("a").unwrap().segment_id = Some(replacement);
+            fail_next_save_at_for_test(&path, SaveFaultPoint::AfterRename);
+            assert!(guard.save().is_err());
+        }
+        let guard = LockFileGuard::open(&path).unwrap();
+        assert_eq!(
+            guard
+                .data()
+                .find("a")
+                .and_then(|allocation| allocation.segment_id),
+            Some(replacement)
+        );
+    }
+
+    #[test]
+    fn allocation_lock_remains_exclusive_across_atomic_save() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("workers.json");
+        let mut guard = open_empty(&path);
+        guard.save().unwrap();
+
+        let (sent, received) = std::sync::mpsc::channel();
+        let contender_path = path.clone();
+        let contender = std::thread::spawn(move || {
+            let contender = LockFileGuard::open(&contender_path).unwrap();
+            sent.send(contender.data().allocations.len()).unwrap();
+        });
+        assert!(received.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(guard);
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), 0);
+        contender.join().unwrap();
     }
 
     #[test]

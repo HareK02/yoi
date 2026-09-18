@@ -272,17 +272,18 @@ impl ParentNotificationTarget {
         };
         match self {
             Self::Controller { sender, fallback } => {
+                // Persist through the Worker-owned pending authority before the
+                // child completion path returns. The Controller delivery is only
+                // a wake-up hint; replay is idempotent by notification_request_id.
+                fallback(method.clone());
                 let Some(parent_method_tx) = sender.upgrade() else {
-                    fallback(method);
                     return;
                 };
-                let fallback = fallback.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = parent_method_tx.send(method).await {
+                    if parent_method_tx.send(method).await.is_err() {
                         tracing::warn!(
-                            "failed to notify parent Controller; using durable pending authority"
+                            "failed to wake parent Controller after durable notification acceptance"
                         );
-                        fallback(error.0);
                     }
                 });
             }
@@ -1199,6 +1200,30 @@ enabled = false
         assert!(parent_method_rx.recv().await.is_none());
         target.notify("child-session".into(), "late completion".to_string());
         assert!(*captured.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn parent_controller_notification_is_durable_before_wakeup_delivery() {
+        let (parent_method_tx, mut parent_method_rx) = mpsc::channel(1);
+        let durable = Arc::new(AtomicBool::new(false));
+        let durable_for_fallback = Arc::clone(&durable);
+        let target = ParentNotificationTarget::with_controller_fallback(
+            parent_method_tx.downgrade(),
+            ParentNotificationTarget::Durable(Arc::new(move |_| {
+                durable_for_fallback.store(true, Ordering::Release);
+            })),
+        );
+
+        target.notify("child-session".into(), "completed".into());
+        let wakeup = parent_method_rx.recv().await.unwrap();
+        assert!(durable.load(Ordering::Acquire));
+        assert!(matches!(
+            wakeup,
+            Method::NotifyTracked {
+                source: protocol::AuthenticatedInputSource::SubWorker { session_id },
+                ..
+            } if session_id == "child-session"
+        ));
     }
 
     #[test]

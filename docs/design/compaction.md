@@ -32,6 +32,44 @@ Compaction should preserve persisted reasoning history and avoid serializing unv
 
 The important property is explainability: after compaction, records should still show what summary replaced which older context and why future turns can rely on it.
 
+## Activation boundary
+
+A compacted Segment is staged completely before it can become authoritative. The
+activation boundary uses this lock order everywhere a live Worker changes Segment:
+
+1. stop the compaction service and remove its registry record;
+2. acquire the Worker's append barrier;
+3. write the final pending-submission checkpoint and stage the replacement Segment;
+4. acquire and preflight the machine-wide Worker allocation lock;
+5. compare-and-swap `metadata.json` from the source Segment to the replacement;
+6. atomically replace the allocation table while still holding its separate lock;
+7. publish the append destination, session projection, sink, and in-memory history;
+8. release the append barrier.
+
+Submit and Notify acceptance take the same append barrier. The controller persists
+requests received while manual compaction is running immediately rather than holding
+volatile deferred methods, so an overlapping Shutdown cannot discard a SubWorker
+completion. Consequently an accepted item is either durably included in the
+replacement checkpoint, or waits until every live authority points at the replacement
+and is then appended there. Restore admission takes the allocation lock, so it cannot
+observe the interval between the metadata CAS and allocation hand-off.
+
+The metadata CAS is the commit point. Failures before it leave the source Segment
+active. A failure updating allocation after it marks the old in-memory writer
+unusable and retains the machine-wide allocation lock: further acceptance fails
+closed and restore admission cannot register a competing writer until process
+teardown, after which restore converges from the replacement named by metadata.
+The Worker must likewise remain non-idle while terminal compaction-service cleanup
+is pending. Cleanup authority is stored on the Worker (not only on one compaction
+future). A failed stop returns a typed cleanup-pending outcome without clearing that
+authority; the next compaction boundary retries it. The authority and lifecycle
+reference are cleared exactly once after the registry record is gone, before
+activation or a terminal idle-capable result. While either activation repair or
+cleanup attention is outstanding, the controller fences Submit/Notify dispatch and
+does not start queued work. Shutdown is itself a cleanup barrier: it retries the
+Worker-owned stop authority with backoff and does not emit its terminal event until
+the registry record is gone.
+
 ## Metrics and comparison procedure
 
 Compaction measurements stay out of the ordinary transcript. They are appended as
