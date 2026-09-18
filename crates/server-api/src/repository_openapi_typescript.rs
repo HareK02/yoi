@@ -404,12 +404,39 @@ fn render_schema(value: &Value, context: &str) -> Result<String, GenerationError
             )));
         }
         let mut rendered = Vec::with_capacity(branches.len());
+        let mut seen_literals = BTreeSet::new();
         for branch in branches {
             let branch_object = object(branch, context)?;
             if !branch_object.contains_key("enum") && !branch_object.contains_key("const") {
                 return Err(GenerationError::invalid(format!(
                     "{context} contains unsupported ambiguous oneOf semantics"
                 )));
+            }
+            let literals = if let Some(constant) = branch_object.get("const") {
+                std::slice::from_ref(constant)
+            } else {
+                branch_object
+                    .get("enum")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        GenerationError::invalid(format!(
+                            "{context} contains a non-array oneOf enum"
+                        ))
+                    })?
+                    .as_slice()
+            };
+            for literal in literals {
+                render_literal(literal, context)?;
+                let normalized = serde_json::to_string(literal).map_err(|error| {
+                    GenerationError::invalid(format!(
+                        "failed to normalize {context} oneOf literal: {error}"
+                    ))
+                })?;
+                if !seen_literals.insert(normalized) {
+                    return Err(GenerationError::invalid(format!(
+                        "{context} contains overlapping oneOf literal branches"
+                    )));
+                }
             }
             if let Some(kind) = outer_type {
                 if !literal_schema_matches_type(branch_object, kind) {
@@ -800,6 +827,14 @@ mod tests {
                 .to_string()
                 .contains("oneOf branch does not match outer type")
         );
+
+        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
+        document["components"]["schemas"]["RepositorySourceKind"]["oneOf"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"const": "invalid", "type": "string"}));
+        let error = generate_repository_typescript(&document.to_string()).unwrap_err();
+        assert!(error.to_string().contains("overlapping oneOf literal"));
     }
 
     #[test]
