@@ -64,10 +64,9 @@ authority; the next compaction boundary retries it. The authority and lifecycle
 reference are cleared exactly once after the registry record is gone, before
 activation or a terminal idle-capable result. While either activation repair or
 cleanup attention is outstanding, the controller fences Submit/Notify dispatch and
-does not start queued work. Shutdown is itself a cleanup barrier: it performs a
-bounded set of direct stop attempts and does not emit its terminal event until either
-the registry record is gone or cleanup authority has moved to a runtime-owned
-quarantine task.
+does not start queued work. Shutdown is itself a cleanup barrier: it retries the
+Worker-owned stop authority with backoff and does not emit its terminal event until
+the registry record is gone.
 
 ## Metrics and comparison procedure
 

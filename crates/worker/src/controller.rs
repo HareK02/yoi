@@ -1756,7 +1756,7 @@ async fn controller_loop<C, St>(
                         while let Err(error) =
                             worker.finish_pending_compaction_cleanup_for_shutdown().await
                         {
-                            tracing::warn!(error = %error, "shutdown cleanup quarantine failed");
+                            tracing::warn!(error = %error, "shutdown cleanup retry failed");
                             tokio::time::sleep(Duration::from_millis(50)).await;
                         }
                         break 'controller;
@@ -1790,7 +1790,7 @@ async fn controller_loop<C, St>(
                         while let Err(error) =
                             worker.finish_pending_compaction_cleanup_for_shutdown().await
                         {
-                            tracing::warn!(error = %error, "shutdown cleanup quarantine failed");
+                            tracing::warn!(error = %error, "shutdown cleanup retry failed");
                             tokio::time::sleep(Duration::from_millis(50)).await;
                         }
                         break 'controller;

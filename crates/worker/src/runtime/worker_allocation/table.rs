@@ -8,16 +8,39 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
-static FAIL_NEXT_SAVE_PATHS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaveFaultPoint {
+    BeforeRename,
+    AfterRename,
+}
+
+#[cfg(test)]
+static SAVE_FAULTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, SaveFaultPoint>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 #[cfg(test)]
 pub(crate) fn fail_next_save_for_test(path: &Path) {
-    FAIL_NEXT_SAVE_PATHS
+    fail_next_save_at_for_test(path, SaveFaultPoint::BeforeRename);
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_save_at_for_test(path: &Path, point: SaveFaultPoint) {
+    SAVE_FAULTS
         .lock()
         .unwrap()
-        .insert(path.to_path_buf());
+        .insert(path.to_path_buf(), point);
+}
+
+#[cfg(test)]
+fn take_save_fault(path: &Path, point: SaveFaultPoint) -> bool {
+    let mut faults = SAVE_FAULTS.lock().unwrap();
+    if faults.get(path) == Some(&point) {
+        faults.remove(path);
+        true
+    } else {
+        false
+    }
 }
 
 use fs4::fs_std::FileExt;
@@ -222,16 +245,6 @@ impl LockFileGuard {
     /// Persist with atomic replacement while the separate allocation lock stays
     /// held. A crash exposes either the old complete table or the new one.
     pub fn save(&mut self) -> io::Result<()> {
-        #[cfg(test)]
-        {
-            if FAIL_NEXT_SAVE_PATHS
-                .lock()
-                .unwrap()
-                .remove(&self.data_path)
-            {
-                return Err(io::Error::other("injected allocation save failure"));
-            }
-        }
         let json = serde_json::to_vec_pretty(&self.data).map_err(io::Error::other)?;
         let mut temp_os = self.data_path.as_os_str().to_owned();
         temp_os.push(".tmp");
@@ -244,7 +257,19 @@ impl LockFileGuard {
             .open(&temp_path)?;
         temp_file.write_all(&json)?;
         temp_file.sync_all()?;
+        #[cfg(test)]
+        if take_save_fault(&self.data_path, SaveFaultPoint::BeforeRename) {
+            return Err(io::Error::other(
+                "injected allocation save failure before rename",
+            ));
+        }
         fs::rename(&temp_path, &self.data_path)?;
+        #[cfg(test)]
+        if take_save_fault(&self.data_path, SaveFaultPoint::AfterRename) {
+            return Err(io::Error::other(
+                "injected allocation save failure after rename",
+            ));
+        }
         if let Some(parent) = self.data_path.parent() {
             File::open(parent)?.sync_all()?;
         }
@@ -311,6 +336,51 @@ mod tests {
         let guard = LockFileGuard::open(&path).unwrap();
         assert_eq!(guard.data().allocations.len(), 1);
         assert_eq!(guard.data().allocations[0].worker_name, "a");
+    }
+
+    #[test]
+    fn atomic_save_reopens_complete_table_at_both_rename_boundaries() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("workers.json");
+        let old_segment = sid();
+        let replacement = sid();
+        {
+            let mut guard = open_empty(&path);
+            register_worker(
+                &mut guard,
+                "a".into(),
+                std::process::id(),
+                sock("a"),
+                vec![write_rule("/src", true)],
+                old_segment,
+            )
+            .unwrap();
+        }
+
+        {
+            let mut guard = LockFileGuard::open(&path).unwrap();
+            guard.data_mut().find_mut("a").unwrap().segment_id = Some(replacement);
+            fail_next_save_at_for_test(&path, SaveFaultPoint::BeforeRename);
+            assert!(guard.save().is_err());
+        }
+        let guard = LockFileGuard::open(&path).unwrap();
+        assert_eq!(
+            guard.data().find("a").and_then(|allocation| allocation.segment_id),
+            Some(old_segment)
+        );
+        drop(guard);
+
+        {
+            let mut guard = LockFileGuard::open(&path).unwrap();
+            guard.data_mut().find_mut("a").unwrap().segment_id = Some(replacement);
+            fail_next_save_at_for_test(&path, SaveFaultPoint::AfterRename);
+            assert!(guard.save().is_err());
+        }
+        let guard = LockFileGuard::open(&path).unwrap();
+        assert_eq!(
+            guard.data().find("a").and_then(|allocation| allocation.segment_id),
+            Some(replacement)
+        );
     }
 
     #[test]

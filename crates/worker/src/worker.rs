@@ -5216,45 +5216,18 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     pub(crate) async fn finish_pending_compaction_cleanup_for_shutdown(
         &self,
     ) -> Result<(), WorkerError> {
-        const SHUTDOWN_CLEANUP_ATTEMPTS: usize = 3;
-        let mut last_error = None;
-        for attempt in 0..SHUTDOWN_CLEANUP_ATTEMPTS {
+        loop {
             match self.retry_pending_compaction_cleanup().await {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    last_error = Some(error);
-                    if attempt + 1 < SHUTDOWN_CLEANUP_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
+                    warn!(
+                        error = %error,
+                        "shutdown remains blocked on compaction service cleanup"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }
         }
-
-        let cleanup = self
-            .pending_compaction_cleanup
-            .lock()
-            .expect("pending compaction cleanup mutex poisoned")
-            .clone();
-        let Some(cleanup) = cleanup else {
-            return Ok(());
-        };
-        let Some(registry) = &self.internal_worker_registry else {
-            return Err(last_error.unwrap_or_else(|| WorkerError::CompactionCleanupPending {
-                source: ScopeLockError::Io(std::io::Error::other(
-                    "compaction registry unavailable during shutdown quarantine",
-                )),
-            }));
-        };
-        registry
-            .quarantine_service_cleanup(cleanup.session_id.clone())
-            .map_err(|source| WorkerError::CompactionCleanupPending {
-                source: ScopeLockError::Io(source),
-            })?;
-        *self
-            .pending_compaction_cleanup
-            .lock()
-            .expect("pending compaction cleanup mutex poisoned") = None;
-        Ok(())
     }
 
     async fn release_pending_compaction_service(&self) -> Result<(), WorkerError> {
@@ -8682,7 +8655,7 @@ mod build_summary_prompt_tests {
     }
 
     #[tokio::test]
-    async fn shutdown_cleanup_failures_transfer_service_authority_to_quarantine() {
+    async fn shutdown_cleanup_stays_blocked_until_registered_service_stops() {
         let dir = tempfile::tempdir().unwrap();
         let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
         let mut worker = Worker::new(
@@ -8708,28 +8681,20 @@ mod build_summary_prompt_tests {
             compaction_id: "compaction".into(),
         });
 
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            worker.finish_pending_compaction_cleanup_for_shutdown(),
-        )
-        .await
-        .expect("shutdown cleanup must be bounded")
-        .unwrap();
-        assert!(!worker.has_pending_compaction_cleanup());
+        let cleanup = worker.finish_pending_compaction_cleanup_for_shutdown();
+        tokio::pin!(cleanup);
+        tokio::select! {
+            result = &mut cleanup => panic!("shutdown cleanup completed before injected failures: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(75)) => {}
+        }
+        assert!(worker.has_pending_compaction_cleanup());
         assert!(registry.has_service_for_test(&cleanup_session_id));
-        assert!(registry.is_service_cleanup_quarantined_for_test(&cleanup_session_id));
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if !registry.is_service_cleanup_quarantined_for_test(&cleanup_session_id)
-                    && !registry.has_service_for_test(&cleanup_session_id)
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cleanup)
+            .await
+            .expect("shutdown cleanup must converge after retry")
+            .unwrap();
+        assert!(!worker.has_pending_compaction_cleanup());
+        assert!(!registry.has_service_for_test(&cleanup_session_id));
     }
 
     #[tokio::test]
@@ -10476,6 +10441,78 @@ mod build_summary_prompt_tests {
                 .delete_uncommitted_uploaded_files(session_id)
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn submit_and_notification_wait_for_activation_barrier_then_append_to_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        let old_location = handle.writer.state.location();
+        let replacement = session_store::new_segment_id();
+        handle
+            .writer
+            .store
+            .create_segment(old_location.session_id, replacement, &[])
+            .unwrap();
+        let old_entries = handle
+            .writer
+            .store
+            .read_all(old_location.session_id, old_location.segment_id)
+            .unwrap()
+            .len();
+        let append_guard = handle.writer.state.append_lock.lock().unwrap();
+        let submit_handle = handle.clone();
+        let notify_handle = handle.clone();
+        let (started, starts) = std::sync::mpsc::channel();
+        let (finished, finishes) = std::sync::mpsc::channel();
+        let submit_started = started.clone();
+        let submit_finished = finished.clone();
+        let submit = std::thread::spawn(move || {
+            submit_started.send(()).unwrap();
+            submit_handle
+                .accept("barrier-submit".into(), vec![Segment::text("queued")], false)
+                .unwrap();
+            submit_finished.send(()).unwrap();
+        });
+        let notify = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            notify_handle
+                .accept_notification("barrier-notify".into(), "completed".into())
+                .unwrap();
+            finished.send(()).unwrap();
+        });
+        starts.recv_timeout(Duration::from_secs(1)).unwrap();
+        starts.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(finishes.recv_timeout(Duration::from_millis(50)).is_err());
+
+        handle.writer.state.set_location(SegmentLocation {
+            session_id: old_location.session_id,
+            segment_id: replacement,
+        });
+        drop(append_guard);
+        finishes.recv_timeout(Duration::from_secs(1)).unwrap();
+        finishes.recv_timeout(Duration::from_secs(1)).unwrap();
+        submit.join().unwrap();
+        notify.join().unwrap();
+
+        assert_eq!(
+            handle
+                .writer
+                .store
+                .read_all(old_location.session_id, old_location.segment_id)
+                .unwrap()
+                .len(),
+            old_entries
+        );
+        assert_eq!(
+            handle
+                .writer
+                .store
+                .read_all(old_location.session_id, replacement)
+                .unwrap()
+                .len(),
+            2
         );
     }
 
