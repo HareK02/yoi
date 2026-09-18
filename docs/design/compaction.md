@@ -42,7 +42,7 @@ activation boundary uses this lock order everywhere a live Worker changes Segmen
 3. write the final pending-submission checkpoint and stage the replacement Segment;
 4. acquire and preflight the machine-wide Worker allocation lock;
 5. compare-and-swap `metadata.json` from the source Segment to the replacement;
-6. update the allocation table while still holding its lock;
+6. atomically replace the allocation table while still holding its separate lock;
 7. publish the append destination, session projection, sink, and in-memory history;
 8. release the append barrier.
 
@@ -64,8 +64,10 @@ authority; the next compaction boundary retries it. The authority and lifecycle
 reference are cleared exactly once after the registry record is gone, before
 activation or a terminal idle-capable result. While either activation repair or
 cleanup attention is outstanding, the controller fences Submit/Notify dispatch and
-does not start queued work. Shutdown is itself a cleanup barrier: it is not emitted
-until the retained service record has been stopped successfully.
+does not start queued work. Shutdown is itself a cleanup barrier: it performs a
+bounded set of direct stop attempts and does not emit its terminal event until either
+the registry record is gone or cleanup authority has moved to a runtime-owned
+quarantine task.
 
 ## Metrics and comparison procedure
 

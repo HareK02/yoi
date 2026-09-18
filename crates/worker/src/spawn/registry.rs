@@ -311,6 +311,7 @@ impl Drop for InternalSpawnReservation {
 pub struct SpawnedWorkerRegistry {
     internal_records: std::sync::Mutex<Vec<InternalSpawnedWorkerRecord>>,
     service_records: std::sync::Mutex<Vec<InternalServiceWorkerRecord>>,
+    quarantined_service_cleanup: std::sync::Mutex<HashSet<String>>,
     internal_names: std::sync::Mutex<HashSet<String>>,
     internal_shutting_down: AtomicBool,
     pending_internal_spawns: AtomicUsize,
@@ -331,6 +332,7 @@ impl SpawnedWorkerRegistry {
         Arc::new(Self {
             internal_records: std::sync::Mutex::new(Vec::new()),
             service_records: std::sync::Mutex::new(Vec::new()),
+            quarantined_service_cleanup: std::sync::Mutex::new(HashSet::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
             internal_shutting_down: AtomicBool::new(false),
             pending_internal_spawns: AtomicUsize::new(0),
@@ -346,6 +348,7 @@ impl SpawnedWorkerRegistry {
         Arc::new(Self {
             internal_records: std::sync::Mutex::new(Vec::new()),
             service_records: std::sync::Mutex::new(Vec::new()),
+            quarantined_service_cleanup: std::sync::Mutex::new(HashSet::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
             internal_shutting_down: AtomicBool::new(false),
             pending_internal_spawns: AtomicUsize::new(0),
@@ -360,6 +363,7 @@ impl SpawnedWorkerRegistry {
         Arc::new(Self {
             internal_records: std::sync::Mutex::new(Vec::new()),
             service_records: std::sync::Mutex::new(Vec::new()),
+            quarantined_service_cleanup: std::sync::Mutex::new(HashSet::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
             internal_shutting_down: AtomicBool::new(false),
             pending_internal_spawns: AtomicUsize::new(0),
@@ -443,6 +447,7 @@ impl SpawnedWorkerRegistry {
             registry: Arc::new(Self {
                 internal_records: std::sync::Mutex::new(Vec::new()),
                 service_records: std::sync::Mutex::new(Vec::new()),
+            quarantined_service_cleanup: std::sync::Mutex::new(HashSet::new()),
                 internal_names: std::sync::Mutex::new(HashSet::new()),
                 internal_shutting_down: AtomicBool::new(false),
                 pending_internal_spawns: AtomicUsize::new(0),
@@ -554,6 +559,45 @@ impl SpawnedWorkerRegistry {
             .await
             .map_err(|error| io::Error::other(error.to_string()))?;
         self.remove_service(session_id)
+    }
+
+    /// Transfer cleanup authority to a registry-owned quarantine task after the
+    /// controller has exhausted its bounded shutdown attempts. The service record
+    /// remains registered until a later stop succeeds.
+    pub(crate) fn quarantine_service_cleanup(
+        self: &Arc<Self>,
+        session_id: String,
+    ) -> io::Result<()> {
+        let mut quarantined = self
+            .quarantined_service_cleanup
+            .lock()
+            .map_err(|_| io::Error::other("service cleanup quarantine lock poisoned"))?;
+        if !quarantined.insert(session_id.clone()) {
+            return Ok(());
+        }
+        drop(quarantined);
+
+        let registry = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                match registry.stop_service(&session_id).await {
+                    Ok(_) => {
+                        if let Ok(mut quarantined) = registry.quarantined_service_cleanup.lock() {
+                            quarantined.remove(&session_id);
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            "quarantined service cleanup retry failed"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                }
+            }
+        });
+        Ok(())
     }
 
     /// Remove one service Worker and emit the terminal projection fence.
@@ -1533,6 +1577,30 @@ mod tests {
             parent_rx.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn cleanup_quarantine_owns_record_until_background_stop_finishes() {
+        let registry = registry();
+        registry
+            .quarantine_service_cleanup("missing-service".into())
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !registry
+                    .quarantined_service_cleanup
+                    .lock()
+                    .unwrap()
+                    .contains("missing-service")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

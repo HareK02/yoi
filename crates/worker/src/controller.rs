@@ -1719,14 +1719,13 @@ async fn controller_loop<C, St>(
             )
             .await;
             if shutdown {
-                while worker.has_pending_compaction_cleanup() {
-                    if let Err(error) = worker.retry_pending_compaction_cleanup().await {
-                        let _ = working_event_tx.send(Event::Error {
-                            code: worker_error_code(&error),
-                            message: error.to_string(),
-                        });
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
+                while let Err(error) = worker.finish_pending_compaction_cleanup_for_shutdown().await
+                {
+                    let _ = working_event_tx.send(Event::Error {
+                        code: worker_error_code(&error),
+                        message: error.to_string(),
+                    });
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 let _ = working_event_tx.send(Event::Shutdown);
                 break;
@@ -1754,11 +1753,11 @@ async fn controller_loop<C, St>(
                 method = method_rx.recv() => match method {
                     Some(method) => method,
                     None => {
-                        while worker.has_pending_compaction_cleanup() {
-                            if let Err(error) = worker.retry_pending_compaction_cleanup().await {
-                                tracing::warn!(error = %error, "shutdown waiting for compaction cleanup");
-                                tokio::time::sleep(Duration::from_millis(50)).await;
-                            }
+                        while let Err(error) =
+                            worker.finish_pending_compaction_cleanup_for_shutdown().await
+                        {
+                            tracing::warn!(error = %error, "shutdown cleanup quarantine failed");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
                         }
                         break 'controller;
                     }
@@ -1788,11 +1787,11 @@ async fn controller_loop<C, St>(
                 method = method_rx.recv() => match method {
                     Some(method) => method,
                     None => {
-                        while worker.has_pending_compaction_cleanup() {
-                            if let Err(error) = worker.retry_pending_compaction_cleanup().await {
-                                tracing::warn!(error = %error, "shutdown waiting for compaction cleanup");
-                                tokio::time::sleep(Duration::from_millis(50)).await;
-                            }
+                        while let Err(error) =
+                            worker.finish_pending_compaction_cleanup_for_shutdown().await
+                        {
+                            tracing::warn!(error = %error, "shutdown cleanup quarantine failed");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
                         }
                         break 'controller;
                     }
@@ -1813,22 +1812,29 @@ async fn controller_loop<C, St>(
                     .await;
                 }
                 Err(error) => {
-                    let message = error.to_string();
-                    let _ = working_event_tx.send(Event::Error {
-                        code: worker_error_code(&error),
-                        message: message.clone(),
-                    });
-                    if reject_method_while_attention_locked(
-                        &method,
-                        &working_event_tx,
-                        &message,
-                    ) {
-                        continue;
-                    }
-                    // Shutdown is an explicit cleanup barrier: it is not allowed
-                    // to complete while the service remains unconfirmed.
                     if matches!(&method, Method::Shutdown { .. }) {
-                        continue;
+                        if let Err(error) =
+                            worker.finish_pending_compaction_cleanup_for_shutdown().await
+                        {
+                            let _ = working_event_tx.send(Event::Error {
+                                code: worker_error_code(&error),
+                                message: error.to_string(),
+                            });
+                            continue;
+                        }
+                    } else {
+                        let message = error.to_string();
+                        let _ = working_event_tx.send(Event::Error {
+                            code: worker_error_code(&error),
+                            message: message.clone(),
+                        });
+                        if reject_method_while_attention_locked(
+                            &method,
+                            &working_event_tx,
+                            &message,
+                        ) {
+                            continue;
+                        }
                     }
                 }
             }
@@ -2277,14 +2283,14 @@ async fn controller_loop<C, St>(
                     });
                 }
                 if shutdown_after_compaction {
-                    while worker.has_pending_compaction_cleanup() {
-                        if let Err(error) = worker.retry_pending_compaction_cleanup().await {
-                            let _ = working_event_tx.send(Event::Error {
-                                code: worker_error_code(&error),
-                                message: error.to_string(),
-                            });
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                        }
+                    while let Err(error) =
+                        worker.finish_pending_compaction_cleanup_for_shutdown().await
+                    {
+                        let _ = working_event_tx.send(Event::Error {
+                            code: worker_error_code(&error),
+                            message: error.to_string(),
+                        });
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                     let _ = working_event_tx.send(Event::Shutdown);
                     break 'controller;

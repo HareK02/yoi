@@ -1058,7 +1058,6 @@ pub struct SegmentState {
     entries_written: AtomicUsize,
     append_lock: Mutex<()>,
     activation_failed: AtomicBool,
-    activation_failure_authority: Mutex<Option<SegmentActivationGuard>>,
 }
 
 impl SegmentState {
@@ -1071,7 +1070,6 @@ impl SegmentState {
             entries_written: AtomicUsize::new(entries_written),
             append_lock: Mutex::new(()),
             activation_failed: AtomicBool::new(false),
-            activation_failure_authority: Mutex::new(None),
         })
     }
 
@@ -1108,11 +1106,7 @@ impl SegmentState {
         Ok(())
     }
 
-    fn fail_closed_activation(&self, authority: SegmentActivationGuard) {
-        *self
-            .activation_failure_authority
-            .lock()
-            .expect("Segment activation failure authority mutex poisoned") = Some(authority);
+    fn fail_closed_activation(&self) {
         self.activation_failed.store(true, Ordering::Release);
     }
 
@@ -2224,6 +2218,10 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// interceptor before Agen applies them to live typed history.
     pending_committed_history:
         Arc<Mutex<std::collections::VecDeque<HistoryEntry<SessionHistoryMetadata>>>>,
+    /// Machine-wide lock retained after a post-CAS allocation publication
+    /// failure. Declared before `scope_allocation` so drop releases this nested
+    /// authority before the outer allocation guard reacquires the same lock.
+    failed_activation_authority: Mutex<Option<SegmentActivationGuard>>,
     /// Scope allocation in the machine-wide lock file. `Some` for
     /// Workers built via `from_manifest` / `from_manifest_spawned` /
     /// `restore_from_manifest` (production paths); `None` for the
@@ -2283,6 +2281,19 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// paths skip SystemItem disk commits but still see the rendered
     /// `Item::system_message` in worker history.
     log_writer: Option<Arc<dyn SystemItemCommitter>>,
+}
+
+impl<C: LlmClient, St: Store> Drop for Worker<C, St> {
+    fn drop(&mut self) {
+        // A failed activation authority nests the same machine-wide lock used by
+        // `ScopeAllocationGuard::drop`. Release the nested guard first so Worker
+        // teardown cannot self-deadlock while removing its outer allocation.
+        let authority = match self.failed_activation_authority.get_mut() {
+            Ok(authority) => authority.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        drop(authority);
+    }
 }
 
 impl<C: LlmClient + 'static, St: Store + 'static> Worker<C, St> {
@@ -2484,6 +2495,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             notification_coalesce_delay: DEFAULT_NOTIFICATION_COALESCE_DELAY,
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            failed_activation_authority: Mutex::new(None),
             scope_allocation: None,
             callback_socket: None,
             runtime_ticket_role: None,
@@ -4522,7 +4534,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         if let Some(allocation_activation) = allocation_activation {
             if let Err(error) = allocation_activation.commit() {
                 let (source, authority) = error.into_parts();
-                segment_state.fail_closed_activation(authority);
+                self.fail_closed_segment_activation(authority);
                 return Err(WorkerError::SegmentActivationIncomplete { source });
             }
         }
@@ -5185,12 +5197,64 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .is_some()
     }
 
+    fn fail_closed_segment_activation(&self, authority: SegmentActivationGuard) {
+        *self
+            .failed_activation_authority
+            .lock()
+            .expect("failed activation authority mutex poisoned") = Some(authority);
+        self.segment_state.fail_closed_activation();
+    }
+
     pub(crate) fn has_failed_segment_activation(&self) -> bool {
         self.segment_state.activation_failed.load(Ordering::Acquire)
     }
 
     pub(crate) async fn retry_pending_compaction_cleanup(&self) -> Result<(), WorkerError> {
         self.release_pending_compaction_service().await
+    }
+
+    pub(crate) async fn finish_pending_compaction_cleanup_for_shutdown(
+        &self,
+    ) -> Result<(), WorkerError> {
+        const SHUTDOWN_CLEANUP_ATTEMPTS: usize = 3;
+        let mut last_error = None;
+        for attempt in 0..SHUTDOWN_CLEANUP_ATTEMPTS {
+            match self.retry_pending_compaction_cleanup().await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt + 1 < SHUTDOWN_CLEANUP_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        }
+
+        let cleanup = self
+            .pending_compaction_cleanup
+            .lock()
+            .expect("pending compaction cleanup mutex poisoned")
+            .clone();
+        let Some(cleanup) = cleanup else {
+            return Ok(());
+        };
+        let Some(registry) = &self.internal_worker_registry else {
+            return Err(last_error.unwrap_or_else(|| WorkerError::CompactionCleanupPending {
+                source: ScopeLockError::Io(std::io::Error::other(
+                    "compaction registry unavailable during shutdown quarantine",
+                )),
+            }));
+        };
+        registry
+            .quarantine_service_cleanup(cleanup.session_id.clone())
+            .map_err(|source| WorkerError::CompactionCleanupPending {
+                source: ScopeLockError::Io(source),
+            })?;
+        *self
+            .pending_compaction_cleanup
+            .lock()
+            .expect("pending compaction cleanup mutex poisoned") = None;
+        Ok(())
     }
 
     async fn release_pending_compaction_service(&self) -> Result<(), WorkerError> {
@@ -5904,7 +5968,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 // the old in-memory writer to accept another byte while durable
                 // authorities disagree; retain the allocation lock so restore
                 // admission cannot register a competing writer.
-                segment_state.fail_closed_activation(authority);
+                self.fail_closed_segment_activation(authority);
                 return Err(WorkerError::SegmentActivationIncomplete { source });
             }
         }
@@ -6123,6 +6187,7 @@ where
             notification_coalesce_delay: DEFAULT_NOTIFICATION_COALESCE_DELAY,
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            failed_activation_authority: Mutex::new(None),
             scope_allocation: Some(scope_allocation),
             callback_socket: None,
             runtime_ticket_role: None,
@@ -6210,6 +6275,7 @@ where
             notification_coalesce_delay: DEFAULT_NOTIFICATION_COALESCE_DELAY,
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            failed_activation_authority: Mutex::new(None),
             scope_allocation: None,
             callback_socket: None,
             runtime_ticket_role: None,
@@ -6332,6 +6398,7 @@ where
             notification_coalesce_delay: DEFAULT_NOTIFICATION_COALESCE_DELAY,
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            failed_activation_authority: Mutex::new(None),
             scope_allocation: Some(scope_allocation),
             callback_socket: Some(callback_socket),
             runtime_ticket_role: None,
@@ -6711,6 +6778,7 @@ where
             notification_coalesce_delay: DEFAULT_NOTIFICATION_COALESCE_DELAY,
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            failed_activation_authority: Mutex::new(None),
             scope_allocation: Some(scope_allocation),
             callback_socket: None,
             runtime_ticket_role: None,
