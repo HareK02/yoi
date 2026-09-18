@@ -2,7 +2,10 @@
 //! Runtime receives only resolved dispositions and stable ids; policy authority
 //! never comes from prompts, profiles, or model input.
 
-use crate::{Error as StoreError, store::SqliteWorkspaceStore};
+use crate::{
+    Error as StoreError,
+    store::{SqliteWorkspaceStore, WorkerRemovalCommit, commit_worker_catalog_removal},
+};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -417,13 +420,19 @@ impl SqliteWorkspaceStore {
         operation_id: &str,
         fp: &str,
         result: &WorkerRetentionExecutionResult,
-    ) -> Result<WorkerRemovalPlan, WorkerRetentionError> {
+    ) -> Result<WorkerRemovalCommit, WorkerRetentionError> {
         self.with_conn_mut(|conn|{
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let mut plan=load_plan_op(&tx,operation_id)?.ok_or_else(||StoreError::InvalidInput("operation missing".into()))?;
             if plan.workspace_id!=workspace_id{return Err(StoreError::InvalidInput("cross-workspace".into()));}
             if plan.input_fingerprint!=fp||result.input_fingerprint!=fp||result.operation_id!=operation_id{return Err(StoreError::InvalidInput(format!("fingerprint:{operation_id}")));}
-            if plan.state==WorkerRemovalPlanState::Succeeded{tx.commit()?;return Ok(plan);}
+            if plan.state==WorkerRemovalPlanState::Succeeded{
+                // Repair projection fences left by the pre-atomic implementation and
+                // return a replayable change for a broadcast missed after commit.
+                let catalog=commit_worker_catalog_removal(&tx,workspace_id,&plan.worker)?;
+                tx.commit()?;
+                return Ok(WorkerRemovalCommit { plan, catalog });
+            }
             if plan.state != WorkerRemovalPlanState::Executing {
                 return Err(StoreError::InvalidInput(format!("stale:{}:plan state {} is not committable", plan.plan_id, state_s(plan.state))));
             }
@@ -460,12 +469,14 @@ impl SqliteWorkspaceStore {
             if plan.metadata_disposition==MetadataDisposition::Tombstone{
                 tx.execute("INSERT OR IGNORE INTO worker_tombstones(workspace_id,runtime_id,worker_id,display_name,profile,worker_created_at,removed_at,archive_id,policy_id,policy_revision,operation_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,worker.display_name,worker.profile,worker.created_at,now,plan.archive_id,plan.policy_id,plan.policy_revision,operation_id])?;
             }
+            tx.execute("UPDATE worker_workdir_links SET unlinked_at=?4 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND unlinked_at IS NULL",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,now])?;
             let deleted=tx.execute("DELETE FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND updated_at=?4",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,plan.worker_revision])?;
             tx.execute("UPDATE worker_create_reservations SET state='removed',updated_at=?4 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state='created'",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,now])?;
             if deleted!=1{return Err(StoreError::InvalidInput(format!("stale:{}:removal fence changed",plan.plan_id)));}
+            let catalog=commit_worker_catalog_removal(&tx,workspace_id,&plan.worker)?;
             tx.execute("UPDATE worker_removal_operations SET state='succeeded',failure_category=NULL,updated_at=?1 WHERE operation_id=?2",params![now,operation_id])?;
             tx.execute("INSERT OR IGNORE INTO worker_retention_audit_events(event_id,operation_id,workspace_id,event_kind,detail,created_at) VALUES(?1,?2,?3,'worker_removed',?4,?5)",params![stable("wre",operation_id),operation_id,workspace_id,format!("runtime_id={} worker_id={} session={} metadata={} diagnostics={}",plan.worker.runtime_id,plan.worker.worker_id,sess(plan.session_disposition),meta(plan.metadata_disposition),diag(plan.diagnostics_disposition)),now])?;
-            tx.commit()?;plan.state=WorkerRemovalPlanState::Succeeded;plan.updated_at=now;Ok(plan)
+            tx.commit()?;plan.state=WorkerRemovalPlanState::Succeeded;plan.updated_at=now;Ok(WorkerRemovalCommit { plan, catalog })
         }).map_err(map_error)
     }
 
@@ -948,7 +959,9 @@ fn parse_state(v: &str) -> rusqlite::Result<WorkerRemovalPlanState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{ControlPlaneStore, TicketCoderAssignmentRecord, WorkerRegistryRecord};
+    use crate::store::{
+        ControlPlaneStore, TicketCoderAssignmentRecord, WorkerCatalogChange, WorkerRegistryRecord,
+    };
     use worker_runtime::identity::WorkerId;
     fn worker_id() -> WorkerId {
         WorkerId::from_legacy_u64(1)
@@ -1203,6 +1216,7 @@ mod tests {
         assert_eq!(
             s.commit_worker_removal("w", &p.operation_id, &p.input_fingerprint, &result)
                 .unwrap()
+                .plan
                 .state,
             WorkerRemovalPlanState::Succeeded
         );
@@ -1219,6 +1233,7 @@ mod tests {
         assert_eq!(
             s.commit_worker_removal("w", &p.operation_id, &p.input_fingerprint, &result)
                 .unwrap()
+                .plan
                 .state,
             WorkerRemovalPlanState::Succeeded
         );
@@ -1351,6 +1366,98 @@ mod tests {
             .unwrap();
         assert!(s.worker_tombstone("w", &p.worker).unwrap().is_none());
     }
+    #[test]
+    fn terminal_catalog_failure_rolls_back_removal_projection_and_operation() {
+        let store = setup();
+        let purge = WorkerRetentionPolicyUpdate {
+            policy_id: "purge".into(),
+            session_disposition: SessionDisposition::Purge,
+            metadata_disposition: MetadataDisposition::Tombstone,
+            archive_retention: ArchiveRetention::Forever,
+            diagnostics_disposition: DiagnosticsDisposition::Purge,
+            diagnostics_retention_seconds: None,
+        };
+        store
+            .update_worker_retention_policy("w", 1, &purge)
+            .unwrap();
+        let plan = store.plan_worker_removal(&req(), &inv()).unwrap();
+        store
+            .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+            .unwrap();
+        let result = WorkerRetentionExecutionResult {
+            operation_id: plan.operation_id.clone(),
+            input_fingerprint: plan.input_fingerprint.clone(),
+            expected_worker_revision: plan.worker_revision.clone(),
+            worker_id: worker_id(),
+            session_disposition: SessionDisposition::Purge,
+            diagnostics_disposition: DiagnosticsDisposition::Purge,
+            archive: None,
+            source_removed: true,
+            diagnostics_retained: false,
+        };
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_worker_projection_removal
+                     BEFORE INSERT ON worker_registry_projection_removals
+                     BEGIN SELECT RAISE(ABORT, 'injected projection failure'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(
+            store
+                .commit_worker_removal("w", &plan.operation_id, &plan.input_fingerprint, &result,)
+                .is_err()
+        );
+        let (registry, removal, state, tombstone): (i64, i64, String, i64) = store
+            .with_conn(|conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM worker_registry WHERE workspace_id='w' AND runtime_id='r' AND worker_id=?1",
+                        [worker_id().to_string()],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM worker_registry_projection_removals WHERE workspace_id='w' AND runtime_id='r' AND worker_id=?1",
+                        [worker_id().to_string()],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT state FROM worker_removal_operations WHERE operation_id=?1",
+                        [&plan.operation_id],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM worker_tombstones WHERE workspace_id='w' AND runtime_id='r' AND worker_id=?1",
+                        [worker_id().to_string()],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(registry, 1, "catalog deletion must roll back");
+        assert_eq!(removal, 0, "removal fence must not partially commit");
+        assert_eq!(state, "executing", "operation must remain recoverable");
+        assert_eq!(tombstone, 0, "retention metadata must roll back");
+
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER fail_worker_projection_removal;")?;
+                Ok(())
+            })
+            .unwrap();
+        let committed = store
+            .commit_worker_removal("w", &plan.operation_id, &plan.input_fingerprint, &result)
+            .unwrap();
+        assert!(matches!(
+            committed.catalog.changes.as_slice(),
+            [WorkerCatalogChange::Removed(worker)] if worker == &plan.worker
+        ));
+        assert_eq!(committed.plan.state, WorkerRemovalPlanState::Succeeded);
+    }
+
     #[test]
     fn commit_requires_executing_state_and_exact_runtime_result() {
         let store = setup();
@@ -1592,6 +1699,26 @@ mod tests {
             &runtime_result,
         )
         .unwrap();
+        assert!(
+            s.get_worker_registry("w", &request.worker)
+                .unwrap()
+                .is_none()
+        );
+        s.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM worker_registry_projection_removals WHERE workspace_id='w' AND runtime_id='r' AND worker_id=?1",
+                [worker_id().to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let repaired = s
+            .recover_succeeded_worker_removal_catalog("w", &request.worker)
+            .unwrap();
+        assert!(matches!(
+            repaired.changes.as_slice(),
+            [WorkerCatalogChange::Removed(worker)] if worker == &request.worker
+        ));
         assert!(
             s.get_worker_registry("w", &request.worker)
                 .unwrap()

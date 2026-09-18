@@ -659,7 +659,7 @@ impl From<&WorkspaceApi> for ServerAuthApi {
 }
 
 #[derive(Clone)]
-struct WorkspaceWorkerRemoveExecutor {
+struct WorkerRemovalService {
     workspace_id: String,
     store: Arc<dyn ControlPlaneStore>,
     runtime: Weak<RuntimeRegistry>,
@@ -667,10 +667,10 @@ struct WorkspaceWorkerRemoveExecutor {
     workdir_session_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
     worker_remove_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
     worker_control_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
-    worker_projection: std::sync::Weak<crate::worker_projection::WorkerProjectionService>,
+    worker_projection: Arc<crate::worker_projection::WorkerProjectionService>,
 }
 
-impl WorkspaceWorkerRemoveExecutor {
+impl WorkerRemovalService {
     fn new(api: &WorkspaceApi) -> Self {
         Self {
             workspace_id: api.config.workspace_id.clone(),
@@ -680,8 +680,166 @@ impl WorkspaceWorkerRemoveExecutor {
             workdir_session_locks: api.workdir_session_locks.clone(),
             worker_remove_locks: api.worker_remove_locks.clone(),
             worker_control_locks: api.worker_control_locks.clone(),
-            worker_projection: Arc::downgrade(&api.worker_projection),
+            worker_projection: api.worker_projection.clone(),
         }
+    }
+
+    /// Terminal catalog deletion shared by cleanup and spawn compensation.
+    /// The Store atomically commits membership, reservation, link and projection
+    /// state; this service owns the only production-side publication step.
+    fn commit_catalog_removal(&self, target: &RuntimeWorkerRef) -> crate::Result<()> {
+        let commit = self
+            .store
+            .delete_worker_registry(&self.workspace_id, target)?;
+        self.worker_projection.publish_commit(commit)
+    }
+
+    async fn execute_cleanup_removal(&self, candidate: &CleanupWorkerCandidate) -> ApiResult<()> {
+        let target = RuntimeWorkerRef::new(
+            candidate.runtime_id.clone(),
+            candidate.runtime_worker_id.clone(),
+        );
+        let remove_lock = {
+            let mut locks = self
+                .worker_remove_locks
+                .lock()
+                .map_err(|_| Error::Store("Worker removal lock registry was poisoned".into()))?;
+            locks
+                .entry(target.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _remove_guard = remove_lock.lock().await;
+        let session_lock = {
+            let mut locks = self
+                .workdir_session_locks
+                .lock()
+                .map_err(|_| Error::Store("Workdir session lock registry was poisoned".into()))?;
+            locks
+                .entry(target.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _session_guard = session_lock.lock().await;
+        close_worker_workdir_sessions(&self.workdir_sessions, &target)
+            .await
+            .map_err(|message| Error::RuntimeOperationFailed {
+                runtime_id: target.runtime_id.clone(),
+                code: "workdir_session_close_failed".to_string(),
+                message,
+            })?;
+        let runtime = self.runtime.upgrade().ok_or_else(|| {
+            Error::Store("Workspace Runtime registry is unavailable during cleanup".to_string())
+        })?;
+        match runtime.stop_worker(
+            &target,
+            WorkerLifecycleRequest {
+                reason: Some("cleanup worker before deletion".to_string()),
+                ticket_assignment: None,
+            },
+        ) {
+            Ok(result) if result.state == WorkerOperationState::Accepted => {}
+            Ok(result) => {
+                return Err(ApiError::with_diagnostics(
+                    Error::RuntimeOperationFailed {
+                        runtime_id: target.runtime_id.clone(),
+                        code: "workspace_cleanup_worker_runtime_stop_rejected".to_string(),
+                        message: "Runtime did not stop selected Worker before deletion".to_string(),
+                    },
+                    result.diagnostics,
+                ));
+            }
+            Err(RuntimeRegistryError::UnknownWorker { .. }) => {}
+            Err(error) => return Err(error.into_error().into()),
+        }
+        match runtime.delete_worker(&target) {
+            Ok(result) if result.deleted && result.state == WorkerOperationState::Accepted => {}
+            Ok(result) => {
+                return Err(ApiError::with_diagnostics(
+                    Error::RuntimeOperationFailed {
+                        runtime_id: target.runtime_id.clone(),
+                        code: "workspace_cleanup_worker_runtime_delete_rejected".to_string(),
+                        message: "Runtime did not delete selected Worker after stopping it"
+                            .to_string(),
+                    },
+                    result.diagnostics,
+                ));
+            }
+            Err(RuntimeRegistryError::UnknownWorker { .. }) => {}
+            Err(error) => return Err(error.into_error().into()),
+        }
+        self.commit_catalog_removal(&target)?;
+        Ok(())
+    }
+
+    fn delete_spawn_compensation_runtime_worker(
+        &self,
+        worker_ref: &RuntimeWorkerRef,
+    ) -> (bool, Vec<RuntimeDiagnostic>) {
+        let mut diagnostics = Vec::new();
+        let Some(runtime) = self.runtime.upgrade() else {
+            diagnostics.push(spawn_compensation_diagnostic(
+                "worker_spawn_compensation_runtime_delete_failed",
+                "Workspace Runtime registry is unavailable during spawn compensation".to_string(),
+            ));
+            return (false, diagnostics);
+        };
+        let lifecycle_request = WorkerLifecycleRequest {
+            reason: Some("Backend spawn finalize failed; compensating Runtime Worker".to_string()),
+            ticket_assignment: None,
+        };
+        let cancellation = runtime.cancel_worker(worker_ref, lifecycle_request.clone());
+        let stop = runtime.stop_worker(worker_ref, lifecycle_request);
+        let stop_accepted = stop
+            .as_ref()
+            .is_ok_and(|result| result.state == WorkerOperationState::Accepted);
+        let termination_detail = (!stop_accepted).then(|| {
+            let cancellation = lifecycle_failure_detail("cancel", &cancellation);
+            let stop = lifecycle_failure_detail("stop", &stop);
+            format!("{cancellation}; {stop}")
+        });
+
+        let runtime_deleted = match runtime.delete_worker(worker_ref) {
+            Ok(result) if result.state == WorkerOperationState::Accepted && result.deleted => true,
+            Ok(result) => {
+                let mut message = format!(
+                    "Runtime did not delete Worker {}:{}: state={:?}, deleted={}",
+                    worker_ref.runtime_id, worker_ref.worker_id, result.state, result.deleted
+                );
+                if let Some(detail) = termination_detail.as_deref() {
+                    message.push_str(&format!("; cancellation: {detail}"));
+                }
+                if !result.diagnostics.is_empty() {
+                    message.push_str(&format!(
+                        "; delete diagnostics: {}",
+                        runtime_diagnostics_message(&result.diagnostics)
+                    ));
+                }
+                diagnostics.push(spawn_compensation_diagnostic(
+                    "worker_spawn_compensation_runtime_delete_failed",
+                    message,
+                ));
+                false
+            }
+            Err(RuntimeRegistryError::UnknownWorker { .. }) => true,
+            Err(error) => {
+                let mut message = format!(
+                    "Failed to delete Runtime Worker {}:{}: {}",
+                    worker_ref.runtime_id,
+                    worker_ref.worker_id,
+                    error.message()
+                );
+                if let Some(detail) = termination_detail.as_deref() {
+                    message.push_str(&format!("; cancellation: {detail}"));
+                }
+                diagnostics.push(spawn_compensation_diagnostic(
+                    "worker_spawn_compensation_runtime_delete_failed",
+                    message,
+                ));
+                false
+            }
+        };
+        (runtime_deleted, diagnostics)
     }
 
     async fn resume_worker_retention(
@@ -707,10 +865,10 @@ impl WorkspaceWorkerRemoveExecutor {
             &prepared.plan.input_fingerprint,
             &result,
         ) {
-            Ok(_) => {
-                if let Some(worker_projection) = self.worker_projection.upgrade() {
-                    let _ = worker_projection.publish_removed(target.clone());
-                }
+            Ok(commit) => {
+                self.worker_projection
+                    .publish_commit(commit.catalog)
+                    .map_err(|error| error.to_string())?;
                 Ok(worker_remove_success_response(target))
             }
             Err(error) => Ok(worker_retention_error_response(error)),
@@ -834,7 +992,14 @@ impl WorkspaceWorkerRemoveExecutor {
             .map_err(|_| "Worker removal recovery authority is unavailable".to_string())?;
         if let Some(prepared) = prepared {
             if prepared.plan.state == crate::retention::WorkerRemovalPlanState::Succeeded {
-                return Ok(worker_remove_success_response(&target));
+                let commit = self
+                    .store
+                    .recover_succeeded_worker_removal_catalog(&self.workspace_id, target)
+                    .map_err(|error| error.to_string())?;
+                self.worker_projection
+                    .publish_commit(commit)
+                    .map_err(|error| error.to_string())?;
+                return Ok(worker_remove_success_response(target));
             }
             let prepared = if matches!(
                 prepared.plan.state,
@@ -1023,10 +1188,10 @@ impl WorkspaceWorkerRemoveExecutor {
             &plan.input_fingerprint,
             &retention_result,
         ) {
-            Ok(_) => {
-                if let Some(worker_projection) = self.worker_projection.upgrade() {
-                    let _ = worker_projection.publish_removed(plan.worker.clone());
-                }
+            Ok(commit) => {
+                self.worker_projection
+                    .publish_commit(commit.catalog)
+                    .map_err(|error| error.to_string())?;
             }
             Err(error) => {
                 let _ = self.store.fail_worker_removal(
@@ -1042,7 +1207,7 @@ impl WorkspaceWorkerRemoveExecutor {
     }
 }
 
-impl crate::worker_source::VerifiedWorkerRemoveExecutor for WorkspaceWorkerRemoveExecutor {
+impl crate::worker_source::VerifiedWorkerRemoveExecutor for WorkerRemovalService {
     fn execute(
         &self,
         source: crate::worker_source::VerifiedWorkerMutationSource,
@@ -1252,7 +1417,7 @@ impl WorkspaceServerApi {
         {
             let worker_key = worker.display_name.clone();
             let target = worker.worker;
-            let response = WorkspaceWorkerRemoveExecutor::new(&api)
+            let response = WorkerRemovalService::new(&api)
                 .execute_target_removal(
                     api.runtime.as_ref(),
                     &target,
@@ -2473,7 +2638,7 @@ impl WorkspaceApi {
         };
         if let Some(dispatcher) = worker_remove_dispatcher {
             dispatcher
-                .install_executor(Arc::new(WorkspaceWorkerRemoveExecutor::new(&api)))
+                .install_executor(Arc::new(WorkerRemovalService::new(&api)))
                 .map_err(|message| Error::Config(message.to_string()))?;
         }
         recover_workdir_removals(&api)?;
@@ -8530,7 +8695,7 @@ async fn scoped_attach_current_worker_workdir(
         return Err(error.into());
     }
     api.worker_projection
-        .publish_catalog_change(&worker)
+        .refresh(&worker)
         .map_err(ApiError::from)?;
     Ok(Json(CurrentWorkerWorkdirAttachmentResponse {
         workspace_id: api.config.workspace_id.clone(),
@@ -8557,7 +8722,7 @@ async fn scoped_detach_current_worker_workdir(
         &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
     )?;
     api.worker_projection
-        .publish_catalog_change(&worker)
+        .refresh(&worker)
         .map_err(ApiError::from)?;
     Ok(Json(CurrentWorkerWorkdirAttachmentResponse {
         workspace_id: api.config.workspace_id.clone(),
@@ -10008,7 +10173,7 @@ async fn scoped_worker_remove_source_boundary(
     .await
     {
         Ok(source) => {
-            let executor = WorkspaceWorkerRemoveExecutor::new(&api);
+            let executor = WorkerRemovalService::new(&api);
             match executor
                 .execute_async(
                     source,
@@ -11903,19 +12068,22 @@ async fn set_worker_retention(
         }
     }
     let retention_state = if pinned { "pinned" } else { "normal" };
-    let changed = api.store.update_worker_retention(
+    let commit = api.store.update_worker_retention(
         &api.config.workspace_id,
         &worker_ref,
         retention_state,
         now_registry_timestamp().as_str(),
     )?;
-    if !changed {
+    if commit.changes.is_empty() {
         return Err(cleanup_api_error(
             runtime_id.as_str(),
             "workspace_worker_retention_unknown_worker",
             "Worker is not known to the Backend registry",
         ));
     }
+    api.worker_projection
+        .publish_commit(commit)
+        .map_err(ApiError::from)?;
     Ok(Json(WorkerRetentionResponse {
         workspace_id: api.config.workspace_id,
         worker_ref,
@@ -12196,13 +12364,9 @@ async fn execute_runtime_cleanup(
             ));
         }
         parse_runtime_worker_id_for_registry(&candidate.runtime_worker_id)?;
-        let session_lock = current_worker_session_lock(api, &worker);
-        let _session_guard = session_lock.lock().await;
-        close_current_worker_session_locked(api, &worker).await?;
-        cleanup_runtime_worker_for_execution(api, runtime_id, candidate)?;
-        api.store
-            .delete_worker_registry(&api.config.workspace_id, &worker)?;
-        drop(_session_guard);
+        WorkerRemovalService::new(api)
+            .execute_cleanup_removal(candidate)
+            .await?;
         api.workdir_session_locks
             .lock()
             .expect("Workdir session lock registry poisoned")
@@ -12295,49 +12459,6 @@ async fn execute_runtime_cleanup(
         diagnostics: plan_after.diagnostics.clone(),
         plan_after,
     })
-}
-
-fn cleanup_runtime_worker_for_execution(
-    api: &WorkspaceApi,
-    runtime_id: &str,
-    candidate: &CleanupWorkerCandidate,
-) -> ApiResult<()> {
-    let worker = RuntimeWorkerRef::new(runtime_id, &candidate.runtime_worker_id);
-    match api.runtime.stop_worker(
-        &worker,
-        WorkerLifecycleRequest {
-            reason: Some("cleanup worker before deletion".to_string()),
-            ticket_assignment: None,
-        },
-    ) {
-        Ok(result) if result.state == WorkerOperationState::Accepted => {}
-        Ok(result) => {
-            return Err(ApiError::with_diagnostics(
-                Error::RuntimeOperationFailed {
-                    runtime_id: runtime_id.to_string(),
-                    code: "workspace_cleanup_worker_runtime_stop_rejected".to_string(),
-                    message: "Runtime did not stop selected Worker before deletion".to_string(),
-                },
-                result.diagnostics,
-            ));
-        }
-        Err(RuntimeRegistryError::UnknownWorker { .. }) => return Ok(()),
-        Err(error) => return Err(error.into_error().into()),
-    }
-
-    match api.runtime.delete_worker(&worker) {
-        Ok(result) if result.deleted && result.state == WorkerOperationState::Accepted => Ok(()),
-        Ok(result) => Err(ApiError::with_diagnostics(
-            Error::RuntimeOperationFailed {
-                runtime_id: runtime_id.to_string(),
-                code: "workspace_cleanup_worker_runtime_delete_rejected".to_string(),
-                message: "Runtime did not delete selected Worker after stopping it".to_string(),
-            },
-            result.diagnostics,
-        )),
-        Err(RuntimeRegistryError::UnknownWorker { .. }) => Ok(()),
-        Err(error) => Err(error.into_error().into()),
-    }
 }
 
 fn cleanup_api_error(runtime_id: &str, code: &str, message: &str) -> ApiError {
@@ -15690,7 +15811,7 @@ fn compensate_failed_workspace_worker_create(
     let mut reserved_worker_absent = false;
     if let Some(worker) = worker {
         let (returned_worker_absent, delete_diagnostics) =
-            delete_runtime_worker_for_spawn_compensation(api, &worker.worker);
+            WorkerRemovalService::new(api).delete_spawn_compensation_runtime_worker(&worker.worker);
         diagnostics.extend(delete_diagnostics);
         if returned_worker_absent {
             diagnostics.extend(finalize_spawn_compensation_after_worker_delete(
@@ -15702,8 +15823,8 @@ fn compensate_failed_workspace_worker_create(
         }
     }
     if !reserved_worker_absent {
-        let (worker_absent, delete_diagnostics) =
-            delete_runtime_worker_for_spawn_compensation(api, &reserved_worker_ref);
+        let (worker_absent, delete_diagnostics) = WorkerRemovalService::new(api)
+            .delete_spawn_compensation_runtime_worker(&reserved_worker_ref);
         reserved_worker_absent = worker_absent;
         diagnostics.extend(delete_diagnostics);
     }
@@ -15762,7 +15883,7 @@ fn compensate_failed_worker_spawn(
     context: &WorkerSpawnCompensationContext<'_>,
 ) -> Vec<RuntimeDiagnostic> {
     let (runtime_deleted, mut diagnostics) =
-        delete_runtime_worker_for_spawn_compensation(api, &worker.worker);
+        WorkerRemovalService::new(api).delete_spawn_compensation_runtime_worker(&worker.worker);
     if !runtime_deleted {
         return diagnostics;
     }
@@ -15770,71 +15891,6 @@ fn compensate_failed_worker_spawn(
         api, worker, context,
     ));
     diagnostics
-}
-
-fn delete_runtime_worker_for_spawn_compensation(
-    api: &WorkspaceApi,
-    worker_ref: &RuntimeWorkerRef,
-) -> (bool, Vec<RuntimeDiagnostic>) {
-    let mut diagnostics = Vec::new();
-    let lifecycle_request = WorkerLifecycleRequest {
-        reason: Some("Backend spawn finalize failed; compensating Runtime Worker".to_string()),
-        ticket_assignment: None,
-    };
-    let cancellation = api
-        .runtime
-        .cancel_worker(worker_ref, lifecycle_request.clone());
-    let stop = api.runtime.stop_worker(worker_ref, lifecycle_request);
-    let stop_accepted = stop
-        .as_ref()
-        .is_ok_and(|result| result.state == WorkerOperationState::Accepted);
-    let termination_detail = (!stop_accepted).then(|| {
-        let cancellation = lifecycle_failure_detail("cancel", &cancellation);
-        let stop = lifecycle_failure_detail("stop", &stop);
-        format!("{cancellation}; {stop}")
-    });
-
-    let runtime_deleted = match api.runtime.delete_worker(worker_ref) {
-        Ok(result) if result.state == WorkerOperationState::Accepted && result.deleted => true,
-        Ok(result) => {
-            let mut message = format!(
-                "Runtime did not delete Worker {}:{}: state={:?}, deleted={}",
-                worker_ref.runtime_id, worker_ref.worker_id, result.state, result.deleted
-            );
-            if let Some(detail) = termination_detail.as_deref() {
-                message.push_str(&format!("; cancellation: {detail}"));
-            }
-            if !result.diagnostics.is_empty() {
-                message.push_str(&format!(
-                    "; delete diagnostics: {}",
-                    runtime_diagnostics_message(&result.diagnostics)
-                ));
-            }
-            diagnostics.push(spawn_compensation_diagnostic(
-                "worker_spawn_compensation_runtime_delete_failed",
-                message,
-            ));
-            false
-        }
-        Err(RuntimeRegistryError::UnknownWorker { .. }) => true,
-        Err(error) => {
-            let mut message = format!(
-                "Failed to delete Runtime Worker {}:{}: {}",
-                worker_ref.runtime_id,
-                worker_ref.worker_id,
-                error.message()
-            );
-            if let Some(detail) = termination_detail.as_deref() {
-                message.push_str(&format!("; cancellation: {detail}"));
-            }
-            diagnostics.push(spawn_compensation_diagnostic(
-                "worker_spawn_compensation_runtime_delete_failed",
-                message,
-            ));
-            false
-        }
-    };
-    (runtime_deleted, diagnostics)
 }
 
 fn finalize_spawn_compensation_after_worker_delete(
@@ -15860,10 +15916,7 @@ fn finalize_spawn_compensation_after_worker_delete(
             ));
         }
     }
-    if let Err(error) = api
-        .store
-        .delete_worker_registry(&api.config.workspace_id, &worker.worker)
-    {
+    if let Err(error) = WorkerRemovalService::new(api).commit_catalog_removal(&worker.worker) {
         diagnostics.push(spawn_compensation_diagnostic(
             "worker_spawn_compensation_registry_delete_failed",
             format!(
@@ -17554,7 +17607,10 @@ fn record_worker_summary(
         created_at: timestamp.clone(),
         updated_at: timestamp,
     };
-    api.store.upsert_worker_registry(&record)?;
+    let catalog_commit = api.store.upsert_worker_registry(&record)?;
+    api.worker_projection
+        .publish_commit(catalog_commit)
+        .map_err(ApiError::from)?;
     if let Ok(worker_id) =
         protocol::subscription::SubscriptionWorkerId::new(worker.worker.worker_id.clone())
     {
@@ -17589,10 +17645,6 @@ fn record_worker_summary(
                     .as_deref()
                     .unwrap_or(record.updated_at.as_str()),
             )
-            .map_err(ApiError::from)?;
-    } else {
-        api.worker_projection
-            .publish_catalog_change(&worker_ref)
             .map_err(ApiError::from)?;
     }
     Ok(api
@@ -18133,7 +18185,7 @@ fn link_worker_to_workdir(
         api.store.attach_worker_workdir(&record)?;
     }
     api.worker_projection
-        .publish_catalog_change(&worker_record.worker)
+        .refresh(&worker_record.worker)
         .map_err(ApiError::from)?;
     Ok(())
 }
@@ -26994,7 +27046,7 @@ mod tests {
             permission: worker_runtime::auth::WORKER_REMOVE_PERMISSION.to_string(),
             jti: "caller-guard-proof".to_string(),
         };
-        let executor = WorkspaceWorkerRemoveExecutor::new(&api);
+        let executor = WorkerRemovalService::new(&api);
         let self_response = executor
             .execute_async(
                 verified_source(),
@@ -27125,8 +27177,9 @@ mod tests {
         let summary = api.runtime.worker(&target).unwrap();
         sync_worker_observation(&api, &summary).unwrap();
         seed_worker_control_grant(&api, &source, &target, "embedded-valid-proof");
+        let mut subscriber = api.worker_projection.subscribe();
 
-        let response = WorkspaceWorkerRemoveExecutor::new(&api)
+        let response = WorkerRemovalService::new(&api)
             .execute_async(
                 crate::worker_source::VerifiedWorkerMutationSource {
                     runtime_id: source.runtime_id,
@@ -27157,6 +27210,84 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let removal = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let event = subscriber.recv().await.expect("projection event");
+                if event.changes.iter().any(|change| {
+                    matches!(change, crate::store::WorkerCatalogChange::Removed(worker) if worker == &target)
+                }) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("WorkerRemove catalog removal broadcast");
+        assert!(removal.revision > 0);
+    }
+
+    #[tokio::test]
+    async fn published_spawn_compensation_uses_catalog_removal_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        let spawned = api
+            .spawn_workspace_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                WorkerSpawnRequest {
+                    intent: WorkerSpawnIntent::WorkspaceCompanion,
+                    requested_worker_name: Some("compensation-target".to_string()),
+                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                        expected_segments: 0,
+                    },
+                    profile: worker_runtime::catalog::ProfileSelector::Builtin(
+                        "builtin:companion".to_string(),
+                    ),
+                    ticket_assignment: None,
+                    initial_submit: Vec::new(),
+                    working_directory_request: None,
+                    resolved_working_directory_request: None,
+                    resolved_working_directory: None,
+                    resolved_config_bundle: Some(runtime_test_bundle()),
+                    resolved_worker_observation_enabled: false,
+                    resolved_worker_observation_grants: Vec::new(),
+                    resolved_workspace_api: None,
+                    resolved_memory_settings: None,
+                    resolved_control_operation: None,
+                },
+            )
+            .unwrap();
+        let worker = spawned.worker.unwrap().worker;
+        let summary = api.runtime.worker(&worker).unwrap();
+        sync_worker_observation(&api, &summary).unwrap();
+        let mut subscriber = api.worker_projection.subscribe();
+        let diagnostics = compensate_failed_worker_spawn(
+            &api,
+            &summary,
+            &WorkerSpawnCompensationContext {
+                assignment: None,
+                prepared_workdir_id: None,
+                cleanup_spawned_workdir: false,
+            },
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(
+            api.store
+                .get_worker_registry(TEST_WORKSPACE_ID, &worker)
+                .unwrap()
+                .is_none()
+        );
+        let removal = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let event = subscriber.recv().await.expect("projection event");
+                if event.changes.iter().any(|change| {
+                    matches!(change, crate::store::WorkerCatalogChange::Removed(removed) if removed == &worker)
+                }) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("spawn compensation catalog removal broadcast");
+        assert!(removal.revision > 0);
     }
 
     #[tokio::test]
@@ -28532,6 +28663,121 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_http_entry_publishes_atomic_catalog_removal_without_runtime_event() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let spawned = api
+            .spawn_workspace_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                WorkerSpawnRequest {
+                    intent: WorkerSpawnIntent::WorkspaceCompanion,
+                    requested_worker_name: Some("cleanup-projection-target".to_string()),
+                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                        expected_segments: 0,
+                    },
+                    profile: worker_runtime::catalog::ProfileSelector::Builtin(
+                        "builtin:companion".to_string(),
+                    ),
+                    ticket_assignment: None,
+                    initial_submit: Vec::new(),
+                    working_directory_request: None,
+                    resolved_working_directory_request: None,
+                    resolved_working_directory: None,
+                    resolved_config_bundle: Some(runtime_test_bundle()),
+                    resolved_worker_observation_enabled: false,
+                    resolved_worker_observation_grants: Vec::new(),
+                    resolved_workspace_api: None,
+                    resolved_memory_settings: None,
+                    resolved_control_operation: None,
+                },
+            )
+            .unwrap();
+        let worker = spawned.worker.unwrap().worker;
+        let stopped = api
+            .runtime
+            .stop_worker(
+                &worker,
+                WorkerLifecycleRequest {
+                    reason: Some("prepare cleanup projection regression".to_string()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped.state, WorkerOperationState::Accepted);
+        let summary = api.runtime.worker(&worker).unwrap();
+        sync_worker_observation(&api, &summary).unwrap();
+        let worker_id = worker.worker_id.clone();
+        let mut subscriber = api.worker_projection.subscribe();
+        let plan = build_runtime_cleanup_plan(&api, EMBEDDED_WORKER_RUNTIME_ID)
+            .unwrap_or_else(|error| panic!("cleanup plan: {}", error.error));
+        let candidate = plan
+            .workers
+            .iter()
+            .find(|candidate| candidate.worker_id == worker_id)
+            .unwrap();
+        let request = ExecuteRuntimeCleanupRequest {
+            expected_plan_revision: plan.revision,
+            expected_plan_digest: plan.digest,
+            worker_target_ids: vec![candidate.target_id.clone()],
+            workdir_target_ids: Vec::new(),
+            confirm_dirty_discard_target_ids: Vec::new(),
+        };
+
+        let Json(response) = scoped_execute_runtime_cleanup(
+            State(api.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+            }),
+            Json(request),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.results[0].status, "deleted");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), subscriber.recv())
+            .await
+            .expect("catalog removal broadcast")
+            .expect("projection event");
+        assert!(matches!(
+            event.changes.as_slice(),
+            [crate::store::WorkerCatalogChange::Removed(removed)] if removed == &worker
+        ));
+        assert!(
+            api.store
+                .get_worker_registry(&api.config.workspace_id, &worker)
+                .unwrap()
+                .is_none()
+        );
+        let (snapshot_revision, snapshot) = api
+            .store
+            .worker_registry_projection_snapshot(&api.config.workspace_id, 100)
+            .unwrap();
+        assert_eq!(snapshot_revision, event.revision);
+        assert!(
+            snapshot
+                .iter()
+                .all(|record| record.registry.worker != worker)
+        );
+
+        // A retry replays the durable fence at the same revision, healing an
+        // in-process broadcast omitted after the first DB commit.
+        WorkerRemovalService::new(&api)
+            .commit_catalog_removal(&worker)
+            .unwrap();
+        let replay = tokio::time::timeout(std::time::Duration::from_secs(1), subscriber.recv())
+            .await
+            .expect("catalog removal replay")
+            .expect("projection replay");
+        assert_eq!(replay.revision, event.revision);
+        assert!(matches!(
+            replay.changes.as_slice(),
+            [crate::store::WorkerCatalogChange::Removed(removed)] if removed == &worker
+        ));
     }
 
     #[tokio::test]
@@ -32102,7 +32348,7 @@ mod tests {
             .unwrap();
         projection_api
             .worker_projection
-            .publish_catalog_change(&RuntimeWorkerRef::new(
+            .refresh(&RuntimeWorkerRef::new(
                 EMBEDDED_WORKER_RUNTIME_ID,
                 &worker_id,
             ))

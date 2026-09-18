@@ -564,9 +564,26 @@ pub struct WorkerRegistryProjectionRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerCatalogChange {
+    Upsert(WorkerRegistryProjectionRecord),
+    Removed(RuntimeWorkerRef),
+}
+
+/// A catalog mutation and the exact projection payload committed at its revision.
+///
+/// Callers may broadcast this value, but must never re-read catalog rows to infer
+/// what happened: a later catalog mutation could otherwise be paired with an
+/// older revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerRegistryProjectionCommit {
     pub revision: u64,
-    pub changed_workers: Vec<RuntimeWorkerRef>,
+    pub changes: Vec<WorkerCatalogChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerRemovalCommit {
+    pub plan: crate::retention::WorkerRemovalPlan,
+    pub catalog: WorkerRegistryProjectionCommit,
 }
 
 /// Durable authority describing which Runtime Worker another Runtime Worker may
@@ -1130,16 +1147,23 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
             "Worker retention authority is unavailable".to_string(),
         ))
     }
+    fn recover_succeeded_worker_removal_catalog(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<WorkerRegistryProjectionCommit> {
+        let _ = (workspace_id, worker);
+        Err(Error::Store(
+            "Worker removal catalog recovery authority is unavailable".to_string(),
+        ))
+    }
     fn commit_worker_removal(
         &self,
         workspace_id: &str,
         operation_id: &str,
         input_fingerprint: &str,
         result: &worker_runtime::retention::WorkerRetentionExecutionResult,
-    ) -> std::result::Result<
-        crate::retention::WorkerRemovalPlan,
-        crate::retention::WorkerRetentionError,
-    > {
+    ) -> std::result::Result<WorkerRemovalCommit, crate::retention::WorkerRetentionError> {
         let _ = (workspace_id, operation_id, input_fingerprint, result);
         Err(crate::retention::WorkerRetentionError::Invalid(
             "Worker retention authority is unavailable".to_string(),
@@ -1317,7 +1341,10 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         consumed_at: &str,
     ) -> Result<Option<DeviceLoginFlowRecord>>;
 
-    fn upsert_worker_registry(&self, record: &WorkerRegistryRecord) -> Result<()>;
+    fn upsert_worker_registry(
+        &self,
+        record: &WorkerRegistryRecord,
+    ) -> Result<WorkerRegistryProjectionCommit>;
     fn get_worker_registry(
         &self,
         workspace_id: &str,
@@ -1369,12 +1396,7 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         subject_revision: Option<u64>,
         observed_at: &str,
     ) -> Result<WorkerRegistryProjectionCommit>;
-    fn publish_worker_registry_catalog_change(
-        &self,
-        workspace_id: &str,
-        worker: &RuntimeWorkerRef,
-    ) -> Result<WorkerRegistryProjectionCommit>;
-    fn publish_worker_registry_removal(
+    fn commit_worker_registry_projection_refresh(
         &self,
         workspace_id: &str,
         worker: &RuntimeWorkerRef,
@@ -1385,9 +1407,12 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         worker: &RuntimeWorkerRef,
         retention_state: &str,
         updated_at: &str,
-    ) -> Result<bool>;
-    fn delete_worker_registry(&self, workspace_id: &str, worker: &RuntimeWorkerRef)
-    -> Result<bool>;
+    ) -> Result<WorkerRegistryProjectionCommit>;
+    fn delete_worker_registry(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<WorkerRegistryProjectionCommit>;
 
     fn create_worker_control_grant(
         &self,
@@ -4330,16 +4355,36 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         )
     }
 
+    fn recover_succeeded_worker_removal_catalog(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<WorkerRegistryProjectionCommit> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let succeeded: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM worker_removal_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state='succeeded')",
+                params![workspace_id, worker.runtime_id, worker.worker_id],
+                |row| row.get(0),
+            )?;
+            if !succeeded {
+                return Err(Error::InvalidInput(
+                    "Worker removal operation has not succeeded".to_string(),
+                ));
+            }
+            let commit = commit_worker_catalog_removal(&tx, workspace_id, worker)?;
+            tx.commit()?;
+            Ok(commit)
+        })
+    }
+
     fn commit_worker_removal(
         &self,
         workspace_id: &str,
         operation_id: &str,
         input_fingerprint: &str,
         result: &worker_runtime::retention::WorkerRetentionExecutionResult,
-    ) -> std::result::Result<
-        crate::retention::WorkerRemovalPlan,
-        crate::retention::WorkerRetentionError,
-    > {
+    ) -> std::result::Result<WorkerRemovalCommit, crate::retention::WorkerRetentionError> {
         SqliteWorkspaceStore::commit_worker_removal(
             self,
             workspace_id,
@@ -5527,7 +5572,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
-    fn upsert_worker_registry(&self, record: &WorkerRegistryRecord) -> Result<()> {
+    fn upsert_worker_registry(
+        &self,
+        record: &WorkerRegistryRecord,
+    ) -> Result<WorkerRegistryProjectionCommit> {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
             let removal_blocks_upsert: bool = tx.query_row(
@@ -5545,9 +5593,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 |row| row.get(0),
             )?;
             if removal_blocks_upsert {
-                return Ok(());
+                return Ok(WorkerRegistryProjectionCommit {
+                    revision: current_worker_projection_revision(&tx, &record.workspace_id)?,
+                    changes: Vec::new(),
+                });
             }
-            tx.execute(
+            let changed = tx.execute(
                 r#"INSERT INTO worker_registry (
                     workspace_id, runtime_id, worker_id, display_name, profile,
                     retention_state, transcript_ref, session_ref, summary_ref,
@@ -5600,8 +5651,20 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 "DELETE FROM worker_registry_projection_removals WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
                 params![record.workspace_id, record.worker.runtime_id, record.worker.worker_id],
             )?;
+            let changed_workers = if changed == 0 {
+                Vec::new()
+            } else {
+                vec![record.worker.clone()]
+            };
+            let revision =
+                commit_worker_projection_changes(&tx, &record.workspace_id, &changed_workers)?;
+            let changes = worker_catalog_upsert_changes(
+                &tx,
+                &record.workspace_id,
+                changed_workers.as_slice(),
+            )?;
             tx.commit()?;
-            Ok(())
+            Ok(WorkerRegistryProjectionCommit { revision, changes })
         })
     }
 
@@ -5715,7 +5778,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 tx.commit()?;
                 return Ok(WorkerRegistryProjectionCommit {
                     revision,
-                    changed_workers: Vec::new(),
+                    changes: Vec::new(),
                 });
             }
             upsert_worker_projection_cursor(
@@ -5775,11 +5838,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 }
             }
             let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
+            let changes =
+                worker_catalog_upsert_changes(&tx, workspace_id, changed_workers.as_slice())?;
             tx.commit()?;
-            Ok(WorkerRegistryProjectionCommit {
-                revision,
-                changed_workers,
-            })
+            Ok(WorkerRegistryProjectionCommit { revision, changes })
         })
     }
 
@@ -5810,7 +5872,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 tx.commit()?;
                 return Ok(WorkerRegistryProjectionCommit {
                     revision,
-                    changed_workers: Vec::new(),
+                    changes: Vec::new(),
                 });
             }
             let changed = upsert_worker_observation(
@@ -5825,11 +5887,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             let changed_workers = if changed { vec![identity] } else { Vec::new() };
             let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
+            let changes =
+                worker_catalog_upsert_changes(&tx, workspace_id, changed_workers.as_slice())?;
             tx.commit()?;
-            Ok(WorkerRegistryProjectionCommit {
-                revision,
-                changed_workers,
-            })
+            Ok(WorkerRegistryProjectionCommit { revision, changes })
         })
     }
 
@@ -5878,15 +5939,14 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 }
             }
             let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
+            let changes =
+                worker_catalog_upsert_changes(&tx, workspace_id, changed_workers.as_slice())?;
             tx.commit()?;
-            Ok(WorkerRegistryProjectionCommit {
-                revision,
-                changed_workers,
-            })
+            Ok(WorkerRegistryProjectionCommit { revision, changes })
         })
     }
 
-    fn publish_worker_registry_catalog_change(
+    fn commit_worker_registry_projection_refresh(
         &self,
         workspace_id: &str,
         worker: &RuntimeWorkerRef,
@@ -5899,46 +5959,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 Vec::new()
             };
             let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
+            let changes =
+                worker_catalog_upsert_changes(&tx, workspace_id, changed_workers.as_slice())?;
             tx.commit()?;
-            Ok(WorkerRegistryProjectionCommit {
-                revision,
-                changed_workers,
-            })
-        })
-    }
-
-    fn publish_worker_registry_removal(
-        &self,
-        workspace_id: &str,
-        worker: &RuntimeWorkerRef,
-    ) -> Result<WorkerRegistryProjectionCommit> {
-        self.with_conn_mut(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let published_revision = tx
-                .query_row(
-                    "SELECT projection_revision FROM worker_registry_projection_removals WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
-                    params![workspace_id, worker.runtime_id, worker.worker_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()?;
-            if let Some(revision) = published_revision {
-                tx.commit()?;
-                return Ok(WorkerRegistryProjectionCommit {
-                    revision: revision.max(0) as u64,
-                    changed_workers: Vec::new(),
-                });
-            }
-            let changed_workers = vec![worker.clone()];
-            let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
-            tx.execute(
-                "INSERT INTO worker_registry_projection_removals (workspace_id, runtime_id, worker_id, projection_revision) VALUES (?1, ?2, ?3, ?4)",
-                params![workspace_id, worker.runtime_id, worker.worker_id, revision as i64],
-            )?;
-            tx.commit()?;
-            Ok(WorkerRegistryProjectionCommit {
-                revision,
-                changed_workers,
-            })
+            Ok(WorkerRegistryProjectionCommit { revision, changes })
         })
     }
 
@@ -5948,9 +5972,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         worker: &RuntimeWorkerRef,
         retention_state: &str,
         updated_at: &str,
-    ) -> Result<bool> {
-        self.with_conn(|conn| {
-            let changed = conn.execute(
+    ) -> Result<WorkerRegistryProjectionCommit> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
                 r#"UPDATE worker_registry
                    SET retention_state = ?4, updated_at = ?5
                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
@@ -5968,7 +5993,16 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     updated_at
                 ],
             )?;
-            Ok(changed > 0)
+            let changed_workers = if changed == 0 {
+                Vec::new()
+            } else {
+                vec![worker.clone()]
+            };
+            let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
+            let changes =
+                worker_catalog_upsert_changes(&tx, workspace_id, changed_workers.as_slice())?;
+            tx.commit()?;
+            Ok(WorkerRegistryProjectionCommit { revision, changes })
         })
     }
 
@@ -5976,9 +6010,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         &self,
         workspace_id: &str,
         worker: &RuntimeWorkerRef,
-    ) -> Result<bool> {
-        self.with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
+    ) -> Result<WorkerRegistryProjectionCommit> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
                 r#"UPDATE worker_workdir_links
                    SET unlinked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -5989,7 +6023,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 "DELETE FROM worker_registry WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
                 params![workspace_id, worker.runtime_id, worker.worker_id],
             )?;
-            if changed != 0 {
+            let commit = if changed != 0 {
                 tx.execute(
                     "UPDATE worker_create_reservations
                      SET state = 'removed', updated_at = ?4
@@ -6002,9 +6036,27 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         chrono::Utc::now().to_rfc3339(),
                     ],
                 )?;
-            }
+                commit_worker_catalog_removal(&tx, workspace_id, worker)?
+            } else if let Some(revision) = tx
+                .query_row(
+                    "SELECT projection_revision FROM worker_registry_projection_removals WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
+                    params![workspace_id, worker.runtime_id, worker.worker_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+            {
+                WorkerRegistryProjectionCommit {
+                    revision: revision.max(0) as u64,
+                    changes: vec![WorkerCatalogChange::Removed(worker.clone())],
+                }
+            } else {
+                WorkerRegistryProjectionCommit {
+                    revision: current_worker_projection_revision(&tx, workspace_id)?,
+                    changes: Vec::new(),
+                }
+            };
             tx.commit()?;
-            Ok(changed > 0)
+            Ok(commit)
         })
     }
 
@@ -8818,6 +8870,60 @@ fn set_worker_observation_unavailable(
         params![workspace_id, worker.runtime_id, worker.worker_id, worker_json, connection_generation as i64, revision as i64, snapshot_revision as i64, observed_at],
     )?;
     Ok(true)
+}
+
+fn worker_catalog_upsert_changes(
+    conn: &Connection,
+    workspace_id: &str,
+    changed_workers: &[RuntimeWorkerRef],
+) -> Result<Vec<WorkerCatalogChange>> {
+    changed_workers
+        .iter()
+        .map(|worker| {
+            read_worker_registry_projection(conn, workspace_id, worker)?.map_or_else(
+                || {
+                    Err(Error::Store(format!(
+                        "committed Worker catalog row disappeared before projection payload was captured: {}:{}",
+                        worker.runtime_id, worker.worker_id
+                    )))
+                },
+                |record| Ok(WorkerCatalogChange::Upsert(record)),
+            )
+        })
+        .collect()
+}
+
+/// Commits the durable removal fence in the same transaction as catalog deletion.
+/// Existing fences are returned as replayable changes so a retry can heal a
+/// process-local broadcast missed after the original DB commit.
+pub(crate) fn commit_worker_catalog_removal(
+    conn: &Connection,
+    workspace_id: &str,
+    worker: &RuntimeWorkerRef,
+) -> Result<WorkerRegistryProjectionCommit> {
+    if let Some(revision) = conn
+        .query_row(
+            "SELECT projection_revision FROM worker_registry_projection_removals WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
+            params![workspace_id, worker.runtime_id, worker.worker_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    {
+        return Ok(WorkerRegistryProjectionCommit {
+            revision: revision.max(0) as u64,
+            changes: vec![WorkerCatalogChange::Removed(worker.clone())],
+        });
+    }
+    let revision =
+        commit_worker_projection_changes(conn, workspace_id, std::slice::from_ref(worker))?;
+    conn.execute(
+        "INSERT INTO worker_registry_projection_removals (workspace_id, runtime_id, worker_id, projection_revision) VALUES (?1, ?2, ?3, ?4)",
+        params![workspace_id, worker.runtime_id, worker.worker_id, revision as i64],
+    )?;
+    Ok(WorkerRegistryProjectionCommit {
+        revision,
+        changes: vec![WorkerCatalogChange::Removed(worker.clone())],
+    })
 }
 
 fn commit_worker_projection_changes(
@@ -13499,9 +13605,11 @@ mod tests {
                 .is_err()
         );
         assert!(
-            store
+            !store
                 .delete_worker_registry("workspace-a", &reserved_worker)
                 .unwrap()
+                .changes
+                .is_empty()
         );
         let removed_state: String = store
             .with_conn(|conn| {
@@ -14202,9 +14310,11 @@ INSERT INTO worker_registry (
                 .is_none()
         );
         assert!(
-            store
+            !store
                 .delete_worker_registry("workspace-role", &worker.worker)
                 .unwrap()
+                .changes
+                .is_empty()
         );
         let removed_worker_assignment = TicketRoleAssignmentRecord {
             assignment_id: "contributor-removed-worker".to_string(),
@@ -14937,7 +15047,10 @@ INSERT INTO worker_registry (
                 "2",
             )
             .unwrap();
-        assert_eq!(first.changed_workers, vec![catalog.worker.clone()]);
+        assert!(matches!(
+            first.changes.as_slice(),
+            [WorkerCatalogChange::Upsert(record)] if record.registry.worker == catalog.worker
+        ));
         let (_, records) = store
             .worker_registry_projection_snapshot("local-dev", 10)
             .unwrap();
@@ -14959,7 +15072,10 @@ INSERT INTO worker_registry (
         let unavailable = store
             .reconcile_worker_registry_snapshot("local-dev", "embedded", 1, 11, &[], "3")
             .unwrap();
-        assert_eq!(unavailable.changed_workers, vec![catalog.worker.clone()]);
+        assert!(matches!(
+            unavailable.changes.as_slice(),
+            [WorkerCatalogChange::Upsert(record)] if record.registry.worker == catalog.worker
+        ));
         let projection = store
             .worker_registry_projection("local-dev", &catalog.worker)
             .unwrap()
@@ -14978,7 +15094,7 @@ INSERT INTO worker_registry (
         let duplicate = store
             .reconcile_worker_registry_snapshot("local-dev", "embedded", 1, 11, &[], "4")
             .unwrap();
-        assert!(duplicate.changed_workers.is_empty());
+        assert!(duplicate.changes.is_empty());
 
         let reconnected = store
             .reconcile_worker_registry_snapshot(
@@ -14990,7 +15106,10 @@ INSERT INTO worker_registry (
                 "5",
             )
             .unwrap();
-        assert_eq!(reconnected.changed_workers, vec![catalog.worker.clone()]);
+        assert!(matches!(
+            reconnected.changes.as_slice(),
+            [WorkerCatalogChange::Upsert(record)] if record.registry.worker == catalog.worker
+        ));
         let projection = store
             .worker_registry_projection("local-dev", &catalog.worker)
             .unwrap()
@@ -15003,7 +15122,7 @@ INSERT INTO worker_registry (
         let duplicate_reconnect = store
             .reconcile_worker_registry_snapshot("local-dev", "embedded", 1, 11, &[observed], "6")
             .unwrap();
-        assert!(duplicate_reconnect.changed_workers.is_empty());
+        assert!(duplicate_reconnect.changes.is_empty());
     }
 
     #[tokio::test]
@@ -15037,19 +15156,20 @@ INSERT INTO worker_registry (
                 updated_at: "1".to_string(),
             })
             .unwrap();
-        assert!(
-            store
-                .delete_worker_registry("local-dev", &worker_ref)
-                .unwrap()
-        );
         let first_removal = store
-            .publish_worker_registry_removal("local-dev", &worker_ref)
+            .delete_worker_registry("local-dev", &worker_ref)
             .unwrap();
-        assert_eq!(first_removal.changed_workers, vec![worker_ref.clone()]);
+        assert!(matches!(
+            first_removal.changes.as_slice(),
+            [WorkerCatalogChange::Removed(worker)] if worker == &worker_ref
+        ));
         let duplicate_removal = store
-            .publish_worker_registry_removal("local-dev", &worker_ref)
+            .delete_worker_registry("local-dev", &worker_ref)
             .unwrap();
-        assert!(duplicate_removal.changed_workers.is_empty());
+        assert!(matches!(
+            duplicate_removal.changes.as_slice(),
+            [WorkerCatalogChange::Removed(worker)] if worker == &worker_ref
+        ));
         assert_eq!(duplicate_removal.revision, first_removal.revision);
         let event = SubscriptionWorker {
             worker_id: SubscriptionWorkerId::new("removed").unwrap(),
@@ -15070,7 +15190,7 @@ INSERT INTO worker_registry (
         let commit = store
             .apply_worker_registry_observation("local-dev", "embedded", 2, &event, "2")
             .unwrap();
-        assert!(commit.changed_workers.is_empty());
+        assert!(commit.changes.is_empty());
         assert!(
             store
                 .worker_registry_projection("local-dev", &worker_ref)
@@ -15194,9 +15314,11 @@ INSERT INTO worker_registry (
                 .is_empty()
         );
         assert!(
-            store
+            !store
                 .delete_worker_registry("workspace-control", &subject_record.worker)
                 .unwrap()
+                .changes
+                .is_empty()
         );
         assert!(
             store
