@@ -32008,7 +32008,7 @@ mod tests {
             .upsert_workdir_registry(&WorkdirRegistryRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 workdir_id: workdir_id.to_string(),
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                runtime_id: "arcadia".to_string(),
                 repository_id: test_repository_id(&api),
                 creation_selector: Some("HEAD".to_string()),
                 creation_ref: None,

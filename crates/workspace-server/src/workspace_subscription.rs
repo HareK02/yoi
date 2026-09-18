@@ -447,9 +447,6 @@ fn project_working_directory(
         else {
             return false;
         };
-        if workdir.runtime_id != worker_ref.runtime_id {
-            return false;
-        }
         let Ok(working_directory_id) =
             protocol::subscription::SubscriptionWorkdirId::new(workdir.workdir_id)
         else {
