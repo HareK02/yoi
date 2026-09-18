@@ -46,11 +46,13 @@ activation boundary uses this lock order everywhere a live Worker changes Segmen
 7. publish the append destination, session projection, sink, and in-memory history;
 8. release the append barrier.
 
-Submit and Notify acceptance take the same append barrier. Consequently an accepted
-item is either durably included in the replacement checkpoint, or waits until every
-live authority points at the replacement and is then appended there. Restore
-admission takes the allocation lock, so it cannot observe the interval between the
-metadata CAS and allocation hand-off.
+Submit and Notify acceptance take the same append barrier. The controller persists
+requests received while manual compaction is running immediately rather than holding
+volatile deferred methods, so an overlapping Shutdown cannot discard a SubWorker
+completion. Consequently an accepted item is either durably included in the
+replacement checkpoint, or waits until every live authority points at the replacement
+and is then appended there. Restore admission takes the allocation lock, so it cannot
+observe the interval between the metadata CAS and allocation hand-off.
 
 The metadata CAS is the commit point. Failures before it leave the source Segment
 active. A failure updating allocation after it marks the old in-memory writer

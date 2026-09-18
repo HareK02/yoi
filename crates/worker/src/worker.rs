@@ -1930,6 +1930,15 @@ impl PendingSubmissionHandle<session_store::FsStore> {
             },
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn persisted_entries_for_test(&self) -> Vec<LogEntry> {
+        let location = self.writer.state.location();
+        self.writer
+            .store
+            .read_all(location.session_id, location.segment_id)
+            .expect("read test pending entries")
+    }
 }
 
 /// Type-erased commit handle for the interceptor. Lets the interceptor commit `SystemItem`s without being generic over the
@@ -8649,6 +8658,93 @@ mod build_summary_prompt_tests {
         drop(
             recovered
                 .begin_segment_activation(replacement, session_store::new_segment_id())
+                .unwrap(),
+        );
+        drop(recovered);
+    }
+
+    #[tokio::test]
+    async fn crash_after_allocation_before_live_switch_recovers_committed_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store,
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        worker.ensure_segment_head().await.unwrap();
+        let old_location = worker.segment_state.location();
+        let replacement_location = SegmentLocation {
+            session_id: old_location.session_id,
+            segment_id: session_store::new_segment_id(),
+        };
+        let persisted_metadata = Arc::new(Mutex::new(WorkerActiveSegmentRef::active_segment(
+            old_location.session_id,
+            old_location.segment_id,
+        )));
+        let metadata_for_cas = Arc::clone(&persisted_metadata);
+        worker.worker_metadata_segment_cas = Some(Arc::new(move |_worker_name, expected, replacement| {
+            let mut persisted = metadata_for_cas.lock().unwrap();
+            if &*persisted != expected {
+                return Ok(false);
+            }
+            *persisted = replacement;
+            Ok(true)
+        }));
+        let lock_path = dir.path().join("workers.json");
+        let allocation = worker_allocation::install_top_level_at_for_test(
+            lock_path.clone(),
+            "test-worker".into(),
+            std::process::id(),
+            dir.path().join("worker.sock"),
+            Vec::new(),
+            old_location.segment_id,
+        )
+        .unwrap();
+        let activation = allocation
+            .begin_segment_activation(
+                old_location.segment_id,
+                replacement_location.segment_id,
+            )
+            .unwrap();
+        worker.scope_allocation = Some(allocation);
+        worker
+            .compare_and_swap_worker_metadata_segment(old_location, replacement_location)
+            .unwrap();
+        activation.commit().unwrap();
+
+        // Simulated crash point: durable metadata and allocation moved, while the
+        // in-memory append destination still names the source Segment.
+        assert_eq!(worker.segment_id(), old_location.segment_id);
+        assert_eq!(
+            *persisted_metadata.lock().unwrap(),
+            WorkerActiveSegmentRef::active_segment(
+                replacement_location.session_id,
+                replacement_location.segment_id,
+            )
+        );
+        drop(worker);
+
+        let recovered = worker_allocation::install_top_level_at_for_test(
+            lock_path,
+            "test-worker".into(),
+            std::process::id(),
+            dir.path().join("worker-restored.sock"),
+            Vec::new(),
+            replacement_location.segment_id,
+        )
+        .unwrap();
+        drop(
+            recovered
+                .begin_segment_activation(
+                    replacement_location.segment_id,
+                    session_store::new_segment_id(),
+                )
                 .unwrap(),
         );
         drop(recovered);

@@ -25,7 +25,9 @@ use crate::shutdown_after_idle::{
 };
 use crate::spawn::registry::SpawnedWorkerRegistry;
 use crate::spawn::tool::sub_worker_spawn_tool;
-use crate::worker::{SystemItemCommitter, Worker, WorkerError, WorkerRunResult};
+use crate::worker::{
+    PendingSubmissionHandle, SystemItemCommitter, Worker, WorkerError, WorkerRunResult,
+};
 use protocol::{
     AlertLevel, AlertSource, CommandEvent as ProtocolCommandEvent,
     CommandSnapshot as ProtocolCommandSnapshot, CommandStatus as ProtocolCommandStatus,
@@ -1489,6 +1491,115 @@ where
     Ok(workdir_for_view)
 }
 
+fn durably_accept_method_while_busy<St>(
+    method: Method,
+    pending_submissions: &PendingSubmissionHandle<St>,
+    working_event_tx: &broadcast::Sender<Event>,
+) -> Option<Method>
+where
+    St: session_store::Store + Clone,
+{
+    match method {
+        Method::Submit {
+            submission_request_id,
+            input,
+        } => {
+            let request_id = submission_request_id.clone();
+            match pending_submissions.accept_from_source(
+                submission_request_id,
+                input,
+                pending_submissions.direct_client_namespace(),
+                session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
+                false,
+            ) {
+                Ok(acceptance) => {
+                    let _ = working_event_tx.send(Event::SubmissionAccepted {
+                        submission_request_id: acceptance.submission_request_id,
+                        submission_id: acceptance.submission_id,
+                        disposition: acceptance.disposition,
+                    });
+                }
+                Err(error) => {
+                    let _ = working_event_tx.send(Event::SubmissionRejected {
+                        submission_request_id: request_id,
+                        message: error.to_string(),
+                    });
+                }
+            }
+            None
+        }
+        Method::SubmitTracked {
+            submission_request_id,
+            input,
+            source,
+        } => {
+            let request_id = submission_request_id.clone();
+            let (source_namespace, provenance) =
+                resolved_input_source(pending_submissions, &source);
+            match pending_submissions.accept_from_source(
+                submission_request_id,
+                input,
+                source_namespace,
+                provenance,
+                false,
+            ) {
+                Ok(acceptance) => {
+                    let _ = working_event_tx.send(Event::SubmissionAccepted {
+                        submission_request_id: acceptance.submission_request_id,
+                        submission_id: acceptance.submission_id,
+                        disposition: acceptance.disposition,
+                    });
+                }
+                Err(error) => {
+                    let _ = working_event_tx.send(Event::SubmissionRejected {
+                        submission_request_id: request_id,
+                        message: error.to_string(),
+                    });
+                }
+            }
+            None
+        }
+        Method::Notify {
+            notification_request_id,
+            message,
+        } => {
+            if let Err(error) = pending_submissions.accept_notification_from_source(
+                notification_request_id,
+                message,
+                pending_submissions.direct_client_namespace(),
+                session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
+            ) {
+                let _ = working_event_tx.send(Event::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: error.to_string(),
+                });
+            }
+            None
+        }
+        Method::NotifyTracked {
+            notification_request_id,
+            message,
+            source,
+        } => {
+            let (source_namespace, provenance) =
+                resolved_input_source(pending_submissions, &source);
+            if let Err(error) = pending_submissions.accept_notification_from_source(
+                notification_request_id,
+                message,
+                source_namespace,
+                provenance,
+            ) {
+                let _ = working_event_tx.send(Event::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: error.to_string(),
+                });
+            }
+            None
+        }
+        method => Some(method),
+    }
+}
+
 fn reject_method_while_attention_locked(
     method: &Method,
     working_event_tx: &broadcast::Sender<Event>,
@@ -2250,7 +2361,15 @@ async fn controller_loop<C, St>(
                                         );
                                         let _ = cancel_tx.send(true);
                                     }
-                                    Some(method) => deferred_methods.push_back(method),
+                                    Some(method) => {
+                                        if let Some(method) = durably_accept_method_while_busy(
+                                            method,
+                                            &pending_submissions,
+                                            &working_event_tx,
+                                        ) {
+                                            deferred_methods.push_back(method);
+                                        }
+                                    }
                                     None => {
                                         shutdown_after_compaction = true;
                                         let _ = cancel_tx.send(true);
@@ -3458,6 +3577,30 @@ mod tests {
             WorkerEvent::TurnEnded { worker_name } => assert_eq!(worker_name, "child-worker"),
             other => panic!("expected TurnEnded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn busy_notification_is_durable_before_shutdown_can_observe_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = PendingSubmissionHandle::for_test(dir.path());
+        let (event_tx, _event_rx) = broadcast::channel(4);
+
+        assert!(durably_accept_method_while_busy(
+            Method::NotifyTracked {
+                notification_request_id: "completion-1".into(),
+                message: "subworker completed".into(),
+                source: protocol::AuthenticatedInputSource::UntrustedWire,
+            },
+            &pending,
+            &event_tx,
+        )
+        .is_none());
+        let entries = pending.persisted_entries_for_test();
+        assert!(entries.iter().any(|entry| matches!(
+            entry,
+            LogEntry::Extension { domain, .. }
+                if domain == "worker.pending_activations.v1"
+        )));
     }
 
     #[test]
