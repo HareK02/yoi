@@ -1,9 +1,8 @@
 use crate::{BackendApiClient, BackendApiClientError};
 use reqwest::Method;
 use server_api::{
-    InitialRepositoryIntent, RepositoryListResponse, RepositorySummary,
-    WorkspaceCatalogListResponse, WorkspaceCreateRequest, WorkspaceCreateResponse,
-    WorkspaceSummary,
+    InitialRepositoryIntent, RepositorySummary, WorkspaceCatalogListResponse,
+    WorkspaceCreateRequest, WorkspaceCreateResponse, WorkspaceSummary,
 };
 use std::fmt;
 
@@ -32,6 +31,7 @@ pub enum BackendWorkspaceClientError {
     InvalidTarget(String),
     Api(BackendApiClientError),
     Http(reqwest::Error),
+    RepositoryApi(server_api::client_support::ClientError<server_api::RepositoryApiError>),
 }
 
 impl fmt::Display for BackendWorkspaceClientError {
@@ -40,6 +40,7 @@ impl fmt::Display for BackendWorkspaceClientError {
             Self::InvalidTarget(message) => f.write_str(message),
             Self::Api(error) => write!(f, "{error}"),
             Self::Http(error) => write!(f, "{error}"),
+            Self::RepositoryApi(error) => write!(f, "{error}"),
         }
     }
 }
@@ -57,6 +58,39 @@ impl From<reqwest::Error> for BackendWorkspaceClientError {
         Self::Http(error)
     }
 }
+
+impl From<server_api::client_support::ClientError<server_api::RepositoryApiError>>
+    for BackendWorkspaceClientError
+{
+    fn from(
+        error: server_api::client_support::ClientError<server_api::RepositoryApiError>,
+    ) -> Self {
+        Self::RepositoryApi(error)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RepositoryBearerAuthorizer {
+    authorization: String,
+}
+
+impl server_api::client_support::RequestAuthorizer for RepositoryBearerAuthorizer {
+    fn authorize(
+        &self,
+        _request: server_api::client_support::AuthorizerRequest<'_>,
+    ) -> Result<reqwest::header::HeaderMap, server_api::client_support::AuthorizationError> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            self.authorization
+                .parse()
+                .map_err(|_| server_api::client_support::AuthorizationError::new())?,
+        );
+        Ok(headers)
+    }
+}
+
+const REPOSITORY_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
 
 pub fn list_backend_workspaces_blocking(
     target: &BackendWorkspaceCatalogTarget,
@@ -76,6 +110,21 @@ pub fn list_backend_workspace_repositories_blocking(
     target: &BackendWorkspaceCatalogTarget,
     workspace_id: &str,
 ) -> Result<Vec<RepositorySummary>, BackendWorkspaceClientError> {
+    let client = BackendApiClient::from_stored_token(&target.base_url)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?;
+    runtime.block_on(list_backend_workspace_repositories_with_client(
+        &client,
+        workspace_id,
+    ))
+}
+
+async fn list_backend_workspace_repositories_with_client(
+    backend: &BackendApiClient,
+    workspace_id: &str,
+) -> Result<Vec<RepositorySummary>, BackendWorkspaceClientError> {
     if workspace_id.is_empty()
         || workspace_id.len() > 200
         || !workspace_id
@@ -86,12 +135,16 @@ pub fn list_backend_workspace_repositories_blocking(
             "Workspace id returned by Backend is invalid".to_string(),
         ));
     }
-    let client = BackendApiClient::from_stored_token(&target.base_url)?;
-    let response = client
-        .blocking_request(Method::GET, &format!("/api/w/{workspace_id}/repositories"))?
-        .send()?;
-    client.check_status(response.status())?;
-    let response = response.json::<RepositoryListResponse>()?;
+    let client = server_api::ServerApiClient::builder(backend.origin().as_str())
+        .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?
+        .client(backend.asynchronous_client())
+        .authorizer(RepositoryBearerAuthorizer {
+            authorization: backend.authorization_header_value(),
+        })
+        .response_body_limit(REPOSITORY_RESPONSE_LIMIT)
+        .build()
+        .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?;
+    let response = client.repository_list(workspace_id.to_owned()).await?;
     if response.workspace_id != workspace_id {
         return Err(BackendWorkspaceClientError::InvalidTarget(
             "Repository catalog response does not match the requested Workspace".to_string(),

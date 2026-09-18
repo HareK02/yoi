@@ -3074,6 +3074,56 @@ impl server_api::ServerApi for WorkspaceApi {
             observation,
         })
     }
+
+    async fn repository_list(
+        &self,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::RepositoryListResponse, server_api::RepositoryApiError>
+    {
+        scoped_list_repositories(
+            State(self.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn repository_detail(
+        &self,
+        workspace_id: String,
+        repository_key: String,
+    ) -> std::result::Result<server_api::RepositoryDetailResponse, server_api::RepositoryApiError>
+    {
+        scoped_repository_detail(
+            State(self.clone()),
+            AxumPath(ScopedRepositoryPath {
+                workspace_id,
+                repository_key,
+            }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn repository_create(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        request: CreateWorkspaceRepositoryRequest,
+    ) -> std::result::Result<CreateWorkspaceRepositoryResponse, server_api::RepositoryApiError>
+    {
+        scoped_create_repository(
+            State(self.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Extension(actor),
+            Json(request),
+        )
+        .await
+        .map(|(_status, Json(response))| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
 }
 
 fn build_inner_router(api: WorkspaceApi) -> Router {
@@ -3399,15 +3449,7 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
             delete(scoped_unlink_objective_ticket),
         )
         .route("/api/repositories", get(list_repositories))
-        .route(
-            "/api/w/{workspace_id}/repositories",
-            get(scoped_list_repositories).post(scoped_create_repository),
-        )
         .route("/api/repositories/{repository_key}", get(repository_detail))
-        .route(
-            "/api/w/{workspace_id}/repositories/{repository_key}",
-            get(scoped_repository_detail),
-        )
         .route(
             "/api/w/{workspace_id}/repositories/{repository_key}/ssh-connection-test",
             post(scoped_probe_repository_ssh_connection)
@@ -18781,6 +18823,47 @@ impl ApiError {
     fn with_diagnostics(error: Error, diagnostics: Vec<RuntimeDiagnostic>) -> Self {
         Self { error, diagnostics }
     }
+
+    fn into_repository_api_error(self) -> server_api::RepositoryApiError {
+        let status = match &self.error {
+            Error::WorkspacePermissionDenied(_) | Error::BrowserReopenConfirmationRequired => {
+                StatusCode::FORBIDDEN
+            }
+            Error::RepositoryConflict(_) => StatusCode::CONFLICT,
+            Error::InvalidInput(_)
+            | Error::WorkerSourceIdentity(_)
+            | Error::InvalidRuntimeIdentifier { .. }
+            | Error::ReservedWorkerName(_) => StatusCode::BAD_REQUEST,
+            Error::RuntimeOperationFailed { code, .. } if code == "repository_not_configured" => {
+                StatusCode::NOT_FOUND
+            }
+            Error::RuntimeOperationFailed { code, .. }
+                if code == "repository_provider_unsupported" =>
+            {
+                StatusCode::BAD_REQUEST
+            }
+            Error::InvalidRecordId(_)
+            | Error::MissingFrontmatter(_)
+            | Error::UnknownRepository(_)
+            | Error::UnknownRuntime(_)
+            | Error::UnknownWorker { .. }
+            | Error::RuntimeBindingNotFound { .. }
+            | Error::UnknownHost(_)
+            | Error::WorkspaceIdMismatch => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
+            "internal server error".to_owned()
+        } else {
+            self.error.to_string()
+        };
+        server_api::RepositoryApiError::new(
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("error"),
+            message,
+            working_directory_diagnostics(self.diagnostics),
+        )
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -22845,6 +22928,45 @@ mod tests {
             .await
             .unwrap();
         assert!(String::from_utf8_lossy(&listed_body).contains("documentation"));
+
+        let repository_detail_uri = format!("{repositories_uri}/documentation");
+        let detailed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(repository_detail_uri)
+                    .header(
+                        axum::http::header::COOKIE,
+                        "yoi_workspace_session=browser-session-auth",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detailed.status(), StatusCode::OK);
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{repositories_uri}/missing"))
+                    .header(
+                        axum::http::header::COOKIE,
+                        "yoi_workspace_session=browser-session-auth",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let missing_status = missing.status();
+        let missing_body = to_bytes(missing.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            missing_status,
+            StatusCode::NOT_FOUND,
+            "{}",
+            String::from_utf8_lossy(&missing_body)
+        );
 
         let identity_uri = format!(
             "/api/w/{}/settings/signing-identity",

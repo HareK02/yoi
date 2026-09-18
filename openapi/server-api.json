@@ -1,0 +1,495 @@
+{
+  "components": {
+    "schemas": {
+      "CreateWorkspaceRepositoryRequest": {
+        "additionalProperties": false,
+        "description": "Browser/user intent for registering one Repository in a Workspace.\n\nThe Server parses and canonicalizes `source`; callers cannot assert a\ntransport classification or supply credential material through this DTO.",
+        "properties": {
+          "default_ref": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repository_key": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository_key",
+          "source"
+        ],
+        "type": "object"
+      },
+      "CreateWorkspaceRepositoryResponse": {
+        "properties": {
+          "replayed": {
+            "type": "boolean"
+          },
+          "repository_key": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "repository_key",
+          "replayed"
+        ],
+        "type": "object"
+      },
+      "Diagnostic": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "severity": {
+            "$ref": "#/components/schemas/DiagnosticSeverity"
+          }
+        },
+        "required": [
+          "code",
+          "severity",
+          "message"
+        ],
+        "type": "object"
+      },
+      "DiagnosticSeverity": {
+        "enum": [
+          "info",
+          "warning",
+          "error"
+        ],
+        "type": "string"
+      },
+      "GitRemoteSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "fetch_url": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "fetch_url"
+        ],
+        "type": "object"
+      },
+      "GitRepositorySummary": {
+        "additionalProperties": false,
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dirty": {
+            "type": "boolean"
+          },
+          "head": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "remotes": {
+            "items": {
+              "$ref": "#/components/schemas/GitRemoteSummary"
+            },
+            "type": "array"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "dirty",
+          "remotes"
+        ],
+        "type": "object"
+      },
+      "RepositoryApiError": {
+        "description": "Error body shared by the existing repository routes and their generated adapters.",
+        "properties": {
+          "diagnostics": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "error": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "error",
+          "message"
+        ],
+        "type": "object"
+      },
+      "RepositoryDetailResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/RepositorySummary"
+          },
+          "source": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "item",
+          "source"
+        ],
+        "type": "object"
+      },
+      "RepositoryDiagnostic": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "severity",
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "RepositoryListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/RepositorySummary"
+            },
+            "type": "array"
+          },
+          "source": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "items",
+          "source",
+          "diagnostics"
+        ],
+        "type": "object"
+      },
+      "RepositoryObservedStatus": {
+        "enum": [
+          "unverified",
+          "ready",
+          "invalid"
+        ],
+        "type": "string"
+      },
+      "RepositorySource": {
+        "description": "Stable Repository source identity stored by Workspace authority.",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/RepositorySourceKind"
+          },
+          "uri": {
+            "description": "Canonical source representation. This is an absolute local path for\n`local_path`, and a normalized URI/remote specification otherwise.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "uri"
+        ],
+        "type": "object"
+      },
+      "RepositorySourceKind": {
+        "description": "Provider-neutral classification of an authoritative Repository source.\n\nLocal paths remain distinct from network Git transports so callers cannot\naccidentally treat an unmaterialized remote as a server-local filesystem path.",
+        "oneOf": [
+          {
+            "enum": [
+              "local_path",
+              "file",
+              "ssh",
+              "https"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "invalid",
+            "description": "A legacy value that could not be classified during migration. It remains\ninspectable but every provider operation must fail closed. Historical\n`http` wire values decode into this non-executable classification.",
+            "type": "string"
+          }
+        ]
+      },
+      "RepositorySummary": {
+        "additionalProperties": false,
+        "properties": {
+          "default_selector": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/RepositoryDiagnostic"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "git": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GitRepositorySummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "observed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "observed_status": {
+            "$ref": "#/components/schemas/RepositoryObservedStatus"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "record_authority": {
+            "type": "string"
+          },
+          "repository_key": {
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/RepositorySource"
+          },
+          "source_fingerprint": {
+            "type": "string"
+          },
+          "source_revision": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository_key",
+          "kind",
+          "provider",
+          "source",
+          "source_revision",
+          "source_fingerprint",
+          "observed_status",
+          "record_authority"
+        ],
+        "type": "object"
+      },
+      "string": {
+        "type": "string"
+      }
+    }
+  },
+  "info": {
+    "title": "Yoi Server API",
+    "version": "0.1.0",
+    "x-yoi-source-digest": "sha256:1a30fd87bc5d6e1a03acfb86c86630ad8d458e5c0db8b3d146459d5f2c376db6"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/w/{workspace_id}/repositories": {
+      "get": {
+        "operationId": "repository_list",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryListResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      },
+      "post": {
+        "operationId": "repository_create",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWorkspaceRepositoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateWorkspaceRepositoryResponse"
+                }
+              }
+            },
+            "description": "Alternate successful response"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateWorkspaceRepositoryResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
+    "/api/w/{workspace_id}/repositories/{repository_key}": {
+      "get": {
+        "operationId": "repository_detail",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "repository_key",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryDetailResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    }
+  }
+}

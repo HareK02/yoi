@@ -104,7 +104,9 @@ struct RouteArgs {
     path: LitStr,
     operation_id: Option<LitStr>,
     status: Option<LitInt>,
+    alternate_status: Option<LitInt>,
     error_status: Option<LitInt>,
+    openapi: Option<syn::LitBool>,
 }
 
 impl Parse for RouteArgs {
@@ -114,7 +116,9 @@ impl Parse for RouteArgs {
             path,
             operation_id: None,
             status: None,
+            alternate_status: None,
             error_status: None,
+            openapi: None,
         };
 
         while !input.is_empty() {
@@ -132,11 +136,23 @@ impl Parse for RouteArgs {
                     "operation_id",
                 )?,
                 "status" => set_once(&mut result.status, input.parse::<LitInt>()?, &key, "status")?,
+                "alternate_status" => set_once(
+                    &mut result.alternate_status,
+                    input.parse::<LitInt>()?,
+                    &key,
+                    "alternate_status",
+                )?,
                 "error_status" => set_once(
                     &mut result.error_status,
                     input.parse::<LitInt>()?,
                     &key,
                     "error_status",
+                )?,
+                "openapi" => set_once(
+                    &mut result.openapi,
+                    input.parse::<syn::LitBool>()?,
+                    &key,
+                    "openapi",
                 )?,
                 _ => {
                     return Err(syn::Error::new(
@@ -167,6 +183,9 @@ enum Location {
     Query,
     Header,
     Body,
+    /// Trusted request-local context supplied by the server adapter. Extension
+    /// parameters are not part of the wire contract or generated client signature.
+    Extension,
 }
 
 impl Location {
@@ -176,6 +195,7 @@ impl Location {
             Self::Query => quote!(Query),
             Self::Header => quote!(Header),
             Self::Body => quote!(Body),
+            Self::Extension => unreachable!("extensions are not wire parameters"),
         };
         quote!(#api_crate::ParameterLocation::#variant)
     }
@@ -201,7 +221,9 @@ struct Operation {
     error_body: Option<Type>,
     fallible: bool,
     response_status: u16,
+    alternate_status: Option<u16>,
     error_status: Option<u16>,
+    openapi_skip: bool,
 }
 
 struct ApiDefinition {
@@ -392,6 +414,21 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
             "status must be a success status between 200 and 299",
         ));
     }
+    let alternate_status = parse_status(route.alternate_status.as_ref(), "alternate_status")?;
+    if let Some(status) = alternate_status
+        && (!(200..=299).contains(&status) || status == response_status)
+    {
+        return Err(syn::Error::new_spanned(
+            route.alternate_status,
+            "alternate_status must be a distinct success status between 200 and 299",
+        ));
+    }
+    if alternate_status.is_some() && response_body.is_none() {
+        return Err(syn::Error::new_spanned(
+            route.alternate_status,
+            "alternate_status requires a response body implementing HttpSuccess",
+        ));
+    }
     let error_status = parse_status(route.error_status.as_ref(), "error_status")?;
     if error_status.is_some() && error_body.is_none() {
         return Err(syn::Error::new_spanned(
@@ -464,11 +501,20 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
                 }
                 (Location::Body, rust_name.clone())
             }
+            Some((Location::Extension, wire_name)) => {
+                if wire_name.is_some() {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        "#[extension] does not accept a wire name",
+                    ));
+                }
+                (Location::Extension, rust_name.clone())
+            }
             None if placeholders.contains(&rust_name) => (Location::Path, rust_name.clone()),
             None => {
                 return Err(syn::Error::new(
                     ident.span(),
-                    "API arguments must use #[path], #[query], #[header], or #[body]; path arguments may omit #[path] when their name matches a placeholder",
+                    "API arguments must use #[path], #[query], #[header], #[body], or #[extension]; path arguments may omit #[path] when their name matches a placeholder",
                 ));
             }
         };
@@ -537,7 +583,9 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
         error_body,
         fallible,
         response_status,
+        alternate_status,
         error_status,
+        openapi_skip: route.openapi.as_ref().is_some_and(|value| !value.value),
     })
 }
 
@@ -588,6 +636,7 @@ fn take_location(attrs: &mut Vec<Attribute>) -> syn::Result<Option<(Location, Op
             Some("query") => Some(Location::Query),
             Some("header") => Some(Location::Header),
             Some("body") => Some(Location::Body),
+            Some("extension") => Some(Location::Extension),
             Some("stream") | Some("multipart") | Some("binary") => {
                 return Err(syn::Error::new_spanned(
                     attr,
@@ -881,10 +930,13 @@ fn reqwest_adapter_tokens(
     let builder_ident = format_ident!("{}ClientBuilder", ident_text(trait_ident));
     let methods = api.operations.iter().map(|operation| {
         let method_ident = &operation.method_ident;
-        let arguments = operation.parameters.iter().map(|parameter| {
+        let arguments = operation.parameters.iter().filter_map(|parameter| {
+            if matches!(parameter.location, Location::Extension) {
+                return None;
+            }
             let ident = &parameter.rust_ident;
             let ty = &parameter.ty;
-            quote!(#ident: #ty)
+            Some(quote!(#ident: #ty))
         });
         let path_segments = operation
             .path
@@ -928,6 +980,10 @@ fn reqwest_adapter_tokens(
             .unwrap_or_else(|| quote!(::core::option::Option::None));
         let method = reqwest_method_tokens(operation.method, api_crate);
         let response_status = operation.response_status;
+        let accepted_status = operation
+            .alternate_status
+            .map(|alternate| quote!(__actual == #response_status || __actual == #alternate))
+            .unwrap_or_else(|| quote!(__actual == #response_status));
         let response_type = operation
             .response_body
             .as_ref()
@@ -985,7 +1041,7 @@ fn reqwest_adapter_tokens(
                     .await
                     .map_err(#api_crate::reqwest::ClientError::from)?;
                 let __actual = __response.status().as_u16();
-                if __actual == #response_status {
+                if #accepted_status {
                     #success
                 }
                 #public_error
@@ -1181,6 +1237,14 @@ fn axum_adapter_tokens(
                 };
             })
         });
+        let extension_extractors = operation.parameters.iter().filter_map(|parameter| {
+            if !matches!(parameter.location, Location::Extension) {
+                return None;
+            }
+            let ident = &parameter.rust_ident;
+            let ty = &parameter.ty;
+            Some(quote!(#api_crate::axum::framework::Extension(#ident): #api_crate::axum::framework::Extension<#ty>,))
+        });
         let body_extractor = operation.parameters.iter().find_map(|parameter| {
             if !matches!(parameter.location, Location::Body) {
                 return None;
@@ -1191,7 +1255,16 @@ fn axum_adapter_tokens(
         });
         let call_arguments = operation.parameters.iter().map(|parameter| &parameter.rust_ident);
         let response_status = operation.response_status;
-        let success = if operation.response_body.is_some() {
+        let success = if let Some(alternate_status) = operation.alternate_status {
+            quote!({
+                let status = #api_crate::HttpSuccess::status_code(&value);
+                if status == #response_status || status == #alternate_status {
+                    #api_crate::axum::json_response(#api_crate::axum::status(status), value)
+                } else {
+                    #api_crate::axum::empty_response(#api_crate::axum::status(500))
+                }
+            })
+        } else if operation.response_body.is_some() {
             quote!(#api_crate::axum::json_response(#api_crate::axum::status(#response_status), value))
         } else {
             quote!({ let _ = value; #api_crate::axum::empty_response(#api_crate::axum::status(#response_status)) })
@@ -1232,6 +1305,7 @@ fn axum_adapter_tokens(
                 #path_extractor
                 #(#query_extractors)*
                 #header_extractor
+                #(#extension_extractors)*
                 #body_extractor
             ) -> #api_crate::axum::framework::Response
             where
@@ -1285,12 +1359,16 @@ fn openapi_adapter_tokens(
         to_snake_case(&api.item.ident),
         span = api.item.ident.span()
     );
-    let operations = api.operations.iter().map(|operation| {
+    let operations = api
+        .operations
+        .iter()
+        .filter(|operation| !operation.openapi_skip)
+        .map(|operation| {
         let method = method_name(operation.method);
         let path = &operation.path;
         let operation_id = &operation.operation_id;
         let parameters = operation.parameters.iter().filter_map(|parameter| {
-            if matches!(parameter.location, Location::Body) {
+            if matches!(parameter.location, Location::Body | Location::Extension) {
                 return None;
             }
             let ty = &parameter.ty;
@@ -1299,7 +1377,7 @@ fn openapi_adapter_tokens(
                 Location::Path => "path",
                 Location::Query => "query",
                 Location::Header => "header",
-                Location::Body => unreachable!(),
+                Location::Body | Location::Extension => unreachable!(),
             };
             Some(quote! {
                 operation.parameter::<#ty>(#name, #location)?;
@@ -1319,6 +1397,16 @@ fn openapi_adapter_tokens(
                 operation.empty_response(#status, "Successful response")?;
             },
         };
+        let alternate_response = operation.alternate_status.map(|status| {
+            match operation.response_body.as_ref() {
+                Some(ty) => quote! {
+                    operation.response::<#ty>(#status, "application/json", "Alternate successful response")?;
+                },
+                None => quote! {
+                    operation.empty_response(#status, "Alternate successful response")?;
+                },
+            }
+        });
         let error = operation
             .error_status
             .zip(operation.error_body.as_ref())
@@ -1334,6 +1422,7 @@ fn openapi_adapter_tokens(
                 #(#parameters)*
                 #request
                 #response
+                #alternate_response
                 #error
                 operation.finish()?;
             }
@@ -1383,7 +1472,13 @@ fn expand_api(api: ApiDefinition) -> syn::Result<proc_macro2::TokenStream> {
         .map(|operation| {
             let marker_ident = &operation.marker_ident;
             let metadata = metadata_tokens(operation, &api_crate);
-            let parameter_types = operation.parameters.iter().map(|parameter| &parameter.ty);
+            let parameter_types = operation.parameters.iter().filter_map(|parameter| {
+                if matches!(parameter.location, Location::Extension) {
+                    None
+                } else {
+                    Some(&parameter.ty)
+                }
+            });
             let request_type = operation
                 .request_body
                 .as_ref()
@@ -1472,17 +1567,20 @@ fn metadata_tokens(
         },
         None => quote!(::core::option::Option::None),
     };
-    let parameters = operation.parameters.iter().map(|parameter| {
+    let parameters = operation.parameters.iter().filter_map(|parameter| {
+        if matches!(parameter.location, Location::Extension) {
+            return None;
+        }
         let rust_name = &parameter.rust_name;
         let wire_name = &parameter.wire_name;
         let location = parameter.location.tokens(api_crate);
-        quote! {
+        Some(quote! {
             #api_crate::ParameterMetadata {
                 rust_name: #rust_name,
                 wire_name: #wire_name,
                 location: #location,
             }
-        }
+        })
     });
 
     quote! {

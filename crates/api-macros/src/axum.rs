@@ -52,7 +52,7 @@ pub fn status(code: u16) -> StatusCode {
 pub mod framework {
     pub use axum::{
         Json, Router,
-        extract::{Path, Query, State},
+        extract::{Extension, Path, Query, State},
         http::{HeaderMap, StatusCode},
         response::Response,
         routing::{delete, get, head, options, patch, post, put},
