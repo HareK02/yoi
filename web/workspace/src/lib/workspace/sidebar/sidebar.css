@@ -387,6 +387,20 @@
   .section-heading-link.active {
     background: var(--sidebar-item-active);
   }
+  .section-action {
+    margin-left: auto;
+    padding: var(--space-1) var(--space-2);
+    border-radius: var(--radius-soft);
+    color: var(--accent);
+    font-size: var(--font-size-compact);
+    font-weight: 650;
+    line-height: var(--line-height-compact);
+    text-decoration: none;
+  }
+  .section-action:hover,
+  .section-action:focus-visible {
+    background: var(--interactive-hover);
+  }
   .section-count {
     color: var(--text-muted);
     font-size: var(--font-size-compact);

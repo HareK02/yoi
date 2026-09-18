@@ -123,6 +123,14 @@ Deno.test("Shell regions use selected Bevel edges while open separators use Beve
     "The design language and showroom must preserve adjacent area and line hierarchy",
   );
   assert(
+    sidebarCss.includes(".section-action {") &&
+      sidebarCss.includes("padding: var(--space-1) var(--space-2)") &&
+      sidebarCss.includes("font-size: var(--font-size-compact)") &&
+      sidebarCss.includes("line-height: var(--line-height-compact)") &&
+      !showroomCss.includes(".workspace-sidebar .section-action"),
+    "Workspace Sidebar must own the Workers section action spacing used by the showroom",
+  );
+  assert(
     !sidebarCss.includes("border-right:") &&
       !sidebarCss.includes("border-bottom:") &&
       !showroomCss.includes("border-top: 1px solid") &&

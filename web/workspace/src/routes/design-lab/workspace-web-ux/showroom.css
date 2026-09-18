@@ -30,22 +30,6 @@
     white-space: nowrap;
   }
 
-  .workspace-sidebar .section-action {
-    margin-left: auto;
-    padding: var(--space-1) var(--space-2);
-    border-radius: var(--radius-soft);
-    color: var(--accent);
-    font-size: var(--font-size-compact);
-    font-weight: 650;
-    line-height: 16px;
-    text-decoration: none;
-  }
-
-  .workspace-sidebar .section-action:hover,
-  .workspace-sidebar .section-action:focus-visible {
-    background: var(--interactive-hover);
-  }
-
   .showroom {
     width: min(100%, 1180px);
     margin: 0 auto;
