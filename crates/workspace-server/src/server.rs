@@ -602,6 +602,18 @@ impl AttachmentUploadGrant {
     }
 }
 
+struct WorkerProjectionShutdownGuard {
+    service: std::sync::Weak<crate::worker_projection::WorkerProjectionService>,
+}
+
+impl Drop for WorkerProjectionShutdownGuard {
+    fn drop(&mut self) {
+        if let Some(service) = self.service.upgrade() {
+            service.shutdown();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WorkspaceApi {
     pub(crate) config: ServerConfig,
@@ -612,6 +624,7 @@ pub struct WorkspaceApi {
     config_schema_registry: crate::config_source::WorkspaceConfigSchemaRegistry,
     prompt_projection_cache: crate::prompt_settings::WorkspacePromptProjectionCache,
     authority: SqliteWorkspaceAuthority,
+    _worker_projection_shutdown: Arc<WorkerProjectionShutdownGuard>,
     runtime: Arc<RuntimeRegistry>,
     runtime_binding_expectations: Arc<RwLock<HashMap<(String, String), WorkspaceRuntimeBinding>>>,
     companion: Arc<CompanionConsole>,
@@ -619,6 +632,7 @@ pub struct WorkspaceApi {
     orchestrator_attention_fingerprint: Arc<Mutex<Option<String>>>,
     observation_proxy: BackendObservationProxy,
     runtime_subscription_broker: RuntimeSubscriptionBroker,
+    pub(crate) worker_projection: Arc<crate::worker_projection::WorkerProjectionService>,
     resource_broker: BackendResourceBroker,
     workdir_sessions: Arc<Mutex<WorkdirSessionRegistry>>,
     workdir_session_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
@@ -653,6 +667,7 @@ struct WorkspaceWorkerRemoveExecutor {
     workdir_session_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
     worker_remove_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
     worker_control_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    worker_projection: std::sync::Weak<crate::worker_projection::WorkerProjectionService>,
 }
 
 impl WorkspaceWorkerRemoveExecutor {
@@ -665,6 +680,7 @@ impl WorkspaceWorkerRemoveExecutor {
             workdir_session_locks: api.workdir_session_locks.clone(),
             worker_remove_locks: api.worker_remove_locks.clone(),
             worker_control_locks: api.worker_control_locks.clone(),
+            worker_projection: Arc::downgrade(&api.worker_projection),
         }
     }
 
@@ -691,7 +707,12 @@ impl WorkspaceWorkerRemoveExecutor {
             &prepared.plan.input_fingerprint,
             &result,
         ) {
-            Ok(_) => Ok(worker_remove_success_response(target)),
+            Ok(_) => {
+                if let Some(worker_projection) = self.worker_projection.upgrade() {
+                    let _ = worker_projection.publish_removed(target.clone());
+                }
+                Ok(worker_remove_success_response(target))
+            }
             Err(error) => Ok(worker_retention_error_response(error)),
         }
     }
@@ -1002,7 +1023,11 @@ impl WorkspaceWorkerRemoveExecutor {
             &plan.input_fingerprint,
             &retention_result,
         ) {
-            Ok(_) => {}
+            Ok(_) => {
+                if let Some(worker_projection) = self.worker_projection.upgrade() {
+                    let _ = worker_projection.publish_removed(plan.worker.clone());
+                }
+            }
             Err(error) => {
                 let _ = self.store.fail_worker_removal(
                     &self.workspace_id,
@@ -2338,6 +2363,16 @@ impl WorkspaceApi {
             &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             config_schema_registry.compose()?,
         )?;
+        let worker_projection = crate::worker_projection::WorkerProjectionService::new(
+            config.workspace_id.clone(),
+            store.clone(),
+        );
+        for runtime_id in runtime_subscription_broker.runtime_ids() {
+            worker_projection
+                .attach_runtime(&runtime_subscription_broker, runtime_id.as_str())
+                .await
+                .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        }
         let api = Self {
             config_store,
             repository_secrets,
@@ -2353,6 +2388,9 @@ impl WorkspaceApi {
                 workspace_id: config.workspace_id.clone(),
                 reader: RepositoryRegistryReader::new(config.repositories.clone()),
             })),
+            _worker_projection_shutdown: Arc::new(WorkerProjectionShutdownGuard {
+                service: Arc::downgrade(&worker_projection),
+            }),
             config,
             store,
             runtime,
@@ -2362,6 +2400,7 @@ impl WorkspaceApi {
             orchestrator_attention_fingerprint: Arc::new(Mutex::new(None)),
             observation_proxy,
             runtime_subscription_broker,
+            worker_projection,
             resource_broker,
             workdir_sessions: Arc::new(Mutex::new(WorkdirSessionRegistry::default())),
             workdir_session_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -2410,9 +2449,20 @@ impl WorkspaceApi {
         )
         .map(|runtime| runtime.with_resource_broker(self.resource_broker.clone()))
         .map_err(|error| error.into_error())?;
+        let runtime_id = remote_config.runtime_id.clone();
         self.runtime.register_or_replace(remote_runtime);
         self.runtime_subscription_broker
             .register_remote_runtime(remote_config);
+        let projection = self.worker_projection.clone();
+        let broker = self.runtime_subscription_broker.clone();
+        tokio::spawn(async move {
+            if let Err(error) = projection
+                .attach_runtime(&broker, runtime_id.as_str())
+                .await
+            {
+                tracing::warn!(%runtime_id, %error, "failed to attach Worker projection Runtime");
+            }
+        });
         Ok(())
     }
 
@@ -2763,6 +2813,15 @@ impl WorkspaceApi {
                 );
                 return Err(api_error_with_additional_diagnostics(error, diagnostics));
             }
+        }
+        if attachment_reservation.is_none() {
+            record_worker_summary(
+                self,
+                worker,
+                worker.label.as_str(),
+                worker.profile.clone(),
+                WorkerRegistryDisplayNamePolicy::PreserveExisting,
+            )?;
         }
         if let Err(error) = self
             .config_store
@@ -16585,46 +16644,21 @@ fn workers_response(
     api: WorkspaceApi,
 ) -> ApiResult<server_api::ListResponse<server_api::WorkerSummary>> {
     let limit = api.config.max_records.min(200);
-    let runtime_workers = api.runtime.list_workers(limit);
-    let mut observed = std::collections::BTreeMap::new();
-    for worker in &runtime_workers.items {
-        let _ = sync_worker_observation(&api, worker);
-        observed.insert(worker.worker.clone(), worker.clone());
-    }
-    let mut diagnostics = runtime_workers.diagnostics;
-    let worker_records = api
+    let (_, projections) = api
         .store
-        .list_worker_registry(&api.config.workspace_id, limit)?;
+        .worker_registry_projection_snapshot(&api.config.workspace_id, limit)?;
     let workdir_records = api
         .store
         .list_workdir_registry(&api.config.workspace_id, 500)?;
     let mut items = Vec::new();
-    for record in worker_records {
-        if !observed.contains_key(&record.worker) {
-            match api.runtime.worker(&record.worker) {
-                Ok(worker) => {
-                    let _ = sync_worker_observation(&api, &worker);
-                    observed.insert(record.worker.clone(), worker);
-                }
-                Err(RuntimeRegistryError::UnknownWorker { .. }) => {}
-                Err(error) => diagnostics.push(RuntimeDiagnostic {
-                    code: "worker_detail_probe_failed".to_string(),
-                    severity: DiagnosticSeverity::Info,
-                    message: format!(
-                        "Could not verify Worker {} on Runtime {}: {}",
-                        record.worker.worker_id,
-                        record.worker.runtime_id,
-                        sanitize_backend_error(&error.into_error().to_string())
-                    ),
-                }),
-            }
-        }
+    for projection in projections {
         let links = api
             .store
-            .list_worker_workdir_links(&api.config.workspace_id, &record.worker)?;
+            .list_worker_workdir_links(&api.config.workspace_id, &projection.registry.worker)?;
+        let observed = worker_summary_from_projection(&projection);
         let summary = merge_worker_registry_projection(
-            observed.get(&record.worker),
-            &record,
+            observed.as_ref(),
+            &projection.registry,
             links,
             &workdir_records,
         );
@@ -16634,8 +16668,8 @@ fn workers_response(
         workspace_id: api.config.workspace_id,
         limit,
         items,
-        source: "backend_worker_registry".to_string(),
-        diagnostics: diagnostics.into_iter().map(Into::into).collect(),
+        source: "backend_worker_registry_projection".to_string(),
+        diagnostics: Vec::new(),
     })
 }
 
@@ -17364,6 +17398,46 @@ fn record_worker_summary(
         updated_at: timestamp,
     };
     api.store.upsert_worker_registry(&record)?;
+    if let Ok(worker_id) =
+        protocol::subscription::SubscriptionWorkerId::new(worker.worker.worker_id.clone())
+    {
+        let state = match worker.state.as_str() {
+            "running" => protocol::subscription::SubscriptionWorkerState::Running,
+            "paused" => protocol::subscription::SubscriptionWorkerState::Paused,
+            "stopped" => protocol::subscription::SubscriptionWorkerState::Stopped,
+            _ => protocol::subscription::SubscriptionWorkerState::Idle,
+        };
+        let observation = protocol::subscription::SubscriptionWorker {
+            worker_id,
+            runtime_id: Some(worker.worker.runtime_id.clone()),
+            resource_key: None,
+            availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
+            subject_revision: 0,
+            worker_state: worker.worker_state.clone(),
+            state,
+            has_running_internal_workers: false,
+            workspace_id: worker.workspace.workspace_id.clone(),
+            display_name: Some(worker.display_name.clone()),
+            profile: worker.profile.clone(),
+            repository_id: None,
+            repository_key: None,
+            working_directory_id: None,
+        };
+        api.worker_projection
+            .seed_observation(
+                worker.worker.runtime_id.as_str(),
+                &observation,
+                worker
+                    .last_seen_at
+                    .as_deref()
+                    .unwrap_or(record.updated_at.as_str()),
+            )
+            .map_err(ApiError::from)?;
+    } else {
+        api.worker_projection
+            .publish_catalog_change(&worker_ref)
+            .map_err(ApiError::from)?;
+    }
     Ok(api
         .store
         .get_worker_registry(&api.config.workspace_id, &worker_ref)?
@@ -17406,6 +17480,45 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> WorkerSummary 
                     .to_string(),
         }],
     }
+}
+
+fn worker_summary_from_projection(
+    projection: &crate::store::WorkerRegistryProjectionRecord,
+) -> Option<WorkerSummary> {
+    let observation = projection.observation.as_ref()?;
+    let mut summary = worker_summary_from_registry(&projection.registry);
+    let observed = observation.availability
+        == protocol::subscription::SubscriptionWorkerAvailability::Observed;
+    summary.state = if observed {
+        match observation.worker.state {
+            protocol::subscription::SubscriptionWorkerState::Idle => "idle",
+            protocol::subscription::SubscriptionWorkerState::Running => "running",
+            protocol::subscription::SubscriptionWorkerState::Paused => "paused",
+            protocol::subscription::SubscriptionWorkerState::Stopped => "stopped",
+        }
+    } else {
+        "unavailable"
+    }
+    .to_string();
+    summary.worker_state = observation.worker.worker_state.clone();
+    summary.last_seen_at = Some(observation.observed_at.clone());
+    summary.capabilities.can_stop = observed
+        && observation.worker.state != protocol::subscription::SubscriptionWorkerState::Stopped;
+    summary.implementation.display_hint = if observed {
+        "Runtime-backed Worker".to_string()
+    } else {
+        "Worker observation unavailable".to_string()
+    };
+    summary.diagnostics = if observed {
+        Vec::new()
+    } else {
+        vec![RuntimeDiagnostic {
+            code: "worker_observation_unavailable".to_string(),
+            severity: DiagnosticSeverity::Info,
+            message: "The Worker remains in the Backend catalog, but its Runtime observation is currently unavailable.".to_string(),
+        }]
+    };
+    Some(summary)
 }
 
 fn merge_worker_registry_projection(
@@ -21393,6 +21506,7 @@ mod tests {
             .await
             .unwrap();
         drop(api);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let restored_config = test_server_config(&root);
         let restored_store =
@@ -29523,6 +29637,7 @@ mod tests {
             RuntimeRemovalOperationState::CleanupPending
         );
         drop(api);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let recovered = test_api(root.path()).await;
         let operation = recovered
@@ -29594,12 +29709,8 @@ mod tests {
         let app = build_inner_router(api.clone()).layer(Extension(test_owner_actor()));
         let workers = get_json(app.clone(), "/api/workers").await;
         assert!(
-            workers["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|worker| worker["runtime_id"] == "busy-runtime"),
-            "expected remote runtime to report at least one worker, got {workers}"
+            workers["items"].as_array().unwrap().is_empty(),
+            "Runtime-only Workers must not be promoted into the Backend catalog: {workers}"
         );
 
         let response = request_json(
@@ -30858,6 +30969,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         drop(api);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let restored_store = test_control_store(&config);
         let restored = WorkspaceApi::new_with_execution_backend(
@@ -30871,8 +30983,11 @@ mod tests {
             .runtime
             .worker(&worker_ref)
             .expect("restored worker");
-        assert_eq!(restored_worker.state, "stopped");
-        assert!(!restored_worker.capabilities.can_stop);
+        // The durable projection keeps an observer attached, so the restored Runtime
+        // catalog remains controllable while its failed execution is represented in
+        // `worker_state` rather than by removing the catalog Worker.
+        assert_eq!(restored_worker.state, "idle");
+        assert!(restored_worker.capabilities.can_stop);
 
         let bundles = restored
             .runtime

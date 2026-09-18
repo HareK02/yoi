@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use futures::{SinkExt, StreamExt};
@@ -10,11 +10,10 @@ use protocol::subscription::{
 use tokio::sync::mpsc;
 use worker_runtime::identity::RuntimeWorkerRef;
 
-use crate::runtime_subscription::{BrokerSubscriptionEvent, RuntimeSubscriptionBroker};
+use crate::runtime_subscription::RuntimeSubscriptionBroker;
 use crate::server::{
     WorkspaceApi, authorize_browser_worker_method, connect_workspace_worker_protocol,
 };
-use crate::store::WorkspaceResourceKind;
 
 const OUTBOUND_CAPACITY: usize = 256;
 
@@ -293,62 +292,31 @@ async fn run_worker_protocol(
 
 async fn run_workspace_workers(
     api: WorkspaceApi,
-    broker: RuntimeSubscriptionBroker,
+    _broker: RuntimeSubscriptionBroker,
     request_id: protocol::subscription::SubscriptionRequestId,
     subscription_id: SubscriptionId,
     outbound: mpsc::Sender<WsMessage>,
 ) {
-    let runtime_ids = broker.runtime_ids();
-    let mut pending = runtime_ids.iter().cloned().collect::<HashSet<_>>();
-    let (events, mut event_receiver) = mpsc::channel(OUTBOUND_CAPACITY);
-    let mut upstreams = tokio::task::JoinSet::new();
-    for runtime_id in runtime_ids {
-        let Ok(mut subscription) =
-            broker.subscribe(&runtime_id, EventSubscriptionSelector::RuntimeWorkers)
-        else {
-            pending.remove(&runtime_id);
-            continue;
-        };
-        let sender = events.clone();
-        upstreams.spawn(async move {
-            while let Some(event) = subscription.recv().await {
-                if sender.send((runtime_id.clone(), event)).await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
-    drop(events);
-
-    let mut workers = HashMap::<String, BTreeMap<String, SubscriptionWorker>>::new();
-    while !pending.is_empty() {
-        let Some((runtime_id, event)) = event_receiver.recv().await else {
-            return;
-        };
-        match event {
-            BrokerSubscriptionEvent::Snapshot { snapshot, .. } => {
-                install_snapshot(&api, &mut workers, &runtime_id, snapshot);
-                pending.remove(&runtime_id);
-            }
-            BrokerSubscriptionEvent::Disconnected { .. }
-            | BrokerSubscriptionEvent::Rejected { .. }
-            | BrokerSubscriptionEvent::Closed { .. } => {
-                pending.remove(&runtime_id);
-            }
-            BrokerSubscriptionEvent::Event { .. } => {}
-        }
-    }
-
-    let mut revisions = HashMap::<RuntimeWorkerRef, u64>::new();
-    let mut initial_workers = Vec::new();
-    for (runtime_id, runtime) in &mut workers {
-        for worker in runtime.values_mut() {
-            let worker_ref = RuntimeWorkerRef::new(runtime_id, worker.worker_id.as_str());
-            worker.subject_revision = next_revision(&mut revisions, &worker_ref);
-            initial_workers.push(worker.clone());
-        }
-    }
-    sort_workers(&mut initial_workers);
+    // Subscribe before reading so commits racing with the snapshot are replayed.
+    let mut events = api.worker_projection.subscribe();
+    let Ok((snapshot_revision, records)) = api.store.worker_registry_projection_snapshot(
+        &api.config.workspace_id,
+        api.config.max_records.max(1),
+    ) else {
+        let _ = send_rejected(
+            &outbound,
+            request_id,
+            SubscriptionRejectionCode::Internal,
+            "failed to read durable Worker projection".to_string(),
+        )
+        .await;
+        return;
+    };
+    let mut workers = records
+        .into_iter()
+        .filter_map(|record| project_registry_worker(&api, record))
+        .collect::<Vec<_>>();
+    sort_workers(&mut workers);
     if send_frame(
         &outbound,
         SubscriptionFrame::new(SubscriptionFramePayload::Response(
@@ -356,10 +324,8 @@ async fn run_workspace_workers(
                 request_id,
                 subscription_id: subscription_id.clone(),
                 selector: EventSubscriptionSelector::WorkspaceWorkers,
-                snapshot_revision: 1,
-                snapshot: SubscriptionSnapshot::Workers {
-                    workers: initial_workers,
-                },
+                snapshot_revision,
+                snapshot: SubscriptionSnapshot::Workers { workers },
             },
         )),
     )
@@ -369,174 +335,103 @@ async fn run_workspace_workers(
         return;
     }
 
-    while let Some((runtime_id, event)) = event_receiver.recv().await {
-        match event {
-            BrokerSubscriptionEvent::Snapshot { snapshot, .. } => {
-                let removed = workers.remove(&runtime_id).unwrap_or_default();
-                for worker in removed.values() {
-                    let worker_ref = RuntimeWorkerRef::new(&runtime_id, worker.worker_id.as_str());
-                    let revision = next_revision(&mut revisions, &worker_ref);
-                    if send_event(
-                        &outbound,
-                        &subscription_id,
-                        revision,
-                        SubscriptionEventPayload::WorkerRemoved {
-                            worker_id: worker.worker_id.clone(),
-                            runtime_id: Some(runtime_id.clone()),
-                        },
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return;
-                    }
-                }
-                install_snapshot(&api, &mut workers, &runtime_id, snapshot);
-                if let Some(current) = workers.get_mut(&runtime_id) {
-                    for worker in current.values_mut() {
-                        let worker_ref =
-                            RuntimeWorkerRef::new(&runtime_id, worker.worker_id.as_str());
-                        let revision = next_revision(&mut revisions, &worker_ref);
-                        worker.subject_revision = revision;
-                        if send_event(
-                            &outbound,
-                            &subscription_id,
-                            revision,
-                            SubscriptionEventPayload::WorkerUpserted {
-                                worker: worker.clone(),
-                            },
-                        )
+    loop {
+        match events.recv().await {
+            Ok(event) if event.revision <= snapshot_revision => continue,
+            Ok(event) => {
+                for change in event.changes {
+                    let payload = match change {
+                        crate::worker_projection::WorkerProjectionChange::Upsert(record) => {
+                            let Some(mut worker) = project_registry_worker(&api, record) else {
+                                continue;
+                            };
+                            worker.subject_revision = event.revision;
+                            SubscriptionEventPayload::WorkerUpserted { worker }
+                        }
+                        crate::worker_projection::WorkerProjectionChange::Removed(worker) => {
+                            let Ok(worker_id) =
+                                protocol::subscription::SubscriptionWorkerId::new(worker.worker_id)
+                            else {
+                                continue;
+                            };
+                            SubscriptionEventPayload::WorkerRemoved {
+                                worker_id,
+                                runtime_id: Some(worker.runtime_id),
+                            }
+                        }
+                    };
+                    if send_event(&outbound, &subscription_id, event.revision, payload)
                         .await
                         .is_err()
-                        {
-                            return;
-                        }
+                    {
+                        return;
                     }
                 }
             }
-            BrokerSubscriptionEvent::Event { payload, .. } => match payload {
-                SubscriptionEventPayload::WorkerUpserted { mut worker } => {
-                    worker.runtime_id = Some(runtime_id.clone());
-                    let Ok(Some(resource_key)) = api.store.resource_key(
-                        &api.config.workspace_id,
-                        WorkspaceResourceKind::Worker,
-                        worker.worker_id.as_str(),
-                    ) else {
-                        continue;
-                    };
-                    worker.resource_key = Some(resource_key);
-                    if !project_repository_key(&api, &mut worker) {
-                        continue;
-                    }
-                    let worker_ref = RuntimeWorkerRef::new(&runtime_id, worker.worker_id.as_str());
-                    let revision = next_revision(&mut revisions, &worker_ref);
-                    worker.subject_revision = revision;
-                    workers
-                        .entry(runtime_id)
-                        .or_default()
-                        .insert(worker.worker_id.to_string(), worker.clone());
-                    if send_event(
-                        &outbound,
-                        &subscription_id,
-                        revision,
-                        SubscriptionEventPayload::WorkerUpserted { worker },
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return;
-                    }
-                }
-                SubscriptionEventPayload::WorkerRemoved { worker_id, .. } => {
-                    workers
-                        .entry(runtime_id.clone())
-                        .or_default()
-                        .remove(worker_id.as_str());
-                    let worker_ref = RuntimeWorkerRef::new(&runtime_id, worker_id.as_str());
-                    let revision = next_revision(&mut revisions, &worker_ref);
-                    if send_event(
-                        &outbound,
-                        &subscription_id,
-                        revision,
-                        SubscriptionEventPayload::WorkerRemoved {
-                            worker_id,
-                            runtime_id: Some(runtime_id),
-                        },
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return;
-                    }
-                }
-                _ => {}
-            },
-            BrokerSubscriptionEvent::Disconnected { .. } => {}
-            BrokerSubscriptionEvent::Rejected { code, message, .. } => {
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                 let _ = send_frame(
                     &outbound,
                     SubscriptionFrame::new(SubscriptionFramePayload::Event(
                         SubscriptionEvent::SubscriptionClosed {
                             subscription_id: subscription_id.clone(),
-                            code: rejection_termination(code),
-                            message,
+                            code: protocol::subscription::SubscriptionTerminationCode::Lagged,
+                            message: "durable Worker projection subscriber lagged; reconnect for a fresh snapshot".to_string(),
                         },
                     )),
                 )
                 .await;
                 return;
             }
-            BrokerSubscriptionEvent::Closed { code, message, .. } => {
-                let _ = send_frame(
-                    &outbound,
-                    SubscriptionFrame::new(SubscriptionFramePayload::Event(
-                        SubscriptionEvent::SubscriptionClosed {
-                            subscription_id: subscription_id.clone(),
-                            code,
-                            message,
-                        },
-                    )),
-                )
-                .await;
-                return;
-            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
     }
 }
 
-fn install_snapshot(
+fn project_registry_worker(
     api: &WorkspaceApi,
-    workers: &mut HashMap<String, BTreeMap<String, SubscriptionWorker>>,
-    runtime_id: &str,
-    snapshot: SubscriptionSnapshot,
-) {
-    let SubscriptionSnapshot::Workers {
-        workers: snapshot_workers,
-    } = snapshot
-    else {
-        return;
-    };
-    let mut projected = BTreeMap::new();
-    for mut worker in snapshot_workers {
-        worker.runtime_id = Some(runtime_id.to_string());
-        let Ok(Some(resource_key)) = api.store.resource_key(
-            &api.config.workspace_id,
-            WorkspaceResourceKind::Worker,
-            worker.worker_id.as_str(),
-        ) else {
-            continue;
-        };
-        worker.resource_key = Some(resource_key);
-        if !project_repository_key(api, &mut worker) {
-            continue;
+    record: crate::store::WorkerRegistryProjectionRecord,
+) -> Option<SubscriptionWorker> {
+    let runtime_id = record.registry.worker.runtime_id.clone();
+    let mut worker = if let Some(observation) = record.observation {
+        let mut worker = observation.worker;
+        worker.availability = observation.availability;
+        worker.subject_revision = observation.projection_revision;
+        worker
+    } else {
+        SubscriptionWorker {
+            worker_id: protocol::subscription::SubscriptionWorkerId::new(
+                record.registry.worker.worker_id.clone(),
+            )
+            .ok()?,
+            runtime_id: Some(runtime_id.clone()),
+            resource_key: record.resource_key.clone(),
+            availability: protocol::subscription::SubscriptionWorkerAvailability::Unavailable,
+            subject_revision: 0,
+            worker_state: None,
+            state: protocol::subscription::SubscriptionWorkerState::Stopped,
+            has_running_internal_workers: false,
+            workspace_id: Some(record.registry.workspace_id.clone()),
+            display_name: Some(record.registry.display_name.clone()),
+            profile: record.registry.profile.clone(),
+            repository_id: None,
+            repository_key: None,
+            working_directory_id: None,
         }
-        projected.insert(worker.worker_id.to_string(), worker);
+    };
+    worker.runtime_id = Some(runtime_id);
+    worker.resource_key = record.resource_key;
+    worker.workspace_id = Some(record.registry.workspace_id);
+    worker.display_name = Some(record.registry.display_name);
+    worker.profile = record.registry.profile;
+    if !project_repository_key(api, &mut worker) {
+        return None;
     }
-    workers.insert(runtime_id.to_string(), projected);
+    Some(worker)
 }
 
 fn project_repository_key(api: &WorkspaceApi, worker: &mut SubscriptionWorker) -> bool {
     let Some(repository_id) = worker.repository_id.take() else {
+        worker.repository_key = None;
         return true;
     };
     let Ok(Some(repository)) = api
@@ -547,6 +442,14 @@ fn project_repository_key(api: &WorkspaceApi, worker: &mut SubscriptionWorker) -
     };
     worker.repository_key = Some(repository.repository_key);
     true
+}
+
+fn sort_workers(workers: &mut [SubscriptionWorker]) {
+    workers.sort_by(|left, right| {
+        left.runtime_id
+            .cmp(&right.runtime_id)
+            .then_with(|| left.worker_id.cmp(&right.worker_id))
+    });
 }
 
 async fn send_event(
@@ -585,24 +488,4 @@ async fn send_frame(
         ))
         .await
         .map_err(|_| ())
-}
-
-fn next_revision(revisions: &mut HashMap<RuntimeWorkerRef, u64>, worker: &RuntimeWorkerRef) -> u64 {
-    let revision = revisions.entry(worker.clone()).or_insert(0);
-    *revision = revision.saturating_add(1);
-    *revision
-}
-fn sort_workers(workers: &mut [SubscriptionWorker]) {
-    workers.sort_by(|left, right| {
-        left.runtime_id
-            .cmp(&right.runtime_id)
-            .then_with(|| left.worker_id.cmp(&right.worker_id))
-    });
-}
-fn rejection_termination(code: SubscriptionRejectionCode) -> SubscriptionTerminationCode {
-    match code {
-        SubscriptionRejectionCode::Unauthorized => SubscriptionTerminationCode::Unauthorized,
-        SubscriptionRejectionCode::ResourceNotFound => SubscriptionTerminationCode::ResourceGone,
-        _ => SubscriptionTerminationCode::ServerShutdown,
-    }
 }

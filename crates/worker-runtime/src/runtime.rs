@@ -3413,6 +3413,7 @@ impl RuntimeState {
             worker_id,
             runtime_id: None,
             resource_key: None,
+            availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
             subject_revision: self
                 .worker_subject_revisions
                 .get(&worker.worker_id)

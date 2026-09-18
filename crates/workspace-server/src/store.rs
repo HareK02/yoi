@@ -5,6 +5,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use flow::{CompiledFlowDefinition, FlowSourceKind, compile_flow_source};
+use protocol::subscription::{
+    SubscriptionWorker, SubscriptionWorkerAvailability, SubscriptionWorkerId,
+};
 use rusqlite::backup::Backup;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -18,7 +21,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 61;
+const LATEST_SCHEMA_VERSION: i64 = 62;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -36,6 +39,51 @@ const WORKDIR_CREDENTIAL_CANDIDATE_SNAPSHOT_MIGRATION_NAME: &str =
     "Workdir create credential candidate snapshots";
 const RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME: &str = "guarded Runtime removal operations";
 const REMOVE_WORKER_RUN_GENERATION_MIGRATION_NAME: &str = "remove obsolete Worker run generation";
+const WORKER_REGISTRY_PROJECTION_MIGRATION_NAME: &str =
+    "durable Runtime-backed Worker registry projection";
+const WORKER_REGISTRY_PROJECTION_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS worker_registry_observations (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    availability TEXT NOT NULL CHECK (availability IN ('observed', 'unavailable')),
+    worker_json TEXT,
+    connection_generation INTEGER NOT NULL,
+    subject_revision INTEGER NOT NULL,
+    snapshot_revision INTEGER NOT NULL,
+    projection_revision INTEGER NOT NULL,
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, runtime_id, worker_id),
+    FOREIGN KEY (workspace_id, worker_id)
+        REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS worker_registry_projection_cursors (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    connection_generation INTEGER NOT NULL,
+    snapshot_revision INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, runtime_id)
+);
+CREATE TABLE IF NOT EXISTS worker_registry_projection_revisions (
+    workspace_id TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS worker_registry_projection_removals (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    projection_revision INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, runtime_id, worker_id)
+);
+CREATE TABLE IF NOT EXISTS worker_registry_projection_diagnostics (
+    diagnostic_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    observed_at TEXT NOT NULL
+);
+"#;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -92,6 +140,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 61,
         name: REMOVE_WORKER_RUN_GENERATION_MIGRATION_NAME,
         apply: migrate_worker_run_generation_v60_to_v61,
+    },
+    Migration {
+        version: 62,
+        name: WORKER_REGISTRY_PROJECTION_MIGRATION_NAME,
+        apply: migrate_worker_registry_projection_v61_to_v62,
     },
 ];
 
@@ -486,6 +539,34 @@ pub struct WorkerRegistryRecord {
     pub diagnostics_ref: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Runtime-backed observation joined to the durable Worker catalog.
+///
+/// The Runtime payload remains intact so protocol projection is lossless. Ordering
+/// metadata is persisted separately to reject stale reconnect snapshots and events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerRegistryObservationRecord {
+    pub worker: SubscriptionWorker,
+    pub availability: SubscriptionWorkerAvailability,
+    pub connection_generation: u64,
+    pub subject_revision: u64,
+    pub snapshot_revision: u64,
+    pub projection_revision: u64,
+    pub observed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerRegistryProjectionRecord {
+    pub registry: WorkerRegistryRecord,
+    pub resource_key: Option<String>,
+    pub observation: Option<WorkerRegistryObservationRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerRegistryProjectionCommit {
+    pub revision: u64,
+    pub changed_workers: Vec<RuntimeWorkerRef>,
 }
 
 /// Durable authority describing which Runtime Worker another Runtime Worker may
@@ -1252,6 +1333,52 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         workspace_id: &str,
         limit: usize,
     ) -> Result<Vec<WorkerRegistryRecord>>;
+    fn worker_registry_projection_snapshot(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<(u64, Vec<WorkerRegistryProjectionRecord>)>;
+    fn worker_registry_projection(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<WorkerRegistryProjectionRecord>>;
+    fn reconcile_worker_registry_snapshot(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        connection_generation: u64,
+        snapshot_revision: u64,
+        workers: &[SubscriptionWorker],
+        observed_at: &str,
+    ) -> Result<WorkerRegistryProjectionCommit>;
+    fn apply_worker_registry_observation(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        connection_generation: u64,
+        worker: &SubscriptionWorker,
+        observed_at: &str,
+    ) -> Result<WorkerRegistryProjectionCommit>;
+    fn mark_worker_registry_observation_unavailable(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        connection_generation: u64,
+        worker_id: Option<&str>,
+        subject_revision: Option<u64>,
+        observed_at: &str,
+    ) -> Result<WorkerRegistryProjectionCommit>;
+    fn publish_worker_registry_catalog_change(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<WorkerRegistryProjectionCommit>;
+    fn publish_worker_registry_removal(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<WorkerRegistryProjectionCommit>;
     fn update_worker_retention(
         &self,
         workspace_id: &str,
@@ -5469,6 +5596,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 &record.worker.worker_id,
                 &record.created_at,
             )?;
+            tx.execute(
+                "DELETE FROM worker_registry_projection_removals WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
+                params![record.workspace_id, record.worker.runtime_id, record.worker.worker_id],
+            )?;
             tx.commit()?;
             Ok(())
         })
@@ -5531,6 +5662,283 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             rows.collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(Error::from)
+        })
+    }
+
+    fn worker_registry_projection_snapshot(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<(u64, Vec<WorkerRegistryProjectionRecord>)> {
+        self.with_conn(|conn| {
+            let revision = current_worker_projection_revision(conn, workspace_id)?;
+            let mut statement = conn.prepare(
+                "SELECT runtime_id, worker_id FROM worker_registry WHERE workspace_id = ?1 ORDER BY updated_at DESC LIMIT ?2",
+            )?;
+            let identities = statement.query_map(params![workspace_id, limit as i64], |row| {
+                Ok(RuntimeWorkerRef { runtime_id: row.get(0)?, worker_id: row.get(1)? })
+            })?.collect::<std::result::Result<Vec<_>, _>>()?;
+            let records = identities.iter()
+                .map(|worker| read_worker_registry_projection(conn, workspace_id, worker))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter().flatten().collect();
+            Ok((revision, records))
+        })
+    }
+
+    fn worker_registry_projection(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<WorkerRegistryProjectionRecord>> {
+        self.with_conn(|conn| read_worker_registry_projection(conn, workspace_id, worker))
+    }
+
+    fn reconcile_worker_registry_snapshot(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        connection_generation: u64,
+        snapshot_revision: u64,
+        workers: &[SubscriptionWorker],
+        observed_at: &str,
+    ) -> Result<WorkerRegistryProjectionCommit> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (current_generation, current_snapshot) =
+                worker_projection_cursor(&tx, workspace_id, runtime_id)?;
+            if connection_generation < current_generation
+                || (connection_generation == current_generation
+                    && snapshot_revision < current_snapshot)
+            {
+                let revision = current_worker_projection_revision(&tx, workspace_id)?;
+                tx.commit()?;
+                return Ok(WorkerRegistryProjectionCommit {
+                    revision,
+                    changed_workers: Vec::new(),
+                });
+            }
+            upsert_worker_projection_cursor(
+                &tx,
+                workspace_id,
+                runtime_id,
+                connection_generation,
+                snapshot_revision,
+            )?;
+            let catalog = worker_registry_identities_for_runtime(&tx, workspace_id, runtime_id)?;
+            let runtime_workers = workers
+                .iter()
+                .map(|worker| (worker.worker_id.as_str(), worker))
+                .collect::<HashMap<_, _>>();
+            for worker in workers {
+                if !catalog
+                    .iter()
+                    .any(|item| item.worker_id == worker.worker_id.as_str())
+                {
+                    insert_worker_projection_orphan_diagnostic(
+                        &tx,
+                        workspace_id,
+                        runtime_id,
+                        worker.worker_id.as_str(),
+                        "runtime_worker_without_backend_catalog",
+                        observed_at,
+                    )?;
+                }
+            }
+            let mut changed_workers = Vec::new();
+            for identity in catalog {
+                let changed = if let Some(worker) = runtime_workers.get(identity.worker_id.as_str())
+                {
+                    upsert_worker_observation(
+                        &tx,
+                        workspace_id,
+                        runtime_id,
+                        connection_generation,
+                        snapshot_revision,
+                        worker,
+                        SubscriptionWorkerAvailability::Observed,
+                        observed_at,
+                    )?
+                } else {
+                    set_worker_observation_unavailable(
+                        &tx,
+                        workspace_id,
+                        &identity,
+                        connection_generation,
+                        None,
+                        snapshot_revision,
+                        observed_at,
+                    )?
+                };
+                if changed {
+                    changed_workers.push(identity);
+                }
+            }
+            let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
+            tx.commit()?;
+            Ok(WorkerRegistryProjectionCommit {
+                revision,
+                changed_workers,
+            })
+        })
+    }
+
+    fn apply_worker_registry_observation(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        connection_generation: u64,
+        worker: &SubscriptionWorker,
+        observed_at: &str,
+    ) -> Result<WorkerRegistryProjectionCommit> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let identity = RuntimeWorkerRef {
+                runtime_id: runtime_id.to_string(),
+                worker_id: worker.worker_id.to_string(),
+            };
+            if !worker_registry_identity_exists(&tx, workspace_id, &identity)? {
+                insert_worker_projection_orphan_diagnostic(
+                    &tx,
+                    workspace_id,
+                    runtime_id,
+                    worker.worker_id.as_str(),
+                    "runtime_worker_without_backend_catalog",
+                    observed_at,
+                )?;
+                let revision = current_worker_projection_revision(&tx, workspace_id)?;
+                tx.commit()?;
+                return Ok(WorkerRegistryProjectionCommit {
+                    revision,
+                    changed_workers: Vec::new(),
+                });
+            }
+            let changed = upsert_worker_observation(
+                &tx,
+                workspace_id,
+                runtime_id,
+                connection_generation,
+                0,
+                worker,
+                SubscriptionWorkerAvailability::Observed,
+                observed_at,
+            )?;
+            let changed_workers = if changed { vec![identity] } else { Vec::new() };
+            let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
+            tx.commit()?;
+            Ok(WorkerRegistryProjectionCommit {
+                revision,
+                changed_workers,
+            })
+        })
+    }
+
+    fn mark_worker_registry_observation_unavailable(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        connection_generation: u64,
+        worker_id: Option<&str>,
+        subject_revision: Option<u64>,
+        observed_at: &str,
+    ) -> Result<WorkerRegistryProjectionCommit> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let identities = if let Some(worker_id) = worker_id {
+                vec![RuntimeWorkerRef {
+                    runtime_id: runtime_id.to_string(),
+                    worker_id: worker_id.to_string(),
+                }]
+            } else {
+                worker_registry_identities_for_runtime(&tx, workspace_id, runtime_id)?
+            };
+            let mut changed_workers = Vec::new();
+            for identity in identities {
+                if !worker_registry_identity_exists(&tx, workspace_id, &identity)? {
+                    insert_worker_projection_orphan_diagnostic(
+                        &tx,
+                        workspace_id,
+                        runtime_id,
+                        identity.worker_id.as_str(),
+                        "runtime_worker_without_backend_catalog",
+                        observed_at,
+                    )?;
+                    continue;
+                }
+                if set_worker_observation_unavailable(
+                    &tx,
+                    workspace_id,
+                    &identity,
+                    connection_generation,
+                    subject_revision,
+                    0,
+                    observed_at,
+                )? {
+                    changed_workers.push(identity);
+                }
+            }
+            let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
+            tx.commit()?;
+            Ok(WorkerRegistryProjectionCommit {
+                revision,
+                changed_workers,
+            })
+        })
+    }
+
+    fn publish_worker_registry_catalog_change(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<WorkerRegistryProjectionCommit> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed_workers = if worker_registry_identity_exists(&tx, workspace_id, worker)? {
+                vec![worker.clone()]
+            } else {
+                Vec::new()
+            };
+            let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
+            tx.commit()?;
+            Ok(WorkerRegistryProjectionCommit {
+                revision,
+                changed_workers,
+            })
+        })
+    }
+
+    fn publish_worker_registry_removal(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<WorkerRegistryProjectionCommit> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let published_revision = tx
+                .query_row(
+                    "SELECT projection_revision FROM worker_registry_projection_removals WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
+                    params![workspace_id, worker.runtime_id, worker.worker_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if let Some(revision) = published_revision {
+                tx.commit()?;
+                return Ok(WorkerRegistryProjectionCommit {
+                    revision: revision.max(0) as u64,
+                    changed_workers: Vec::new(),
+                });
+            }
+            let changed_workers = vec![worker.clone()];
+            let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
+            tx.execute(
+                "INSERT INTO worker_registry_projection_removals (workspace_id, runtime_id, worker_id, projection_revision) VALUES (?1, ?2, ?3, ?4)",
+                params![workspace_id, worker.runtime_id, worker.worker_id, revision as i64],
+            )?;
+            tx.commit()?;
+            Ok(WorkerRegistryProjectionCommit {
+                revision,
+                changed_workers,
+            })
         })
     }
 
@@ -8140,6 +8548,301 @@ fn read_worker_registry_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Work
     })
 }
 
+fn read_worker_registry_projection(
+    conn: &Connection,
+    workspace_id: &str,
+    worker: &RuntimeWorkerRef,
+) -> Result<Option<WorkerRegistryProjectionRecord>> {
+    let registry = conn
+        .query_row(
+            "SELECT workspace_id, runtime_id, worker_id, display_name, profile, retention_state, transcript_ref, session_ref, summary_ref, diagnostics_ref, created_at, updated_at FROM worker_registry WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
+            params![workspace_id, worker.runtime_id, worker.worker_id],
+            read_worker_registry_record,
+        )
+        .optional()?;
+    let Some(registry) = registry else {
+        return Ok(None);
+    };
+    let resource_key = conn
+        .query_row(
+            "SELECT resource_key FROM workspace_resource_keys WHERE workspace_id = ?1 AND resource_kind = 'worker' AND resource_id = ?2",
+            params![workspace_id, worker.worker_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let observation = conn
+        .query_row(
+            "SELECT availability, worker_json, connection_generation, subject_revision, snapshot_revision, projection_revision, observed_at FROM worker_registry_observations WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
+            params![workspace_id, worker.runtime_id, worker.worker_id],
+            |row| {
+                let availability: String = row.get(0)?;
+                let worker_json: Option<String> = row.get(1)?;
+                Ok((availability, worker_json, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?, row.get::<_, String>(6)?))
+            },
+        )
+        .optional()?;
+    let observation = observation
+        .map(
+            |(
+                availability,
+                worker_json,
+                generation,
+                subject_revision,
+                snapshot_revision,
+                projection_revision,
+                observed_at,
+            )|
+             -> Result<_> {
+                let availability = match availability.as_str() {
+                    "observed" => SubscriptionWorkerAvailability::Observed,
+                    "unavailable" => SubscriptionWorkerAvailability::Unavailable,
+                    other => {
+                        return Err(Error::InvalidInput(format!(
+                            "invalid Worker observation availability `{other}`"
+                        )));
+                    }
+                };
+                let mut observed_worker: SubscriptionWorker = if let Some(worker_json) = worker_json
+                {
+                    serde_json::from_str(&worker_json).map_err(|error| {
+                        Error::InvalidInput(format!("invalid stored Worker observation: {error}"))
+                    })?
+                } else {
+                    SubscriptionWorker {
+                        worker_id: SubscriptionWorkerId::new(worker.worker_id.to_string())
+                            .map_err(|error| Error::InvalidInput(error.to_string()))?,
+                        runtime_id: Some(worker.runtime_id.to_string()),
+                        resource_key: resource_key.clone(),
+                        availability,
+                        subject_revision: subject_revision.max(0) as u64,
+                        state: protocol::subscription::SubscriptionWorkerState::Stopped,
+                        worker_state: None,
+                        has_running_internal_workers: false,
+                        workspace_id: Some(workspace_id.to_string()),
+                        display_name: Some(registry.display_name.clone()),
+                        profile: registry.profile.clone(),
+                        repository_id: None,
+                        repository_key: None,
+                        working_directory_id: None,
+                    }
+                };
+                observed_worker.availability = availability;
+                observed_worker.resource_key = resource_key.clone();
+                Ok(WorkerRegistryObservationRecord {
+                    worker: observed_worker,
+                    availability,
+                    connection_generation: generation.max(0) as u64,
+                    subject_revision: subject_revision.max(0) as u64,
+                    snapshot_revision: snapshot_revision.max(0) as u64,
+                    projection_revision: projection_revision.max(0) as u64,
+                    observed_at,
+                })
+            },
+        )
+        .transpose()?;
+    Ok(Some(WorkerRegistryProjectionRecord {
+        registry,
+        resource_key,
+        observation,
+    }))
+}
+
+fn current_worker_projection_revision(conn: &Connection, workspace_id: &str) -> Result<u64> {
+    Ok(conn
+        .query_row(
+            "SELECT revision FROM worker_registry_projection_revisions WHERE workspace_id = ?1",
+            params![workspace_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .unwrap_or(0)
+        .max(0) as u64)
+}
+
+fn worker_projection_cursor(
+    conn: &Connection,
+    workspace_id: &str,
+    runtime_id: &str,
+) -> Result<(u64, u64)> {
+    Ok(conn.query_row(
+        "SELECT connection_generation, snapshot_revision FROM worker_registry_projection_cursors WHERE workspace_id = ?1 AND runtime_id = ?2",
+        params![workspace_id, runtime_id],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    ).optional()?.map(|(generation, revision)| (generation.max(0) as u64, revision.max(0) as u64)).unwrap_or((0, 0)))
+}
+
+fn upsert_worker_projection_cursor(
+    conn: &Connection,
+    workspace_id: &str,
+    runtime_id: &str,
+    generation: u64,
+    snapshot_revision: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO worker_registry_projection_cursors (workspace_id, runtime_id, connection_generation, snapshot_revision) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(workspace_id, runtime_id) DO UPDATE SET connection_generation = excluded.connection_generation, snapshot_revision = excluded.snapshot_revision",
+        params![workspace_id, runtime_id, generation as i64, snapshot_revision as i64],
+    )?;
+    Ok(())
+}
+
+fn worker_registry_identities_for_runtime(
+    conn: &Connection,
+    workspace_id: &str,
+    runtime_id: &str,
+) -> Result<Vec<RuntimeWorkerRef>> {
+    let mut statement = conn.prepare("SELECT runtime_id, worker_id FROM worker_registry WHERE workspace_id = ?1 AND runtime_id = ?2 ORDER BY worker_id")?;
+    Ok(statement
+        .query_map(params![workspace_id, runtime_id], |row| {
+            Ok(RuntimeWorkerRef {
+                runtime_id: row.get(0)?,
+                worker_id: row.get(1)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn worker_registry_identity_exists(
+    conn: &Connection,
+    workspace_id: &str,
+    worker: &RuntimeWorkerRef,
+) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT 1 FROM worker_registry WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
+        params![workspace_id, worker.runtime_id, worker.worker_id],
+        |_| Ok(()),
+    ).optional()?.is_some())
+}
+
+fn insert_worker_projection_orphan_diagnostic(
+    conn: &Connection,
+    workspace_id: &str,
+    runtime_id: &str,
+    worker_id: &str,
+    reason: &str,
+    observed_at: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO worker_registry_projection_diagnostics (workspace_id, runtime_id, worker_id, reason, observed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![workspace_id, runtime_id, worker_id, reason, observed_at],
+    )?;
+    Ok(())
+}
+
+fn upsert_worker_observation(
+    conn: &Connection,
+    workspace_id: &str,
+    runtime_id: &str,
+    connection_generation: u64,
+    snapshot_revision: u64,
+    worker: &SubscriptionWorker,
+    availability: SubscriptionWorkerAvailability,
+    observed_at: &str,
+) -> Result<bool> {
+    let existing = conn.query_row(
+        "SELECT availability, worker_json, connection_generation, subject_revision FROM worker_registry_observations WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
+        params![workspace_id, runtime_id, worker.worker_id.as_str()],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
+    ).optional()?;
+    if let Some((old_availability, _, generation, revision)) = existing.as_ref() {
+        let generation = (*generation).max(0) as u64;
+        let revision = (*revision).max(0) as u64;
+        let restores_unavailable = old_availability == "unavailable"
+            && availability == SubscriptionWorkerAvailability::Observed;
+        if connection_generation < generation
+            || (connection_generation == generation
+                && (worker.subject_revision < revision
+                    || (worker.subject_revision == revision && !restores_unavailable)))
+        {
+            return Ok(false);
+        }
+    }
+    let mut persisted_worker = worker.clone();
+    persisted_worker.runtime_id = Some(runtime_id.to_string());
+    persisted_worker.availability = availability;
+    let worker_json = serde_json::to_string(&persisted_worker).map_err(|error| {
+        Error::InvalidInput(format!("failed to encode Worker observation: {error}"))
+    })?;
+    let availability_text = match availability {
+        SubscriptionWorkerAvailability::Observed => "observed",
+        SubscriptionWorkerAvailability::Unavailable => "unavailable",
+    };
+    let changed = existing
+        .as_ref()
+        .is_none_or(|(old_availability, old_json, _, _)| {
+            old_availability != availability_text
+                || old_json.as_deref() != Some(worker_json.as_str())
+        });
+    conn.execute(
+        "INSERT INTO worker_registry_observations (workspace_id, runtime_id, worker_id, availability, worker_json, connection_generation, subject_revision, snapshot_revision, projection_revision, observed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9) ON CONFLICT(workspace_id, runtime_id, worker_id) DO UPDATE SET availability = excluded.availability, worker_json = excluded.worker_json, connection_generation = excluded.connection_generation, subject_revision = excluded.subject_revision, snapshot_revision = MAX(worker_registry_observations.snapshot_revision, excluded.snapshot_revision), observed_at = excluded.observed_at",
+        params![workspace_id, runtime_id, worker.worker_id.as_str(), availability_text, worker_json, connection_generation as i64, worker.subject_revision as i64, snapshot_revision as i64, observed_at],
+    )?;
+    Ok(changed)
+}
+
+fn set_worker_observation_unavailable(
+    conn: &Connection,
+    workspace_id: &str,
+    worker: &RuntimeWorkerRef,
+    connection_generation: u64,
+    subject_revision: Option<u64>,
+    snapshot_revision: u64,
+    observed_at: &str,
+) -> Result<bool> {
+    let existing = conn.query_row(
+        "SELECT availability, connection_generation, subject_revision, worker_json FROM worker_registry_observations WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
+        params![workspace_id, worker.runtime_id, worker.worker_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, Option<String>>(3)?)),
+    ).optional()?;
+    if let Some((availability, generation, revision, _)) = existing.as_ref() {
+        let generation = (*generation).max(0) as u64;
+        let revision = (*revision).max(0) as u64;
+        if connection_generation < generation
+            || (connection_generation == generation
+                && subject_revision.is_some_and(|incoming| incoming <= revision))
+        {
+            return Ok(false);
+        }
+        if availability == "unavailable"
+            && subject_revision.is_none()
+            && connection_generation == generation
+        {
+            return Ok(false);
+        }
+    }
+    let revision = subject_revision
+        .or_else(|| existing.as_ref().map(|item| item.2.max(0) as u64))
+        .unwrap_or(0);
+    let worker_json = existing.and_then(|item| item.3);
+    conn.execute(
+        "INSERT INTO worker_registry_observations (workspace_id, runtime_id, worker_id, availability, worker_json, connection_generation, subject_revision, snapshot_revision, projection_revision, observed_at) VALUES (?1, ?2, ?3, 'unavailable', ?4, ?5, ?6, ?7, 0, ?8) ON CONFLICT(workspace_id, runtime_id, worker_id) DO UPDATE SET availability = 'unavailable', connection_generation = excluded.connection_generation, subject_revision = excluded.subject_revision, snapshot_revision = MAX(worker_registry_observations.snapshot_revision, excluded.snapshot_revision), observed_at = excluded.observed_at",
+        params![workspace_id, worker.runtime_id, worker.worker_id, worker_json, connection_generation as i64, revision as i64, snapshot_revision as i64, observed_at],
+    )?;
+    Ok(true)
+}
+
+fn commit_worker_projection_changes(
+    conn: &Connection,
+    workspace_id: &str,
+    changed_workers: &[RuntimeWorkerRef],
+) -> Result<u64> {
+    let current = current_worker_projection_revision(conn, workspace_id)?;
+    if changed_workers.is_empty() {
+        return Ok(current);
+    }
+    let revision = current.saturating_add(1);
+    conn.execute(
+        "INSERT INTO worker_registry_projection_revisions (workspace_id, revision) VALUES (?1, ?2) ON CONFLICT(workspace_id) DO UPDATE SET revision = excluded.revision",
+        params![workspace_id, revision as i64],
+    )?;
+    for worker in changed_workers {
+        conn.execute(
+            "UPDATE worker_registry_observations SET projection_revision = ?1 WHERE workspace_id = ?2 AND runtime_id = ?3 AND worker_id = ?4",
+            params![revision as i64, workspace_id, worker.runtime_id, worker.worker_id],
+        )?;
+    }
+    Ok(revision)
+}
+
 fn read_worker_control_grant_record(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<WorkerControlGrantRecord> {
@@ -9786,9 +10489,20 @@ fn migrate_worker_run_generation_v60_to_v61(conn: &Connection) -> Result<()> {
     tx.execute_batch("ALTER TABLE worker_removal_operations DROP COLUMN run_generation;")?;
     tx.execute(
         "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![61, REMOVE_WORKER_RUN_GENERATION_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_worker_registry_projection_v61_to_v62(conn: &Connection) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch(WORKER_REGISTRY_PROJECTION_SCHEMA)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
         params![
             LATEST_SCHEMA_VERSION,
-            REMOVE_WORKER_RUN_GENERATION_MIGRATION_NAME
+            WORKER_REGISTRY_PROJECTION_MIGRATION_NAME
         ],
     )?;
     tx.commit()?;
@@ -11166,6 +11880,10 @@ mod tests {
                     version: 61,
                     name: REMOVE_WORKER_RUN_GENERATION_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 62,
+                    name: WORKER_REGISTRY_PROJECTION_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -11216,6 +11934,7 @@ mod tests {
                             61,
                             REMOVE_WORKER_RUN_GENERATION_MIGRATION_NAME.to_string(),
                         ),
+                        (62, WORKER_REGISTRY_PROJECTION_MIGRATION_NAME.to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -11286,7 +12005,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![52, 53, 54, 55, 56, 57, 58, 59, 60, 61]
+            vec![52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
@@ -11294,7 +12013,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 12);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 13);
     }
 
     #[test]
@@ -14140,6 +14859,223 @@ INSERT INTO worker_registry (
         assert_eq!(
             store.attach_worker_workdir(&workdir_conflict).unwrap(),
             workdir_conflict
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_projection_reconciles_snapshots_and_preserves_unavailable_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteWorkspaceStore::open(temp.path().join("workspace.db")).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "local-dev".to_string(),
+                owner_account_id: "owner-account".to_string(),
+                display_name: "Local Dev".to_string(),
+                state: "active".to_string(),
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .await
+            .unwrap();
+        let catalog = WorkerRegistryRecord {
+            workspace_id: "local-dev".to_string(),
+            worker: RuntimeWorkerRef::new("embedded", "known"),
+            display_name: "Known Worker".to_string(),
+            profile: None,
+            retention_state: "normal".to_string(),
+            transcript_ref: None,
+            session_ref: None,
+            summary_ref: None,
+            diagnostics_ref: None,
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        store.upsert_worker_registry(&catalog).unwrap();
+        assert_eq!(
+            store
+                .resource_key("local-dev", WorkspaceResourceKind::Worker, "known")
+                .unwrap()
+                .as_deref(),
+            Some("W-1")
+        );
+        assert_eq!(
+            store
+                .worker_registry_projection("local-dev", &catalog.worker)
+                .unwrap()
+                .unwrap()
+                .resource_key
+                .as_deref(),
+            Some("W-1")
+        );
+        let observed = SubscriptionWorker {
+            worker_id: SubscriptionWorkerId::new("known").unwrap(),
+            runtime_id: Some("embedded".to_string()),
+            resource_key: None,
+            availability: SubscriptionWorkerAvailability::Observed,
+            subject_revision: 4,
+            worker_state: None,
+            state: protocol::subscription::SubscriptionWorkerState::Running,
+            has_running_internal_workers: true,
+            workspace_id: Some("local-dev".to_string()),
+            display_name: Some("Known Worker".to_string()),
+            profile: None,
+            repository_id: None,
+            repository_key: None,
+            working_directory_id: None,
+        };
+        let orphan = SubscriptionWorker {
+            worker_id: SubscriptionWorkerId::new("orphan").unwrap(),
+            ..observed.clone()
+        };
+        let first = store
+            .reconcile_worker_registry_snapshot(
+                "local-dev",
+                "embedded",
+                1,
+                10,
+                &[observed.clone(), orphan],
+                "2",
+            )
+            .unwrap();
+        assert_eq!(first.changed_workers, vec![catalog.worker.clone()]);
+        let (_, records) = store
+            .worker_registry_projection_snapshot("local-dev", 10)
+            .unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "orphan Runtime rows must not create catalog rows"
+        );
+        let observation = records[0].observation.as_ref().unwrap();
+        assert_eq!(
+            observation.availability,
+            SubscriptionWorkerAvailability::Observed
+        );
+        assert_eq!(
+            observation.worker.state,
+            protocol::subscription::SubscriptionWorkerState::Running
+        );
+
+        let unavailable = store
+            .reconcile_worker_registry_snapshot("local-dev", "embedded", 1, 11, &[], "3")
+            .unwrap();
+        assert_eq!(unavailable.changed_workers, vec![catalog.worker.clone()]);
+        let projection = store
+            .worker_registry_projection("local-dev", &catalog.worker)
+            .unwrap()
+            .unwrap();
+        let observation = projection.observation.unwrap();
+        assert_eq!(
+            observation.availability,
+            SubscriptionWorkerAvailability::Unavailable
+        );
+        assert_eq!(
+            observation.worker.state,
+            protocol::subscription::SubscriptionWorkerState::Running,
+            "unavailable must retain the last lifecycle observation rather than becoming stopped"
+        );
+
+        let duplicate = store
+            .reconcile_worker_registry_snapshot("local-dev", "embedded", 1, 11, &[], "4")
+            .unwrap();
+        assert!(duplicate.changed_workers.is_empty());
+
+        let reconnected = store
+            .reconcile_worker_registry_snapshot(
+                "local-dev",
+                "embedded",
+                1,
+                11,
+                &[observed.clone()],
+                "5",
+            )
+            .unwrap();
+        assert_eq!(reconnected.changed_workers, vec![catalog.worker.clone()]);
+        let projection = store
+            .worker_registry_projection("local-dev", &catalog.worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            projection.observation.unwrap().availability,
+            SubscriptionWorkerAvailability::Observed,
+            "an equal-revision reconnect snapshot must restore availability"
+        );
+        let duplicate_reconnect = store
+            .reconcile_worker_registry_snapshot("local-dev", "embedded", 1, 11, &[observed], "6")
+            .unwrap();
+        assert!(duplicate_reconnect.changed_workers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn late_runtime_event_does_not_recreate_retention_deleted_catalog_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteWorkspaceStore::open(temp.path().join("workspace.db")).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "local-dev".to_string(),
+                owner_account_id: "owner-account".to_string(),
+                display_name: "Local Dev".to_string(),
+                state: "active".to_string(),
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .await
+            .unwrap();
+        let worker_ref = RuntimeWorkerRef::new("embedded", "removed");
+        store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: "local-dev".to_string(),
+                worker: worker_ref.clone(),
+                display_name: "Removed Worker".to_string(),
+                profile: None,
+                retention_state: "normal".to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .unwrap();
+        assert!(
+            store
+                .delete_worker_registry("local-dev", &worker_ref)
+                .unwrap()
+        );
+        let first_removal = store
+            .publish_worker_registry_removal("local-dev", &worker_ref)
+            .unwrap();
+        assert_eq!(first_removal.changed_workers, vec![worker_ref.clone()]);
+        let duplicate_removal = store
+            .publish_worker_registry_removal("local-dev", &worker_ref)
+            .unwrap();
+        assert!(duplicate_removal.changed_workers.is_empty());
+        assert_eq!(duplicate_removal.revision, first_removal.revision);
+        let event = SubscriptionWorker {
+            worker_id: SubscriptionWorkerId::new("removed").unwrap(),
+            runtime_id: Some("embedded".to_string()),
+            resource_key: None,
+            availability: SubscriptionWorkerAvailability::Observed,
+            subject_revision: 99,
+            worker_state: None,
+            state: protocol::subscription::SubscriptionWorkerState::Running,
+            has_running_internal_workers: false,
+            workspace_id: Some("local-dev".to_string()),
+            display_name: None,
+            profile: None,
+            repository_id: None,
+            repository_key: None,
+            working_directory_id: None,
+        };
+        let commit = store
+            .apply_worker_registry_observation("local-dev", "embedded", 2, &event, "2")
+            .unwrap();
+        assert!(commit.changed_workers.is_empty());
+        assert!(
+            store
+                .worker_registry_projection("local-dev", &worker_ref)
+                .unwrap()
+                .is_none()
         );
     }
 

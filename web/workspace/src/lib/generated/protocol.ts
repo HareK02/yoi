@@ -232,6 +232,8 @@ export type SubscriptionWorkerIds = Array<SubscriptionWorkerId>;
 
 export type SubscriptionWorkerState = "idle" | "running" | "paused" | "stopped";
 
+export type SubscriptionWorkerAvailability = "observed" | "unavailable";
+
 export type EventSubscriptionSelector = { "topic": "runtime_workers" } | { "topic": "worker_lifecycle", worker_ids: SubscriptionWorkerIds, } | { "topic": "worker_protocol", worker_id: SubscriptionWorkerId, runtime_id?: string | null, } | { "topic": "workspace_workers" } | { "topic": "workspace_workdirs" };
 
 export type SubscriptionWorker = { worker_id: SubscriptionWorkerId,
@@ -245,6 +247,11 @@ runtime_id?: string | null,
  * Workspace-facing projections must populate it before publishing the Worker.
  */
 resource_key?: string | null,
+/**
+ * Freshness of the Runtime-backed observation carried by this projection.
+ * `Unavailable` preserves catalog membership without claiming that execution stopped.
+ */
+availability: SubscriptionWorkerAvailability,
 /**
  * Producer-owned monotonic revision for this Worker subject.
  */
