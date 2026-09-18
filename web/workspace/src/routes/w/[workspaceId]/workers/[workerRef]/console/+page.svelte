@@ -2120,7 +2120,7 @@
         color: var(--text-muted);
         padding: 0.42rem 0.65rem;
         font: inherit;
-        font-size: 0.7rem;
+        font-size: var(--font-size-compact);
         font-weight: 700;
         cursor: pointer;
     }
@@ -2147,7 +2147,7 @@
 
     .rewind-targets h3 {
         margin: 0;
-        font-size: 0.9rem;
+        font-size: var(--font-size-body);
     }
 
     .rewind-target-list {
@@ -2209,7 +2209,7 @@
         background: var(--bg-raised);
         color: var(--text-muted);
         cursor: pointer;
-        font-size: 0.76rem;
+        font-size: var(--font-size-compact);
         font-weight: 800;
         padding: 0.35rem 0.5rem;
         text-align: left;
@@ -2240,7 +2240,7 @@
     .pending-submissions {
         margin: 0 var(--space-3);
         color: var(--muted);
-        font-size: 0.75rem;
+        font-size: var(--font-size-compact);
     }
 
     .pending-submissions ol {
@@ -2306,7 +2306,7 @@
 
     .console-side-panel dt {
         color: var(--text-muted);
-        font-size: 0.72rem;
+        font-size: var(--font-size-compact);
         font-weight: 800;
         letter-spacing: 0.05em;
         text-transform: uppercase;
@@ -2320,7 +2320,7 @@
 
     .metadata-details {
         color: var(--text-muted);
-        font-size: 0.84rem;
+        font-size: var(--font-size-compact);
     }
 
     .metadata-details summary {
@@ -2380,7 +2380,7 @@
         border: 1px solid var(--line);
         border-radius: 999px;
         padding: 0.2rem 0.5rem;
-        font: 500 0.75rem/1.2 var(--font-mono);
+        font: 500 var(--font-size-compact) / var(--line-height-compact) var(--font-mono);
     }
 
     .composer-attachment.failed {
@@ -2469,12 +2469,12 @@
         gap: var(--space-2);
         align-items: center;
         color: var(--text-muted);
-        font-size: 0.86rem;
+        font-size: var(--font-size-compact);
     }
 
     .composer-notice {
         color: var(--text-muted);
-        font-size: 0.86rem;
+        font-size: var(--font-size-compact);
     }
 
     .composer-actions {

@@ -4,6 +4,10 @@
 real Web Workspace. It does not add a Yoi product Skill, Flow, Runtime capability, or browser
 automation route.
 
+The required implementer-owned review workflow and pass/fail policy are defined in
+[`../../docs/development/ui-ux/visual-review.md`](../../docs/development/ui-ux/visual-review.md). This
+README documents the tool; running the tool is not itself visual review completion.
+
 The workbench produces a **review context bundle** rather than treating a screenshot as evidence by
 itself. Every capture records the persona, route, viewport, theme, intended user goal, expected data
 state, sanitized document URL/status, console/page/request failures, screenshot hashes, an

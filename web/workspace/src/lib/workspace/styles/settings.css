@@ -1,5 +1,40 @@
 @layer reset, tokens, base, layout, components;
 @layer components {
+  .main-content .muted {
+    color: var(--text-muted);
+  }
+
+  .main-content .inline-link {
+    color: var(--accent);
+    font-weight: 700;
+    text-underline-offset: 0.15em;
+  }
+
+  .main-content .secondary-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-soft);
+    padding: 0.45rem 0.75rem;
+    background: var(--bg-raised);
+    color: var(--text-strong);
+    font-weight: 700;
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  .main-content .secondary-button:hover:not(:disabled),
+  .main-content .secondary-button:focus-visible:not(:disabled) {
+    border-color: var(--accent);
+    background: var(--interactive-hover);
+  }
+
+  .main-content .secondary-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
   .settings-button {
     text-decoration: none;
     cursor: pointer;
@@ -32,15 +67,23 @@
   }
 
   .badge {
+    display: inline-flex;
     flex: 0 0 auto;
-    border-radius: 999px;
-    padding: 0.35rem 0.65rem;
-    background: var(--bg-subtle);
+    align-items: center;
+    gap: var(--space-1);
     color: var(--text-muted);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     font-weight: 800;
     letter-spacing: 0.06em;
     text-transform: uppercase;
+  }
+
+  .badge::before {
+    width: 0.45rem;
+    height: 0.45rem;
+    border-radius: 50%;
+    background: currentColor;
+    content: "";
   }
 
   .badge.warning {
@@ -62,7 +105,6 @@
     max-width: 24rem;
     padding: var(--space-3) var(--space-4);
     border: 1px solid var(--line);
-    border-radius: var(--radius-panel);
     background: var(--bg-raised);
     color: var(--text-muted);
   }
@@ -83,7 +125,6 @@
     min-width: min(16rem, 100%);
     padding: var(--space-3) var(--space-4);
     border: 1px solid var(--line);
-    border-radius: var(--radius-panel);
     background: var(--bg-raised);
     color: inherit;
     text-decoration: none;
@@ -128,7 +169,6 @@
 
   .settings-pattern {
     padding: var(--space-4);
-    border-radius: var(--radius-panel);
     background: var(--bg-raised);
   }
 
@@ -162,7 +202,7 @@
 
   .account-details dt {
     color: var(--text-muted);
-    font-size: 0.8rem;
+    font-size: var(--font-size-compact);
     font-weight: 700;
     text-transform: uppercase;
   }
@@ -173,7 +213,7 @@
   }
 
   .account-details code {
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
   }
 
   .account-panel {
@@ -192,7 +232,7 @@
     display: grid;
     gap: 0.25rem;
     color: var(--text-muted);
-    font-size: 0.78rem;
+    font-size: var(--font-size-body);
   }
 
   .settings-runtime-form button,
@@ -223,7 +263,7 @@
     border: 1px solid var(--line);
     border-radius: 1rem;
     padding: 1rem;
-    background: rgba(255, 255, 255, 0.03);
+    background: color-mix(in srgb, var(--text-strong) 3%, transparent);
   }
 
   .settings-runtime-table-wrap {
@@ -249,7 +289,7 @@
 
   .settings-runtime-table th {
     color: var(--text-muted);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     letter-spacing: 0.05em;
     text-transform: uppercase;
   }
@@ -288,12 +328,12 @@
 
   .settings-runtime-detail-row td {
     padding-top: 0;
-    background: rgba(255, 255, 255, 0.025);
+    background: color-mix(in srgb, var(--text-strong) 2.5%, transparent);
   }
 
   .settings-muted-action {
     color: var(--text-muted);
-    font-size: 0.82rem;
+    font-size: var(--font-size-compact);
   }
 
   .settings-action-row {
@@ -325,18 +365,18 @@
   }
 
   .settings-diagnostics-list li.error {
-    border-color: rgba(255, 99, 99, 0.55);
+    border-color: color-mix(in srgb, var(--danger) 55%, transparent);
   }
 
   .settings-diagnostics-list li.warning {
-    border-color: rgba(255, 205, 86, 0.55);
+    border-color: color-mix(in srgb, var(--warning) 55%, transparent);
   }
 
   .settings-test-result {
     display: grid;
     gap: 0.3rem;
     border-radius: 0.75rem;
-    background: rgba(255, 255, 255, 0.04);
+    background: color-mix(in srgb, var(--text-strong) 4%, transparent);
     padding: 0.75rem;
   }
   .settings-test-result.failed {
@@ -374,7 +414,7 @@
   .runtime-detail-grid dt {
     margin-bottom: var(--space-1);
     color: var(--text-muted);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     font-weight: 700;
     letter-spacing: 0.05em;
     text-transform: uppercase;
@@ -433,7 +473,7 @@
     background: var(--bg-raised);
     color: var(--text-strong);
     font-family: var(--font-mono);
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
   }
 
   .runtime-public-key {
@@ -468,7 +508,7 @@
   .runtime-trust-form label,
   .runtime-revoke-row label {
     color: var(--text-muted);
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
     font-weight: 700;
   }
 
@@ -503,7 +543,7 @@
 
   .runtime-trust-comparison dt {
     color: var(--text-muted);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     font-weight: 700;
   }
 
@@ -559,7 +599,7 @@
 
   .runtime-audit-table th {
     color: var(--text-muted);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     letter-spacing: 0.05em;
     text-transform: uppercase;
   }
@@ -589,7 +629,6 @@
     min-width: min(16rem, 100%);
     padding: var(--space-3) var(--space-4);
     border: 1px solid var(--line);
-    border-radius: var(--radius-panel);
     background: var(--bg-raised);
   }
   .settings-section-card:hover,
@@ -628,7 +667,7 @@
     display: grid;
     gap: var(--space-1);
     color: var(--text-muted);
-    font-size: 0.82rem;
+    font-size: var(--font-size-body);
   }
   .settings-form input,
   .settings-form select,
@@ -685,7 +724,6 @@
     gap: var(--space-2);
     padding: var(--space-3);
     border: 1px solid var(--line);
-    border-radius: var(--radius-panel);
     background: var(--bg-raised);
   }
   .settings-profile-list strong,
@@ -721,21 +759,28 @@
   }
   .settings-identity-list dt {
     color: var(--text-muted);
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
   }
   .settings-identity-list dd {
     margin: 0;
     color: var(--text-strong);
   }
   .section-status-pill {
+    display: inline-flex;
     width: fit-content;
-    border-radius: 999px;
-    padding: 0.25rem 0.55rem;
-    background: var(--bg-subtle);
+    align-items: center;
+    gap: var(--space-1);
     color: var(--text-muted);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     font-weight: 800;
     text-transform: uppercase;
+  }
+  .section-status-pill::before {
+    width: 0.45rem;
+    height: 0.45rem;
+    border-radius: 50%;
+    background: currentColor;
+    content: "";
   }
   .config-source-shell {
     display: grid;
@@ -743,7 +788,6 @@
     min-height: 40rem;
     overflow: hidden;
     border: 1px solid var(--line);
-    border-radius: var(--radius-panel);
     background: var(--bg-raised);
   }
   .config-source-tree {
@@ -784,7 +828,7 @@
   }
   .config-source-tree nav button small {
     color: var(--text-muted);
-    font-size: 0.65rem;
+    font-size: var(--font-size-compact);
     letter-spacing: 0.06em;
     text-transform: uppercase;
   }
@@ -799,10 +843,13 @@
     padding: var(--space-3);
     border-top: 1px solid var(--line);
   }
-  .config-source-create label,
+  .config-source-create label {
+    color: var(--text-muted);
+    font-size: var(--font-size-body);
+  }
   .config-source-workbench__header span {
     color: var(--text-muted);
-    font-size: 0.75rem;
+    font-size: var(--font-size-compact);
   }
   .config-source-create input,
   .config-source-actions input {
@@ -861,7 +908,7 @@
     padding: var(--space-2) var(--space-3);
     border-top: 1px solid var(--line);
     color: var(--text-muted);
-    font-size: 0.8rem;
+    font-size: var(--font-size-compact);
   }
   .config-source-conflict {
     display: flex;
@@ -924,7 +971,6 @@
     gap: var(--space-4);
     padding: var(--space-5);
     border: 1px solid var(--line);
-    border-radius: var(--radius-panel);
     background: var(--bg-raised);
   }
   .settings-repository-form h2 {
@@ -934,7 +980,7 @@
     display: grid;
     gap: var(--space-2);
     color: var(--text-muted);
-    font-size: 0.78rem;
+    font-size: var(--font-size-body);
     font-weight: 700;
   }
   .settings-repository-form input {
@@ -963,7 +1009,6 @@
   .settings-repository-table-wrap {
     overflow-x: auto;
     border: 1px solid var(--line);
-    border-radius: var(--radius-panel);
     background: var(--bg-raised);
   }
   .settings-repository-table {
@@ -979,7 +1024,7 @@
   }
   .settings-repository-table th {
     color: var(--text-muted);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     text-transform: uppercase;
   }
   .settings-repository-table tbody tr:last-child td {

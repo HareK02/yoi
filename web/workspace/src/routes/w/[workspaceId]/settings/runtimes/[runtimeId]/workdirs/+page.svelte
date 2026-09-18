@@ -187,9 +187,9 @@
     width: 2rem;
     height: 2rem;
     padding: 0;
-    border: 1px solid var(--border);
+    border: 1px solid var(--line);
     border-radius: 0.5rem;
-    background: var(--surface);
+    background: var(--bg-raised);
     color: var(--text);
     cursor: pointer;
   }

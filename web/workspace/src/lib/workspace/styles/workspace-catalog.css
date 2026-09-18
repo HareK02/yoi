@@ -1,3 +1,4 @@
+@layer reset, tokens, base, layout, components;
 @layer components {
   .workspace-catalog-shell {
     width: min(1120px, calc(100% - 2rem));
@@ -32,7 +33,7 @@
 
   .workspace-catalog-eyebrow {
     color: var(--accent) !important;
-    font-size: 0.75rem;
+    font-size: var(--font-size-compact);
     font-weight: 700;
     letter-spacing: 0.12em;
     text-transform: uppercase;
@@ -74,11 +75,20 @@
   }
 
   .workspace-card-heading > span {
-    border: 1px solid var(--line);
-    border-radius: 999px;
-    padding: 0.15rem 0.5rem;
-    font-size: 0.7rem;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    color: var(--text-muted);
+    font-size: var(--font-size-compact);
     text-transform: uppercase;
+  }
+
+  .workspace-card-heading > span::before {
+    width: 0.45rem;
+    height: 0.45rem;
+    border-radius: 50%;
+    background: currentColor;
+    content: "";
   }
 
   .workspace-card-heading > .workspace-state-active {
@@ -112,7 +122,7 @@
     display: grid;
     gap: 0.35rem;
     color: var(--text-muted);
-    font-size: 0.8rem;
+    font-size: var(--font-size-body);
   }
 
   .workspace-create-panel input,
@@ -172,7 +182,7 @@
   }
 
   .workspace-switcher label {
-    font-size: 0.68rem;
+    font-size: var(--font-size-compact);
     letter-spacing: 0.08em;
     color: var(--text-muted);
     text-transform: uppercase;
@@ -181,18 +191,18 @@
   .workspace-switcher select {
     width: 100%;
     padding: 0.45rem 0.55rem;
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
   }
 
   .workspace-switcher-actions {
     display: flex;
     gap: 0.75rem;
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
   }
 
   .workspace-switcher-error {
     color: var(--danger);
-    font-size: 0.7rem;
+    font-size: var(--font-size-compact);
   }
 
   @media (max-width: 760px) {

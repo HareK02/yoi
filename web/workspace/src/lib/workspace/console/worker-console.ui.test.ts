@@ -78,6 +78,134 @@ Deno.test("workspace feature css is owned outside app css", async () => {
   );
 });
 
+Deno.test("workspace app css is limited to global foundation", async () => {
+  const appCss = await Deno.readTextFile(
+    new URL("./../../../app.css", import.meta.url),
+  );
+  const workspacePagesCss = await Deno.readTextFile(
+    new URL(
+      "./../styles/workspace-pages.css",
+      import.meta.url,
+    ),
+  );
+  const settingsCss = await Deno.readTextFile(
+    new URL("./../styles/settings.css", import.meta.url),
+  );
+  const sidebarCss = await Deno.readTextFile(
+    new URL("./../sidebar/sidebar.css", import.meta.url),
+  );
+
+  for (
+    const selector of [
+      ".card",
+      ".stack",
+      ".section-note",
+      ".section-state",
+      ".muted",
+      ".table-wrap",
+      ".inline-link",
+      ".secondary-button",
+    ]
+  ) {
+    assert(
+      !appCss.includes(selector),
+      `app.css must not own feature selector ${selector}`,
+    );
+  }
+
+  assert(
+    !/^\s*a\s*\{[^}]*\bcolor\s*:/ms.test(appCss),
+    "app.css must not override component-owned link colors",
+  );
+
+  for (
+    const legacyToken of [
+      "--surface",
+      "--border",
+      "--bg-panel",
+      "--interactive-muted",
+      "--radius-card",
+      "--radius-panel",
+      "--shadow-soft",
+      "--tui-error",
+    ]
+  ) {
+    assert(
+      !appCss.includes(legacyToken),
+      `app.css must not retain legacy token ${legacyToken}`,
+    );
+  }
+
+  assert(
+    workspacePagesCss.includes(".main-content .card") &&
+      workspacePagesCss.includes(".main-content table") &&
+      workspacePagesCss.includes(".main-content dl"),
+    "workspace content primitives must be scoped to the main content owner",
+  );
+  assert(
+    settingsCss.includes(".main-content .inline-link") &&
+      settingsCss.includes(".main-content .secondary-button"),
+    "settings CSS must own its link and button variants",
+  );
+  assert(
+    sidebarCss.includes(".section-state"),
+    "sidebar CSS must own sidebar status presentation",
+  );
+});
+
+Deno.test("design lab demonstrates nested sidebar slots without flattening levels", async () => {
+  const workspaceLayout = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/design-lab/workspace-web-ux/+layout.svelte",
+      import.meta.url,
+    ),
+  );
+  const settingsLayout = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/design-lab/workspace-web-ux/settings/+layout.svelte",
+      import.meta.url,
+    ),
+  );
+
+  assert(
+    workspaceLayout.includes("createOverrideStack<SidebarSnippet>"),
+    "Workspace design-lab layout must provide a child sidebar slot",
+  );
+  assert(
+    workspaceLayout.includes("<WorkspaceSidebarFixture"),
+    "Workspace design-lab layout must register its WorkspaceSidebar fixture",
+  );
+  assert(
+    workspaceLayout.includes("content={sidebarContent}"),
+    "Workspace design-lab layout must expose its child override slot",
+  );
+  assert(
+    !workspaceLayout.includes("<GlobalNavSections"),
+    "Workspace design-lab layout must not flatten Global navigation",
+  );
+  assert(
+    !workspaceLayout.includes("<SettingsSidebar"),
+    "Workspace design-lab layout must not flatten Settings navigation",
+  );
+
+  assert(
+    settingsLayout.includes("createOverrideStack<SidebarSnippet>"),
+    "Settings design-lab layout must provide a child sidebar slot",
+  );
+  assert(
+    settingsLayout.includes("<SettingsSidebarFixture"),
+    "Settings design-lab layout must register its SettingsSidebar fixture",
+  );
+  assert(
+    settingsLayout.includes("controller={parentSidebarController}"),
+    "Settings design-lab layout must register into its parent slot",
+  );
+  assert(
+    !settingsLayout.includes("<WorkspaceSidebar"),
+    "Settings design-lab layout must not duplicate WorkspaceSidebar",
+  );
+});
+
 Deno.test("workspace Worker list lives on the dedicated Workers page", async () => {
   const workspacePage = await Deno.readTextFile(
     new URL("./../../../routes/w/[workspaceId]/+page.svelte", import.meta.url),
@@ -420,7 +548,7 @@ Deno.test("Worker Console overview activity summaries use 14px text", async () =
 
   assert(
     consoleLine.includes(".activity-summary {") &&
-      consoleLine.includes("font-size: 14px;"),
+      consoleLine.includes("font-size: var(--font-size-body);"),
     "Overview activity summaries such as ran command counts should render at 14px",
   );
 });
@@ -443,7 +571,7 @@ Deno.test("Worker Console renders markdown only for message rows", async () => {
       consoleLine.includes(
         ".console-line.tool.tool-bash .console-plain-text",
       ) &&
-      consoleLine.includes("font-size: 12px;") &&
+      consoleLine.includes("font-size: var(--font-size-compact);") &&
       consoleLine.includes("line-height: 1.1;") &&
       consoleLine.includes("{:else if shouldRenderMarkdown(item)}") &&
       consoleLine.includes("<RichMarkdown text={item.body || '—'} />") &&
@@ -920,10 +1048,12 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     "Workspace layout should load workspace data, register with the parent slot, and provide the same slot contract to children",
   );
   assert(
-    sidebarFrame.includes("let folded = $state(false)") &&
+    sidebarFrame.includes("folded = $bindable(false)") &&
       sidebarFrame.includes("sidebar-fold-button") &&
       sidebarFrame.includes("Fold sidebar") &&
       sidebarFrame.includes("Unfold sidebar") &&
+      rootLayout.includes("let sidebarFolded = $state(false)") &&
+      rootLayout.includes("<SidebarFrame bind:folded={sidebarFolded}>") &&
       !workspaceLayout.includes("sidebarFolded") &&
       !workspaceLayout.includes("onToggleFold") &&
       !sidebar.includes("folded?: boolean") &&

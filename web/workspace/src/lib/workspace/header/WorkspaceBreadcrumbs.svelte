@@ -61,7 +61,7 @@
     gap: 0.55rem;
     color: var(--text-muted);
     font-family: var(--font-mono);
-    font-size: 0.84rem;
+    font-size: var(--font-size-compact);
     line-height: 1;
   }
 

@@ -158,8 +158,8 @@
     text-align: left;
     border: 1px solid var(--line);
     border-radius: 10px;
-    background: color-mix(in srgb, var(--bg-panel) 92%, transparent);
-    box-shadow: var(--shadow-soft);
+    background: color-mix(in srgb, var(--bg-raised) 92%, transparent);
+    box-shadow: var(--shadow-overlay);
     opacity: 1;
     padding: 0.25rem 0.45rem;
     transform: none;

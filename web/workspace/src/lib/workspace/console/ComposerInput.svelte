@@ -586,7 +586,7 @@
     border-radius: 999px;
     background: color-mix(in srgb, var(--accent) 10%, var(--bg-subtle));
     color: var(--text-muted);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     font-weight: 600;
     line-height: 1.35;
     text-overflow: ellipsis;

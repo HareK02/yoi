@@ -384,7 +384,7 @@
   .metadata-list div { display: grid; grid-template-columns: 8rem minmax(0, 1fr); gap: var(--space-3); }
   .metadata-list dd { margin: 0; overflow-wrap: anywhere; }
   .identity-bundle { display: grid; gap: var(--space-2); margin-top: var(--space-4); }
-  .identity-bundle textarea { width: 100%; resize: vertical; font-family: var(--font-mono); font-size: 0.75rem; }
+  .identity-bundle textarea { width: 100%; resize: vertical; font-family: var(--font-mono); font-size: var(--font-size-compact); }
   .danger-zone { display: flex; justify-content: space-between; align-items: start; gap: var(--space-4); border-top: 1px solid var(--color-danger, #b42318); }
   .danger-zone p { max-width: 68ch; }
   .danger-button { color: white; background: var(--color-danger, #b42318); border-color: var(--color-danger, #b42318); }

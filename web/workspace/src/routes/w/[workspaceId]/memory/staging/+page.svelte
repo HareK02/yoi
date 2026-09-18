@@ -170,7 +170,7 @@
   .staging-meta dt {
     color: var(--text-muted);
     display: block;
-    font-size: 0.76rem;
+    font-size: var(--font-size-compact);
     font-weight: 600;
     letter-spacing: 0.04em;
     text-transform: uppercase;
@@ -179,7 +179,7 @@
   .staging-summary-grid strong {
     color: var(--text);
     display: block;
-    font-size: 0.95rem;
+    font-size: var(--font-size-compact);
     margin-top: 0.25rem;
     overflow-wrap: anywhere;
   }
@@ -206,7 +206,7 @@
 
   .staging-entry h3 {
     color: var(--text-strong);
-    font-size: 1rem;
+    font-size: var(--font-size-body);
     margin: 0.35rem 0 0;
   }
 
@@ -225,7 +225,7 @@
     border-radius: 999px;
     color: var(--accent);
     display: inline-flex;
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     font-weight: 700;
     letter-spacing: 0.04em;
     padding: 0.18rem 0.55rem;

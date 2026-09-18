@@ -96,7 +96,7 @@
     display: block;
     margin-bottom: 0.15rem;
     color: var(--alert-color);
-    font-size: 0.82rem;
+    font-size: var(--font-size-body);
     letter-spacing: 0.02em;
     text-transform: uppercase;
   }
@@ -105,8 +105,8 @@
     margin: 0;
     overflow-wrap: anywhere;
     color: var(--text);
-    font-size: 0.9rem;
-    line-height: 1.35;
+    font-size: var(--font-size-body);
+    line-height: var(--line-height-body);
   }
 
   .workspace-alert-dismiss {
@@ -118,7 +118,7 @@
     background: transparent;
     color: var(--text-muted);
     cursor: pointer;
-    font-size: 1.2rem;
+    font-size: var(--font-size-body);
     line-height: 1;
   }
 

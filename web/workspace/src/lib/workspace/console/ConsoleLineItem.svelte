@@ -192,7 +192,7 @@
   .task-reminder-summary {
     margin: 0;
     color: var(--text-muted);
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
     line-height: 1.55;
     white-space: pre-line;
   }
@@ -203,7 +203,7 @@
     gap: var(--space-2);
     color: var(--text-muted);
     font-family: var(--font-mono);
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
     font-variant-numeric: tabular-nums;
     font-weight: 750;
   }
@@ -213,7 +213,7 @@
     padding-left: 1.25rem;
     color: var(--tui-dark-gray);
     font-family: var(--font-mono);
-    font-size: 0.75rem;
+    font-size: var(--font-size-compact);
   }
 
   .compaction-summary,
@@ -227,15 +227,15 @@
     display: block;
     color: var(--text-muted);
     font-family: var(--font-mono);
-    font-size: 0.7rem;
+    font-size: var(--font-size-compact);
   }
 
   .compaction-error {
-    color: var(--tui-error);
+    color: var(--danger);
   }
 
   .activity-summary {
-    font-size: 14px;
+    font-size: var(--font-size-body);
   }
 
   .task-reminder-summary {
@@ -245,14 +245,14 @@
   }
 
   .console-line.error .activity-summary {
-    color: var(--tui-error);
+    color: var(--danger);
   }
 
   .run-stats {
     margin: 0;
     color: var(--text-muted);
     font-family: var(--font-mono);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     font-variant-numeric: tabular-nums;
     text-align: right;
     white-space: nowrap;
@@ -294,7 +294,7 @@
     min-width: 0;
     margin: 0;
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--font-size-compact);
     line-height: 1.1;
     overflow-x: auto;
     white-space: pre;
@@ -313,7 +313,7 @@
     align-items: baseline;
     gap: 0.5rem;
     color: var(--text-muted);
-    font-size: 0.88rem;
+    font-size: var(--font-size-compact);
     font-weight: 750;
   }
 
@@ -329,7 +329,7 @@
   .tool-status {
     flex: 0 0 auto;
     color: var(--tui-dark-gray);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     white-space: nowrap;
   }
 
@@ -357,7 +357,7 @@
     justify-content: space-between;
     gap: var(--space-2);
     color: var(--text-muted);
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
     font-weight: 750;
   }
 
@@ -367,7 +367,7 @@
     border-radius: 0.65rem;
     color: var(--text);
     font-family: var(--font-mono);
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
     line-height: 1.45;
     margin: 0.6rem 0 0;
     overflow-x: auto;
@@ -424,7 +424,7 @@
     color: var(--text-muted);
     cursor: pointer;
     font: inherit;
-    font-size: 0.68rem;
+    font-size: var(--font-size-compact);
     font-weight: 750;
     opacity: 0;
     pointer-events: none;
@@ -443,7 +443,7 @@
     border-left: 2px solid var(--line);
     padding-left: 0.6rem;
     color: var(--text-muted);
-    font-size: 0.84rem;
+    font-size: var(--font-size-compact);
   }
 
   .message-detail p {

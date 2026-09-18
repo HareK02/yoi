@@ -1,5 +1,63 @@
 @layer reset, tokens, base, layout, components;
 @layer components {
+  .main-content .stack {
+    display: grid;
+    gap: var(--space-2);
+  }
+
+  .main-content .card {
+    min-width: 0;
+    padding: 0;
+  }
+
+  .main-content .section-note {
+    margin: 0;
+    color: var(--text-muted);
+  }
+
+  .main-content .section-state {
+    margin: var(--space-3) 0 0;
+    color: var(--text-muted);
+  }
+
+  .main-content .section-state.error {
+    color: var(--danger);
+  }
+
+  .main-content .muted {
+    color: var(--text-muted);
+  }
+
+  .main-content .secondary-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-soft);
+    padding: 0.45rem 0.75rem;
+    background: var(--bg-raised);
+    color: var(--text-strong);
+    font-weight: 700;
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  .main-content .secondary-button:hover:not(:disabled),
+  .main-content .secondary-button:focus-visible:not(:disabled) {
+    border-color: var(--accent);
+    background: var(--interactive-hover);
+  }
+
+  .main-content .secondary-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
+  .main-content small {
+    display: block;
+    margin-top: var(--space-1);
+  }
+
   .workspace-actions {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -10,7 +68,6 @@
     gap: var(--space-1);
     padding: var(--space-4);
     border: 1px solid var(--line);
-    border-radius: var(--radius-card);
     background: var(--bg-raised);
     color: inherit;
     text-decoration: none;
@@ -24,7 +81,7 @@
     color: var(--text-muted);
   }
   .workspace-action-card span {
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
   }
   .workspace-action-card strong {
     color: var(--text-strong);
@@ -51,7 +108,6 @@
     align-items: start;
     gap: var(--space-4);
     padding: var(--space-3) var(--space-4);
-    border-radius: var(--radius-panel);
     background: var(--bg-raised);
     color: inherit;
     text-decoration: none;
@@ -96,7 +152,7 @@
   .state-pill {
     flex: 0 0 auto;
     color: var(--success);
-    font-size: 0.76rem;
+    font-size: var(--font-size-compact);
     font-weight: 700;
     letter-spacing: 0.05em;
     text-transform: uppercase;
@@ -105,7 +161,7 @@
   .objective-summary {
     margin: 0;
     color: var(--text-muted);
-    font-size: 0.88rem;
+    font-size: var(--font-size-compact);
     line-height: 1.4;
   }
   .ticket-meta,
@@ -115,7 +171,7 @@
     justify-content: flex-end;
     gap: var(--space-2);
     color: var(--text-faint);
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
     line-height: 1.35;
     text-align: right;
     white-space: nowrap;
@@ -155,7 +211,7 @@
   }
   .detail-heading span {
     color: var(--text-muted);
-    font-size: 0.8rem;
+    font-size: var(--font-size-compact);
   }
   .ticket-detail-grid {
     margin-bottom: var(--space-4);
@@ -168,70 +224,77 @@
   }
   .risk-flags span,
   .warning-pill {
-    border-radius: 999px;
-    padding: 0.18rem 0.55rem;
-    background: var(--bg-subtle);
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
     color: var(--warning);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     font-weight: 800;
     letter-spacing: 0.06em;
     text-transform: uppercase;
+  }
+  .risk-flags span::before,
+  .warning-pill::before {
+    width: 0.45rem;
+    height: 0.45rem;
+    border-radius: 50%;
+    background: currentColor;
+    content: "";
   }
   .ticket-body pre {
     overflow-x: auto;
     margin: 0;
     padding: var(--space-4);
     border: 1px solid var(--line);
-    border-radius: var(--radius-panel);
     background: var(--bg-raised);
     color: var(--text);
     white-space: pre-wrap;
   }
-  dl {
+  .main-content dl {
     display: grid;
     gap: var(--space-1);
     margin: 0;
   }
-  dl > div {
+  .main-content dl > div {
     display: grid;
     grid-template-columns: minmax(6.5rem, 10rem) minmax(0, 1fr);
     align-items: baseline;
     gap: var(--space-3);
     min-width: 0;
   }
-  dt {
+  .main-content dt {
     color: var(--text-faint);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     letter-spacing: 0.08em;
     text-transform: uppercase;
     white-space: nowrap;
   }
-  dd {
+  .main-content dd {
     min-width: 0;
     margin: 0;
   }
-  dd small {
+  .main-content dd small {
     display: inline;
     margin-top: 0;
     margin-left: var(--space-2);
   }
-  .table-wrap {
+  .main-content .table-wrap {
     overflow-x: auto;
   }
-  table {
+  .main-content table {
     width: 100%;
     border-collapse: collapse;
   }
-  th,
-  td {
+  .main-content th,
+  .main-content td {
     border-bottom: 1px solid var(--line);
     padding: 10px 8px;
     text-align: left;
     vertical-align: top;
   }
-  th {
+  .main-content th {
     color: var(--text-faint);
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
     letter-spacing: 0.08em;
     text-transform: uppercase;
   }
@@ -251,8 +314,8 @@
   .page-header-row h1,
   .workers-page-header h1 {
     color: var(--text-strong);
-    font-size: clamp(1.6rem, 4vw, 2.4rem);
-    line-height: 1.05;
+    font-size: var(--font-size-title);
+    line-height: var(--line-height-title);
   }
   .page-header-row p:not(.breadcrumb),
   .workers-page-header p {
@@ -262,7 +325,7 @@
   .breadcrumb {
     margin-bottom: var(--space-2);
     color: var(--text-muted);
-    font-size: 0.85rem;
+    font-size: var(--font-size-compact);
   }
   .breadcrumb a {
     color: inherit;
