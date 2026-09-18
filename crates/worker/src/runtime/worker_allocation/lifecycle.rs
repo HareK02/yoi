@@ -88,8 +88,7 @@ impl ScopeAllocationGuard {
         }
 
         if let Some(existing) = guard.data().allocations.iter().find(|allocation| {
-            allocation.segment_id == Some(replacement)
-                && allocation.worker_name != self.worker_name
+            allocation.segment_id == Some(replacement) && allocation.worker_name != self.worker_name
         }) {
             return Err(ScopeLockError::SegmentConflict {
                 segment_id: replacement,
@@ -494,14 +493,18 @@ mod tests {
         let lookup = std::thread::spawn(move || {
             sent.send(lookup_segment(replacement).unwrap()).unwrap();
         });
-        assert!(received
-            .recv_timeout(std::time::Duration::from_millis(50))
-            .is_err());
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
         drop(authority);
-        assert!(received
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap()
-            .is_none());
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .is_none()
+        );
         lookup.join().unwrap();
     }
 
@@ -528,7 +531,8 @@ mod tests {
         let error = activation.commit().unwrap_err();
         let (source, authority) = error.into_parts();
         assert!(matches!(source, ScopeLockError::Io(_)));
-        let persisted: LockFile = serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+        let persisted: LockFile =
+            serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
         assert_eq!(
             persisted
                 .find("activation")

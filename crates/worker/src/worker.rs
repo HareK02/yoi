@@ -4535,9 +4535,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let allocation_activation = self
             .scope_allocation
             .as_ref()
-            .map(|allocation| {
-                allocation.begin_segment_activation(loc.segment_id, fork_segment_id)
-            })
+            .map(|allocation| allocation.begin_segment_activation(loc.segment_id, fork_segment_id))
             .transpose()?;
         self.compare_and_swap_worker_metadata_segment(loc, new_location)?;
         if let Some(allocation_activation) = allocation_activation {
@@ -8596,14 +8594,15 @@ mod build_summary_prompt_tests {
             old_location.segment_id,
         )));
         let metadata_for_cas = Arc::clone(&persisted_metadata);
-        worker.worker_metadata_segment_cas = Some(Arc::new(move |_worker_name, expected, replacement| {
-            let mut persisted = metadata_for_cas.lock().unwrap();
-            if &*persisted != expected {
-                return Ok(false);
-            }
-            *persisted = replacement;
-            Ok(true)
-        }));
+        worker.worker_metadata_segment_cas =
+            Some(Arc::new(move |_worker_name, expected, replacement| {
+                let mut persisted = metadata_for_cas.lock().unwrap();
+                if &*persisted != expected {
+                    return Ok(false);
+                }
+                *persisted = replacement;
+                Ok(true)
+            }));
         let lock_path = dir.path().join("workers.json");
         let allocation = worker_allocation::install_top_level_at_for_test(
             lock_path.clone(),
@@ -8688,14 +8687,15 @@ mod build_summary_prompt_tests {
             old_location.segment_id,
         )));
         let metadata_for_cas = Arc::clone(&persisted_metadata);
-        worker.worker_metadata_segment_cas = Some(Arc::new(move |_worker_name, expected, replacement| {
-            let mut persisted = metadata_for_cas.lock().unwrap();
-            if &*persisted != expected {
-                return Ok(false);
-            }
-            *persisted = replacement;
-            Ok(true)
-        }));
+        worker.worker_metadata_segment_cas =
+            Some(Arc::new(move |_worker_name, expected, replacement| {
+                let mut persisted = metadata_for_cas.lock().unwrap();
+                if &*persisted != expected {
+                    return Ok(false);
+                }
+                *persisted = replacement;
+                Ok(true)
+            }));
         let lock_path = dir.path().join("workers.json");
         let allocation = worker_allocation::install_top_level_at_for_test(
             lock_path.clone(),
@@ -8707,10 +8707,7 @@ mod build_summary_prompt_tests {
         )
         .unwrap();
         let activation = allocation
-            .begin_segment_activation(
-                old_location.segment_id,
-                replacement_location.segment_id,
-            )
+            .begin_segment_activation(old_location.segment_id, replacement_location.segment_id)
             .unwrap();
         worker.scope_allocation = Some(allocation);
         worker
@@ -8764,8 +8761,7 @@ mod build_summary_prompt_tests {
         )
         .await
         .unwrap();
-        let registry =
-            crate::spawn::registry::SpawnedWorkerRegistry::new_for_internal_services();
+        let registry = crate::spawn::registry::SpawnedWorkerRegistry::new_for_internal_services();
         let (cleanup_session_id, _events) = registry.install_service_for_test();
         registry.fail_service_stops_for_test(&cleanup_session_id, 4);
         worker.internal_worker_registry = Some(Arc::clone(&registry));
@@ -10567,7 +10563,11 @@ mod build_summary_prompt_tests {
         let submit = std::thread::spawn(move || {
             submit_started.send(()).unwrap();
             submit_handle
-                .accept("barrier-submit".into(), vec![Segment::text("queued")], false)
+                .accept(
+                    "barrier-submit".into(),
+                    vec![Segment::text("queued")],
+                    false,
+                )
                 .unwrap();
             submit_finished.send(()).unwrap();
         });

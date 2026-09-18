@@ -365,7 +365,10 @@ mod tests {
         }
         let guard = LockFileGuard::open(&path).unwrap();
         assert_eq!(
-            guard.data().find("a").and_then(|allocation| allocation.segment_id),
+            guard
+                .data()
+                .find("a")
+                .and_then(|allocation| allocation.segment_id),
             Some(old_segment)
         );
         drop(guard);
@@ -378,7 +381,10 @@ mod tests {
         }
         let guard = LockFileGuard::open(&path).unwrap();
         assert_eq!(
-            guard.data().find("a").and_then(|allocation| allocation.segment_id),
+            guard
+                .data()
+                .find("a")
+                .and_then(|allocation| allocation.segment_id),
             Some(replacement)
         );
     }
@@ -396,9 +402,7 @@ mod tests {
             let contender = LockFileGuard::open(&contender_path).unwrap();
             sent.send(contender.data().allocations.len()).unwrap();
         });
-        assert!(received
-            .recv_timeout(Duration::from_millis(50))
-            .is_err());
+        assert!(received.recv_timeout(Duration::from_millis(50)).is_err());
         drop(guard);
         assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), 0);
         contender.join().unwrap();

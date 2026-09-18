@@ -8,9 +8,9 @@
 //! Parent registry drop closes all session handles and synchronously returns delegated Write deny
 //! rules to the parent scope.
 
-use std::collections::{BTreeMap, HashSet};
 #[cfg(test)]
 use std::collections::HashMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::sync::{
     Arc, Mutex,
@@ -453,8 +453,8 @@ impl SpawnedWorkerRegistry {
             registry: Arc::new(Self {
                 internal_records: std::sync::Mutex::new(Vec::new()),
                 service_records: std::sync::Mutex::new(Vec::new()),
-            #[cfg(test)]
-            fail_service_stops: std::sync::Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                fail_service_stops: std::sync::Mutex::new(HashMap::new()),
                 internal_names: std::sync::Mutex::new(HashSet::new()),
                 internal_shutting_down: AtomicBool::new(false),
                 pending_internal_spawns: AtomicUsize::new(0),
@@ -550,17 +550,19 @@ impl SpawnedWorkerRegistry {
     #[cfg(test)]
     pub(crate) fn install_service_for_test(
         &self,
-    ) -> (
-        String,
-        tokio::sync::broadcast::Sender<protocol::Event>,
-    ) {
+    ) -> (String, tokio::sync::broadcast::Sender<protocol::Event>) {
         let (session, status_tx) = crate::internal_worker::test_internal_worker_session(
             crate::internal_worker::InternalWorkerVisibility::ServicePrivate,
         );
         let session_id = session.session_id_string();
-        self.service_records.lock().unwrap().push(
-            InternalServiceWorkerRecord::new("test-service", "test-service", session),
-        );
+        self.service_records
+            .lock()
+            .unwrap()
+            .push(InternalServiceWorkerRecord::new(
+                "test-service",
+                "test-service",
+                session,
+            ));
         (session_id, status_tx)
     }
 

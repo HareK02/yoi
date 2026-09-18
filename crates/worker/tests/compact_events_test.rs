@@ -1117,11 +1117,9 @@ async fn pre_run_compact_failure_clears_runtime_progress() {
 
 #[tokio::test]
 async fn manual_compact_cancel_clears_progress_before_returning_idle() {
-    let (worker, observed_store) = make_worker_with_manifest_and_store(
-        POST_RUN_MANIFEST_TOML,
-        BlockingCompactClient::new(),
-    )
-    .await;
+    let (worker, observed_store) =
+        make_worker_with_manifest_and_store(POST_RUN_MANIFEST_TOML, BlockingCompactClient::new())
+            .await;
     let source_session = worker.session_id();
     let source_segment = worker.segment_id();
     let runtime_tmp = tempfile::tempdir().unwrap();

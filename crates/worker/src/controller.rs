@@ -1830,7 +1830,9 @@ async fn controller_loop<C, St>(
             )
             .await;
             if shutdown {
-                while let Err(error) = worker.finish_pending_compaction_cleanup_for_shutdown().await
+                while let Err(error) = worker
+                    .finish_pending_compaction_cleanup_for_shutdown()
+                    .await
                 {
                     let _ = working_event_tx.send(Event::Error {
                         code: worker_error_code(&error),
@@ -1924,8 +1926,9 @@ async fn controller_loop<C, St>(
                 }
                 Err(error) => {
                     if matches!(&method, Method::Shutdown { .. }) {
-                        if let Err(error) =
-                            worker.finish_pending_compaction_cleanup_for_shutdown().await
+                        if let Err(error) = worker
+                            .finish_pending_compaction_cleanup_for_shutdown()
+                            .await
                         {
                             let _ = working_event_tx.send(Event::Error {
                                 code: worker_error_code(&error),
@@ -2402,8 +2405,9 @@ async fn controller_loop<C, St>(
                     });
                 }
                 if shutdown_after_compaction {
-                    while let Err(error) =
-                        worker.finish_pending_compaction_cleanup_for_shutdown().await
+                    while let Err(error) = worker
+                        .finish_pending_compaction_cleanup_for_shutdown()
+                        .await
                     {
                         let _ = working_event_tx.send(Event::Error {
                             code: worker_error_code(&error),
@@ -3585,16 +3589,18 @@ mod tests {
         let pending = PendingSubmissionHandle::for_test(dir.path());
         let (event_tx, _event_rx) = broadcast::channel(4);
 
-        assert!(durably_accept_method_while_busy(
-            Method::NotifyTracked {
-                notification_request_id: "completion-1".into(),
-                message: "subworker completed".into(),
-                source: protocol::AuthenticatedInputSource::UntrustedWire,
-            },
-            &pending,
-            &event_tx,
-        )
-        .is_none());
+        assert!(
+            durably_accept_method_while_busy(
+                Method::NotifyTracked {
+                    notification_request_id: "completion-1".into(),
+                    message: "subworker completed".into(),
+                    source: protocol::AuthenticatedInputSource::UntrustedWire,
+                },
+                &pending,
+                &event_tx,
+            )
+            .is_none()
+        );
         let entries = pending.persisted_entries_for_test();
         assert!(entries.iter().any(|entry| matches!(
             entry,
