@@ -208,13 +208,25 @@ fn json_content_schema<'a>(
     .ok_or_else(|| GenerationError::invalid(format!("{context} is missing its JSON schema")))
 }
 
+fn schema_reference<'a>(value: &'a Value, context: &str) -> Result<&'a str, GenerationError> {
+    const ALLOWED_REFERENCE_SIBLINGS: &[&str] =
+        &["$ref", "$comment", "deprecated", "description", "title"];
+    let schema = object(value, context)?;
+    if let Some(keyword) = schema
+        .keys()
+        .find(|keyword| !ALLOWED_REFERENCE_SIBLINGS.contains(&keyword.as_str()))
+    {
+        return Err(GenerationError::invalid(format!(
+            "{context} contains unsupported `$ref` sibling `{keyword}`"
+        )));
+    }
+    schema.get("$ref").and_then(Value::as_str).ok_or_else(|| {
+        GenerationError::invalid(format!("{context} must use a string schema reference"))
+    })
+}
+
 fn require_schema_ref(value: &Value, expected: &str, context: &str) -> Result<(), GenerationError> {
-    let reference = object(value, context)?
-        .get("$ref")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            GenerationError::invalid(format!("{context} must use a schema reference"))
-        })?;
+    let reference = schema_reference(value, context)?;
     if reference != format!("{SCHEMA_REF_PREFIX}{expected}") {
         return Err(GenerationError::invalid(format!(
             "{context} must reference `{expected}`, found `{reference}`"
@@ -250,10 +262,8 @@ fn collect_schema_references(
 ) -> Result<(), GenerationError> {
     match value {
         Value::Object(object) => {
-            if let Some(reference) = object.get("$ref") {
-                let reference = reference.as_str().ok_or_else(|| {
-                    GenerationError::invalid(format!("{context} contains a non-string $ref"))
-                })?;
+            if object.contains_key("$ref") {
+                let reference = schema_reference(value, context)?;
                 let Some(name) = reference.strip_prefix(SCHEMA_REF_PREFIX) else {
                     return Err(GenerationError::invalid(format!(
                         "{context} contains unsupported reference `{reference}`"
@@ -277,20 +287,8 @@ fn collect_schema_references(
 
 fn render_schema(value: &Value, context: &str) -> Result<String, GenerationError> {
     let schema = object(value, context)?;
-    if let Some(reference) = schema.get("$ref") {
-        const ALLOWED_REFERENCE_SIBLINGS: &[&str] =
-            &["$ref", "$comment", "deprecated", "description", "title"];
-        if let Some(keyword) = schema
-            .keys()
-            .find(|keyword| !ALLOWED_REFERENCE_SIBLINGS.contains(&keyword.as_str()))
-        {
-            return Err(GenerationError::invalid(format!(
-                "{context} contains unsupported `$ref` sibling `{keyword}`"
-            )));
-        }
-        let reference = reference.as_str().ok_or_else(|| {
-            GenerationError::invalid(format!("{context} contains a non-string $ref"))
-        })?;
+    if schema.contains_key("$ref") {
+        let reference = schema_reference(value, context)?;
         return reference
             .strip_prefix(SCHEMA_REF_PREFIX)
             .map(str::to_owned)
@@ -583,6 +581,15 @@ mod tests {
         let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
         document["components"]["schemas"]["RepositorySummary"]["properties"]["source"]["maxLength"] =
             serde_json::json!(1);
+        let error = generate_repository_typescript(&document.to_string()).unwrap_err();
+        assert!(error.to_string().contains("unsupported `$ref` sibling"));
+    }
+
+    #[test]
+    fn generator_rejects_lossy_operation_reference_siblings() {
+        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
+        document["paths"]["/api/repositories"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["maxItems"] = serde_json::json!(1);
         let error = generate_repository_typescript(&document.to_string()).unwrap_err();
         assert!(error.to_string().contains("unsupported `$ref` sibling"));
     }
