@@ -156,7 +156,7 @@
     box-shadow: var(--shadow-overlay);
     color: var(--bg);
     font-family: var(--font-sans);
-    font-size: 12px;
+    font-size: var(--font-size-compact);
     font-weight: 500;
     line-height: 16px;
     opacity: 0;

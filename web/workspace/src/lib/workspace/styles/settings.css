@@ -72,7 +72,7 @@
     align-items: center;
     gap: var(--space-1);
     color: var(--text-muted);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     font-weight: 800;
     letter-spacing: 0.06em;
     text-transform: uppercase;
@@ -202,7 +202,7 @@
 
   .account-details dt {
     color: var(--text-muted);
-    font-size: 0.8rem;
+    font-size: var(--font-size-compact);
     font-weight: 700;
     text-transform: uppercase;
   }
@@ -213,7 +213,7 @@
   }
 
   .account-details code {
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
   }
 
   .account-panel {
@@ -232,7 +232,7 @@
     display: grid;
     gap: 0.25rem;
     color: var(--text-muted);
-    font-size: 0.78rem;
+    font-size: var(--font-size-body);
   }
 
   .settings-runtime-form button,
@@ -289,7 +289,7 @@
 
   .settings-runtime-table th {
     color: var(--text-muted);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     letter-spacing: 0.05em;
     text-transform: uppercase;
   }
@@ -333,7 +333,7 @@
 
   .settings-muted-action {
     color: var(--text-muted);
-    font-size: 0.82rem;
+    font-size: var(--font-size-compact);
   }
 
   .settings-action-row {
@@ -432,7 +432,7 @@
     display: grid;
     gap: var(--space-1);
     color: var(--text-muted);
-    font-size: 0.82rem;
+    font-size: var(--font-size-body);
   }
   .settings-form input,
   .settings-form select,
@@ -524,7 +524,7 @@
   }
   .settings-identity-list dt {
     color: var(--text-muted);
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
   }
   .settings-identity-list dd {
     margin: 0;
@@ -536,7 +536,7 @@
     align-items: center;
     gap: var(--space-1);
     color: var(--text-muted);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     font-weight: 800;
     text-transform: uppercase;
   }
@@ -593,7 +593,7 @@
   }
   .config-source-tree nav button small {
     color: var(--text-muted);
-    font-size: 0.65rem;
+    font-size: var(--font-size-compact);
     letter-spacing: 0.06em;
     text-transform: uppercase;
   }
@@ -608,10 +608,13 @@
     padding: var(--space-3);
     border-top: 1px solid var(--line);
   }
-  .config-source-create label,
+  .config-source-create label {
+    color: var(--text-muted);
+    font-size: var(--font-size-body);
+  }
   .config-source-workbench__header span {
     color: var(--text-muted);
-    font-size: 0.75rem;
+    font-size: var(--font-size-compact);
   }
   .config-source-create input,
   .config-source-actions input {
@@ -670,7 +673,7 @@
     padding: var(--space-2) var(--space-3);
     border-top: 1px solid var(--line);
     color: var(--text-muted);
-    font-size: 0.8rem;
+    font-size: var(--font-size-compact);
   }
   .config-source-conflict {
     display: flex;
@@ -742,7 +745,7 @@
     display: grid;
     gap: var(--space-2);
     color: var(--text-muted);
-    font-size: 0.78rem;
+    font-size: var(--font-size-body);
     font-weight: 700;
   }
   .settings-repository-form input {
@@ -786,7 +789,7 @@
   }
   .settings-repository-table th {
     color: var(--text-muted);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     text-transform: uppercase;
   }
   .settings-repository-table tbody tr:last-child td {

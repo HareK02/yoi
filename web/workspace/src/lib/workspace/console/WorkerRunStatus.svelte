@@ -42,7 +42,7 @@
     min-height: 1.35rem;
     color: var(--text-muted);
     font-family: var(--font-mono);
-    font-size: 0.74rem;
+    font-size: var(--font-size-compact);
     font-variant-numeric: tabular-nums;
   }
 </style>

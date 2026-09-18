@@ -69,7 +69,7 @@
   :global(.rich-markdown h4) {
     margin: 0.7rem 0 0.35rem;
     color: var(--text-strong);
-    font-size: 1rem;
+    font-size: var(--font-size-body);
   }
 
   :global(.rich-markdown blockquote) {

@@ -547,7 +547,7 @@ Deno.test("Worker Console overview activity summaries use 14px text", async () =
 
   assert(
     consoleLine.includes(".activity-summary {") &&
-      consoleLine.includes("font-size: 14px;"),
+      consoleLine.includes("font-size: var(--font-size-body);"),
     "Overview activity summaries such as ran command counts should render at 14px",
   );
 });
@@ -570,7 +570,7 @@ Deno.test("Worker Console renders markdown only for message rows", async () => {
       consoleLine.includes(
         ".console-line.tool.tool-bash .console-plain-text",
       ) &&
-      consoleLine.includes("font-size: 12px;") &&
+      consoleLine.includes("font-size: var(--font-size-compact);") &&
       consoleLine.includes("line-height: 1.1;") &&
       consoleLine.includes("{:else if shouldRenderMarkdown(item)}") &&
       consoleLine.includes("<RichMarkdown text={item.body || '—'} />") &&

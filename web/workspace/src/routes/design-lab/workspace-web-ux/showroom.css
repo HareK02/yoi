@@ -1,3 +1,4 @@
+@layer reset, tokens, base, layout, components;
 @layer components {
   .design-lab-header {
     display: flex;
@@ -5,7 +6,7 @@
     align-items: center;
     gap: var(--space-2);
     color: var(--text-muted);
-    font-size: 14px;
+    font-size: var(--font-size-compact);
     font-weight: 600;
     line-height: 20px;
   }
@@ -34,7 +35,7 @@
     padding: var(--space-1) var(--space-2);
     border-radius: var(--radius-soft);
     color: var(--accent);
-    font-size: 12px;
+    font-size: var(--font-size-compact);
     font-weight: 650;
     line-height: 16px;
     text-decoration: none;
@@ -69,7 +70,7 @@
     margin: 0;
     padding-bottom: var(--space-2);
     color: var(--text-strong);
-    font-size: 14px;
+    font-size: var(--font-size-body);
     font-weight: 650;
     line-height: 20px;
   }
@@ -95,7 +96,7 @@
     padding: 7px var(--space-4);
     background: transparent;
     color: inherit;
-    font-size: 14px;
+    font-size: var(--font-size-compact);
     font-weight: 600;
     line-height: 20px;
     cursor: pointer;
@@ -150,7 +151,8 @@
     background: var(--interactive-selected);
     color: var(--text-strong);
     cursor: pointer;
-    font: 600 12px/1 var(--font-mono);
+    font: 600 var(--font-size-compact) / var(--line-height-compact)
+      var(--font-mono);
   }
 
   .border-matrix {
@@ -200,13 +202,13 @@
     gap: var(--space-3);
     color: var(--text-muted);
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--font-size-compact);
   }
 
   .line-sample__label {
     color: var(--text-muted);
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--font-size-compact);
   }
 
   .status {
@@ -215,7 +217,7 @@
     align-items: center;
     gap: var(--space-2);
     color: var(--text);
-    font-size: 13px;
+    font-size: var(--font-size-compact);
     font-weight: 600;
     line-height: 18px;
     white-space: nowrap;
@@ -276,14 +278,14 @@
 
   .feedback strong {
     color: var(--text-strong);
-    font-size: 14px;
+    font-size: var(--font-size-body);
   }
 
   .feedback p {
     margin: 2px 0 0;
     color: var(--text-muted);
-    font-size: 13px;
-    line-height: 18px;
+    font-size: var(--font-size-body);
+    line-height: var(--line-height-body);
   }
 
   .feedback--error {
@@ -334,13 +336,13 @@
     min-width: 0;
     overflow-wrap: anywhere;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-compact);
     line-height: 16px;
   }
 
   .resource-row__meta {
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-compact);
     line-height: 16px;
     text-align: right;
   }
@@ -373,7 +375,7 @@
 
   .showroom thead th {
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-compact);
     font-weight: 600;
     line-height: 16px;
   }
@@ -381,7 +383,7 @@
   .showroom tbody th {
     max-width: 360px;
     color: var(--text-strong);
-    font-size: 14px;
+    font-size: var(--font-size-compact);
     font-weight: 600;
   }
 
@@ -396,7 +398,7 @@
     display: block;
     margin-top: 2px;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-compact);
     font-weight: 400;
   }
 
@@ -423,7 +425,7 @@
   .key-value dt,
   .technical-values dt {
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-compact);
     font-weight: 600;
     line-height: 18px;
   }
@@ -433,7 +435,7 @@
     min-width: 0;
     margin: 0;
     color: var(--text-strong);
-    font-size: 13px;
+    font-size: var(--font-size-compact);
     line-height: 18px;
   }
 
@@ -497,7 +499,7 @@
   .type-samples code,
   .space-samples code {
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-compact);
     line-height: 16px;
   }
 
@@ -513,21 +515,21 @@
 
   .type-route {
     color: var(--text-strong);
-    font-size: 24px;
+    font-size: var(--font-size-title);
     font-weight: 650;
-    line-height: 32px;
+    line-height: var(--line-height-title);
   }
 
   .type-body {
     color: var(--text);
-    font-size: 14px;
+    font-size: var(--font-size-body);
     line-height: 20px;
   }
 
   .type-meta {
     color: var(--text-muted);
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--font-size-compact);
     line-height: 16px;
   }
 
@@ -565,7 +567,7 @@
     display: grid;
     gap: var(--space-2);
     color: var(--text-strong);
-    font-size: 13px;
+    font-size: var(--font-size-compact);
     font-weight: 600;
   }
 
@@ -582,14 +584,14 @@
 
   .form-field small {
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-compact);
     font-weight: 400;
     line-height: 16px;
   }
 
   .field-error {
     color: var(--danger);
-    font-size: 12px;
+    font-size: var(--font-size-compact);
     font-weight: 600;
     line-height: 16px;
   }
@@ -608,7 +610,7 @@
     align-items: center;
     gap: var(--space-2);
     color: var(--text-strong);
-    font-size: 13px;
+    font-size: var(--font-size-compact);
     font-weight: 600;
   }
 
@@ -620,7 +622,7 @@
   .permission-read-view p {
     margin: 0;
     color: var(--text-muted);
-    font-size: 13px;
+    font-size: var(--font-size-body);
   }
 
   @media (prefers-reduced-motion: reduce) {

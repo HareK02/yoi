@@ -122,7 +122,7 @@
     border-radius: var(--radius-soft);
     padding: 0.45rem 0.6rem;
     color: var(--text-strong);
-    font-size: 1.05rem;
+    font-size: var(--font-size-compact);
     font-weight: 800;
     line-height: 1.25;
     text-overflow: ellipsis;
@@ -149,7 +149,7 @@
     background: transparent;
     color: var(--text-strong);
     font: inherit;
-    font-size: 1.05rem;
+    font-size: var(--font-size-compact);
     font-weight: 800;
     line-height: 1.25;
     text-align: left;
@@ -184,7 +184,7 @@
     padding: 0.35rem 0.45rem;
     color: var(--text-muted);
     font-family: var(--font-mono);
-    font-size: 0.84rem;
+    font-size: var(--font-size-compact);
     font-weight: 650;
     line-height: 1;
   }
@@ -227,7 +227,7 @@
     border-radius: var(--radius-soft);
     padding: var(--space-2);
     color: var(--text-strong);
-    font-size: 0.82rem;
+    font-size: var(--font-size-compact);
     font-weight: 650;
     line-height: 1.3;
     text-decoration: none;
@@ -257,7 +257,7 @@
     gap: var(--space-2);
     padding: var(--space-1) var(--space-2) 0;
     color: var(--text-faint);
-    font-size: 0.68rem;
+    font-size: var(--font-size-compact);
     font-weight: 750;
     letter-spacing: 0.08em;
     text-transform: uppercase;
@@ -269,7 +269,7 @@
     place-items: center;
     border-radius: var(--radius-soft);
     color: var(--text-muted);
-    font-size: 1rem;
+    font-size: var(--font-size-body);
     line-height: 1;
     text-decoration: none;
   }
@@ -291,7 +291,7 @@
   .workspace-menu-status {
     margin: var(--space-1) var(--space-2);
     color: var(--text-muted);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     line-height: 1.35;
   }
   .workspace-menu-status.error {
@@ -300,13 +300,13 @@
   .section-state {
     margin: var(--space-2) 0 0;
     color: var(--text-muted);
-    font-size: 0.74rem;
+    font-size: var(--font-size-compact);
     line-height: 1.35;
   }
   .workspace-status {
     margin: var(--space-1) 0 0;
     color: var(--text-muted);
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
     line-height: 1.35;
   }
   .workspace-status.error,
@@ -365,7 +365,7 @@
   .sidebar-nav-section__header,
   .sidebar-section-label {
     color: var(--text-faint);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     font-weight: 750;
     letter-spacing: 0.11em;
     text-transform: uppercase;
@@ -389,7 +389,7 @@
   }
   .section-count {
     color: var(--text-muted);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     line-height: 1;
   }
   .nav-list,
@@ -408,7 +408,7 @@
     padding: var(--space-2) var(--space-3);
     border-radius: var(--radius-soft);
     color: var(--text-strong);
-    font-size: 0.9rem;
+    font-size: var(--font-size-compact);
     text-align: left;
     text-decoration: none;
     transition: background-color 140ms ease, color 140ms ease;
@@ -490,7 +490,7 @@
     background: transparent;
     color: var(--text-strong);
     font: inherit;
-    font-size: 0.76rem;
+    font-size: var(--font-size-compact);
     font-weight: 650;
     line-height: 1.2;
     text-align: left;
@@ -551,7 +551,7 @@
     align-items: center;
     justify-content: center;
     width: 0.75rem;
-    font-size: 0.7rem;
+    font-size: var(--font-size-compact);
     line-height: 1;
   }
   .worker-status-spinner.is-subworker {
@@ -563,7 +563,7 @@
     min-width: 0;
     overflow: hidden;
     color: inherit;
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
     font-weight: 600;
     line-height: 1.1rem;
     text-overflow: ellipsis;
@@ -576,7 +576,7 @@
     overflow: hidden;
     color: var(--text-muted);
     font-family: var(--font-mono);
-    font-size: 0.66rem;
+    font-size: var(--font-size-compact);
     line-height: 1rem;
     text-overflow: ellipsis;
     white-space: nowrap;

@@ -121,6 +121,12 @@ font sizeは、その領域でユーザーが行う読み方によって選ぶ�
 ```css
 --font-sans
 --font-mono
+--font-size-title /* 24px */
+--line-height-title /* 32px */
+--font-size-body /* 14px */
+--line-height-body /* 20px */
+--font-size-compact /* 12px */
+--line-height-compact /* 16px */
 ```
 
 ### Spacing / Shape

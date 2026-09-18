@@ -53,6 +53,12 @@
 
     --font-sans: "Gen Interface JP", sans-serif;
     --font-mono: "IBM Plex Mono", monospace;
+    --font-size-title: 24px;
+    --line-height-title: 32px;
+    --font-size-body: 14px;
+    --line-height-body: 20px;
+    --font-size-compact: 12px;
+    --line-height-compact: 16px;
 
     --space-1: 4px;
     --space-2: 8px;
@@ -99,13 +105,14 @@
 
 @layer base {
   html {
-    font-size: 14px;
+    font-size: var(--font-size-body);
   }
 
   body {
     background: var(--bg);
     color: var(--text);
     font-family: var(--font-sans);
+    line-height: var(--line-height-body);
   }
 
   h1,
@@ -124,8 +131,19 @@
     color: var(--text-strong);
   }
 
+  h1 {
+    font-size: var(--font-size-title);
+    line-height: var(--line-height-title);
+  }
+
+  h2,
+  h3 {
+    font-size: var(--font-size-body);
+    line-height: var(--line-height-body);
+  }
+
   p {
-    line-height: 1.55;
+    line-height: var(--line-height-body);
   }
 
   code,
@@ -136,7 +154,8 @@
 
   small {
     color: var(--text-muted);
-    font-size: 0.85em;
+    font-size: var(--font-size-compact);
+    line-height: var(--line-height-compact);
   }
 
   :where(

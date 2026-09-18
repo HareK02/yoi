@@ -81,7 +81,7 @@
     color: var(--text-muted);
   }
   .workspace-action-card span {
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
   }
   .workspace-action-card strong {
     color: var(--text-strong);
@@ -152,7 +152,7 @@
   .state-pill {
     flex: 0 0 auto;
     color: var(--success);
-    font-size: 0.76rem;
+    font-size: var(--font-size-compact);
     font-weight: 700;
     letter-spacing: 0.05em;
     text-transform: uppercase;
@@ -161,7 +161,7 @@
   .objective-summary {
     margin: 0;
     color: var(--text-muted);
-    font-size: 0.88rem;
+    font-size: var(--font-size-compact);
     line-height: 1.4;
   }
   .ticket-meta,
@@ -171,7 +171,7 @@
     justify-content: flex-end;
     gap: var(--space-2);
     color: var(--text-faint);
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
     line-height: 1.35;
     text-align: right;
     white-space: nowrap;
@@ -211,7 +211,7 @@
   }
   .detail-heading span {
     color: var(--text-muted);
-    font-size: 0.8rem;
+    font-size: var(--font-size-compact);
   }
   .ticket-detail-grid {
     margin-bottom: var(--space-4);
@@ -228,7 +228,7 @@
     align-items: center;
     gap: var(--space-1);
     color: var(--warning);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     font-weight: 800;
     letter-spacing: 0.06em;
     text-transform: uppercase;
@@ -264,7 +264,7 @@
   }
   .main-content dt {
     color: var(--text-faint);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     letter-spacing: 0.08em;
     text-transform: uppercase;
     white-space: nowrap;
@@ -294,7 +294,7 @@
   }
   .main-content th {
     color: var(--text-faint);
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
     letter-spacing: 0.08em;
     text-transform: uppercase;
   }
@@ -314,8 +314,8 @@
   .page-header-row h1,
   .workers-page-header h1 {
     color: var(--text-strong);
-    font-size: clamp(1.6rem, 4vw, 2.4rem);
-    line-height: 1.05;
+    font-size: var(--font-size-title);
+    line-height: var(--line-height-title);
   }
   .page-header-row p:not(.breadcrumb),
   .workers-page-header p {
@@ -325,7 +325,7 @@
   .breadcrumb {
     margin-bottom: var(--space-2);
     color: var(--text-muted);
-    font-size: 0.85rem;
+    font-size: var(--font-size-compact);
   }
   .breadcrumb a {
     color: inherit;

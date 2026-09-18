@@ -10,7 +10,7 @@
     border-radius: 0.55rem;
     padding: 0.5rem 0.8rem;
     font: inherit;
-    font-size: 0.82rem;
+    font-size: var(--font-size-compact);
     font-weight: 700;
     text-decoration: none;
     cursor: pointer;
@@ -38,7 +38,7 @@
   }
   .workspace-back-link {
     color: var(--text-muted);
-    font-size: 0.82rem;
+    font-size: var(--font-size-compact);
     text-decoration: none;
   }
   .workspace-callout {
@@ -94,11 +94,11 @@
   }
   .orchestrator-status strong {
     color: var(--text-strong);
-    font-size: 0.76rem;
+    font-size: var(--font-size-compact);
   }
   .orchestrator-status span {
     color: var(--text-muted);
-    font-size: 0.68rem;
+    font-size: var(--font-size-compact);
   }
   .orchestrator-status-dot {
     width: 0.55rem;
@@ -116,8 +116,8 @@
   }
   .ticket-panel-summary strong {
     color: var(--text-strong);
-    font-size: 1.8rem;
-    line-height: 1;
+    font-size: var(--font-size-compact);
+    line-height: var(--line-height-compact);
   }
   .ticket-kanban {
     display: grid;
@@ -149,7 +149,7 @@
   }
   .ticket-lane-header h2 {
     margin: 0;
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
@@ -170,7 +170,7 @@
   }
   .ticket-lane-count {
     color: var(--text-muted);
-    font-size: 0.75rem;
+    font-size: var(--font-size-compact);
   }
   .ticket-lane-cards {
     display: grid;
@@ -188,7 +188,7 @@
     margin: 0;
     color: var(--text-muted);
     padding: 0.5rem;
-    font-size: 0.7rem;
+    font-size: var(--font-size-compact);
     text-align: center;
   }
   .ticket-lane-page-state {
@@ -198,7 +198,7 @@
     margin: 0;
     padding: 0.45rem;
     color: var(--text-muted);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
     text-align: center;
   }
   .ticket-lane-page-error {
@@ -229,17 +229,17 @@
     overflow: hidden;
     color: var(--text-muted);
     font-family: var(--font-mono);
-    font-size: 0.68rem;
+    font-size: var(--font-size-compact);
     text-overflow: ellipsis;
   }
   .ticket-card strong {
-    font-size: 0.85rem;
+    font-size: var(--font-size-compact);
     line-height: 1.35;
   }
   .ticket-card-meta {
     justify-content: space-between;
     color: var(--text-muted);
-    font-size: 0.68rem;
+    font-size: var(--font-size-compact);
   }
   .ticket-risk-list {
     display: flex;
@@ -251,7 +251,7 @@
     align-items: center;
     gap: var(--space-1);
     color: var(--warning);
-    font-size: 0.62rem;
+    font-size: var(--font-size-compact);
   }
   .ticket-risk-list span::before {
     width: 0.4rem;
@@ -263,7 +263,7 @@
   .ticket-lane-empty {
     padding: 1.2rem 0.4rem;
     color: var(--text-muted);
-    font-size: 0.75rem;
+    font-size: var(--font-size-compact);
     text-align: center;
   }
   .ticket-detail-page {
@@ -274,26 +274,26 @@
   .ticket-detail-header h1 {
     margin: 0.45rem 0 0.25rem;
     color: var(--text-strong);
-    font-size: clamp(1.5rem, 3vw, 2.4rem);
+    font-size: var(--font-size-title);
   }
   .ticket-detail-header p {
     margin: 0;
     color: var(--text-muted);
-    font-size: 0.78rem;
+    font-size: var(--font-size-compact);
   }
   .ticket-detail-kicker {
     gap: 0.6rem;
   }
   .ticket-detail-kicker code {
     color: var(--text-muted);
-    font-size: 0.72rem;
+    font-size: var(--font-size-compact);
   }
   .workspace-status-pill {
     display: inline-flex;
     align-items: center;
     gap: var(--space-1);
     color: var(--text-muted);
-    font-size: 0.68rem;
+    font-size: var(--font-size-compact);
     text-transform: uppercase;
   }
   .workspace-status-pill::before {
@@ -332,11 +332,11 @@
   .ticket-section-heading h2, .ticket-control-card h2 {
     margin: 0;
     color: var(--text-strong);
-    font-size: 0.9rem;
+    font-size: var(--font-size-body);
   }
   .ticket-section-heading span, .ticket-control-card header span {
     color: var(--text-muted);
-    font-size: 0.7rem;
+    font-size: var(--font-size-compact);
   }
   .ticket-editor, .ticket-control-form {
     display: grid;
@@ -346,7 +346,7 @@
     display: grid;
     gap: 0.3rem;
     color: var(--text-muted);
-    font-size: 0.72rem;
+    font-size: var(--font-size-body);
   }
   .ticket-editor input,
   .ticket-editor textarea,
@@ -363,8 +363,8 @@
   }
   .ticket-worker-card p {
     color: var(--text-muted);
-    font-size: 0.78rem;
-    line-height: 1.5;
+    font-size: var(--font-size-body);
+    line-height: var(--line-height-body);
   }
   .ticket-role-actions {
     gap: 0.55rem;
@@ -379,7 +379,7 @@
   details.ticket-control-card summary {
     cursor: pointer;
     color: var(--text-strong);
-    font-size: 0.85rem;
+    font-size: var(--font-size-compact);
     font-weight: 700;
   }
   details.ticket-control-card[open] summary {
@@ -411,7 +411,7 @@
   .ticket-relations-list small,
   .ticket-blocker-list span {
     color: var(--text-muted);
-    font-size: 0.68rem;
+    font-size: var(--font-size-compact);
   }
   .ticket-timeline {
     display: grid;
@@ -449,7 +449,7 @@
   }
   .ticket-timeline time, .ticket-event-author {
     color: var(--text-muted);
-    font-size: 0.68rem;
+    font-size: var(--font-size-compact);
   }
   .ticket-event-author {
     margin: 0.2rem 0;

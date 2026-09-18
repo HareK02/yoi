@@ -81,7 +81,7 @@
   .memory-document-summary span {
     color: var(--text-muted);
     display: block;
-    font-size: 0.76rem;
+    font-size: var(--font-size-compact);
     font-weight: 600;
     letter-spacing: 0.04em;
     text-transform: uppercase;
@@ -90,7 +90,7 @@
   .memory-document-summary strong {
     color: var(--text);
     display: block;
-    font-size: 0.95rem;
+    font-size: var(--font-size-compact);
     margin-top: 0.25rem;
     overflow-wrap: anywhere;
   }
@@ -101,8 +101,8 @@
     border-radius: 0.9rem;
     color: var(--text);
     font-family: var(--font-mono);
-    font-size: 0.88rem;
-    line-height: 1.6;
+    font-size: var(--font-size-body);
+    line-height: var(--line-height-body);
     margin: 1rem 0 0;
     overflow: auto;
     padding: 1rem;

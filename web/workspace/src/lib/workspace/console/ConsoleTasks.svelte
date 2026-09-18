@@ -124,7 +124,7 @@
     gap: 0.1rem;
     min-width: 0;
     padding-inline: 0.75rem;
-    font-size: 0.8rem;
+    font-size: var(--font-size-compact);
     line-height: 1.35;
   }
 
@@ -237,7 +237,7 @@
   .task-pane h3 {
     margin: 0 0 1rem;
     color: var(--accent);
-    font-size: 0.9rem;
+    font-size: var(--font-size-body);
   }
 
   .task-empty {
@@ -262,8 +262,8 @@
   }
 
   .task-description {
-    font-size: 0.8rem;
-    line-height: 1.45;
+    font-size: var(--font-size-body);
+    line-height: var(--line-height-body);
   }
 
   @media (max-width: 900px) {
