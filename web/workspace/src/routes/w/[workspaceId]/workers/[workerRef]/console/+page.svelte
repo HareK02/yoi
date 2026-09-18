@@ -934,7 +934,7 @@
     }
 
     function connectProtocolTransport(
-        _targetWorker: Worker | null,
+        targetWorker: Worker | null,
         token: number,
         target: ConsoleTarget,
     ) {
@@ -980,6 +980,23 @@
                             code: "retained_session_unavailable",
                             severity: "warning",
                             message: action.message,
+                        },
+                    ];
+                    return;
+                }
+                if (
+                    action.kind === "subscribe_live" &&
+                    targetWorker &&
+                    targetWorker.state === "stopped"
+                ) {
+                    protocolState = "closed";
+                    streamDiagnostics = [
+                        ...streamDiagnostics,
+                        {
+                            code: "worker_session_state_changed",
+                            severity: "warning",
+                            message:
+                                "The Session is live but the Worker is stopped. Reload to refresh its state.",
                         },
                     ];
                     return;
