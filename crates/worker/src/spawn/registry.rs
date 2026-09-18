@@ -553,6 +553,32 @@ impl SpawnedWorkerRegistry {
     }
 
     #[cfg(test)]
+    pub(crate) fn install_service_for_test(
+        &self,
+    ) -> (
+        String,
+        tokio::sync::broadcast::Sender<protocol::Event>,
+    ) {
+        let (session, status_tx) = crate::internal_worker::test_internal_worker_session(
+            crate::internal_worker::InternalWorkerVisibility::ServicePrivate,
+        );
+        let session_id = session.session_id_string();
+        self.service_records.lock().unwrap().push(
+            InternalServiceWorkerRecord::new("test-service", "test-service", session),
+        );
+        (session_id, status_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_service_for_test(&self, session_id: &str) -> bool {
+        self.service_records
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|record| record.session.session_id_string() == session_id)
+    }
+
+    #[cfg(test)]
     pub(crate) fn fail_service_stops_for_test(&self, session_id: &str, count: usize) {
         self.fail_service_stops
             .lock()

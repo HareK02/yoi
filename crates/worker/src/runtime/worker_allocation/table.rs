@@ -8,11 +8,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
-static FAIL_NEXT_SAVE_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+static FAIL_NEXT_SAVE_PATHS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
 #[cfg(test)]
 pub(crate) fn fail_next_save_for_test(path: &Path) {
-    *FAIL_NEXT_SAVE_PATH.lock().unwrap() = Some(path.to_path_buf());
+    FAIL_NEXT_SAVE_PATHS
+        .lock()
+        .unwrap()
+        .insert(path.to_path_buf());
 }
 
 use fs4::fs_std::FileExt;
@@ -219,9 +224,11 @@ impl LockFileGuard {
     pub fn save(&mut self) -> io::Result<()> {
         #[cfg(test)]
         {
-            let mut fail_path = FAIL_NEXT_SAVE_PATH.lock().unwrap();
-            if fail_path.as_ref() == Some(&self.data_path) {
-                *fail_path = None;
+            if FAIL_NEXT_SAVE_PATHS
+                .lock()
+                .unwrap()
+                .remove(&self.data_path)
+            {
                 return Err(io::Error::other("injected allocation save failure"));
             }
         }

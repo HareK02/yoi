@@ -8585,7 +8585,7 @@ mod build_summary_prompt_tests {
     }
 
     #[tokio::test]
-    async fn failed_activation_worker_drop_releases_nested_authority_before_allocation() {
+    async fn post_metadata_allocation_failure_fences_appends_and_restart_converges() {
         let dir = tempfile::tempdir().unwrap();
         let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
         let mut worker = Worker::new(
@@ -8601,6 +8601,27 @@ mod build_summary_prompt_tests {
         worker.ensure_segment_head().await.unwrap();
         let old_segment = worker.segment_id();
         let replacement = session_store::new_segment_id();
+        let old_location = SegmentLocation {
+            session_id: worker.session_id(),
+            segment_id: old_segment,
+        };
+        let replacement_location = SegmentLocation {
+            session_id: worker.session_id(),
+            segment_id: replacement,
+        };
+        let persisted_metadata = Arc::new(Mutex::new(WorkerActiveSegmentRef::active_segment(
+            old_location.session_id,
+            old_location.segment_id,
+        )));
+        let metadata_for_cas = Arc::clone(&persisted_metadata);
+        worker.worker_metadata_segment_cas = Some(Arc::new(move |_worker_name, expected, replacement| {
+            let mut persisted = metadata_for_cas.lock().unwrap();
+            if &*persisted != expected {
+                return Ok(false);
+            }
+            *persisted = replacement;
+            Ok(true)
+        }));
         let lock_path = dir.path().join("workers.json");
         let allocation = worker_allocation::install_top_level_at_for_test(
             lock_path.clone(),
@@ -8615,6 +8636,16 @@ mod build_summary_prompt_tests {
             .begin_segment_activation(old_segment, replacement)
             .unwrap();
         worker.scope_allocation = Some(allocation);
+        worker
+            .compare_and_swap_worker_metadata_segment(old_location, replacement_location)
+            .unwrap();
+        assert_eq!(
+            *persisted_metadata.lock().unwrap(),
+            WorkerActiveSegmentRef::active_segment(
+                replacement_location.session_id,
+                replacement_location.segment_id,
+            )
+        );
         worker_allocation::fail_next_save_for_test(&lock_path);
         let (source, authority) = activation.commit().unwrap_err().into_parts();
         assert!(matches!(source, ScopeLockError::Io(_)));
@@ -8630,6 +8661,24 @@ mod build_summary_prompt_tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("Worker teardown must not deadlock on nested allocation locks");
         teardown.join().unwrap();
+
+        // Process-stop releases the retained authority and the old allocation;
+        // restart follows the replacement named by committed metadata.
+        let recovered = worker_allocation::install_top_level_at_for_test(
+            lock_path,
+            "test-worker".into(),
+            std::process::id(),
+            dir.path().join("worker-restored.sock"),
+            Vec::new(),
+            replacement,
+        )
+        .unwrap();
+        drop(
+            recovered
+                .begin_segment_activation(replacement, session_store::new_segment_id())
+                .unwrap(),
+        );
+        drop(recovered);
     }
 
     #[tokio::test]
@@ -8648,13 +8697,14 @@ mod build_summary_prompt_tests {
         .unwrap();
         let registry =
             crate::spawn::registry::SpawnedWorkerRegistry::new_for_internal_services();
-        registry.fail_service_stops_for_test("cleanup-session", 3);
+        let (cleanup_session_id, _events) = registry.install_service_for_test();
+        registry.fail_service_stops_for_test(&cleanup_session_id, 4);
         worker.internal_worker_registry = Some(Arc::clone(&registry));
         *worker
             .pending_compaction_cleanup
             .lock()
             .expect("pending cleanup lock poisoned") = Some(PendingCompactionCleanup {
-            session_id: "cleanup-session".into(),
+            session_id: cleanup_session_id.clone(),
             compaction_id: "compaction".into(),
         });
 
@@ -8666,9 +8716,13 @@ mod build_summary_prompt_tests {
         .expect("shutdown cleanup must be bounded")
         .unwrap();
         assert!(!worker.has_pending_compaction_cleanup());
+        assert!(registry.has_service_for_test(&cleanup_session_id));
+        assert!(registry.is_service_cleanup_quarantined_for_test(&cleanup_session_id));
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if !registry.is_service_cleanup_quarantined_for_test("cleanup-session") {
+                if !registry.is_service_cleanup_quarantined_for_test(&cleanup_session_id)
+                    && !registry.has_service_for_test(&cleanup_session_id)
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
