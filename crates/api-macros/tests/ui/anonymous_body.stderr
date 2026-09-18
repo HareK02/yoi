@@ -1,0 +1,5 @@
+error: request bodies must use a named Rust type
+ --> tests/ui/anonymous_body.rs:8:45
+  |
+8 |     async fn create(&self, #[body] request: (u64, u64)) -> Response;
+  |                                             ^^^^^^^^^^

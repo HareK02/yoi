@@ -84,6 +84,59 @@ impl WorkerSessionStore {
         })
     }
 
+    /// Open an already-retained Session without creating directories or migrating
+    /// persisted data. Observation paths must never mutate retained state.
+    pub fn open_read_only(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        let root = root.into();
+        let bytes = crate::read_without_atime(&root.join(SESSION_FILE))?;
+        let manifest: SessionManifest = serde_json::from_slice(&bytes)?;
+        if manifest.schema_version != SESSION_SCHEMA_VERSION {
+            return Err(StoreError::Corrupt {
+                line: 0,
+                message: format!(
+                    "Worker Session schema version {} requires migration; expected {}",
+                    manifest.schema_version, SESSION_SCHEMA_VERSION
+                ),
+            });
+        }
+        Ok(Self {
+            root,
+            session_id: Arc::new(Mutex::new(Some(manifest.session_id))),
+            append_lock: Arc::new(Mutex::new(())),
+        })
+    }
+
+    pub fn read_all_read_only(
+        &self,
+        session_id: SessionId,
+        segment_id: SegmentId,
+    ) -> Result<Vec<LogEntry>, StoreError> {
+        let retained_session_id = self.session_id.lock().map_err(|_| StoreError::Corrupt {
+            line: 0,
+            message: "Worker Session identity lock poisoned".to_string(),
+        })?;
+        if *retained_session_id != Some(session_id) {
+            return Err(StoreError::Corrupt {
+                line: 0,
+                message: "active Worker Session identity does not match retained manifest"
+                    .to_string(),
+            });
+        }
+        let path = self.log_path(segment_id);
+        let bytes = crate::read_without_atime(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                StoreError::NotFound(segment_id)
+            } else {
+                StoreError::Io(error)
+            }
+        })?;
+        parse_jsonl(&bytes)
+    }
+
+    pub fn segment_log_len(&self, segment_id: SegmentId) -> Result<u64, StoreError> {
+        Ok(fs::metadata(self.log_path(segment_id))?.len())
+    }
+
     pub fn root_dir(&self) -> &Path {
         &self.root
     }

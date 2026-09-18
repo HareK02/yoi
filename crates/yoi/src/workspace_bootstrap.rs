@@ -21,7 +21,7 @@ pub(crate) struct InitOptions {
 
 pub(crate) async fn run_init(
     options: InitOptions,
-) -> Result<workspace_api::WorkspaceCreateResponse, ParseError> {
+) -> Result<server_api::WorkspaceCreateResponse, ParseError> {
     let repository_uri = options
         .repository_root
         .to_str()
@@ -82,8 +82,8 @@ pub(crate) fn discover_repository_root(path: &Path) -> Result<PathBuf, ParseErro
 fn select_workspace_from_repository_catalog(
     repository: &OpenRepositoryIdentity,
     catalog: &[(
-        workspace_api::WorkspaceSummary,
-        Vec<workspace_api::RepositorySummary>,
+        server_api::WorkspaceSummary,
+        Vec<server_api::RepositorySummary>,
     )],
 ) -> Result<String, ParseError> {
     let matches = catalog
@@ -122,22 +122,21 @@ struct OpenRepositoryIdentity {
 }
 
 impl OpenRepositoryIdentity {
-    fn matches(&self, source: &workspace_api::RepositorySource) -> bool {
+    fn matches(&self, source: &server_api::RepositorySource) -> bool {
         match source.kind {
-            workspace_api::RepositorySourceKind::LocalPath => fs::canonicalize(&source.uri)
+            server_api::RepositorySourceKind::LocalPath => fs::canonicalize(&source.uri)
                 .ok()
                 .is_some_and(|path| path == self.root),
-            workspace_api::RepositorySourceKind::File => source
+            server_api::RepositorySourceKind::File => source
                 .uri
                 .strip_prefix("file://")
                 .and_then(|path| fs::canonicalize(path).ok())
                 .is_some_and(|path| path == self.root),
-            workspace_api::RepositorySourceKind::Ssh
-            | workspace_api::RepositorySourceKind::Https => self
+            server_api::RepositorySourceKind::Ssh | server_api::RepositorySourceKind::Https => self
                 .remote_uris
                 .iter()
                 .any(|uri| normalize_git_uri(uri) == normalize_git_uri(&source.uri)),
-            workspace_api::RepositorySourceKind::Invalid => false,
+            server_api::RepositorySourceKind::Invalid => false,
         }
     }
 }
@@ -306,8 +305,8 @@ mod tests {
     use super::*;
     use crate::{ClientDefaultConnection, read_client_config_from_global_path};
 
-    fn workspace_summary(id: &str, name: &str) -> workspace_api::WorkspaceSummary {
-        workspace_api::WorkspaceSummary {
+    fn workspace_summary(id: &str, name: &str) -> server_api::WorkspaceSummary {
+        server_api::WorkspaceSummary {
             workspace_id: id.to_string(),
             owner_account_id: "owner-account".to_string(),
             display_name: name.to_string(),
@@ -317,17 +316,15 @@ mod tests {
         }
     }
 
-    fn repository_summary(
-        source: workspace_api::RepositorySource,
-    ) -> workspace_api::RepositorySummary {
-        workspace_api::RepositorySummary {
+    fn repository_summary(source: server_api::RepositorySource) -> server_api::RepositorySummary {
+        server_api::RepositorySummary {
             repository_key: "main".to_string(),
             kind: "git".to_string(),
             provider: "builtin:git".to_string(),
             source,
             source_revision: 1,
             source_fingerprint: "fingerprint".to_string(),
-            observed_status: workspace_api::RepositoryObservedStatus::Unverified,
+            observed_status: server_api::RepositoryObservedStatus::Unverified,
             observed_at: None,
             default_selector: Some("develop".to_string()),
             record_authority: "server_db".to_string(),
@@ -345,8 +342,8 @@ mod tests {
             .status()
             .unwrap();
         let identity = discover_open_repository(repository.path()).unwrap();
-        let source = workspace_api::RepositorySource {
-            kind: workspace_api::RepositorySourceKind::LocalPath,
+        let source = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::LocalPath,
             uri: identity.root.display().to_string(),
         };
         let matching_repository = repository_summary(source);

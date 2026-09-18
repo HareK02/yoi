@@ -782,7 +782,6 @@ impl App {
         Some(Method::Notify {
             notification_request_id: protocol::new_submission_request_id(),
             message,
-            auto_run: true,
         })
     }
 

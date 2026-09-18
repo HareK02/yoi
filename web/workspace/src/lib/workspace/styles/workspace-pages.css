@@ -140,14 +140,21 @@
     gap: var(--space-2);
     min-width: 0;
   }
-  .ticket-title,
-  .objective-title {
+  .ticket-title {
     min-width: 0;
     overflow: hidden;
     color: var(--text-strong);
     font-weight: 700;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .objective-title {
+    min-width: 0;
+    flex: 1 1 auto;
+    color: var(--text-strong);
+    font-weight: 700;
+    overflow-wrap: anywhere;
+    white-space: normal;
   }
   .state-pill {
     flex: 0 0 auto;
@@ -157,8 +164,7 @@
     letter-spacing: 0.05em;
     text-transform: uppercase;
   }
-  .ticket-summary,
-  .objective-summary {
+  .ticket-summary {
     margin: 0;
     color: var(--text-muted);
     font-size: var(--font-size-compact);
@@ -187,6 +193,51 @@
       justify-content: flex-start;
       text-align: left;
       white-space: normal;
+    }
+  }
+  .objective-title-row {
+    align-items: flex-start;
+  }
+  .objective-title-row.detail h3 {
+    min-width: 0;
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+  .objective-detail-card {
+    display: grid;
+    gap: var(--space-4);
+  }
+  .objective-detail-card > h2 {
+    margin: 0;
+  }
+  .objective-back-link {
+    width: fit-content;
+    color: var(--text-muted);
+    font-size: var(--font-size-compact);
+  }
+  .objective-detail-metadata {
+    padding-bottom: var(--space-4);
+    border-bottom: 1px solid var(--line);
+  }
+  .objective-detail-metadata dd {
+    overflow-wrap: anywhere;
+  }
+  .objective-body {
+    min-width: 0;
+  }
+  .objective-body > :first-child {
+    margin-top: 0;
+  }
+  .objective-body > :last-child {
+    margin-bottom: 0;
+  }
+  @media (max-width: 600px) {
+    .objective-title-row.detail {
+      flex-wrap: wrap;
+    }
+    .objective-detail-metadata > div {
+      grid-template-columns: minmax(0, 1fr);
+      gap: var(--space-1);
     }
   }
   .runtime-heading,

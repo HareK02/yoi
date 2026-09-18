@@ -1,14 +1,7 @@
 use reqwest::Method;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use ticket::{
-    MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent, NewTicketRelation,
-    OrchestrationPlanKind, OrchestrationPlanRecord, Ticket, TicketBackend, TicketDependencyCheck,
-    TicketDoctorReport, TicketError, TicketIdOrSlug, TicketIntakeSummary, TicketItemEdit,
-    TicketListQuery, TicketListState, TicketMarkReady, TicketRef, TicketRelation,
-    TicketRelationKind, TicketRelationView, TicketStateChange, TicketStateSelector, TicketSummary,
-};
-use workspace_api::{
+use server_api::{
     BrowserCreateWorkerResponse, BrowserWorkspaceOrchestratorResponse,
     CreateWorkspaceWorkerRequest, ListResponse, MemoryDocumentResponse, MemoryStagingListResponse,
     ObjectiveCreateRequest, ObjectiveDetail, ObjectiveEditRequest, ObjectiveLinkTicketRequest,
@@ -16,6 +9,13 @@ use workspace_api::{
     RuntimeTrustKeyRevealResponse, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
     TICKET_RELATIONS_QUERY_PATH, WorkerLaunchOptionsResponse, WorkspaceRuntimeDetail,
     WorkspaceRuntimeResource,
+};
+use ticket::{
+    MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent, NewTicketRelation,
+    OrchestrationPlanKind, OrchestrationPlanRecord, Ticket, TicketBackend, TicketDependencyCheck,
+    TicketDoctorReport, TicketError, TicketIdOrSlug, TicketIntakeSummary, TicketItemEdit,
+    TicketListQuery, TicketListState, TicketMarkReady, TicketRef, TicketRelation,
+    TicketRelationKind, TicketRelationView, TicketStateChange, TicketStateSelector, TicketSummary,
 };
 
 use crate::{BackendApiClient, BackendWorkspaceClientError};
@@ -758,7 +758,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .kind,
-            workspace_api::MemoryEvidenceOriginKind::WorkerInput
+            server_api::MemoryEvidenceOriginKind::WorkerInput
         );
         assert!(
             request

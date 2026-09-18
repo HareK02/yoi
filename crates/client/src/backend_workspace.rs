@@ -1,11 +1,10 @@
 use crate::{BackendApiClient, BackendApiClientError};
 use reqwest::Method;
-use std::fmt;
-use workspace_api::{
-    InitialRepositoryIntent, RepositoryListResponse, RepositorySummary,
-    WorkspaceCatalogListResponse, WorkspaceCreateRequest, WorkspaceCreateResponse,
-    WorkspaceSummary,
+use server_api::{
+    InitialRepositoryIntent, RepositorySummary, WorkspaceCatalogListResponse,
+    WorkspaceCreateRequest, WorkspaceCreateResponse, WorkspaceSummary,
 };
+use std::fmt;
 
 const DEFAULT_WORKSPACE_LIMIT: usize = 200;
 
@@ -32,6 +31,7 @@ pub enum BackendWorkspaceClientError {
     InvalidTarget(String),
     Api(BackendApiClientError),
     Http(reqwest::Error),
+    RepositoryApi(server_api::client_support::ClientError<server_api::RepositoryApiError>),
 }
 
 impl fmt::Display for BackendWorkspaceClientError {
@@ -40,6 +40,7 @@ impl fmt::Display for BackendWorkspaceClientError {
             Self::InvalidTarget(message) => f.write_str(message),
             Self::Api(error) => write!(f, "{error}"),
             Self::Http(error) => write!(f, "{error}"),
+            Self::RepositoryApi(error) => write!(f, "{error}"),
         }
     }
 }
@@ -57,6 +58,62 @@ impl From<reqwest::Error> for BackendWorkspaceClientError {
         Self::Http(error)
     }
 }
+
+impl From<server_api::client_support::ClientError<server_api::RepositoryApiError>>
+    for BackendWorkspaceClientError
+{
+    fn from(
+        error: server_api::client_support::ClientError<server_api::RepositoryApiError>,
+    ) -> Self {
+        Self::RepositoryApi(error)
+    }
+}
+
+fn repository_client_error(
+    backend: &BackendApiClient,
+    error: server_api::client_support::ClientError<server_api::RepositoryApiError>,
+) -> BackendWorkspaceClientError {
+    let status = match &error {
+        server_api::client_support::ClientError::Public { status, .. } => Some(*status),
+        server_api::client_support::ClientError::Failure(_) => None,
+    };
+    match status {
+        Some(reqwest::StatusCode::UNAUTHORIZED) => {
+            BackendWorkspaceClientError::Api(BackendApiClientError::Unauthorized {
+                origin: backend.origin().clone(),
+            })
+        }
+        Some(reqwest::StatusCode::FORBIDDEN) => {
+            BackendWorkspaceClientError::Api(BackendApiClientError::Forbidden {
+                origin: backend.origin().clone(),
+            })
+        }
+        _ => BackendWorkspaceClientError::RepositoryApi(error),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RepositoryBearerAuthorizer {
+    authorization: String,
+}
+
+impl server_api::client_support::RequestAuthorizer for RepositoryBearerAuthorizer {
+    fn authorize(
+        &self,
+        _request: server_api::client_support::AuthorizerRequest<'_>,
+    ) -> Result<reqwest::header::HeaderMap, server_api::client_support::AuthorizationError> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            self.authorization
+                .parse()
+                .map_err(|_| server_api::client_support::AuthorizationError::new())?,
+        );
+        Ok(headers)
+    }
+}
+
+const REPOSITORY_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
 
 pub fn list_backend_workspaces_blocking(
     target: &BackendWorkspaceCatalogTarget,
@@ -76,6 +133,21 @@ pub fn list_backend_workspace_repositories_blocking(
     target: &BackendWorkspaceCatalogTarget,
     workspace_id: &str,
 ) -> Result<Vec<RepositorySummary>, BackendWorkspaceClientError> {
+    let client = BackendApiClient::from_stored_token(&target.base_url)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?;
+    runtime.block_on(list_backend_workspace_repositories_with_client(
+        &client,
+        workspace_id,
+    ))
+}
+
+async fn list_backend_workspace_repositories_with_client(
+    backend: &BackendApiClient,
+    workspace_id: &str,
+) -> Result<Vec<RepositorySummary>, BackendWorkspaceClientError> {
     if workspace_id.is_empty()
         || workspace_id.len() > 200
         || !workspace_id
@@ -86,12 +158,19 @@ pub fn list_backend_workspace_repositories_blocking(
             "Workspace id returned by Backend is invalid".to_string(),
         ));
     }
-    let client = BackendApiClient::from_stored_token(&target.base_url)?;
+    let client = server_api::ServerApiClient::builder(backend.origin().as_str())
+        .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?
+        .client(backend.asynchronous_client())
+        .authorizer(RepositoryBearerAuthorizer {
+            authorization: backend.authorization_header_value(),
+        })
+        .response_body_limit(REPOSITORY_RESPONSE_LIMIT)
+        .build()
+        .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?;
     let response = client
-        .blocking_request(Method::GET, &format!("/api/w/{workspace_id}/repositories"))?
-        .send()?;
-    client.check_status(response.status())?;
-    let response = response.json::<RepositoryListResponse>()?;
+        .repository_list(workspace_id.to_owned())
+        .await
+        .map_err(|error| repository_client_error(backend, error))?;
     if response.workspace_id != workspace_id {
         return Err(BackendWorkspaceClientError::InvalidTarget(
             "Repository catalog response does not match the requested Workspace".to_string(),
@@ -168,6 +247,124 @@ mod tests {
                 .is_empty()
         );
         handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn repository_catalog_uses_generated_path_and_bearer_authorizer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = vec![0; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            assert!(request.starts_with("get /api/w/workspace-test/repositories "));
+            assert!(request.contains("authorization: bearer repository-secret\r\n"));
+            let body = r#"{"workspace_id":"workspace-test","items":[],"source":"workspace","diagnostics":[]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let client =
+            BackendApiClient::from_access_token_for_test(&base_url, "repository-secret").unwrap();
+
+        assert!(
+            list_backend_workspace_repositories_with_client(&client, "workspace-test")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn repository_catalog_enforces_generated_response_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = vec![0; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                REPOSITORY_RESPONSE_LIMIT + 1,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            let chunk = [b' '; 8192];
+            let mut remaining = REPOSITORY_RESPONSE_LIMIT + 1;
+            while remaining > 0 {
+                let length = remaining.min(chunk.len());
+                if stream.write_all(&chunk[..length]).is_err() {
+                    break;
+                }
+                remaining -= length;
+            }
+        });
+        let client =
+            BackendApiClient::from_access_token_for_test(&base_url, "repository-secret").unwrap();
+
+        let error = list_backend_workspace_repositories_with_client(&client, "workspace-test")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                BackendWorkspaceClientError::RepositoryApi(
+                    server_api::client_support::ClientError::Failure(
+                        server_api::client_support::ClientFailure::ResponseTooLarge {
+                            limit: REPOSITORY_RESPONSE_LIMIT
+                        }
+                    )
+                )
+            ),
+            "unexpected error: {error:?}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn repository_client_preserves_authentication_error_taxonomy() {
+        let client =
+            BackendApiClient::from_access_token_for_test("https://backend.example.test", "token")
+                .unwrap();
+        let unauthorized = repository_client_error(
+            &client,
+            server_api::client_support::ClientError::public(
+                reqwest::StatusCode::UNAUTHORIZED,
+                server_api::RepositoryApiError::new(
+                    401,
+                    "Unauthorized",
+                    "authentication required",
+                    Vec::new(),
+                ),
+            ),
+        );
+        assert!(matches!(
+            unauthorized,
+            BackendWorkspaceClientError::Api(BackendApiClientError::Unauthorized { .. })
+        ));
+        let forbidden = repository_client_error(
+            &client,
+            server_api::client_support::ClientError::public(
+                reqwest::StatusCode::FORBIDDEN,
+                server_api::RepositoryApiError::new(
+                    403,
+                    "Forbidden",
+                    "repository access denied",
+                    Vec::new(),
+                ),
+            ),
+        );
+        assert!(matches!(
+            forbidden,
+            BackendWorkspaceClientError::Api(BackendApiClientError::Forbidden { .. })
+        ));
     }
 
     #[test]

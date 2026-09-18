@@ -12,7 +12,7 @@ import type {
   WorkspaceSigningIdentityPublic,
   WorkspaceSigningIdentityResponse,
   WorkspaceSigningIdentityState,
-} from "$lib/generated/workspace-api";
+} from "$lib/generated/legacy-server-api";
 
 export class ProfileApiError extends Error {
   constructor(

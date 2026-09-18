@@ -30,6 +30,7 @@ pub mod skills;
 pub mod store;
 pub mod workdir_create_operations;
 mod workdir_removal;
+mod worker_projection;
 pub mod worker_source;
 pub mod workspace_catalog;
 mod workspace_deletion;
@@ -48,11 +49,11 @@ pub use server::{
     AuthConfig, ServerConfig, WorkspaceApi, WorkspaceServerApi, build_router,
     build_workspace_server_router, serve, serve_workspace_catalog,
 };
-pub use store::{ControlPlaneStore, SqliteWorkspaceStore, WorkspaceRecord};
-pub use workspace_api::{
+pub use server_api::{
     GitCommitSummary, GitRemoteSummary, GitRepositorySummary, RepositorySummary,
     WorkspaceCreateResponse,
 };
+pub use store::{ControlPlaneStore, SqliteWorkspaceStore, WorkspaceRecord};
 pub use workspace_catalog::{
     InitialRepositoryIntent, WorkspaceCatalogService, WorkspaceCreateRequest, WorkspaceCreateResult,
 };

@@ -1,7 +1,14 @@
 <script lang="ts">
-  import type { InFlightCompaction } from "$lib/generated/protocol.ts";
+  import type {
+    InFlightCompaction,
+    WorkerStateSnapshot,
+  } from "$lib/generated/protocol.ts";
   import Spinner from "./Spinner.svelte";
-  import { formatRunElapsed, formatRunTokens } from "./run-status";
+  import {
+    formatRunElapsed,
+    formatRunTokens,
+    resolveCompactionStatusPresentation,
+  } from "./run-status";
 
   type Props = {
     startedAtMs: number | null;
@@ -9,12 +16,24 @@
     uploadTokens: number;
     outputTokens: number;
     compaction?: InFlightCompaction | null;
+    workerState?: WorkerStateSnapshot | null;
   };
 
-  let { startedAtMs, requests, uploadTokens, outputTokens, compaction = null }: Props =
-    $props();
+  let {
+    startedAtMs,
+    requests,
+    uploadTokens,
+    outputTokens,
+    compaction = null,
+    workerState = null,
+  }: Props = $props();
   let nowMs = $state(Date.now());
-  const clockStartedAtMs = $derived(compaction?.started_at_ms ?? startedAtMs);
+  const compactionStatus = $derived(
+    resolveCompactionStatusPresentation(compaction, workerState),
+  );
+  const clockStartedAtMs = $derived(
+    compactionStatus?.progress.started_at_ms ?? startedAtMs,
+  );
 
   $effect(() => {
     clockStartedAtMs;
@@ -33,8 +52,8 @@
 
 <div class="worker-run-status" role="status" aria-live="off">
   <Spinner />
-  {#if compaction}
-    <span>Compacting · {compaction.phase}</span>
+  {#if compactionStatus}
+    <span>{compactionStatus.label}</span>
     <span aria-hidden="true">|</span>
   {/if}
   <span>{elapsed}</span>

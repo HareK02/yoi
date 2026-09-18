@@ -349,7 +349,6 @@ async fn standalone_restore_preserves_history_tasks_notifications_and_cwd_scope(
         .send(&Method::Notify {
             notification_request_id: protocol::new_submission_request_id(),
             message: "persisted notification".to_string(),
-            auto_run: true,
         })
         .await?;
     wait_for_run_end(&mut protocol_client).await?;

@@ -25,7 +25,6 @@
                 <strong class="objective-title">{objective.title}</strong>
                 <span class="state-pill">{objective.state}</span>
               </div>
-              <p class="objective-summary">{objective.summary || 'No summary text is available.'}</p>
             </div>
             <div class="objective-meta" aria-label="Objective metadata">
               <span>Updated {objective.updated_at ? formatDate(objective.updated_at) : 'unknown'}</span>

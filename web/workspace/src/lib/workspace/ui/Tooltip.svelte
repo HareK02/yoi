@@ -21,7 +21,7 @@
   let open = $state(false);
   let pointerInside = false;
   let focusInside = false;
-  let hoverTimer: number | undefined;
+  let hoverTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
   let rootElement: HTMLSpanElement | undefined;
   let tooltipElement: HTMLSpanElement | undefined;
   let tooltipLeft = $state(0);

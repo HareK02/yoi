@@ -20,6 +20,41 @@ pub struct ScopeAllocationGuard {
     lock_path: PathBuf,
 }
 
+/// Exclusive authority to activate a replacement Segment for one allocated Worker.
+///
+/// The allocation lock remains held across the durable metadata CAS and the final
+/// allocation-table update, so restore admission cannot observe an intermediate
+/// ownership state.
+pub struct SegmentActivationGuard {
+    guard: LockFileGuard,
+    worker_name: String,
+    expected: SegmentId,
+    replacement: SegmentId,
+}
+
+/// A failed allocation-table publication together with the still-held machine-wide
+/// activation authority. Callers must retain `authority` until recovery or process
+/// teardown so restore admission cannot register a competing writer.
+pub struct SegmentActivationCommitError {
+    source: ScopeLockError,
+    authority: SegmentActivationGuard,
+}
+
+impl std::fmt::Debug for SegmentActivationCommitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SegmentActivationCommitError")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SegmentActivationCommitError {
+    pub fn into_parts(self) -> (ScopeLockError, SegmentActivationGuard) {
+        (self.source, self.authority)
+    }
+}
+
 impl ScopeAllocationGuard {
     pub fn worker_name(&self) -> &str {
         &self.worker_name
@@ -27,6 +62,86 @@ impl ScopeAllocationGuard {
 
     pub fn lock_path(&self) -> &Path {
         &self.lock_path
+    }
+
+    /// Lock the machine-wide table and validate a Segment replacement before
+    /// its durable metadata is changed.
+    pub fn begin_segment_activation(
+        &self,
+        expected: SegmentId,
+        replacement: SegmentId,
+    ) -> Result<SegmentActivationGuard, ScopeLockError> {
+        let guard = LockFileGuard::open(&self.lock_path)?;
+        let actual = guard
+            .data()
+            .allocations
+            .iter()
+            .find(|allocation| allocation.worker_name == self.worker_name)
+            .and_then(|allocation| allocation.segment_id);
+
+        if actual != Some(expected) {
+            return Err(ScopeLockError::SegmentChanged {
+                worker_name: self.worker_name.clone(),
+                expected,
+                actual,
+            });
+        }
+
+        if let Some(existing) = guard.data().allocations.iter().find(|allocation| {
+            allocation.segment_id == Some(replacement) && allocation.worker_name != self.worker_name
+        }) {
+            return Err(ScopeLockError::SegmentConflict {
+                segment_id: replacement,
+                worker_name: existing.worker_name.clone(),
+                socket: existing.socket.clone(),
+            });
+        }
+
+        Ok(SegmentActivationGuard {
+            guard,
+            worker_name: self.worker_name.clone(),
+            expected,
+            replacement,
+        })
+    }
+}
+
+impl SegmentActivationGuard {
+    /// Persist the replacement Segment while retaining exclusive allocation
+    /// authority. This is intentionally consumed so a successful metadata CAS
+    /// cannot accidentally be followed by an unlocked update.
+    pub fn commit(mut self) -> Result<(), SegmentActivationCommitError> {
+        let actual = self
+            .guard
+            .data()
+            .allocations
+            .iter()
+            .find(|allocation| allocation.worker_name == self.worker_name)
+            .and_then(|allocation| allocation.segment_id);
+        let Some(allocation) = self
+            .guard
+            .data_mut()
+            .allocations
+            .iter_mut()
+            .find(|allocation| allocation.worker_name == self.worker_name)
+        else {
+            return Err(SegmentActivationCommitError {
+                source: ScopeLockError::SegmentChanged {
+                    worker_name: self.worker_name.clone(),
+                    expected: self.expected,
+                    actual,
+                },
+                authority: self,
+            });
+        };
+        allocation.segment_id = Some(self.replacement);
+        if let Err(source) = self.guard.save() {
+            return Err(SegmentActivationCommitError {
+                source: ScopeLockError::Io(source),
+                authority: self,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -85,6 +200,31 @@ pub fn install_top_level_with_deny(
     })
 }
 
+#[cfg(test)]
+pub(crate) fn install_top_level_at_for_test(
+    lock_path: PathBuf,
+    worker_name: String,
+    pid: u32,
+    socket: PathBuf,
+    scope_allow: Vec<ScopeRule>,
+    segment_id: SegmentId,
+) -> Result<ScopeAllocationGuard, ScopeLockError> {
+    let mut guard = LockFileGuard::open(&lock_path)?;
+    super::mutate::register_worker_with_deny(
+        &mut guard,
+        worker_name.clone(),
+        pid,
+        socket,
+        scope_allow,
+        Vec::new(),
+        segment_id,
+    )?;
+    Ok(ScopeAllocationGuard {
+        worker_name,
+        lock_path,
+    })
+}
+
 /// Take ownership of an existing allocation that was pre-registered by
 /// a spawning Worker.
 ///
@@ -112,46 +252,6 @@ pub fn adopt_allocation(
         worker_name,
         lock_path,
     })
-}
-
-/// Rewrite the `segment_id` recorded for `worker_name` to
-/// `new_segment_id`.
-///
-/// The Worker's in-memory `segment_id` can change underneath the
-/// allocation in two normal places:
-///
-/// - `Worker::compact` mints a fresh Segment in the same Session.
-/// - `session_store::ensure_head_or_fork` auto-forks within that Session when another
-///   writer has advanced the store head behind our back.
-///
-/// Both paths must call this so subsequent [`lookup_segment`] queries
-/// find the live Segment id, not the old one. Without this update a
-/// concurrent `restore_from_manifest(new_id)` would see "no live
-/// writer" and proceed to register a competing allocation on the
-/// Segment lineage this Worker just moved into.
-///
-/// The lock is opened once and the allocation is rewritten inside the
-/// guard, so the segment_id collision check is atomic with the
-/// rewrite.
-pub fn update_segment(worker_name: &str, new_segment_id: SegmentId) -> Result<(), ScopeLockError> {
-    let lock_path = default_allocation_path()?;
-    let mut guard = LockFileGuard::open(&lock_path)?;
-    if let Some(other) = guard.data().find_by_segment(new_segment_id) {
-        if other.worker_name != worker_name {
-            return Err(ScopeLockError::SegmentConflict {
-                segment_id: new_segment_id,
-                worker_name: other.worker_name.clone(),
-                socket: other.socket.clone(),
-            });
-        }
-    }
-    let alloc = guard
-        .data_mut()
-        .find_mut(worker_name)
-        .ok_or_else(|| ScopeLockError::UnknownWorker(worker_name.into()))?;
-    alloc.segment_id = Some(new_segment_id);
-    guard.save()?;
-    Ok(())
 }
 
 /// Information about a Worker that currently holds an allocation for a
@@ -184,7 +284,7 @@ pub fn lookup_segment(segment_id: SegmentId) -> Result<Option<SegmentLockInfo>, 
 
 #[cfg(test)]
 mod tests {
-    use super::super::table::Allocation;
+    use super::super::table::{Allocation, LockFile};
     use super::super::test_util::*;
     use super::*;
     use tempfile::TempDir;
@@ -283,32 +383,12 @@ mod tests {
     }
 
     #[test]
-    fn update_session_rewrites_allocation_session_id() {
-        let dir = TempDir::new().unwrap();
-        let _sandbox = RuntimeDirSandbox::new(dir.path());
-        let original = sid();
-        let updated = sid();
-        let _guard = install_top_level(
-            "p".into(),
-            std::process::id(),
-            sock("p"),
-            vec![write_rule("/work", true)],
-            original,
-        )
-        .unwrap();
-        update_segment("p", updated).unwrap();
-        // lookup against the original is now empty, the updated id wins.
-        assert!(lookup_segment(original).unwrap().is_none());
-        assert_eq!(lookup_segment(updated).unwrap().unwrap().worker_name, "p");
-    }
-
-    #[test]
-    fn update_session_rejects_when_target_already_held() {
+    fn segment_activation_rejects_when_target_already_held() {
         let dir = TempDir::new().unwrap();
         let _sandbox = RuntimeDirSandbox::new(dir.path());
         let s_a = sid();
         let s_b = sid();
-        let _g_a = install_top_level(
+        let g_a = install_top_level(
             "a".into(),
             std::process::id(),
             sock("a"),
@@ -324,8 +404,11 @@ mod tests {
             s_b,
         )
         .unwrap();
-        // `a` cannot adopt b's live session id.
-        let err = update_segment("a", s_b).unwrap_err();
+        // `a` cannot activate b's live Segment id.
+        let err = match g_a.begin_segment_activation(s_a, s_b) {
+            Ok(_) => panic!("expected SegmentConflict"),
+            Err(error) => error,
+        };
         match err {
             ScopeLockError::SegmentConflict {
                 worker_name,
@@ -337,5 +420,192 @@ mod tests {
             }
             other => panic!("expected SegmentConflict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn segment_activation_commits_verified_replacement() {
+        let dir = TempDir::new().unwrap();
+        let _sandbox = RuntimeDirSandbox::new(dir.path());
+        let lock_path = dir.path().join("workers.json");
+        let old_segment = sid();
+        let replacement = sid();
+        let guard = install_top_level(
+            "activation".into(),
+            std::process::id(),
+            sock("activation"),
+            vec![write_rule("/work", true)],
+            old_segment,
+        )
+        .unwrap();
+
+        guard
+            .begin_segment_activation(old_segment, replacement)
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        let table = LockFileGuard::open(&lock_path).unwrap();
+        assert_eq!(
+            table
+                .data()
+                .find("activation")
+                .and_then(|allocation| allocation.segment_id),
+            Some(replacement)
+        );
+    }
+
+    #[test]
+    fn failed_segment_activation_returns_locked_recovery_authority() {
+        let dir = TempDir::new().unwrap();
+        let _sandbox = RuntimeDirSandbox::new(dir.path());
+        let old_segment = sid();
+        let replacement = sid();
+        let guard = install_top_level(
+            "activation".into(),
+            std::process::id(),
+            sock("activation"),
+            vec![write_rule("/work", true)],
+            old_segment,
+        )
+        .unwrap();
+        let mut activation = guard
+            .begin_segment_activation(old_segment, replacement)
+            .unwrap();
+        activation
+            .guard
+            .data_mut()
+            .allocations
+            .retain(|allocation| allocation.worker_name != "activation");
+
+        let error = activation.commit().unwrap_err();
+        let (source, authority) = error.into_parts();
+        assert!(matches!(
+            source,
+            ScopeLockError::SegmentChanged {
+                expected,
+                actual: None,
+                ..
+            } if expected == old_segment
+        ));
+        // The authority is returned rather than dropped on failure. Production
+        // stores it on Worker to keep restore admission blocked.
+        let (sent, received) = std::sync::mpsc::channel();
+        let lookup = std::thread::spawn(move || {
+            sent.send(lookup_segment(replacement).unwrap()).unwrap();
+        });
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        drop(authority);
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .is_none()
+        );
+        lookup.join().unwrap();
+    }
+
+    #[test]
+    fn allocation_save_failure_preserves_source_table_and_returns_authority() {
+        let dir = TempDir::new().unwrap();
+        let _sandbox = RuntimeDirSandbox::new(dir.path());
+        let lock_path = dir.path().join("workers.json");
+        let old_segment = sid();
+        let replacement = sid();
+        let guard = install_top_level(
+            "activation".into(),
+            std::process::id(),
+            sock("activation"),
+            vec![write_rule("/work", true)],
+            old_segment,
+        )
+        .unwrap();
+        let activation = guard
+            .begin_segment_activation(old_segment, replacement)
+            .unwrap();
+        crate::runtime::worker_allocation::table::fail_next_save_for_test(&lock_path);
+
+        let error = activation.commit().unwrap_err();
+        let (source, authority) = error.into_parts();
+        assert!(matches!(source, ScopeLockError::Io(_)));
+        let persisted: LockFile =
+            serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted
+                .find("activation")
+                .and_then(|allocation| allocation.segment_id),
+            Some(old_segment)
+        );
+        drop(authority);
+    }
+
+    #[test]
+    fn dropping_segment_activation_preserves_source_allocation() {
+        let dir = TempDir::new().unwrap();
+        let _sandbox = RuntimeDirSandbox::new(dir.path());
+        let lock_path = dir.path().join("workers.json");
+        let old_segment = sid();
+        let replacement = sid();
+        let guard = install_top_level(
+            "activation".into(),
+            std::process::id(),
+            sock("activation"),
+            vec![write_rule("/work", true)],
+            old_segment,
+        )
+        .unwrap();
+
+        drop(
+            guard
+                .begin_segment_activation(old_segment, replacement)
+                .unwrap(),
+        );
+
+        let table = LockFileGuard::open(&lock_path).unwrap();
+        assert_eq!(
+            table
+                .data()
+                .find("activation")
+                .and_then(|allocation| allocation.segment_id),
+            Some(old_segment)
+        );
+    }
+
+    #[test]
+    fn segment_activation_rejects_stale_expected_segment_without_mutation() {
+        let dir = TempDir::new().unwrap();
+        let _sandbox = RuntimeDirSandbox::new(dir.path());
+        let lock_path = dir.path().join("workers.json");
+        let allocated = sid();
+        let stale = sid();
+        let replacement = sid();
+        let guard = install_top_level(
+            "activation".into(),
+            std::process::id(),
+            sock("activation"),
+            vec![write_rule("/work", true)],
+            allocated,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            guard.begin_segment_activation(stale, replacement),
+            Err(ScopeLockError::SegmentChanged {
+                expected,
+                actual: Some(actual),
+                ..
+            }) if expected == stale && actual == allocated
+        ));
+        let table = LockFileGuard::open(&lock_path).unwrap();
+        assert_eq!(
+            table
+                .data()
+                .find("activation")
+                .and_then(|allocation| allocation.segment_id),
+            Some(allocated)
+        );
     }
 }

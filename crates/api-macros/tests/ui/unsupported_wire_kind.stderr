@@ -1,0 +1,5 @@
+error: this wire kind is explicitly unsupported by the initial API contract
+ --> tests/ui/unsupported_wire_kind.rs:9:28
+  |
+9 |     async fn create(&self, #[stream] request: StreamRequest) -> Response;
+  |                            ^^^^^^^^^

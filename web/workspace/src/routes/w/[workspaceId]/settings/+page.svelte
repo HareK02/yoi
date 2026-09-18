@@ -6,7 +6,7 @@
     WorkspaceDeletionRequest,
     WorkspaceMetadataSettingsResponse,
     WorkspaceSigningIdentityResponse,
-  } from '$lib/generated/workspace-api';
+  } from '$lib/generated/legacy-server-api';
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
   import { disposeWorkspaceMultiplexer } from '$lib/workspace/multiplexer';

@@ -74,7 +74,7 @@ impl std::ops::Deref for RepositorySelector {
 pub struct WorkingDirectoryRepository {
     pub id: String,
     pub provider: String,
-    pub source: workspace_api::RepositorySource,
+    pub source: server_api::RepositorySource,
     pub source_revision: u64,
     pub source_fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -131,7 +131,7 @@ pub struct RepositorySshMaterializationAccess {
     pub credential_candidates: Vec<RepositorySshCredentialCandidate>,
     pub host_trust_id: String,
     pub host_trust_revision: u64,
-    pub access: workspace_api::RepositoryAccessMode,
+    pub access: server_api::RepositoryAccessMode,
     pub expires_at_epoch_seconds: u64,
     pub repository_id: String,
     pub repository_source_fingerprint: String,

@@ -389,7 +389,7 @@ where
                 reason: detail.live.error,
             };
         }
-        match send_notify(&detail.live.socket_path, message, false).await {
+        match send_notify(&detail.live.socket_path, message).await {
             Ok(()) => WeakNotifyDelivery::Delivered,
             Err(error) => WeakNotifyDelivery::SendFailed {
                 error: error.to_string(),
@@ -1009,17 +1009,16 @@ where
 }
 
 async fn send_peer_notify(socket_path: &Path, message: String) -> io::Result<()> {
-    send_notify(socket_path, message, true).await
+    send_notify(socket_path, message).await
 }
 
-async fn send_notify(socket_path: &Path, message: String, auto_run: bool) -> io::Result<()> {
+async fn send_notify(socket_path: &Path, message: String) -> io::Result<()> {
     let notification_request_id = protocol::new_submission_request_id();
     connect_and_send(
         socket_path,
         &Method::NotifyTracked {
             notification_request_id: notification_request_id.clone(),
             message,
-            auto_run,
             source: protocol::AuthenticatedInputSource::Backend {
                 operation_id: notification_request_id,
             },
@@ -1552,11 +1551,7 @@ mod tests {
                 .await
                 .unwrap();
             let method = reader.next::<Method>().await.unwrap().unwrap();
-            if let Method::NotifyTracked {
-                message, auto_run, ..
-            } = method
-            {
-                assert!(auto_run);
+            if let Method::NotifyTracked { message, .. } = method {
                 tx.send(message).await.unwrap();
             } else {
                 panic!("expected Notify, got {method:?}");
@@ -1575,7 +1570,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn weak_notify_to_live_peer_uses_notify_without_auto_run_and_noops_when_missing() {
+    async fn weak_notify_to_live_peer_uses_realtime_notify_and_noops_when_missing() {
         let root = TempDir::new().unwrap();
         let store_dir = root.path().join("store");
         let runtime_base = root.path().join("runtime");
@@ -1674,11 +1669,7 @@ mod tests {
                 .await
                 .unwrap();
             let method = reader.next::<Method>().await.unwrap().unwrap();
-            if let Method::NotifyTracked {
-                message, auto_run, ..
-            } = method
-            {
-                assert!(!auto_run);
+            if let Method::NotifyTracked { message, .. } = method {
                 tx.send(message).await.unwrap();
             } else {
                 panic!("expected Notify, got {method:?}");

@@ -383,6 +383,43 @@ impl WorkerAggregateStore {
         })
     }
 
+    /// Open an existing aggregate without creating or rewriting retained files.
+    pub fn open_read_only(
+        root: impl Into<PathBuf>,
+        worker_name: impl Into<String>,
+    ) -> Result<Self, WorkerStoreError> {
+        let root = root.into();
+        let worker_name = worker_name.into();
+        validate_worker_name(&worker_name)?;
+        if !root.is_dir() {
+            return Err(WorkerStoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "worker aggregate is not retained",
+            )));
+        }
+        Ok(Self {
+            update_lock: metadata_lock(&root),
+            root,
+            worker_name,
+        })
+    }
+
+    pub fn read_read_only(&self) -> Result<Option<WorkerMetadata>, WorkerStoreError> {
+        let content = match crate::read_without_atime(&self.metadata_path()) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let metadata: WorkerMetadata = serde_json::from_slice(&content)?;
+        if metadata.worker_name != self.worker_name {
+            return Err(WorkerStoreError::InvalidWorkerName(format!(
+                "aggregate identity mismatch: expected `{}`, found `{}`",
+                self.worker_name, metadata.worker_name
+            )));
+        }
+        Ok(Some(metadata))
+    }
+
     fn validate_name(&self, worker_name: &str) -> Result<(), WorkerStoreError> {
         validate_worker_name(worker_name)?;
         if worker_name == self.worker_name {

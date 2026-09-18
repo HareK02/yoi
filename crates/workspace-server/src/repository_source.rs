@@ -1,8 +1,8 @@
 use std::path::Path;
 
+use server_api::{RepositorySource, RepositorySourceKind};
 use sha2::{Digest, Sha256};
 use url::Url;
-use workspace_api::{RepositorySource, RepositorySourceKind};
 
 use crate::{Error, Result};
 

@@ -4,12 +4,12 @@ use config_source::{
     ConfigSchemaContribution, MarkdownDocumentProjection, VirtualPath, project_markdown_document,
 };
 use serde::Deserialize;
-use worker::skill::SkillActivationResponse;
-use workspace_api::{
+use server_api::{
     SKILL_CATALOG_AUTHORITY, SkillActivationStatus, SkillCatalogEntry, SkillCatalogResponse,
     SkillDetailResponse, SkillDiagnostic, SkillDiagnosticSeverity, SkillProjectionIdentity,
     SkillProjectionStatus, SkillProvenance, SkillResourceRef, SkillSourceKind,
 };
+use worker::skill::SkillActivationResponse;
 
 use crate::config_source::{
     WorkspaceConfigSchemaProvider, WorkspaceConfigState, evaluate_workspace_config_state,

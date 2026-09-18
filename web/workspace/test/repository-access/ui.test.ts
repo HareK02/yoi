@@ -20,7 +20,7 @@ const loaderSource = await Deno.readTextFile(
   ),
 );
 
-test("Repository Access Web code consumes workspace-api generated DTOs", () => {
+test("Repository Access Web code consumes server-api legacy generated DTOs", () => {
   assert(
     source.includes("$lib/generated/repository-access-api"),
     "mutation code should import generated request and response contracts",

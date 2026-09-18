@@ -1,5 +1,5 @@
 import { assert, assertEquals } from "jsr:@std/assert";
-import type { WorkspaceRuntimeResource } from "../src/lib/generated/workspace-api.ts";
+import type { WorkspaceRuntimeResource } from "../src/lib/generated/legacy-server-api.ts";
 import { parseRepositorySshConnectionProbeResponse } from "../src/lib/workspace/api/workspace-model.ts";
 import {
   changeRepositorySshProbeRuntime,

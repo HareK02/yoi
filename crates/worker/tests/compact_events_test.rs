@@ -344,7 +344,10 @@ target = "./"
 permission = "write"
 "#;
 
-async fn make_worker_with_manifest<C>(manifest_toml: &str, client: C) -> Worker<C, TestStore>
+async fn make_worker_with_manifest_and_store<C>(
+    manifest_toml: &str,
+    client: C,
+) -> (Worker<C, TestStore>, TestStore)
 where
     C: LlmClient + Clone + Send + Sync + 'static,
 {
@@ -364,6 +367,7 @@ where
 
     let worker =
         Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(client);
+    let observed_store = store.clone();
     let mut worker = Worker::new(
         manifest,
         worker,
@@ -375,7 +379,16 @@ where
     .await
     .unwrap();
     worker.enable_worker_metadata_write_through().unwrap();
-    worker
+    (worker, observed_store)
+}
+
+async fn make_worker_with_manifest<C>(manifest_toml: &str, client: C) -> Worker<C, TestStore>
+where
+    C: LlmClient + Clone + Send + Sync + 'static,
+{
+    make_worker_with_manifest_and_store(manifest_toml, client)
+        .await
+        .0
 }
 
 async fn make_worker(client: MockClient) -> Worker<MockClient, TestStore> {
@@ -922,7 +935,7 @@ async fn pre_run_compact_publishes_runtime_progress_phases() {
 
     let session_before = worker.session_id();
     let segment_before = worker.segment_id();
-    worker.try_pre_run_compact().await;
+    worker.try_pre_run_compact().await.unwrap();
     assert_eq!(worker.session_id(), session_before);
     assert_ne!(worker.segment_id(), segment_before);
 
@@ -1083,7 +1096,7 @@ async fn pre_run_compact_failure_clears_runtime_progress() {
     let _ = drain(&mut rx);
 
     // Best-effort: returns Ok(()) even on failure and clears runtime progress.
-    worker.try_pre_run_compact().await;
+    worker.try_pre_run_compact().await.unwrap();
 
     let events = drain(&mut rx);
     assert!(events.iter().any(|event| matches!(
@@ -1104,8 +1117,11 @@ async fn pre_run_compact_failure_clears_runtime_progress() {
 
 #[tokio::test]
 async fn manual_compact_cancel_clears_progress_before_returning_idle() {
-    let worker =
-        make_worker_with_manifest(POST_RUN_MANIFEST_TOML, BlockingCompactClient::new()).await;
+    let (worker, observed_store) =
+        make_worker_with_manifest_and_store(POST_RUN_MANIFEST_TOML, BlockingCompactClient::new())
+            .await;
+    let source_session = worker.session_id();
+    let source_segment = worker.segment_id();
     let runtime_tmp = tempfile::tempdir().unwrap();
     let bash_output_dir = runtime_tmp.path().join("bash-output");
     let (handle, shutdown_receiver) =
@@ -1201,6 +1217,15 @@ async fn manual_compact_cancel_clears_progress_before_returning_idle() {
             break;
         }
     }
+    let completion_request_id = "subworker-completion-during-compact";
+    handle
+        .send(Method::NotifyTracked {
+            notification_request_id: completion_request_id.into(),
+            message: "subworker completed".into(),
+            source: protocol::AuthenticatedInputSource::UntrustedWire,
+        })
+        .await
+        .expect("send completion notification during compact");
     let shutdown = protocol::WorkerCommandEnvelope::new(4);
     handle
         .send(Method::Shutdown { command: shutdown })
@@ -1230,6 +1255,18 @@ async fn manual_compact_cancel_clears_progress_before_returning_idle() {
         .await
         .expect("controller shutdown timeout")
         .expect("shutdown confirmation");
+
+    let persisted = observed_store
+        .read_all(source_session, source_segment)
+        .expect("read source Segment after shutdown");
+    assert!(persisted.iter().any(|entry| {
+        matches!(
+            entry,
+            LogEntry::Extension { domain, payload, .. }
+                if domain == "worker.pending_activations.v1"
+                    && payload.to_string().contains(completion_request_id)
+        )
+    }));
 }
 
 #[tokio::test]

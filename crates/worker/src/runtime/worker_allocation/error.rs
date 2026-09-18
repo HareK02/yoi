@@ -37,4 +37,12 @@ pub enum ScopeLockError {
         worker_name: String,
         socket: PathBuf,
     },
+    #[error(
+        "worker `{worker_name}` allocation moved from expected Segment {expected} to {actual:?}"
+    )]
+    SegmentChanged {
+        worker_name: String,
+        expected: SegmentId,
+        actual: Option<SegmentId>,
+    },
 }

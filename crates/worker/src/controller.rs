@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use agen::EngineError;
 use agen::llm_client::client::LlmClient;
@@ -24,7 +25,9 @@ use crate::shutdown_after_idle::{
 };
 use crate::spawn::registry::SpawnedWorkerRegistry;
 use crate::spawn::tool::sub_worker_spawn_tool;
-use crate::worker::{SystemItemCommitter, Worker, WorkerError, WorkerRunResult};
+use crate::worker::{
+    PendingSubmissionHandle, SystemItemCommitter, Worker, WorkerError, WorkerRunResult,
+};
 use protocol::{
     AlertLevel, AlertSource, CommandEvent as ProtocolCommandEvent,
     CommandSnapshot as ProtocolCommandSnapshot, CommandStatus as ProtocolCommandStatus,
@@ -307,7 +310,6 @@ enum PendingRun {
     /// committed at the start of `worker.run_for_notification`.
     RunForNotification {
         invoke_kind: protocol::InvokeKind,
-        notification_request_id: Option<String>,
     },
     Resume,
 }
@@ -336,7 +338,6 @@ fn durable_parent_notification_target<St: Store + Clone + Send + Sync + 'static>
         let Method::NotifyTracked {
             notification_request_id,
             message,
-            auto_run,
             source,
         } = method
         else {
@@ -344,21 +345,14 @@ fn durable_parent_notification_target<St: Store + Clone + Send + Sync + 'static>
         };
         let (source_namespace, provenance) = resolved_input_source(&pending_submissions, &source);
         match pending_submissions.accept_notification_from_source(
-            notification_request_id.clone(),
+            notification_request_id,
             message,
-            source_namespace.clone(),
+            source_namespace,
             provenance,
-            auto_run,
         ) {
-            Ok(_) if !auto_run => {
-                stage_pending_notification(
-                    &pending_submissions,
-                    &notify_buffer,
-                    &source_namespace,
-                    &notification_request_id,
-                );
+            Ok(_) => {
+                stage_pending_notifications(&pending_submissions, &notify_buffer);
             }
-            Ok(_) => {}
             Err(error) => {
                 tracing::warn!(%error, "failed to durably accept SubWorker notification");
             }
@@ -366,69 +360,57 @@ fn durable_parent_notification_target<St: Store + Clone + Send + Sync + 'static>
     }))
 }
 
-fn stage_pending_notification<St: Store + Clone>(
+fn stage_pending_notifications<St: Store + Clone>(
     pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
     notify_buffer: &NotifyBuffer,
-    source_namespace: &str,
-    notification_request_id: &str,
-) -> bool {
-    let Some(notification) =
-        pending_submissions.prepare_notification(source_namespace, notification_request_id)
-    else {
-        return false;
-    };
-    let extension = pending_submissions.notification_activation_extension();
-    notify_buffer.push_durable_notify(
-        notification.message,
-        notification.auto_run,
-        notification.provenance,
-        extension,
-    );
-    true
+) -> usize {
+    let notifications = pending_submissions.prepare_notification_batch();
+    if notifications.is_empty() {
+        return 0;
+    }
+    let count = notifications.len();
+    for (notification, extension) in notifications {
+        notify_buffer.push_durable_notify(notification.message, notification.provenance, extension);
+    }
+    count
 }
 
-fn stage_oldest_passive_notification<St: Store + Clone>(
+fn notification_coalesce_remaining<St: Store + Clone>(
     pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
     notify_buffer: &NotifyBuffer,
-) -> bool {
-    pending_submissions
-        .next_passive_notification_identity()
-        .is_some_and(|(source_namespace, request_id)| {
-            stage_pending_notification(
-                pending_submissions,
-                notify_buffer,
-                &source_namespace,
-                &request_id,
-            )
-        })
+    delay: Duration,
+) -> Option<Duration> {
+    let Some(accepted_at_ms) = pending_submissions.oldest_pending_notification_accepted_at_ms()
+    else {
+        return notify_buffer
+            .has_notification_pending()
+            .then_some(Duration::ZERO);
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let elapsed = Duration::from_millis(now_ms.saturating_sub(accepted_at_ms));
+    Some(delay.saturating_sub(elapsed))
 }
 
 fn prepare_pending_run<St: Store + Clone>(
     pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
     notify_buffer: &NotifyBuffer,
     fence: Option<(u64, &str)>,
+    allow_notification_run: bool,
 ) -> Result<Option<PendingRun>, crate::worker::PendingSubmissionError> {
-    let staged_passive_notification = pending_submissions.activating_passive_notification_id();
     Ok(match pending_submissions.prepare_next_activation(fence)? {
         Some(crate::worker::PendingActivation::Submission(submission)) => {
-            if staged_passive_notification.is_some() {
-                let extension = pending_submissions.notification_activation_extension();
-                debug_assert!(notify_buffer.replace_durable_notification_extension(extension));
-            }
+            stage_pending_notifications(pending_submissions, notify_buffer);
             Some(PendingRun::Submit(submission))
         }
-        Some(crate::worker::PendingActivation::Notification(notification)) => {
-            let extension = pending_submissions.notification_activation_extension();
-            let notification_request_id = notification.notification_request_id.clone();
-            notify_buffer.push_durable_notify(
-                notification.message,
-                notification.auto_run,
-                notification.provenance,
-                extension,
-            );
+        None if allow_notification_run
+            && (stage_pending_notifications(pending_submissions, notify_buffer) > 0
+                || notify_buffer.has_notification_pending()) =>
+        {
             Some(PendingRun::RunForNotification {
                 invoke_kind: protocol::InvokeKind::Notify,
-                notification_request_id: Some(notification_request_id),
             })
         }
         None => None,
@@ -702,7 +684,6 @@ impl WorkerController {
             worker.push_notify(
                 "Restored Worker state contained unreachable delegated child Workers; their delegated write scopes were reclaimed before resume."
                     .to_string(),
-                false,
             );
         }
 
@@ -1510,6 +1491,153 @@ where
     Ok(workdir_for_view)
 }
 
+fn durably_accept_method_while_busy<St>(
+    method: Method,
+    pending_submissions: &PendingSubmissionHandle<St>,
+    working_event_tx: &broadcast::Sender<Event>,
+) -> Option<Method>
+where
+    St: session_store::Store + Clone,
+{
+    match method {
+        Method::Submit {
+            submission_request_id,
+            input,
+        } => {
+            let request_id = submission_request_id.clone();
+            match pending_submissions.accept_from_source(
+                submission_request_id,
+                input,
+                pending_submissions.direct_client_namespace(),
+                session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
+                false,
+            ) {
+                Ok(acceptance) => {
+                    let _ = working_event_tx.send(Event::SubmissionAccepted {
+                        submission_request_id: acceptance.submission_request_id,
+                        submission_id: acceptance.submission_id,
+                        disposition: acceptance.disposition,
+                    });
+                }
+                Err(error) => {
+                    let _ = working_event_tx.send(Event::SubmissionRejected {
+                        submission_request_id: request_id,
+                        message: error.to_string(),
+                    });
+                }
+            }
+            None
+        }
+        Method::SubmitTracked {
+            submission_request_id,
+            input,
+            source,
+        } => {
+            let request_id = submission_request_id.clone();
+            let (source_namespace, provenance) =
+                resolved_input_source(pending_submissions, &source);
+            match pending_submissions.accept_from_source(
+                submission_request_id,
+                input,
+                source_namespace,
+                provenance,
+                false,
+            ) {
+                Ok(acceptance) => {
+                    let _ = working_event_tx.send(Event::SubmissionAccepted {
+                        submission_request_id: acceptance.submission_request_id,
+                        submission_id: acceptance.submission_id,
+                        disposition: acceptance.disposition,
+                    });
+                }
+                Err(error) => {
+                    let _ = working_event_tx.send(Event::SubmissionRejected {
+                        submission_request_id: request_id,
+                        message: error.to_string(),
+                    });
+                }
+            }
+            None
+        }
+        Method::Notify {
+            notification_request_id,
+            message,
+        } => {
+            if let Err(error) = pending_submissions.accept_notification_from_source(
+                notification_request_id,
+                message,
+                pending_submissions.direct_client_namespace(),
+                session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
+            ) {
+                let _ = working_event_tx.send(Event::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: error.to_string(),
+                });
+            }
+            None
+        }
+        Method::NotifyTracked {
+            notification_request_id,
+            message,
+            source,
+        } => {
+            let (source_namespace, provenance) =
+                resolved_input_source(pending_submissions, &source);
+            if let Err(error) = pending_submissions.accept_notification_from_source(
+                notification_request_id,
+                message,
+                source_namespace,
+                provenance,
+            ) {
+                let _ = working_event_tx.send(Event::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: error.to_string(),
+                });
+            }
+            None
+        }
+        method => Some(method),
+    }
+}
+
+fn reject_method_while_attention_locked(
+    method: &Method,
+    working_event_tx: &broadcast::Sender<Event>,
+    message: &str,
+) -> bool {
+    match method {
+        Method::Shutdown { .. } | Method::ListPendingSubmissions => false,
+        Method::Submit {
+            submission_request_id,
+            ..
+        }
+        | Method::SubmitTracked {
+            submission_request_id,
+            ..
+        } => {
+            let _ = working_event_tx.send(Event::SubmissionRejected {
+                submission_request_id: submission_request_id.clone(),
+                message: message.to_owned(),
+            });
+            true
+        }
+        Method::Notify { .. } | Method::NotifyTracked { .. } => {
+            let _ = working_event_tx.send(Event::Error {
+                code: ErrorCode::InvalidRequest,
+                message: message.to_owned(),
+            });
+            true
+        }
+        _ => {
+            let _ = working_event_tx.send(Event::Error {
+                code: ErrorCode::InvalidRequest,
+                message: message.to_owned(),
+            });
+            true
+        }
+    }
+}
+
 /// Idle/Paused event loop. Each iteration either fires a staged
 /// `PendingRun` (delegating to [`drive_turn`] for the Running phase) or
 /// waits for the next `Method`. Method handlers stop at "update state +
@@ -1556,9 +1684,9 @@ async fn controller_loop<C, St>(
         discovery_cwd,
         spawned_registry.clone(),
     );
+    let notification_coalesce_delay = worker.notification_coalesce_delay();
     let pending_submissions = worker.pending_submission_handle();
-    stage_oldest_passive_notification(&pending_submissions, &notify_buffer);
-    let mut pending = match prepare_pending_run(&pending_submissions, &notify_buffer, None) {
+    let mut pending = match prepare_pending_run(&pending_submissions, &notify_buffer, None, false) {
         Ok(pending) => pending,
         Err(error) => {
             let _ = working_event_tx.send(Event::Error {
@@ -1572,9 +1700,19 @@ async fn controller_loop<C, St>(
     let mut deferred_methods = VecDeque::new();
 
     'controller: loop {
+        if worker.has_failed_segment_activation() || worker.has_pending_compaction_cleanup() {
+            // A queued activation may have been accepted while the failing turn
+            // was still running. Preserve its durable queue entry, but never
+            // start it while repair/cleanup attention is required.
+            pending = None;
+        }
         // here so the status flip → drive_turn → finish sequence lives
         // in one place, regardless of which Method caused it.
         if let Some(run) = pending.take() {
+            // A submit/resume/run always provides an immediate model boundary,
+            // so any coalescing window ends and the whole FIFO notification
+            // batch is injected into that run.
+            stage_pending_notifications(&pending_submissions, &notify_buffer);
             // Cancellation is meaningful only for an accepted running turn. Clear
             // idle/stale signals before the status flip; any Cancel/Pause received
             // after this point is delivered to the turn and must not be discarded by
@@ -1595,15 +1733,6 @@ async fn controller_loop<C, St>(
                 )
                 .await;
             }
-            let notification_request_id = match &run {
-                PendingRun::RunForNotification {
-                    notification_request_id,
-                    ..
-                } => notification_request_id.clone(),
-                _ => None,
-            };
-            let passive_notification_request_id =
-                pending_submissions.activating_passive_notification_id();
             let (mut new_status, shutdown, may_drain_pending) = match run {
                 PendingRun::Submit(submission) => {
                     let (input_commit_tx, input_commit_rx) = oneshot::channel();
@@ -1673,28 +1802,17 @@ async fn controller_loop<C, St>(
                     .await
                 }
             };
-            if let Some(notification_request_id) =
-                notification_request_id.or(passive_notification_request_id)
-            {
-                pending_submissions.finish_notification_activation(&notification_request_id);
-                stage_oldest_passive_notification(&pending_submissions, &notify_buffer);
+            if notify_buffer.is_empty() {
+                pending_submissions.finish_notification_batch();
             }
 
             if !shutdown && may_drain_pending && new_status == WorkerStatus::Idle {
-                match prepare_pending_run(&pending_submissions, &notify_buffer, None) {
+                match prepare_pending_run(&pending_submissions, &notify_buffer, None, false) {
                     Ok(Some(next)) => {
                         pending = Some(next);
                         new_status = WorkerStatus::Running;
                     }
-                    Ok(None) => {
-                        if notify_buffer.has_auto_run_pending() {
-                            pending = Some(PendingRun::RunForNotification {
-                                invoke_kind: protocol::InvokeKind::Notify,
-                                notification_request_id: None,
-                            });
-                            new_status = WorkerStatus::Running;
-                        }
-                    }
+                    Ok(None) => {}
                     Err(error) => {
                         let _ = working_event_tx.send(Event::Error {
                             code: ErrorCode::Internal,
@@ -1712,6 +1830,16 @@ async fn controller_loop<C, St>(
             )
             .await;
             if shutdown {
+                while let Err(error) = worker
+                    .finish_pending_compaction_cleanup_for_shutdown()
+                    .await
+                {
+                    let _ = working_event_tx.send(Event::Error {
+                        code: worker_error_code(&error),
+                        message: error.to_string(),
+                    });
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 let _ = working_event_tx.send(Event::Shutdown);
                 break;
             }
@@ -1722,14 +1850,119 @@ async fn controller_loop<C, St>(
             continue;
         }
 
+        let notification_delay = (shared_state.catalog_status() == WorkerStatus::Idle)
+            .then(|| {
+                notification_coalesce_remaining(
+                    &pending_submissions,
+                    &notify_buffer,
+                    notification_coalesce_delay,
+                )
+            })
+            .flatten();
         let method = if let Some(method) = deferred_methods.pop_front() {
             method
+        } else if let Some(remaining) = notification_delay {
+            tokio::select! {
+                method = method_rx.recv() => match method {
+                    Some(method) => method,
+                    None => {
+                        while let Err(error) =
+                            worker.finish_pending_compaction_cleanup_for_shutdown().await
+                        {
+                            tracing::warn!(error = %error, "shutdown cleanup retry failed");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        break 'controller;
+                    }
+                },
+                _ = notify_buffer.notified() => continue,
+                _ = tokio::time::sleep(remaining) => {
+                    match prepare_pending_run(
+                        &pending_submissions,
+                        &notify_buffer,
+                        None,
+                        true,
+                    ) {
+                        Ok(Some(next)) => pending = Some(next),
+                        Ok(None) => {}
+                        Err(error) => {
+                            let _ = working_event_tx.send(Event::Error {
+                                code: ErrorCode::Internal,
+                                message: error.to_string(),
+                            });
+                        }
+                    }
+                    continue;
+                }
+            }
         } else {
-            match method_rx.recv().await {
-                Some(method) => method,
-                None => break,
+            tokio::select! {
+                method = method_rx.recv() => match method {
+                    Some(method) => method,
+                    None => {
+                        while let Err(error) =
+                            worker.finish_pending_compaction_cleanup_for_shutdown().await
+                        {
+                            tracing::warn!(error = %error, "shutdown cleanup retry failed");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        break 'controller;
+                    }
+                },
+                _ = notify_buffer.notified() => continue,
             }
         };
+
+        if worker.has_pending_compaction_cleanup() {
+            match worker.retry_pending_compaction_cleanup().await {
+                Ok(()) => {
+                    set_controller_state(
+                        &shared_state,
+                        &runtime_dir,
+                        &working_event_tx,
+                        WorkerState::Idle,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    if matches!(&method, Method::Shutdown { .. }) {
+                        if let Err(error) = worker
+                            .finish_pending_compaction_cleanup_for_shutdown()
+                            .await
+                        {
+                            let _ = working_event_tx.send(Event::Error {
+                                code: worker_error_code(&error),
+                                message: error.to_string(),
+                            });
+                            continue;
+                        }
+                    } else {
+                        let message = error.to_string();
+                        let _ = working_event_tx.send(Event::Error {
+                            code: worker_error_code(&error),
+                            message: message.clone(),
+                        });
+                        if reject_method_while_attention_locked(
+                            &method,
+                            &working_event_tx,
+                            &message,
+                        ) {
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        if worker.has_failed_segment_activation()
+            && reject_method_while_attention_locked(
+                &method,
+                &working_event_tx,
+                "Segment activation is incomplete; restore or shut down the Worker",
+            )
+        {
+            continue;
+        }
 
         match method {
             Method::Submit {
@@ -1799,37 +2032,15 @@ async fn controller_loop<C, St>(
             Method::Notify {
                 notification_request_id,
                 message,
-                auto_run,
             } => {
-                let request_id = notification_request_id.clone();
                 let source_namespace = pending_submissions.direct_client_namespace();
                 match pending_submissions.accept_notification_from_source(
                     notification_request_id,
                     message,
                     source_namespace.clone(),
                     session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
-                    auto_run,
                 ) {
-                    Ok(_) if auto_run => {
-                        match prepare_pending_run(&pending_submissions, &notify_buffer, None) {
-                            Ok(Some(next)) => pending = Some(next),
-                            Ok(None) => {}
-                            Err(error) => {
-                                let _ = working_event_tx.send(Event::Error {
-                                    code: ErrorCode::Internal,
-                                    message: error.to_string(),
-                                });
-                            }
-                        }
-                    }
-                    Ok(_) => {
-                        stage_pending_notification(
-                            &pending_submissions,
-                            &notify_buffer,
-                            &source_namespace,
-                            &request_id,
-                        );
-                    }
+                    Ok(_) => {}
                     Err(error) => {
                         let _ = working_event_tx.send(Event::Error {
                             code: ErrorCode::InvalidRequest,
@@ -1842,10 +2053,8 @@ async fn controller_loop<C, St>(
             Method::NotifyTracked {
                 notification_request_id,
                 message,
-                auto_run,
                 source,
             } => {
-                let request_id = notification_request_id.clone();
                 let (source_namespace, provenance) =
                     resolved_input_source(&pending_submissions, &source);
                 match pending_submissions.accept_notification_from_source(
@@ -1853,28 +2062,8 @@ async fn controller_loop<C, St>(
                     message,
                     source_namespace.clone(),
                     provenance,
-                    auto_run,
                 ) {
-                    Ok(_) if auto_run => {
-                        match prepare_pending_run(&pending_submissions, &notify_buffer, None) {
-                            Ok(Some(next)) => pending = Some(next),
-                            Ok(None) => {}
-                            Err(error) => {
-                                let _ = working_event_tx.send(Event::Error {
-                                    code: ErrorCode::Internal,
-                                    message: error.to_string(),
-                                });
-                            }
-                        }
-                    }
-                    Ok(_) => {
-                        stage_pending_notification(
-                            &pending_submissions,
-                            &notify_buffer,
-                            &source_namespace,
-                            &request_id,
-                        );
-                    }
+                    Ok(_) => {}
                     Err(error) => {
                         let _ = working_event_tx.send(Event::Error {
                             code: ErrorCode::InvalidRequest,
@@ -1935,6 +2124,7 @@ async fn controller_loop<C, St>(
                     &pending_submissions,
                     &notify_buffer,
                     Some((expected_revision, &expected_head_id)),
+                    true,
                 ) {
                     Ok(Some(next)) => pending = Some(next),
                     Ok(None) => {
@@ -2174,7 +2364,15 @@ async fn controller_loop<C, St>(
                                         );
                                         let _ = cancel_tx.send(true);
                                     }
-                                    Some(method) => deferred_methods.push_back(method),
+                                    Some(method) => {
+                                        if let Some(method) = durably_accept_method_while_busy(
+                                            method,
+                                            &pending_submissions,
+                                            &working_event_tx,
+                                        ) {
+                                            deferred_methods.push_back(method);
+                                        }
+                                    }
                                     None => {
                                         shutdown_after_compaction = true;
                                         let _ = cancel_tx.send(true);
@@ -2189,6 +2387,8 @@ async fn controller_loop<C, St>(
                     Err(WorkerError::Store(_))
                         | Err(WorkerError::WorkerStore(_))
                         | Err(WorkerError::InvalidState(_))
+                        | Err(WorkerError::SegmentActivationIncomplete { .. })
+                        | Err(WorkerError::CompactionCleanupPending { .. })
                 ) {
                     set_controller_state(
                         &shared_state,
@@ -2205,6 +2405,16 @@ async fn controller_loop<C, St>(
                     });
                 }
                 if shutdown_after_compaction {
+                    while let Err(error) = worker
+                        .finish_pending_compaction_cleanup_for_shutdown()
+                        .await
+                    {
+                        let _ = working_event_tx.send(Event::Error {
+                            code: worker_error_code(&error),
+                            message: error.to_string(),
+                        });
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                     let _ = working_event_tx.send(Event::Shutdown);
                     break 'controller;
                 }
@@ -2361,7 +2571,6 @@ async fn controller_loop<C, St>(
                     if shared_state.catalog_status() == WorkerStatus::Idle {
                         pending = Some(PendingRun::RunForNotification {
                             invoke_kind: protocol::InvokeKind::WorkerEvent,
-                            notification_request_id: None,
                         });
                     }
                 }
@@ -2608,6 +2817,19 @@ where
                         (WorkerStatus::Paused, shutdown_requested, false)
                     }
                     Err(e) => {
+                        let status = if matches!(
+                            &e,
+                            WorkerError::SegmentActivationIncomplete { .. }
+                                | WorkerError::CompactionCleanupPending { .. }
+                        ) {
+                            // Metadata has already committed the replacement, but
+                            // one live authority failed to publish. Keep the
+                            // controller visibly busy/fail-closed; publishing Idle
+                            // would admit another turn against inconsistent state.
+                            WorkerStatus::Running
+                        } else {
+                            WorkerStatus::Idle
+                        };
                         let code = worker_error_code(&e);
                         let message = e.to_string();
                         let _ = working_event_tx.send(Event::Error {
@@ -2623,7 +2845,7 @@ where
                                 },
                             );
                         }
-                        (WorkerStatus::Idle, shutdown_requested, false)
+                        (status, shutdown_requested, false)
                     }
                 };
             }
@@ -2893,26 +3115,17 @@ where
                     Some(Method::Notify {
                         notification_request_id,
                         message,
-                        auto_run,
                     }) => {
-                        let request_id = notification_request_id.clone();
                         let source_namespace = pending_submissions.direct_client_namespace();
                         match pending_submissions.accept_notification_from_source(
                             notification_request_id,
                             message,
                             source_namespace.clone(),
                             session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
-                            auto_run,
                         ) {
-                            Ok(_) if !auto_run => {
-                                stage_pending_notification(
-                                    &pending_submissions,
-                                    notify_buffer,
-                                    &source_namespace,
-                                    &request_id,
-                                );
+                            Ok(_) => {
+                                stage_pending_notifications(&pending_submissions, notify_buffer);
                             }
-                            Ok(_) => {}
                             Err(error) => {
                                 let _ = working_event_tx.send(Event::Error {
                                     code: ErrorCode::InvalidRequest,
@@ -2927,10 +3140,8 @@ where
                     Some(Method::NotifyTracked {
                         notification_request_id,
                         message,
-                        auto_run,
                         source,
                     }) => {
-                        let request_id = notification_request_id.clone();
                         let (source_namespace, provenance) =
                             resolved_input_source(pending_submissions, &source);
                         match pending_submissions.accept_notification_from_source(
@@ -2938,17 +3149,10 @@ where
                             message,
                             source_namespace.clone(),
                             provenance,
-                            auto_run,
                         ) {
-                            Ok(_) if !auto_run => {
-                                stage_pending_notification(
-                                    &pending_submissions,
-                                    notify_buffer,
-                                    &source_namespace,
-                                    &request_id,
-                                );
+                            Ok(_) => {
+                                stage_pending_notifications(&pending_submissions, notify_buffer);
                             }
-                            Ok(_) => {}
                             Err(error) => {
                                 let _ = working_event_tx.send(Event::Error {
                                     code: ErrorCode::InvalidRequest,
@@ -3141,7 +3345,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let pending =
             crate::worker::PendingSubmissionHandle::for_test(&temp.path().join("sessions"));
-        let target = durable_parent_notification_target(pending.clone(), NotifyBuffer::new());
+        let notify_buffer = NotifyBuffer::new();
+        let target = durable_parent_notification_target(pending.clone(), notify_buffer.clone());
         let (wire_namespace, wire_provenance) =
             resolved_input_source(&pending, &protocol::AuthenticatedInputSource::UntrustedWire);
         assert_eq!(wire_namespace, pending.direct_client_namespace());
@@ -3150,20 +3355,15 @@ mod tests {
             session_store::LoggedSessionHistoryOrigin::LegacyUnknown
         ));
 
-        target.notify("child-session".into(), "completed".into(), true);
+        target.notify("child-session".into(), "completed".into());
 
         let snapshot = pending.snapshot();
-        assert_eq!(snapshot.notification_count, 1);
-        assert!(snapshot.head_id.is_some());
-        let notify_buffer = NotifyBuffer::new();
+        assert_eq!(snapshot.notification_count, 0);
         assert!(matches!(
-            prepare_pending_run(&pending, &notify_buffer, None).unwrap(),
-            Some(PendingRun::RunForNotification {
-                notification_request_id: Some(_),
-                ..
-            })
+            prepare_pending_run(&pending, &notify_buffer, None, true).unwrap(),
+            Some(PendingRun::RunForNotification { .. })
         ));
-        assert!(notify_buffer.has_auto_run_pending());
+        assert!(notify_buffer.has_notification_pending());
     }
 
     #[test]
@@ -3181,19 +3381,19 @@ mod tests {
             )
             .unwrap();
         pending
-            .accept_notification("notify-second".into(), "newer notification".into(), true)
+            .accept_notification("notify-second".into(), "newer notification".into())
             .unwrap();
         let notify_buffer = NotifyBuffer::new();
 
         assert!(matches!(
-            prepare_pending_run(&pending, &notify_buffer, None).unwrap(),
+            prepare_pending_run(&pending, &notify_buffer, None, true).unwrap(),
             Some(PendingRun::Submit(_))
         ));
 
         let pending =
             crate::worker::PendingSubmissionHandle::for_test(&temp.path().join("notify-first"));
         pending
-            .accept_notification("notify-first".into(), "older notification".into(), true)
+            .accept_notification("notify-first".into(), "older notification".into())
             .unwrap();
         pending
             .accept(
@@ -3207,40 +3407,10 @@ mod tests {
         let notify_buffer = NotifyBuffer::new();
 
         assert!(matches!(
-            prepare_pending_run(&pending, &notify_buffer, None).unwrap(),
-            Some(PendingRun::RunForNotification {
-                notification_request_id: Some(request_id),
-                ..
-            }) if request_id == "notify-first"
-        ));
-
-        let pending =
-            crate::worker::PendingSubmissionHandle::for_test(&temp.path().join("passive-first"));
-        pending
-            .accept_notification("passive-first".into(), "passive notification".into(), false)
-            .unwrap();
-        pending
-            .accept(
-                "submit-after-passive".into(),
-                vec![protocol::Segment::Text {
-                    content: "queued after passive".into(),
-                }],
-                false,
-            )
-            .unwrap();
-        let snapshot = pending.snapshot();
-        let head_id = snapshot.head_id.clone().expect("queued Submit is the head");
-        let notify_buffer = NotifyBuffer::new();
-        assert!(stage_oldest_passive_notification(&pending, &notify_buffer));
-        assert!(matches!(
-            prepare_pending_run(
-                &pending,
-                &notify_buffer,
-                Some((snapshot.revision + 1, &head_id)),
-            )
-            .unwrap(),
+            prepare_pending_run(&pending, &notify_buffer, None, true).unwrap(),
             Some(PendingRun::Submit(_))
         ));
+        assert_eq!(notify_buffer.len(), 1);
     }
 
     #[test]
@@ -3263,7 +3433,6 @@ mod tests {
         assert!(
             !PendingRun::RunForNotification {
                 invoke_kind: protocol::InvokeKind::Notify,
-                notification_request_id: None,
             }
             .is_parent_originated()
         );
@@ -3412,6 +3581,137 @@ mod tests {
             WorkerEvent::TurnEnded { worker_name } => assert_eq!(worker_name, "child-worker"),
             other => panic!("expected TurnEnded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn busy_notification_is_durable_before_shutdown_can_observe_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = PendingSubmissionHandle::for_test(dir.path());
+        let (event_tx, _event_rx) = broadcast::channel(4);
+
+        assert!(
+            durably_accept_method_while_busy(
+                Method::NotifyTracked {
+                    notification_request_id: "completion-1".into(),
+                    message: "subworker completed".into(),
+                    source: protocol::AuthenticatedInputSource::UntrustedWire,
+                },
+                &pending,
+                &event_tx,
+            )
+            .is_none()
+        );
+        let entries = pending.persisted_entries_for_test();
+        assert!(entries.iter().any(|entry| matches!(
+            entry,
+            LogEntry::Extension { domain, .. }
+                if domain == "worker.pending_activations.v1"
+        )));
+    }
+
+    #[test]
+    fn attention_gate_rejects_submit_before_dispatch() {
+        let (event_tx, mut event_rx) = broadcast::channel(4);
+        let method = Method::Submit {
+            submission_request_id: "request-1".into(),
+            input: Vec::new(),
+        };
+
+        assert!(reject_method_while_attention_locked(
+            &method,
+            &event_tx,
+            "repair required",
+        ));
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            Event::SubmissionRejected {
+                submission_request_id,
+                message,
+            } if submission_request_id == "request-1" && message == "repair required"
+        ));
+    }
+
+    #[tokio::test]
+    async fn segment_activation_failure_from_run_never_publishes_idle() {
+        let mut env = make_env().await;
+        let worker_future = async {
+            Err::<WorkerRunResult, _>(WorkerError::SegmentActivationIncomplete {
+                source: crate::runtime::worker_allocation::ScopeLockError::UnknownWorker(
+                    "worker".into(),
+                ),
+            })
+        };
+
+        let (status, shutdown, may_drain_pending) = drive_turn(
+            worker_future,
+            &mut env.method_rx,
+            &env.working_event_tx,
+            &env.cancel_tx,
+            &env.pause_tx,
+            &env.shared_state,
+            &env.runtime_dir,
+            None,
+            &env.notify_buffer,
+            &env.pending_submissions,
+            None,
+            "worker",
+            &env.spawned_registry,
+            false,
+        )
+        .await;
+
+        assert_eq!(status, WorkerStatus::Running);
+        assert!(!shutdown);
+        assert!(!may_drain_pending);
+    }
+
+    #[tokio::test]
+    async fn pending_compaction_cleanup_preserves_shutdown_request_for_outer_barrier() {
+        let mut env = make_env().await;
+        let method_tx = env._method_tx.clone();
+        env.shared_state
+            .transition(WorkerState::Busy(WorkerBusyState::Run(
+                WorkerRunState::Running,
+            )));
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            method_tx
+                .send(Method::Shutdown {
+                    command: WorkerCommandEnvelope::new(1),
+                })
+                .await
+                .expect("send shutdown");
+        });
+        let worker_future = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Err::<WorkerRunResult, _>(WorkerError::CompactionCleanupPending {
+                source: crate::runtime::worker_allocation::ScopeLockError::UnknownWorker(
+                    "worker".into(),
+                ),
+            })
+        };
+
+        let (status, shutdown, may_drain_pending) = drive_turn(
+            worker_future,
+            &mut env.method_rx,
+            &env.working_event_tx,
+            &env.cancel_tx,
+            &env.pause_tx,
+            &env.shared_state,
+            &env.runtime_dir,
+            None,
+            &env.notify_buffer,
+            &env.pending_submissions,
+            None,
+            "worker",
+            &env.spawned_registry,
+            false,
+        )
+        .await;
+
+        assert_eq!(status, WorkerStatus::Running);
+        assert!(shutdown);
+        assert!(!may_drain_pending);
     }
 
     #[tokio::test]
@@ -3658,13 +3958,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn running_auto_run_notify_remains_staged_for_followup_turn() {
+    async fn running_notify_remains_staged_for_the_next_model_boundary() {
         let mut env = make_env().await;
         env._method_tx
             .send(Method::Notify {
                 notification_request_id: protocol::new_submission_request_id(),
                 message: "continue".into(),
-                auto_run: true,
             })
             .await
             .expect("send notify");
@@ -3693,8 +3992,8 @@ mod tests {
 
         assert_eq!(status, WorkerStatus::Idle);
         assert!(!shutdown);
-        assert_eq!(env.notify_buffer.len(), 0);
-        assert_eq!(env.pending_submissions.snapshot().notification_count, 1);
+        assert_eq!(env.notify_buffer.len(), 1);
+        assert_eq!(env.pending_submissions.snapshot().notification_count, 0);
     }
 
     #[tokio::test]

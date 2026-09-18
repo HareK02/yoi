@@ -772,6 +772,47 @@ CREATE TABLE "worker_registry" (
             PRIMARY KEY (workspace_id, worker_id),
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
         );
+CREATE TABLE worker_registry_observations (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    availability TEXT NOT NULL CHECK (availability IN ('observed', 'unavailable')),
+    worker_json TEXT,
+    connection_generation INTEGER NOT NULL,
+    subject_revision INTEGER NOT NULL,
+    snapshot_revision INTEGER NOT NULL,
+    projection_revision INTEGER NOT NULL,
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, runtime_id, worker_id),
+    FOREIGN KEY (workspace_id, worker_id)
+        REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE
+);
+CREATE TABLE worker_registry_projection_cursors (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    connection_generation INTEGER NOT NULL,
+    snapshot_revision INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, runtime_id)
+);
+CREATE TABLE worker_registry_projection_revisions (
+    workspace_id TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL
+);
+CREATE TABLE worker_registry_projection_removals (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    projection_revision INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, runtime_id, worker_id)
+);
+CREATE TABLE worker_registry_projection_diagnostics (
+    diagnostic_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    observed_at TEXT NOT NULL
+);
 CREATE TABLE worker_removal_operations (
         operation_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL UNIQUE, input_fingerprint TEXT NOT NULL,
         workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL, worker_id TEXT NOT NULL,

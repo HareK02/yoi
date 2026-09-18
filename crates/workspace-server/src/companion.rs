@@ -1,9 +1,9 @@
-use workspace_api::{
+use server_api::{
     CompanionLifecycleState, CompanionMessageDisposition, CompanionTransportSummary, Diagnostic,
     DiagnosticSeverity,
 };
 
-pub use workspace_api::{
+pub use server_api::{
     CompanionCancelRequest, CompanionMessageRequest, CompanionMessageResponse,
     CompanionStatusResponse, CompanionTranscriptProjection,
 };

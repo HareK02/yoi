@@ -4,7 +4,7 @@ use std::{
     process::Command,
 };
 
-use workspace_api::{
+use server_api::{
     Diagnostic, DiagnosticSeverity, GitCommitSummary, GitRemoteSummary, GitRepositorySummary,
     RepositoryDiagnostic, RepositoryObservedStatus, RepositorySource, RepositorySummary,
 };
@@ -629,7 +629,7 @@ mod tests {
         let projection = reader.list();
         assert_eq!(
             projection.items[0].source.kind,
-            workspace_api::RepositorySourceKind::Invalid
+            server_api::RepositorySourceKind::Invalid
         );
         let diagnostics = projection.items[0].diagnostics.as_ref().unwrap();
         assert!(diagnostics.iter().any(|diagnostic| {
@@ -642,7 +642,7 @@ mod tests {
     #[test]
     fn remote_source_is_visible_but_local_provider_operations_fail_closed() {
         let source = RepositorySource {
-            kind: workspace_api::RepositorySourceKind::Ssh,
+            kind: server_api::RepositorySourceKind::Ssh,
             uri: "git@example.test:org/repository.git".to_string(),
         };
         let reader = RepositoryRegistryReader::new(vec![ConfiguredRepository {
@@ -660,10 +660,7 @@ mod tests {
 
         let projection = reader.list();
         let summary = &projection.items[0];
-        assert_eq!(
-            summary.source.kind,
-            workspace_api::RepositorySourceKind::Ssh
-        );
+        assert_eq!(summary.source.kind, server_api::RepositorySourceKind::Ssh);
         assert_eq!(
             summary.observed_status,
             RepositoryObservedStatus::Unverified
@@ -766,7 +763,7 @@ mod tests {
         );
 
         let source_descriptor = RepositorySource {
-            kind: workspace_api::RepositorySourceKind::LocalPath,
+            kind: server_api::RepositorySourceKind::LocalPath,
             uri: path.display().to_string(),
         };
         let reader = RepositoryRegistryReader::new(vec![ConfiguredRepository {

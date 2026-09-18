@@ -4,6 +4,8 @@ members = [
     "crates/client",
     "crates/agen",
     "crates/agen-macros",
+    "crates/api-macros",
+    "crates/api-macros-impl",
     "crates/session-store",
     "crates/standalone",
     "crates/secrets",
@@ -11,6 +13,8 @@ members = [
     "crates/mcp",
     "crates/worker",
     "crates/worker-runtime",
+    "crates/runtime-api",
+    "crates/server-api",
     "crates/plugin-pdk",
     "crates/yoi",
     "crates/protocol",
@@ -28,7 +32,6 @@ members = [
     "crates/ticket",
     "crates/merge-request",
     "crates/project-record",
-    "crates/workspace-api",
     "crates/workspace-server",
     "tests/e2e",
 ]
@@ -36,6 +39,8 @@ default-members = [
     "crates/client",
     "crates/agen",
     "crates/agen-macros",
+    "crates/api-macros",
+    "crates/api-macros-impl",
     "crates/session-store",
     "crates/standalone",
     "crates/secrets",
@@ -43,6 +48,8 @@ default-members = [
     "crates/mcp",
     "crates/worker",
     "crates/worker-runtime",
+    "crates/runtime-api",
+    "crates/server-api",
     "crates/plugin-pdk",
     "crates/yoi",
     "crates/protocol",
@@ -60,7 +67,6 @@ default-members = [
     "crates/ticket",
     "crates/merge-request",
     "crates/project-record",
-    "crates/workspace-api",
     "crates/workspace-server",
 ]
 
@@ -79,6 +85,7 @@ debug = false
 client = { path = "crates/client" }
 agen = { path = "crates/agen", version = "0.2" }
 agen-macros = { path = "crates/agen-macros", version = "0.2" }
+api-macros = { path = "crates/api-macros" }
 manifest = { path = "crates/manifest" }
 mcp = { path = "crates/mcp" }
 lint-common = { path = "crates/lint-common" }
@@ -88,7 +95,6 @@ ticket = { path = "crates/ticket" }
 project-record = { path = "crates/project-record" }
 worker = { path = "crates/worker" }
 worker-runtime = { path = "crates/worker-runtime" }
-workspace-api = { path = "crates/workspace-api" }
 yoi-plugin-pdk = { path = "crates/plugin-pdk" }
 yoi = { path = "crates/yoi" }
 protocol = { path = "crates/protocol" }
@@ -96,6 +102,8 @@ session-metrics = { path = "crates/session-metrics" }
 session-analytics = { path = "crates/session-analytics" }
 session-store = { path = "crates/session-store" }
 standalone = { path = "crates/standalone" }
+runtime-api = { path = "crates/runtime-api" }
+server-api = { path = "crates/server-api" }
 secrets = { path = "crates/secrets" }
 tools = { path = "crates/tools" }
 config-source = { path = "crates/config-source" }

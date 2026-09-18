@@ -574,7 +574,9 @@ Deno.test("Worker Console renders markdown only for message rows", async () => {
       consoleLine.includes("font-size: var(--font-size-compact);") &&
       consoleLine.includes("line-height: 1.1;") &&
       consoleLine.includes("{:else if shouldRenderMarkdown(item)}") &&
-      consoleLine.includes("<RichMarkdown text={item.body || '—'} />") &&
+      consoleLine.includes(
+        "<RichMarkdown text={item.body || '—'} streamId={item.id} />",
+      ) &&
       !consoleLine.includes("{@html"),
     "Console should keep markdown rendering to message bodies, safely project Bash ANSI, and render other tool text literally",
   );
@@ -1244,5 +1246,31 @@ Deno.test("Web Console uses Notify while running and exposes durable pending con
   assert(
     !userCase.includes("workerRunning"),
     "ordinary text must remain Submit instead of being implicitly converted to Notify",
+  );
+});
+
+Deno.test("Web Console gates compaction progress before rendering run status", async () => {
+  const consolePage = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const runStatus = await Deno.readTextFile(
+    new URL("./WorkerRunStatus.svelte", import.meta.url),
+  );
+
+  assert(
+    consolePage.includes("compaction={consoleProjection.compaction}") &&
+      consolePage.includes("workerState={consoleProjection.workerState}"),
+    "Console page should pass compaction metadata with authoritative worker state to the status component",
+  );
+  assert(
+    runStatus.includes("resolveCompactionStatusPresentation(") &&
+      runStatus.includes("{compactionStatus.label}") &&
+      runStatus.includes(
+        "compactionStatus?.progress.started_at_ms ?? startedAtMs",
+      ),
+    "run status should render the guarded presentation and derive elapsed time from its authoritative start timestamp",
   );
 });

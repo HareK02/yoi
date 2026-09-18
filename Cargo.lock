@@ -169,6 +169,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "api-macros"
+version = "0.1.0"
+dependencies = [
+ "api-macros-impl",
+ "axum",
+ "futures",
+ "oas3",
+ "reqwest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "tokio",
+ "trybuild",
+ "url",
+]
+
+[[package]]
+name = "api-macros-impl"
+version = "0.1.0"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "arc-swap"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -624,15 +652,16 @@ dependencies = [
  "futures",
  "protocol",
  "reqwest",
+ "runtime-api",
  "serde",
  "serde_json",
+ "server-api",
  "tempfile",
  "thiserror 2.0.18",
  "ticket",
  "tokio",
  "tokio-tungstenite 0.29.0",
  "uuid",
- "workspace-api",
 ]
 
 [[package]]
@@ -1058,6 +1087,7 @@ dependencies = [
  "quote",
  "rustc_version",
  "syn 2.0.117",
+ "unicode-xid",
 ]
 
 [[package]]
@@ -2779,6 +2809,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6aa2c4e539b869820a2b82e1aef6ff40aa85e65decdd5185e83fb4b1249cd00f"
 
 [[package]]
+name = "oas3"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da5a5aa72eddcc53edfd06f287a2c10f872d88e8b72c650234cd8a227572424a"
+dependencies = [
+ "derive_more",
+ "http",
+ "indexmap",
+ "log",
+ "once_cell",
+ "regex",
+ "semver",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "oid-registry"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3239,6 +3287,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "proc-macro-crate"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
+dependencies = [
+ "toml_edit",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3672,6 +3729,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-api"
+version = "0.1.0"
+dependencies = [
+ "api-macros",
+ "manifest",
+ "protocol",
+ "serde",
+ "serde_json",
+ "tokio",
+ "workdir",
+]
+
+[[package]]
 name = "rusqlite"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4081,6 +4151,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "server-api"
+version = "0.1.0"
+dependencies = [
+ "api-macros",
+ "protocol",
+ "runtime-api",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "ts-rs",
+ "webauthn-rs-proto",
+ "workdir",
+]
+
+[[package]]
 name = "session-analytics"
 version = "0.1.0"
 dependencies = [
@@ -4107,8 +4194,10 @@ dependencies = [
  "agen",
  "async-trait",
  "base64 0.22.1",
+ "filetime",
  "fs4",
  "futures",
+ "libc",
  "protocol",
  "serde",
  "serde_json",
@@ -4825,6 +4914,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.25.13+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6975367e4d2ef766d86af01ffad14b622fecc8d4357a998fbc4deb6e9bacaf9b"
+dependencies = [
+ "indexmap",
+ "toml_datetime",
+ "toml_parser",
+ "winnow",
 ]
 
 [[package]]
@@ -5883,6 +5984,9 @@ name = "winnow"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09dac053f1cd375980747450bfc7250c264eaae0583872e845c0c7cd578872b5"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "wiremock"
@@ -6010,7 +6114,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "workspace-api",
 ]
 
 [[package]]
@@ -6043,6 +6146,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "server-api",
  "session-metrics",
  "session-store",
  "sha2 0.11.0",
@@ -6057,7 +6161,6 @@ dependencies = [
  "tungstenite 0.28.0",
  "uuid",
  "workdir",
- "workspace-api",
 ]
 
 [[package]]
@@ -6076,9 +6179,11 @@ dependencies = [
  "protocol",
  "reqwest",
  "ring",
+ "runtime-api",
  "serde",
  "serde_json",
  "serial_test",
+ "server-api",
  "session-store",
  "sha2 0.11.0",
  "tar",
@@ -6094,19 +6199,7 @@ dependencies = [
  "uuid",
  "workdir",
  "worker",
- "workspace-api",
  "zeroize",
-]
-
-[[package]]
-name = "workspace-api"
-version = "0.1.0"
-dependencies = [
- "protocol",
- "serde",
- "serde_json",
- "ts-rs",
- "webauthn-rs-proto",
 ]
 
 [[package]]
@@ -6171,6 +6264,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "server-api",
  "session-analytics",
  "session-store",
  "tempfile",
@@ -6180,7 +6274,6 @@ dependencies = [
  "tui",
  "uuid",
  "worker",
- "workspace-api",
 ]
 
 [[package]]
@@ -6222,10 +6315,12 @@ dependencies = [
  "protocol",
  "reqwest",
  "ring",
+ "runtime-api",
  "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",
+ "server-api",
  "sha2 0.11.0",
  "ssh-key",
  "tempfile",
@@ -6244,7 +6339,6 @@ dependencies = [
  "workdir",
  "worker",
  "worker-runtime",
- "workspace-api",
  "zeroize",
 ]
 

@@ -2,7 +2,7 @@ import type {
   WorkspaceDeletionOperationResponse,
   WorkspaceDeletionPreflightResponse,
   WorkspaceDeletionRequest,
-} from "$lib/generated/workspace-api";
+} from "$lib/generated/legacy-server-api";
 import { loadJson } from "$lib/workspace/api/http";
 import {
   parseWorkspaceDeletionOperationResponse,

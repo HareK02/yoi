@@ -8,6 +8,8 @@
 //! Parent registry drop closes all session handles and synchronously returns delegated Write deny
 //! rules to the parent scope.
 
+#[cfg(test)]
+use std::collections::HashMap;
 use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::sync::{
@@ -311,6 +313,8 @@ impl Drop for InternalSpawnReservation {
 pub struct SpawnedWorkerRegistry {
     internal_records: std::sync::Mutex<Vec<InternalSpawnedWorkerRecord>>,
     service_records: std::sync::Mutex<Vec<InternalServiceWorkerRecord>>,
+    #[cfg(test)]
+    fail_service_stops: std::sync::Mutex<HashMap<String, usize>>,
     internal_names: std::sync::Mutex<HashSet<String>>,
     internal_shutting_down: AtomicBool,
     pending_internal_spawns: AtomicUsize,
@@ -331,6 +335,8 @@ impl SpawnedWorkerRegistry {
         Arc::new(Self {
             internal_records: std::sync::Mutex::new(Vec::new()),
             service_records: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            fail_service_stops: std::sync::Mutex::new(HashMap::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
             internal_shutting_down: AtomicBool::new(false),
             pending_internal_spawns: AtomicUsize::new(0),
@@ -346,6 +352,8 @@ impl SpawnedWorkerRegistry {
         Arc::new(Self {
             internal_records: std::sync::Mutex::new(Vec::new()),
             service_records: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            fail_service_stops: std::sync::Mutex::new(HashMap::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
             internal_shutting_down: AtomicBool::new(false),
             pending_internal_spawns: AtomicUsize::new(0),
@@ -360,6 +368,8 @@ impl SpawnedWorkerRegistry {
         Arc::new(Self {
             internal_records: std::sync::Mutex::new(Vec::new()),
             service_records: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            fail_service_stops: std::sync::Mutex::new(HashMap::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
             internal_shutting_down: AtomicBool::new(false),
             pending_internal_spawns: AtomicUsize::new(0),
@@ -443,6 +453,8 @@ impl SpawnedWorkerRegistry {
             registry: Arc::new(Self {
                 internal_records: std::sync::Mutex::new(Vec::new()),
                 service_records: std::sync::Mutex::new(Vec::new()),
+                #[cfg(test)]
+                fail_service_stops: std::sync::Mutex::new(HashMap::new()),
                 internal_names: std::sync::Mutex::new(HashSet::new()),
                 internal_shutting_down: AtomicBool::new(false),
                 pending_internal_spawns: AtomicUsize::new(0),
@@ -535,9 +547,53 @@ impl SpawnedWorkerRegistry {
         Ok(worker_ref)
     }
 
-    /// Stop and remove one parent-owned service Worker. This is host-only and is
-    /// intentionally separate from the SubWorker control surface.
+    #[cfg(test)]
+    pub(crate) fn install_service_for_test(
+        &self,
+    ) -> (String, tokio::sync::broadcast::Sender<protocol::Event>) {
+        let (session, status_tx) = crate::internal_worker::test_internal_worker_session(
+            crate::internal_worker::InternalWorkerVisibility::ServicePrivate,
+        );
+        let session_id = session.session_id_string();
+        self.service_records
+            .lock()
+            .unwrap()
+            .push(InternalServiceWorkerRecord::new(
+                "test-service",
+                "test-service",
+                session,
+            ));
+        (session_id, status_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_service_for_test(&self, session_id: &str) -> bool {
+        self.service_records
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|record| record.session.session_id_string() == session_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_service_stops_for_test(&self, session_id: &str, count: usize) {
+        self.fail_service_stops
+            .lock()
+            .unwrap()
+            .insert(session_id.to_owned(), count);
+    }
+
     pub(crate) async fn stop_service(&self, session_id: &str) -> io::Result<bool> {
+        #[cfg(test)]
+        {
+            let mut failures = self.fail_service_stops.lock().unwrap();
+            if let Some(remaining) = failures.get_mut(session_id) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Err(io::Error::other("injected service stop failure"));
+                }
+            }
+        }
         let record = self
             .service_records
             .lock()

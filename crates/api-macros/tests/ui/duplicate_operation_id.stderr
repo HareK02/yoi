@@ -1,0 +1,5 @@
+error: duplicate operation ID `duplicate`
+  --> tests/ui/duplicate_operation_id.rs:11:14
+   |
+11 |     async fn two(&self) -> Response;
+   |              ^^^

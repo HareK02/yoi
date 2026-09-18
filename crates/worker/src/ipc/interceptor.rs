@@ -1543,7 +1543,7 @@ mod tests {
             PromptCatalog::from_projection(projection).unwrap(),
         ));
 
-        buffer.push_notify("updated".to_string(), false);
+        buffer.push_notify("updated".to_string());
         let appends = interceptor
             .pending_history_appends(PendingHistoryAppendsContext {
                 invocation: Default::default(),
@@ -1598,7 +1598,7 @@ mod tests {
         prompts.store(Arc::new(
             PromptCatalog::from_projection(projection).unwrap(),
         ));
-        buffer.push_notify("must persist".to_string(), false);
+        buffer.push_notify("must persist".to_string());
 
         let error = interceptor
             .pending_history_appends(PendingHistoryAppendsContext {
@@ -1621,8 +1621,8 @@ mod tests {
     async fn pending_history_appends_drains_buffer_into_items() {
         let registry = Arc::new(HookRegistryBuilder::new().build());
         let buffer = NotifyBuffer::new();
-        buffer.push_notify("first".into(), false);
-        buffer.push_notify("second".into(), false);
+        buffer.push_notify("first".into());
+        buffer.push_notify("second".into());
 
         let interceptor = WorkerInterceptor::new(
             registry,
@@ -1671,7 +1671,7 @@ mod tests {
         // anything itself.
         let registry = Arc::new(HookRegistryBuilder::new().build());
         let buffer = NotifyBuffer::new();
-        buffer.push_notify("msg".into(), false);
+        buffer.push_notify("msg".into());
 
         let interceptor = WorkerInterceptor::new(
             registry,

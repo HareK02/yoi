@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-pub use workspace_api::{
+pub use server_api::{
     ObjectiveDetail, ObjectiveEventDetail, ObjectiveLinkedTicketSummary, ObjectiveResourceSummary,
     ObjectiveSummary, QueryPage,
 };

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::worker::WorkspaceClient;
 
-pub use workspace_api::{
+pub use server_api::{
     SkillActivationStatus, SkillCatalogEntry, SkillCatalogResponse, SkillDetailResponse,
     SkillDiagnostic, SkillDiagnosticSeverity, SkillProjectionIdentity, SkillProjectionStatus,
     SkillProvenance, SkillResourceRef, SkillSourceKind,
@@ -29,7 +29,7 @@ pub enum SkillClientError {
     #[error("Skill API response JSON is invalid: {0}")]
     Json(#[from] serde_json::Error),
     #[error("Skill API response violates the shared contract: {0}")]
-    InvalidResponse(#[from] workspace_api::SkillApiValidationError),
+    InvalidResponse(#[from] server_api::SkillApiValidationError),
     #[error("Skill API returned HTTP {status}: {body}")]
     Http {
         status: reqwest::StatusCode,

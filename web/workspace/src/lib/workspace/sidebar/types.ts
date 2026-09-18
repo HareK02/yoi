@@ -5,6 +5,7 @@ import type {
   WorkerLaunchOptionsResponse as SharedWorkerLaunchOptionsResponse,
   WorkerLaunchProfileCandidate as SharedWorkerLaunchProfileCandidate,
   WorkerLaunchRuntimeOption as SharedWorkerLaunchRuntimeOption,
+  WorkerLaunchWorkerSummary as WorkerSummary,
   WorkingDirectoryRepositoryOption as SharedWorkingDirectoryRepositoryOption,
 } from "$lib/generated/worker-launch-api";
 import type {
@@ -111,6 +112,19 @@ export type Worker = {
 };
 
 export type WorkerOperationState = "accepted" | "unsupported" | "rejected";
+
+/** Typed result of restore across Runtime, Workspace, Web, and TUI clients. */
+export type WorkerRestoreState =
+  | "accepted"
+  | "rejected"
+  | "rolled_back"
+  | "reconciliation_required";
+
+export type WorkerRestoreResult = {
+  state: WorkerRestoreState;
+  worker?: WorkerSummary | null;
+  diagnostics: Diagnostic[];
+};
 
 export type WorkerLaunchRuntimeOption = SharedWorkerLaunchRuntimeOption;
 export type WorkerLaunchProfileCandidate = SharedWorkerLaunchProfileCandidate;

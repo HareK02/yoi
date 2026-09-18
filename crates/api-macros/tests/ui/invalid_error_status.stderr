@@ -1,0 +1,5 @@
+error: error_status must be between 400 and 599
+ --> tests/ui/invalid_error_status.rs:8:38
+  |
+8 |     #[get("/widgets", error_status = 200)]
+  |                                      ^^^

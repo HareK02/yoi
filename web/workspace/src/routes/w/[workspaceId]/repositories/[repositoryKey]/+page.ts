@@ -1,22 +1,14 @@
 import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
+import { loadWorkspaceRepositoryDetail } from "$lib/workspace/api/repositories";
 import { parseWorkspaceRuntimeList } from "$lib/workspace/api/runtime-management";
-import {
-  parseRepositoryDetailResponse,
-  parseRepositoryLogResponse,
-} from "$lib/workspace/api/workspace-model";
+import { parseRepositoryLogResponse } from "$lib/workspace/api/workspace-model";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {
   const workspaceId = params.workspaceId;
   const repositoryKey = params.repositoryKey;
   const [repositoryResult, logResult, runtimesResult] = await Promise.all([
-    loadJson<unknown>(
-      fetch,
-      workspaceApiPath(
-        workspaceId,
-        `/repositories/${encodeURIComponent(repositoryKey)}`,
-      ),
-    ),
+    loadWorkspaceRepositoryDetail(fetch, workspaceId, repositoryKey),
     loadJson<unknown>(
       fetch,
       workspaceApiPath(
@@ -30,17 +22,8 @@ export const load: PageLoad = async ({ fetch, params }) => {
     ),
   ]);
 
-  let repository = null;
-  let repositoryError = repositoryResult.error;
-  if (repositoryResult.data !== null) {
-    try {
-      repository = parseRepositoryDetailResponse(repositoryResult.data);
-    } catch (cause) {
-      repositoryError = cause instanceof Error
-        ? cause.message
-        : "invalid repository detail response";
-    }
-  }
+  const repository = repositoryResult.data;
+  const repositoryError = repositoryResult.error;
 
   let log = null;
   let logError = logResult.error;

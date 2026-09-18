@@ -8,16 +8,17 @@ license.workspace = true
 async-trait.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 protocol = { workspace = true }
+runtime-api.workspace = true
 ticket = { workspace = true }
 futures = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+server-api.workspace = true
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "sync", "time"] }
 tokio-tungstenite = { workspace = true }
 uuid = { workspace = true }
-workspace-api.workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }

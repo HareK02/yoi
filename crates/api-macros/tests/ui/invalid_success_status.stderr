@@ -1,0 +1,5 @@
+error: status must be a success status between 200 and 299
+ --> tests/ui/invalid_success_status.rs:7:32
+  |
+7 |     #[get("/widgets", status = 404)]
+  |                                ^^^

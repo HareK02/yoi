@@ -23,7 +23,7 @@ use workdir::{
     WorkdirSessionCapabilities, WorkdirSessionHandle, WriteRequest, WriteResult,
 };
 
-use workspace_api::{
+use server_api::{
     WorkingDirectoryCreateRequest as WorkdirCreateRequest,
     WorkingDirectoryCreateResponse as WorkdirCreateResponse,
     WorkingDirectoryListResponse as WorkdirListResponse,

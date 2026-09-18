@@ -24,7 +24,7 @@ import type {
   WorkspaceRuntimeBindingSummary,
   WorkspaceRuntimeDetail,
   WorkspaceRuntimeResource,
-} from "$lib/generated/workspace-api.ts";
+} from "$lib/generated/legacy-server-api.ts";
 import type { ListResponse } from "$lib/workspace/sidebar/types";
 import { workspaceApiPath } from "./http.ts";
 

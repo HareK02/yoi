@@ -1,8 +1,8 @@
 use axum::http::{HeaderMap, header};
 use chrono::{DateTime, Duration, Utc};
+pub use server_api::{ActorAuthMethod, AuthPublicConfig, AuthenticatedUser, RequestActor};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
-pub use workspace_api::{ActorAuthMethod, AuthPublicConfig, AuthenticatedUser, RequestActor};
 
 use crate::{Error, Result, store::ControlPlaneStore};
 

@@ -286,7 +286,21 @@ pub enum WorkerExecutionSpawnResult {
         worker_state: protocol::WorkerStateSnapshot,
         working_directory: Option<WorkingDirectoryStatus>,
     },
+    /// A read-only preflight rejected the operation before live work started.
     Rejected(WorkerExecutionResult),
+    /// Live work started, failed, and all operation-owned resources were joined/released.
+    RolledBack(WorkerExecutionResult),
+    /// The operation crossed the live side-effect boundary and could not prove
+    /// either commit or complete cleanup. Optional handle/state fields preserve
+    /// concrete execution evidence for retry reconciliation.
+    ReconciliationRequired {
+        result: WorkerExecutionResult,
+        handle: Option<WorkerExecutionHandle>,
+        worker_state: Option<protocol::WorkerStateSnapshot>,
+        working_directory: Option<WorkingDirectoryStatus>,
+    },
+    /// Legacy spawn failure. Restore implementations must use `RolledBack` or
+    /// `ReconciliationRequired` after crossing their live side-effect boundary.
     Errored(WorkerExecutionResult),
 }
 
@@ -304,6 +318,11 @@ impl WorkerExecutionSpawnResult {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerSessionObservationRequest {
+    pub worker_ref: WorkerRef,
+}
+
 pub trait WorkerExecutionBackend: Send + Sync + 'static {
     fn backend_id(&self) -> &str;
 
@@ -314,7 +333,26 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         Err("execution backend does not support Workspace Config fetching".to_string())
     }
 
+    fn worker_session(
+        &self,
+        _request: WorkerSessionObservationRequest,
+    ) -> runtime_api::WorkerSessionAvailability {
+        runtime_api::WorkerSessionAvailability::Unavailable {
+            reason: runtime_api::WorkerSessionUnavailableReason::StorageUnavailable,
+            message: "retained session storage is unavailable".to_string(),
+        }
+    }
+
     fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult;
+
+    /// Read-only restore validation performed before any live controller,
+    /// bridge, task, or external registration is created.
+    fn preflight_restore(
+        &self,
+        _request: &WorkerExecutionRestoreRequest,
+    ) -> Result<(), WorkerExecutionResult> {
+        Ok(())
+    }
 
     fn restore_worker(
         &self,
@@ -502,11 +540,25 @@ impl WorkerExecutionBackendRef {
         self.backend.fetch_workspace_config(request)
     }
 
+    pub(crate) fn worker_session(
+        &self,
+        request: WorkerSessionObservationRequest,
+    ) -> runtime_api::WorkerSessionAvailability {
+        self.backend.worker_session(request)
+    }
+
     pub(crate) fn spawn_worker(
         &self,
         request: WorkerExecutionSpawnRequest,
     ) -> WorkerExecutionSpawnResult {
         self.backend.spawn_worker(request)
+    }
+
+    pub(crate) fn preflight_restore(
+        &self,
+        request: &WorkerExecutionRestoreRequest,
+    ) -> Result<(), WorkerExecutionResult> {
+        self.backend.preflight_restore(request)
     }
 
     pub(crate) fn restore_worker(

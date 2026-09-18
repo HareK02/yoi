@@ -52,6 +52,13 @@
     import { pushWorkspaceAlert } from "$lib/workspace/alerts/store";
     import { workspaceApiPath } from "$lib/workspace/api/http";
     import { workspaceMultiplexer, type WorkspaceMultiplexerSubscription } from "$lib/workspace/multiplexer";
+    import {
+        isCurrentWorkerSessionRequest,
+        workerSessionAction,
+        workerSessionRequestInit,
+        type WorkerSessionObservation,
+        type WorkerSessionRequestIdentity,
+    } from "$lib/workspace/session-observation";
     import type { Diagnostic, Worker } from "$lib/workspace/sidebar/types";
 
     type Props = {
@@ -248,18 +255,6 @@
         liveWorkerState ?? (worker?.state === "stopped" ? "stopped" : "loading"),
     );
     const workerRunning = $derived(workerState === "running");
-    const compactionProgress = $derived.by(() => {
-        const state = consoleProjection.workerState?.state;
-        if (!state || typeof state !== "object" || !("busy" in state)) return null;
-        const progress = consoleProjection.compaction;
-        if (!progress) return null;
-        const busy = state.busy;
-        if (!busy || typeof busy !== "object") return null;
-        const valid = progress.trigger === "manual"
-            ? "maintenance" in busy && busy.maintenance === "compacting"
-            : "run" in busy;
-        return valid ? progress : null;
-    });
     const workerPaused = $derived(workerState === "paused");
     const composerEditable = $derived(protocolState === "open" && !sending);
     const draftHasText = $derived(draft.content.trim().length > 0);
@@ -659,7 +654,6 @@
                     params: {
                         notification_request_id: crypto.randomUUID(),
                         message: request.content,
-                        auto_run: true,
                     },
                 };
             case "compact": {
@@ -944,10 +938,121 @@
         token: number,
         target: ConsoleTarget,
     ) {
-        if (!targetWorker || targetWorker.state === "stopped") {
-            protocolState = "closed";
-            return;
-        }
+        protocolState = "connecting";
+        const controller = new AbortController();
+        let closeLiveSubscription: (() => void) | undefined;
+        const requestIdentity: WorkerSessionRequestIdentity = {
+            token,
+            workspaceId: target.workspaceId,
+            runtimeId: target.runtimeId,
+            workerId: target.workerId,
+        };
+        void fetch(
+            workerApiPath(
+                `/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(target.workerId)}/session`,
+            ),
+            workerSessionRequestInit(controller.signal),
+        )
+            .then(async (response) => {
+                if (!response.ok) {
+                    throw new Error(`failed to observe Worker Session (${response.status})`);
+                }
+                return (await response.json()) as WorkerSessionObservation;
+            })
+            .then((observation) => {
+                const currentIdentity: WorkerSessionRequestIdentity = {
+                    token: reloadToken,
+                    workspaceId,
+                    runtimeId,
+                    workerId,
+                };
+                if (
+                    !isCurrentWorkerSessionRequest(requestIdentity, currentIdentity) ||
+                    controller.signal.aborted
+                )
+                    return;
+                const action = workerSessionAction(observation);
+                if (action.kind === "show_unavailable") {
+                    protocolState = "closed";
+                    streamDiagnostics = [
+                        ...streamDiagnostics,
+                        {
+                            code: "retained_session_unavailable",
+                            severity: "warning",
+                            message: action.message,
+                        },
+                    ];
+                    return;
+                }
+                if (
+                    action.kind === "subscribe_live" &&
+                    targetWorker &&
+                    targetWorker.state === "stopped"
+                ) {
+                    protocolState = "closed";
+                    streamDiagnostics = [
+                        ...streamDiagnostics,
+                        {
+                            code: "worker_session_state_changed",
+                            severity: "warning",
+                            message:
+                                "The Session is live but the Worker is stopped. Reload to refresh its state.",
+                        },
+                    ];
+                    return;
+                }
+                if (action.kind === "subscribe_live") {
+                    closeLiveSubscription = connectLiveProtocolTransport(token, target);
+                    return;
+                }
+                handleIncomingProtocolEvent({
+                    event: "snapshot",
+                    data: {
+                        session: action.snapshot,
+                        greeting: {
+                            worker_name: "retained worker",
+                            cwd: "",
+                            provider: "retained session",
+                            model: "",
+                            scope_summary: "read-only retained session",
+                            tools: [],
+                            context_window: 0,
+                            context_tokens: 0,
+                        },
+                        state: { last_command_id: 0, state: { kind: "idle" } },
+                        in_flight: { responses: [], commands: [] },
+                        internal_workers: [],
+                    },
+                } as ProtocolEvent);
+                protocolState = "closed";
+                streamDiagnostics = [
+                    ...streamDiagnostics,
+                    {
+                        code: "retained_session_read_only",
+                        severity: "info",
+                        message: "Showing a read-only retained Session snapshot.",
+                    },
+                ];
+            })
+            .catch((error) => {
+                if (token !== reloadToken || controller.signal.aborted) return;
+                protocolState = "error";
+                streamDiagnostics = [
+                    ...streamDiagnostics,
+                    {
+                        code: "worker_session_observation_failed",
+                        severity: "warning",
+                        message: error instanceof Error ? error.message : String(error),
+                    },
+                ];
+            });
+        return () => {
+            controller.abort();
+            closeLiveSubscription?.();
+        };
+    }
+
+    function connectLiveProtocolTransport(token: number, target: ConsoleTarget) {
         protocolState = "connecting";
         const subscription = workspaceMultiplexer(target.workspaceId).subscribe(
             {
@@ -1917,7 +2022,8 @@
             requests={consoleProjection.runActivity.requests}
             uploadTokens={consoleProjection.runActivity.uploadTokens}
             outputTokens={consoleProjection.runActivity.outputTokens}
-            compaction={compactionProgress}
+            compaction={consoleProjection.compaction}
+            workerState={consoleProjection.workerState}
         />
     {/if}
 

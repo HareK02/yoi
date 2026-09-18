@@ -262,28 +262,28 @@ impl ParentNotificationTarget {
         Self::Controller { sender, fallback }
     }
 
-    pub(crate) fn notify(&self, child_session_id: String, message: String, auto_run: bool) {
+    pub(crate) fn notify(&self, child_session_id: String, message: String) {
         let method = Method::NotifyTracked {
             notification_request_id: protocol::new_submission_request_id(),
             message,
-            auto_run,
             source: protocol::AuthenticatedInputSource::SubWorker {
                 session_id: child_session_id,
             },
         };
         match self {
             Self::Controller { sender, fallback } => {
+                // Persist through the Worker-owned pending authority before the
+                // child completion path returns. The Controller delivery is only
+                // a wake-up hint; replay is idempotent by notification_request_id.
+                fallback(method.clone());
                 let Some(parent_method_tx) = sender.upgrade() else {
-                    fallback(method);
                     return;
                 };
-                let fallback = fallback.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = parent_method_tx.send(method).await {
+                    if parent_method_tx.send(method).await.is_err() {
                         tracing::warn!(
-                            "failed to notify parent Controller; using durable pending authority"
+                            "failed to wake parent Controller after durable notification acceptance"
                         );
-                        fallback(error.0);
                     }
                 });
             }
@@ -588,7 +588,7 @@ impl Tool for SubWorkerSpawnTool {
                 let message = format!(
                     "SubWorker `{child_name}` turn ended with status {status:?}. Inspect its committed session with worker-observation tools before making completion decisions."
                 );
-                parent_notifications.notify(child_name.clone(), message, true);
+                parent_notifications.notify(child_name.clone(), message);
             })),
             Some(child_workdir_tool_broker.clone()),
         )
@@ -1199,8 +1199,32 @@ enabled = false
         drop(parent_method_tx);
 
         assert!(parent_method_rx.recv().await.is_none());
-        target.notify("child-session".into(), "late completion".to_string(), true);
+        target.notify("child-session".into(), "late completion".to_string());
         assert!(*captured.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn parent_controller_notification_is_durable_before_wakeup_delivery() {
+        let (parent_method_tx, mut parent_method_rx) = mpsc::channel(1);
+        let durable = Arc::new(AtomicBool::new(false));
+        let durable_for_fallback = Arc::clone(&durable);
+        let target = ParentNotificationTarget::with_controller_fallback(
+            parent_method_tx.downgrade(),
+            ParentNotificationTarget::Durable(Arc::new(move |_| {
+                durable_for_fallback.store(true, Ordering::Release);
+            })),
+        );
+
+        target.notify("child-session".into(), "completed".into());
+        let wakeup = parent_method_rx.recv().await.unwrap();
+        assert!(durable.load(Ordering::Acquire));
+        assert!(matches!(
+            wakeup,
+            Method::NotifyTracked {
+                source: protocol::AuthenticatedInputSource::SubWorker { session_id },
+                ..
+            } if session_id == "child-session"
+        ));
     }
 
     #[test]
@@ -1211,13 +1235,12 @@ enabled = false
             *captured_for_target.lock().unwrap() = Some(method);
         }));
 
-        target.notify("child-session".into(), "completed".into(), true);
+        target.notify("child-session".into(), "completed".into());
 
         assert!(matches!(
             captured.lock().unwrap().take(),
             Some(Method::NotifyTracked {
                 message,
-                auto_run: true,
                 source: protocol::AuthenticatedInputSource::SubWorker { session_id },
                 ..
             }) if session_id == "child-session" && message == "completed"
@@ -1361,7 +1384,6 @@ enabled = false
             completion,
             Method::NotifyTracked {
                 message,
-                auto_run: true,
                 source: protocol::AuthenticatedInputSource::SubWorker { session_id },
                 ..
             } if session_id == "reviewer-child"
