@@ -446,7 +446,9 @@ Deno.test("Worker Console renders markdown only for message rows", async () => {
       consoleLine.includes("font-size: 12px;") &&
       consoleLine.includes("line-height: 1.1;") &&
       consoleLine.includes("{:else if shouldRenderMarkdown(item)}") &&
-      consoleLine.includes("<RichMarkdown text={item.body || '—'} />") &&
+      consoleLine.includes(
+        "<RichMarkdown text={item.body || '—'} streamId={item.id} />",
+      ) &&
       !consoleLine.includes("{@html"),
     "Console should keep markdown rendering to message bodies, safely project Bash ANSI, and render other tool text literally",
   );

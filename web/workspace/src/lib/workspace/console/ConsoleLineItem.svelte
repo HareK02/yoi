@@ -133,7 +133,7 @@
   {:else if item.kind === 'user'}
     <div class="user-message">
       <span class="user-prompt" aria-hidden="true">&gt;</span>
-      <div><RichMarkdown text={item.body || '—'} /></div>
+      <div><RichMarkdown text={item.body || '—'} streamId={item.id} /></div>
     </div>
   {:else if item.kind === 'activity'}
     <p class="activity-summary">{item.body || '—'}</p>
@@ -142,7 +142,7 @@
   {:else if item.kind === 'run_stats'}
     <p class="run-stats">{item.body}</p>
   {:else if shouldRenderMarkdown(item)}
-    <RichMarkdown text={item.body || '—'} />
+    <RichMarkdown text={item.body || '—'} streamId={item.id} />
   {:else}
     <p class="console-plain-text">{item.body || '—'}</p>
   {/if}

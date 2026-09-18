@@ -1,41 +1,49 @@
+<script module lang="ts">
+  import {
+    createShikiHighlighter,
+    setShikiHighlighter,
+  } from "@humanspeak/svelte-markdown/extensions/shiki";
+  import bash from "shiki/langs/bash.mjs";
+  import javascript from "shiki/langs/javascript.mjs";
+  import json from "shiki/langs/json.mjs";
+  import python from "shiki/langs/python.mjs";
+  import rust from "shiki/langs/rust.mjs";
+  import typescript from "shiki/langs/typescript.mjs";
+  import kanagawaWave from "shiki/themes/kanagawa-wave.mjs";
+
+  setShikiHighlighter(
+    createShikiHighlighter({
+      themes: [kanagawaWave],
+      langs: [bash, javascript, json, python, rust, typescript],
+    }),
+  );
+</script>
+
 <script lang="ts">
-  import { markdownToHtml } from "$lib/workspace/console/markdown";
+  import SvelteMarkdown, {
+    buildUnsupportedHTML,
+    type Renderers,
+  } from "@humanspeak/svelte-markdown";
+  import { ShikiCode } from "@humanspeak/svelte-markdown/extensions/shiki";
+  import MarkdownLink from "$lib/workspace/console/MarkdownLink.svelte";
 
   type Props = {
     text: string;
+    streamId?: string | number;
     class?: string;
   };
 
-  let { text, class: className = "" }: Props = $props();
-  let html = $state("");
-  let rendering = $state(false);
+  let { text, streamId = "static", class: className = "" }: Props = $props();
 
-  async function render(value: string): Promise<void> {
-    const current = value;
-    rendering = true;
-    try {
-      const next = await markdownToHtml(current);
-      if (text === current) {
-        html = next;
-      }
-    } finally {
-      if (text === current) {
-        rendering = false;
-      }
-    }
-  }
-
-  $effect(() => {
-    void render(text);
-  });
+  const renderers = {
+    code: ShikiCode,
+    html: buildUnsupportedHTML(),
+    link: MarkdownLink,
+  } satisfies Partial<Renderers>;
 </script>
 
-<div class={`rich-markdown ${className}`} class:is-rendering={rendering}>
-  {#if html}
-    {@html html}
-  {:else}
-    <p>{text}</p>
-  {/if}
+<div class={`rich-markdown ${className}`}>
+  <SvelteMarkdown source={text} {streamId} {renderers} streaming />
 </div>
 
 <style>
