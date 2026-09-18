@@ -16,6 +16,7 @@ engine = {
 
 compaction = {
     kind = "tokens";
+    prune_enabled = false;
     threshold = 240000;
     request_threshold = 270000;
     worker_context_max_tokens = 100000;

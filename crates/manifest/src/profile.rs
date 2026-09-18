@@ -1245,6 +1245,26 @@ mod tests {
                 .unwrap()
         };
 
+        for name in [
+            "default",
+            "intake",
+            "orchestrator",
+            "companion",
+            "coder",
+            "reviewer",
+            "memory-consolidation",
+        ] {
+            let role = resolve(name);
+            assert_eq!(
+                role.manifest
+                    .compaction
+                    .as_ref()
+                    .map(|compaction| compaction.prune_enabled),
+                Some(false),
+                "{name} must keep pruning disabled for the experiment"
+            );
+        }
+
         let companion = resolve("companion");
         assert_eq!(
             companion.manifest.model.ref_.as_deref(),

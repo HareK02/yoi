@@ -578,6 +578,8 @@ pub struct PermissionConfigPartial {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompactionConfigPartial {
     #[serde(default)]
+    pub prune_enabled: Option<bool>,
+    #[serde(default)]
     pub prune_protected_tokens: Option<u64>,
     #[serde(default)]
     pub prune_min_savings: Option<u64>,
@@ -912,6 +914,7 @@ impl PermissionConfigPartial {
 impl CompactionConfigPartial {
     fn merge(self, upper: Self) -> Self {
         Self {
+            prune_enabled: upper.prune_enabled.or(self.prune_enabled),
             prune_protected_tokens: upper.prune_protected_tokens.or(self.prune_protected_tokens),
             prune_min_savings: upper.prune_min_savings.or(self.prune_min_savings),
             threshold: upper.threshold.or(self.threshold),
@@ -1223,6 +1226,7 @@ impl TryFrom<WorkerManifestConfig> for WorkerManifest {
                     validate_model_paths(cm, "compaction.model.auth.file")?;
                 }
                 Ok(CompactionConfig {
+                    prune_enabled: c.prune_enabled.unwrap_or(defaults::PRUNE_ENABLED),
                     prune_protected_tokens: c
                         .prune_protected_tokens
                         .unwrap_or(defaults::PRUNE_PROTECTED_TOKENS),
@@ -1831,6 +1835,7 @@ mod tests {
         let lower = WorkerManifestConfig {
             compaction: Some(CompactionConfigPartial {
                 threshold: Some(50_000),
+                prune_enabled: Some(false),
                 prune_protected_tokens: Some(5_000),
                 ..Default::default()
             }),
@@ -1861,7 +1866,8 @@ mod tests {
         let merged = lower.merge(upper);
         let c = merged.compaction.unwrap();
         assert_eq!(c.threshold, Some(80_000));
-        // field from lower retained when upper has None
+        // fields from lower retained when upper has None
+        assert_eq!(c.prune_enabled, Some(false));
         assert_eq!(c.prune_protected_tokens, Some(5_000));
         let search = merged.web.unwrap().search.unwrap();
         assert_eq!(search.timeout_secs, Some(3));

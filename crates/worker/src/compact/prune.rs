@@ -22,6 +22,13 @@ use crate::compact::token_counter::{
     EstimateSource, savings_for_prune_impl, token_estimates_for_prune_impl,
 };
 
+fn prune_config_from_compaction(compaction: &manifest::CompactionConfig) -> Option<PruneConfig> {
+    compaction.prune_enabled.then_some(PruneConfig {
+        protected_tokens: compaction.prune_protected_tokens,
+        min_savings: compaction.prune_min_savings,
+    })
+}
+
 impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Enable prune projection on the underlying Engine.
     ///
@@ -105,18 +112,46 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         worker.set_prune_observer(Some(observer));
     }
 
-    /// If the manifest has a `[compaction]` section, build a `PruneConfig`
-    /// from its `prune_*` fields and call [`attach_prune`](Self::attach_prune).
-    /// Otherwise no-op. Called from all Worker constructors so prune is
-    /// active whenever the manifest asks for it.
+    /// If the manifest enables prune under `[compaction]`, build a
+    /// `PruneConfig` from its `prune_*` fields and call
+    /// [`attach_prune`](Self::attach_prune). Otherwise no-op. Called from all
+    /// Worker constructors.
     pub(crate) fn apply_prune_from_manifest(&mut self) {
         let Some(compaction) = self.manifest().compaction.as_ref() else {
             return;
         };
-        let config = PruneConfig {
-            protected_tokens: compaction.prune_protected_tokens,
-            min_savings: compaction.prune_min_savings,
+        let Some(config) = prune_config_from_compaction(compaction) else {
+            return;
         };
         self.attach_prune(config);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_pruning_does_not_build_prune_config() {
+        let compaction = manifest::CompactionConfig {
+            prune_enabled: false,
+            ..Default::default()
+        };
+
+        assert!(prune_config_from_compaction(&compaction).is_none());
+    }
+
+    #[test]
+    fn enabled_compaction_preserves_prune_thresholds() {
+        let compaction = manifest::CompactionConfig {
+            prune_enabled: true,
+            prune_protected_tokens: 1234,
+            prune_min_savings: 5678,
+            ..Default::default()
+        };
+
+        let config = prune_config_from_compaction(&compaction).unwrap();
+        assert_eq!(config.protected_tokens, 1234);
+        assert_eq!(config.min_savings, 5678);
     }
 }

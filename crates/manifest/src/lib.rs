@@ -768,6 +768,11 @@ pub enum ToolPermissionAction {
 /// (full history summarisation). Omitting `[compaction]` disables both.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactionConfig {
+    /// Whether request-time projection removes detail from old tool results.
+    /// Independent from the compaction thresholds below.
+    #[serde(default = "default_prune_enabled")]
+    pub prune_enabled: bool,
+
     /// Token budget at the history tail protected from pruning.
     #[serde(default = "default_prune_protected_tokens")]
     pub prune_protected_tokens: u64,
@@ -868,6 +873,9 @@ pub struct CompactionConfig {
     pub model: Option<ModelManifest>,
 }
 
+fn default_prune_enabled() -> bool {
+    defaults::PRUNE_ENABLED
+}
 fn default_prune_protected_tokens() -> u64 {
     defaults::PRUNE_PROTECTED_TOKENS
 }
@@ -914,6 +922,7 @@ fn default_result_context_max_tokens() -> u64 {
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
+            prune_enabled: default_prune_enabled(),
             prune_protected_tokens: default_prune_protected_tokens(),
             prune_min_savings: default_prune_min_savings(),
             threshold: None,
@@ -1460,15 +1469,22 @@ model_id = "claude-sonnet-4-20250514"
 
     #[test]
     fn parse_compaction_config() {
-        let toml = format!("{MINIMAL_REQUIRED}\n[compaction]\nthreshold = 80000\n");
+        let toml =
+            format!("{MINIMAL_REQUIRED}\n[compaction]\nprune_enabled = false\nthreshold = 80000\n");
         let manifest = WorkerManifest::from_toml(&toml).unwrap();
         let c = manifest.compaction.unwrap();
+        assert!(!c.prune_enabled);
         assert_eq!(c.prune_protected_tokens, 8000);
         assert_eq!(c.prune_min_savings, 4096);
         assert_eq!(c.threshold, Some(80000));
         assert_eq!(c.request_threshold, None);
         assert_eq!(c.retained_tokens, 8000);
         assert_eq!(c.worker_max_turns, Some(20));
+    }
+
+    #[test]
+    fn compaction_defaults_to_pruning_disabled() {
+        assert!(!CompactionConfig::default().prune_enabled);
     }
 
     #[test]

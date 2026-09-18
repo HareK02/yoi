@@ -14,6 +14,10 @@ pub const TOOL_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 /// See [`crate::FileUploadLimits`].
 pub const FILE_UPLOAD_MAX_BYTES: usize = 256 * 1024;
 
+/// Whether request-time tool-result pruning is enabled when `[compaction]`
+/// exists. See [`crate::CompactionConfig::prune_enabled`].
+pub const PRUNE_ENABLED: bool = false;
+
 /// Token budget at the history tail protected from pruning. See
 /// [`crate::CompactionConfig::prune_protected_tokens`].
 pub const PRUNE_PROTECTED_TOKENS: u64 = 8000;

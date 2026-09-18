@@ -159,6 +159,7 @@ model_id = "test-model"
 max_tokens = 100
 
 [compaction]
+prune_enabled = true
 prune_protected_tokens = {prune_protected_tokens}
 prune_min_savings = {prune_min_savings}
 

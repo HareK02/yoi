@@ -179,8 +179,11 @@ permission = "write"
 
 # ===== [compaction] =========================================================
 # コンテキスト圧縮 (Prune / Compact)。セクション省略で両方無効。
-# セクションを書いた時点で Prune は有効化、Compact は閾値が None なら無効。
+# `prune_enabled`でPruneを制御する。Compactは閾値がNoneなら無効。
 # [compaction]
+#
+# # 任意。デフォルト: false。Compactの設定を保ったままPruneだけ切替できる。
+# prune_enabled = true
 #
 # # 任意。デフォルト: 8000 (`defaults::PRUNE_PROTECTED_TOKENS`)。
 # # pruning から保護する末尾 token budget。turn 数ではなく usage estimate で境界を引く。

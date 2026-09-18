@@ -956,6 +956,7 @@ fn manifest_to_reusable_config(manifest: &WorkerManifest) -> WorkerManifestConfi
             .compaction
             .as_ref()
             .map(|c| CompactionConfigPartial {
+                prune_enabled: Some(c.prune_enabled),
                 prune_protected_tokens: Some(c.prune_protected_tokens),
                 prune_min_savings: Some(c.prune_min_savings),
                 threshold: c.threshold,
