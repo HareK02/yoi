@@ -4,8 +4,7 @@ use serde_json::{Map, Value};
 
 pub const GENERATOR_NAME: &str = "yoi-repository-openapi-typescript";
 pub const GENERATOR_VERSION: &str = "1";
-pub const GENERATOR_OPTIONS: &str =
-    "repository-operation-schema-closure,openapi-3.1,strict-safe-integers,sorted-output";
+pub const GENERATOR_OPTIONS: &str = "repository-operation-schema-closure,openapi-3.1,format:uint64=safe-number,strict-safe-integers,sorted-output";
 pub const INPUT_PATH: &str = "openapi/server-api.json";
 pub const OUTPUT_PATH: &str = "web/workspace/src/lib/generated/repository-api.ts";
 
@@ -285,6 +284,49 @@ fn collect_schema_references(
     Ok(())
 }
 
+fn ensure_schema_keywords(
+    schema: &Map<String, Value>,
+    allowed: &[&str],
+    context: &str,
+) -> Result<(), GenerationError> {
+    const ALLOWED_ANNOTATIONS: &[&str] = &[
+        "$comment",
+        "default",
+        "deprecated",
+        "description",
+        "example",
+        "examples",
+        "title",
+    ];
+    if let Some(keyword) = schema.keys().find(|keyword| {
+        !allowed.contains(&keyword.as_str()) && !ALLOWED_ANNOTATIONS.contains(&keyword.as_str())
+    }) {
+        return Err(GenerationError::invalid(format!(
+            "{context} contains unsupported schema keyword `{keyword}`"
+        )));
+    }
+    Ok(())
+}
+
+fn literal_matches_type(kind: &str, value: &Value) -> bool {
+    matches!(
+        (kind, value),
+        ("string", Value::String(_)) | ("boolean", Value::Bool(_)) | ("null", Value::Null)
+    )
+}
+
+fn literal_schema_matches_type(schema: &Map<String, Value>, kind: &str) -> bool {
+    if let Some(constant) = schema.get("const") {
+        return literal_matches_type(kind, constant);
+    }
+    schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|values| {
+            !values.is_empty() && values.iter().all(|value| literal_matches_type(kind, value))
+        })
+}
+
 fn render_schema(value: &Value, context: &str) -> Result<String, GenerationError> {
     let schema = object(value, context)?;
     if schema.contains_key("$ref") {
@@ -299,9 +341,21 @@ fn render_schema(value: &Value, context: &str) -> Result<String, GenerationError
             });
     }
     if let Some(constant) = schema.get("const") {
+        ensure_schema_keywords(schema, &["const", "type"], context)?;
+        if let Some(type_value) = schema.get("type") {
+            let kind = type_value.as_str().ok_or_else(|| {
+                GenerationError::invalid(format!("{context} const type must be a string"))
+            })?;
+            if !literal_matches_type(kind, constant) {
+                return Err(GenerationError::invalid(format!(
+                    "{context} const literal does not match type `{kind}`"
+                )));
+            }
+        }
         return render_literal(constant, context);
     }
     if let Some(enumeration) = schema.get("enum") {
+        ensure_schema_keywords(schema, &["enum", "type"], context)?;
         let values = enumeration.as_array().ok_or_else(|| {
             GenerationError::invalid(format!("{context} contains a non-array enum"))
         })?;
@@ -310,6 +364,16 @@ fn render_schema(value: &Value, context: &str) -> Result<String, GenerationError
                 "{context} contains an empty enum"
             )));
         }
+        if let Some(type_value) = schema.get("type") {
+            let kind = type_value.as_str().ok_or_else(|| {
+                GenerationError::invalid(format!("{context} enum type must be a string"))
+            })?;
+            if !values.iter().all(|value| literal_matches_type(kind, value)) {
+                return Err(GenerationError::invalid(format!(
+                    "{context} enum literals do not match type `{kind}`"
+                )));
+            }
+        }
         return values
             .iter()
             .map(|value| render_literal(value, context))
@@ -317,9 +381,20 @@ fn render_schema(value: &Value, context: &str) -> Result<String, GenerationError
             .map(|values| values.join(" | "));
     }
     if let Some(branches) = schema.get("anyOf") {
+        ensure_schema_keywords(schema, &["anyOf"], context)?;
         return render_nullable_union(branches, context);
     }
     if let Some(branches) = schema.get("oneOf") {
+        ensure_schema_keywords(schema, &["oneOf", "type"], context)?;
+        let outer_type = match schema.get("type") {
+            Some(Value::String(kind)) if kind == "string" => Some(kind.as_str()),
+            Some(_) => {
+                return Err(GenerationError::invalid(format!(
+                    "{context} contains an unsupported oneOf type"
+                )));
+            }
+            None => None,
+        };
         let branches = branches.as_array().ok_or_else(|| {
             GenerationError::invalid(format!("{context} contains a non-array oneOf"))
         })?;
@@ -329,12 +404,46 @@ fn render_schema(value: &Value, context: &str) -> Result<String, GenerationError
             )));
         }
         let mut rendered = Vec::with_capacity(branches.len());
+        let mut seen_literals = BTreeSet::new();
         for branch in branches {
             let branch_object = object(branch, context)?;
             if !branch_object.contains_key("enum") && !branch_object.contains_key("const") {
                 return Err(GenerationError::invalid(format!(
                     "{context} contains unsupported ambiguous oneOf semantics"
                 )));
+            }
+            let literals = if let Some(constant) = branch_object.get("const") {
+                std::slice::from_ref(constant)
+            } else {
+                branch_object
+                    .get("enum")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        GenerationError::invalid(format!(
+                            "{context} contains a non-array oneOf enum"
+                        ))
+                    })?
+                    .as_slice()
+            };
+            for literal in literals {
+                render_literal(literal, context)?;
+                let normalized = serde_json::to_string(literal).map_err(|error| {
+                    GenerationError::invalid(format!(
+                        "failed to normalize {context} oneOf literal: {error}"
+                    ))
+                })?;
+                if !seen_literals.insert(normalized) {
+                    return Err(GenerationError::invalid(format!(
+                        "{context} contains overlapping oneOf literal branches"
+                    )));
+                }
+            }
+            if let Some(kind) = outer_type {
+                if !literal_schema_matches_type(branch_object, kind) {
+                    return Err(GenerationError::invalid(format!(
+                        "{context} oneOf branch does not match outer type `{kind}`"
+                    )));
+                }
             }
             rendered.push(render_schema(branch, context)?);
         }
@@ -384,6 +493,15 @@ fn render_nullable_union(value: &Value, context: &str) -> Result<String, Generat
             "{context} contains unsupported ambiguous anyOf semantics"
         )));
     }
+    let null_branch = branches
+        .iter()
+        .find(|branch| branch.get("type").and_then(Value::as_str) == Some("null"))
+        .expect("validated one null branch");
+    if render_schema(null_branch, context)? != "null" {
+        return Err(GenerationError::invalid(format!(
+            "{context} contains an invalid nullable null branch"
+        )));
+    }
     let branch = branches
         .iter()
         .find(|branch| branch.get("type").and_then(Value::as_str) != Some("null"))
@@ -397,28 +515,63 @@ fn render_typed_schema(
     context: &str,
 ) -> Result<String, GenerationError> {
     match kind {
-        "string" => Ok("string".to_owned()),
-        "boolean" => Ok("boolean".to_owned()),
-        "null" => Ok("null".to_owned()),
+        "string" => {
+            ensure_schema_keywords(schema, &["type"], context)?;
+            Ok("string".to_owned())
+        }
+        "boolean" => {
+            ensure_schema_keywords(schema, &["type"], context)?;
+            Ok("boolean".to_owned())
+        }
+        "null" => {
+            ensure_schema_keywords(schema, &["type"], context)?;
+            Ok("null".to_owned())
+        }
         "integer" => {
+            ensure_schema_keywords(schema, &["format", "maximum", "minimum", "type"], context)?;
+            let format = match schema.get("format") {
+                Some(Value::String(format)) if format == "uint64" => Some(format.as_str()),
+                Some(Value::String(format)) => {
+                    return Err(GenerationError::invalid(format!(
+                        "{context} uses unsupported integer format `{format}`"
+                    )));
+                }
+                Some(_) => {
+                    return Err(GenerationError::invalid(format!(
+                        "{context} integer format must be a string"
+                    )));
+                }
+                None => None,
+            };
             let minimum = schema.get("minimum").and_then(Value::as_f64);
             let maximum = schema.get("maximum").and_then(Value::as_f64);
-            if minimum.is_none_or(|minimum| minimum < MIN_SAFE_INTEGER)
-                || maximum.is_none_or(|maximum| maximum > MAX_SAFE_INTEGER)
-            {
+            let expected_minimum = if format == Some("uint64") {
+                0.0
+            } else {
+                MIN_SAFE_INTEGER
+            };
+            if minimum != Some(expected_minimum) || maximum != Some(MAX_SAFE_INTEGER) {
                 return Err(GenerationError::invalid(format!(
-                    "{context} integer range exceeds JavaScript safe integers"
+                    "{context} integer range does not match its JavaScript safe-number mapping"
                 )));
             }
             Ok("number".to_owned())
         }
         "array" => {
+            ensure_schema_keywords(schema, &["items", "type"], context)?;
             let items = schema.get("items").ok_or_else(|| {
                 GenerationError::invalid(format!("{context} array has no item schema"))
             })?;
             Ok(format!("Array<{}>", render_schema(items, context)?))
         }
-        "object" => render_object(schema, context),
+        "object" => {
+            ensure_schema_keywords(
+                schema,
+                &["additionalProperties", "properties", "required", "type"],
+                context,
+            )?;
+            render_object(schema, context)
+        }
         other => Err(GenerationError::invalid(format!(
             "{context} uses unsupported type `{other}`"
         ))),
@@ -565,7 +718,25 @@ mod tests {
         document["components"]["schemas"]["RepositorySummary"]["properties"]["source_revision"]["maximum"] =
             serde_json::json!(9_007_199_254_740_992_u64);
         let error = generate_repository_typescript(&document.to_string()).unwrap_err();
-        assert!(error.to_string().contains("safe integers"));
+        assert!(error.to_string().contains("safe-number"));
+
+        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
+        document["components"]["schemas"]["RepositorySummary"]["properties"]["source_revision"]["minimum"] =
+            serde_json::json!(-1);
+        let error = generate_repository_typescript(&document.to_string()).unwrap_err();
+        assert!(error.to_string().contains("safe-number"));
+
+        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
+        document["components"]["schemas"]["RepositorySummary"]["properties"]["source_revision"]["maximum"] =
+            serde_json::json!(9_007_199_254_740_990_u64);
+        let error = generate_repository_typescript(&document.to_string()).unwrap_err();
+        assert!(error.to_string().contains("safe-number"));
+
+        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
+        document["components"]["schemas"]["RepositorySummary"]["properties"]["source_revision"]["format"] =
+            serde_json::json!("int64");
+        let error = generate_repository_typescript(&document.to_string()).unwrap_err();
+        assert!(error.to_string().contains("unsupported integer format"));
 
         let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
         document["components"]["schemas"]["RepositorySummary"]["properties"]["git"]["anyOf"]
@@ -592,6 +763,78 @@ mod tests {
             ["schema"]["maxItems"] = serde_json::json!(1);
         let error = generate_repository_typescript(&document.to_string()).unwrap_err();
         assert!(error.to_string().contains("unsupported `$ref` sibling"));
+    }
+
+    #[test]
+    fn generator_rejects_unimplemented_ordinary_schema_keywords() {
+        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
+        document["components"]["schemas"]["RepositorySource"]["properties"]["uri"]["maxLength"] =
+            serde_json::json!(1);
+        let error = generate_repository_typescript(&document.to_string()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported schema keyword `maxLength`")
+        );
+
+        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
+        document["components"]["schemas"]["RepositoryListResponse"]["properties"]["items"]["maxItems"] =
+            serde_json::json!(1);
+        let error = generate_repository_typescript(&document.to_string()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported schema keyword `maxItems`")
+        );
+    }
+
+    #[test]
+    fn generator_rejects_discarded_combined_schema_constraints() {
+        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
+        document["components"]["schemas"]["DiagnosticSeverity"]["const"] =
+            serde_json::json!("info");
+        let error = generate_repository_typescript(&document.to_string()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported schema keyword `enum`")
+        );
+
+        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
+        let null_branch =
+            document["components"]["schemas"]["RepositorySummary"]["properties"]["git"]["anyOf"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|branch| branch.get("type").and_then(Value::as_str) == Some("null"))
+                .unwrap();
+        null_branch["maxLength"] = serde_json::json!(1);
+        let error = generate_repository_typescript(&document.to_string()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported schema keyword `maxLength`")
+        );
+
+        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
+        document["components"]["schemas"]["RepositorySourceKind"]["type"] =
+            serde_json::json!("string");
+        document["components"]["schemas"]["RepositorySourceKind"]["oneOf"][0] =
+            serde_json::json!({"const": true, "type": "boolean"});
+        let error = generate_repository_typescript(&document.to_string()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("oneOf branch does not match outer type")
+        );
+
+        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
+        document["components"]["schemas"]["RepositorySourceKind"]["oneOf"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"const": "invalid", "type": "string"}));
+        let error = generate_repository_typescript(&document.to_string()).unwrap_err();
+        assert!(error.to_string().contains("overlapping oneOf literal"));
     }
 
     #[test]

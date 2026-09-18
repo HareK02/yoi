@@ -235,8 +235,8 @@ function gitSummary(value: unknown, path: string): GitRepositorySummary {
   exactKeys(git, ["status", "head", "branch", "dirty", "remotes"], path);
   return {
     status: repositoryString(git.status, `${path}.status`),
-    head: nullableRepositoryString(git.head, `${path}.head`),
-    branch: nullableRepositoryString(git.branch, `${path}.branch`),
+    head: optionalNullableRepositoryString(git.head, `${path}.head`),
+    branch: optionalNullableRepositoryString(git.branch, `${path}.branch`),
     dirty: boolean(git.dirty, `${path}.dirty`),
     remotes: repositoryArray(git.remotes, `${path}.remotes`).map((
       item,

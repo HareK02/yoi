@@ -50,6 +50,40 @@ Deno.test("generated repository wrapper validates current Backend JSON", () => {
   }
 });
 
+Deno.test("repository git optional nullable fields accept omission and null", () => {
+  const omitted = structuredClone(repositoryList) as Record<string, unknown>;
+  const omittedItems = omitted.items as Array<Record<string, unknown>>;
+  omittedItems[0].git = {
+    status: "available",
+    dirty: false,
+    remotes: [],
+  };
+  const omittedParsed = parseRepositoryListResponse(omitted);
+  if (
+    omittedParsed.items[0]?.git?.head !== undefined ||
+    omittedParsed.items[0]?.git?.branch !== undefined
+  ) {
+    throw new Error("omitted git fields were not preserved");
+  }
+
+  const nullable = structuredClone(repositoryList) as Record<string, unknown>;
+  const nullableItems = nullable.items as Array<Record<string, unknown>>;
+  nullableItems[0].git = {
+    status: "available",
+    head: null,
+    branch: null,
+    dirty: false,
+    remotes: [],
+  };
+  const nullableParsed = parseRepositoryListResponse(nullable);
+  if (
+    nullableParsed.items[0]?.git?.head !== null ||
+    nullableParsed.items[0]?.git?.branch !== null
+  ) {
+    throw new Error("null git fields were not preserved");
+  }
+});
+
 Deno.test("plain HTTP repository source kind fails closed at the JSON boundary", () => {
   const stale = structuredClone(repositoryList) as Record<string, unknown>;
   const items = stale.items as Array<Record<string, unknown>>;
