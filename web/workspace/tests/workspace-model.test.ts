@@ -74,6 +74,24 @@ Deno.test("stale repository aliases fail closed at the JSON boundary", () => {
   );
 });
 
+Deno.test("repository source revisions enforce the OpenAPI integer range", () => {
+  const negative = structuredClone(repositoryList) as Record<string, unknown>;
+  const negativeItems = negative.items as Array<Record<string, unknown>>;
+  negativeItems[0].source_revision = -1;
+  assertThrows(
+    () => parseRepositoryListResponse(negative),
+    "must be between 0 and Number.MAX_SAFE_INTEGER",
+  );
+
+  const unsafe = structuredClone(repositoryList) as Record<string, unknown>;
+  const unsafeItems = unsafe.items as Array<Record<string, unknown>>;
+  unsafeItems[0].source_revision = Number.MAX_SAFE_INTEGER + 1;
+  assertThrows(
+    () => parseRepositoryListResponse(unsafe),
+    "must be a safe integer",
+  );
+});
+
 Deno.test("repository create/error responses use the generated strict contract", () => {
   const created = parseCreateWorkspaceRepositoryResponse({
     workspace_id: repositoryList.workspace_id,

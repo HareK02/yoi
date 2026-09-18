@@ -278,6 +278,16 @@ fn collect_schema_references(
 fn render_schema(value: &Value, context: &str) -> Result<String, GenerationError> {
     let schema = object(value, context)?;
     if let Some(reference) = schema.get("$ref") {
+        const ALLOWED_REFERENCE_SIBLINGS: &[&str] =
+            &["$ref", "$comment", "deprecated", "description", "title"];
+        if let Some(keyword) = schema
+            .keys()
+            .find(|keyword| !ALLOWED_REFERENCE_SIBLINGS.contains(&keyword.as_str()))
+        {
+            return Err(GenerationError::invalid(format!(
+                "{context} contains unsupported `$ref` sibling `{keyword}`"
+            )));
+        }
         let reference = reference.as_str().ok_or_else(|| {
             GenerationError::invalid(format!("{context} contains a non-string $ref"))
         })?;
@@ -566,6 +576,15 @@ mod tests {
             .push(serde_json::json!({"type": "string"}));
         let error = generate_repository_typescript(&document.to_string()).unwrap_err();
         assert!(error.to_string().contains("ambiguous anyOf"));
+    }
+
+    #[test]
+    fn generator_rejects_lossy_reference_siblings() {
+        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
+        document["components"]["schemas"]["RepositorySummary"]["properties"]["source"]["maxLength"] =
+            serde_json::json!(1);
+        let error = generate_repository_typescript(&document.to_string()).unwrap_err();
+        assert!(error.to_string().contains("unsupported `$ref` sibling"));
     }
 
     #[test]

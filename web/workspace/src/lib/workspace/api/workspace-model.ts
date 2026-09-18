@@ -131,6 +131,14 @@ function repositoryArray(value: unknown, path: string): unknown[] {
   return parsed;
 }
 
+function repositorySourceRevision(value: unknown, path: string): number {
+  const parsed = integer(value, path);
+  if (parsed < 0) {
+    throw new Error(`${path} must be between 0 and Number.MAX_SAFE_INTEGER`);
+  }
+  return parsed;
+}
+
 function optionalNullableString(
   value: unknown,
   path: string,
@@ -279,7 +287,10 @@ function repositorySummary(value: unknown, path: string): RepositorySummary {
     kind: repositoryString(item.kind, `${path}.kind`),
     provider: repositoryString(item.provider, `${path}.provider`),
     source: repositorySource(item.source, `${path}.source`),
-    source_revision: integer(item.source_revision, `${path}.source_revision`),
+    source_revision: repositorySourceRevision(
+      item.source_revision,
+      `${path}.source_revision`,
+    ),
     source_fingerprint: repositoryString(
       item.source_fingerprint,
       `${path}.source_fingerprint`,
@@ -368,7 +379,10 @@ function workspaceRepositoryRecord(
     provider: nullableString(item.provider, `${path}.provider`),
     source: repositorySource(item.source, `${path}.source`),
     default_ref: nullableString(item.default_ref, `${path}.default_ref`),
-    source_revision: integer(item.source_revision, `${path}.source_revision`),
+    source_revision: repositorySourceRevision(
+      item.source_revision,
+      `${path}.source_revision`,
+    ),
     source_fingerprint: repositoryString(
       item.source_fingerprint,
       `${path}.source_fingerprint`,
