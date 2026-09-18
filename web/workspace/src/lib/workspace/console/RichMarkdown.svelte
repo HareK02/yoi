@@ -23,6 +23,7 @@
   import SvelteMarkdown, {
     buildUnsupportedHTML,
     type Renderers,
+    type SvelteMarkdownProps,
   } from "@humanspeak/svelte-markdown";
   import { ShikiCode } from "@humanspeak/svelte-markdown/extensions/shiki";
   import MarkdownLink from "$lib/workspace/console/MarkdownLink.svelte";
@@ -35,6 +36,11 @@
 
   let { text, streamId = "static", class: className = "" }: Props = $props();
 
+  const options = {
+    breaks: true,
+    gfm: true,
+  } satisfies NonNullable<SvelteMarkdownProps["options"]>;
+
   const renderers = {
     code: ShikiCode,
     html: buildUnsupportedHTML(),
@@ -43,7 +49,7 @@
 </script>
 
 <div class={`rich-markdown ${className}`}>
-  <SvelteMarkdown source={text} {streamId} {renderers} streaming />
+  <SvelteMarkdown source={text} {streamId} {options} {renderers} streaming />
 </div>
 
 <style>
@@ -98,7 +104,8 @@
     color: var(--tui-cyan);
   }
 
-  :global(.rich-markdown .shiki) {
+  :global(.rich-markdown .shiki),
+  :global(.rich-markdown .shiki-fallback) {
     border: 1px solid var(--line);
     border-radius: 0.65rem;
     overflow: auto;

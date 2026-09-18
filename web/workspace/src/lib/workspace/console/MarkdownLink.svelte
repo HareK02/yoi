@@ -10,8 +10,23 @@
     title?: string;
     children?: Snippet;
   } = $props();
+
+  let safeHref = $derived(httpHref(href));
+
+  function httpHref(value: string): string | undefined {
+    try {
+      const protocol = new URL(value).protocol.toLowerCase();
+      return protocol === "http:" || protocol === "https:" ? value : undefined;
+    } catch {
+      return undefined;
+    }
+  }
 </script>
 
-<a {href} {title} target="_blank" rel="noreferrer">
+{#if safeHref}
+  <a href={safeHref} {title} target="_blank" rel="noreferrer">
+    {@render children?.()}
+  </a>
+{:else}
   {@render children?.()}
-</a>
+{/if}
