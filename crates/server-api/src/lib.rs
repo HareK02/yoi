@@ -3759,10 +3759,14 @@ mod tests {
     #[test]
     fn worker_session_contract_and_flattened_availability_are_stable() {
         let operations = ServerApiMetadata::OPERATIONS;
-        assert_eq!(operations.len(), 1);
-        assert_eq!(operations[0].method, HttpMethod::Get);
+        assert_eq!(operations.len(), 4);
+        let operation = operations
+            .iter()
+            .find(|operation| operation.operation_id == "worker_session")
+            .expect("worker-session operation must remain in ServerApi metadata");
+        assert_eq!(operation.method, HttpMethod::Get);
         assert_eq!(
-            operations[0].path,
+            operation.path,
             "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/session"
         );
 
