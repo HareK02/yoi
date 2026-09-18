@@ -13,7 +13,7 @@ cargo run -q -p server-api --example generate_repository_openapi_types
 cargo run -q -p server-api --example generate_repository_openapi_types -- --check
 ```
 
-The generator fails closed on unsupported or lossy OpenAPI constructs, including ambiguous nullable unions, external references, unsupported enum literals, and integer ranges that cannot be represented safely by JavaScript numbers. The legacy TypeScript generator imports the two shared Repository source projection types it still needs and no longer declares the migrated Repository list/detail types.
+The generator fails closed on unsupported or lossy OpenAPI constructs, including ambiguous nullable unions, external references, semantic `$ref` siblings, unimplemented ordinary schema keywords, unsupported enum literals/formats, and integer ranges that cannot be represented safely by JavaScript numbers. Its one explicit format mapping is canonical `uint64` to a nonnegative JavaScript safe `number`; the runtime parser enforces the same range. The legacy TypeScript generator imports the two shared Repository source projection types it still needs and no longer declares the migrated Repository list/detail types.
 
 ## Other generated contracts
 
