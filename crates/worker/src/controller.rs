@@ -1719,6 +1719,15 @@ async fn controller_loop<C, St>(
             )
             .await;
             if shutdown {
+                while worker.has_pending_compaction_cleanup() {
+                    if let Err(error) = worker.retry_pending_compaction_cleanup().await {
+                        let _ = working_event_tx.send(Event::Error {
+                            code: worker_error_code(&error),
+                            message: error.to_string(),
+                        });
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
                 let _ = working_event_tx.send(Event::Shutdown);
                 break;
             }
@@ -3502,9 +3511,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_compaction_cleanup_from_run_never_publishes_idle() {
+    async fn pending_compaction_cleanup_preserves_shutdown_request_for_outer_barrier() {
         let mut env = make_env().await;
+        let method_tx = env._method_tx.clone();
+        env.shared_state
+            .transition(WorkerState::Busy(WorkerBusyState::Run(
+                WorkerRunState::Running,
+            )));
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            method_tx
+                .send(Method::Shutdown {
+                    command: WorkerCommandEnvelope::new(1),
+                })
+                .await
+                .expect("send shutdown");
+        });
         let worker_future = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
             Err::<WorkerRunResult, _>(WorkerError::CompactionCleanupPending {
                 source: crate::runtime::worker_allocation::ScopeLockError::UnknownWorker(
                     "worker".into(),
@@ -3531,7 +3555,7 @@ mod tests {
         .await;
 
         assert_eq!(status, WorkerStatus::Running);
-        assert!(!shutdown);
+        assert!(shutdown);
         assert!(!may_drain_pending);
     }
 
