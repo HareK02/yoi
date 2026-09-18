@@ -8,7 +8,9 @@ use api_macros::api;
 pub use api_macros::axum as server_support;
 pub use api_macros::reqwest as client_support;
 pub use api_macros::{ApiContract, HttpMethod};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use webauthn_rs_proto::{
     CreationChallengeResponse, PublicKeyCredential, RegisterPublicKeyCredential,
     RequestChallengeResponse,
@@ -17,6 +19,69 @@ use webauthn_rs_proto::{
 pub type ServerApiError = runtime_api::RuntimeApiError;
 pub type ServerApiClientError = client_support::ClientError<ServerApiError>;
 
+/// Error body shared by the existing repository routes and their generated adapters.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct RepositoryApiError {
+    pub error: String,
+    pub message: String,
+    #[serde(default)]
+    pub diagnostics: Vec<Diagnostic>,
+    #[serde(skip, default = "default_repository_error_status")]
+    status: u16,
+}
+
+const fn default_repository_error_status() -> u16 {
+    400
+}
+
+impl RepositoryApiError {
+    pub fn new(
+        status: u16,
+        error: impl Into<String>,
+        message: impl Into<String>,
+        diagnostics: Vec<Diagnostic>,
+    ) -> Self {
+        Self {
+            error: error.into(),
+            message: message.into(),
+            diagnostics,
+            status,
+        }
+    }
+}
+
+impl api_macros::HttpError for RepositoryApiError {
+    fn status_code(&self) -> u16 {
+        self.status
+    }
+}
+
+impl api_macros::HttpRequestError for RepositoryApiError {
+    fn from_request_rejection(status: u16, message: String) -> Self {
+        let reason = match status {
+            413 => "Payload Too Large",
+            415 => "Unsupported Media Type",
+            422 => "Unprocessable Entity",
+            _ => "Bad Request",
+        };
+        Self::new(status, reason, message, Vec::new())
+    }
+}
+
+macro_rules! impl_openapi_schema {
+    ($($ty:ty),+ $(,)?) => {
+        $(impl api_macros::openapi::OpenApiSchema for $ty {})+
+    };
+}
+
+impl_openapi_schema!(
+    CreateWorkspaceRepositoryRequest,
+    CreateWorkspaceRepositoryResponse,
+    RepositoryApiError,
+    RepositoryListResponse,
+    RepositoryDetailResponse,
+);
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceWorkerSessionResponse {
     pub subject: WorkspaceWorkerSubject,
@@ -24,12 +89,13 @@ pub struct WorkspaceWorkerSessionResponse {
     pub observation: runtime_api::WorkerSessionAvailability,
 }
 
-#[api(reqwest, axum)]
+#[api(reqwest, axum, openapi)]
 pub trait ServerApi {
     #[get(
         "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/session",
         status = 200,
-        error_status = 400
+        error_status = 400,
+        openapi = false
     )]
     async fn worker_session(
         &self,
@@ -37,6 +103,104 @@ pub trait ServerApi {
         #[path] runtime_id: String,
         #[path] worker_id: String,
     ) -> Result<WorkspaceWorkerSessionResponse, ServerApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/repositories",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_list(
+        &self,
+        #[path] workspace_id: String,
+    ) -> Result<RepositoryListResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/repositories",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_list_alias(&self) -> Result<RepositoryListResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/repositories/{repository_key}",
+        status = 200,
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_detail(
+        &self,
+        #[path] workspace_id: String,
+        #[path] repository_key: String,
+    ) -> Result<RepositoryDetailResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/repositories/{repository_key}",
+        status = 200,
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_detail_alias(
+        &self,
+        #[path] repository_key: String,
+    ) -> Result<RepositoryDetailResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/repositories",
+        status = 201,
+        alternate_status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 413, 415, 422, 500],
+        bearer_auth = true,
+        browser_auth = true,
+        normalize_body_errors = true
+    )]
+    async fn repository_create(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[body] request: CreateWorkspaceRepositoryRequest,
+    ) -> Result<CreateWorkspaceRepositoryResponse, RepositoryApiError>;
+}
+
+/// Digest of the fully rendered canonical contract with its digest slot normalized.
+pub fn canonical_openapi_source_digest() -> Result<String, api_macros::openapi::OpenApiError> {
+    const NORMALIZED_DIGEST: &str =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    let normalized = server_api_openapi(api_macros::openapi::OpenApiInfo {
+        title: "Yoi Server API",
+        version: env!("CARGO_PKG_VERSION"),
+        source_digest: NORMALIZED_DIGEST,
+    })?
+    .to_json()?;
+    let digest = Sha256::digest(normalized.as_bytes());
+    let mut encoded = String::with_capacity("sha256:".len() + digest.len() * 2);
+    encoded.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(encoded)
+}
+
+/// Build the deployment-independent canonical ServerApi OpenAPI document.
+pub fn canonical_openapi_document()
+-> Result<api_macros::openapi::OpenApiDocument, api_macros::openapi::OpenApiError> {
+    let source_digest = canonical_openapi_source_digest()?;
+    server_api_openapi(api_macros::openapi::OpenApiInfo {
+        title: "Yoi Server API",
+        version: env!("CARGO_PKG_VERSION"),
+        source_digest: &source_digest,
+    })
 }
 
 /// Public browser-authentication configuration.
@@ -394,7 +558,7 @@ pub fn validate_repository_key(value: &str) -> Result<(), RepositoryKeyError> {
 ///
 /// Local paths remain distinct from network Git transports so callers cannot
 /// accidentally treat an unmaterialized remote as a server-local filesystem path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RepositorySourceKind {
@@ -451,7 +615,7 @@ impl<'de> Deserialize<'de> for RepositorySourceKind {
 }
 
 /// Stable Repository source identity stored by Workspace authority.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct RepositorySource {
     pub kind: RepositorySourceKind,
@@ -464,7 +628,7 @@ pub struct RepositorySource {
 ///
 /// The Server parses and canonicalizes `source`; callers cannot assert a
 /// transport classification or supply credential material through this DTO.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateWorkspaceRepositoryRequest {
     pub repository_key: String,
@@ -473,14 +637,20 @@ pub struct CreateWorkspaceRepositoryRequest {
     pub default_ref: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct CreateWorkspaceRepositoryResponse {
     pub workspace_id: String,
     pub repository_key: String,
     pub replayed: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+impl api_macros::HttpSuccess for CreateWorkspaceRepositoryResponse {
+    fn status_code(&self) -> u16 {
+        if self.replayed { 200 } else { 201 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryObservedStatus {
@@ -1125,7 +1295,7 @@ pub enum WorkspaceProfileSourceProvenance {
     ProjectProfileSourceTree,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryDiagnostic {
@@ -1134,7 +1304,7 @@ pub struct RepositoryDiagnostic {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct GitRemoteSummary {
@@ -1142,7 +1312,7 @@ pub struct GitRemoteSummary {
     pub fetch_url: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct GitRepositorySummary {
@@ -1153,7 +1323,7 @@ pub struct GitRepositorySummary {
     pub remotes: Vec<GitRemoteSummary>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositorySummary {
@@ -1162,6 +1332,7 @@ pub struct RepositorySummary {
     pub provider: String,
     pub source: RepositorySource,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub source_revision: u64,
     pub source_fingerprint: String,
     pub observed_status: RepositoryObservedStatus,
@@ -1194,7 +1365,7 @@ pub struct GitCommitSummary {
     pub refs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryListResponse {
@@ -1204,7 +1375,7 @@ pub struct RepositoryListResponse {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryDetailResponse {
@@ -1282,7 +1453,7 @@ pub struct RepositoryLogResponse {
 pub const TICKET_RELATIONS_QUERY_PATH: &str = "/tickets/relations/search";
 pub const TICKET_ORCHESTRATION_PLANS_QUERY_PATH: &str = "/tickets/orchestration-plans/search";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticSeverity {
@@ -1291,7 +1462,7 @@ pub enum DiagnosticSeverity {
     Error,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct Diagnostic {
@@ -3645,10 +3816,14 @@ mod tests {
     #[test]
     fn worker_session_contract_and_flattened_availability_are_stable() {
         let operations = ServerApiMetadata::OPERATIONS;
-        assert_eq!(operations.len(), 1);
-        assert_eq!(operations[0].method, HttpMethod::Get);
+        assert_eq!(operations.len(), 6);
+        let operation = operations
+            .iter()
+            .find(|operation| operation.operation_id == "worker_session")
+            .expect("worker-session operation must remain in ServerApi metadata");
+        assert_eq!(operation.method, HttpMethod::Get);
         assert_eq!(
-            operations[0].path,
+            operation.path,
             "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/session"
         );
 
@@ -4982,6 +5157,107 @@ mod tests {
         });
 
         assert!(serde_json::from_value::<WorkingDirectoryListResponse>(stale).is_err());
+    }
+}
+
+#[cfg(test)]
+mod openapi_artifact_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_openapi_artifact_is_current() {
+        let generated = canonical_openapi_document()
+            .expect("canonical OpenAPI contract must be valid")
+            .to_json()
+            .expect("canonical OpenAPI contract must serialize");
+        let checked_in = include_str!("../../../openapi/server-api.json");
+        assert_eq!(
+            generated, checked_in,
+            "regenerate with `cargo run -p server-api --example export_openapi -- openapi/server-api.json`",
+        );
+    }
+
+    #[test]
+    fn repository_operations_are_in_the_canonical_contract() {
+        let document = canonical_openapi_document().expect("canonical OpenAPI contract must build");
+        let value: serde_json::Value =
+            serde_json::from_str(&document.to_json().expect("document must serialize"))
+                .expect("document must be JSON");
+
+        assert_eq!(value["openapi"], "3.1.0");
+        assert!(
+            value["paths"]
+                ["/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/session"]
+                .is_null()
+        );
+        assert!(
+            value["info"]["x-yoi-source-digest"]
+                .as_str()
+                .is_some_and(|digest| digest.starts_with("sha256:"))
+        );
+        assert_eq!(
+            value["paths"]["/api/w/{workspace_id}/repositories"]["get"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/RepositoryListResponse"
+        );
+        assert!(value["paths"]["/api/repositories"]["get"].is_object());
+        assert!(value["paths"]["/api/repositories/{repository_key}"]["get"].is_object());
+        for (path, method) in [
+            ("/api/w/{workspace_id}/repositories", "get"),
+            ("/api/w/{workspace_id}/repositories", "post"),
+            ("/api/w/{workspace_id}/repositories/{repository_key}", "get"),
+            ("/api/repositories", "get"),
+            ("/api/repositories/{repository_key}", "get"),
+        ] {
+            let operation = &value["paths"][path][method];
+            assert_eq!(
+                operation["security"][0]["bearerAuth"],
+                serde_json::json!([])
+            );
+            assert_eq!(
+                operation["security"][1]["browserSession"],
+                serde_json::json!([])
+            );
+            for status in ["401", "403", "500"] {
+                assert!(
+                    operation["responses"][status].is_object(),
+                    "missing {method} {path} response {status}"
+                );
+            }
+        }
+        let repository_collection = &value["paths"]["/api/w/{workspace_id}/repositories"];
+        let repository_create = &repository_collection["post"];
+        assert_eq!(
+            repository_create["security"][0]["bearerAuth"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            repository_create["security"][1]["browserSession"],
+            serde_json::json!([])
+        );
+        for status in [
+            "200", "201", "400", "401", "403", "404", "409", "413", "415", "422", "500",
+        ] {
+            assert!(
+                repository_create["responses"][status].is_object(),
+                "missing repository-create response {status}"
+            );
+        }
+        assert_eq!(
+            repository_create["responses"]["422"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/RepositoryApiError"
+        );
+        assert_eq!(
+            value["components"]["securitySchemes"]["bearerAuth"]["scheme"],
+            "bearer"
+        );
+        assert_eq!(
+            value["components"]["securitySchemes"]["browserSession"]["in"],
+            "cookie"
+        );
+        assert!(value["paths"]["/api/w/{workspace_id}/repositories/{repository_key}"]
+            ["get"]["responses"]["404"]
+            .is_object());
     }
 }
 

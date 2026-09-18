@@ -192,6 +192,10 @@ impl BackendApiClient {
         format!("Bearer {}", self.access_token.0)
     }
 
+    pub(crate) fn asynchronous_client(&self) -> reqwest::Client {
+        self.asynchronous.clone()
+    }
+
     pub async fn require_success(
         &self,
         response: reqwest::Response,

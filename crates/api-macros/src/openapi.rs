@@ -131,6 +131,7 @@ pub struct OpenApiBuilder {
     schemas: BTreeMap<String, Value>,
     operation_ids: BTreeSet<String>,
     uses_bearer_auth: bool,
+    uses_browser_auth: bool,
 }
 
 impl OpenApiBuilder {
@@ -157,6 +158,7 @@ impl OpenApiBuilder {
             schemas: BTreeMap::new(),
             operation_ids: BTreeSet::new(),
             uses_bearer_auth: false,
+            uses_browser_auth: false,
         })
     }
 
@@ -199,6 +201,7 @@ impl OpenApiBuilder {
             request_body: None,
             responses: BTreeMap::new(),
             bearer_security_required: None,
+            browser_security_required: false,
         })
     }
 
@@ -214,15 +217,30 @@ impl OpenApiBuilder {
         let schemas = self.schemas.into_iter().collect::<Map<_, _>>();
         let mut components = Map::new();
         components.insert("schemas".to_owned(), Value::Object(schemas));
+        let mut security_schemes = Map::new();
         if self.uses_bearer_auth {
+            security_schemes.insert(
+                "bearerAuth".to_owned(),
+                json!({
+                    "type": "http",
+                    "scheme": "bearer"
+                }),
+            );
+        }
+        if self.uses_browser_auth {
+            security_schemes.insert(
+                "browserSession".to_owned(),
+                json!({
+                    "type": "apiKey",
+                    "in": "cookie",
+                    "name": "yoi_workspace_session"
+                }),
+            );
+        }
+        if !security_schemes.is_empty() {
             components.insert(
                 "securitySchemes".to_owned(),
-                json!({
-                    "bearerAuth": {
-                        "type": "http",
-                        "scheme": "bearer"
-                    }
-                }),
+                Value::Object(security_schemes),
             );
         }
 
@@ -295,6 +313,7 @@ pub struct OpenApiOperation<'a> {
     request_body: Option<Value>,
     responses: BTreeMap<String, Value>,
     bearer_security_required: Option<bool>,
+    browser_security_required: bool,
 }
 
 impl OpenApiOperation<'_> {
@@ -336,6 +355,16 @@ impl OpenApiOperation<'_> {
             "explode": location == "query",
         }));
         Ok(())
+    }
+
+    pub fn bearer_authentication(&mut self) {
+        self.parent.uses_bearer_auth = true;
+        self.bearer_security_required = Some(true);
+    }
+
+    pub fn browser_authentication(&mut self) {
+        self.parent.uses_browser_auth = true;
+        self.browser_security_required = true;
     }
 
     pub fn request_body<T: OpenApiSchema>(
@@ -418,15 +447,18 @@ impl OpenApiOperation<'_> {
         if let Some(request_body) = self.request_body {
             operation.insert("requestBody".to_owned(), request_body);
         }
-        if let Some(required) = self.bearer_security_required {
-            operation.insert(
-                "security".to_owned(),
-                if required {
-                    json!([{ "bearerAuth": [] }])
-                } else {
-                    json!([{}, { "bearerAuth": [] }])
-                },
-            );
+        let mut security = Vec::new();
+        if self.bearer_security_required == Some(false) {
+            security.push(json!({}));
+        }
+        if self.bearer_security_required.is_some() {
+            security.push(json!({ "bearerAuth": [] }));
+        }
+        if self.browser_security_required {
+            security.push(json!({ "browserSession": [] }));
+        }
+        if !security.is_empty() {
+            operation.insert("security".to_owned(), Value::Array(security));
         }
         self.parent
             .paths

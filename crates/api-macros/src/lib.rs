@@ -38,13 +38,21 @@
 //! `options`. The first argument is a path template. `operation_id` defaults to the Rust
 //! method name but should be set explicitly for contracts which must remain stable while Rust
 //! names evolve. Success status defaults to `200`, except an empty (`()`) response defaults to
-//! `204`. A public error inferred from `Result<T, E>` defaults to status `400`.
+//! `204`. `alternate_status` opts a JSON response into [`HttpSuccess`] when two successful HTTP
+//! outcomes share one schema. A public error inferred from `Result<T, E>` defaults to status `400`;
+//! `additional_error_statuses` publishes the same typed error schema for other declared outcomes.
+//! `bearer_auth = true` and `browser_auth = true` attach standard bearer and browser-session cookie
+//! security schemes. Body operations may opt into typed Axum rejection normalization with
+//! typed Axum rejection normalization with `normalize_body_errors = true` and [`HttpRequestError`].
 //!
-//! Arguments are classified with `#[body]`, `#[query]`, `#[header]`, or `#[path]`. An
-//! unannotated argument whose Rust name occurs in the route template is inferred as a path
+//! Arguments are classified with `#[body]`, `#[query]`, `#[header]`, `#[path]`, or `#[extension]`.
+//! Extension values are trusted server-local Axum context: generated clients and OpenAPI omit them.
+//! An unannotated argument whose Rust name occurs in the route template is inferred as a path
 //! argument. Header attributes may carry a wire name, as in `#[header("x-request-id")]`.
 //! Exactly one JSON body is allowed. JSON request, response, and error bodies must be named
 //! Rust types; tuples, references, arrays, and other anonymous structural types are rejected.
+//! `openapi = false` explicitly excludes an operation whose wire body cannot yet satisfy the
+//! strict OpenAPI schema boundary; Reqwest and Axum adapters are still generated.
 //!
 //! # Generated names
 //!
@@ -198,6 +206,18 @@ pub trait Operation {
 /// service's typed 401/403/404/409 responses without introducing duplicate route handlers.
 pub trait HttpError {
     fn status_code(&self) -> u16;
+}
+
+/// Successful JSON response that selects one of an operation's declared success statuses.
+///
+/// Operations opt in with `alternate_status`; ordinary one-status operations remain fully static.
+pub trait HttpSuccess {
+    fn status_code(&self) -> u16;
+}
+
+/// Public error type capable of normalizing Axum request-body rejections.
+pub trait HttpRequestError: HttpError {
+    fn from_request_rejection(status: u16, message: String) -> Self;
 }
 
 /// Marker used when an operation has no request, response, or public error body.
