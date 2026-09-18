@@ -172,32 +172,30 @@ pub trait ServerApi {
     ) -> Result<CreateWorkspaceRepositoryResponse, RepositoryApiError>;
 }
 
-/// Digest of every authoritative input used to derive the canonical OpenAPI artifact.
-pub fn canonical_openapi_source_digest() -> String {
-    let mut hasher = Sha256::new();
-    for source in [
-        include_bytes!("lib.rs").as_slice(),
-        include_bytes!("../../api-macros-impl/src/lib.rs").as_slice(),
-        include_bytes!("../../api-macros/src/lib.rs").as_slice(),
-        include_bytes!("../../api-macros/src/openapi.rs").as_slice(),
-    ] {
-        hasher.update((source.len() as u64).to_le_bytes());
-        hasher.update(source);
-    }
-    let digest = hasher.finalize();
+/// Digest of the fully rendered canonical contract with its digest slot normalized.
+pub fn canonical_openapi_source_digest() -> Result<String, api_macros::openapi::OpenApiError> {
+    const NORMALIZED_DIGEST: &str =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    let normalized = server_api_openapi(api_macros::openapi::OpenApiInfo {
+        title: "Yoi Server API",
+        version: env!("CARGO_PKG_VERSION"),
+        source_digest: NORMALIZED_DIGEST,
+    })?
+    .to_json()?;
+    let digest = Sha256::digest(normalized.as_bytes());
     let mut encoded = String::with_capacity("sha256:".len() + digest.len() * 2);
     encoded.push_str("sha256:");
     for byte in digest {
         use std::fmt::Write as _;
         write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
     }
-    encoded
+    Ok(encoded)
 }
 
 /// Build the deployment-independent canonical ServerApi OpenAPI document.
 pub fn canonical_openapi_document()
 -> Result<api_macros::openapi::OpenApiDocument, api_macros::openapi::OpenApiError> {
-    let source_digest = canonical_openapi_source_digest();
+    let source_digest = canonical_openapi_source_digest()?;
     server_api_openapi(api_macros::openapi::OpenApiInfo {
         title: "Yoi Server API",
         version: env!("CARGO_PKG_VERSION"),
