@@ -25,6 +25,7 @@ pub fn request_fingerprint(
     repository_id: &str,
     selector: Option<&str>,
     requested_runtime_id: Option<&str>,
+    display_name: Option<&str>,
     repository_source_fingerprint: &str,
     repository_source_revision: u64,
 ) -> String {
@@ -33,6 +34,7 @@ pub fn request_fingerprint(
         Some(repository_id),
         selector,
         requested_runtime_id,
+        display_name,
         Some(repository_source_fingerprint),
     ] {
         match value {
@@ -569,6 +571,7 @@ mod tests {
                 "main",
                 Some("develop"),
                 None,
+                None,
                 "sha256:test",
                 1,
             ),
@@ -718,7 +721,7 @@ mod tests {
         );
         let mut changed_input = record.clone();
         changed_input.request_fingerprint =
-            request_fingerprint("main", Some("main"), None, "sha256:test", 1);
+            request_fingerprint("main", Some("main"), None, None, "sha256:test", 1);
         assert!(
             store
                 .reserve_workdir_create_operation(&changed_input)

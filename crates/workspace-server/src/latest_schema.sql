@@ -667,6 +667,7 @@ CREATE TABLE workdir_create_credential_revision_retentions (
 CREATE TABLE "workdir_registry" (
     workspace_id TEXT NOT NULL,
     workdir_id TEXT NOT NULL,
+    display_name TEXT,
     runtime_id TEXT NOT NULL,
     repository_id TEXT NOT NULL,
     creation_selector TEXT,
@@ -859,10 +860,10 @@ CREATE TABLE "worker_workdir_links" (
             runtime_id TEXT NOT NULL,
             worker_id TEXT NOT NULL,
             workdir_id TEXT NOT NULL,
-            role TEXT NOT NULL,
+            alias TEXT NOT NULL,
             linked_at TEXT NOT NULL,
             unlinked_at TEXT,
-            PRIMARY KEY (workspace_id, worker_id, workdir_id, role),
+            PRIMARY KEY (workspace_id, worker_id, workdir_id, alias),
             FOREIGN KEY (workspace_id, worker_id)
                 REFERENCES "worker_registry"(workspace_id, worker_id) ON DELETE CASCADE,
             FOREIGN KEY (workspace_id, workdir_id)
@@ -1093,8 +1094,8 @@ CREATE INDEX worker_removal_operations_worker_idx ON worker_removal_operations(w
 CREATE UNIQUE INDEX worker_workdir_links_active_workdir_unique
             ON worker_workdir_links(workspace_id, workdir_id)
             WHERE unlinked_at IS NULL;
-CREATE UNIQUE INDEX worker_workdir_links_active_worker_unique
-            ON worker_workdir_links(workspace_id, worker_id)
+CREATE UNIQUE INDEX worker_workdir_links_active_alias_unique
+            ON worker_workdir_links(workspace_id, worker_id, alias)
             WHERE unlinked_at IS NULL;
 CREATE INDEX worker_workdir_links_workdir
             ON worker_workdir_links(workspace_id, workdir_id);

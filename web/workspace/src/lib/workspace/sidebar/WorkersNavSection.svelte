@@ -37,6 +37,14 @@
     Math.max(0, workers.length - COLLAPSED_WORKER_COUNT),
   );
 
+  function workdirMeta(worker: SidebarWorker): string {
+    const attachments = worker.workdir_attachments;
+    if (attachments.length === 0) return '—';
+    return attachments
+      .map((attachment) => `${attachment.alias}: ${attachment.repository_key ?? '—'}・${attachment.working_directory_id}`)
+      .join(', ');
+  }
+
   function workerKey(worker: SidebarWorker): string {
     return `${worker.runtime_id}:${worker.worker_id}`;
   }
@@ -190,7 +198,7 @@
             </span>
             <span class="worker-nav-label">{label}</span>
             <small class="worker-nav-meta">
-              {worker.repository_key ?? '—'}・{worker.working_directory_id ?? '—'}
+              {workdirMeta(worker)}
             </small>
           </a>
           <button

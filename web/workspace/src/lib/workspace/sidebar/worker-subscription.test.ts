@@ -32,7 +32,7 @@ function worker(
     workspace_id: 'workspace-test',
     display_name: null,
     profile: null,
-    working_directory_id: null,
+    workdir_attachments: [],
   };
 }
 

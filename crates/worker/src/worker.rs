@@ -374,7 +374,8 @@ use protocol::{
 use tokio::net::UnixStream;
 use tokio::sync::broadcast;
 use workdir::{
-    LocalWorkdirSession, ReadOnlyWorkdirSession, WorkdirSessionCapabilities, WorkdirSessionHandle,
+    LocalWorkdirSession, ReadOnlyWorkdirSession, WorkdirAttachmentAlias,
+    WorkdirSessionCapabilities, WorkdirSessionHandle, WorkdirSessionRouter,
 };
 
 const RESTORE_RECONCILIATION_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(500);
@@ -2128,9 +2129,9 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// Explicit local filesystem authority, or `None` for Workers with no
     /// local cwd and no filesystem/Bash tool surface.
     filesystem_authority: WorkerFilesystemAuthority,
-    /// Live WorkdirSession provider derived once from the Worker–Workdir binding.
-    /// Local tools, file views, and compaction workers clone this handle.
-    workdir_session: Option<WorkdirSessionHandle>,
+    /// Alias-keyed live Workdir sessions. Provider transport remains hidden
+    /// behind each handle and no attachment is designated primary.
+    workdir_sessions: Arc<WorkdirSessionRouter>,
     /// Path-free workspace identity/client context injected by Runtime/host.
     /// This never grants local filesystem authority.
     workspace_context: WorkerWorkspaceContext,
@@ -2464,7 +2465,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let prompts = Arc::new(ArcSwap::from(PromptCatalog::builtins_only()?));
         DelegationScope::from_config(&manifest.delegation_scope).map_err(WorkerError::Scope)?;
         let scope = SharedScope::new(scope);
-        let workdir_session = workdir_session_from_authority(&filesystem_authority, &scope);
+        let workdir_sessions = workdir_sessions_from_authority(&filesystem_authority, &scope);
         let mut worker = Self {
             manifest,
             engine: Some(worker),
@@ -2475,7 +2476,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             worker_metadata_segment_cas: None,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             filesystem_authority,
-            workdir_session,
+            workdir_sessions,
             workspace_context,
             flow_runtime_state: Arc::new(Mutex::new(None)),
             flow_feature_enabled: false,
@@ -2652,15 +2653,36 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.filesystem_authority.as_local()
     }
 
-    pub fn workdir_session(&self) -> Option<&WorkdirSessionHandle> {
-        self.workdir_session.as_ref()
+    /// Compatibility projection for tool schemas that do not yet carry a
+    /// target alias. It is available only when the attachment set has exactly
+    /// one member, so multiple attachments never acquire an implicit primary.
+    pub fn workdir_session(&self) -> Option<WorkdirSessionHandle> {
+        self.workdir_sessions.only_session()
     }
 
-    /// Replace the constructor fallback with the provider binding resolved by
-    /// the owning Runtime. Runtime calls this before the Worker controller is
-    /// spawned, so tools only ever observe the Runtime-bound handle.
-    pub fn bind_workdir_session(&mut self, workdir_session: Option<WorkdirSessionHandle>) {
-        self.workdir_session = workdir_session;
+    pub fn workdir_sessions(&self) -> Arc<WorkdirSessionRouter> {
+        self.workdir_sessions.clone()
+    }
+
+    /// Replace the constructor fallback with the complete alias-keyed provider
+    /// set resolved by the owning Runtime before controller startup.
+    pub fn bind_workdir_sessions(&mut self, workdir_sessions: Arc<WorkdirSessionRouter>) {
+        self.workdir_sessions = workdir_sessions;
+    }
+
+    /// Bind one session for direct/Internal Worker construction. Runtime Worker
+    /// creation uses [`Self::bind_workdir_sessions`] with the complete set.
+    pub fn bind_single_workdir_session(&mut self, workdir_session: Option<WorkdirSessionHandle>) {
+        let router = Arc::new(WorkdirSessionRouter::new());
+        if let Some(session) = workdir_session {
+            router
+                .attach(
+                    WorkdirAttachmentAlias::new("workdir").expect("static alias is valid"),
+                    session,
+                )
+                .expect("fresh Workdir router accepts its only attachment");
+        }
+        self.workdir_sessions = router;
     }
 
     /// Path-free workspace identity, if Runtime/host associated this Worker
@@ -2929,8 +2951,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             location.segment_id,
         );
         let read_only_tools = self
-            .workdir_session
-            .clone()
+            .workdir_session()
             .map(|source| Arc::new(ReadOnlyWorkdirSession::new(source)) as WorkdirSessionHandle)
             .map(tools::read_only_builtin_tools)
             .unwrap_or_default();
@@ -4061,7 +4082,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// unresolved placeholder stays in the flattened user message so the LLM
     /// still sees the intent.
     async fn resolve_file_refs(&self, segments: &[Segment]) -> Vec<SystemItem> {
-        let Some(workdir) = self.workdir_session.clone() else {
+        let Some(workdir) = self.workdir_session() else {
             for seg in segments {
                 if let Segment::FileRef { path } = seg {
                     self.alert(
@@ -5428,7 +5449,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
 
         // Build a normal parent-owned Internal Worker over a pinned immutable
         // capture. Only SessionExplore and compaction output tools are installed.
-        let workdir = self.workdir_session.clone();
+        let workdir = self.workdir_session();
         let read_only_workdir = workdir.clone().map(|session| {
             Arc::new(ReadOnlyWorkdirSession::new(session)) as workdir::WorkdirSessionHandle
         });
@@ -6139,7 +6160,8 @@ where
         let worker_metadata_writer = Some(worker_metadata_writer_for_store(&store));
         let worker_metadata_segment_cas = Some(worker_metadata_segment_cas_for_store(&store));
         let scope = SharedScope::new(common.scope);
-        let workdir_session = workdir_session_from_authority(&common.filesystem_authority, &scope);
+        let workdir_sessions =
+            workdir_sessions_from_authority(&common.filesystem_authority, &scope);
 
         let mut worker = Self {
             manifest,
@@ -6151,7 +6173,7 @@ where
             worker_metadata_segment_cas,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             filesystem_authority: common.filesystem_authority,
-            workdir_session,
+            workdir_sessions,
             workspace_context: common.workspace_context,
             flow_runtime_state: Arc::new(Mutex::new(None)),
             flow_feature_enabled: false,
@@ -6228,7 +6250,8 @@ where
         apply_worker_manifest(&mut engine, &manifest.engine);
         engine.set_cache_key(Some(segment_id.to_string()));
         let scope = SharedScope::new(common.scope);
-        let workdir_session = workdir_session_from_authority(&common.filesystem_authority, &scope);
+        let workdir_sessions =
+            workdir_sessions_from_authority(&common.filesystem_authority, &scope);
         let mut worker = Self {
             manifest,
             engine: Some(engine),
@@ -6239,7 +6262,7 @@ where
             worker_metadata_segment_cas: None,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             filesystem_authority: common.filesystem_authority,
-            workdir_session,
+            workdir_sessions,
             workspace_context: common.workspace_context,
             flow_runtime_state: Arc::new(Mutex::new(None)),
             flow_feature_enabled: false,
@@ -6350,7 +6373,8 @@ where
         let worker_metadata_writer = Some(worker_metadata_writer_for_store(&store));
         let worker_metadata_segment_cas = Some(worker_metadata_segment_cas_for_store(&store));
         let scope = SharedScope::new(common.scope);
-        let workdir_session = workdir_session_from_authority(&common.filesystem_authority, &scope);
+        let workdir_sessions =
+            workdir_sessions_from_authority(&common.filesystem_authority, &scope);
 
         let mut worker = Self {
             manifest,
@@ -6362,7 +6386,7 @@ where
             worker_metadata_segment_cas,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             filesystem_authority: common.filesystem_authority,
-            workdir_session,
+            workdir_sessions,
             workspace_context: common.workspace_context,
             flow_runtime_state: Arc::new(Mutex::new(None)),
             flow_feature_enabled: false,
@@ -6726,7 +6750,8 @@ where
         let worker_metadata_writer = Some(worker_metadata_writer_for_store(&store));
         let worker_metadata_segment_cas = Some(worker_metadata_segment_cas_for_store(&store));
         let scope = SharedScope::new(common.scope);
-        let workdir_session = workdir_session_from_authority(&common.filesystem_authority, &scope);
+        let workdir_sessions =
+            workdir_sessions_from_authority(&common.filesystem_authority, &scope);
 
         let mut worker = Self {
             manifest,
@@ -6738,7 +6763,7 @@ where
             worker_metadata_segment_cas,
             segment_state: SegmentState::new(session_id, segment_id, state.entries_count),
             filesystem_authority: common.filesystem_authority,
-            workdir_session,
+            workdir_sessions,
             workspace_context: common.workspace_context,
             flow_runtime_state: Arc::new(Mutex::new(restored_flow_runtime_state(
                 &state.extensions,
@@ -7580,18 +7605,26 @@ pub enum WorkerError {
     },
 }
 
-fn workdir_session_from_authority(
+fn workdir_sessions_from_authority(
     authority: &WorkerFilesystemAuthority,
     scope: &SharedScope,
-) -> Option<WorkdirSessionHandle> {
-    authority.as_local().map(|local| {
-        Arc::new(LocalWorkdirSession::materialized(
+) -> Arc<WorkdirSessionRouter> {
+    let router = Arc::new(WorkdirSessionRouter::new());
+    if let Some(local) = authority.as_local() {
+        let session = Arc::new(LocalWorkdirSession::materialized(
             local.root.clone(),
             local.cwd.clone(),
             scope.clone(),
             WorkdirSessionCapabilities::ALL,
-        )) as WorkdirSessionHandle
-    })
+        )) as WorkdirSessionHandle;
+        router
+            .attach(
+                WorkdirAttachmentAlias::new("workdir").expect("static alias is valid"),
+                session,
+            )
+            .expect("fresh Workdir router accepts its only attachment");
+    }
+    router
 }
 
 /// Bundle of resources that every high-level Worker constructor needs:

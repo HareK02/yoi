@@ -2282,7 +2282,11 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     if path.ends_with("/workspace-api") {
         return Some("workers:create");
     }
-    if path.ends_with("/input") || path.ends_with("/restore") || path.contains("/attachments") {
+    if path.ends_with("/input")
+        || path.ends_with("/restore")
+        || path.contains("/attachments")
+        || path.contains("/workdir-attachments")
+    {
         return Some("workers:input");
     }
     if path.ends_with("/stop") || path.ends_with("/cancel") {
@@ -3072,8 +3076,8 @@ mod tests {
                 digest: bundle.metadata.digest,
             }),
             initial_input: None,
-            working_directory_request: None,
-            working_directory: None,
+            workdir_attachment_requests: Vec::new(),
+            workdir_attachments: Vec::new(),
             worker_observation_enabled: false,
             worker_observation_grants: Vec::new(),
             workspace_api: None,
@@ -3319,10 +3323,16 @@ mod tests {
                 worker_state: protocol::WorkerStateSnapshot {
                     ..protocol::WorkerStatus::Idle.into()
                 },
-                working_directory: request
-                    .working_directory
-                    .as_ref()
-                    .map(|binding| binding.status()),
+                workdir_attachments: request
+                    .workdir_attachments
+                    .iter()
+                    .map(
+                        |(alias, binding)| crate::catalog::WorkingDirectoryAttachmentStatus {
+                            alias: alias.clone(),
+                            working_directory: binding.status(),
+                        },
+                    )
+                    .collect(),
             }
         }
 
@@ -3335,7 +3345,7 @@ mod tests {
                 worker_state: protocol::WorkerStateSnapshot {
                     ..protocol::WorkerStatus::Idle.into()
                 },
-                working_directory: request.previous_working_directory,
+                workdir_attachments: request.previous_workdir_attachments,
             }
         }
 
@@ -3907,10 +3917,16 @@ mod ws_tests {
                 worker_state: protocol::WorkerStateSnapshot {
                     ..protocol::WorkerStatus::Idle.into()
                 },
-                working_directory: request
-                    .working_directory
-                    .as_ref()
-                    .map(|binding| binding.status()),
+                workdir_attachments: request
+                    .workdir_attachments
+                    .iter()
+                    .map(
+                        |(alias, binding)| crate::catalog::WorkingDirectoryAttachmentStatus {
+                            alias: alias.clone(),
+                            working_directory: binding.status(),
+                        },
+                    )
+                    .collect(),
             }
         }
 
@@ -4020,8 +4036,8 @@ mod ws_tests {
                 digest: bundle.metadata.digest,
             }),
             initial_input: None,
-            working_directory_request: None,
-            working_directory: None,
+            workdir_attachment_requests: Vec::new(),
+            workdir_attachments: Vec::new(),
             worker_observation_enabled: false,
             worker_observation_grants: Vec::new(),
             workspace_api: None,

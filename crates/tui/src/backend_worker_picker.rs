@@ -408,10 +408,22 @@ fn short_worker_id(worker: &BackendWorkerSummary) -> String {
 }
 
 fn working_directory_text(worker: &BackendWorkerSummary) -> String {
-    let Some(wd) = worker.working_directory.as_ref() else {
+    if worker.workdir_attachments.is_empty() {
         return "wd:—".to_string();
-    };
-    format!("wd:{}・{}", wd.repository_key, wd.working_directory_id)
+    }
+    if worker.workdir_attachments.len() > 1 {
+        return format!("wd:{} attachments", worker.workdir_attachments.len());
+    }
+    let attachment = &worker.workdir_attachments[0];
+    let directory = &attachment.working_directory;
+    let label = directory
+        .display_name
+        .as_deref()
+        .unwrap_or(&directory.repository_key);
+    format!(
+        "wd:{}:{}・{}",
+        attachment.alias, label, directory.working_directory_id
+    )
 }
 
 #[cfg(test)]
@@ -456,7 +468,7 @@ mod tests {
                 can_stop: true,
                 can_spawn_followup: false,
             },
-            working_directory: None,
+            workdir_attachments: Vec::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -529,22 +541,26 @@ mod tests {
         worker.label = "Coder · T-585".to_string();
         worker.state = "stopped".to_string();
         worker.worker_state = None;
-        worker.working_directory = Some(
+        worker.workdir_attachments = vec![
             serde_json::from_value(serde_json::json!({
-                "working_directory_id": "001a06a9f0202000000",
-                "repository_key": "main",
-                "materializer_kind": "runtime_git_clone",
-                "status": "active",
-                "cleanliness": "clean"
+                "alias": "checkout",
+                "working_directory": {
+                    "working_directory_id": "001a06a9f0202000000",
+                    "display_name": "Checkout",
+                    "repository_key": "main",
+                    "materializer_kind": "runtime_git_clone",
+                    "status": "active",
+                    "cleanliness": "clean"
+                }
             }))
             .unwrap(),
-        );
+        ];
         let widths = WorkerColumnWidths::from_workers(std::slice::from_ref(&worker));
         let text = row_text(&worker, &widths);
 
         assert_eq!(
             text,
-            "  W-90  Coder · T-585  [stopped]  wd:main・001a06a9f0202000000"
+            "  W-90  Coder · T-585  [stopped]  wd:checkout:Checkout・001a06a9f0202000000"
         );
         assert!(!text.contains("profile:"));
         assert!(!text.contains("active clean"));
@@ -570,15 +586,18 @@ mod tests {
         long.worker_state = None;
 
         for worker in [&mut short, &mut long] {
-            worker.working_directory = Some(
+            worker.workdir_attachments = vec![
                 serde_json::from_value(serde_json::json!({
-                    "working_directory_id": "workdir-1",
-                    "repository_key": "main",
-                    "materializer_kind": "runtime_git_clone",
-                    "status": "active"
+                    "alias": "checkout",
+                    "working_directory": {
+                        "working_directory_id": "workdir-1",
+                        "repository_key": "main",
+                        "materializer_kind": "runtime_git_clone",
+                        "status": "active"
+                    }
                 }))
                 .unwrap(),
-            );
+            ];
         }
 
         let workers = vec![short, long];
@@ -595,8 +614,8 @@ mod tests {
             display_column(&second, "[stopped]")
         );
         assert_eq!(
-            display_column(&first, "wd:main"),
-            display_column(&second, "wd:main")
+            display_column(&first, "wd:checkout:main"),
+            display_column(&second, "wd:checkout:main")
         );
     }
 

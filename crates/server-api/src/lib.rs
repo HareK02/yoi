@@ -1583,6 +1583,9 @@ pub struct RuntimeWorkingDirectoryCleanupTarget {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkingDirectorySummary {
     pub working_directory_id: String,
+    /// Optional human-facing label, never a routing key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub repository_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_selector: Option<String>,
@@ -1606,8 +1609,6 @@ pub struct RuntimeWorkingDirectorySummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanliness: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub primary_worker_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occupied_by: Option<WorkingDirectoryOccupancy>,
 }
 
@@ -1618,6 +1619,9 @@ pub struct RuntimeWorkingDirectorySummary {
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectorySummary {
     pub working_directory_id: String,
+    /// Optional human-facing label, never a routing key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub repository_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_selector: Option<String>,
@@ -1640,8 +1644,6 @@ pub struct WorkingDirectorySummary {
     pub status: WorkingDirectoryStatusKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanliness: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub primary_worker_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occupied_by: Option<WorkingDirectoryOccupancy>,
 }
@@ -1713,6 +1715,7 @@ impl From<workdir::workspace::RuntimeWorkingDirectorySummary> for RuntimeWorking
     fn from(value: workdir::workspace::RuntimeWorkingDirectorySummary) -> Self {
         Self {
             working_directory_id: value.working_directory_id,
+            display_name: value.display_name,
             repository_id: value.repository_id,
             creation_selector: value.creation_selector,
             creation_ref: value.creation_ref,
@@ -1725,7 +1728,6 @@ impl From<workdir::workspace::RuntimeWorkingDirectorySummary> for RuntimeWorking
             cleanup_target: value.cleanup_target.map(Into::into),
             status: value.status.into(),
             cleanliness: value.cleanliness,
-            primary_worker_id: value.primary_worker_id,
             occupied_by: value.occupied_by.map(Into::into),
         }
     }
@@ -1735,6 +1737,7 @@ impl From<workdir::workspace::WorkingDirectorySummary> for WorkingDirectorySumma
     fn from(value: workdir::workspace::WorkingDirectorySummary) -> Self {
         Self {
             working_directory_id: value.working_directory_id,
+            display_name: value.display_name,
             repository_key: value.repository_key,
             creation_selector: value.creation_selector,
             creation_ref: value.creation_ref,
@@ -1747,7 +1750,6 @@ impl From<workdir::workspace::WorkingDirectorySummary> for WorkingDirectorySumma
             cleanup_target: value.cleanup_target.map(Into::into),
             status: value.status.into(),
             cleanliness: value.cleanliness,
-            primary_worker_id: value.primary_worker_id,
             occupied_by: value.occupied_by.map(Into::into),
         }
     }
@@ -1765,6 +1767,9 @@ impl From<workdir::workspace::WorkingDirectorySummary> for WorkingDirectorySumma
 pub struct WorkingDirectoryCreateRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_id: Option<String>,
+    /// Optional human-facing label, independent of every Worker attachment alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub repository_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<String>,
@@ -2445,6 +2450,24 @@ pub struct WorkspaceWorkerDiscoveryPage {
     pub next_cursor: Option<String>,
 }
 
+/// One Workspace Worker Workdir attachment. `alias` is the stable Worker-local
+/// routing key; the nested Workdir id and display name are inventory metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkerWorkdirAttachmentSummary {
+    pub alias: String,
+    pub working_directory: WorkingDirectorySummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeWorkerWorkdirAttachmentSummary {
+    pub alias: String,
+    pub working_directory: RuntimeWorkingDirectorySummary,
+}
+
 /// Workspace-authoritative Worker projection.
 ///
 /// `resource_key` is required here even though Runtime-internal Worker summaries
@@ -2478,8 +2501,8 @@ pub struct WorkerSummary {
     pub retention_state: String,
     pub implementation: WorkerImplementationSummary,
     pub capabilities: WorkerCapabilitySummary,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_directory: Option<WorkingDirectorySummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workdir_attachments: Vec<WorkerWorkdirAttachmentSummary>,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -2507,9 +2530,8 @@ pub struct WorkerLaunchWorkerSummary {
     pub retention_state: String,
     pub implementation: WorkerImplementationSummary,
     pub capabilities: WorkerCapabilitySummary,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
-    pub working_directory: Option<RuntimeWorkingDirectorySummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workdir_attachments: Vec<RuntimeWorkerWorkdirAttachmentSummary>,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -2563,6 +2585,8 @@ pub struct WorkingDirectoryRepositoryOption {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct BrowserWorkerWorkingDirectorySelection {
+    /// Stable Worker-local routing alias.
+    pub alias: String,
     pub working_directory_id: String,
     #[serde(default)]
     pub relative_cwd: Option<String>,
@@ -2589,7 +2613,7 @@ pub struct CreateWorkspaceWorkerRequest {
     #[serde(default)]
     pub initial_submit: Vec<protocol::Segment>,
     #[serde(default)]
-    pub working_directory: Option<BrowserWorkerWorkingDirectorySelection>,
+    pub workdir_attachments: Vec<BrowserWorkerWorkingDirectorySelection>,
     /// Backend idempotency key used only for authenticated Worker-owned spawn/control.
     #[serde(default)]
     pub control_operation_id: Option<String>,
@@ -3663,6 +3687,7 @@ pub fn worker_launch_api_typescript() -> String {
         WorkerWorkspaceSummary::decl(&config),
         WorkerImplementationSummary::decl(&config),
         WorkerCapabilitySummary::decl(&config),
+        RuntimeWorkerWorkdirAttachmentSummary::decl(&config),
         WorkerLaunchWorkerSummary::decl(&config),
         WorkerLaunchRuntimeOption::decl(&config),
         WorkerLaunchProfileCandidate::decl(&config),
@@ -4100,7 +4125,7 @@ mod tests {
                 can_stop: true,
                 can_spawn_followup: false,
             },
-            working_directory: None,
+            workdir_attachments: Vec::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -4178,7 +4203,7 @@ mod tests {
             profile: None,
             ticket_assignment: None,
             initial_submit: Vec::new(),
-            working_directory: None,
+            workdir_attachments: Vec::new(),
             control_operation_id: None,
         })
         .unwrap();
@@ -4190,7 +4215,7 @@ mod tests {
                 "profile": null,
                 "ticket_assignment": null,
                 "initial_submit": [],
-                "working_directory": null,
+                "workdir_attachments": [],
                 "control_operation_id": null,
             })
         );
@@ -5097,6 +5122,7 @@ mod tests {
     fn workdir_summary_omits_absent_optional_fields_on_the_wire() {
         let value = serde_json::to_value(WorkingDirectorySummary {
             working_directory_id: "workdir-1".into(),
+            display_name: None,
             repository_key: "main".into(),
             creation_selector: None,
             creation_ref: None,
@@ -5109,7 +5135,6 @@ mod tests {
             cleanup_target: None,
             status: WorkingDirectoryStatusKind::Active,
             cleanliness: None,
-            primary_worker_id: None,
             occupied_by: None,
         })
         .expect("serialize Workdir summary");
@@ -5125,7 +5150,6 @@ mod tests {
             "observed_at_epoch_seconds",
             "cleanup_target",
             "cleanliness",
-            "primary_worker_id",
             "occupied_by",
         ] {
             assert!(

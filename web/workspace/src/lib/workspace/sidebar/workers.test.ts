@@ -40,7 +40,7 @@ function worker(overrides: Partial<Worker>): Worker {
       can_stop: true,
       can_spawn_followup: false,
     },
-    working_directory: null,
+    workdir_attachments: [],
     diagnostics: [],
     ...overrides,
   };

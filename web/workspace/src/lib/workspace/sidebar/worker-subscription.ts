@@ -1,5 +1,8 @@
 import { readable, type Readable } from 'svelte/store';
-import type { SubscriptionWorker } from '$lib/generated/protocol';
+import type {
+  SubscriptionWorker,
+  SubscriptionWorkerWorkdirAttachment,
+} from '$lib/generated/protocol';
 import { workspaceMultiplexer } from '$lib/workspace/multiplexer';
 import {
   applyWorkspaceWorkersFrame,
@@ -9,9 +12,8 @@ import { liveWorkerState } from './worker-state';
 import { compareWorkersForSidebar } from './workers';
 import type { Worker } from './types';
 
-export type SidebarWorker = Worker & {
-  repository_key: string | null;
-  working_directory_id: string | null;
+export type SidebarWorker = Omit<Worker, 'workdir_attachments'> & {
+  workdir_attachments: SubscriptionWorkerWorkdirAttachment[];
   has_running_internal_workers: boolean;
 };
 
@@ -103,10 +105,8 @@ function projectWorker(worker: SubscriptionWorker): SidebarWorker {
       can_stop: worker.availability !== 'unavailable' && worker.state !== 'stopped',
       can_spawn_followup: false,
     },
-    repository_key: worker.repository_key ?? null,
-    working_directory_id: worker.working_directory_id ?? null,
+    workdir_attachments: worker.workdir_attachments ?? [],
     has_running_internal_workers: worker.has_running_internal_workers,
-    working_directory: null,
     diagnostics: [],
   };
 }

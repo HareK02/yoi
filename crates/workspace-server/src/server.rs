@@ -195,7 +195,9 @@ use worker_runtime::catalog::{
     ConfigBundleRef, ProfileSelector, RepositoryMaterializationContext, RepositoryRefObservation,
     RepositoryRefObservationRequest, RepositorySelector as RuntimeRepositorySelector,
     RepositorySshCredentialCandidate, RepositorySshMaterializationAccess, SensitiveString,
-    WorkingDirectoryClaim, WorkingDirectoryRepository, WorkingDirectoryRequest, WorkspaceApiRef,
+    WorkingDirectoryAttachmentClaim, WorkingDirectoryAttachmentRequest,
+    WorkingDirectoryAttachmentStatus, WorkingDirectoryRepository, WorkingDirectoryRequest,
+    WorkspaceApiRef,
 };
 use worker_runtime::config_bundle::ConfigBundle;
 use worker_runtime::http_server::MAX_WORKER_FILE_UPLOAD_BYTES;
@@ -2136,31 +2138,35 @@ async fn seed_test_registered_workspace(
 
 fn take_new_workdir_repository_access(
     request: &mut WorkerSpawnRequest,
-) -> ApiResult<Option<worker_runtime::catalog::WorkingDirectoryRepositoryAccessRequest>> {
-    let Some(working_directory) = request.resolved_working_directory_request.as_mut() else {
-        return Ok(None);
-    };
-    let Some(materialization) = working_directory.materialization.as_mut() else {
-        return Ok(None);
-    };
-    if materialization.ssh.is_none() {
-        return Ok(None);
+) -> ApiResult<Vec<worker_runtime::catalog::WorkingDirectoryRepositoryAccessRequest>> {
+    let mut accesses = Vec::new();
+    for attachment in &mut request.resolved_workdir_attachment_requests {
+        let working_directory = &mut attachment.working_directory;
+        let Some(materialization) = working_directory.materialization.as_mut() else {
+            continue;
+        };
+        if materialization.ssh.is_none() {
+            continue;
+        }
+        let working_directory_id =
+            working_directory
+                .backend_workdir_id
+                .clone()
+                .ok_or_else(|| {
+                    Error::Config(
+                        "repository access authorization requires a Backend WorkingDirectory id"
+                            .to_string(),
+                    )
+                })?;
+        accesses.push(
+            worker_runtime::catalog::WorkingDirectoryRepositoryAccessRequest {
+                working_directory_id,
+                materialization: materialization.clone(),
+            },
+        );
+        materialization.ssh = None;
     }
-    let working_directory_id = working_directory
-        .backend_workdir_id
-        .clone()
-        .ok_or_else(|| {
-            Error::Config(
-                "repository access authorization requires a Backend WorkingDirectory id"
-                    .to_string(),
-            )
-        })?;
-    let access = worker_runtime::catalog::WorkingDirectoryRepositoryAccessRequest {
-        working_directory_id,
-        materialization: materialization.clone(),
-    };
-    materialization.ssh = None;
-    Ok(Some(access))
+    Ok(accesses)
 }
 
 fn embedded_runtime_request_audience(config: &ServerConfig) -> crate::Result<String> {
@@ -2552,33 +2558,34 @@ impl WorkspaceApi {
         self.validate_worker_spawn_repository_scope(&request)?;
         let workspace_api = self.workspace_api_ref(runtime_id);
         request.resolved_workspace_api = Some(workspace_api.clone());
-        if let Some(access) = take_new_workdir_repository_access(&mut request)? {
+        for access in take_new_workdir_repository_access(&mut request)? {
             self.runtime
                 .authorize_working_directory_repository_access(runtime_id, access)
                 .map_err(RuntimeRegistryError::into_error)?;
         }
-        if let Some(working_directory) = request.resolved_working_directory.as_ref()
-            && let Some(access) = repository_access_request_for_workdir(
+        for attachment in &request.resolved_workdir_attachments {
+            if let Some(access) = repository_access_request_for_workdir(
                 self,
                 runtime_id,
-                &working_directory.working_directory_id,
+                &attachment.working_directory_id,
                 &format!("worker-spawn:{}", WorkerId::now_v7()),
-            )?
-        {
-            self.runtime
-                .authorize_working_directory_repository_access(runtime_id, access)
-                .map_err(RuntimeRegistryError::into_error)?;
+            )? {
+                self.runtime
+                    .authorize_working_directory_repository_access(runtime_id, access)
+                    .map_err(RuntimeRegistryError::into_error)?;
+            }
         }
-        let attachment_reservation =
-            request
-                .resolved_working_directory
-                .as_ref()
-                .map(|working_directory| {
-                    (
-                        working_directory.working_directory_id.clone(),
-                        Uuid::new_v4().to_string(),
-                    )
-                });
+        let attachment_reservations = request
+            .resolved_workdir_attachments
+            .iter()
+            .map(|attachment| {
+                (
+                    attachment.alias.to_string(),
+                    attachment.working_directory_id.clone(),
+                    Uuid::new_v4().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
         let request_fingerprint = worker_spawn_create_fingerprint(&request)
             .map_err(|message| Error::Config(message.to_string()))?;
         let current_memory_settings = self
@@ -2618,42 +2625,43 @@ impl WorkspaceApi {
         };
         let compensation_context = WorkerSpawnCompensationContext {
             assignment: None,
-            prepared_workdir_id: attachment_reservation
-                .as_ref()
-                .map(|(workdir_id, _)| workdir_id.as_str()),
+            prepared_workdir_id: None,
             cleanup_spawned_workdir: false,
         };
-        if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref()
-            && let Err(error) = self.store.reserve_worker_workdir_attachment(
+        let mut reserved_attachments: Vec<(String, String, String)> = Vec::new();
+        for (alias, workdir_id, reservation_id) in &attachment_reservations {
+            if let Err(error) = self.store.reserve_worker_workdir_attachment(
                 &self.config.workspace_id,
                 workdir_id,
                 reservation_id,
                 &now_registry_timestamp(),
-            )
-        {
-            let mut diagnostics = Vec::new();
-            if let Err(cleanup_error) = self.config_store.fail_worker_create_reservation(
-                &self.config.workspace_id,
-                runtime_id,
-                worker_id,
-                &reservation_fingerprint,
             ) {
-                diagnostics.push(spawn_compensation_diagnostic(
-                    "worker_spawn_compensation_create_reservation_release_failed",
-                    format!(
-                        "Failed to terminalize Worker create reservation {} and release its resource key: {}",
-                        worker_id,
-                        sanitize_backend_error(&cleanup_error.to_string())
-                    ),
-                ));
+                let mut diagnostics =
+                    release_worker_workdir_attachment_reservations(self, &reserved_attachments);
+                if let Err(cleanup_error) = self.config_store.fail_worker_create_reservation(
+                    &self.config.workspace_id,
+                    runtime_id,
+                    worker_id,
+                    &reservation_fingerprint,
+                ) {
+                    diagnostics.push(spawn_compensation_diagnostic(
+                        "worker_spawn_compensation_create_reservation_release_failed",
+                        format!(
+                            "Failed to terminalize Worker create reservation {} and release its resource key: {}",
+                            worker_id,
+                            sanitize_backend_error(&cleanup_error.to_string())
+                        ),
+                    ));
+                }
+                write_workspace_worker_create_failure(
+                    runtime_id,
+                    worker_id,
+                    "workdir_attachment_reserve",
+                    &diagnostics,
+                );
+                return Err(ApiError::with_diagnostics(error, diagnostics));
             }
-            write_workspace_worker_create_failure(
-                runtime_id,
-                worker_id,
-                "workdir_attachment_reserve",
-                &diagnostics,
-            );
-            return Err(ApiError::with_diagnostics(error, diagnostics));
+            reserved_attachments.push((alias.clone(), workdir_id.clone(), reservation_id.clone()));
         }
         let mut result = match self
             .runtime
@@ -2669,11 +2677,7 @@ impl WorkspaceApi {
                     "runtime_spawn_transport",
                     None,
                     &compensation_context,
-                    attachment_reservation
-                        .as_ref()
-                        .map(|(workdir_id, reservation_id)| {
-                            (workdir_id.as_str(), reservation_id.as_str())
-                        }),
+                    &reserved_attachments,
                 );
                 return Err(ApiError::with_diagnostics(error.into_error(), diagnostics));
             }
@@ -2689,11 +2693,7 @@ impl WorkspaceApi {
                     "runtime_spawn_rejected",
                     None,
                     &compensation_context,
-                    attachment_reservation
-                        .as_ref()
-                        .map(|(workdir_id, reservation_id)| {
-                            (workdir_id.as_str(), reservation_id.as_str())
-                        }),
+                    &reserved_attachments,
                 ));
             return Ok(result);
         };
@@ -2707,11 +2707,7 @@ impl WorkspaceApi {
                 "runtime_worker_identity",
                 Some(worker),
                 &compensation_context,
-                attachment_reservation
-                    .as_ref()
-                    .map(|(workdir_id, reservation_id)| {
-                        (workdir_id.as_str(), reservation_id.as_str())
-                    }),
+                &reserved_attachments,
             );
             return Err(ApiError::with_diagnostics(
                 Error::RuntimeOperationFailed {
@@ -2734,11 +2730,7 @@ impl WorkspaceApi {
                 "runtime_spawn_rejected",
                 Some(worker),
                 &compensation_context,
-                attachment_reservation
-                    .as_ref()
-                    .map(|(workdir_id, reservation_id)| {
-                        (workdir_id.as_str(), reservation_id.as_str())
-                    }),
+                &reserved_attachments,
             );
             result.diagnostics.extend(diagnostics);
             return Ok(result);
@@ -2757,11 +2749,7 @@ impl WorkspaceApi {
                     "workspace_api_transport",
                     Some(worker),
                     &compensation_context,
-                    attachment_reservation
-                        .as_ref()
-                        .map(|(workdir_id, reservation_id)| {
-                            (workdir_id.as_str(), reservation_id.as_str())
-                        }),
+                    &reserved_attachments,
                 );
                 return Err(ApiError::with_diagnostics(error.into_error(), diagnostics));
             }
@@ -2775,11 +2763,7 @@ impl WorkspaceApi {
                 "workspace_api_rejected",
                 Some(worker),
                 &compensation_context,
-                attachment_reservation
-                    .as_ref()
-                    .map(|(workdir_id, reservation_id)| {
-                        (workdir_id.as_str(), reservation_id.as_str())
-                    }),
+                &reserved_attachments,
             );
             return Err(ApiError::with_diagnostics(
                 Error::RuntimeOperationFailed {
@@ -2796,58 +2780,53 @@ impl WorkspaceApi {
                 diagnostics,
             ));
         }
-        if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
-            if let Err(error) = parse_runtime_worker_id_for_registry(&worker.worker.worker_id) {
-                let diagnostics = compensate_failed_workspace_worker_create(
-                    self,
-                    runtime_id,
-                    worker_id,
-                    &reservation_fingerprint,
-                    "worker_registry_identity",
-                    Some(worker),
-                    &compensation_context,
-                    Some((workdir_id.as_str(), reservation_id.as_str())),
-                );
-                return Err(api_error_with_additional_diagnostics(error, diagnostics));
-            }
-            let compensation_context = WorkerSpawnCompensationContext {
-                assignment: None,
-                prepared_workdir_id: Some(workdir_id.as_str()),
-                cleanup_spawned_workdir: false,
-            };
-            let registry_result = record_worker_summary(
+        if let Err(error) = parse_runtime_worker_id_for_registry(&worker.worker.worker_id) {
+            let diagnostics = compensate_failed_workspace_worker_create(
                 self,
-                worker,
-                worker.label.as_str(),
-                worker.profile.clone(),
-                WorkerRegistryDisplayNamePolicy::PreserveExisting,
-            )
-            .map(|_| ());
-            if let Err(error) = finalize_worker_spawn_stage(
-                self,
-                worker,
+                runtime_id,
+                worker_id,
+                &reservation_fingerprint,
+                "worker_registry_identity",
+                Some(worker),
                 &compensation_context,
-                WorkerSpawnFinalizeStage::WorkerRegistry,
-                registry_result,
-            ) {
-                let diagnostics = compensate_failed_workspace_worker_create(
-                    self,
-                    runtime_id,
-                    worker_id,
-                    &reservation_fingerprint,
-                    "worker_registry_finalize",
-                    None,
-                    &compensation_context,
-                    Some((workdir_id.as_str(), reservation_id.as_str())),
-                );
-                return Err(api_error_with_additional_diagnostics(error, diagnostics));
-            }
+                &reserved_attachments,
+            );
+            return Err(api_error_with_additional_diagnostics(error, diagnostics));
+        }
+        let registry_result = record_worker_summary(
+            self,
+            worker,
+            worker.label.as_str(),
+            worker.profile.clone(),
+            WorkerRegistryDisplayNamePolicy::PreserveExisting,
+        )
+        .map(|_| ());
+        if let Err(error) = finalize_worker_spawn_stage(
+            self,
+            worker,
+            &compensation_context,
+            WorkerSpawnFinalizeStage::WorkerRegistry,
+            registry_result,
+        ) {
+            let diagnostics = compensate_failed_workspace_worker_create(
+                self,
+                runtime_id,
+                worker_id,
+                &reservation_fingerprint,
+                "worker_registry_finalize",
+                None,
+                &compensation_context,
+                &reserved_attachments,
+            );
+            return Err(api_error_with_additional_diagnostics(error, diagnostics));
+        }
 
+        for (alias, workdir_id, reservation_id) in &reserved_attachments {
             let attachment = WorkerWorkdirLinkRecord {
                 workspace_id: self.config.workspace_id.clone(),
                 worker: worker_ref.clone(),
                 workdir_id: workdir_id.clone(),
-                role: "attachment".to_string(),
+                alias: alias.clone(),
                 linked_at: now_registry_timestamp(),
                 unlinked_at: None,
             };
@@ -2870,19 +2849,10 @@ impl WorkspaceApi {
                     "workdir_attachment_finalize",
                     None,
                     &compensation_context,
-                    Some((workdir_id.as_str(), reservation_id.as_str())),
+                    &reserved_attachments,
                 );
                 return Err(api_error_with_additional_diagnostics(error, diagnostics));
             }
-        }
-        if attachment_reservation.is_none() {
-            record_worker_summary(
-                self,
-                worker,
-                worker.label.as_str(),
-                worker.profile.clone(),
-                WorkerRegistryDisplayNamePolicy::PreserveExisting,
-            )?;
         }
         if let Err(error) = self
             .config_store
@@ -2896,7 +2866,7 @@ impl WorkspaceApi {
                 "create_reservation_complete",
                 Some(worker),
                 &compensation_context,
-                None,
+                &reserved_attachments,
             );
             return Err(ApiError::with_diagnostics(
                 Error::Config(error.to_string()),
@@ -2910,11 +2880,11 @@ impl WorkspaceApi {
         &self,
         worker: &RuntimeWorkerRef,
     ) -> ApiResult<WorkerRestoreResult> {
-        if let Some(link) = self
+        for link in self
             .store
             .list_worker_workdir_links(&self.config.workspace_id, worker)?
             .into_iter()
-            .find(|link| link.unlinked_at.is_none())
+            .filter(|link| link.unlinked_at.is_none())
         {
             let workdir_runtime_id = registered_workdir_runtime_id(self, &link.workdir_id)?;
             if let Some(access) = repository_access_request_for_workdir(
@@ -2994,40 +2964,40 @@ impl WorkspaceApi {
         &self,
         request: &WorkerSpawnRequest,
     ) -> ApiResult<()> {
-        let (selected_repository_id, selected_ref_selector) =
-            if let Some(working_directory) = request.resolved_working_directory_request.as_ref() {
-                let repository_id = working_directory.repository.id.as_str();
-                self.require_workspace_repository(repository_id)?;
-                (
-                    Some(repository_id.to_string()),
-                    working_directory
-                        .repository
-                        .selector
-                        .as_deref()
-                        .map(str::to_owned),
-                )
-            } else if let Some(claim) = request.resolved_working_directory.as_ref() {
-                let workdir = self
-                    .store
-                    .get_workdir_registry(&self.config.workspace_id, &claim.working_directory_id)?
-                    .ok_or_else(|| {
-                        ApiError::from(Error::Config(format!(
-                            "unknown working directory `{}` in this Workspace",
-                            claim.working_directory_id
-                        )))
-                    })?;
-                self.require_workspace_repository(&workdir.repository_id)?;
-                (Some(workdir.repository_id), workdir.creation_selector)
-            } else {
-                (None, None)
-            };
+        let mut selected_repositories = Vec::new();
+        for attachment in &request.resolved_workdir_attachment_requests {
+            let working_directory = &attachment.working_directory;
+            let repository_id = working_directory.repository.id.as_str();
+            self.require_workspace_repository(repository_id)?;
+            selected_repositories.push((
+                repository_id.to_string(),
+                working_directory
+                    .repository
+                    .selector
+                    .as_deref()
+                    .map(str::to_owned),
+            ));
+        }
+        for claim in &request.resolved_workdir_attachments {
+            let workdir = self
+                .store
+                .get_workdir_registry(&self.config.workspace_id, &claim.working_directory_id)?
+                .ok_or_else(|| {
+                    ApiError::from(Error::Config(format!(
+                        "unknown working directory `{}` in this Workspace",
+                        claim.working_directory_id
+                    )))
+                })?;
+            self.require_workspace_repository(&workdir.repository_id)?;
+            selected_repositories.push((workdir.repository_id, workdir.creation_selector));
+        }
 
         if let WorkerSpawnIntent::TicketRole { ticket_id, .. } = &request.intent {
             let ticket = self.authority.ticket(ticket_id)?;
             // Workdir-less Ticket Workers cannot execute repository implementation.
             // Preserve that control-plane launch while still validating any persisted
             // target (including its Workspace ownership) when one exists.
-            if selected_repository_id.is_none() && ticket.repository_key.is_none() {
+            if selected_repositories.is_empty() && ticket.repository_key.is_none() {
                 return Ok(());
             }
             let repository_key = ticket.repository_key.as_deref().ok_or_else(|| {
@@ -3050,16 +3020,18 @@ impl WorkspaceApi {
                         "Ticket implementation target is no longer resolvable: {error:?}"
                     )))
                 })?;
-            if selected_repository_id.as_deref() != Some(repository_id) {
-                return Err(ApiError::from(Error::Config(format!(
-                    "Ticket `{ticket_id}` targets Repository `{repository_key}`, but the Worker launch resolves a different Repository"
-                ))));
-            }
-            if selected_ref_selector.as_deref() != Some(ref_selector) {
-                return Err(ApiError::from(Error::Config(format!(
-                    "Ticket `{ticket_id}` targets selector `{ref_selector}`, but the Worker launch resolves `{}`",
-                    selected_ref_selector.as_deref().unwrap_or("none")
-                ))));
+            for (selected_repository_id, selected_ref_selector) in &selected_repositories {
+                if selected_repository_id != repository_id {
+                    return Err(ApiError::from(Error::Config(format!(
+                        "Ticket `{ticket_id}` targets Repository `{repository_key}`, but a Worker attachment resolves a different Repository"
+                    ))));
+                }
+                if selected_ref_selector.as_deref() != Some(ref_selector) {
+                    return Err(ApiError::from(Error::Config(format!(
+                        "Ticket `{ticket_id}` targets selector `{ref_selector}`, but a Worker attachment resolves `{}`",
+                        selected_ref_selector.as_deref().unwrap_or("none")
+                    ))));
+                }
             }
         }
         Ok(())
@@ -3614,9 +3586,12 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
             get(scoped_runtime_working_directory_detail).delete(scoped_cleanup_runtime_working_directory),
         )
         .route(
-            "/api/w/{workspace_id}/workers/self/workdir-attachment",
-            post(scoped_attach_current_worker_workdir)
-                .delete(scoped_detach_current_worker_workdir),
+            "/api/w/{workspace_id}/workers/self/workdir-attachments",
+            post(scoped_attach_current_worker_workdir),
+        )
+        .route(
+            "/api/w/{workspace_id}/workers/self/workdir-attachments/{alias}",
+            delete(scoped_detach_current_worker_workdir),
         )
         .route(
             "/api/w/{workspace_id}/workers/self/workdir-session/operations",
@@ -4221,13 +4196,15 @@ struct PutFlowRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AttachCurrentWorkerWorkdirRequest {
-    workdir_id: String,
+    alias: String,
+    working_directory_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct CurrentWorkerWorkdirAttachmentResponse {
     workspace_id: String,
-    workdir_id: String,
+    alias: String,
+    working_directory_id: String,
     attached: bool,
 }
 
@@ -6766,34 +6743,46 @@ fn require_assigned_workdir_source(
         .runtime
         .worker(&assignment.worker)
         .map_err(|error| error.into_error())?;
-    let attached_workdir = worker.working_directory.ok_or_else(|| {
-        Error::MergeRequest(merge_request::MergeRequestError::Conflict(
-            "merge_request_source_workdir_missing: current Coder has no attached Workdir".into(),
-        ))
-    })?;
-    let workdir = api
-        .runtime
-        .working_directory(
-            &assignment.worker.runtime_id,
-            &attached_workdir.working_directory_id,
-        )
-        .map_err(|error| error.into_error())?
-        .working_directory
-        .ok_or_else(|| {
+    if worker.workdir_attachments.is_empty() {
+        return Err(
             Error::MergeRequest(merge_request::MergeRequestError::Conflict(
-                "merge_request_source_workdir_unavailable: current Coder Workdir could not be observed"
+                "merge_request_source_workdir_missing: current Coder has no attached Workdir"
                     .into(),
             ))
-        })?
-        .summary;
-    validate_assigned_workdir_source(&workdir, repository_id, selector, revision_ref).map_err(
-        |diagnostic| Error::RuntimeOperationFailed {
-            runtime_id: assignment.worker.runtime_id.clone(),
-            code: diagnostic.code,
-            message: diagnostic.message,
-        },
-    )?;
-    Ok(())
+            .into(),
+        );
+    }
+    let mut last_diagnostic = None;
+    for attachment in &worker.workdir_attachments {
+        let Some(workdir) = api
+            .runtime
+            .working_directory(
+                &assignment.worker.runtime_id,
+                &attachment.working_directory.summary.working_directory_id,
+            )
+            .map_err(|error| error.into_error())?
+            .working_directory
+            .map(|status| status.summary)
+        else {
+            continue;
+        };
+        match validate_assigned_workdir_source(&workdir, repository_id, selector, revision_ref) {
+            Ok(()) => return Ok(()),
+            Err(diagnostic) => last_diagnostic = Some(diagnostic),
+        }
+    }
+    let diagnostic = last_diagnostic.unwrap_or_else(|| {
+        worker_runtime::working_directory::WorkingDirectoryDiagnostic {
+            code: "merge_request_source_workdir_unavailable".to_string(),
+            message: "No attached Coder Workdir could be observed".to_string(),
+        }
+    });
+    Err(Error::RuntimeOperationFailed {
+        runtime_id: assignment.worker.runtime_id.clone(),
+        code: diagnostic.code,
+        message: diagnostic.message,
+    }
+    .into())
 }
 
 fn validate_assigned_workdir_source(
@@ -8307,13 +8296,21 @@ fn current_worker_active_attachment(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
 ) -> ApiResult<WorkerWorkdirLinkRecord> {
-    if let Some(link) = api
+    let active_links = api
         .store
         .list_worker_workdir_links(&api.config.workspace_id, worker)?
         .into_iter()
-        .next()
-    {
-        return Ok(link);
+        .filter(|link| link.unlinked_at.is_none())
+        .collect::<Vec<_>>();
+    if active_links.len() == 1 {
+        return Ok(active_links.into_iter().next().expect("one active link"));
+    }
+    if active_links.len() > 1 {
+        return Err(Error::WorkdirAttachmentConflict(format!(
+            "Worker {}:{} has multiple Workdir attachments; implicit operation routing is unavailable",
+            worker.runtime_id, worker.worker_id
+        ))
+        .into());
     }
 
     if api
@@ -8335,16 +8332,9 @@ fn current_worker_active_attachment(
         .runtime
         .worker(worker)
         .map_err(|error| error.into_error())?;
-    if observed_worker.working_directory.is_some() {
+    if !observed_worker.workdir_attachments.is_empty() {
         sync_worker_observation(api, &observed_worker)?;
-        if let Some(link) = api
-            .store
-            .list_worker_workdir_links(&api.config.workspace_id, worker)?
-            .into_iter()
-            .next()
-        {
-            return Ok(link);
-        }
+        return current_worker_active_attachment(api, worker);
     }
     Err(Error::WorkdirAttachmentConflict(format!(
         "Worker {}:{} has no active Workdir attachment",
@@ -8485,6 +8475,60 @@ async fn close_current_worker_session_locked(
         })
 }
 
+fn sync_runtime_worker_workdir_attachments(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+) -> ApiResult<()> {
+    let attachments = api
+        .store
+        .list_worker_workdir_links(&api.config.workspace_id, worker)?
+        .into_iter()
+        .filter(|link| link.unlinked_at.is_none())
+        .map(|link| {
+            Ok(WorkingDirectoryAttachmentClaim {
+                alias: workdir::WorkdirAttachmentAlias::new(link.alias)
+                    .map_err(|error| Error::InvalidInput(error.to_string()))?,
+                working_directory_id: link.workdir_id,
+                relative_cwd: None,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let result = api
+        .runtime
+        .replace_worker_workdir_attachments(worker, attachments)
+        .map_err(RuntimeRegistryError::into_error)?;
+    if result.state != WorkerOperationState::Accepted {
+        return Err(Error::RuntimeOperationFailed {
+            runtime_id: worker.runtime_id.clone(),
+            code: "worker_workdir_attachments_replace_failed".to_string(),
+            message: result
+                .diagnostics
+                .first()
+                .map(|diagnostic| diagnostic.message.clone())
+                .unwrap_or_else(|| "Runtime rejected Workdir attachment persistence".to_string()),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+async fn refresh_current_worker_session_locked(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+) -> Result<()> {
+    close_current_worker_session_locked(api, worker).await?;
+    let remaining = api
+        .store
+        .list_worker_workdir_links(&api.config.workspace_id, worker)?
+        .into_iter()
+        .filter(|link| link.unlinked_at.is_none())
+        .collect::<Vec<_>>();
+    if remaining.len() == 1 {
+        open_current_worker_workdir_session_locked(api, worker, &remaining[0]).await?;
+    }
+    Ok(())
+}
+
 async fn scoped_attach_current_worker_workdir(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -8493,62 +8537,136 @@ async fn scoped_attach_current_worker_workdir(
 ) -> ApiResult<Json<CurrentWorkerWorkdirAttachmentResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let worker = current_worker_identity(&api, &path.workspace_id, &headers)?;
-    let workdir_id = request.workdir_id.trim();
+    let alias = workdir::WorkdirAttachmentAlias::new(request.alias)
+        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+    let workdir_id = request.working_directory_id.trim();
     if workdir_id.is_empty() || workdir_id.chars().any(char::is_control) {
-        return Err(Error::InvalidRecordId(request.workdir_id).into());
+        return Err(Error::InvalidRecordId(request.working_directory_id).into());
     }
-    if !api
+    let workdir = api
         .store
         .list_workdir_registry(&api.config.workspace_id, 10_000)?
-        .iter()
-        .any(|workdir| workdir.workdir_id == workdir_id)
-    {
-        return Err(Error::RuntimeOperationFailed {
+        .into_iter()
+        .find(|workdir| workdir.workdir_id == workdir_id)
+        .ok_or_else(|| Error::RuntimeOperationFailed {
             runtime_id: worker.runtime_id.clone(),
             code: "working_directory_not_found".to_string(),
             message: format!("unknown Workdir `{workdir_id}`"),
-        }
+        })?;
+    let status = runtime_workdir_summary_from_record(&workdir).status;
+    if status != WorkingDirectoryStatusKind::Active {
+        return Err(Error::WorkdirAttachmentConflict(format!(
+            "Workdir `{workdir_id}` is not active ({status})"
+        ))
         .into());
     }
     let session_lock = current_worker_session_lock(&api, &worker);
     let _session_guard = session_lock.lock().await;
+    if let Some(existing) = api
+        .store
+        .list_worker_workdir_links(&api.config.workspace_id, &worker)?
+        .into_iter()
+        .find(|link| link.unlinked_at.is_none() && link.alias == alias.as_str())
+    {
+        if existing.workdir_id != workdir_id {
+            return Err(Error::WorkdirAttachmentConflict(format!(
+                "Worker {}:{} attachment alias `{alias}` is already bound to Workdir {}",
+                worker.runtime_id, worker.worker_id, existing.workdir_id
+            ))
+            .into());
+        }
+        sync_runtime_worker_workdir_attachments(&api, &worker)?;
+        api.worker_projection
+            .publish_catalog_change(&worker)
+            .map_err(ApiError::from)?;
+        return Ok(Json(CurrentWorkerWorkdirAttachmentResponse {
+            workspace_id: api.config.workspace_id.clone(),
+            alias: alias.to_string(),
+            working_directory_id: workdir_id.to_string(),
+            attached: true,
+        }));
+    }
+    close_current_worker_session_locked(&api, &worker).await?;
     let link = api.store.attach_worker_workdir(&WorkerWorkdirLinkRecord {
         workspace_id: api.config.workspace_id.clone(),
         worker: worker.clone(),
         workdir_id: workdir_id.to_string(),
-        role: "attachment".to_string(),
+        alias: alias.to_string(),
         linked_at: Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
         unlinked_at: None,
     })?;
-    if let Err(error) = open_current_worker_workdir_session_locked(&api, &worker, &link).await {
+    if let Err(error) = sync_runtime_worker_workdir_attachments(&api, &worker) {
         let _ = api.store.detach_worker_workdir(
             &api.config.workspace_id,
             &worker,
             Some(workdir_id),
             &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         );
+        return Err(error);
+    }
+    let active_count = api
+        .store
+        .list_worker_workdir_links(&api.config.workspace_id, &worker)?
+        .into_iter()
+        .filter(|link| link.unlinked_at.is_none())
+        .count();
+    if active_count == 1
+        && let Err(error) = open_current_worker_workdir_session_locked(&api, &worker, &link).await
+    {
+        let _ = api.store.detach_worker_workdir(
+            &api.config.workspace_id,
+            &worker,
+            Some(workdir_id),
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        );
+        let _ = sync_runtime_worker_workdir_attachments(&api, &worker);
         return Err(error.into());
     }
-    api.worker_projection
+    if let Err(error) = api
+        .worker_projection
         .publish_catalog_change(&worker)
-        .map_err(ApiError::from)?;
+        .map_err(ApiError::from)
+    {
+        api.store.detach_worker_workdir(
+            &api.config.workspace_id,
+            &worker,
+            Some(workdir_id),
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        )?;
+        sync_runtime_worker_workdir_attachments(&api, &worker)?;
+        refresh_current_worker_session_locked(&api, &worker).await?;
+        return Err(error);
+    }
     Ok(Json(CurrentWorkerWorkdirAttachmentResponse {
         workspace_id: api.config.workspace_id.clone(),
-        workdir_id: workdir_id.to_string(),
+        alias: alias.to_string(),
+        working_directory_id: workdir_id.to_string(),
         attached: true,
     }))
 }
 
 async fn scoped_detach_current_worker_workdir(
     State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    AxumPath((workspace_id, alias)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<CurrentWorkerWorkdirAttachmentResponse>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    let worker = current_worker_identity(&api, &path.workspace_id, &headers)?;
+    validate_workspace_scope(&api, &workspace_id)?;
+    let alias = workdir::WorkdirAttachmentAlias::new(alias)
+        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+    let worker = current_worker_identity(&api, &workspace_id, &headers)?;
     let session_lock = current_worker_session_lock(&api, &worker);
     let _session_guard = session_lock.lock().await;
-    let link = current_worker_active_attachment(&api, &worker)?;
+    let link = api
+        .store
+        .list_worker_workdir_links(&api.config.workspace_id, &worker)?
+        .into_iter()
+        .find(|link| link.unlinked_at.is_none() && link.alias == alias.as_str())
+        .ok_or_else(|| {
+            Error::WorkdirAttachmentConflict(format!(
+                "Worker {}:{} has no Workdir attachment `{alias}`",
+                worker.runtime_id, worker.worker_id
+            ))
+        })?;
     close_current_worker_session_locked(&api, &worker).await?;
     api.store.detach_worker_workdir(
         &api.config.workspace_id,
@@ -8556,12 +8674,44 @@ async fn scoped_detach_current_worker_workdir(
         Some(&link.workdir_id),
         &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
     )?;
-    api.worker_projection
+    if let Err(error) = sync_runtime_worker_workdir_attachments(&api, &worker) {
+        let mut restored = link.clone();
+        restored.unlinked_at = None;
+        api.store.attach_worker_workdir(&restored)?;
+        return Err(error);
+    }
+    let remaining = api
+        .store
+        .list_worker_workdir_links(&api.config.workspace_id, &worker)?
+        .into_iter()
+        .filter(|link| link.unlinked_at.is_none())
+        .collect::<Vec<_>>();
+    if remaining.len() == 1
+        && let Err(error) =
+            open_current_worker_workdir_session_locked(&api, &worker, &remaining[0]).await
+    {
+        let mut restored = link.clone();
+        restored.unlinked_at = None;
+        api.store.attach_worker_workdir(&restored)?;
+        let _ = sync_runtime_worker_workdir_attachments(&api, &worker);
+        return Err(error.into());
+    }
+    if let Err(error) = api
+        .worker_projection
         .publish_catalog_change(&worker)
-        .map_err(ApiError::from)?;
+        .map_err(ApiError::from)
+    {
+        let mut restored = link.clone();
+        restored.unlinked_at = None;
+        api.store.attach_worker_workdir(&restored)?;
+        sync_runtime_worker_workdir_attachments(&api, &worker)?;
+        refresh_current_worker_session_locked(&api, &worker).await?;
+        return Err(error);
+    }
     Ok(Json(CurrentWorkerWorkdirAttachmentResponse {
         workspace_id: api.config.workspace_id.clone(),
-        workdir_id: link.workdir_id,
+        alias: alias.to_string(),
+        working_directory_id: link.workdir_id,
         attached: false,
     }))
 }
@@ -9168,9 +9318,9 @@ fn start_memory_staging_consolidation(
             profile: profile_selector,
             ticket_assignment: None,
             initial_submit,
-            working_directory_request: None,
-            resolved_working_directory_request: None,
-            resolved_working_directory: None,
+            workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachments: Vec::new(),
             resolved_config_bundle,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
@@ -10707,9 +10857,9 @@ async fn scoped_start_workspace_orchestrator(
             profile: ProfileSelector::Builtin("builtin:orchestrator".to_string()),
             ticket_assignment: None,
             initial_submit: Vec::new(),
-            working_directory_request: None,
-            resolved_working_directory_request: None,
-            resolved_working_directory: None,
+            workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachments: Vec::new(),
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: true,
             resolved_worker_observation_grants: Vec::new(),
@@ -10770,7 +10920,16 @@ fn worker_launch_worker_summary(worker: WorkerSummary) -> WorkerLaunchWorkerSumm
             can_stop: worker.capabilities.can_stop,
             can_spawn_followup: worker.capabilities.can_spawn_followup,
         },
-        working_directory: worker.working_directory.map(Into::into),
+        workdir_attachments: worker
+            .workdir_attachments
+            .into_iter()
+            .map(
+                |attachment| server_api::RuntimeWorkerWorkdirAttachmentSummary {
+                    alias: attachment.alias.to_string(),
+                    working_directory: attachment.working_directory.summary.into(),
+                },
+            )
+            .collect(),
         diagnostics: worker
             .diagnostics
             .into_iter()
@@ -11062,9 +11221,24 @@ async fn create_workspace_working_directory(
     api: &WorkspaceApi,
     workspace_id: &str,
     route_runtime_id: Option<&str>,
-    request: BrowserWorkingDirectoryCreateRequest,
+    mut request: BrowserWorkingDirectoryCreateRequest,
 ) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryCreateResponse>)> {
     validate_workspace_scope(api, workspace_id)?;
+    request.display_name = request
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if value.len() > 80 || value.chars().any(char::is_control) {
+                return Err(Error::InvalidInput(
+                    "display_name must contain no control characters and be at most 80 bytes"
+                        .to_string(),
+                ));
+            }
+            Ok(value.to_string())
+        })
+        .transpose()?;
     if let (Some(route_runtime_id), Some(request_runtime_id)) =
         (route_runtime_id, request.runtime_id.as_deref())
         && route_runtime_id != request_runtime_id
@@ -11134,6 +11308,7 @@ async fn create_workspace_working_directory(
         &request.repository_key,
         selector.as_deref(),
         requested_runtime_id.as_deref(),
+        working_directory_request.display_name.as_deref(),
         &working_directory_request.repository.source_fingerprint,
         working_directory_request.repository.source_revision,
     );
@@ -14797,6 +14972,7 @@ fn working_directory_request_from_repository(
                 })
                 .or_else(|| Some(RuntimeRepositorySelector::from("HEAD"))),
         },
+        display_name: None,
         materializer: MaterializerKind::RuntimeGitClone,
         backend_workdir_id: None,
         materialization: None,
@@ -14939,7 +15115,7 @@ async fn create_workspace_worker_inner(
         profile,
         ticket_assignment,
         initial_submit,
-        working_directory,
+        workdir_attachments,
         control_operation_id: _,
     } = request;
     let config_state = api
@@ -14999,15 +15175,24 @@ async fn create_workspace_worker_inner(
         &initial_submit,
         ticket_assignment.is_some(),
     )?;
-    let selected_working_directory_id = working_directory
-        .as_ref()
-        .map(|selection| selection.working_directory_id.clone());
-    let resolved_working_directory = working_directory.map(|selection| WorkingDirectoryClaim {
-        working_directory_id: selection.working_directory_id,
-        relative_cwd: selection.relative_cwd,
-    });
-    validate_working_directory_claim_for_browser(resolved_working_directory.as_ref())?;
-    if resolved_working_directory.is_none() {
+    let resolved_workdir_attachments = workdir_attachments
+        .into_iter()
+        .map(|selection| {
+            let alias = workdir::WorkdirAttachmentAlias::new(selection.alias).map_err(|_| {
+                settings_bad_request(
+                    "invalid_workdir_attachment_alias",
+                    "attachment alias must be a valid Worker-local routing key",
+                )
+            })?;
+            Ok(WorkingDirectoryAttachmentClaim {
+                alias,
+                working_directory_id: selection.working_directory_id,
+                relative_cwd: selection.relative_cwd,
+            })
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+    validate_working_directory_claims_for_browser(&resolved_workdir_attachments)?;
+    if resolved_workdir_attachments.is_empty() {
         reject_no_workdir_for_non_embedded_runtime(&runtime_id)?;
     }
     let (intent, acceptance, ticket_assignment) =
@@ -15019,9 +15204,9 @@ async fn create_workspace_worker_inner(
         profile: profile_selector,
         ticket_assignment,
         initial_submit,
-        working_directory_request: None,
-        resolved_working_directory_request: None,
-        resolved_working_directory,
+        workdir_attachment_requests: Vec::new(),
+        resolved_workdir_attachment_requests: Vec::new(),
+        resolved_workdir_attachments,
         resolved_config_bundle,
         resolved_worker_observation_enabled: false,
         resolved_worker_observation_grants: Vec::new(),
@@ -15060,7 +15245,6 @@ async fn create_workspace_worker_inner(
                 &api,
                 worker,
                 display_name,
-                selected_working_directory_id.as_deref(),
                 Vec::new(),
                 Some(assignment),
             )?));
@@ -15081,7 +15265,6 @@ async fn create_workspace_worker_inner(
         &api,
         runtime_id,
         display_name,
-        selected_working_directory_id,
         result,
         assignment.as_ref(),
     )?))
@@ -15091,7 +15274,6 @@ fn record_browser_worker_spawn(
     api: &WorkspaceApi,
     requested_runtime_id: String,
     display_name: String,
-    selected_working_directory_id: Option<String>,
     result: WorkerSpawnResult,
     assignment: Option<&WorkerTicketAssignmentRequest>,
 ) -> ApiResult<BrowserCreateWorkerResponse> {
@@ -15106,21 +15288,13 @@ fn record_browser_worker_spawn(
         code: "workspace_worker_create_missing_summary".to_string(),
         message: "Runtime completed worker creation without returning a Worker summary".to_string(),
     })?;
-    browser_worker_response_from_summary(
-        api,
-        worker,
-        display_name,
-        selected_working_directory_id.as_deref(),
-        result.diagnostics,
-        assignment,
-    )
+    browser_worker_response_from_summary(api, worker, display_name, result.diagnostics, assignment)
 }
 
 fn browser_worker_response_from_summary(
     api: &WorkspaceApi,
     worker: WorkerSummary,
     display_name: String,
-    selected_working_directory_id: Option<&str>,
     diagnostics: Vec<RuntimeDiagnostic>,
     assignment: Option<&WorkerTicketAssignmentRequest>,
 ) -> ApiResult<BrowserCreateWorkerResponse> {
@@ -15142,7 +15316,7 @@ fn browser_worker_response_from_summary(
         ) {
             let context = WorkerSpawnCompensationContext {
                 assignment: Some(assignment),
-                prepared_workdir_id: selected_working_directory_id,
+                prepared_workdir_id: None,
                 cleanup_spawned_workdir: false,
             };
             return finalize_worker_spawn_stage(
@@ -15161,7 +15335,7 @@ fn browser_worker_response_from_summary(
         ) {
             let context = WorkerSpawnCompensationContext {
                 assignment: Some(assignment),
-                prepared_workdir_id: selected_working_directory_id,
+                prepared_workdir_id: None,
                 cleanup_spawned_workdir: false,
             };
             return finalize_worker_spawn_stage(
@@ -15173,50 +15347,23 @@ fn browser_worker_response_from_summary(
             );
         }
     }
-    if let Some(working_directory) = worker.working_directory.as_ref() {
+    for attachment in &worker.workdir_attachments {
+        let working_directory = &attachment.working_directory.summary;
         let workdir_record =
             workdir_record_from_summary(api, worker.worker.runtime_id.as_str(), working_directory);
         api.store.upsert_workdir_registry(&workdir_record)?;
         link_worker_to_workdir(
             api,
             &worker_record,
+            attachment.alias.as_str(),
             &working_directory.working_directory_id,
             None,
         )?;
     }
-    if let Some(workdir_id) = selected_working_directory_id {
-        if api
-            .store
-            .get_workdir_registry(&api.config.workspace_id, workdir_id)?
-            .is_none()
-        {
-            if let Ok(result) = api
-                .runtime
-                .working_directory(worker.worker.runtime_id.as_str(), workdir_id)
-                .map_err(|err| err.into_error())
-            {
-                if let Some(status) = result.working_directory {
-                    let record = workdir_record_from_summary(
-                        api,
-                        worker.worker.runtime_id.as_str(),
-                        &status.summary,
-                    );
-                    api.store.upsert_workdir_registry(&record)?;
-                }
-            }
-        }
-        if api
-            .store
-            .get_workdir_registry(&api.config.workspace_id, workdir_id)?
-            .is_some()
-        {
-            link_worker_to_workdir(api, &worker_record, workdir_id, None)?;
-        }
-    }
     if let Some(assignment) = assignment {
         let context = WorkerSpawnCompensationContext {
             assignment: Some(assignment),
-            prepared_workdir_id: selected_working_directory_id,
+            prepared_workdir_id: None,
             cleanup_spawned_workdir: false,
         };
         finalize_worker_spawn_stage(
@@ -15565,7 +15712,6 @@ enum WorkerSpawnFinalizeStage {
     TicketAssignmentBind,
     TicketAssignmentCurrent,
     TicketStateAccept,
-    WorkdirRegistry,
     WorkdirAttachment,
 }
 
@@ -15576,7 +15722,6 @@ impl WorkerSpawnFinalizeStage {
             Self::TicketAssignmentBind => "ticket_assignment_bind",
             Self::TicketAssignmentCurrent => "ticket_assignment_current",
             Self::TicketStateAccept => "ticket_state_accept",
-            Self::WorkdirRegistry => "workdir_registry",
             Self::WorkdirAttachment => "workdir_attachment",
         }
     }
@@ -15674,6 +15819,29 @@ fn api_error_with_additional_diagnostics(
     error
 }
 
+fn release_worker_workdir_attachment_reservations(
+    api: &WorkspaceApi,
+    reservations: &[(String, String, String)],
+) -> Vec<RuntimeDiagnostic> {
+    let mut diagnostics = Vec::new();
+    for (_, workdir_id, reservation_id) in reservations {
+        if let Err(error) = api.store.release_worker_workdir_attachment_reservation(
+            &api.config.workspace_id,
+            workdir_id,
+            reservation_id,
+        ) {
+            diagnostics.push(spawn_compensation_diagnostic(
+                "worker_spawn_compensation_attachment_reservation_release_failed",
+                format!(
+                    "Failed to release Workdir `{workdir_id}` attachment reservation `{reservation_id}`: {}",
+                    sanitize_backend_error(&error.to_string())
+                ),
+            ));
+        }
+    }
+    diagnostics
+}
+
 fn compensate_failed_workspace_worker_create(
     api: &WorkspaceApi,
     runtime_id: &str,
@@ -15682,7 +15850,7 @@ fn compensate_failed_workspace_worker_create(
     failure_phase: &str,
     worker: Option<&WorkerSummary>,
     context: &WorkerSpawnCompensationContext<'_>,
-    attachment_reservation: Option<(&str, &str)>,
+    attachment_reservations: &[(String, String, String)],
 ) -> Vec<RuntimeDiagnostic> {
     let mut diagnostics = Vec::new();
     let reserved_worker_ref =
@@ -15707,21 +15875,10 @@ fn compensate_failed_workspace_worker_create(
         reserved_worker_absent = worker_absent;
         diagnostics.extend(delete_diagnostics);
     }
-    if let Some((workdir_id, reservation_id)) = attachment_reservation
-        && let Err(error) = api.store.release_worker_workdir_attachment_reservation(
-            &api.config.workspace_id,
-            workdir_id,
-            reservation_id,
-        )
-    {
-        diagnostics.push(spawn_compensation_diagnostic(
-            "worker_spawn_compensation_attachment_reservation_release_failed",
-            format!(
-                "Failed to release Workdir `{workdir_id}` attachment reservation `{reservation_id}`: {}",
-                sanitize_backend_error(&error.to_string())
-            ),
-        ));
-    }
+    diagnostics.extend(release_worker_workdir_attachment_reservations(
+        api,
+        attachment_reservations,
+    ));
     if reserved_worker_absent {
         if let Err(error) = api.config_store.fail_worker_create_reservation(
             &api.config.workspace_id,
@@ -15986,16 +16143,27 @@ async fn create_runtime_worker(
     validate_ticket_assignment_spawn(&api, &runtime_id, &request)?;
     reject_workdir_for_embedded_runtime(
         &runtime_id,
-        request.working_directory_request.is_some() || request.resolved_working_directory.is_some(),
+        !request.workdir_attachment_requests.is_empty()
+            || !request.resolved_workdir_attachments.is_empty(),
     )?;
-    if request.working_directory_request.is_none() && request.resolved_working_directory.is_none() {
+    if request.workdir_attachment_requests.is_empty()
+        && request.resolved_workdir_attachments.is_empty()
+    {
         reject_no_workdir_for_non_embedded_runtime(&runtime_id)?;
     }
-    request.resolved_working_directory_request = request
-        .working_directory_request
-        .as_ref()
-        .map(|working_directory| configured_working_directory_request(&api, working_directory))
-        .transpose()?;
+    request.resolved_workdir_attachment_requests = request
+        .workdir_attachment_requests
+        .iter()
+        .map(|attachment| {
+            Ok(WorkingDirectoryAttachmentRequest {
+                alias: attachment.alias.clone(),
+                working_directory: configured_working_directory_request(
+                    &api,
+                    &attachment.working_directory,
+                )?,
+            })
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
     let repository_operation_id = request
         .resolved_control_operation
         .as_ref()
@@ -16006,11 +16174,10 @@ async fn create_runtime_worker(
                 .as_ref()
                 .map(|assignment| assignment.operation_id.clone())
         });
-    let prepared_workdir_id = if let Some(working_directory_request) =
-        request.resolved_working_directory_request.as_mut()
-    {
+    let mut prepared_workdirs = Vec::new();
+    for attachment in &mut request.resolved_workdir_attachment_requests {
         let workdir_id =
-            upsert_pending_backend_workdir(&api, &runtime_id, working_directory_request)?;
+            upsert_pending_backend_workdir(&api, &runtime_id, &mut attachment.working_directory)?;
         let operation_id = repository_operation_id
             .clone()
             .unwrap_or_else(|| format!("worker-spawn-workdir:{workdir_id}"));
@@ -16018,15 +16185,13 @@ async fn create_runtime_worker(
             &api,
             &runtime_id,
             &operation_id,
-            working_directory_request,
+            &mut attachment.working_directory,
         )?;
-        Some(workdir_id)
-    } else {
-        request
-            .resolved_working_directory
-            .as_ref()
-            .map(|claim| claim.working_directory_id.clone())
-    };
+        prepared_workdirs.push((attachment.alias.clone(), workdir_id));
+    }
+    for claim in &request.resolved_workdir_attachments {
+        prepared_workdirs.push((claim.alias.clone(), claim.working_directory_id.clone()));
+    }
     let requested_worker_name = request.requested_worker_name.clone();
     let spawn_idempotency =
         crate::hosts::worker_spawn_idempotency(&request).map_err(Error::Config)?;
@@ -16043,7 +16208,13 @@ async fn create_runtime_worker(
             &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         )?;
     }
-    let cleanup_spawned_workdir = request.resolved_working_directory_request.is_some();
+    let cleanup_spawned_workdir = !request.resolved_workdir_attachment_requests.is_empty();
+    let created_workdir_ids = request
+        .resolved_workdir_attachment_requests
+        .iter()
+        .filter_map(|attachment| attachment.working_directory.backend_workdir_id.clone())
+        .collect::<Vec<_>>();
+    let prepared_workdir_id = prepared_workdirs.first().map(|(_, id)| id.as_str());
     let result = api.spawn_workspace_worker(&runtime_id, request)?;
     if let Some(worker) = result.worker.as_ref() {
         let compensation = WorkerSpawnCompensationContext {
@@ -16104,37 +16275,50 @@ async fn create_runtime_worker(
                 accept_queued_ticket_after_worker_spawn(&api, assignment).map_err(ApiError::from),
             )?;
         }
-        if worker.working_directory.is_none() {
-            if let Some(workdir_id) = prepared_workdir_id.as_deref() {
-                let workdir_exists = finalize_worker_spawn_stage(
+        let existing_links = api
+            .store
+            .list_worker_workdir_links(&api.config.workspace_id, &record.worker)?;
+        for attachment in &worker.workdir_attachments {
+            let summary = &attachment.working_directory.summary;
+            let mut workdir_record =
+                workdir_record_from_summary(&api, worker.worker.runtime_id.as_str(), summary);
+            preserve_workdir_identity_for_corrupted_summary(
+                &mut workdir_record,
+                api.store
+                    .get_workdir_registry(&api.config.workspace_id, &summary.working_directory_id)?
+                    .as_ref(),
+            );
+            api.store.upsert_workdir_registry(&workdir_record)?;
+            if !existing_links.iter().any(|link| {
+                link.unlinked_at.is_none()
+                    && link.alias == attachment.alias.as_str()
+                    && link.workdir_id == summary.working_directory_id
+            }) {
+                finalize_worker_spawn_stage(
                     &api,
                     worker,
                     &compensation,
-                    WorkerSpawnFinalizeStage::WorkdirRegistry,
-                    api.store
-                        .get_workdir_registry(&api.config.workspace_id, workdir_id)
-                        .map_err(ApiError::from),
-                )?
-                .is_some();
-                if workdir_exists {
-                    finalize_worker_spawn_stage(
+                    WorkerSpawnFinalizeStage::WorkdirAttachment,
+                    link_worker_to_workdir(
                         &api,
-                        worker,
-                        &compensation,
-                        WorkerSpawnFinalizeStage::WorkdirAttachment,
-                        link_worker_to_workdir(&api, &record, workdir_id, None),
-                    )?;
-                }
+                        &record,
+                        attachment.alias.as_str(),
+                        &summary.working_directory_id,
+                        None,
+                    ),
+                )?;
             }
         }
-    } else if let Some(workdir_id) = prepared_workdir_id.as_deref() {
-        if let Some(mut record) = api
-            .store
-            .get_workdir_registry(&api.config.workspace_id, workdir_id)?
-        {
-            record.materialization_status = "failed".to_string();
-            record.updated_at = now_registry_timestamp();
-            api.store.upsert_workdir_registry(&record)?;
+    } else {
+        for workdir_id in &created_workdir_ids {
+            if let Some(mut record) = api
+                .store
+                .get_workdir_registry(&api.config.workspace_id, workdir_id)?
+            {
+                record.materialization_status = "failed".to_string();
+                record.updated_at = now_registry_timestamp();
+                api.store.upsert_workdir_registry(&record)?;
+            }
         }
     }
     Ok(Json(result))
@@ -16760,19 +16944,25 @@ fn project_workspace_worker(
                 summary.worker.worker_id
             ))
         })?;
-    let working_directory = summary
-        .working_directory
-        .as_ref()
-        .map(|working_directory| {
-            let record =
-                workdir_record_from_summary(api, &summary.worker.runtime_id, working_directory);
-            projected_workdir_summary_from_record(api, &record)
+    let workdir_attachments = summary
+        .workdir_attachments
+        .iter()
+        .map(|attachment| {
+            let record = workdir_record_from_summary(
+                api,
+                &summary.worker.runtime_id,
+                &attachment.working_directory.summary,
+            );
+            Ok(server_api::WorkerWorkdirAttachmentSummary {
+                alias: attachment.alias.to_string(),
+                working_directory: projected_workdir_summary_from_record(api, &record)?.into(),
+            })
         })
-        .transpose()?;
+        .collect::<ApiResult<Vec<_>>>()?;
     Ok(workspace_worker_summary(
         summary,
         resource_key,
-        working_directory.map(Into::into),
+        workdir_attachments,
     ))
 }
 
@@ -17467,7 +17657,7 @@ fn available_working_directory_summaries(
         {
             continue;
         }
-        if summary.occupied_by.is_none() && summary.primary_worker_id.is_none() {
+        if summary.occupied_by.is_none() {
             available.push(summary);
         }
     }
@@ -17576,9 +17766,7 @@ fn record_worker_summary(
             workspace_id: worker.workspace.workspace_id.clone(),
             display_name: Some(worker.display_name.clone()),
             profile: worker.profile.clone(),
-            repository_id: None,
-            repository_key: None,
-            working_directory_id: None,
+            workdir_attachments: Vec::new(),
         };
         api.worker_projection
             .seed_observation(
@@ -17628,7 +17816,7 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> WorkerSummary 
             kind: "backend_worker_registry".to_string(),
             display_hint: "Missing Worker".to_string(),
         },
-        working_directory: None,
+        workdir_attachments: Vec::new(),
         diagnostics: vec![RuntimeDiagnostic {
             code: "backend_worker_missing".to_string(),
             severity: DiagnosticSeverity::Info,
@@ -17691,21 +17879,30 @@ fn merge_worker_registry_projection(
     summary.profile = record.profile.clone();
     summary.pinned = record.retention_state == "pinned";
     summary.retention_state = record.retention_state.clone();
-    summary.working_directory = links.iter().find_map(|link| {
-        workdirs
-            .iter()
-            .find(|workdir| workdir.workdir_id == link.workdir_id)
-            .map(|workdir| {
-                let mut workdir_summary = runtime_workdir_summary_from_record(workdir);
-                workdir_summary.occupied_by = Some(WorkingDirectoryOccupancy {
-                    runtime_id: record.worker.runtime_id.clone(),
-                    worker_id: record.worker.worker_id.clone(),
-                    display_name: record.display_name.clone(),
-                    linked_at: link.linked_at.clone(),
-                });
-                workdir_summary
-            })
-    });
+    summary.workdir_attachments = links
+        .iter()
+        .filter_map(|link| {
+            workdirs
+                .iter()
+                .find(|workdir| workdir.workdir_id == link.workdir_id)
+                .map(|workdir| {
+                    let mut workdir_summary = runtime_workdir_summary_from_record(workdir);
+                    workdir_summary.occupied_by = Some(WorkingDirectoryOccupancy {
+                        runtime_id: record.worker.runtime_id.clone(),
+                        worker_id: record.worker.worker_id.clone(),
+                        display_name: record.display_name.clone(),
+                        linked_at: link.linked_at.clone(),
+                    });
+                    WorkingDirectoryAttachmentStatus {
+                        alias: workdir::WorkdirAttachmentAlias::new(link.alias.clone())
+                            .expect("persisted attachment aliases are validated on write"),
+                        working_directory: worker_runtime::catalog::WorkingDirectoryStatus {
+                            summary: workdir_summary,
+                        },
+                    }
+                })
+        })
+        .collect();
     summary
 }
 
@@ -17720,11 +17917,27 @@ fn sync_worker_observation(
         worker.profile.clone(),
         WorkerRegistryDisplayNamePolicy::PreserveExisting,
     )?;
-    if let Some(working_directory) = worker.working_directory.as_ref() {
+    for attachment in &worker.workdir_attachments {
+        let working_directory = &attachment.working_directory.summary;
         let workdir_record =
             workdir_record_from_summary(api, worker.worker.runtime_id.as_str(), working_directory);
         api.store.upsert_workdir_registry(&workdir_record)?;
-        link_worker_to_workdir(api, &record, &working_directory.working_directory_id, None)?;
+        let links = api
+            .store
+            .list_worker_workdir_links(&api.config.workspace_id, &record.worker)?;
+        if !links.iter().any(|link| {
+            link.unlinked_at.is_none()
+                && link.alias == attachment.alias.as_str()
+                && link.workdir_id == working_directory.working_directory_id
+        }) {
+            link_worker_to_workdir(
+                api,
+                &record,
+                attachment.alias.as_str(),
+                &working_directory.working_directory_id,
+                None,
+            )?;
+        }
     }
     Ok(record)
 }
@@ -17743,6 +17956,7 @@ fn upsert_pending_backend_workdir(
     api.store.upsert_workdir_registry(&WorkdirRegistryRecord {
         workspace_id: api.config.workspace_id.clone(),
         workdir_id: workdir_id.clone(),
+        display_name: request.display_name.clone(),
         runtime_id: runtime_id.to_string(),
         repository_id: request.repository.id.clone(),
         creation_selector: request
@@ -17936,6 +18150,7 @@ fn workdir_record_from_summary(
     WorkdirRegistryRecord {
         workspace_id: api.config.workspace_id.clone(),
         workdir_id: summary.working_directory_id.clone(),
+        display_name: summary.display_name.clone(),
         runtime_id: runtime_id.to_string(),
         repository_id: summary.repository_id.clone(),
         creation_selector: summary.creation_selector.clone(),
@@ -18010,6 +18225,7 @@ fn runtime_workdir_summary_from_record(
     };
     worker_runtime::catalog::WorkingDirectorySummary {
         working_directory_id: record.workdir_id.clone(),
+        display_name: record.display_name.clone(),
         repository_id: record.repository_id.clone(),
         creation_selector: record.creation_selector.clone(),
         creation_ref: record.creation_ref.clone(),
@@ -18026,7 +18242,6 @@ fn runtime_workdir_summary_from_record(
         }),
         status,
         cleanliness: Some(record.cleanliness.clone()),
-        primary_worker_id: None,
         occupied_by: None,
     }
 }
@@ -18045,6 +18260,7 @@ fn workdir_summary_from_record(
     };
     WorkingDirectorySummary {
         working_directory_id: record.workdir_id.clone(),
+        display_name: record.display_name.clone(),
         repository_key: repository_key.to_string(),
         creation_selector: record.creation_selector.clone(),
         creation_ref: record.creation_ref.clone(),
@@ -18061,7 +18277,6 @@ fn workdir_summary_from_record(
         }),
         status,
         cleanliness: Some(record.cleanliness.clone()),
-        primary_worker_id: None,
         occupied_by: None,
     }
 }
@@ -18074,7 +18289,6 @@ fn apply_workdir_occupancy_projection(
         .store
         .list_workdir_worker_links(&api.config.workspace_id, &summary.working_directory_id)?;
     let Some(link) = links.first() else {
-        summary.primary_worker_id = None;
         summary.occupied_by = None;
         return Ok(());
     };
@@ -18088,7 +18302,6 @@ fn apply_workdir_occupancy_projection(
                 link.workdir_id, link.worker.runtime_id, link.worker.worker_id
             ))
         })?;
-    summary.primary_worker_id = None;
     summary.occupied_by = Some(WorkingDirectoryOccupancy {
         runtime_id: link.worker.runtime_id.clone(),
         worker_id: link.worker.worker_id.clone(),
@@ -18114,6 +18327,7 @@ fn projected_workdir_summary_from_record(
 fn link_worker_to_workdir(
     api: &WorkspaceApi,
     worker_record: &WorkerRegistryRecord,
+    alias: &str,
     workdir_id: &str,
     reservation_id: Option<&str>,
 ) -> ApiResult<()> {
@@ -18122,7 +18336,7 @@ fn link_worker_to_workdir(
         workspace_id: api.config.workspace_id.clone(),
         worker: worker_record.worker.clone(),
         workdir_id: workdir_id.to_string(),
-        role: "attachment".to_string(),
+        alias: alias.to_string(),
         linked_at: timestamp,
         unlinked_at: None,
     };
@@ -18138,31 +18352,44 @@ fn link_worker_to_workdir(
     Ok(())
 }
 
-fn validate_working_directory_claim_for_browser(
-    claim: Option<&WorkingDirectoryClaim>,
+fn validate_working_directory_claims_for_browser(
+    claims: &[WorkingDirectoryAttachmentClaim],
 ) -> ApiResult<()> {
-    let Some(claim) = claim else {
-        return Ok(());
-    };
-    if let Some(relative_cwd) = claim.relative_cwd.as_deref() {
-        let path = Path::new(relative_cwd);
-        if path.is_absolute()
-            || path
-                .components()
-                .any(|component| !matches!(component, Component::CurDir | Component::Normal(_)))
-        {
-            return Err(ApiError::with_diagnostics(
-                Error::RuntimeOperationFailed {
-                    runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                    code: "working_directory_relative_cwd_invalid".to_string(),
-                    message: "working directory relative_cwd must stay inside the Runtime-owned working directory".to_string(),
-                },
-                vec![RuntimeDiagnostic {
-                    code: "working_directory_relative_cwd_invalid".to_string(),
-                    severity: DiagnosticSeverity::Error,
-                    message: "relative_cwd must be a relative path without parent traversal".to_string(),
-                }],
+    let mut aliases = HashSet::new();
+    let mut workdir_ids = HashSet::new();
+    for claim in claims {
+        if !aliases.insert(claim.alias.as_str()) {
+            return Err(settings_bad_request(
+                "duplicate_workdir_attachment_alias",
+                "attachment aliases must be unique within one Worker",
             ));
+        }
+        if !workdir_ids.insert(claim.working_directory_id.as_str()) {
+            return Err(settings_bad_request(
+                "duplicate_workdir_attachment",
+                "a Workdir cannot be attached more than once to one Worker",
+            ));
+        }
+        if let Some(relative_cwd) = claim.relative_cwd.as_deref() {
+            let path = Path::new(relative_cwd);
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| !matches!(component, Component::CurDir | Component::Normal(_)))
+            {
+                return Err(ApiError::with_diagnostics(
+                    Error::RuntimeOperationFailed {
+                        runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                        code: "working_directory_relative_cwd_invalid".to_string(),
+                        message: "working directory relative_cwd must stay inside the Runtime-owned working directory".to_string(),
+                    },
+                    vec![RuntimeDiagnostic {
+                        code: "working_directory_relative_cwd_invalid".to_string(),
+                        severity: DiagnosticSeverity::Error,
+                        message: "relative_cwd must be a relative path without parent traversal".to_string(),
+                    }],
+                ));
+            }
         }
     }
     Ok(())
@@ -18670,6 +18897,21 @@ fn working_directory_request_for_browser(
     request: BrowserWorkingDirectoryCreateRequest,
 ) -> ApiResult<WorkingDirectoryRequest> {
     let repository = api.require_configured_workspace_repository_by_key(&request.repository_key)?;
+    let display_name = request
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    if display_name
+        .as_deref()
+        .is_some_and(|name| name.len() > 120 || name.chars().any(char::is_control))
+    {
+        return Err(settings_bad_request(
+            "working_directory_display_name_invalid",
+            "display_name must be at most 120 bytes and contain no control characters",
+        ));
+    }
     let selector = request
         .selector
         .or_else(|| repository.default_selector.clone())
@@ -18683,6 +18925,7 @@ fn working_directory_request_for_browser(
             source_fingerprint: repository.source_fingerprint.clone(),
             selector: selector.map(RuntimeRepositorySelector),
         },
+        display_name,
         materializer: MaterializerKind::RuntimeGitClone,
         backend_workdir_id: None,
         materialization: None,
@@ -19502,6 +19745,7 @@ mod tests {
     fn assigned_workdir_must_be_clean_and_match_published_source() {
         let mut workdir = worker_runtime::catalog::WorkingDirectorySummary {
             working_directory_id: "workdir-1".to_string(),
+            display_name: Some("Ticket checkout".to_string()),
             repository_id: "repository-1".to_string(),
             creation_selector: Some("work/T-549".to_string()),
             creation_ref: Some("abc123".to_string()),
@@ -19515,7 +19759,6 @@ mod tests {
             cleanup_target: None,
             status: worker_runtime::catalog::WorkingDirectoryStatusKind::Active,
             cleanliness: Some("clean".to_string()),
-            primary_worker_id: Some("worker-1".to_string()),
             occupied_by: None,
         };
         assert!(
@@ -20163,6 +20406,7 @@ mod tests {
         let workdir = WorkdirRegistryRecord {
             workspace_id: "workspace-1".to_string(),
             workdir_id: "0000019a00000000000".to_string(),
+            display_name: None,
             runtime_id: "embedded".to_string(),
             repository_id: "repo".to_string(),
             creation_selector: Some("develop".to_string()),
@@ -20181,7 +20425,7 @@ mod tests {
             workspace_id: "workspace-1".to_string(),
             worker: worker.worker.clone(),
             workdir_id: workdir.workdir_id.clone(),
-            role: "attachment".to_string(),
+            alias: "attachment".to_string(),
             linked_at: "4".to_string(),
             unlinked_at: None,
         };
@@ -20189,7 +20433,7 @@ mod tests {
         let projected = merge_worker_registry_projection(None, &worker, vec![link], &[workdir]);
 
         assert_eq!(projected.state, "missing");
-        let working_directory = projected.working_directory.as_ref().unwrap();
+        let working_directory = &projected.workdir_attachments[0].working_directory.summary;
         assert_eq!(
             working_directory.status,
             WorkingDirectoryStatusKind::NotFound
@@ -20204,7 +20448,6 @@ mod tests {
         let occupied_by = working_directory.occupied_by.as_ref().unwrap();
         assert_eq!(occupied_by.runtime_id, "embedded");
         assert_eq!(occupied_by.worker_id, "1");
-        assert!(working_directory.primary_worker_id.is_none());
         let occupancy = serde_json::to_value(occupied_by).unwrap();
         assert_eq!(occupancy["runtime_id"], "embedded");
         assert_eq!(occupancy["worker_id"], "1");
@@ -20431,6 +20674,7 @@ mod tests {
                 source_fingerprint: source_fingerprint.clone(),
                 selector: None,
             },
+            display_name: None,
             materializer: Default::default(),
             backend_workdir_id: Some("workdir-a".to_string()),
             materialization: None,
@@ -20594,12 +20838,15 @@ mod tests {
             initial_submit: vec![Segment::Flow {
                 selector: "builtin:coder-review".to_string(),
             }],
-            working_directory_request: None,
-            resolved_working_directory_request: Some(working_directory_request_from_repository(
-                &foreign_repository,
-                Some("HEAD"),
-            )),
-            resolved_working_directory: None,
+            workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachment_requests: vec![WorkingDirectoryAttachmentRequest {
+                alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
+                working_directory: working_directory_request_from_repository(
+                    &foreign_repository,
+                    Some("HEAD"),
+                ),
+            }],
+            resolved_workdir_attachments: Vec::new(),
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
@@ -20633,10 +20880,11 @@ mod tests {
                 },
             )
             .unwrap();
-        let working_directory = repository_access_launch
-            .resolved_working_directory_request
-            .as_mut()
-            .unwrap();
+        let working_directory = &mut repository_access_launch
+            .resolved_workdir_attachment_requests
+            .first_mut()
+            .unwrap()
+            .working_directory;
         working_directory.backend_workdir_id = Some("working-directory-1".to_string());
         working_directory.materialization =
             Some(worker_runtime::catalog::RepositoryMaterializationContext {
@@ -20670,9 +20918,8 @@ mod tests {
                 ),
             });
 
-        let access = take_new_workdir_repository_access(&mut repository_access_launch)
-            .unwrap()
-            .unwrap();
+        let accesses = take_new_workdir_repository_access(&mut repository_access_launch).unwrap();
+        let access = accesses.first().unwrap();
 
         assert_eq!(access.working_directory_id, "working-directory-1");
         assert!(access.materialization.ssh.is_some());
@@ -20683,9 +20930,9 @@ mod tests {
         assert!(!serialized_access.contains("known_hosts_entry"));
         assert!(
             repository_access_launch
-                .resolved_working_directory_request
-                .as_ref()
-                .and_then(|request| request.materialization.as_ref())
+                .resolved_workdir_attachment_requests
+                .first()
+                .and_then(|attachment| attachment.working_directory.materialization.as_ref())
                 .and_then(|materialization| materialization.ssh.as_ref())
                 .is_none()
         );
@@ -20852,9 +21099,9 @@ mod tests {
             initial_submit: vec![Segment::Flow {
                 selector: "builtin:coder-review".to_string(),
             }],
-            working_directory_request: None,
-            resolved_working_directory_request: None,
-            resolved_working_directory: None,
+            workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachments: Vec::new(),
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
@@ -20905,7 +21152,7 @@ mod tests {
                 initial_submit: vec![Segment::Flow {
                     selector: "builtin:coder-review".to_string(),
                 }],
-                working_directory: None,
+                workdir_attachments: Vec::new(),
                 control_operation_id: None,
             }),
         )
@@ -20961,7 +21208,7 @@ mod tests {
                 initial_submit: vec![Segment::Flow {
                     selector: "builtin:coder-review".to_string(),
                 }],
-                working_directory: None,
+                workdir_attachments: Vec::new(),
                 control_operation_id: None,
             }),
         )
@@ -20994,7 +21241,7 @@ mod tests {
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
-                working_directory: None,
+                workdir_attachments: Vec::new(),
                 control_operation_id: None,
             }),
         )
@@ -21029,7 +21276,7 @@ mod tests {
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
-                working_directory: None,
+                workdir_attachments: Vec::new(),
                 control_operation_id: None,
             }),
         )
@@ -21240,7 +21487,7 @@ mod tests {
                 profile: None,
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
-                working_directory: None,
+                workdir_attachments: Vec::new(),
                 control_operation_id: None,
             }),
         )
@@ -21271,7 +21518,7 @@ mod tests {
             profile: None,
             ticket_assignment: None,
             initial_submit: Vec::new(),
-            working_directory: None,
+            workdir_attachments: Vec::new(),
             control_operation_id: Some("control-spawn-retry".to_string()),
         };
 
@@ -21350,7 +21597,7 @@ mod tests {
                 profile: Some("builtin:orchestrator".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
-                working_directory: None,
+                workdir_attachments: Vec::new(),
                 control_operation_id: None,
             }),
         )
@@ -21367,7 +21614,7 @@ mod tests {
                 profile: Some("builtin:orchestrator".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
-                working_directory: None,
+                workdir_attachments: Vec::new(),
                 control_operation_id: None,
             }),
         )
@@ -21541,6 +21788,7 @@ mod tests {
             .upsert_workdir_registry(&WorkdirRegistryRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 workdir_id: "managed".to_string(),
+                display_name: Some("Managed checkout".to_string()),
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 repository_id: "repo".to_string(),
                 creation_selector: None,
@@ -21560,6 +21808,7 @@ mod tests {
             .upsert_workdir_registry(&WorkdirRegistryRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 workdir_id: "runtime-direct".to_string(),
+                display_name: None,
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 repository_id: "repo".to_string(),
                 creation_selector: None,
@@ -21595,7 +21844,7 @@ mod tests {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 worker: RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, "7"),
                 workdir_id: "managed".to_string(),
-                role: "attachment".to_string(),
+                alias: "attachment".to_string(),
                 linked_at: "3".to_string(),
                 unlinked_at: None,
             })
@@ -21634,6 +21883,7 @@ mod tests {
         let workdir = WorkdirRegistryRecord {
             workspace_id: "workspace-1".to_string(),
             workdir_id: "runtime-direct".to_string(),
+            display_name: None,
             runtime_id: "embedded".to_string(),
             repository_id: "repo".to_string(),
             creation_selector: None,
@@ -22217,23 +22467,14 @@ mod tests {
                     ),
                 );
             }
-            let working_directory = match request.request.working_directory.as_ref() {
-                Some(claim) => match self.materializer.bind_working_directory(
-                    &claim.working_directory_id,
-                    claim.relative_cwd.as_deref(),
-                ) {
-                    Ok(binding) => Some(binding.status()),
-                    Err(diagnostic) => {
-                        return worker_runtime::execution::WorkerExecutionSpawnResult::Rejected(
-                            worker_runtime::execution::WorkerExecutionResult::rejected(
-                                worker_runtime::execution::WorkerExecutionOperation::Spawn,
-                                diagnostic.to_string(),
-                            ),
-                        );
-                    }
-                },
-                None => None,
-            };
+            let workdir_attachments = request
+                .workdir_attachments
+                .iter()
+                .map(|(alias, binding)| WorkingDirectoryAttachmentStatus {
+                    alias: alias.clone(),
+                    working_directory: binding.status(),
+                })
+                .collect();
             self.contexts
                 .lock()
                 .unwrap()
@@ -22246,7 +22487,7 @@ mod tests {
                 worker_state: protocol::WorkerStateSnapshot {
                     ..protocol::WorkerStatus::Idle.into()
                 },
-                working_directory,
+                workdir_attachments,
             }
         }
 
@@ -22507,6 +22748,7 @@ mod tests {
         let foreign = WorkdirRegistryRecord {
             workspace_id: "other-workspace".to_string(),
             workdir_id: "foreign-workdir".to_string(),
+            display_name: None,
             runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
             repository_id: "foreign-repository".to_string(),
             creation_selector: None,
@@ -24059,9 +24301,9 @@ mod tests {
                     profile: ProfileSelector::Builtin(MEMORY_CONSOLIDATION_PROFILE.to_string()),
                     ticket_assignment: None,
                     initial_submit: Vec::new(),
-                    working_directory_request: None,
-                    resolved_working_directory_request: None,
-                    resolved_working_directory: None,
+                    workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachments: Vec::new(),
                     resolved_config_bundle,
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
@@ -24288,9 +24530,9 @@ mod tests {
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
                     ticket_assignment: None,
                     initial_submit: Vec::new(),
-                    working_directory_request: None,
-                    resolved_working_directory_request: None,
-                    resolved_working_directory: None,
+                    workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachments: Vec::new(),
                     resolved_config_bundle: None,
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
@@ -24633,9 +24875,9 @@ mod tests {
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
                     ticket_assignment: None,
                     initial_submit: Vec::new(),
-                    working_directory_request: None,
-                    resolved_working_directory_request: None,
-                    resolved_working_directory: None,
+                    workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachments: Vec::new(),
                     resolved_config_bundle: None,
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
@@ -24736,9 +24978,9 @@ mod tests {
             profile: ProfileSelector::Builtin("builtin:coder".to_string()),
             ticket_assignment: None,
             initial_submit: Vec::new(),
-            working_directory_request: None,
-            resolved_working_directory_request: None,
-            resolved_working_directory: None,
+            workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachments: Vec::new(),
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
@@ -25361,9 +25603,9 @@ mod tests {
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
                     ticket_assignment: None,
                     initial_submit: Vec::new(),
-                    working_directory_request: None,
-                    resolved_working_directory_request: None,
-                    resolved_working_directory: None,
+                    workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachments: Vec::new(),
                     resolved_config_bundle: None,
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
@@ -25427,9 +25669,9 @@ mod tests {
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
                     ticket_assignment: None,
                     initial_submit: Vec::new(),
-                    working_directory_request: None,
-                    resolved_working_directory_request: None,
-                    resolved_working_directory: None,
+                    workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachments: Vec::new(),
                     resolved_config_bundle: None,
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
@@ -25775,9 +26017,9 @@ mod tests {
             initial_submit: vec![Segment::Flow {
                 selector: "builtin:coder-review".to_string(),
             }],
-            working_directory_request: None,
-            resolved_working_directory_request: None,
-            resolved_working_directory: None,
+            workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachments: Vec::new(),
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
@@ -26057,9 +26299,9 @@ mod tests {
             initial_submit: vec![Segment::Flow {
                 selector: "builtin:coder-review".to_string(),
             }],
-            working_directory_request: None,
-            resolved_working_directory_request: None,
-            resolved_working_directory: None,
+            workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachments: Vec::new(),
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
@@ -27021,9 +27263,9 @@ mod tests {
                     ),
                     ticket_assignment: None,
                     initial_submit: Vec::new(),
-                    working_directory_request: None,
-                    resolved_working_directory_request: None,
-                    resolved_working_directory: None,
+                    workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachments: Vec::new(),
                     resolved_config_bundle: Some(runtime_test_bundle()),
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
@@ -27079,9 +27321,9 @@ mod tests {
                     ),
                     ticket_assignment: None,
                     initial_submit: Vec::new(),
-                    working_directory_request: None,
-                    resolved_working_directory_request: None,
-                    resolved_working_directory: None,
+                    workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachments: Vec::new(),
                     resolved_config_bundle: Some(runtime_test_bundle()),
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
@@ -27653,6 +27895,7 @@ mod tests {
             .upsert_workdir_registry(&WorkdirRegistryRecord {
                 workspace_id: api.config.workspace_id.clone(),
                 workdir_id: workdir_id.to_string(),
+                display_name: None,
                 runtime_id: "runtime-test".to_string(),
                 repository_id: "repo-test".to_string(),
                 creation_selector: Some("HEAD".to_string()),
@@ -27759,7 +28002,7 @@ mod tests {
                 workspace_id: api.config.workspace_id.clone(),
                 worker: RuntimeWorkerRef::new("runtime-test", runtime_worker_id.to_string()),
                 workdir_id: workdir_id.to_string(),
-                role: "attachment".to_string(),
+                alias: "attachment".to_string(),
                 linked_at: now_registry_timestamp(),
                 unlinked_at: None,
             })
@@ -27803,10 +28046,12 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri(format!(
-                        "/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-attachment"
+                        "/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-attachments"
                     ))
                     .header("content-type", "application/json")
-                    .body(Body::from(json!({"workdir_id": "wd"}).to_string()))
+                    .body(Body::from(
+                        json!({"alias": "checkout", "working_directory_id": "wd"}).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -29033,7 +29278,7 @@ mod tests {
                     can_stop: true,
                     can_spawn_followup: false,
                 },
-                working_directory: None,
+                workdir_attachments: Vec::new(),
                 diagnostics: Vec::new(),
             }
         }
@@ -29130,7 +29375,7 @@ mod tests {
                     can_stop: true,
                     can_spawn_followup: false,
                 },
-                working_directory: None,
+                workdir_attachments: Vec::new(),
                 diagnostics: Vec::new(),
             }],
             None,
@@ -29459,8 +29704,8 @@ mod tests {
                 digest: bundle.metadata.digest,
             }),
             initial_input: None,
-            working_directory_request: None,
-            working_directory: None,
+            workdir_attachment_requests: Vec::new(),
+            workdir_attachments: Vec::new(),
             worker_observation_enabled: false,
             worker_observation_grants: Vec::new(),
             workspace_api: None,
@@ -29522,6 +29767,7 @@ mod tests {
             &repository_id,
             Some("HEAD"),
             Some(EMBEDDED_WORKER_RUNTIME_ID),
+            None,
             &repository.source_fingerprint,
             repository.source_revision,
         );
@@ -29828,10 +30074,11 @@ mod tests {
                 "display_name": "Coding Worker",
                 "profile": "builtin:coder",
                 "initial_submit": [],
-                "working_directory": {
+                "workdir_attachments": [{
+                    "alias": "workdir",
                     "working_directory_id": working_directory_id,
                     "relative_cwd": "../escape"
-                }
+                }]
             })),
             StatusCode::BAD_REQUEST,
         )
@@ -30695,10 +30942,13 @@ mod tests {
                     "kind": "builtin",
                     "value": "builtin:coder"
                 },
-                "working_directory_request": {
-                    "repository_key": "test-repository",
-                    "selector": "HEAD"
-                }
+                "workdir_attachment_requests": [{
+                    "alias": "workdir",
+                    "working_directory": {
+                        "repository_key": "test-repository",
+                        "selector": "HEAD"
+                    }
+                }]
             })),
             StatusCode::BAD_REQUEST,
         )
@@ -31397,9 +31647,9 @@ mod tests {
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
                     ticket_assignment: None,
                     initial_submit: Vec::new(),
-                    working_directory_request: None,
-                    resolved_working_directory_request: None,
-                    resolved_working_directory: None,
+                    workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachments: Vec::new(),
                     resolved_config_bundle: None,
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
@@ -31682,6 +31932,7 @@ mod tests {
             .upsert_workdir_registry(&WorkdirRegistryRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 workdir_id: workdir_id.to_string(),
+                display_name: None,
                 runtime_id: "external-workdir-runtime".to_string(),
                 repository_id,
                 creation_selector: None,
@@ -31702,7 +31953,7 @@ mod tests {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 worker: RuntimeWorkerRef::new("embedded-worker-runtime", &worker_id),
                 workdir_id: workdir_id.to_string(),
-                role: "attachment".to_string(),
+                alias: "attachment".to_string(),
                 linked_at: "2".to_string(),
                 unlinked_at: None,
             })
@@ -31976,9 +32227,9 @@ mod tests {
             ),
             ticket_assignment: None,
             initial_submit: Vec::new(),
-            working_directory_request: None,
-            resolved_working_directory_request: None,
-            resolved_working_directory: None,
+            workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachments: Vec::new(),
             resolved_config_bundle: Some(runtime_test_bundle()),
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
@@ -32000,14 +32251,14 @@ mod tests {
             .find(|projection| projection.registry.worker.worker_id == worker_id)
             .and_then(|projection| projection.observation.as_ref())
             .expect("spawned Worker observation exists");
-        assert!(observation.worker.repository_id.is_none());
-        assert!(observation.worker.working_directory_id.is_none());
+        assert!(observation.worker.workdir_attachments.is_empty());
 
         let workdir_id = "001a0b415233500000c";
         api.store
             .upsert_workdir_registry(&WorkdirRegistryRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 workdir_id: workdir_id.to_string(),
+                display_name: None,
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 repository_id: test_repository_id(&api),
                 creation_selector: Some("HEAD".to_string()),
@@ -32028,7 +32279,7 @@ mod tests {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 worker: RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, &worker_id),
                 workdir_id: workdir_id.to_string(),
-                role: "attachment".to_string(),
+                alias: "attachment".to_string(),
                 linked_at: "1".to_string(),
                 unlinked_at: None,
             })
@@ -32079,16 +32330,16 @@ mod tests {
             .find(|worker| worker.worker_id.as_str() == worker_id)
             .expect("spawned Worker is projected");
         assert_eq!(projected_worker.resource_key.as_deref(), Some("W-1"));
+        assert_eq!(projected_worker.workdir_attachments.len(), 1);
+        let projected_attachment = &projected_worker.workdir_attachments[0];
+        assert_eq!(projected_attachment.alias, "attachment");
         assert_eq!(
-            projected_worker.repository_key.as_deref(),
+            projected_attachment.repository_key.as_deref(),
             Some("test-repository")
         );
         assert_eq!(
-            projected_worker
-                .working_directory_id
-                .as_ref()
-                .map(|workdir_id| workdir_id.as_str()),
-            Some(workdir_id)
+            projected_attachment.working_directory_id.as_str(),
+            workdir_id
         );
 
         projection_api
@@ -32123,8 +32374,7 @@ mod tests {
             other => panic!("expected Worker upsert after Workdir detach, got {other:?}"),
         };
         assert_eq!(detached_worker.worker_id.as_str(), worker_id);
-        assert!(detached_worker.repository_key.is_none());
-        assert!(detached_worker.working_directory_id.is_none());
+        assert!(detached_worker.workdir_attachments.is_empty());
 
         let subscribe_protocol = protocol::subscription::SubscriptionFrame::new(
             protocol::subscription::SubscriptionFramePayload::Request(
@@ -32612,6 +32862,7 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
             items: vec![
                 WorkingDirectorySummary {
                     working_directory_id: "wd-1".to_string(),
+                    display_name: Some("Checkout".to_string()),
                     repository_key: "main".to_string(),
                     creation_selector: None,
                     creation_ref: None,
@@ -32624,7 +32875,6 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
                     cleanup_target: None,
                     status: WorkingDirectoryStatusKind::Active,
                     cleanliness: Some("clean".to_string()),
-                    primary_worker_id: None,
                     occupied_by: Some(WorkingDirectoryOccupancy {
                         runtime_id: "arcadia".to_string(),
                         worker_id: "worker-opaque-64".to_string(),

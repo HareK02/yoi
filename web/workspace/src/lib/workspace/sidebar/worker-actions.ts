@@ -7,13 +7,14 @@ import type {
 } from "./types";
 
 type FetchFn = typeof fetch;
+type WorkerActionTarget = Pick<Worker, "runtime_id" | "worker_id" | "state">;
 
 type WorkerLifecycleResponse = {
   state: string;
   diagnostics?: Diagnostic[];
 };
 
-function workerPath(workspaceId: string, worker: Worker): string {
+function workerPath(workspaceId: string, worker: WorkerActionTarget): string {
   return workspaceApiPath(
     workspaceId,
     `/runtimes/${encodeURIComponent(worker.runtime_id)}/workers/${
@@ -45,13 +46,13 @@ function diagnosticMessage(
     fallback;
 }
 
-export function canDeleteSidebarWorker(worker: Worker): boolean {
+export function canDeleteSidebarWorker(worker: WorkerActionTarget): boolean {
   return worker.state === "stopped";
 }
 
 export async function stopSidebarWorker(
   workspaceId: string,
-  worker: Worker,
+  worker: WorkerActionTarget,
   fetchFn: FetchFn = fetch,
 ): Promise<void> {
   const response = await fetchFn(`${workerPath(workspaceId, worker)}/stop`, {
@@ -71,7 +72,7 @@ export async function stopSidebarWorker(
 
 export async function deleteSidebarWorker(
   workspaceId: string,
-  worker: Worker,
+  worker: WorkerActionTarget,
   fetchFn: FetchFn = fetch,
 ): Promise<void> {
   const runtimePath = `/runtimes/${encodeURIComponent(worker.runtime_id)}`;

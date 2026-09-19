@@ -57,7 +57,6 @@ const options: WorkerLaunchOptionsResponse = {
       materializer_kind: "runtime_git_clone",
       status: "active",
       cleanliness: "clean",
-      primary_worker_id: null,
       cleanup_target: {
         kind: "runtime_git_clone",
         working_directory_id: "wd-1-repo",
@@ -180,7 +179,7 @@ Deno.test("defaultWorkerLaunchForm preserves a Ticket repository target", () => 
   assertEquals(form.working_directory_selector, "work/ticket");
 });
 
-Deno.test("buildCreateWorkspaceWorkerRequest sends working_directory id and relative cwd only", () => {
+Deno.test("buildCreateWorkspaceWorkerRequest sends one aliased attachment", () => {
   const request = buildCreateWorkspaceWorkerRequest({
     runtime_id: "embedded",
     display_name: "Worker",
@@ -198,10 +197,11 @@ Deno.test("buildCreateWorkspaceWorkerRequest sends working_directory id and rela
     profile: "builtin:coder",
     ticket_assignment: null,
     initial_submit: [{ kind: "text", content: "go" }],
-    working_directory: {
+    workdir_attachments: [{
+      alias: "workdir",
       working_directory_id: "wd-1-repo",
       relative_cwd: "crates/yoi",
-    },
+    }],
     control_operation_id: null,
   });
 });
@@ -221,7 +221,7 @@ Deno.test("buildCreateWorkspaceWorkerRequest sends no initial segments for an em
   assertEquals(request.initial_submit, []);
 });
 
-Deno.test("buildCreateWorkspaceWorkerRequest emits null for embedded no-workdir launches", () => {
+Deno.test("buildCreateWorkspaceWorkerRequest emits an empty attachment list for workdirless launches", () => {
   const request = buildCreateWorkspaceWorkerRequest({
     runtime_id: "embedded",
     display_name: "Worker",
@@ -239,7 +239,7 @@ Deno.test("buildCreateWorkspaceWorkerRequest emits null for embedded no-workdir 
     profile: "builtin:companion",
     ticket_assignment: null,
     initial_submit: [{ kind: "text", content: "chat" }],
-    working_directory: null,
+    workdir_attachments: [],
     control_operation_id: null,
   });
 });

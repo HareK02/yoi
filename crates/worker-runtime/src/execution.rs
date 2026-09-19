@@ -12,6 +12,7 @@ use crate::observation::WorkerObservationEvent;
 use crate::working_directory::{WorkingDirectoryBinding, WorkingDirectoryDiagnostic};
 use protocol::{Method, UploadedFileRef};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use workdir::WorkdirSessionHandle;
@@ -246,7 +247,7 @@ pub struct WorkerExecutionSpawnRequest {
     pub request: crate::catalog::CreateWorkerRequest,
     pub workspace_scope: Option<crate::runtime::RuntimeWorkspaceScope>,
     pub context: WorkerExecutionContext,
-    pub working_directory: Option<WorkingDirectoryBinding>,
+    pub workdir_attachments: BTreeMap<workdir::WorkdirAttachmentAlias, WorkingDirectoryBinding>,
     pub config_bundle: Option<ConfigBundle>,
 }
 
@@ -257,8 +258,8 @@ pub struct WorkerExecutionRestoreRequest {
     pub request: crate::catalog::CreateWorkerRequest,
     pub workspace_scope: Option<crate::runtime::RuntimeWorkspaceScope>,
     pub context: WorkerExecutionContext,
-    pub previous_working_directory: Option<WorkingDirectoryStatus>,
-    pub working_directory: Option<WorkingDirectoryBinding>,
+    pub previous_workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
+    pub workdir_attachments: BTreeMap<workdir::WorkdirAttachmentAlias, WorkingDirectoryBinding>,
     pub config_bundle: Option<ConfigBundle>,
 }
 
@@ -284,7 +285,7 @@ pub enum WorkerExecutionSpawnResult {
     Connected {
         handle: WorkerExecutionHandle,
         worker_state: protocol::WorkerStateSnapshot,
-        working_directory: Option<WorkingDirectoryStatus>,
+        workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
     },
     /// A read-only preflight rejected the operation before live work started.
     Rejected(WorkerExecutionResult),
@@ -297,7 +298,7 @@ pub enum WorkerExecutionSpawnResult {
         result: WorkerExecutionResult,
         handle: Option<WorkerExecutionHandle>,
         worker_state: Option<protocol::WorkerStateSnapshot>,
-        working_directory: Option<WorkingDirectoryStatus>,
+        workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
     },
     /// Legacy spawn failure. Restore implementations must use `RolledBack` or
     /// `ReconciliationRequired` after crossing their live side-effect boundary.
@@ -308,12 +309,12 @@ impl WorkerExecutionSpawnResult {
     pub fn connected(
         handle: WorkerExecutionHandle,
         worker_state: protocol::WorkerStateSnapshot,
-        working_directory: Option<WorkingDirectoryStatus>,
+        workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
     ) -> Self {
         Self::Connected {
             handle,
             worker_state,
-            working_directory,
+            workdir_attachments,
         }
     }
 }
