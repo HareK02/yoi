@@ -1,18 +1,28 @@
-import type { CreateWorkspaceWorkerRequest } from "$lib/generated/worker-launch-api";
+import type {
+  BrowserWorkerWorkingDirectorySelection,
+  CreateWorkspaceWorkerRequest,
+} from "$lib/generated/worker-launch-api";
 import { parseCreateWorkspaceWorkerRequest } from "$lib/workspace/api/workers";
 
 import type { WorkerLaunchOptionsResponse } from "./types";
+
+export type WorkerLaunchAttachmentFormState = {
+  alias: string;
+  working_directory_id: string;
+  relative_cwd: string;
+};
 
 export type WorkerLaunchFormState = {
   runtime_id: string;
   display_name: string;
   profile: string;
   initial_text: string;
-  working_directory_id: string;
+  workdir_attachments: WorkerLaunchAttachmentFormState[];
   working_directory_repository_key: string;
   working_directory_selector: string;
-  relative_cwd: string;
 };
+
+const WORKDIR_ALIAS_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 export function defaultWorkerLaunchForm(
   options: WorkerLaunchOptionsResponse | null,
@@ -59,6 +69,27 @@ export function defaultWorkerLaunchForm(
       repository.repository_key === current.working_directory_repository_key
     ) ??
       options?.repositories[0];
+  const availableWorkdirIds = new Set(
+    availableWorkingDirectories.map((directory) =>
+      directory.working_directory_id
+    ),
+  );
+  const currentAttachments = workdirlessRuntime
+    ? []
+    : current.workdir_attachments.filter((attachment) =>
+      availableWorkdirIds.has(attachment.working_directory_id)
+    );
+  const workdirAttachments = currentAttachments.length > 0
+    ? currentAttachments
+    : preferredWorkingDirectory
+    ? [{
+      alias: "workdir",
+      working_directory_id: preferredWorkingDirectory.working_directory_id,
+      relative_cwd: "",
+    }]
+    : selectedRuntime?.working_directory_required === true
+    ? [{ alias: "workdir", working_directory_id: "", relative_cwd: "" }]
+    : [];
 
   return {
     runtime_id: current.runtime_id || preferredRuntime?.runtime_id || "",
@@ -68,20 +99,66 @@ export function defaultWorkerLaunchForm(
         ? current.profile
         : preferredProfile?.id || "",
     initial_text: current.initial_text,
-    working_directory_id:
-      !workdirlessRuntime && availableWorkingDirectories.some(
-          (directory) =>
-            directory.working_directory_id === current.working_directory_id,
-        )
-        ? current.working_directory_id
-        : preferredWorkingDirectory?.working_directory_id || "",
+    workdir_attachments: workdirAttachments,
     working_directory_repository_key:
       current.working_directory_repository_key ||
       preferredRepository?.repository_key || "",
     working_directory_selector: current.working_directory_selector ||
       preferredRepository?.default_selector || "HEAD",
-    relative_cwd: current.relative_cwd,
   };
+}
+
+export function workerLaunchAttachmentError(
+  attachments: WorkerLaunchAttachmentFormState[],
+): string | null {
+  const aliases = new Set<string>();
+  const workdirIds = new Set<string>();
+
+  for (const [index, attachment] of attachments.entries()) {
+    const position = index + 1;
+    const alias = attachment.alias.trim();
+    const workdirId = attachment.working_directory_id.trim();
+    const relativeCwd = attachment.relative_cwd.trim();
+
+    if (!WORKDIR_ALIAS_PATTERN.test(alias)) {
+      return `Attachment ${position} alias must be 1–64 ASCII letters, digits, dots, underscores, or hyphens, and start with a letter or digit.`;
+    }
+    if (aliases.has(alias)) {
+      return `Attachment alias “${alias}” is used more than once.`;
+    }
+    aliases.add(alias);
+
+    if (!workdirId) {
+      return `Attachment ${position} must select a Workdir.`;
+    }
+    if (workdirIds.has(workdirId)) {
+      return "A Workdir cannot be attached more than once to one Worker.";
+    }
+    workdirIds.add(workdirId);
+
+    if (
+      relativeCwd.startsWith("/") ||
+      relativeCwd.split("/").some((component) => component === "..")
+    ) {
+      return `Attachment ${position} relative cwd must stay inside the selected Workdir.`;
+    }
+  }
+
+  return null;
+}
+
+function validatedAttachments(
+  attachments: WorkerLaunchAttachmentFormState[],
+): BrowserWorkerWorkingDirectorySelection[] {
+  const error = workerLaunchAttachmentError(attachments);
+  if (error) {
+    throw new Error(error);
+  }
+  return attachments.map((attachment) => ({
+    alias: attachment.alias.trim(),
+    working_directory_id: attachment.working_directory_id.trim(),
+    relative_cwd: attachment.relative_cwd.trim() || null,
+  }));
 }
 
 export function buildCreateWorkspaceWorkerRequest(
@@ -96,13 +173,7 @@ export function buildCreateWorkspaceWorkerRequest(
     initial_submit: initialMessage
       ? [{ kind: "text", content: form.initial_text }]
       : [],
-    workdir_attachments: form.working_directory_id
-      ? [{
-        alias: "workdir",
-        working_directory_id: form.working_directory_id,
-        relative_cwd: form.relative_cwd.trim() || null,
-      }]
-      : [],
+    workdir_attachments: validatedAttachments(form.workdir_attachments),
     control_operation_id: null,
   });
 }

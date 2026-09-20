@@ -161,14 +161,23 @@ impl Tracker {
     }
 
     /// Return a view whose read-before-mutation state is isolated to one
-    /// Worker-local attachment alias while aggregate recency/change statistics
-    /// remain shared with the Worker tracker.
+    /// attachment incarnation (the Worker-local alias plus router generation),
+    /// while aggregate recency/change statistics remain shared with the Worker
+    /// tracker.
     pub fn scoped(&self, namespace: impl Into<String>) -> Self {
         Self {
             inner: self.inner.clone(),
             mutations: self.mutations.clone(),
             namespace: Some(Arc::from(namespace.into())),
         }
+    }
+
+    pub(crate) fn scoped_attachment(
+        &self,
+        alias: &workdir::WorkdirAttachmentAlias,
+        generation: u64,
+    ) -> Self {
+        self.scoped(format!("{}#{generation}", alias.as_str()))
     }
 
     fn key(&self, path: PathBuf) -> TrackedPath {

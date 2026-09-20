@@ -340,6 +340,66 @@ async fn routed_tools_observe_detach_after_registration() {
 }
 
 #[tokio::test]
+async fn detach_and_reattach_same_alias_requires_a_fresh_read() {
+    let first = TempDir::new().unwrap();
+    let second = TempDir::new().unwrap();
+    let spill = TempDir::new().unwrap();
+    std::fs::write(first.path().join("same.txt"), "same bytes\n").unwrap();
+    std::fs::write(second.path().join("same.txt"), "same bytes\n").unwrap();
+
+    let router = Arc::new(WorkdirSessionRouter::new());
+    let alias = WorkdirAttachmentAlias::new("checkout").unwrap();
+    router
+        .attach(
+            alias.clone(),
+            Arc::new(LocalWorkdirSession::new(
+                scope_with_spill(first.path(), spill.path()),
+                first.path().to_path_buf(),
+            )),
+        )
+        .unwrap();
+    let reg = Registry::new(routed_builtin_tools(
+        router.clone(),
+        Tracker::new(),
+        spill.path().to_path_buf(),
+    ));
+    call(
+        &reg.get("Read"),
+        json!({ "target_workdir": "checkout", "file_path": "same.txt" }),
+    )
+    .await;
+
+    router.detach(&alias).await.unwrap();
+    router
+        .attach(
+            alias.clone(),
+            Arc::new(LocalWorkdirSession::new(
+                scope_with_spill(second.path(), spill.path()),
+                second.path().to_path_buf(),
+            )),
+        )
+        .unwrap();
+
+    let error = call_err(
+        &reg.get("Edit"),
+        json!({
+            "target_workdir": "checkout",
+            "file_path": "same.txt",
+            "old_string": "same",
+            "new_string": "changed"
+        }),
+    )
+    .await;
+    assert!(error.to_string().contains("has not been read"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(second.path().join("same.txt")).unwrap(),
+        "same bytes\n"
+    );
+
+    router.close_all().await.unwrap();
+}
+
+#[tokio::test]
 async fn view_image_reads_scoped_bytes_into_durable_tool_detail() {
     let dir = TempDir::new().unwrap();
     let spill = TempDir::new().unwrap();

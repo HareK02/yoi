@@ -49,7 +49,9 @@ impl Tool for WriteTool {
             params.target_workdir.as_deref(),
             workdir::WorkdirSessionCapability::Write,
         )?;
-        let tracker = self.tracker.scoped(selected.alias.as_str());
+        let tracker = self
+            .tracker
+            .scoped_attachment(&selected.alias, selected.generation);
         let path = WorkdirPath::new(&params.file_path).map_err(ToolsError::from)?;
         tracing::debug!(path = %path, bytes = params.content.len(), "Write");
 

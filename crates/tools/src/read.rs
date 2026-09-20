@@ -53,7 +53,9 @@ impl Tool for ReadTool {
             params.target_workdir.as_deref(),
             workdir::WorkdirSessionCapability::Read,
         )?;
-        let tracker = self.tracker.scoped(selected.alias.as_str());
+        let tracker = self
+            .tracker
+            .scoped_attachment(&selected.alias, selected.generation);
         let offset = params.offset.unwrap_or(0);
         let limit = params.limit.unwrap_or(DEFAULT_LIMIT).max(1);
 
@@ -216,7 +218,7 @@ mod tests {
         // History recorded
         assert!(
             tracker
-                .scoped("workdir")
+                .scoped_attachment(&workdir::WorkdirAttachmentAlias::new("workdir").unwrap(), 0,)
                 .expected_workdir_hash(&WorkdirPath::new("a.txt").unwrap())
                 .is_ok()
         );
@@ -247,7 +249,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_tool_missing_file() {
-        let (dir, fs, tracker) = setup();
+        let (_dir, fs, tracker) = setup();
         let def = read_tool(fs, tracker);
         let (_, tool) = def();
         let input = serde_json::json!({
