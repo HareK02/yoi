@@ -45,9 +45,9 @@ use crate::compact::state::{
 };
 use crate::compact::telemetry::{
     CompactAttempt, CompactFailureCategory, CompactMode, CompactSuccessStats,
-    CompactThresholdPolicy, correlated_post_request_metric, new_compact_metric_correlation_id,
+    CompactThresholdPolicy, new_compact_metric_correlation_id,
 };
-use crate::compact::usage_tracker::UsageTracker;
+use crate::compact::usage_tracker::{UsageTracker, persist_pending_usage};
 use crate::feature::background::{BackgroundTaskRewriteGuard, FeatureBackgroundTaskRegistry};
 use crate::feature::builtin::memory::WorkspaceMemoryBackendError;
 use crate::feature::builtin::{TaskFeature, WorkerObservationProvider};
@@ -1946,6 +1946,28 @@ impl PendingSubmissionHandle<session_store::FsStore> {
 pub trait SystemItemCommitter: Send + Sync {
     fn commit_log_entry(&self, entry: LogEntry) -> Result<(), StoreError>;
 
+    /// Commit one authoritative usage record while holding the same append
+    /// barrier across its in-memory publication, guard rearm, and correlated
+    /// post-request metrics. Metric appends remain best-effort.
+    fn commit_usage_boundary(
+        &self,
+        entry: LogEntry,
+        after_commit: &mut dyn FnMut(),
+        post_metrics: &[session_metrics::Metric],
+    ) -> Result<(), StoreError> {
+        self.commit_log_entry(entry)?;
+        after_commit();
+        for metric in post_metrics {
+            let payload = serde_json::to_value(metric).expect("Metric is Serialize");
+            let _ = self.commit_log_entry(LogEntry::Extension {
+                ts: segment_log::now_millis(),
+                domain: session_metrics::DOMAIN.into(),
+                payload,
+            });
+        }
+        Ok(())
+    }
+
     fn commit_system_item_with_extensions(
         &self,
         item: SystemItem,
@@ -1976,6 +1998,30 @@ where
 {
     fn commit_log_entry(&self, entry: LogEntry) -> Result<(), StoreError> {
         self.append_entry(entry)
+    }
+
+    fn commit_usage_boundary(
+        &self,
+        entry: LogEntry,
+        after_commit: &mut dyn FnMut(),
+        post_metrics: &[session_metrics::Metric],
+    ) -> Result<(), StoreError> {
+        let _append_guard = self
+            .state
+            .append_lock
+            .lock()
+            .expect("segment append lock poisoned");
+        self.append_entry_locked(entry)?;
+        after_commit();
+        for metric in post_metrics {
+            let payload = serde_json::to_value(metric).expect("Metric is Serialize");
+            let _ = self.append_entry_locked(LogEntry::Extension {
+                ts: segment_log::now_millis(),
+                domain: session_metrics::DOMAIN.into(),
+                payload,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -2154,16 +2200,16 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// Shared compaction state (present when threshold is configured).
     compact_state: Option<Arc<CompactState>>,
     /// Per-LLM-request Usage tracker. Always present after construction.
-    /// Captures `(history_len, UsageEvent)` pairs during a run; drained
-    /// in `persist_turn` and persisted as `LogEntry::LlmUsage` entries.
+    /// Captures `(history_len, UsageEvent)` pairs until their authoritative
+    /// request-boundary or terminal `LlmUsage` append succeeds.
     usage_tracker: Arc<UsageTracker>,
     /// Sync-side buffer for `Metric` values queued from inside Engine
-    /// callbacks (currently the prune observer). Drained in `persist_turn`
-    /// and written via `session_metrics::record_metric` alongside
-    /// `LogEntry::LlmUsage`. Always present after construction.
+    /// callbacks (currently the prune observer). Drained at the same request
+    /// boundary as usage, with terminal `persist_turn` as the fallback.
     metrics_tracker: Arc<crate::compact::metrics_tracker::MetricsTracker>,
     /// Cumulative Usage measurement timeline, one entry per LLM call.
-    /// Restored from session log on `restore`, appended on each persist.
+    /// Restored from session log on `restore`, appended after each durable
+    /// request-boundary usage commit.
     /// Read by token-accounting APIs (`Worker::total_tokens`, etc.).
     ///
     /// Wrapped in `Arc<Mutex>` so that callbacks injected into the
@@ -3546,6 +3592,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 self.pending_committed_history.clone(),
             )
             .with_usage_tracker(self.usage_tracker.clone())
+            .with_metrics_tracker(self.metrics_tracker.clone())
             .with_prompt_workspace_id(
                 self.workspace_context
                     .workspace_id()
@@ -5008,45 +5055,38 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             self.try_record_metric(&metric);
         }
 
-        // Persist any LLM Usage measurements collected during this run.
-        // One LogEntry::LlmUsage per LLM call (the tool loop may have run
-        // many calls within a single Worker::run). Each is also appended to
-        // the in-memory `usage_history` so token-accounting APIs see it
-        // before the next run. Records carrying a `correlation_id` (set
-        // by an upstream observer such as the prune projection) also get
-        // a paired `prune.post_request` metric so cache_read/write can be
-        // joined back to the originating event.
-        let usage_records = self.usage_tracker.drain();
-        for recorded in usage_records {
-            let crate::compact::usage_tracker::RecordedUsage {
-                record,
-                post_requests,
-            } = recorded;
-            let committed_post_compact_request = post_requests.iter().any(|link| {
-                link.metric == crate::compact::usage_tracker::PostRequestMetric::Compaction
-            });
-            self.commit_entry(LogEntry::LlmUsage {
-                ts: segment_log::now_millis(),
-                history_len: record.history_len,
-                input_total_tokens: record.input_total_tokens,
-                cache_read_tokens: record.cache_read_tokens,
-                cache_write_tokens: record.cache_write_tokens,
-                output_tokens: record.output_tokens,
-            })?;
-            if committed_post_compact_request {
-                if let Some(state) = &self.compact_state {
-                    state.post_compact_request_committed();
-                }
-            }
-            for link in post_requests {
-                let metric =
-                    correlated_post_request_metric(link.metric, &link.correlation_id, &record);
+        // Persist any request measurements that did not already cross the
+        // in-run request boundary (for example partial usage from an errored or
+        // cancelled stream, or low-level Workers without an attached writer).
+        // `persist_pending_usage` removes each record only after its authoritative
+        // LlmUsage append succeeds, so the in-run and terminal paths cannot
+        // double-write or silently lose a failed append.
+        let usage_tracker = self.usage_tracker.clone();
+        let usage_history = self.usage_history.clone();
+        let compact_state = self.compact_state.clone();
+        if let Some(writer) = self.log_writer.clone() {
+            let _ = persist_pending_usage(
+                &usage_tracker,
+                &usage_history,
+                compact_state.as_deref(),
+                |entry, after_commit, post_metrics| {
+                    writer.commit_usage_boundary(entry, after_commit, post_metrics)
+                },
+            )?;
+        } else {
+            let post_request_metrics = persist_pending_usage(
+                &usage_tracker,
+                &usage_history,
+                compact_state.as_deref(),
+                |entry, after_commit, _post_metrics| {
+                    self.commit_entry(entry)?;
+                    after_commit();
+                    Ok(())
+                },
+            )?;
+            for metric in post_request_metrics {
                 self.try_record_metric(&metric);
             }
-            self.usage_history
-                .lock()
-                .expect("usage_history poisoned")
-                .push(record);
         }
 
         let interrupted = matches!(
