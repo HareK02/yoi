@@ -383,6 +383,7 @@ static EMBEDDED_RUNTIME_REQUEST_IDENTITY: std::sync::LazyLock<
 
 #[derive(Clone)]
 struct WorkdirCommandSession {
+    attachment_alias: String,
     source: WorkdirSessionHandle,
     provider_handle: CommandHandle,
 }
@@ -406,10 +407,6 @@ struct WorkdirSessionRegistry {
 }
 
 impl WorkdirSessionRegistry {
-    fn attachment(&self, worker: &RuntimeWorkerRef) -> Option<WorkdirSessionHandle> {
-        self.attachments.get(worker).cloned()
-    }
-
     fn insert_attachment(
         &mut self,
         worker: RuntimeWorkerRef,
@@ -425,6 +422,7 @@ impl WorkdirSessionRegistry {
     fn register_command(
         &mut self,
         worker: RuntimeWorkerRef,
+        attachment_alias: String,
         source: WorkdirSessionHandle,
         provider_handle: CommandHandle,
     ) -> CommandHandle {
@@ -440,6 +438,7 @@ impl WorkdirSessionRegistry {
         self.commands.insert(
             (worker, external_handle.clone()),
             WorkdirCommandSession {
+                attachment_alias,
                 source,
                 provider_handle,
             },
@@ -450,11 +449,40 @@ impl WorkdirSessionRegistry {
     fn command(
         &self,
         worker: &RuntimeWorkerRef,
+        attachment_alias: &str,
         external_handle: &CommandHandle,
     ) -> Option<WorkdirCommandSession> {
         self.commands
             .get(&(worker.clone(), external_handle.clone()))
+            .filter(|session| session.attachment_alias == attachment_alias)
             .cloned()
+    }
+
+    fn take_worker_commands_for_alias(
+        &mut self,
+        worker: &RuntimeWorkerRef,
+        attachment_alias: &str,
+    ) -> Vec<RegisteredWorkdirSession> {
+        let command_handles = self
+            .commands
+            .iter()
+            .filter(|((owner, _), session)| {
+                owner == worker && session.attachment_alias == attachment_alias
+            })
+            .map(|((_, handle), _)| handle.clone())
+            .collect::<Vec<_>>();
+        command_handles
+            .into_iter()
+            .filter_map(|external_handle| {
+                self.commands
+                    .remove(&(worker.clone(), external_handle.clone()))
+                    .map(|session| RegisteredWorkdirSession::Command {
+                        worker: worker.clone(),
+                        external_handle,
+                        session,
+                    })
+            })
+            .collect()
     }
 
     fn take_worker(&mut self, worker: &RuntimeWorkerRef) -> Vec<RegisteredWorkdirSession> {
@@ -502,14 +530,10 @@ impl WorkdirSessionRegistry {
     }
 }
 
-async fn close_worker_workdir_sessions(
+async fn close_registered_workdir_sessions(
     registry: &Arc<Mutex<WorkdirSessionRegistry>>,
-    worker: &RuntimeWorkerRef,
+    registered: Vec<RegisteredWorkdirSession>,
 ) -> std::result::Result<(), String> {
-    let registered = registry
-        .lock()
-        .map_err(|_| "Workdir session registry was poisoned".to_string())?
-        .take_worker(worker);
     let mut failed = Vec::new();
     let mut errors = Vec::new();
     for item in registered {
@@ -535,6 +559,29 @@ async fn close_worker_workdir_sessions(
     } else {
         Err(errors.join("; "))
     }
+}
+
+async fn close_worker_workdir_sessions(
+    registry: &Arc<Mutex<WorkdirSessionRegistry>>,
+    worker: &RuntimeWorkerRef,
+) -> std::result::Result<(), String> {
+    let registered = registry
+        .lock()
+        .map_err(|_| "Workdir session registry was poisoned".to_string())?
+        .take_worker(worker);
+    close_registered_workdir_sessions(registry, registered).await
+}
+
+async fn close_worker_workdir_command_sessions_for_alias(
+    registry: &Arc<Mutex<WorkdirSessionRegistry>>,
+    worker: &RuntimeWorkerRef,
+    attachment_alias: &str,
+) -> std::result::Result<(), String> {
+    let registered = registry
+        .lock()
+        .map_err(|_| "Workdir session registry was poisoned".to_string())?
+        .take_worker_commands_for_alias(worker, attachment_alias);
+    close_registered_workdir_sessions(registry, registered).await
 }
 
 const ATTACHMENT_UPLOAD_GRANT_TTL_MS: u64 = 5 * 60 * 1_000;
@@ -8416,57 +8463,6 @@ fn current_worker_identity(
     authenticate_worker_mutation_source(api, workspace_id, headers)
 }
 
-fn current_worker_active_attachment(
-    api: &WorkspaceApi,
-    worker: &RuntimeWorkerRef,
-) -> ApiResult<WorkerWorkdirLinkRecord> {
-    let active_links = api
-        .store
-        .list_worker_workdir_links(&api.config.workspace_id, worker)?
-        .into_iter()
-        .filter(|link| link.unlinked_at.is_none())
-        .collect::<Vec<_>>();
-    if active_links.len() == 1 {
-        return Ok(active_links.into_iter().next().expect("one active link"));
-    }
-    if active_links.len() > 1 {
-        return Err(Error::WorkdirAttachmentConflict(format!(
-            "Worker {}:{} has multiple Workdir attachments; implicit operation routing is unavailable",
-            worker.runtime_id, worker.worker_id
-        ))
-        .into());
-    }
-
-    if api
-        .store
-        .worker_workdir_link_history_exists(&api.config.workspace_id, worker)?
-    {
-        return Err(Error::WorkdirAttachmentConflict(format!(
-            "Worker {}:{} has no active Workdir attachment",
-            worker.runtime_id, worker.worker_id
-        ))
-        .into());
-    }
-
-    // A Runtime can start the Worker immediately after reserving its local binding, before the
-    // outer spawn handler has projected that binding into the Backend registry. Import the same
-    // binding transactionally on the first identity-bound operation so initial input cannot race
-    // attachment authority.
-    let observed_worker = api
-        .runtime
-        .worker(worker)
-        .map_err(|error| error.into_error())?;
-    if !observed_worker.workdir_attachments.is_empty() {
-        sync_worker_observation(api, &observed_worker)?;
-        return current_worker_active_attachment(api, worker);
-    }
-    Err(Error::WorkdirAttachmentConflict(format!(
-        "Worker {}:{} has no active Workdir attachment",
-        worker.runtime_id, worker.worker_id
-    ))
-    .into())
-}
-
 fn current_worker_session_lock(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
@@ -8529,13 +8525,11 @@ async fn open_current_worker_workdir_session_locked(
         api.runtime
             .authorize_working_directory_repository_access(&workdir.runtime_id, access)
             .map_err(RuntimeRegistryError::into_error)?;
-    } else if let Some(session) = api
-        .workdir_sessions
-        .lock()
-        .expect("Workdir session registry lock poisoned")
-        .attachment(worker)
-    {
-        return Ok(session);
+    } else {
+        // The registry is an operation-session cache, not routing authority.
+        // Close any prior alias session before opening the explicitly selected
+        // attachment so multiple aliases can never share one provider namespace.
+        close_current_worker_attachment_session_locked(api, worker).await?;
     }
     let owner_worker_id = runtime_local_owner_worker_id(worker, &workdir.runtime_id);
     let session = api
@@ -8584,6 +8578,20 @@ async fn close_current_worker_attachment_session_locked(
         }
     }
     Ok(())
+}
+
+async fn close_current_worker_command_sessions_for_alias_locked(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    attachment_alias: &str,
+) -> Result<()> {
+    close_worker_workdir_command_sessions_for_alias(&api.workdir_sessions, worker, attachment_alias)
+        .await
+        .map_err(|message| Error::RuntimeOperationFailed {
+            runtime_id: worker.runtime_id.clone(),
+            code: "workdir_session_close_failed".to_string(),
+            message,
+        })
 }
 
 async fn close_current_worker_session_locked(
@@ -8640,7 +8648,7 @@ async fn refresh_current_worker_session_locked(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
 ) -> Result<()> {
-    close_current_worker_session_locked(api, worker).await?;
+    close_current_worker_attachment_session_locked(api, worker).await?;
     let remaining = api
         .store
         .list_worker_workdir_links(&api.config.workspace_id, worker)?
@@ -8710,7 +8718,7 @@ async fn scoped_attach_current_worker_workdir(
             attached: true,
         }));
     }
-    close_current_worker_session_locked(&api, &worker).await?;
+    close_current_worker_attachment_session_locked(&api, &worker).await?;
     let link = api.store.attach_worker_workdir(&WorkerWorkdirLinkRecord {
         workspace_id: api.config.workspace_id.clone(),
         worker: worker.clone(),
@@ -8791,7 +8799,8 @@ async fn scoped_detach_current_worker_workdir(
                 worker.runtime_id, worker.worker_id
             ))
         })?;
-    close_current_worker_session_locked(&api, &worker).await?;
+    close_current_worker_attachment_session_locked(&api, &worker).await?;
+    close_current_worker_command_sessions_for_alias_locked(&api, &worker, alias.as_str()).await?;
     api.store.detach_worker_workdir(
         &api.config.workspace_id,
         &worker,
@@ -8843,8 +8852,43 @@ async fn scoped_detach_current_worker_workdir(
 fn validated_current_worker_attachment(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
+    target_workdir: &str,
 ) -> ApiResult<WorkerWorkdirLinkRecord> {
-    current_worker_active_attachment(api, worker)
+    let find = || -> Result<Option<WorkerWorkdirLinkRecord>> {
+        Ok(api
+            .store
+            .list_worker_workdir_links(&api.config.workspace_id, worker)?
+            .into_iter()
+            .find(|link| link.unlinked_at.is_none() && link.alias == target_workdir))
+    };
+    if let Some(link) = find()? {
+        return Ok(link);
+    }
+
+    // A Runtime can start the Worker immediately after reserving its local
+    // bindings, before the outer spawn handler projects them into the Backend.
+    // Import that exact alias set once; never substitute another attachment.
+    if !api
+        .store
+        .worker_workdir_link_history_exists(&api.config.workspace_id, worker)?
+    {
+        let observed_worker = api
+            .runtime
+            .worker(worker)
+            .map_err(|error| error.into_error())?;
+        if !observed_worker.workdir_attachments.is_empty() {
+            sync_worker_observation(api, &observed_worker)?;
+            if let Some(link) = find()? {
+                return Ok(link);
+            }
+        }
+    }
+
+    Err(Error::WorkdirAttachmentConflict(format!(
+        "Worker {}:{} has no Workdir attachment alias `{target_workdir}`",
+        worker.runtime_id, worker.worker_id
+    ))
+    .into())
 }
 
 #[derive(Debug)]
@@ -8899,11 +8943,12 @@ async fn scoped_execute_current_worker_workdir_operation(
 ) -> std::result::Result<Json<WorkdirSessionOperationResult>, WorkdirOperationApiError> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let worker = current_worker_identity(&api, &path.workspace_id, &headers)?;
+    let target_workdir = request.target_workdir;
     let result = match request.operation {
         WorkdirSessionOperation::CommandStart(command) => {
             let session_lock = current_worker_session_lock(&api, &worker);
             let _session_guard = session_lock.lock().await;
-            let link = validated_current_worker_attachment(&api, &worker)?;
+            let link = validated_current_worker_attachment(&api, &worker, &target_workdir)?;
             let source = open_current_worker_workdir_session_locked(&api, &worker, &link).await?;
             let provider_handle = source
                 .start_command(command)
@@ -8924,12 +8969,17 @@ async fn scoped_execute_current_worker_workdir_operation(
                 .workdir_sessions
                 .lock()
                 .expect("Workdir session registry lock poisoned")
-                .register_command(worker.clone(), registered_source, provider_handle);
+                .register_command(
+                    worker.clone(),
+                    target_workdir.clone(),
+                    registered_source,
+                    provider_handle,
+                );
             WorkdirSessionOperationResult::CommandStart(external_handle)
         }
         WorkdirSessionOperation::CommandStatus(external_handle) => {
             let (session, provider_handle) =
-                current_worker_command_session(&api, &worker, &external_handle)?;
+                current_worker_command_session(&api, &worker, &target_workdir, &external_handle)?;
             session
                 .command_status(provider_handle)
                 .await
@@ -8938,7 +8988,7 @@ async fn scoped_execute_current_worker_workdir_operation(
         }
         WorkdirSessionOperation::CommandOutput(mut output) => {
             let (session, provider_handle) =
-                current_worker_command_session(&api, &worker, &output.handle)?;
+                current_worker_command_session(&api, &worker, &target_workdir, &output.handle)?;
             output.handle = provider_handle;
             session
                 .command_output(output)
@@ -8948,7 +8998,7 @@ async fn scoped_execute_current_worker_workdir_operation(
         }
         WorkdirSessionOperation::CommandCancel(external_handle) => {
             let (session, provider_handle) =
-                current_worker_command_session(&api, &worker, &external_handle)?;
+                current_worker_command_session(&api, &worker, &target_workdir, &external_handle)?;
             session
                 .cancel_command(provider_handle)
                 .await
@@ -8966,7 +9016,7 @@ async fn scoped_execute_current_worker_workdir_operation(
         | WorkdirSessionOperation::Grep(_)) => {
             let session_lock = current_worker_session_lock(&api, &worker);
             let _session_guard = session_lock.lock().await;
-            let link = validated_current_worker_attachment(&api, &worker)?;
+            let link = validated_current_worker_attachment(&api, &worker, &target_workdir)?;
             let source = open_current_worker_workdir_session_locked(&api, &worker, &link).await?;
             execute_workdir_session_operation(&source, operation)
                 .await
@@ -8979,14 +9029,15 @@ async fn scoped_execute_current_worker_workdir_operation(
 fn current_worker_command_session(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
+    target_workdir: &str,
     external_handle: &CommandHandle,
 ) -> std::result::Result<(WorkdirSessionHandle, CommandHandle), WorkdirOperationApiError> {
-    let _link = validated_current_worker_attachment(api, worker)?;
+    let _link = validated_current_worker_attachment(api, worker, target_workdir)?;
     let command = api
         .workdir_sessions
         .lock()
         .expect("Workdir session registry lock poisoned")
-        .command(worker, external_handle)
+        .command(worker, target_workdir, external_handle)
         .ok_or_else(|| {
             WorkdirOperationApiError::Provider(current_worker_workdir_operation_error(
                 worker,
@@ -20120,8 +20171,12 @@ mod tests {
         let mut registry = WorkdirSessionRegistry::default();
         registry.insert_attachment(worker.clone(), source.clone());
         let registered_source = registry.remove_attachment(&worker).unwrap();
-        let external_handle =
-            registry.register_command(worker.clone(), registered_source, provider_handle.clone());
+        let external_handle = registry.register_command(
+            worker.clone(),
+            "checkout".to_string(),
+            registered_source,
+            provider_handle.clone(),
+        );
         assert_ne!(external_handle, provider_handle);
 
         let refreshed: WorkdirSessionHandle = Arc::new(workdir::LocalWorkdirSession::new(
@@ -20136,7 +20191,14 @@ mod tests {
             .await
             .unwrap();
 
-        let command = registry.command(&worker, &external_handle).unwrap();
+        let command = registry
+            .command(&worker, "checkout", &external_handle)
+            .unwrap();
+        assert!(
+            registry
+                .command(&worker, "other", &external_handle)
+                .is_none()
+        );
         let output = command
             .source
             .command_output(workdir::CommandOutputRequest {
@@ -20194,6 +20256,73 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn attachment_scoped_command_cleanup_preserves_other_aliases() {
+        let left_directory = tempfile::tempdir().unwrap();
+        let right_directory = tempfile::tempdir().unwrap();
+        let worker = RuntimeWorkerRef::new("runtime-command-alias", "worker-command-alias");
+        let make_session = |path: &std::path::Path| -> WorkdirSessionHandle {
+            Arc::new(workdir::LocalWorkdirSession::new(
+                manifest::Scope::writable(path).unwrap(),
+                path.to_path_buf(),
+            ))
+        };
+        let left = make_session(left_directory.path());
+        let right = make_session(right_directory.path());
+        let request = || workdir::CommandRequest {
+            command: "sleep 30".to_string(),
+            timeout_secs: 60,
+            output_limit: 4096,
+            cwd: None,
+            spill_dir: None,
+            tool_call_id: None,
+        };
+        let left_provider = left.start_command(request()).await.unwrap();
+        let right_provider = right.start_command(request()).await.unwrap();
+
+        let registry = Arc::new(Mutex::new(WorkdirSessionRegistry::default()));
+        let (left_external, right_external) = {
+            let mut sessions = registry.lock().unwrap();
+            let left_external =
+                sessions.register_command(worker.clone(), "left".to_string(), left, left_provider);
+            let right_external = sessions.register_command(
+                worker.clone(),
+                "right".to_string(),
+                right,
+                right_provider,
+            );
+            assert!(sessions.command(&worker, "right", &left_external).is_none());
+            assert!(sessions.command(&worker, "left", &right_external).is_none());
+            (left_external, right_external)
+        };
+
+        close_worker_workdir_command_sessions_for_alias(&registry, &worker, "right")
+            .await
+            .unwrap();
+
+        let left_command = {
+            let sessions = registry.lock().unwrap();
+            assert!(
+                sessions
+                    .command(&worker, "right", &right_external)
+                    .is_none()
+            );
+            sessions.command(&worker, "left", &left_external).unwrap()
+        };
+        assert_eq!(
+            left_command
+                .source
+                .command_status(left_command.provider_handle.clone())
+                .await
+                .unwrap(),
+            workdir::CommandStatus::Running
+        );
+
+        close_worker_workdir_sessions(&registry, &worker)
+            .await
+            .unwrap();
     }
 
     fn seed_test_api_token(store: &dyn ControlPlaneStore, suffix: &str) -> String {

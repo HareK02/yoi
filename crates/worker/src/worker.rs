@@ -2996,11 +2996,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             location.session_id,
             location.segment_id,
         );
-        let read_only_tools = self
-            .workdir_session()
-            .map(|source| Arc::new(ReadOnlyWorkdirSession::new(source)) as WorkdirSessionHandle)
-            .map(tools::read_only_builtin_tools)
-            .unwrap_or_default();
+        let read_only_tools = tools::read_only_routed_builtin_tools(self.workdir_sessions());
         let client = self
             .engine
             .as_ref()
@@ -5452,11 +5448,14 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // Default references: the N most-recently-touched files in the
         // session, surfaced so the compact worker can inspect them and
         // decide which (if any) the next session needs.
-        let default_refs: Vec<PathBuf> = self
-            .tracker
-            .as_ref()
-            .map(|t| t.recent_files(manifest::defaults::COMPACT_DEFAULT_REFERENCE_COUNT))
-            .unwrap_or_default();
+        let default_refs: Vec<PathBuf> = if self.workdir_sessions.len() == 1 {
+            self.tracker
+                .as_ref()
+                .map(|t| t.recent_files(manifest::defaults::COMPACT_DEFAULT_REFERENCE_COUNT))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         // Input text fed to the compact worker. Includes the default
         // references, current TaskStore snapshot, current TaskStore snapshot, and the (pruned) conversation text.

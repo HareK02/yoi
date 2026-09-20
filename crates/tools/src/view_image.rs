@@ -7,24 +7,28 @@ use agen::tool::{
 };
 use async_trait::async_trait;
 use serde::Deserialize;
-use workdir::{ReadRequest, WorkdirPath, WorkdirSessionHandle};
+use workdir::{ReadRequest, WorkdirPath, WorkdirSessionHandle, WorkdirSessionRouter};
 
 use crate::error::ToolsError;
 
 /// Maximum image body accepted for one model request.
 pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
-const DESCRIPTION: &str = "Attach an image from the bound Workdir to the next model request. \
-The path must be logical and Workdir-relative. Supported formats: PNG, JPEG, GIF, and WebP.";
+const DESCRIPTION: &str = "Attach an image from the selected Workdir attachment to the next model request. \
+The path must be logical and Workdir-relative. Supported formats: PNG, JPEG, GIF, and WebP. \
+When exactly one Workdir is attached, target_workdir may be omitted.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ViewImageParams {
+    /// Worker-local alias of the Workdir attachment to use.
+    #[serde(default)]
+    target_workdir: Option<String>,
     /// Logical path relative to the bound Workdir root.
     path: String,
 }
 
 struct ViewImageTool {
-    session: WorkdirSessionHandle,
+    router: Arc<WorkdirSessionRouter>,
 }
 
 #[async_trait]
@@ -37,8 +41,13 @@ impl Tool for ViewImageTool {
         let input: ViewImageParams = serde_json::from_str(input_json).map_err(|error| {
             ToolError::InvalidArgument(format!("invalid ViewImage input: {error}"))
         })?;
+        let selected = crate::routing::resolve_session(
+            &self.router,
+            input.target_workdir.as_deref(),
+            workdir::WorkdirSessionCapability::Read,
+        )?;
         let path = WorkdirPath::new(&input.path).map_err(ToolsError::from)?;
-        let result = self
+        let result = selected
             .session
             .read(ReadRequest {
                 path: path.clone(),
@@ -75,6 +84,10 @@ impl Tool for ViewImageTool {
 }
 
 pub fn view_image_tool(session: WorkdirSessionHandle) -> ToolDefinition {
+    routed_view_image_tool(crate::routing::singleton_router(session))
+}
+
+pub fn routed_view_image_tool(router: Arc<WorkdirSessionRouter>) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(ViewImageParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
@@ -82,7 +95,7 @@ pub fn view_image_tool(session: WorkdirSessionHandle) -> ToolDefinition {
             .description(DESCRIPTION)
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(ViewImageTool {
-            session: session.clone(),
+            router: router.clone(),
         });
         (meta, tool)
     })

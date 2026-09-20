@@ -213,14 +213,27 @@ impl std::fmt::Debug for WorkspaceHttpWorkdirBackend {
 #[derive(Debug)]
 pub struct WorkspaceAttachedWorkdirSession {
     client: Arc<dyn WorkspaceClient>,
+    target_workdir: String,
     workdir: Workdir,
 }
 
 impl WorkspaceAttachedWorkdirSession {
-    pub fn handle(client: Arc<dyn WorkspaceClient>) -> WorkdirSessionHandle {
+    pub fn handle(
+        client: Arc<dyn WorkspaceClient>,
+        target_workdir: impl Into<String>,
+    ) -> WorkdirSessionHandle {
+        Self::handle_for_workdir(client, target_workdir, "workspace-attachment")
+    }
+
+    pub fn handle_for_workdir(
+        client: Arc<dyn WorkspaceClient>,
+        target_workdir: impl Into<String>,
+        workdir_id: impl Into<String>,
+    ) -> WorkdirSessionHandle {
         Arc::new(Self {
             client,
-            workdir: Workdir::new("workspace-attachment"),
+            target_workdir: target_workdir.into(),
+            workdir: Workdir::new(workdir_id),
         })
     }
 
@@ -237,13 +250,15 @@ impl WorkspaceAttachedWorkdirSession {
                 "/api/w/{}/workers/self/workdir-session/operations",
                 encode_path_segment(workspace_id)
             ),
-            serde_json::to_string(&WorkspaceWorkdirSessionOperationRequest { operation }).map_err(
-                |error| {
-                    WorkdirError::Transport(format!(
-                        "failed to encode Workspace Workdir operation: {error}"
-                    ))
-                },
-            )?,
+            serde_json::to_string(&WorkspaceWorkdirSessionOperationRequest {
+                target_workdir: self.target_workdir.clone(),
+                operation,
+            })
+            .map_err(|error| {
+                WorkdirError::Transport(format!(
+                    "failed to encode Workspace Workdir operation: {error}"
+                ))
+            })?,
         );
         let response = self
             .client
@@ -507,7 +522,11 @@ impl WorkspaceHttpWorkdirBackend {
         let response = self.attach_response(alias, working_directory_id)?;
         if let Err(error) = self.session_router.attach(
             alias_key.clone(),
-            WorkspaceAttachedWorkdirSession::handle(self.client.clone()),
+            WorkspaceAttachedWorkdirSession::handle_for_workdir(
+                self.client.clone(),
+                alias,
+                working_directory_id,
+            ),
         ) {
             let _ = self.detach(alias);
             return Err(ToolError::ExecutionFailed(format!(
@@ -1282,7 +1301,7 @@ mod tests {
             "operation": "stat",
             "result": {"path": "visible.txt", "kind": "file", "size": 8}
         }))]));
-        let session = WorkspaceAttachedWorkdirSession::handle(client.clone());
+        let session = WorkspaceAttachedWorkdirSession::handle(client.clone(), "workdir");
         let result = session
             .stat(StatRequest {
                 path: workdir::WorkdirPath::new("visible.txt").unwrap(),
@@ -1298,6 +1317,7 @@ mod tests {
         );
         let body: serde_json::Value =
             serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["target_workdir"], "workdir");
         assert_eq!(body["operation"]["operation"], "stat");
         assert!(body.get("expected_session_fence").is_none());
         assert!(body.get("runtime_id").is_none());
@@ -1310,7 +1330,7 @@ mod tests {
             "operation": "command_start",
             "result": "command-1"
         }))]));
-        let session = WorkspaceAttachedWorkdirSession::handle(client.clone());
+        let session = WorkspaceAttachedWorkdirSession::handle(client.clone(), "workdir");
 
         let handle = session
             .start_command(CommandRequest {
@@ -1348,7 +1368,7 @@ mod tests {
             workdir::http::WorkdirTransportErrorCode::InvalidRequest,
             "Workdir operation request is invalid",
         )]));
-        let session = WorkspaceAttachedWorkdirSession::handle(client);
+        let session = WorkspaceAttachedWorkdirSession::handle(client, "workdir");
 
         let error = session
             .glob(workdir::GlobRequest {
@@ -1368,7 +1388,7 @@ mod tests {
             status: 502,
             body: "secret token and /host/private/path".to_string(),
         }]));
-        let session = WorkspaceAttachedWorkdirSession::handle(client);
+        let session = WorkspaceAttachedWorkdirSession::handle(client, "workdir");
 
         let error = session
             .stat(StatRequest {
@@ -1395,6 +1415,7 @@ mod tests {
         ]));
         let broker = workdir::WorkdirToolBroker::new(WorkspaceAttachedWorkdirSession::handle(
             client.clone(),
+            "workdir",
         ));
         let scoped = broker
             .scope(workdir::WorkdirToolScope {
@@ -1495,7 +1516,7 @@ mod tests {
         router
             .attach(
                 workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
-                WorkspaceAttachedWorkdirSession::handle(client.clone()),
+                WorkspaceAttachedWorkdirSession::handle(client.clone(), "workdir"),
             )
             .unwrap();
         let cleanup_calls = Arc::new(AtomicUsize::new(0));
@@ -1533,7 +1554,7 @@ mod tests {
         router
             .attach(
                 workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
-                WorkspaceAttachedWorkdirSession::handle(client.clone()),
+                WorkspaceAttachedWorkdirSession::handle(client.clone(), "workdir"),
             )
             .unwrap();
         let before_release: BeforeWorkdirRelease =

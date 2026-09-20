@@ -772,7 +772,7 @@ pub(crate) async fn prepare_internal_worker_session(
     visibility: InternalWorkerVisibility,
     child_registry: Option<Arc<SpawnedWorkerRegistry>>,
     on_turn_end: Option<Arc<dyn Fn(InternalWorkerSessionStatus) + Send + Sync>>,
-    command_event_broker: Option<workdir::WorkdirToolBroker>,
+    command_event_broker: Option<workdir::WorkdirToolBrokerRouter>,
 ) -> Result<InternalWorkerSessionHandle, InternalWorkerSessionError> {
     let (event_tx, _event_rx) = broadcast::channel(256);
     let sink = worker.sink();
@@ -780,7 +780,12 @@ pub(crate) async fn prepare_internal_worker_session(
     let alerter = Alerter::new(event_tx.clone());
     let in_flight = InFlightEvents::new(event_tx.clone());
     if let Some(broker) = command_event_broker.as_ref() {
-        wire_workdir_command_events(&broker.tool_session(), &in_flight);
+        let sessions = broker.sessions();
+        for alias in sessions.aliases() {
+            if let Ok(selected) = sessions.resolve(Some(alias.as_str())) {
+                wire_workdir_command_events(&selected.session, &in_flight);
+            }
+        }
     } else if let Some(session) = worker.workdir_session() {
         wire_workdir_command_events(&session, &in_flight);
     }

@@ -6,7 +6,7 @@
 //! routing keys.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
@@ -66,9 +66,56 @@ impl std::fmt::Display for WorkdirAttachmentAlias {
     }
 }
 
+/// Stable machine-readable reason why a tool target could not be resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkdirRouteErrorCode {
+    NoWorkdirAttached,
+    TargetWorkdirRequired,
+    UnknownTargetWorkdir,
+}
+
+/// Provider-neutral attachment routing failure returned before an operation starts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct WorkdirRouteError {
+    pub code: WorkdirRouteErrorCode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_workdir: Option<String>,
+    pub available_aliases: Vec<String>,
+}
+
+impl std::fmt::Display for WorkdirRouteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let encoded = serde_json::to_string(self).map_err(|_| std::fmt::Error)?;
+        formatter.write_str(&encoded)
+    }
+}
+
+impl std::error::Error for WorkdirRouteError {}
+
+/// One attachment selected for a single tool invocation.
+#[derive(Clone)]
+pub struct ResolvedWorkdirSession {
+    pub alias: WorkdirAttachmentAlias,
+    pub generation: u64,
+    pub session: WorkdirSessionHandle,
+}
+
+impl std::fmt::Debug for ResolvedWorkdirSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedWorkdirSession")
+            .field("alias", &self.alias)
+            .field("generation", &self.generation)
+            .field("workdir", self.session.workdir())
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 struct RoutedSessionState {
     session: WorkdirSessionHandle,
+    generation: u64,
     detached: AtomicBool,
     active_operations: AtomicUsize,
     active_commands: Mutex<HashSet<CommandHandle>>,
@@ -299,6 +346,7 @@ impl WorkdirSession for RoutedWorkdirSession {
 #[derive(Debug, Default)]
 pub struct WorkdirSessionRouter {
     sessions: RwLock<BTreeMap<WorkdirAttachmentAlias, Arc<RoutedSessionState>>>,
+    next_generation: AtomicU64,
 }
 
 impl WorkdirSessionRouter {
@@ -315,6 +363,16 @@ impl WorkdirSessionRouter {
             .collect()
     }
 
+    pub fn capabilities(&self) -> WorkdirSessionCapabilities {
+        self.sessions
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .fold(WorkdirSessionCapabilities::EMPTY, |capabilities, state| {
+                capabilities.union(state.session.capabilities())
+            })
+    }
+
     pub fn len(&self) -> usize {
         self.sessions
             .read()
@@ -324,6 +382,61 @@ impl WorkdirSessionRouter {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Resolve one model-visible target without exposing provider identity.
+    ///
+    /// Omission is accepted only for the unambiguous single-attachment case.
+    /// Every error includes the current alias snapshot so callers can recover
+    /// without consulting Workdir ids, display names, or transport metadata.
+    pub fn resolve(
+        &self,
+        target_workdir: Option<&str>,
+    ) -> Result<ResolvedWorkdirSession, WorkdirRouteError> {
+        let sessions = self
+            .sessions
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let available_aliases = sessions
+            .keys()
+            .map(|alias| alias.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let selected = match target_workdir {
+            Some(target) => sessions
+                .iter()
+                .find(|(alias, _)| alias.as_str() == target)
+                .map(|(alias, state)| (alias.clone(), state.clone()))
+                .ok_or_else(|| WorkdirRouteError {
+                    code: WorkdirRouteErrorCode::UnknownTargetWorkdir,
+                    target_workdir: Some(target.to_owned()),
+                    available_aliases: available_aliases.clone(),
+                })?,
+            None if sessions.is_empty() => {
+                return Err(WorkdirRouteError {
+                    code: WorkdirRouteErrorCode::NoWorkdirAttached,
+                    target_workdir: None,
+                    available_aliases,
+                });
+            }
+            None if sessions.len() > 1 => {
+                return Err(WorkdirRouteError {
+                    code: WorkdirRouteErrorCode::TargetWorkdirRequired,
+                    target_workdir: None,
+                    available_aliases,
+                });
+            }
+            None => {
+                let (alias, state) = sessions
+                    .first_key_value()
+                    .expect("single attachment exists after cardinality checks");
+                (alias.clone(), state.clone())
+            }
+        };
+        Ok(ResolvedWorkdirSession {
+            alias: selected.0,
+            generation: selected.1.generation,
+            session: Arc::new(RoutedWorkdirSession { state: selected.1 }),
+        })
     }
 
     pub fn attach(
@@ -341,6 +454,7 @@ impl WorkdirSessionRouter {
         }
         let state = Arc::new(RoutedSessionState {
             session,
+            generation: self.next_generation.fetch_add(1, Ordering::AcqRel),
             detached: AtomicBool::new(false),
             active_operations: AtomicUsize::new(0),
             active_commands: Mutex::new(HashSet::new()),
@@ -556,7 +670,38 @@ mod tests {
             ["left", "right"]
         );
         assert!(router.only_session().is_none());
+        let missing = router.resolve(None).unwrap_err();
+        assert_eq!(missing.code, WorkdirRouteErrorCode::TargetWorkdirRequired);
+        assert_eq!(missing.available_aliases, ["left", "right"]);
+        assert_eq!(
+            router
+                .resolve(Some("right"))
+                .unwrap()
+                .session
+                .workdir()
+                .id()
+                .as_str(),
+            "wd-right"
+        );
+        let unknown = router.resolve(Some("display-name")).unwrap_err();
+        assert_eq!(unknown.code, WorkdirRouteErrorCode::UnknownTargetWorkdir);
+        assert_eq!(unknown.target_workdir.as_deref(), Some("display-name"));
+        assert_eq!(unknown.available_aliases, ["left", "right"]);
         router.close_all().await.unwrap();
+    }
+
+    #[test]
+    fn empty_router_returns_structured_no_attachment_error() {
+        let error = WorkdirSessionRouter::new().resolve(None).unwrap_err();
+        assert_eq!(error.code, WorkdirRouteErrorCode::NoWorkdirAttached);
+        assert!(error.available_aliases.is_empty());
+        assert_eq!(
+            serde_json::to_value(error).unwrap(),
+            serde_json::json!({
+                "code": "no_workdir_attached",
+                "available_aliases": []
+            })
+        );
     }
 
     #[tokio::test]

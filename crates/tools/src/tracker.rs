@@ -65,9 +65,15 @@ fn hash_bytes(bytes: &[u8]) -> ContentHash {
     hasher.finalize().into()
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TrackedPath {
+    namespace: Option<Arc<str>>,
+    path: PathBuf,
+}
+
 #[derive(Debug, Clone, Default)]
 struct FileMutationCoordinator {
-    locks: Arc<tokio::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
+    locks: Arc<tokio::sync::Mutex<HashMap<TrackedPath, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 pub(crate) struct FileMutationPermit {
@@ -75,8 +81,7 @@ pub(crate) struct FileMutationPermit {
 }
 
 impl FileMutationCoordinator {
-    async fn acquire(&self, path: &Path) -> FileMutationPermit {
-        let key = file_mutation_key(path);
+    async fn acquire(&self, key: TrackedPath) -> FileMutationPermit {
         let lock = {
             let mut locks = self.locks.lock().await;
             locks
@@ -127,12 +132,12 @@ pub struct ChangeStat {
 
 #[derive(Debug, Default)]
 struct Inner {
-    /// Hash of each file's last observed contents, keyed by canonical path.
-    hashes: HashMap<PathBuf, ContentHash>,
+    /// Hash of each file's last observed contents, keyed by attachment and canonical path.
+    hashes: HashMap<TrackedPath, ContentHash>,
     /// Line count paired with observations that included the file content.
-    line_counts: HashMap<PathBuf, usize>,
+    line_counts: HashMap<TrackedPath, usize>,
     /// LRU list of touched files. Front = most recently touched.
-    recency: VecDeque<PathBuf>,
+    recency: VecDeque<TrackedPath>,
     /// Successful Write/Edit mutations attributed to this session's tools.
     change_stat: ChangeStat,
 }
@@ -146,12 +151,40 @@ struct Inner {
 pub struct Tracker {
     inner: Arc<Mutex<Inner>>,
     mutations: FileMutationCoordinator,
+    namespace: Option<Arc<str>>,
 }
 
 impl Tracker {
     /// Create an empty tracker. Typically called once per session.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Return a view whose read-before-mutation state is isolated to one
+    /// attachment incarnation (the Worker-local alias plus router generation),
+    /// while aggregate recency/change statistics remain shared with the Worker
+    /// tracker.
+    pub fn scoped(&self, namespace: impl Into<String>) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            mutations: self.mutations.clone(),
+            namespace: Some(Arc::from(namespace.into())),
+        }
+    }
+
+    pub(crate) fn scoped_attachment(
+        &self,
+        alias: &workdir::WorkdirAttachmentAlias,
+        generation: u64,
+    ) -> Self {
+        self.scoped(format!("{}#{generation}", alias.as_str()))
+    }
+
+    fn key(&self, path: PathBuf) -> TrackedPath {
+        TrackedPath {
+            namespace: self.namespace.clone(),
+            path,
+        }
     }
 
     /// Acquire the per-target-file mutation guard shared by `Write` and `Edit`.
@@ -170,7 +203,9 @@ impl Tracker {
             call_index = ctx.call_index,
             "acquire file mutation guard"
         );
-        self.mutations.acquire(path).await
+        self.mutations
+            .acquire(self.key(file_mutation_key(path)))
+            .await
     }
 
     /// Record that `path` has been observed with the given content bytes.
@@ -182,7 +217,7 @@ impl Tracker {
     /// Also bumps `path` to the front of the recency list. If the list
     /// grows past [`RECENCY_CAPACITY`], the oldest entry is evicted.
     pub fn record(&self, path: &Path, bytes: &[u8]) {
-        let key = canonicalize_or_owned(path);
+        let key = self.key(canonicalize_or_owned(path));
         let hash = hash_bytes(bytes);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.hashes.insert(key.clone(), hash);
@@ -198,7 +233,7 @@ impl Tracker {
     }
 
     pub fn record_workdir_content(&self, path: &workdir::WorkdirPath, content: &[u8]) {
-        let key = PathBuf::from(path.as_str());
+        let key = self.key(PathBuf::from(path.as_str()));
         let hash = hash_bytes(content);
         let line_count = String::from_utf8_lossy(content).lines().count();
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -212,16 +247,17 @@ impl Tracker {
     }
 
     pub fn observed_workdir_line_count(&self, path: &workdir::WorkdirPath) -> Option<usize> {
+        let key = self.key(PathBuf::from(path.as_str()));
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .line_counts
-            .get(Path::new(path.as_str()))
+            .get(&key)
             .copied()
     }
 
     pub fn record_workdir_hash(&self, path: &workdir::WorkdirPath, hash: workdir::ContentHash) {
-        let key = PathBuf::from(path.as_str());
+        let key = self.key(PathBuf::from(path.as_str()));
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.hashes.insert(key.clone(), hash);
         inner.recency.retain(|candidate| candidate != &key);
@@ -253,7 +289,7 @@ impl Tracker {
     ) {
         let added = added_lines_per_replacement.saturating_mul(replacements);
         let deleted = deleted_lines_per_replacement.saturating_mul(replacements);
-        let key = PathBuf::from(path.as_str());
+        let key = self.key(PathBuf::from(path.as_str()));
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.change_stat.added = inner.change_stat.added.saturating_add(added as u64);
         inner.change_stat.deleted = inner.change_stat.deleted.saturating_add(deleted as u64);
@@ -279,14 +315,14 @@ impl Tracker {
         &self,
         path: &workdir::WorkdirPath,
     ) -> Result<workdir::ContentHash, ToolsError> {
-        let key = PathBuf::from(path.as_str());
+        let key = self.key(PathBuf::from(path.as_str()));
         self.inner
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .hashes
             .get(&key)
             .copied()
-            .ok_or_else(|| ToolsError::NotRead(key))
+            .ok_or_else(|| ToolsError::NotRead(key.path.clone()))
     }
 
     /// Verify that `path` was previously recorded and its current bytes
@@ -296,7 +332,7 @@ impl Tracker {
     /// - If the current content hashes differ from the recorded value,
     ///   returns [`ToolsError::ExternallyModified`].
     pub fn verify(&self, path: &Path, current_bytes: &[u8]) -> Result<(), ToolsError> {
-        let key = canonicalize_or_owned(path);
+        let key = self.key(canonicalize_or_owned(path));
         let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let recorded = guard
             .hashes
@@ -316,13 +352,18 @@ impl Tracker {
     /// can pass them as default references to the compaction worker.
     pub fn recent_files(&self, n: usize) -> Vec<PathBuf> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.recency.iter().take(n).cloned().collect()
+        inner
+            .recency
+            .iter()
+            .take(n)
+            .map(|key| key.path.clone())
+            .collect()
     }
 
     /// Returns true if `path` has a history entry. Test-only.
     #[cfg(test)]
     pub(crate) fn has(&self, path: &Path) -> bool {
-        let key = canonicalize_or_owned(path);
+        let key = self.key(canonicalize_or_owned(path));
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -418,6 +459,22 @@ mod tests {
             // Exactly one entry.
             assert_eq!(tracker.len(), 1);
         }
+    }
+
+    #[test]
+    fn attachment_namespaces_do_not_share_read_state() {
+        let tracker = Tracker::new();
+        let left = tracker.scoped("left");
+        let right = tracker.scoped("right");
+        let path = workdir::WorkdirPath::new("same.txt").unwrap();
+
+        left.record_workdir_content(&path, b"left");
+
+        assert!(left.expected_workdir_hash(&path).is_ok());
+        assert!(matches!(
+            right.expected_workdir_hash(&path),
+            Err(ToolsError::NotRead(_))
+        ));
     }
 
     #[test]

@@ -256,8 +256,10 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
       workersNav.includes("worker.display_name || worker.label") &&
       workersNav.includes("worker-status-dot") &&
       workersNav.includes("worker-status-spinner") &&
-      workersNav.includes("worker.repository_key ?? '—'") &&
-      workersNav.includes("worker.working_directory_id ?? '—'") &&
+      workersNav.includes("workdirMeta(worker)") &&
+      workersNav.includes("attachment.alias") &&
+      workersNav.includes("attachment.repository_key ?? '—'") &&
+      workersNav.includes("attachment.working_directory_id") &&
       !workersNav.includes('aria-disabled="true"'),
     "Workers sidebar should link to the Worker list page and show state indicators with repository/workdir metadata",
   );

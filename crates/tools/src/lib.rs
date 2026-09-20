@@ -17,6 +17,7 @@ mod edit;
 mod glob;
 mod grep;
 mod read;
+mod routing;
 mod view_image;
 mod web;
 mod write;
@@ -28,11 +29,11 @@ pub use glob::glob_tool;
 pub use grep::grep_tool;
 pub use read::read_tool;
 pub use tracker::{ChangeStat, Tracker};
-pub use view_image::view_image_tool;
+pub use view_image::{routed_view_image_tool, view_image_tool};
 pub use web::{web_fetch_tool, web_search_tool};
 pub use write::write_tool;
 
-/// Build the local filesystem/command tool surface implemented by a WorkdirSession.
+/// Build the filesystem/command tool surface for a single Workdir session.
 /// Profile/manifest policy may narrow this set further in the Engine.
 pub fn core_builtin_tools(
     session: workdir::WorkdirSessionHandle,
@@ -42,24 +43,75 @@ pub fn core_builtin_tools(
     use workdir::WorkdirSessionCapability;
 
     let capabilities = session.capabilities();
+    let router = routing::singleton_router(session);
     let mut tools = Vec::with_capacity(6);
     if capabilities.supports(WorkdirSessionCapability::Read) {
-        tools.push(read_tool(session.clone(), tracker.clone()));
+        tools.push(read::routed_read_tool(router.clone(), tracker.clone()));
     }
     if capabilities.supports(WorkdirSessionCapability::Write) {
-        tools.push(write_tool(session.clone(), tracker.clone()));
+        tools.push(write::routed_write_tool(router.clone(), tracker.clone()));
     }
     if capabilities.supports(WorkdirSessionCapability::Edit) {
-        tools.push(edit_tool(session.clone(), tracker));
+        tools.push(edit::routed_edit_tool(router.clone(), tracker));
     }
     if capabilities.supports(WorkdirSessionCapability::Glob) {
-        tools.push(glob_tool(session.clone()));
+        tools.push(glob::routed_glob_tool(router.clone()));
     }
     if capabilities.supports(WorkdirSessionCapability::Grep) {
-        tools.push(grep_tool(session.clone()));
+        tools.push(grep::routed_grep_tool(router.clone()));
     }
     if capabilities.supports(WorkdirSessionCapability::Command) {
-        tools.push(bash_tool(session, bash_output_dir));
+        tools.push(bash::routed_bash_tool(router, bash_output_dir));
+    }
+    tools
+}
+
+/// Build the stable routed tool surface for a Worker's live attachment set.
+///
+/// The definitions remain installed while the set is empty or changes at runtime;
+/// each invocation resolves `target_workdir` against the router and then lets the
+/// selected provider enforce its capabilities.
+pub fn routed_builtin_tools(
+    router: std::sync::Arc<workdir::WorkdirSessionRouter>,
+    tracker: Tracker,
+    bash_output_dir: std::path::PathBuf,
+) -> Vec<agen::tool::ToolDefinition> {
+    vec![
+        read::routed_read_tool(router.clone(), tracker.clone()),
+        write::routed_write_tool(router.clone(), tracker.clone()),
+        edit::routed_edit_tool(router.clone(), tracker),
+        glob::routed_glob_tool(router.clone()),
+        grep::routed_grep_tool(router.clone()),
+        bash::routed_bash_tool(router, bash_output_dir),
+    ]
+}
+
+pub fn routed_builtin_tools_for_current_capabilities(
+    router: std::sync::Arc<workdir::WorkdirSessionRouter>,
+    tracker: Tracker,
+    bash_output_dir: std::path::PathBuf,
+) -> Vec<agen::tool::ToolDefinition> {
+    use workdir::WorkdirSessionCapability;
+
+    let capabilities = router.capabilities();
+    let mut tools = Vec::with_capacity(6);
+    if capabilities.supports(WorkdirSessionCapability::Read) {
+        tools.push(read::routed_read_tool(router.clone(), tracker.clone()));
+    }
+    if capabilities.supports(WorkdirSessionCapability::Write) {
+        tools.push(write::routed_write_tool(router.clone(), tracker.clone()));
+    }
+    if capabilities.supports(WorkdirSessionCapability::Edit) {
+        tools.push(edit::routed_edit_tool(router.clone(), tracker));
+    }
+    if capabilities.supports(WorkdirSessionCapability::Glob) {
+        tools.push(glob::routed_glob_tool(router.clone()));
+    }
+    if capabilities.supports(WorkdirSessionCapability::Grep) {
+        tools.push(grep::routed_grep_tool(router.clone()));
+    }
+    if capabilities.supports(WorkdirSessionCapability::Command) {
+        tools.push(bash::routed_bash_tool(router, bash_output_dir));
     }
     tools
 }
@@ -73,6 +125,29 @@ pub fn read_only_builtin_tools(
         "read-only tool projection requires a read-only Workdir session"
     );
     core_builtin_tools(session, Tracker::new(), std::path::PathBuf::new())
+}
+
+pub fn read_only_routed_builtin_tools(
+    source: std::sync::Arc<workdir::WorkdirSessionRouter>,
+) -> Vec<agen::tool::ToolDefinition> {
+    let router = std::sync::Arc::new(workdir::WorkdirSessionRouter::new());
+    for alias in source.aliases() {
+        let Ok(selected) = source.resolve(Some(alias.as_str())) else {
+            continue;
+        };
+        router
+            .attach(
+                alias,
+                std::sync::Arc::new(workdir::ReadOnlyWorkdirSession::new(selected.session)),
+            )
+            .expect("read-only projection preserves unique aliases");
+    }
+    let tracker = Tracker::new();
+    vec![
+        read::routed_read_tool(router.clone(), tracker),
+        glob::routed_glob_tool(router.clone()),
+        grep::routed_grep_tool(router),
+    ]
 }
 
 pub fn web_builtin_tools(

@@ -1143,7 +1143,7 @@ pub(crate) async fn register_worker_tools<C, St>(
     runtime_base: PathBuf,
     spawned_registry: Arc<SpawnedWorkerRegistry>,
     parent_method_tx: Option<mpsc::WeakSender<Method>>,
-    inherited_workdir_tool_broker: Option<workdir::WorkdirToolBroker>,
+    inherited_workdir_tool_broker: Option<workdir::WorkdirToolBrokerRouter>,
 ) -> std::io::Result<Option<workdir::WorkdirSessionHandle>>
 where
     C: LlmClient + Clone + 'static,
@@ -1152,23 +1152,13 @@ where
     // Worker-immutable snapshots taken before the mutable worker borrow
     // below so the worker borrow doesn't conflict with reads on `worker`.
     let feature_config = worker.manifest().feature.clone();
-    let mut workdir_tool_broker = inherited_workdir_tool_broker;
-    if feature_config.manage_workdir.enabled {
-        let workspace_client = worker.workspace_client_handle();
-        workdir_tool_broker = Some(workdir::WorkdirToolBroker::new(
-            crate::feature::builtin::manage_workdir::WorkspaceAttachedWorkdirSession::handle(
-                workspace_client,
-            ),
-        ));
-    } else if workdir_tool_broker.is_none()
-        && let Some(existing) = worker.workdir_session()
-    {
-        let broker = workdir::WorkdirToolBroker::new(existing);
-        workdir_tool_broker = Some(broker);
-    }
-    let worker_workdir = workdir_tool_broker
-        .as_ref()
-        .map(workdir::WorkdirToolBroker::tool_session);
+    let workdir_sessions = worker.workdir_sessions();
+    let restrict_workdir_tools_to_current_capabilities = inherited_workdir_tool_broker.is_some();
+    let workdir_tool_broker = Some(
+        inherited_workdir_tool_broker
+            .unwrap_or_else(|| workdir::WorkdirToolBrokerRouter::new(workdir_sessions.clone())),
+    );
+    let workdir_for_view = workdir_sessions.only_session();
     let local_filesystem = worker.local_working_directory().cloned();
     let local_workspace_root = local_filesystem.as_ref().map(|local| local.root.clone());
     let task_feature = worker.task_feature();
@@ -1203,28 +1193,29 @@ where
             paste_store,
             paste_session_id,
         ));
-    // Resolve the existing Worker–Workdir binding into the domain provider.
-    // Tools only consume the provider handle; they do not own its root, cwd,
-    // scope, or lifecycle. No-workdir Workers expose no local tools.
-    let (workdir_for_view, tracker) = if let Some(workdir) = worker_workdir {
-        let tracker = tools::Tracker::new();
+    // Keep the alias-routed schemas installed for the Worker lifetime. The
+    // attachment set may be empty or mutate after registration, so target
+    // resolution and provider capability checks happen per invocation.
+    let tracker = tools::Tracker::new();
+    let workdir_tools = if restrict_workdir_tools_to_current_capabilities {
+        tools::routed_builtin_tools_for_current_capabilities(
+            workdir_sessions.clone(),
+            tracker.clone(),
+            bash_output_dir.clone(),
+        )
+    } else {
+        tools::routed_builtin_tools(
+            workdir_sessions.clone(),
+            tracker.clone(),
+            bash_output_dir.clone(),
+        )
+    };
+    worker.engine_mut().register_tools(workdir_tools);
+    if feature_config.image.enabled && model_supports_image_attachments(&spawner_manifest.model) {
         worker
             .engine_mut()
-            .register_tools(tools::core_builtin_tools(
-                workdir.clone(),
-                tracker.clone(),
-                bash_output_dir.clone(),
-            ));
-        if feature_config.image.enabled && model_supports_image_attachments(&spawner_manifest.model)
-        {
-            worker
-                .engine_mut()
-                .register_tool(tools::view_image_tool(workdir.clone()));
-        }
-        (Some(workdir), Some(tracker))
-    } else {
-        (None, None)
-    };
+            .register_tool(tools::routed_view_image_tool(workdir_sessions));
+    }
     if feature_config.web.enabled {
         worker
             .engine_mut()
@@ -1482,9 +1473,7 @@ where
     if let Some((resident_summary, system_prompt_override)) = memory_prompt_contribution {
         worker.install_system_prompt_contribution(resident_summary, system_prompt_override);
     }
-    if let Some(tracker) = tracker {
-        worker.attach_tracker(tracker);
-    }
+    worker.attach_tracker(tracker);
     Ok(workdir_for_view)
 }
 

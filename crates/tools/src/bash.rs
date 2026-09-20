@@ -6,7 +6,9 @@ use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use workdir::{CommandHandle, CommandOutputRequest, CommandRequest, WorkdirSessionHandle};
+use workdir::{
+    CommandHandle, CommandOutputRequest, CommandRequest, WorkdirSessionHandle, WorkdirSessionRouter,
+};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 600;
@@ -14,13 +16,16 @@ const INLINE_BYTE_BUDGET: usize = 12 * 1024;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct BashParams {
+    /// Worker-local alias of the Workdir attachment to use.
+    #[serde(default)]
+    target_workdir: Option<String>,
     command: String,
     #[serde(default)]
     timeout: Option<u64>,
 }
 
 pub(crate) struct BashTool {
-    session: WorkdirSessionHandle,
+    router: Arc<WorkdirSessionRouter>,
     output_dir: PathBuf,
     state: Arc<Mutex<BashExecutionState>>,
 }
@@ -29,6 +34,7 @@ pub(crate) struct BashTool {
 struct ActiveCommand {
     call_id: String,
     execution_nonce: u64,
+    session: WorkdirSessionHandle,
     handle: CommandHandle,
 }
 
@@ -93,6 +99,12 @@ impl Tool for BashTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: BashParams = serde_json::from_str(input_json)
             .map_err(|error| ToolError::InvalidArgument(format!("invalid Bash input: {error}")))?;
+        let selected = crate::routing::resolve_session(
+            &self.router,
+            params.target_workdir.as_deref(),
+            workdir::WorkdirSessionCapability::Command,
+        )?;
+        let session = selected.session;
         let timeout_secs = params
             .timeout
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
@@ -106,14 +118,13 @@ impl Tool for BashTool {
             state.next_execution_nonce
         };
         let mut guard = CommandGuard {
-            session: self.session.clone(),
+            session: session.clone(),
             state: self.state.clone(),
             execution_id: execution_id.clone(),
             execution_nonce,
             handle: None,
         };
-        let handle = self
-            .session
+        let handle = session
             .start_command(CommandRequest {
                 command: params.command,
                 timeout_secs,
@@ -131,6 +142,7 @@ impl Tool for BashTool {
                 ActiveCommand {
                     call_id: call_id.clone(),
                     execution_nonce,
+                    session: session.clone(),
                     handle: handle.clone(),
                 },
             );
@@ -139,13 +151,12 @@ impl Tool for BashTool {
         };
         guard.handle = Some(handle.clone());
         if cancel_after_start {
-            self.session
+            session
                 .cancel_command(handle.clone())
                 .await
                 .map_err(crate::ToolsError::from)?;
         }
-        let output = self
-            .session
+        let output = session
             .command_output(CommandOutputRequest {
                 handle,
                 cursor: 0,
@@ -222,12 +233,13 @@ impl Tool for BashTool {
                 .active
                 .values()
                 .filter(|active| active.call_id == call_id)
-                .map(|active| active.handle.clone())
+                .cloned()
                 .collect::<Vec<_>>()
         };
-        for handle in handles {
-            self.session
-                .cancel_command(handle)
+        for active in handles {
+            active
+                .session
+                .cancel_command(active.handle)
                 .await
                 .map_err(crate::ToolsError::from)?;
         }
@@ -242,14 +254,12 @@ impl Tool for BashTool {
         let handle = {
             let mut state = self.state.lock().unwrap();
             state.cancellation_requested.insert(execution_id.clone());
-            state
-                .active
-                .get(&execution_id)
-                .map(|active| active.handle.clone())
+            state.active.get(&execution_id).cloned()
         };
-        if let Some(handle) = handle {
-            self.session
-                .cancel_command(handle)
+        if let Some(active) = handle {
+            active
+                .session
+                .cancel_command(active.handle)
                 .await
                 .map_err(crate::ToolsError::from)?;
         }
@@ -268,13 +278,20 @@ fn truncate_for_summary(command: &str) -> String {
 }
 
 pub fn bash_tool(session: WorkdirSessionHandle, output_dir: PathBuf) -> ToolDefinition {
+    routed_bash_tool(crate::routing::singleton_router(session), output_dir)
+}
+
+pub(crate) fn routed_bash_tool(
+    router: Arc<WorkdirSessionRouter>,
+    output_dir: PathBuf,
+) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(BashParams);
         let meta = ToolMeta::new("Bash")
-            .description("Execute a shell command in the bound Workdir. Process start, bounded inline output, full-output spill, timeout and cancellation are owned by the WorkdirSession provider. This is not a sandbox.")
+            .description("Execute a shell command in one selected Workdir. Process start, bounded inline output, full-output spill, timeout and cancellation are owned by that WorkdirSession provider. This is not a sandbox.")
             .input_schema(serde_json::to_value(schema).expect("Bash schema serialization"));
         let tool: Arc<dyn Tool> = Arc::new(BashTool {
-            session: session.clone(),
+            router: router.clone(),
             output_dir: output_dir.clone(),
             state: Arc::new(Mutex::new(BashExecutionState::default())),
         });
