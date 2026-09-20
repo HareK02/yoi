@@ -164,7 +164,7 @@ fn request_from_selection(selection: Selection) -> BackendCreateWorkerRequest {
         display_name: selection.display_name,
         profile: Some(selection.profile),
         initial_submit: Vec::new(),
-        working_directory: None,
+        workdir_attachments: Vec::new(),
         ticket_assignment: None,
         control_operation_id: None,
     }
@@ -477,7 +477,7 @@ mod tests {
         assert_eq!(request.display_name, "Coder one");
         assert_eq!(request.profile.as_deref(), Some("builtin:coder"));
         assert!(request.initial_submit.is_empty());
-        assert!(request.working_directory.is_none());
+        assert!(request.workdir_attachments.is_empty());
         assert!(request.ticket_assignment.is_none());
     }
 }

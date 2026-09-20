@@ -70,6 +70,9 @@ pub struct RuntimeWorkingDirectoryCleanupTarget {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkingDirectorySummary {
     pub working_directory_id: String,
+    /// Optional human-facing label. Never used for routing or identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub repository_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_selector: Option<String>,
@@ -92,8 +95,6 @@ pub struct RuntimeWorkingDirectorySummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanliness: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub primary_worker_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occupied_by: Option<WorkingDirectoryOccupancy>,
 }
 
@@ -101,6 +102,9 @@ pub struct RuntimeWorkingDirectorySummary {
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectorySummary {
     pub working_directory_id: String,
+    /// Optional human-facing label. Never used for attachment routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub repository_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_selector: Option<String>,
@@ -122,8 +126,6 @@ pub struct WorkingDirectorySummary {
     pub status: WorkingDirectoryStatusKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanliness: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub primary_worker_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occupied_by: Option<WorkingDirectoryOccupancy>,
 }
@@ -184,8 +186,6 @@ pub struct WorkingDirectoryCurrentObservation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanliness: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub primary_worker_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occupied_by: Option<WorkingDirectoryOccupancy>,
 }
 
@@ -214,6 +214,7 @@ mod tests {
     fn working_directory_summary_preserves_server_projection_wire_shape() {
         let summary = WorkingDirectorySummary {
             working_directory_id: "wd-1".to_string(),
+            display_name: Some("Checkout".to_string()),
             repository_key: "repo-1".to_string(),
             creation_selector: None,
             creation_ref: None,
@@ -226,7 +227,6 @@ mod tests {
             cleanup_target: None,
             status: WorkingDirectoryStatusKind::Active,
             cleanliness: None,
-            primary_worker_id: None,
             occupied_by: None,
         };
         let value = serde_json::to_value(summary).unwrap();

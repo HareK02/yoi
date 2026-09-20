@@ -8,6 +8,7 @@
 pub mod http;
 mod local;
 mod operation;
+mod router;
 mod scope;
 pub mod workspace;
 
@@ -27,6 +28,7 @@ pub use local::{
     LocalWorkdirSession, SymlinkInfo, WorkdirSessionResource, direct_symlink, first_symlink,
 };
 pub use operation::*;
+pub use router::{RoutedWorkdirSession, WorkdirAttachmentAlias, WorkdirSessionRouter};
 pub use scope::{
     ReadOnlyWorkdirSession, WorkdirScopeAuthorizationRequest, WorkdirScopeLease,
     WorkdirScopeOverlapRequest, WorkdirToolBroker, WorkdirToolScope, WorkdirToolScopePermission,

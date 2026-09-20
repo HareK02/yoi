@@ -236,6 +236,12 @@ export type SubscriptionWorkerAvailability = "observed" | "unavailable";
 
 export type EventSubscriptionSelector = { "topic": "runtime_workers" } | { "topic": "worker_lifecycle", worker_ids: SubscriptionWorkerIds, } | { "topic": "worker_protocol", worker_id: SubscriptionWorkerId, runtime_id?: string | null, } | { "topic": "workspace_workers" } | { "topic": "workspace_workdirs" };
 
+export type SubscriptionWorkerWorkdirAttachment = {
+/**
+ * Stable Worker-local routing alias.
+ */
+alias: string, repository_key?: string | null, working_directory_id: SubscriptionWorkdirId, };
+
 export type SubscriptionWorker = { worker_id: SubscriptionWorkerId,
 /**
  * Set by the Workspace Server when projecting a Runtime-owned Worker to clients.
@@ -264,14 +270,9 @@ worker_state?: WorkerStateSnapshot | null,
 /**
  * Runtime catalog lifecycle compatibility projection; not foreground-state authority.
  */
-state: SubscriptionWorkerState, has_running_internal_workers: boolean, workspace_id?: string | null, display_name?: string | null, profile?: string | null,
-/**
- * Workspace-facing Repository key. Runtime producers leave this unset and
- * Workspace Server projections replace `repository_id` with this field.
- */
-repository_key?: string | null, working_directory_id?: SubscriptionWorkdirId | null, };
+state: SubscriptionWorkerState, has_running_internal_workers: boolean, workspace_id?: string | null, display_name?: string | null, profile?: string | null, workdir_attachments?: Array<SubscriptionWorkerWorkdirAttachment>, };
 
-export type WorkspaceSubscriptionWorkdir = { working_directory_id: SubscriptionWorkdirId, repository_key: string, state: string, primary_worker_id?: SubscriptionWorkerId | null, };
+export type WorkspaceSubscriptionWorkdir = { working_directory_id: SubscriptionWorkdirId, repository_key: string, state: string, };
 
 export type SubscriptionSnapshot = { "topic": "workers", "data": { workers: Array<SubscriptionWorker>, } } | { "topic": "worker_protocol", "data": { worker_id: SubscriptionWorkerId, events: Array<Event>, } } | { "topic": "workspace_workdirs", "data": { workdirs: Array<WorkspaceSubscriptionWorkdir>, } };
 

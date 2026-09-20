@@ -335,6 +335,8 @@ pub struct RepositoryMaterializationContext {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkingDirectoryRequest {
     pub repository: WorkingDirectoryRepository,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     #[serde(default)]
     pub materializer: MaterializerKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -344,10 +346,29 @@ pub struct WorkingDirectoryRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct WorkingDirectoryClaim {
+pub struct WorkingDirectoryAttachmentClaim {
+    /// Stable Worker-local routing key. This is not a Workdir id or display name.
+    pub alias: workdir::WorkdirAttachmentAlias,
     pub working_directory_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relative_cwd: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkerWorkdirAttachmentsRequest {
+    pub workdir_attachments: Vec<WorkingDirectoryAttachmentClaim>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkingDirectoryAttachmentRequest {
+    pub alias: workdir::WorkdirAttachmentAlias,
+    pub working_directory: WorkingDirectoryRequest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkingDirectoryAttachmentStatus {
+    pub alias: workdir::WorkdirAttachmentAlias,
+    pub working_directory: WorkingDirectoryStatus,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -387,10 +408,10 @@ pub struct CreateWorkerRequest {
     pub config_bundle: Option<ConfigBundleRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_input: Option<WorkerInput>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_directory_request: Option<WorkingDirectoryRequest>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_directory: Option<WorkingDirectoryClaim>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workdir_attachment_requests: Vec<WorkingDirectoryAttachmentRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workdir_attachments: Vec<WorkingDirectoryAttachmentClaim>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worker_observation_enabled: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -413,8 +434,8 @@ pub struct WorkerSummary {
     pub worker_state: Option<WorkerStateSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_directory: Option<WorkingDirectoryStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workdir_attachments: Vec<WorkingDirectoryAttachmentStatus>,
     pub profile: ProfileSelector,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
@@ -727,6 +748,17 @@ pub trait RuntimeApi {
     ) -> Result<WorkerResponse, RuntimeApiError>;
 
     #[post(
+        "/v1/workers/{worker_id}/workdir-attachments",
+        status = 200,
+        error_status = 400
+    )]
+    async fn replace_worker_workdir_attachments(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerWorkdirAttachmentsRequest,
+    ) -> Result<WorkerResponse, RuntimeApiError>;
+
+    #[post(
         "/v1/workers/{worker_id}/completions",
         status = 200,
         error_status = 400
@@ -1002,6 +1034,13 @@ mod tests {
         ) -> Result<WorkerResponse, RuntimeApiError> {
             Err(test_error(501))
         }
+        async fn replace_worker_workdir_attachments(
+            &self,
+            _worker_id: String,
+            _request: WorkerWorkdirAttachmentsRequest,
+        ) -> Result<WorkerResponse, RuntimeApiError> {
+            Err(test_error(501))
+        }
         async fn complete_worker_arguments(
             &self,
             _worker_id: String,
@@ -1072,7 +1111,7 @@ mod tests {
     #[test]
     fn contract_inventory_is_complete_and_unique() {
         let operations = RuntimeApiMetadata::OPERATIONS;
-        assert_eq!(operations.len(), 15);
+        assert_eq!(operations.len(), 16);
         let mut routes = operations
             .iter()
             .map(|operation| (format!("{:?}", operation.method), operation.path))

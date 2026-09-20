@@ -413,9 +413,7 @@ fn project_registry_worker(
             workspace_id: Some(record.registry.workspace_id.clone()),
             display_name: Some(record.registry.display_name.clone()),
             profile: record.registry.profile.clone(),
-            repository_id: None,
-            repository_key: None,
-            working_directory_id: None,
+            workdir_attachments: Vec::new(),
         }
     };
     worker.runtime_id = Some(runtime_id);
@@ -440,23 +438,33 @@ fn project_working_directory(
     else {
         return false;
     };
-    if let Some(link) = links.first() {
-        let Ok(Some(workdir)) = api
-            .store
-            .get_workdir_registry(&api.config.workspace_id, &link.workdir_id)
-        else {
-            return false;
-        };
-        if workdir.runtime_id != worker_ref.runtime_id {
-            return false;
+    if !links.is_empty() {
+        let mut attachments = Vec::with_capacity(links.len());
+        for link in links {
+            let Ok(Some(workdir)) = api
+                .store
+                .get_workdir_registry(&api.config.workspace_id, &link.workdir_id)
+            else {
+                return false;
+            };
+            if workdir.runtime_id != worker_ref.runtime_id {
+                return false;
+            }
+            let Ok(working_directory_id) =
+                protocol::subscription::SubscriptionWorkdirId::new(workdir.workdir_id)
+            else {
+                return false;
+            };
+            attachments.push(
+                protocol::subscription::SubscriptionWorkerWorkdirAttachment {
+                    alias: link.alias,
+                    repository_id: Some(workdir.repository_id),
+                    repository_key: None,
+                    working_directory_id,
+                },
+            );
         }
-        let Ok(working_directory_id) =
-            protocol::subscription::SubscriptionWorkdirId::new(workdir.workdir_id)
-        else {
-            return false;
-        };
-        worker.repository_id = Some(workdir.repository_id);
-        worker.working_directory_id = Some(working_directory_id);
+        worker.workdir_attachments = attachments;
     } else {
         let Ok(has_link_history) = api
             .store
@@ -465,26 +473,28 @@ fn project_working_directory(
             return false;
         };
         if has_link_history {
-            worker.repository_id = None;
-            worker.repository_key = None;
-            worker.working_directory_id = None;
+            worker.workdir_attachments.clear();
         }
     }
-    project_repository_key(api, worker)
+    project_repository_keys(api, worker)
 }
 
-fn project_repository_key(api: &WorkspaceApi, worker: &mut SubscriptionWorker) -> bool {
-    let Some(repository_id) = worker.repository_id.take() else {
-        worker.repository_key = None;
-        return true;
-    };
-    let Ok(Some(repository)) = api
-        .store
-        .get_repository(&api.config.workspace_id, &repository_id)
-    else {
-        return false;
-    };
-    worker.repository_key = Some(repository.repository_key);
+fn project_repository_keys(api: &WorkspaceApi, worker: &mut SubscriptionWorker) -> bool {
+    for attachment in &mut worker.workdir_attachments {
+        let Some(repository_id) = attachment.repository_id.take() else {
+            if attachment.repository_key.is_none() {
+                return false;
+            }
+            continue;
+        };
+        let Ok(Some(repository)) = api
+            .store
+            .get_repository(&api.config.workspace_id, &repository_id)
+        else {
+            return false;
+        };
+        attachment.repository_key = Some(repository.repository_key);
+    }
     true
 }
 

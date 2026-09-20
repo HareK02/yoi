@@ -31,7 +31,6 @@ export function defaultWorkerLaunchForm(
     options?.working_directories.filter((directory) =>
       directory.status === "active" &&
       directory.cleanliness === "clean" &&
-      directory.primary_worker_id == null &&
       directory.occupied_by == null
     ) ?? [];
   const selectedRuntime = current.runtime_id
@@ -97,12 +96,13 @@ export function buildCreateWorkspaceWorkerRequest(
     initial_submit: initialMessage
       ? [{ kind: "text", content: form.initial_text }]
       : [],
-    working_directory: form.working_directory_id
-      ? {
+    workdir_attachments: form.working_directory_id
+      ? [{
+        alias: "workdir",
         working_directory_id: form.working_directory_id,
         relative_cwd: form.relative_cwd.trim() || null,
-      }
-      : null,
+      }]
+      : [],
     control_operation_id: null,
   });
 }

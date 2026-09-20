@@ -32,8 +32,9 @@ use worker_runtime::catalog::{
     ConfigBundleRef, CreateWorkerRequest, ProfileSelector, ProfileSourceArchiveSource,
     RepositoryRefObservation, RepositoryRefObservationRequest,
     WorkerDetail as EmbeddedWorkerDetail, WorkerStatus as EmbeddedWorkerStatus,
-    WorkingDirectoryClaim, WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest,
-    WorkingDirectoryStatus, WorkingDirectorySummary, WorkspaceApiRef,
+    WorkingDirectoryAttachmentClaim, WorkingDirectoryAttachmentRequest,
+    WorkingDirectoryAttachmentStatus, WorkingDirectoryRepositoryAccessRequest,
+    WorkingDirectoryRequest, WorkingDirectoryStatus, WorkspaceApiRef,
 };
 use worker_runtime::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary};
 #[cfg(test)]
@@ -270,8 +271,8 @@ pub struct WorkerSummary {
     pub retention_state: String,
     pub implementation: WorkerImplementationSummary,
     pub capabilities: WorkerCapabilitySummary,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_directory: Option<WorkingDirectorySummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workdir_attachments: Vec<WorkingDirectoryAttachmentStatus>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -336,7 +337,7 @@ impl From<RuntimeSummary> for server_api::RuntimeSummary {
 pub(crate) fn workspace_worker_summary(
     summary: WorkerSummary,
     resource_key: String,
-    working_directory: Option<server_api::WorkingDirectorySummary>,
+    workdir_attachments: Vec<server_api::WorkerWorkdirAttachmentSummary>,
 ) -> server_api::WorkerSummary {
     server_api::WorkerSummary {
         runtime_id: summary.worker.runtime_id,
@@ -366,7 +367,7 @@ pub(crate) fn workspace_worker_summary(
             can_stop: summary.capabilities.can_stop,
             can_spawn_followup: summary.capabilities.can_spawn_followup,
         },
-        working_directory,
+        workdir_attachments,
         diagnostics: summary.diagnostics.into_iter().map(Into::into).collect(),
     }
 }
@@ -485,6 +486,13 @@ pub struct WorkerCreateBinding {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct WorkerSpawnWorkingDirectoryAttachmentRequest {
+    pub alias: workdir::WorkdirAttachmentAlias,
+    pub working_directory: WorkerSpawnWorkingDirectoryRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerSpawnRequest {
     pub intent: WorkerSpawnIntent,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -495,15 +503,13 @@ pub struct WorkerSpawnRequest {
     pub ticket_assignment: Option<WorkerTicketAssignmentRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub initial_submit: Vec<Segment>,
-    /// Optional safe working-directory creation request. The Workspace server resolves
-    /// this into a runtime-internal `WorkingDirectoryRequest` from configured
-    /// repositories before calling a host.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_directory_request: Option<WorkerSpawnWorkingDirectoryRequest>,
+    /// Safe working-directory materialization requests, keyed by stable Worker-local aliases.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workdir_attachment_requests: Vec<WorkerSpawnWorkingDirectoryAttachmentRequest>,
     #[serde(skip, default)]
-    pub resolved_working_directory_request: Option<WorkingDirectoryRequest>,
+    pub resolved_workdir_attachment_requests: Vec<WorkingDirectoryAttachmentRequest>,
     #[serde(skip, default)]
-    pub resolved_working_directory: Option<WorkingDirectoryClaim>,
+    pub resolved_workdir_attachments: Vec<WorkingDirectoryAttachmentClaim>,
     #[serde(skip, default)]
     pub resolved_config_bundle: Option<ConfigBundle>,
     #[serde(skip, default)]
@@ -900,6 +906,24 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
                 DiagnosticSeverity::Info,
                 format!(
                     "runtime does not support replacing the Workspace API for worker `{worker_id}`"
+                ),
+            )],
+        }
+    }
+
+    fn replace_worker_workdir_attachments(
+        &self,
+        worker_id: &str,
+        _attachments: Vec<WorkingDirectoryAttachmentClaim>,
+    ) -> WorkerWorkspaceApiResult {
+        WorkerWorkspaceApiResult {
+            state: WorkerOperationState::Unsupported,
+            worker: None,
+            diagnostics: vec![diagnostic(
+                "worker_workdir_attachments_replace_unsupported",
+                DiagnosticSeverity::Info,
+                format!(
+                    "runtime does not support replacing Workdir attachments for worker `{worker_id}`"
                 ),
             )],
         }
@@ -1487,6 +1511,19 @@ impl RuntimeRegistry {
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
         Ok(runtime.replace_worker_workspace_api(worker_id, workspace_api))
+    }
+
+    pub fn replace_worker_workdir_attachments(
+        &self,
+        worker: &RuntimeWorkerRef,
+        attachments: Vec<WorkingDirectoryAttachmentClaim>,
+    ) -> Result<WorkerWorkspaceApiResult, RuntimeRegistryError> {
+        let runtime_id = worker.runtime_id.as_str();
+        let worker_id = worker.worker_id.as_str();
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        validate_backend_identifier("worker_id", worker_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        Ok(runtime.replace_worker_workdir_attachments(worker_id, attachments))
     }
 
     pub fn observe_workspace_prompt_projection(
@@ -2176,7 +2213,7 @@ impl EmbeddedWorkerRuntime {
                     && self.can_stop_embedded_worker(summary.status),
                 can_spawn_followup: false,
             },
-            working_directory: summary.working_directory.map(|status| status.summary),
+            workdir_attachments: summary.workdir_attachments,
             diagnostics: embedded_worker_projection_diagnostics(
                 summary.execution_metadata_available,
             ),
@@ -2220,7 +2257,7 @@ impl EmbeddedWorkerRuntime {
                     && self.can_stop_embedded_worker(detail.status),
                 can_spawn_followup: false,
             },
-            working_directory: detail.working_directory.map(|status| status.summary),
+            workdir_attachments: detail.workdir_attachments,
             diagnostics: embedded_worker_projection_diagnostics(
                 detail.execution_metadata_available,
             ),
@@ -2429,6 +2466,39 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         }
     }
 
+    fn replace_worker_workdir_attachments(
+        &self,
+        worker_id: &str,
+        attachments: Vec<WorkingDirectoryAttachmentClaim>,
+    ) -> WorkerWorkspaceApiResult {
+        let Some(worker_ref) = self.worker_ref(worker_id) else {
+            return WorkerWorkspaceApiResult {
+                state: WorkerOperationState::Rejected,
+                worker: None,
+                diagnostics: vec![diagnostic(
+                    "embedded_worker_id_invalid",
+                    DiagnosticSeverity::Warning,
+                    "Worker id was empty and cannot change Workdir attachments".to_string(),
+                )],
+            };
+        };
+        match self
+            .runtime
+            .replace_worker_workdir_attachments(&worker_ref, attachments)
+        {
+            Ok(detail) => WorkerWorkspaceApiResult {
+                state: WorkerOperationState::Accepted,
+                worker: Some(self.map_worker_detail(detail)),
+                diagnostics: Vec::new(),
+            },
+            Err(err) => WorkerWorkspaceApiResult {
+                state: WorkerOperationState::Rejected,
+                worker: None,
+                diagnostics: vec![embedded_runtime_diagnostic(&err)],
+            },
+        }
+    }
+
     fn create_working_directory(
         &self,
         _request: WorkingDirectoryRequest,
@@ -2491,8 +2561,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         request: WorkerSpawnRequest,
     ) -> WorkerSpawnResult {
         let mut diagnostics = Vec::new();
-        if request.resolved_working_directory_request.is_some()
-            || request.resolved_working_directory.is_some()
+        if !request.resolved_workdir_attachment_requests.is_empty()
+            || !request.resolved_workdir_attachments.is_empty()
         {
             diagnostics.push(embedded_workdir_unsupported_diagnostic());
             return WorkerSpawnResult {
@@ -2573,8 +2643,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             config_bundle,
             profile_source,
             initial_input: initial_worker_input(&request.initial_submit),
-            working_directory_request: request.resolved_working_directory_request.clone(),
-            working_directory: request.resolved_working_directory.clone(),
+            workdir_attachment_requests: request.resolved_workdir_attachment_requests.clone(),
+            workdir_attachments: request.resolved_workdir_attachments.clone(),
             worker_observation_enabled: request.resolved_worker_observation_enabled,
             worker_observation_grants: request.resolved_worker_observation_grants.clone(),
             workspace_api: Some(workspace_api),
@@ -3982,7 +4052,7 @@ impl RemoteWorkerRuntime {
                     && runtime_worker_can_stop(true, summary.status),
                 can_spawn_followup: false,
             },
-            working_directory: summary.working_directory.map(|status| status.summary),
+            workdir_attachments: summary.workdir_attachments,
             diagnostics: remote_worker_projection_diagnostics(summary.execution_metadata_available),
         }
     }
@@ -4024,7 +4094,7 @@ impl RemoteWorkerRuntime {
                     && runtime_worker_can_stop(true, detail.status),
                 can_spawn_followup: false,
             },
-            working_directory: detail.working_directory.map(|status| status.summary),
+            workdir_attachments: detail.workdir_attachments,
             diagnostics: remote_worker_projection_diagnostics(detail.execution_metadata_available),
         }
     }
@@ -4388,6 +4458,51 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         }
     }
 
+    fn replace_worker_workdir_attachments(
+        &self,
+        worker_id: &str,
+        attachments: Vec<WorkingDirectoryAttachmentClaim>,
+    ) -> WorkerWorkspaceApiResult {
+        let workdir_attachments = match runtime_contract_convert(attachments) {
+            Ok(attachments) => attachments,
+            Err(diagnostic) => {
+                return WorkerWorkspaceApiResult {
+                    state: WorkerOperationState::Rejected,
+                    worker: None,
+                    diagnostics: vec![diagnostic],
+                };
+            }
+        };
+        let request = runtime_api::WorkerWorkdirAttachmentsRequest {
+            workdir_attachments,
+        };
+        let worker_id = worker_id.to_string();
+        match self
+            .run_runtime_api(
+                self.request_timeout,
+                MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+                move |client| async move {
+                    client
+                        .replace_worker_workdir_attachments(worker_id, request)
+                        .await
+                },
+            )
+            .and_then(|value| {
+                runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(value.worker)
+            }) {
+            Ok(response) => WorkerWorkspaceApiResult {
+                state: WorkerOperationState::Accepted,
+                worker: Some(self.map_worker_detail(response)),
+                diagnostics: Vec::new(),
+            },
+            Err(diagnostic) => WorkerWorkspaceApiResult {
+                state: WorkerOperationState::Rejected,
+                worker: None,
+                diagnostics: vec![diagnostic],
+            },
+        }
+    }
+
     fn create_working_directory(
         &self,
         request: WorkingDirectoryRequest,
@@ -4567,8 +4682,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             config_bundle,
             profile_source,
             initial_input: initial_worker_input(&request.initial_submit),
-            working_directory_request: request.resolved_working_directory_request.clone(),
-            working_directory: request.resolved_working_directory.clone(),
+            workdir_attachment_requests: request.resolved_workdir_attachment_requests.clone(),
+            workdir_attachments: request.resolved_workdir_attachments.clone(),
             worker_observation_enabled: request.resolved_worker_observation_enabled,
             worker_observation_grants: request.resolved_worker_observation_grants.clone(),
             workspace_api: Some(workspace_api),
@@ -5724,7 +5839,7 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
             can_stop: false,
             can_spawn_followup: false,
         },
-        working_directory: None,
+        workdir_attachments: Vec::new(),
         diagnostics: vec![diagnostic(
             "runtime_capability_unsupported",
             DiagnosticSeverity::Info,
@@ -6265,10 +6380,16 @@ mod tests {
                 worker_state: protocol::WorkerStateSnapshot {
                     ..protocol::WorkerStatus::Idle.into()
                 },
-                working_directory: request
-                    .working_directory
-                    .as_ref()
-                    .map(|binding| binding.status()),
+                workdir_attachments: request
+                    .workdir_attachments
+                    .iter()
+                    .map(|(alias, binding)| {
+                        worker_runtime::catalog::WorkingDirectoryAttachmentStatus {
+                            alias: alias.clone(),
+                            working_directory: binding.status(),
+                        }
+                    })
+                    .collect(),
             }
         }
 
@@ -6360,7 +6481,7 @@ mod tests {
                         can_stop: false,
                         can_spawn_followup: false,
                     },
-                    working_directory: None,
+                    workdir_attachments: Vec::new(),
                     diagnostics: Vec::new(),
                 }],
                 observed_prompt_revisions: Arc::new(Mutex::new(Vec::new())),
@@ -6650,9 +6771,9 @@ mod tests {
             profile: ProfileSelector::Builtin("builtin:coder".to_string()),
             ticket_assignment: None,
             initial_submit: Vec::new(),
-            working_directory_request: None,
-            resolved_working_directory_request: None,
-            resolved_working_directory: None,
+            workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachments: Vec::new(),
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
@@ -6890,9 +7011,9 @@ mod tests {
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
                     ticket_assignment: None,
                     initial_submit: Vec::new(),
-                    working_directory_request: None,
-                    resolved_working_directory_request: None,
-                    resolved_working_directory: None,
+                    workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachments: Vec::new(),
                     resolved_config_bundle: None,
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
@@ -6990,9 +7111,9 @@ mod tests {
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
                     ticket_assignment: None,
                     initial_submit: Vec::new(),
-                    working_directory_request: None,
-                    resolved_working_directory_request: None,
-                    resolved_working_directory: None,
+                    workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachments: Vec::new(),
                     resolved_config_bundle: None,
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
@@ -7029,9 +7150,9 @@ mod tests {
                     profile: ProfileSelector::Builtin("builtin:companion".to_string()),
                     ticket_assignment: None,
                     initial_submit: Vec::new(),
-                    working_directory_request: None,
-                    resolved_working_directory_request: None,
-                    resolved_working_directory: None,
+                    workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachments: Vec::new(),
                     resolved_config_bundle: None,
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),

@@ -139,10 +139,11 @@ Deno.test("Worker create request parser requires the complete shared request", (
       { kind: "text", content: "Implement T-565." },
       { kind: "flow", selector: "builtin:coder-review" },
     ],
-    working_directory: {
+    workdir_attachments: [{
+      alias: "source",
       working_directory_id: "workdir-a",
       relative_cwd: null,
-    },
+    }],
     control_operation_id: null,
   };
 

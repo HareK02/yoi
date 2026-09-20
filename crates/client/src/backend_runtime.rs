@@ -943,7 +943,7 @@ mod tests {
             profile: Some("builtin:coder".to_string()),
             ticket_assignment: None,
             initial_submit: Vec::new(),
-            working_directory: None,
+            workdir_attachments: Vec::new(),
             control_operation_id: None,
         };
 
@@ -964,7 +964,7 @@ mod tests {
         assert_eq!(body["display_name"], "Coder one");
         assert_eq!(body["profile"], "builtin:coder");
         assert_eq!(body["initial_submit"], serde_json::json!([]));
-        assert_eq!(body["working_directory"], serde_json::Value::Null);
+        assert_eq!(body["workdir_attachments"], serde_json::json!([]));
     }
 
     #[test]
@@ -1014,29 +1014,35 @@ mod tests {
             "state": "idle",
             "implementation": {"kind": "worker", "display_hint": "Coder"},
             "capabilities": {"can_stop": true, "can_spawn_followup": false},
-            "working_directory": {
-                "working_directory_id": "wd-1",
-                "repository_key": "main",
-                "materializer_kind": "runtime_git_clone",
-                "status": "active",
-                "occupied_by": {
-                    "runtime_id": "arcadia",
-                    "worker_id": "worker-opaque-64",
-                    "display_name": "Coder",
-                    "linked_at": "2026-08-12T00:00:00Z"
+            "workdir_attachments": [{
+                "alias": "checkout",
+                "working_directory": {
+                    "working_directory_id": "wd-1",
+                    "repository_key": "main",
+                    "materializer_kind": "runtime_git_clone",
+                    "status": "active",
+                    "occupied_by": {
+                        "runtime_id": "arcadia",
+                        "worker_id": "worker-opaque-64",
+                        "display_name": "Coder",
+                        "linked_at": "2026-08-12T00:00:00Z"
+                    }
                 }
-            }
+            }]
         });
 
         let worker: BackendWorkerSummary = serde_json::from_value(payload.clone()).unwrap();
-        let workdir = worker.working_directory.unwrap();
+        let attachment = worker.workdir_attachments.into_iter().next().unwrap();
+        assert_eq!(attachment.alias, "checkout");
+        let workdir = attachment.working_directory;
         assert_eq!(workdir.repository_key, "main");
         let occupied_by = workdir.occupied_by.expect("occupied Workdir");
         assert_eq!(occupied_by.runtime_id, "arcadia");
         assert_eq!(occupied_by.worker_id, "worker-opaque-64");
 
         let mut stale = payload;
-        stale["working_directory"]["occupied_by"]["runtime_worker_id"] = serde_json::json!(64);
+        stale["workdir_attachments"][0]["working_directory"]["occupied_by"]["runtime_worker_id"] =
+            serde_json::json!(64);
         assert!(serde_json::from_value::<BackendWorkerSummary>(stale).is_err());
     }
 

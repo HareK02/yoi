@@ -349,7 +349,7 @@ async fn shutdown_closes_bound_workdir_session() {
         })
         .await
         .unwrap();
-    worker.bind_workdir_session(Some(Arc::clone(&session)));
+    worker.bind_single_workdir_session(Some(Arc::clone(&session)));
 
     let runtime_base = tempfile::tempdir().unwrap();
     let bash_output_dir = runtime_base.path().join("bash-output");
@@ -384,7 +384,7 @@ async fn controller_projects_workdir_command_events_and_snapshot_state() {
         worker.scope().clone(),
         WorkdirSessionCapabilities::ALL,
     ));
-    worker.bind_workdir_session(Some(Arc::clone(&session)));
+    worker.bind_single_workdir_session(Some(Arc::clone(&session)));
     let handle = spawn_controller(worker).await;
     let mut events = handle.subscribe();
 
@@ -495,7 +495,7 @@ async fn controller_refreshes_command_snapshot_after_high_output_provider_lag() 
         worker.scope().clone(),
         WorkdirSessionCapabilities::ALL,
     ));
-    worker.bind_workdir_session(Some(Arc::clone(&session)));
+    worker.bind_single_workdir_session(Some(Arc::clone(&session)));
     let handle = spawn_controller(worker).await;
 
     // Local command telemetry uses 8 KiB chunks and a 256-event channel. One
@@ -572,7 +572,7 @@ async fn controller_startup_failure_closes_bound_workdir_session() {
         worker.scope().clone(),
         WorkdirSessionCapabilities::ALL,
     ));
-    worker.bind_workdir_session(Some(Arc::clone(&session)));
+    worker.bind_single_workdir_session(Some(Arc::clone(&session)));
     let runtime_base = tempfile::tempdir().unwrap();
     let invalid_runtime_base = runtime_base.path().join("not-a-directory");
     std::fs::write(&invalid_runtime_base, "file").unwrap();

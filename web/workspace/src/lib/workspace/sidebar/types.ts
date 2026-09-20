@@ -89,6 +89,11 @@ export type WorkerCapabilities = {
   can_spawn_followup: boolean;
 };
 
+export type WorkerWorkdirAttachment = {
+  alias: string;
+  working_directory: WorkingDirectorySummary;
+};
+
 export type Worker = {
   runtime_id: string;
   worker_id: string;
@@ -107,7 +112,7 @@ export type Worker = {
   last_seen_at?: string | null;
   implementation: { kind: string; display_hint: string };
   capabilities: WorkerCapabilities;
-  working_directory?: WorkingDirectorySummary | null;
+  workdir_attachments?: WorkerWorkdirAttachment[];
   diagnostics: Diagnostic[];
 };
 

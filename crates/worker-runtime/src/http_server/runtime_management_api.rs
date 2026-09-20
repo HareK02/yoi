@@ -423,6 +423,31 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         Ok(runtime_api::WorkerResponse { worker })
     }
 
+    async fn replace_worker_workdir_attachments(
+        &self,
+        worker_id: String,
+        value: runtime_api::WorkerWorkdirAttachmentsRequest,
+    ) -> Result<runtime_api::WorkerResponse, runtime_api::RuntimeApiError> {
+        let attachments = request(value.workdir_attachments)?;
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let worker = match auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+        {
+            Some(scope) => self
+                .state
+                .runtime
+                .replace_worker_workdir_attachments_scoped(&scope, &worker_ref, attachments),
+            None => self
+                .state
+                .runtime
+                .replace_worker_workdir_attachments(&worker_ref, attachments),
+        }
+        .map_err(RuntimeHttpRestError::runtime)
+        .map_err(api_error)?;
+        let worker = response(worker)?;
+        Ok(runtime_api::WorkerResponse { worker })
+    }
+
     async fn complete_worker_arguments(
         &self,
         worker_id: String,

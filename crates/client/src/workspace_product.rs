@@ -312,7 +312,7 @@ impl BackendWorkspaceProductClient {
             initial_submit: vec![protocol::Segment::Text {
                 content: format!("Please handle intake for Ticket {ticket_id}."),
             }],
-            working_directory: None,
+            workdir_attachments: Vec::new(),
             control_operation_id: None,
         };
         let response: BrowserCreateWorkerResponse =

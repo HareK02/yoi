@@ -57,6 +57,8 @@ pub struct WorkingDirectoryEvidence {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingDirectory {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub repository_id: String,
     pub materializer_kind: MaterializerKind,
     pub evidence: WorkingDirectoryEvidence,
@@ -68,6 +70,7 @@ impl WorkingDirectory {
     pub fn status_summary(&self) -> WorkingDirectorySummary {
         WorkingDirectorySummary {
             working_directory_id: self.id.clone(),
+            display_name: self.display_name.clone(),
             repository_id: self.repository_id.clone(),
             creation_selector: self.evidence.requested_selector.clone(),
             creation_ref: Some(self.evidence.resolved_commit.clone()),
@@ -80,7 +83,6 @@ impl WorkingDirectory {
             cleanup_target: Some(self.cleanup_target.clone()),
             status: self.status.clone(),
             cleanliness: None,
-            primary_worker_id: None,
             occupied_by: None,
         }
     }
@@ -717,6 +719,7 @@ impl RuntimeGitMaterializer {
         WorkingDirectoryStatus {
             summary: WorkingDirectorySummary {
                 working_directory_id: working_directory_id.to_string(),
+                display_name: None,
                 repository_id: "unknown".to_string(),
                 creation_selector: None,
                 creation_ref: None,
@@ -733,7 +736,6 @@ impl RuntimeGitMaterializer {
                 }),
                 status: WorkingDirectoryStatusKind::Corrupted,
                 cleanliness: Some("unknown".to_string()),
-                primary_worker_id: None,
                 occupied_by: None,
             },
         }
@@ -1072,6 +1074,7 @@ impl RuntimeGitMaterializer {
         let context = request.materialization.as_ref();
         let working_directory = WorkingDirectory {
             id: working_directory_id.clone(),
+            display_name: request.display_name.clone(),
             repository_id: request.repository.id.clone(),
             materializer_kind: MaterializerKind::RuntimeGitClone,
             evidence: WorkingDirectoryEvidence {
@@ -1211,6 +1214,7 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
 
         let working_request = WorkingDirectoryRequest {
             repository: request.repository.clone(),
+            display_name: None,
             materializer: MaterializerKind::RuntimeGitClone,
             backend_workdir_id: None,
             materialization: request.materialization.clone(),
@@ -3316,6 +3320,7 @@ mod tests {
                 source_fingerprint: "sha256:test".to_string(),
                 selector: Some(RepositorySelector::from("HEAD")),
             },
+            display_name: None,
             materializer: MaterializerKind::RuntimeGitClone,
             backend_workdir_id: None,
             materialization: None,

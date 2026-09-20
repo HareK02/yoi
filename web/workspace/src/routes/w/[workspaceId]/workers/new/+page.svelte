@@ -33,7 +33,8 @@
   function workdirOptionLabel(directory: WorkingDirectorySummary): string {
     const provider = data.repositories?.items.find((repository) => repository.repository_key === directory.repository_key)
       ?.provider;
-    return `${directory.repository_key} · ${formatCurrentWorkdirRevision(directory, provider)}`;
+    const label = directory.display_name ?? directory.repository_key;
+    return `${label} · ${formatCurrentWorkdirRevision(directory, provider)}`;
   }
 
   let { data }: PageProps = $props();
@@ -62,6 +63,7 @@
   );
   let initialText = $state(ticketContext?.initialInput ?? '');
   let workingDirectoryId = $state('');
+  let workingDirectoryDisplayName = $state('');
   let workingDirectoryRepositoryKey = $state(ticketContext?.repositoryKey ?? '');
   let workingDirectorySelector = $state(ticketContext?.refSelector ?? 'HEAD');
   let relativeCwd = $state('');
@@ -78,7 +80,6 @@
       : (options?.working_directories ?? []).filter((directory) =>
         directory.status === 'active' &&
         directory.cleanliness === 'clean' &&
-        directory.primary_worker_id == null &&
         directory.occupied_by == null
       ),
   );
@@ -168,6 +169,7 @@
     try {
       const request = validateWorkingDirectoryCreateRequest({
         runtime_id: runtimeId,
+        ...(workingDirectoryDisplayName.trim() ? { display_name: workingDirectoryDisplayName.trim() } : {}),
         repository_key: workingDirectoryRepositoryKey,
         ...(workingDirectorySelector ? { selector: workingDirectorySelector } : {}),
       });
@@ -340,6 +342,10 @@
           <div class="new-working-directory-panel">
             <h3>New workdir</h3>
             <div class="new-working-directory-fields">
+              <label>
+                <span>Display name</span>
+                <input bind:value={workingDirectoryDisplayName} autocomplete="off" placeholder="Optional label" maxlength="80" />
+              </label>
               <label>
                 <span>Repository</span>
                 <select bind:value={workingDirectoryRepositoryKey}>

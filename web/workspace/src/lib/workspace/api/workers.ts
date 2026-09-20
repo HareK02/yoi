@@ -8,6 +8,7 @@ import type {
   DiagnosticSeverity,
   RuntimeWorkingDirectoryCleanupTarget,
   RuntimeWorkingDirectorySummary,
+  RuntimeWorkerWorkdirAttachmentSummary,
   WorkerCapabilitySummary,
   WorkerImplementationSummary,
   WorkerLaunchOptionsResponse,
@@ -261,6 +262,7 @@ function runtimeWorkingDirectory(
     item,
     [
       "working_directory_id",
+      "display_name",
       "repository_id",
       "creation_selector",
       "creation_ref",
@@ -273,7 +275,6 @@ function runtimeWorkingDirectory(
       "cleanup_target",
       "status",
       "cleanliness",
-      "primary_worker_id",
       "occupied_by",
     ],
     label,
@@ -318,6 +319,11 @@ function runtimeWorkingDirectory(
       item.working_directory_id,
       `${label}.working_directory_id`,
     ),
+    display_name: optional(
+      item.display_name,
+      `${label}.display_name`,
+      string,
+    ),
     repository_id: string(item.repository_id, `${label}.repository_id`),
     creation_selector: optional(
       item.creation_selector,
@@ -350,12 +356,22 @@ function runtimeWorkingDirectory(
     ),
     status: status as RuntimeWorkingDirectorySummary["status"],
     cleanliness: optional(item.cleanliness, `${label}.cleanliness`, string),
-    primary_worker_id: optional(
-      item.primary_worker_id,
-      `${label}.primary_worker_id`,
-      string,
-    ),
     occupied_by: occupied,
+  };
+}
+
+function runtimeWorkdirAttachment(
+  value: unknown,
+  label: string,
+): RuntimeWorkerWorkdirAttachmentSummary {
+  const item = record(value, label);
+  exact(item, ["alias", "working_directory"], label);
+  return {
+    alias: string(item.alias, `${label}.alias`),
+    working_directory: runtimeWorkingDirectory(
+      item.working_directory,
+      `${label}.working_directory`,
+    ),
   };
 }
 
@@ -382,7 +398,7 @@ function workerSummary(
       "retention_state",
       "implementation",
       "capabilities",
-      "working_directory",
+      "workdir_attachments",
       "diagnostics",
     ],
     label,
@@ -406,11 +422,13 @@ function workerSummary(
       `${label}.implementation`,
     ),
     capabilities: capabilitySummary(item.capabilities, `${label}.capabilities`),
-    working_directory: optional(
-      item.working_directory,
-      `${label}.working_directory`,
-      runtimeWorkingDirectory,
-    ),
+    workdir_attachments: item.workdir_attachments === undefined
+      ? undefined
+      : array(
+        item.workdir_attachments,
+        `${label}.workdir_attachments`,
+        runtimeWorkdirAttachment,
+      ),
     diagnostics: array(item.diagnostics, `${label}.diagnostics`, diagnostic),
   };
 }
@@ -464,8 +482,9 @@ function workingDirectorySelection(
   label: string,
 ): BrowserWorkerWorkingDirectorySelection {
   const item = record(value, label);
-  exact(item, ["working_directory_id", "relative_cwd"], label);
+  exact(item, ["alias", "working_directory_id", "relative_cwd"], label);
   return {
+    alias: string(item.alias, `${label}.alias`),
     working_directory_id: string(
       item.working_directory_id,
       `${label}.working_directory_id`,
@@ -638,7 +657,7 @@ export function parseCreateWorkspaceWorkerRequest(
       "profile",
       "ticket_assignment",
       "initial_submit",
-      "working_directory",
+      "workdir_attachments",
       "control_operation_id",
     ],
     "Worker create request",
@@ -651,9 +670,11 @@ export function parseCreateWorkspaceWorkerRequest(
       ? null
       : ticketAssignment(item.ticket_assignment, "ticket_assignment"),
     initial_submit: array(item.initial_submit, "initial_submit", segment),
-    working_directory: item.working_directory === null
-      ? null
-      : workingDirectorySelection(item.working_directory, "working_directory"),
+    workdir_attachments: array(
+      item.workdir_attachments,
+      "workdir_attachments",
+      workingDirectorySelection,
+    ),
     control_operation_id: nullableString(
       item.control_operation_id,
       "control_operation_id",
