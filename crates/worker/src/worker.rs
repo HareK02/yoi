@@ -45,9 +45,9 @@ use crate::compact::state::{
 };
 use crate::compact::telemetry::{
     CompactAttempt, CompactFailureCategory, CompactMode, CompactSuccessStats,
-    CompactThresholdPolicy, correlated_post_request_metric, new_compact_metric_correlation_id,
+    CompactThresholdPolicy, new_compact_metric_correlation_id,
 };
-use crate::compact::usage_tracker::UsageTracker;
+use crate::compact::usage_tracker::{UsageTracker, persist_pending_usage};
 use crate::feature::background::{BackgroundTaskRewriteGuard, FeatureBackgroundTaskRegistry};
 use crate::feature::builtin::memory::WorkspaceMemoryBackendError;
 use crate::feature::builtin::{TaskFeature, WorkerObservationProvider};
@@ -1947,6 +1947,28 @@ impl PendingSubmissionHandle<session_store::FsStore> {
 pub trait SystemItemCommitter: Send + Sync {
     fn commit_log_entry(&self, entry: LogEntry) -> Result<(), StoreError>;
 
+    /// Commit one authoritative usage record while holding the same append
+    /// barrier across its in-memory publication, guard rearm, and correlated
+    /// post-request metrics. Metric appends remain best-effort.
+    fn commit_usage_boundary(
+        &self,
+        entry: LogEntry,
+        after_commit: &mut dyn FnMut(),
+        post_metrics: &[session_metrics::Metric],
+    ) -> Result<(), StoreError> {
+        self.commit_log_entry(entry)?;
+        after_commit();
+        for metric in post_metrics {
+            let payload = serde_json::to_value(metric).expect("Metric is Serialize");
+            let _ = self.commit_log_entry(LogEntry::Extension {
+                ts: segment_log::now_millis(),
+                domain: session_metrics::DOMAIN.into(),
+                payload,
+            });
+        }
+        Ok(())
+    }
+
     fn commit_system_item_with_extensions(
         &self,
         item: SystemItem,
@@ -1977,6 +1999,30 @@ where
 {
     fn commit_log_entry(&self, entry: LogEntry) -> Result<(), StoreError> {
         self.append_entry(entry)
+    }
+
+    fn commit_usage_boundary(
+        &self,
+        entry: LogEntry,
+        after_commit: &mut dyn FnMut(),
+        post_metrics: &[session_metrics::Metric],
+    ) -> Result<(), StoreError> {
+        let _append_guard = self
+            .state
+            .append_lock
+            .lock()
+            .expect("segment append lock poisoned");
+        self.append_entry_locked(entry)?;
+        after_commit();
+        for metric in post_metrics {
+            let payload = serde_json::to_value(metric).expect("Metric is Serialize");
+            let _ = self.append_entry_locked(LogEntry::Extension {
+                ts: segment_log::now_millis(),
+                domain: session_metrics::DOMAIN.into(),
+                payload,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -2155,16 +2201,16 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// Shared compaction state (present when threshold is configured).
     compact_state: Option<Arc<CompactState>>,
     /// Per-LLM-request Usage tracker. Always present after construction.
-    /// Captures `(history_len, UsageEvent)` pairs during a run; drained
-    /// in `persist_turn` and persisted as `LogEntry::LlmUsage` entries.
+    /// Captures `(history_len, UsageEvent)` pairs until their authoritative
+    /// request-boundary or terminal `LlmUsage` append succeeds.
     usage_tracker: Arc<UsageTracker>,
     /// Sync-side buffer for `Metric` values queued from inside Engine
-    /// callbacks (currently the prune observer). Drained in `persist_turn`
-    /// and written via `session_metrics::record_metric` alongside
-    /// `LogEntry::LlmUsage`. Always present after construction.
+    /// callbacks (currently the prune observer). Drained at the same request
+    /// boundary as usage, with terminal `persist_turn` as the fallback.
     metrics_tracker: Arc<crate::compact::metrics_tracker::MetricsTracker>,
     /// Cumulative Usage measurement timeline, one entry per LLM call.
-    /// Restored from session log on `restore`, appended on each persist.
+    /// Restored from session log on `restore`, appended after each durable
+    /// request-boundary usage commit.
     /// Read by token-accounting APIs (`Worker::total_tokens`, etc.).
     ///
     /// Wrapped in `Arc<Mutex>` so that callbacks injected into the
@@ -3330,8 +3376,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Handle to the synchronous `MetricsTracker` buffer.
     ///
     /// Engine callbacks (e.g. the prune observer) clone this `Arc` and
-    /// `.push(metric)` into it; Worker drains it in `persist_turn` and
-    /// writes each metric via `session_metrics::record_metric`.
+    /// `.push(metric)` into it; Worker drains it at the next request accounting
+    /// boundary, with terminal persistence as fallback.
     pub(crate) fn metrics_tracker_handle(
         &self,
     ) -> Arc<crate::compact::metrics_tracker::MetricsTracker> {
@@ -3567,6 +3613,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 self.pending_committed_history.clone(),
             )
             .with_usage_tracker(self.usage_tracker.clone())
+            .with_metrics_tracker(self.metrics_tracker.clone())
             .with_prompt_workspace_id(
                 self.workspace_context
                     .workspace_id()
@@ -4452,6 +4499,15 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.handle_worker_result(result, history_before).await
     }
 
+    fn ensure_no_pending_usage_for_segment_replacement(&self) -> Result<(), WorkerError> {
+        let pending_records = self.usage_tracker.pending_record_count();
+        if pending_records == 0 {
+            Ok(())
+        } else {
+            Err(WorkerError::PendingUsagePersistence { pending_records })
+        }
+    }
+
     /// Ensure the session exists and the writer's tally still matches
     /// the on-disk entry count.
     ///
@@ -4493,6 +4549,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         if store_count == entries_written {
             return Ok(());
         }
+        self.ensure_no_pending_usage_for_segment_replacement()?;
         // Auto-fork within the same Session: mint a fresh Segment and
         // switch to it. The source segment is left immutable (no terminal
         // marker is written back); the fork relationship is recorded
@@ -5029,45 +5086,38 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             self.try_record_metric(&metric);
         }
 
-        // Persist any LLM Usage measurements collected during this run.
-        // One LogEntry::LlmUsage per LLM call (the tool loop may have run
-        // many calls within a single Worker::run). Each is also appended to
-        // the in-memory `usage_history` so token-accounting APIs see it
-        // before the next run. Records carrying a `correlation_id` (set
-        // by an upstream observer such as the prune projection) also get
-        // a paired `prune.post_request` metric so cache_read/write can be
-        // joined back to the originating event.
-        let usage_records = self.usage_tracker.drain();
-        for recorded in usage_records {
-            let crate::compact::usage_tracker::RecordedUsage {
-                record,
-                post_requests,
-            } = recorded;
-            let committed_post_compact_request = post_requests.iter().any(|link| {
-                link.metric == crate::compact::usage_tracker::PostRequestMetric::Compaction
-            });
-            self.commit_entry(LogEntry::LlmUsage {
-                ts: segment_log::now_millis(),
-                history_len: record.history_len,
-                input_total_tokens: record.input_total_tokens,
-                cache_read_tokens: record.cache_read_tokens,
-                cache_write_tokens: record.cache_write_tokens,
-                output_tokens: record.output_tokens,
-            })?;
-            if committed_post_compact_request {
-                if let Some(state) = &self.compact_state {
-                    state.post_compact_request_committed();
-                }
-            }
-            for link in post_requests {
-                let metric =
-                    correlated_post_request_metric(link.metric, &link.correlation_id, &record);
+        // Persist any request measurements that did not already cross the
+        // in-run request boundary (for example partial usage from an errored or
+        // cancelled stream, or low-level Workers without an attached writer).
+        // `persist_pending_usage` removes each record only after its authoritative
+        // LlmUsage append succeeds, so the in-run and terminal paths cannot
+        // double-write or silently lose a failed append.
+        let usage_tracker = self.usage_tracker.clone();
+        let usage_history = self.usage_history.clone();
+        let compact_state = self.compact_state.clone();
+        if let Some(writer) = self.log_writer.clone() {
+            let _ = persist_pending_usage(
+                &usage_tracker,
+                &usage_history,
+                compact_state.as_deref(),
+                |entry, after_commit, post_metrics| {
+                    writer.commit_usage_boundary(entry, after_commit, post_metrics)
+                },
+            )?;
+        } else {
+            let post_request_metrics = persist_pending_usage(
+                &usage_tracker,
+                &usage_history,
+                compact_state.as_deref(),
+                |entry, after_commit, _post_metrics| {
+                    self.commit_entry(entry)?;
+                    after_commit();
+                    Ok(())
+                },
+            )?;
+            for metric in post_request_metrics {
                 self.try_record_metric(&metric);
             }
-            self.usage_history
-                .lock()
-                .expect("usage_history poisoned")
-                .push(record);
         }
 
         let interrupted = matches!(
@@ -5127,6 +5177,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
         trigger: CompactionTrigger,
     ) -> Result<SegmentId, WorkerError> {
+        self.ensure_no_pending_usage_for_segment_replacement()?;
         self.release_pending_compaction_service().await?;
         let _rewrite_guard = self
             .prepare_session_rewrite(SessionRewriteKind::Compact)
@@ -7438,7 +7489,9 @@ fn compact_failure_category(error: &WorkerError) -> CompactFailureCategory {
         | WorkerError::SegmentActivationIncomplete { .. } => {
             CompactFailureCategory::ActiveSegmentCommit
         }
-        WorkerError::Store(_) => CompactFailureCategory::Storage,
+        WorkerError::Store(_) | WorkerError::PendingUsagePersistence { .. } => {
+            CompactFailureCategory::Storage
+        }
         WorkerError::InvalidState(_) | WorkerError::Engine(_) => {
             CompactFailureCategory::InternalWorker
         }
@@ -7501,6 +7554,11 @@ pub enum WorkerError {
 
     #[error(transparent)]
     Provider(#[from] crate::model_client::ProviderError),
+
+    #[error(
+        "cannot replace the active Segment while {pending_records} usage record(s) await durable persistence"
+    )]
+    PendingUsagePersistence { pending_records: usize },
 
     #[error("active Segment changed before compaction commit")]
     CompactActiveSegmentChanged,
@@ -8565,6 +8623,117 @@ mod build_summary_prompt_tests {
         Segment::Text {
             content: text.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn failed_usage_append_fences_segment_rotation_until_retry_commits_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store.clone(),
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        worker.ensure_segment_head().await.unwrap();
+        let session_id = worker.session_id();
+        let source_segment = worker.segment_id();
+
+        worker
+            .usage_tracker
+            .note_compaction_correlation_id("compact-id".into());
+        worker.usage_tracker.note_request(1);
+        worker.usage_tracker.record_usage(&agen::event::UsageEvent {
+            input_tokens: Some(10),
+            output_tokens: Some(1),
+            total_tokens: Some(11),
+            cache_read_input_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+        });
+        worker.usage_tracker.request_completed();
+
+        let append_error = persist_pending_usage(
+            &worker.usage_tracker,
+            &worker.usage_history,
+            worker.compact_state.as_deref(),
+            |_, _, _| Err(StoreError::Io(std::io::Error::other("synthetic failure"))),
+        )
+        .expect_err("first usage append must fail");
+        assert!(append_error.to_string().contains("synthetic failure"));
+        assert_eq!(worker.usage_tracker.pending_record_count(), 1);
+
+        // Simulate another writer extending the active Segment. The normal run
+        // prelude must not auto-fork while the failed record still belongs to
+        // this Segment.
+        store
+            .append(
+                session_id,
+                source_segment,
+                &LogEntry::TurnEnd {
+                    ts: segment_log::now_millis(),
+                    turn_count: 99,
+                },
+            )
+            .unwrap();
+        let run_error = worker
+            .run_text("must stop before provider ownership")
+            .await
+            .expect_err("head drift must not fork past pending usage");
+        assert!(matches!(
+            run_error,
+            WorkerError::PendingUsagePersistence { pending_records: 1 }
+        ));
+        assert_eq!(worker.segment_id(), source_segment);
+        assert_eq!(
+            store.list_segments(session_id).unwrap(),
+            vec![source_segment]
+        );
+
+        let error = worker
+            .compact(0)
+            .await
+            .expect_err("pending usage must fence Segment replacement");
+        assert!(matches!(
+            error,
+            WorkerError::PendingUsagePersistence { pending_records: 1 }
+        ));
+        assert_eq!(worker.segment_id(), source_segment);
+        assert_eq!(
+            store.list_segments(session_id).unwrap(),
+            vec![source_segment]
+        );
+
+        let metrics = persist_pending_usage(
+            &worker.usage_tracker,
+            &worker.usage_history,
+            worker.compact_state.as_deref(),
+            |entry, after_commit, _| {
+                store.append(session_id, source_segment, &entry)?;
+                after_commit();
+                Ok(())
+            },
+        )
+        .expect("retry should commit on the originating Segment");
+        assert_eq!(worker.usage_tracker.pending_record_count(), 0);
+        assert_eq!(worker.usage_history.lock().unwrap().len(), 1);
+        assert_eq!(metrics.len(), 1, "correlation must be emitted once");
+        assert_eq!(metrics[0].name, "compact.post_request");
+
+        let usage_entries = store
+            .read_all(session_id, source_segment)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| matches!(entry, LogEntry::LlmUsage { .. }))
+            .count();
+        assert_eq!(usage_entries, 1, "retry must not duplicate accounting");
+        assert_eq!(
+            store.list_segments(session_id).unwrap(),
+            vec![source_segment]
+        );
     }
 
     #[tokio::test]

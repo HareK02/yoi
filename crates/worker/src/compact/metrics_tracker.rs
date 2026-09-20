@@ -2,9 +2,8 @@
 //! Engine callbacks (which run synchronously and cannot themselves
 //! perform `async` store writes).
 //!
-//! Worker drains this buffer in `persist_turn` and writes each metric via
-//! `session_metrics::record_metric`, alongside the regular `LlmUsage`
-//! entries.
+//! Worker drains this buffer at the next successful request accounting
+//! boundary, with terminal `persist_turn` as a fallback.
 
 use std::sync::Mutex;
 
@@ -21,12 +20,12 @@ impl MetricsTracker {
         }
     }
 
-    /// Queue a metric for the next `persist_turn` flush.
+    /// Queue a metric for the next request or terminal accounting flush.
     pub(crate) fn push(&self, metric: Metric) {
         self.pending.lock().unwrap().push(metric);
     }
 
-    /// Drain all queued metrics. Called by Worker after a run completes.
+    /// Drain all queued metrics at an accounting boundary.
     pub(crate) fn drain(&self) -> Vec<Metric> {
         std::mem::take(&mut *self.pending.lock().unwrap())
     }

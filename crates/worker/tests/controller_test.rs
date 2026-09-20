@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agen::Engine;
-use agen::llm_client::event::{ErrorEvent, Event as LlmEvent, ResponseStatus, StatusEvent};
+use agen::llm_client::event::{
+    ErrorEvent, Event as LlmEvent, ResponseStatus, StatusEvent, UsageEvent,
+};
 use agen::llm_client::types::Item;
 use agen::llm_client::{ClientError, LlmClient, Request};
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
@@ -2580,18 +2582,32 @@ async fn drain_until<F: FnMut(&Event) -> bool>(
 /// the interrupted turn's history consistency.
 #[tokio::test]
 async fn pause_then_resume_preserves_notifications_and_history_consistency() {
-    // Response 1: hang after opening a text block (no stop / completed),
-    // so the Engine is parked inside the stream read and `cancel_rx`
-    // races it cleanly on Method::Pause.
+    // Response 1: report billable partial usage, then hang after opening a text
+    // block (no stop / completed). Pause must flush that usage without treating
+    // the provider request as normally completed.
     let hang = MockResponse::Hang(vec![
         LlmEvent::text_block_start(0),
         LlmEvent::text_delta(0, "partial..."),
+        LlmEvent::Usage(UsageEvent {
+            input_tokens: Some(90),
+            output_tokens: Some(2),
+            total_tokens: Some(92),
+            cache_read_input_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+        }),
     ]);
     // Response 2: a clean assistant reply delivered on Resume.
     let ok = MockResponse::Complete(vec![
         LlmEvent::text_block_start(0),
         LlmEvent::text_delta(0, "resumed output"),
         LlmEvent::text_block_stop(0, None),
+        LlmEvent::Usage(UsageEvent {
+            input_tokens: Some(100),
+            output_tokens: Some(3),
+            total_tokens: Some(103),
+            cache_read_input_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+        }),
         LlmEvent::Status(StatusEvent {
             status: ResponseStatus::Completed,
         }),
@@ -2645,6 +2661,23 @@ async fn pause_then_resume_preserves_notifications_and_history_consistency() {
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Paused);
+    let (paused_entries, _) = handle.sink.subscribe_with_snapshot();
+    let paused_usage = paused_entries
+        .iter()
+        .filter_map(|entry| match entry {
+            LogEntry::LlmUsage {
+                input_total_tokens,
+                output_tokens,
+                ..
+            } => Some((*input_total_tokens, *output_tokens)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paused_usage,
+        vec![(90, 2)],
+        "Pause must durably account for usage already observed on the interrupted request"
+    );
 
     handle
         .send(Method::Notify {
@@ -2729,6 +2762,23 @@ async fn pause_then_resume_preserves_notifications_and_history_consistency() {
         })
         .unwrap_or_default();
     assert_eq!(assistant_text, "resumed output");
+    let (final_entries, _) = handle.sink.subscribe_with_snapshot();
+    let final_usage = final_entries
+        .iter()
+        .filter_map(|entry| match entry {
+            LogEntry::LlmUsage {
+                input_total_tokens,
+                output_tokens,
+                ..
+            } => Some((*input_total_tokens, *output_tokens)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        final_usage,
+        vec![(90, 2), (100, 3)],
+        "the paused request must remain a distinct billing record rather than merging into resume"
+    );
     let has_tool_call = history.iter().any(|i| i.is_tool_call());
     assert!(!has_tool_call, "no orphan tool_call in history");
 }

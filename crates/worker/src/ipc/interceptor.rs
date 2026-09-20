@@ -23,11 +23,12 @@ use agen::interceptor::{
 use agen::tool::ToolOutput;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::compact::metrics_tracker::MetricsTracker;
 use crate::compact::state::{AutomaticCompactDecision, CompactState};
-use crate::compact::usage_tracker::UsageTracker;
-use session_store::SystemItem;
+use crate::compact::usage_tracker::{UsageTracker, persist_pending_usage};
+use session_store::{SystemItem, segment_log};
 
 use crate::hook::{
     HookEventKind, HookPostToolAction, HookPreRequestAction, HookPreToolAction, HookPromptAction,
@@ -81,6 +82,10 @@ pub(crate) struct WorkerInterceptor {
     /// persisted into `usage_history`. Subsequent tool-loop LLM calls must
     /// see these records during pre-request safety accounting.
     usage_tracker: Option<Arc<UsageTracker>>,
+    /// Metrics produced synchronously while projecting the request (notably
+    /// prune.fire/skip). Flushed before the matching request usage so metric
+    /// correlation order remains stable at the in-run commit boundary.
+    metrics_tracker: Option<Arc<MetricsTracker>>,
     /// Pending-notification buffer drained into `worker.history`
     /// via [`Self::pending_history_appends`] just before the next LLM
     /// request. The Engine `extend`s these into its persistent history
@@ -152,6 +157,7 @@ impl WorkerInterceptor {
             compact_state,
             usage_history,
             usage_tracker: None,
+            metrics_tracker: None,
             pending_notifies,
             pending_attachments,
             prompts,
@@ -165,6 +171,11 @@ impl WorkerInterceptor {
 
     pub(crate) fn with_usage_tracker(mut self, usage_tracker: Arc<UsageTracker>) -> Self {
         self.usage_tracker = Some(usage_tracker);
+        self
+    }
+
+    pub(crate) fn with_metrics_tracker(mut self, metrics_tracker: Arc<MetricsTracker>) -> Self {
+        self.metrics_tracker = Some(metrics_tracker);
         self
     }
 
@@ -272,6 +283,56 @@ impl WorkerInterceptor {
             }
         }
     }
+    fn try_persist_metric(writer: &Arc<dyn SystemItemCommitter>, metric: &session_metrics::Metric) {
+        let payload = serde_json::to_value(metric).expect("Metric is Serialize");
+        if writer
+            .commit_log_entry(session_store::LogEntry::Extension {
+                ts: segment_log::now_millis(),
+                domain: session_metrics::DOMAIN.into(),
+                payload,
+            })
+            .is_err()
+        {
+            warn!(name = %metric.name, "failed to record session metric; dropping");
+        }
+    }
+
+    fn persist_completed_request_usage(&self) -> InterceptorResult<()> {
+        let Some(tracker) = self.usage_tracker.as_ref() else {
+            return Ok(());
+        };
+        tracker.request_completed();
+
+        let (Some(writer), Some(usage_history)) =
+            (self.log_writer.as_ref(), self.usage_history.as_ref())
+        else {
+            // Low-level Worker tests may omit the type-erased writer. Their
+            // terminal persist_turn remains the durable fallback.
+            return Ok(());
+        };
+        if let Some(metrics_tracker) = self.metrics_tracker.as_ref() {
+            for metric in metrics_tracker.drain() {
+                Self::try_persist_metric(writer, &metric);
+            }
+        }
+
+        persist_pending_usage(
+            tracker,
+            usage_history,
+            self.compact_state.as_deref(),
+            |entry, after_commit, post_metrics| {
+                writer.commit_usage_boundary(entry, after_commit, post_metrics)
+            },
+        )
+        .map_err(|error| {
+            InterceptorError::new(
+                InterceptorErrorCategory::Dependency,
+                format!("usage persistence failed: {error}"),
+            )
+        })?;
+        Ok(())
+    }
+
     fn attach_prompt_provenance(&self, items: &mut [SystemItem]) {
         let prompts = self.prompts.load();
         let projection = prompts.projection();
@@ -596,6 +657,11 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
         &self,
         context: AssistantTurnEndContext<'_, SessionHistoryMetadata>,
     ) -> InterceptorResult<TurnEndAction> {
+        // `on_assistant_turn_end` is reached only after a normal provider
+        // stream completed and its usage callback was flushed. Commit that
+        // exact request before tools can extend the same logical run.
+        self.persist_completed_request_usage()?;
+
         let history = context.history;
         let final_text_preview = history
             .iter()
@@ -747,6 +813,25 @@ mod tests {
                     .lock()
                     .expect("committed system-item list poisoned")
                     .push(item);
+            }
+            Ok(())
+        }
+    }
+
+    struct FailingUsageCommitter {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl SystemItemCommitter for FailingUsageCommitter {
+        fn commit_log_entry(
+            &self,
+            entry: session_store::LogEntry,
+        ) -> Result<(), session_store::StoreError> {
+            if matches!(entry, session_store::LogEntry::LlmUsage { .. }) {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                return Err(session_store::StoreError::Io(std::io::Error::other(
+                    "synthetic usage failure",
+                )));
             }
             Ok(())
         }
@@ -953,6 +1038,68 @@ mod tests {
             state.take_pending_request_block(),
             Some(crate::compact::state::AutomaticCompactBlock::Thrash)
         );
+    }
+
+    #[tokio::test]
+    async fn completed_request_usage_failure_stops_before_rearm() {
+        use crate::compact::state::{AutomaticCompactDecision, CompactionOutcome};
+
+        let registry = Arc::new(HookRegistryBuilder::new().build());
+        let state = Arc::new(CompactState::new(None, Some(10), 0));
+        assert!(matches!(
+            state.evaluate_request(11),
+            AutomaticCompactDecision::Start(_)
+        ));
+        assert!(state.complete_automatic(CompactionOutcome::Succeeded));
+
+        let usage_history = Arc::new(Mutex::new(Vec::new()));
+        let tracker = Arc::new(UsageTracker::new());
+        tracker.note_compaction_correlation_id("compact-id".into());
+        tracker.note_request(1);
+        tracker.record_usage(&agen::event::UsageEvent {
+            input_tokens: Some(5),
+            output_tokens: Some(1),
+            total_tokens: Some(6),
+            cache_read_input_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+        });
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let interceptor = WorkerInterceptor::new(
+            registry,
+            Some(Arc::clone(&state)),
+            Some(Arc::clone(&usage_history)),
+            NotifyBuffer::new(),
+            Arc::new(Mutex::new(Vec::new())),
+            test_prompts(),
+            Some(Arc::new(FailingUsageCommitter {
+                attempts: Arc::clone(&attempts),
+            })),
+        )
+        .with_usage_tracker(Arc::clone(&tracker));
+
+        let error = interceptor
+            .on_assistant_turn_end(AssistantTurnEndContext {
+                invocation: Default::default(),
+                assistant_entries: &[],
+                history: &[],
+                tool_calls: &[],
+            })
+            .await
+            .expect_err("usage storage failure must stop the request boundary");
+
+        assert_eq!(error.category(), InterceptorErrorCategory::Dependency);
+        assert!(error.diagnostic().contains("usage persistence failed"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tracker.records().len(),
+            1,
+            "failed record must remain pending"
+        );
+        assert!(usage_history.lock().unwrap().is_empty());
+        assert!(matches!(
+            state.evaluate_request(11),
+            AutomaticCompactDecision::Block(_)
+        ));
     }
 
     #[tokio::test]
