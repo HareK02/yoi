@@ -214,6 +214,14 @@ impl UsageTracker {
             .collect()
     }
 
+    /// Number of measurements that have not crossed the durable commit
+    /// boundary. Session rewrites must not activate a replacement Segment while
+    /// this is non-zero, because their history coordinates belong to the current
+    /// Segment.
+    pub(crate) fn pending_record_count(&self) -> usize {
+        self.state.lock().unwrap().pending_records.len()
+    }
+
     /// Remove the oldest measurement for one durable commit attempt.
     pub(crate) fn take_next(&self) -> Option<RecordedUsage> {
         self.state

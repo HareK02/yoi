@@ -3355,8 +3355,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Handle to the synchronous `MetricsTracker` buffer.
     ///
     /// Engine callbacks (e.g. the prune observer) clone this `Arc` and
-    /// `.push(metric)` into it; Worker drains it in `persist_turn` and
-    /// writes each metric via `session_metrics::record_metric`.
+    /// `.push(metric)` into it; Worker drains it at the next request accounting
+    /// boundary, with terminal persistence as fallback.
     pub(crate) fn metrics_tracker_handle(
         &self,
     ) -> Arc<crate::compact::metrics_tracker::MetricsTracker> {
@@ -5146,6 +5146,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
         trigger: CompactionTrigger,
     ) -> Result<SegmentId, WorkerError> {
+        let pending_records = self.usage_tracker.pending_record_count();
+        if pending_records > 0 {
+            return Err(WorkerError::PendingUsagePersistence { pending_records });
+        }
         self.release_pending_compaction_service().await?;
         let _rewrite_guard = self
             .prepare_session_rewrite(SessionRewriteKind::Compact)
@@ -7453,7 +7457,9 @@ fn compact_failure_category(error: &WorkerError) -> CompactFailureCategory {
         | WorkerError::SegmentActivationIncomplete { .. } => {
             CompactFailureCategory::ActiveSegmentCommit
         }
-        WorkerError::Store(_) => CompactFailureCategory::Storage,
+        WorkerError::Store(_) | WorkerError::PendingUsagePersistence { .. } => {
+            CompactFailureCategory::Storage
+        }
         WorkerError::InvalidState(_) | WorkerError::Engine(_) => {
             CompactFailureCategory::InternalWorker
         }
@@ -7516,6 +7522,11 @@ pub enum WorkerError {
 
     #[error(transparent)]
     Provider(#[from] crate::model_client::ProviderError),
+
+    #[error(
+        "cannot replace the active Segment while {pending_records} usage record(s) await durable persistence"
+    )]
+    PendingUsagePersistence { pending_records: usize },
 
     #[error("active Segment changed before compaction commit")]
     CompactActiveSegmentChanged,
@@ -8572,6 +8583,90 @@ mod build_summary_prompt_tests {
         Segment::Text {
             content: text.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn failed_usage_append_fences_segment_rotation_until_retry_commits_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store.clone(),
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        worker.ensure_segment_head().await.unwrap();
+        let session_id = worker.session_id();
+        let source_segment = worker.segment_id();
+
+        worker
+            .usage_tracker
+            .note_compaction_correlation_id("compact-id".into());
+        worker.usage_tracker.note_request(1);
+        worker.usage_tracker.record_usage(&agen::event::UsageEvent {
+            input_tokens: Some(10),
+            output_tokens: Some(1),
+            total_tokens: Some(11),
+            cache_read_input_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+        });
+        worker.usage_tracker.request_completed();
+
+        let append_error = persist_pending_usage(
+            &worker.usage_tracker,
+            &worker.usage_history,
+            worker.compact_state.as_deref(),
+            |_, _, _| Err(StoreError::Io(std::io::Error::other("synthetic failure"))),
+        )
+        .expect_err("first usage append must fail");
+        assert!(append_error.to_string().contains("synthetic failure"));
+        assert_eq!(worker.usage_tracker.pending_record_count(), 1);
+
+        let error = worker
+            .compact(0)
+            .await
+            .expect_err("pending usage must fence Segment replacement");
+        assert!(matches!(
+            error,
+            WorkerError::PendingUsagePersistence { pending_records: 1 }
+        ));
+        assert_eq!(worker.segment_id(), source_segment);
+        assert_eq!(
+            store.list_segments(session_id).unwrap(),
+            vec![source_segment]
+        );
+
+        let metrics = persist_pending_usage(
+            &worker.usage_tracker,
+            &worker.usage_history,
+            worker.compact_state.as_deref(),
+            |entry, after_commit, _| {
+                store.append(session_id, source_segment, &entry)?;
+                after_commit();
+                Ok(())
+            },
+        )
+        .expect("retry should commit on the originating Segment");
+        assert_eq!(worker.usage_tracker.pending_record_count(), 0);
+        assert_eq!(worker.usage_history.lock().unwrap().len(), 1);
+        assert_eq!(metrics.len(), 1, "correlation must be emitted once");
+        assert_eq!(metrics[0].name, "compact.post_request");
+
+        let usage_entries = store
+            .read_all(session_id, source_segment)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| matches!(entry, LogEntry::LlmUsage { .. }))
+            .count();
+        assert_eq!(usage_entries, 1, "retry must not duplicate accounting");
+        assert_eq!(
+            store.list_segments(session_id).unwrap(),
+            vec![source_segment]
+        );
     }
 
     #[tokio::test]
