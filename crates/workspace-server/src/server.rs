@@ -2575,6 +2575,11 @@ impl WorkspaceApi {
                     .map_err(RuntimeRegistryError::into_error)?;
             }
         }
+        let spawned_workdir_ids = request
+            .resolved_workdir_attachment_requests
+            .iter()
+            .filter_map(|attachment| attachment.working_directory.backend_workdir_id.clone())
+            .collect::<Vec<_>>();
         let attachment_reservations = request
             .resolved_workdir_attachments
             .iter()
@@ -2625,8 +2630,7 @@ impl WorkspaceApi {
         };
         let compensation_context = WorkerSpawnCompensationContext {
             assignment: None,
-            prepared_workdir_id: None,
-            cleanup_spawned_workdir: false,
+            spawned_workdir_ids: &spawned_workdir_ids,
         };
         let mut reserved_attachments: Vec<(String, String, String)> = Vec::new();
         for (alias, workdir_id, reservation_id) in &attachment_reservations {
@@ -15192,9 +15196,6 @@ async fn create_workspace_worker_inner(
         })
         .collect::<ApiResult<Vec<_>>>()?;
     validate_working_directory_claims_for_browser(&resolved_workdir_attachments)?;
-    if resolved_workdir_attachments.is_empty() {
-        reject_no_workdir_for_non_embedded_runtime(&runtime_id)?;
-    }
     let (intent, acceptance, ticket_assignment) =
         browser_worker_spawn_policy(ticket_assignment, &initial_submit)?;
     let request = WorkerSpawnRequest {
@@ -15308,21 +15309,20 @@ fn browser_worker_response_from_summary(
         Ok(record) => record,
         Err(error) => return Err(error.into()),
     };
+    let compensation = WorkerSpawnCompensationContext {
+        assignment,
+        spawned_workdir_ids: &[],
+    };
     if let Some(assignment) = assignment {
         if let Err(error) = api.store.bind_ticket_assignment_operation_worker(
             &api.config.workspace_id,
             &assignment.operation_id,
             &worker.worker.worker_id,
         ) {
-            let context = WorkerSpawnCompensationContext {
-                assignment: Some(assignment),
-                prepared_workdir_id: None,
-                cleanup_spawned_workdir: false,
-            };
             return finalize_worker_spawn_stage(
                 api,
                 &worker,
-                &context,
+                &compensation,
                 WorkerSpawnFinalizeStage::TicketAssignmentBind,
                 Err(error.into()),
             );
@@ -15333,43 +15333,21 @@ fn browser_worker_response_from_summary(
             &worker.worker.runtime_id,
             &worker.worker.worker_id,
         ) {
-            let context = WorkerSpawnCompensationContext {
-                assignment: Some(assignment),
-                prepared_workdir_id: None,
-                cleanup_spawned_workdir: false,
-            };
             return finalize_worker_spawn_stage(
                 api,
                 &worker,
-                &context,
+                &compensation,
                 WorkerSpawnFinalizeStage::TicketAssignmentBind,
                 Err(error.into()),
             );
         }
     }
-    for attachment in &worker.workdir_attachments {
-        let working_directory = &attachment.working_directory.summary;
-        let workdir_record =
-            workdir_record_from_summary(api, worker.worker.runtime_id.as_str(), working_directory);
-        api.store.upsert_workdir_registry(&workdir_record)?;
-        link_worker_to_workdir(
-            api,
-            &worker_record,
-            attachment.alias.as_str(),
-            &working_directory.working_directory_id,
-            None,
-        )?;
-    }
+    finalize_spawned_worker_workdir_attachments(api, &worker, &worker_record, &compensation)?;
     if let Some(assignment) = assignment {
-        let context = WorkerSpawnCompensationContext {
-            assignment: Some(assignment),
-            prepared_workdir_id: None,
-            cleanup_spawned_workdir: false,
-        };
         finalize_worker_spawn_stage(
             api,
             &worker,
-            &context,
+            &compensation,
             WorkerSpawnFinalizeStage::TicketStateAccept,
             accept_queued_ticket_after_worker_spawn(api, assignment).map_err(ApiError::from),
         )?;
@@ -15398,6 +15376,70 @@ fn browser_worker_response_from_summary(
             .map(server_api::Diagnostic::from)
             .collect(),
     })
+}
+
+fn finalize_spawned_worker_workdir_attachments(
+    api: &WorkspaceApi,
+    worker: &WorkerSummary,
+    worker_record: &WorkerRegistryRecord,
+    compensation: &WorkerSpawnCompensationContext<'_>,
+) -> ApiResult<()> {
+    let existing_links = finalize_worker_spawn_stage(
+        api,
+        worker,
+        compensation,
+        WorkerSpawnFinalizeStage::WorkdirAttachment,
+        api.store
+            .list_worker_workdir_links(&api.config.workspace_id, &worker_record.worker)
+            .map_err(ApiError::from),
+    )?;
+    for attachment in &worker.workdir_attachments {
+        let summary = &attachment.working_directory.summary;
+        let mut workdir_record =
+            workdir_record_from_summary(api, worker.worker.runtime_id.as_str(), summary);
+        let previous_record = finalize_worker_spawn_stage(
+            api,
+            worker,
+            compensation,
+            WorkerSpawnFinalizeStage::WorkdirRegistry,
+            api.store
+                .get_workdir_registry(&api.config.workspace_id, &summary.working_directory_id)
+                .map_err(ApiError::from),
+        )?;
+        preserve_workdir_identity_for_corrupted_summary(
+            &mut workdir_record,
+            previous_record.as_ref(),
+        );
+        finalize_worker_spawn_stage(
+            api,
+            worker,
+            compensation,
+            WorkerSpawnFinalizeStage::WorkdirRegistry,
+            api.store
+                .upsert_workdir_registry(&workdir_record)
+                .map_err(ApiError::from),
+        )?;
+        if !existing_links.iter().any(|link| {
+            link.unlinked_at.is_none()
+                && link.alias == attachment.alias.as_str()
+                && link.workdir_id == summary.working_directory_id
+        }) {
+            finalize_worker_spawn_stage(
+                api,
+                worker,
+                compensation,
+                WorkerSpawnFinalizeStage::WorkdirAttachment,
+                link_worker_to_workdir(
+                    api,
+                    worker_record,
+                    attachment.alias.as_str(),
+                    &summary.working_directory_id,
+                    None,
+                ),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 async fn scoped_post_internal_runtime_resource_fetch(
@@ -15652,26 +15694,6 @@ fn reject_workdir_for_embedded_runtime(runtime_id: &str, has_workdir: bool) -> A
     ))
 }
 
-fn reject_no_workdir_for_non_embedded_runtime(runtime_id: &str) -> ApiResult<()> {
-    if runtime_id == EMBEDDED_WORKER_RUNTIME_ID {
-        return Ok(());
-    }
-    Err(ApiError::with_diagnostics(
-        Error::RuntimeOperationFailed {
-            runtime_id: runtime_id.to_string(),
-            code: "workspace_worker_workdir_required".to_string(),
-            message: "Only the embedded Runtime can launch a Worker without a working directory"
-                .to_string(),
-        },
-        vec![RuntimeDiagnostic {
-            code: "workspace_worker_workdir_required".to_string(),
-            severity: DiagnosticSeverity::Error,
-            message: "Select a working directory for this Runtime, or choose the embedded Runtime for a conversation-only Worker."
-                .to_string(),
-        }],
-    ))
-}
-
 async fn list_runtime_workers(
     State(api): State<WorkspaceApi>,
     AxumPath(runtime_id): AxumPath<String>,
@@ -15712,6 +15734,7 @@ enum WorkerSpawnFinalizeStage {
     TicketAssignmentBind,
     TicketAssignmentCurrent,
     TicketStateAccept,
+    WorkdirRegistry,
     WorkdirAttachment,
 }
 
@@ -15722,6 +15745,7 @@ impl WorkerSpawnFinalizeStage {
             Self::TicketAssignmentBind => "ticket_assignment_bind",
             Self::TicketAssignmentCurrent => "ticket_assignment_current",
             Self::TicketStateAccept => "ticket_state_accept",
+            Self::WorkdirRegistry => "workdir_registry",
             Self::WorkdirAttachment => "workdir_attachment",
         }
     }
@@ -15729,8 +15753,7 @@ impl WorkerSpawnFinalizeStage {
 
 struct WorkerSpawnCompensationContext<'a> {
     assignment: Option<&'a crate::hosts::WorkerTicketAssignmentRequest>,
-    prepared_workdir_id: Option<&'a str>,
-    cleanup_spawned_workdir: bool,
+    spawned_workdir_ids: &'a [String],
 }
 
 fn finalize_worker_spawn_stage<T>(
@@ -15856,14 +15879,18 @@ fn compensate_failed_workspace_worker_create(
     let reserved_worker_ref =
         RuntimeWorkerRef::new(runtime_id.to_string(), reservation_worker_id.to_string());
     let mut reserved_worker_absent = false;
+    let mut backend_compensated = false;
     if let Some(worker) = worker {
         let (returned_worker_absent, delete_diagnostics) =
             delete_runtime_worker_for_spawn_compensation(api, &worker.worker);
         diagnostics.extend(delete_diagnostics);
         if returned_worker_absent {
             diagnostics.extend(finalize_spawn_compensation_after_worker_delete(
-                api, worker, context,
+                api,
+                &worker.worker,
+                context,
             ));
+            backend_compensated = true;
         }
         if worker.worker == reserved_worker_ref {
             reserved_worker_absent = returned_worker_absent;
@@ -15874,6 +15901,13 @@ fn compensate_failed_workspace_worker_create(
             delete_runtime_worker_for_spawn_compensation(api, &reserved_worker_ref);
         reserved_worker_absent = worker_absent;
         diagnostics.extend(delete_diagnostics);
+    }
+    if reserved_worker_absent && !backend_compensated {
+        diagnostics.extend(finalize_spawn_compensation_after_worker_delete(
+            api,
+            &reserved_worker_ref,
+            context,
+        ));
     }
     diagnostics.extend(release_worker_workdir_attachment_reservations(
         api,
@@ -15924,7 +15958,9 @@ fn compensate_failed_worker_spawn(
         return diagnostics;
     }
     diagnostics.extend(finalize_spawn_compensation_after_worker_delete(
-        api, worker, context,
+        api,
+        &worker.worker,
+        context,
     ));
     diagnostics
 }
@@ -15996,7 +16032,7 @@ fn delete_runtime_worker_for_spawn_compensation(
 
 fn finalize_spawn_compensation_after_worker_delete(
     api: &WorkspaceApi,
-    worker: &WorkerSummary,
+    worker_ref: &RuntimeWorkerRef,
     context: &WorkerSpawnCompensationContext<'_>,
 ) -> Vec<RuntimeDiagnostic> {
     let mut diagnostics = Vec::new();
@@ -16010,8 +16046,8 @@ fn finalize_spawn_compensation_after_worker_delete(
                 format!(
                     "Failed to roll back Ticket assignment operation `{}` for Worker {}:{}: {}",
                     assignment.operation_id,
-                    worker.worker.runtime_id,
-                    worker.worker.worker_id,
+                    worker_ref.runtime_id,
+                    worker_ref.worker_id,
                     sanitize_backend_error(&error.to_string())
                 ),
             ));
@@ -16019,52 +16055,49 @@ fn finalize_spawn_compensation_after_worker_delete(
     }
     if let Err(error) = api
         .store
-        .delete_worker_registry(&api.config.workspace_id, &worker.worker)
+        .delete_worker_registry(&api.config.workspace_id, worker_ref)
     {
         diagnostics.push(spawn_compensation_diagnostic(
             "worker_spawn_compensation_registry_delete_failed",
             format!(
                 "Failed to remove Backend Worker registry for {}:{}: {}",
-                worker.worker.runtime_id,
-                worker.worker.worker_id,
+                worker_ref.runtime_id,
+                worker_ref.worker_id,
                 sanitize_backend_error(&error.to_string())
             ),
         ));
     }
 
-    if context.cleanup_spawned_workdir {
-        if let Some(workdir_id) = context.prepared_workdir_id {
-            match execute_workdir_removal(
-                api,
-                workdir_id,
-                "backend:worker_spawn_compensation",
-                "remove Workdir created by rejected Worker spawn",
-            ) {
-                Ok(result)
-                    if result.disposition == WorkingDirectoryRemovalDisposition::Removed => {}
-                Ok(result) => diagnostics.push(spawn_compensation_diagnostic(
-                    "worker_spawn_compensation_workdir_cleanup_failed",
-                    format!(
-                        "Durable removal retained spawn-created Workdir `{workdir_id}` for Worker {}:{}: disposition={:?}, retryable={}",
-                        worker.worker.runtime_id,
-                        worker.worker.worker_id,
-                        result.disposition,
-                        result.retryable,
-                    ),
-                )),
-                Err(error) => diagnostics.push(spawn_compensation_diagnostic(
-                    "worker_spawn_compensation_workdir_cleanup_failed",
-                    format!(
-                        "Failed to reserve durable removal for spawn-created Workdir `{workdir_id}` for Worker {}:{}: {}",
-                        worker.worker.runtime_id,
-                        worker.worker.worker_id,
-                        sanitize_backend_error(&error.to_string())
-                    ),
-                )),
-            }
+    for workdir_id in context.spawned_workdir_ids {
+        match execute_workdir_removal(
+            api,
+            workdir_id,
+            "backend:worker_spawn_compensation",
+            "remove Workdir created by rejected Worker spawn",
+        ) {
+            Ok(result) if result.disposition == WorkingDirectoryRemovalDisposition::Removed => {}
+            Ok(result) => diagnostics.push(spawn_compensation_diagnostic(
+                "worker_spawn_compensation_workdir_cleanup_failed",
+                format!(
+                    "Durable removal retained spawn-created Workdir `{workdir_id}` for Worker {}:{}: disposition={:?}, retryable={}",
+                    worker_ref.runtime_id,
+                    worker_ref.worker_id,
+                    result.disposition,
+                    result.retryable,
+                ),
+            )),
+            Err(error) => diagnostics.push(spawn_compensation_diagnostic(
+                "worker_spawn_compensation_workdir_cleanup_failed",
+                format!(
+                    "Failed to reserve durable removal for spawn-created Workdir `{workdir_id}` for Worker {}:{}: {}",
+                    worker_ref.runtime_id,
+                    worker_ref.worker_id,
+                    sanitize_backend_error(&error.to_string())
+                ),
+            )),
         }
     }
-    if let Ok(worker_id) = parse_runtime_worker_id_for_registry(&worker.worker.worker_id)
+    if let Ok(worker_id) = parse_runtime_worker_id_for_registry(&worker_ref.worker_id)
         && let Err(error) = api
             .config_store
             .release_removed_worker_resource_key(&api.config.workspace_id, worker_id)
@@ -16073,7 +16106,7 @@ fn finalize_spawn_compensation_after_worker_delete(
             "worker_spawn_compensation_resource_key_release_failed",
             format!(
                 "Failed to release removed Workspace Worker resource key {}: {}",
-                worker.worker.worker_id,
+                worker_ref.worker_id,
                 sanitize_backend_error(&error.to_string())
             ),
         ));
@@ -16146,11 +16179,6 @@ async fn create_runtime_worker(
         !request.workdir_attachment_requests.is_empty()
             || !request.resolved_workdir_attachments.is_empty(),
     )?;
-    if request.workdir_attachment_requests.is_empty()
-        && request.resolved_workdir_attachments.is_empty()
-    {
-        reject_no_workdir_for_non_embedded_runtime(&runtime_id)?;
-    }
     request.resolved_workdir_attachment_requests = request
         .workdir_attachment_requests
         .iter()
@@ -16174,7 +16202,6 @@ async fn create_runtime_worker(
                 .as_ref()
                 .map(|assignment| assignment.operation_id.clone())
         });
-    let mut prepared_workdirs = Vec::new();
     for attachment in &mut request.resolved_workdir_attachment_requests {
         let workdir_id =
             upsert_pending_backend_workdir(&api, &runtime_id, &mut attachment.working_directory)?;
@@ -16187,10 +16214,6 @@ async fn create_runtime_worker(
             &operation_id,
             &mut attachment.working_directory,
         )?;
-        prepared_workdirs.push((attachment.alias.clone(), workdir_id));
-    }
-    for claim in &request.resolved_workdir_attachments {
-        prepared_workdirs.push((claim.alias.clone(), claim.working_directory_id.clone()));
     }
     let requested_worker_name = request.requested_worker_name.clone();
     let spawn_idempotency =
@@ -16208,19 +16231,16 @@ async fn create_runtime_worker(
             &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         )?;
     }
-    let cleanup_spawned_workdir = !request.resolved_workdir_attachment_requests.is_empty();
     let created_workdir_ids = request
         .resolved_workdir_attachment_requests
         .iter()
         .filter_map(|attachment| attachment.working_directory.backend_workdir_id.clone())
         .collect::<Vec<_>>();
-    let prepared_workdir_id = prepared_workdirs.first().map(|(_, id)| id.as_str());
     let result = api.spawn_workspace_worker(&runtime_id, request)?;
     if let Some(worker) = result.worker.as_ref() {
         let compensation = WorkerSpawnCompensationContext {
             assignment: lifecycle_assignment.as_ref(),
-            prepared_workdir_id: prepared_workdir_id.as_deref(),
-            cleanup_spawned_workdir,
+            spawned_workdir_ids: &created_workdir_ids,
         };
         let display_name = requested_worker_name
             .as_deref()
@@ -16275,40 +16295,7 @@ async fn create_runtime_worker(
                 accept_queued_ticket_after_worker_spawn(&api, assignment).map_err(ApiError::from),
             )?;
         }
-        let existing_links = api
-            .store
-            .list_worker_workdir_links(&api.config.workspace_id, &record.worker)?;
-        for attachment in &worker.workdir_attachments {
-            let summary = &attachment.working_directory.summary;
-            let mut workdir_record =
-                workdir_record_from_summary(&api, worker.worker.runtime_id.as_str(), summary);
-            preserve_workdir_identity_for_corrupted_summary(
-                &mut workdir_record,
-                api.store
-                    .get_workdir_registry(&api.config.workspace_id, &summary.working_directory_id)?
-                    .as_ref(),
-            );
-            api.store.upsert_workdir_registry(&workdir_record)?;
-            if !existing_links.iter().any(|link| {
-                link.unlinked_at.is_none()
-                    && link.alias == attachment.alias.as_str()
-                    && link.workdir_id == summary.working_directory_id
-            }) {
-                finalize_worker_spawn_stage(
-                    &api,
-                    worker,
-                    &compensation,
-                    WorkerSpawnFinalizeStage::WorkdirAttachment,
-                    link_worker_to_workdir(
-                        &api,
-                        &record,
-                        attachment.alias.as_str(),
-                        &summary.working_directory_id,
-                        None,
-                    ),
-                )?;
-            }
-        }
+        finalize_spawned_worker_workdir_attachments(&api, worker, &record, &compensation)?;
     } else {
         for workdir_id in &created_workdir_ids {
             if let Some(mut record) = api
@@ -19514,6 +19501,234 @@ mod tests {
                     .map_err(|_| server_api::client_support::AuthorizationError::new())?,
             );
             Ok(headers)
+        }
+    }
+
+    #[derive(Default)]
+    struct WorkdirlessFixtureRuntime {
+        workers: Mutex<Vec<WorkerSummary>>,
+    }
+
+    impl WorkdirlessFixtureRuntime {
+        const RUNTIME_ID: &'static str = "workdirless-runtime";
+
+        fn workdir_status(
+            working_directory_id: &str,
+        ) -> worker_runtime::catalog::WorkingDirectoryStatus {
+            worker_runtime::catalog::WorkingDirectoryStatus {
+                summary: worker_runtime::catalog::WorkingDirectorySummary {
+                    working_directory_id: working_directory_id.to_string(),
+                    display_name: None,
+                    repository_id: "repo-test".to_string(),
+                    creation_selector: Some("HEAD".to_string()),
+                    creation_ref: None,
+                    creation_tree: None,
+                    current_selector: Some("HEAD".to_string()),
+                    current_ref: None,
+                    current_tree: None,
+                    observed_at_epoch_seconds: None,
+                    materializer_kind:
+                        workdir::workspace::WorkingDirectoryMaterializerKind::RuntimeGitClone,
+                    cleanup_target: None,
+                    status: WorkingDirectoryStatusKind::Active,
+                    cleanliness: Some("clean".to_string()),
+                    occupied_by: None,
+                },
+            }
+        }
+
+        fn worker_summary(
+            binding: WorkerCreateBinding,
+            request: &WorkerSpawnRequest,
+        ) -> WorkerSummary {
+            WorkerSummary {
+                worker: RuntimeWorkerRef::new(Self::RUNTIME_ID, binding.worker_id.to_string()),
+                host_id: "workdirless-host".to_string(),
+                display_name: request
+                    .requested_worker_name
+                    .clone()
+                    .unwrap_or_else(|| "Workdirless Worker".to_string()),
+                label: request
+                    .requested_worker_name
+                    .clone()
+                    .unwrap_or_else(|| "Workdirless Worker".to_string()),
+                profile: match &request.profile {
+                    ProfileSelector::Builtin(profile) | ProfileSelector::Named(profile) => {
+                        Some(profile.clone())
+                    }
+                },
+                singleton_key: None,
+                tags: Vec::new(),
+                workspace: WorkerWorkspaceSummary {
+                    visibility: "workspace".to_string(),
+                    identity: TEST_WORKSPACE_ID.to_string(),
+                    workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
+                },
+                state: "idle".to_string(),
+                worker_state: None,
+                last_seen_at: None,
+                pinned: false,
+                retention_state: "normal".to_string(),
+                implementation: WorkerImplementationSummary {
+                    kind: "fixture".to_string(),
+                    display_hint: "Workdirless fixture".to_string(),
+                },
+                capabilities: WorkerCapabilitySummary {
+                    can_stop: true,
+                    can_spawn_followup: false,
+                },
+                workdir_attachments: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl crate::hosts::WorkspaceWorkerRuntime for WorkdirlessFixtureRuntime {
+        fn runtime_id(&self) -> &str {
+            Self::RUNTIME_ID
+        }
+
+        fn runtime_summary(&self, _limit: usize) -> crate::hosts::RuntimeSummary {
+            crate::hosts::RuntimeSummary {
+                runtime_id: Self::RUNTIME_ID.to_string(),
+                label: "Workdirless Runtime".to_string(),
+                kind: "fixture".to_string(),
+                status: "active".to_string(),
+                source: crate::hosts::RuntimeSourceSummary::remote_http(),
+                host_ids: vec!["workdirless-host".to_string()],
+                worker_creation_available: true,
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn list_hosts(&self, _limit: usize) -> crate::hosts::RuntimeList<HostSummary> {
+            crate::hosts::RuntimeList {
+                items: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn list_workers(&self, limit: usize) -> crate::hosts::RuntimeList<WorkerSummary> {
+            crate::hosts::RuntimeList {
+                items: self
+                    .workers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .take(limit)
+                    .cloned()
+                    .collect(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn worker(&self, worker_id: &str) -> crate::hosts::WorkerLookupResult {
+            crate::hosts::WorkerLookupResult {
+                worker: self
+                    .workers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .find(|worker| worker.worker.worker_id == worker_id)
+                    .cloned(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn working_directory(
+            &self,
+            working_directory_id: &str,
+        ) -> crate::hosts::RuntimeWorkingDirectoryResult {
+            crate::hosts::RuntimeWorkingDirectoryResult {
+                state: WorkerOperationState::Accepted,
+                working_directory: Some(Self::workdir_status(working_directory_id)),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn cleanup_working_directory(
+            &self,
+            _working_directory_id: &str,
+        ) -> crate::hosts::RuntimeWorkingDirectoryResult {
+            crate::hosts::RuntimeWorkingDirectoryResult {
+                state: WorkerOperationState::Accepted,
+                working_directory: None,
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn spawn_worker(
+            &self,
+            binding: WorkerCreateBinding,
+            request: WorkerSpawnRequest,
+        ) -> WorkerSpawnResult {
+            assert!(request.workdir_attachment_requests.is_empty());
+            assert!(request.resolved_workdir_attachment_requests.is_empty());
+            assert!(request.resolved_workdir_attachments.is_empty());
+            let worker = Self::worker_summary(binding, &request);
+            self.workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(worker.clone());
+            WorkerSpawnResult {
+                state: WorkerOperationState::Accepted,
+                worker: Some(worker),
+                acceptance_evidence: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn stop_worker(
+            &self,
+            worker_id: &str,
+            _request: WorkerLifecycleRequest,
+        ) -> WorkerLifecycleResult {
+            WorkerLifecycleResult {
+                state: WorkerOperationState::Accepted,
+                worker: RuntimeWorkerRef::new(Self::RUNTIME_ID, worker_id),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn cancel_worker(
+            &self,
+            worker_id: &str,
+            _request: WorkerLifecycleRequest,
+        ) -> WorkerLifecycleResult {
+            WorkerLifecycleResult {
+                state: WorkerOperationState::Accepted,
+                worker: RuntimeWorkerRef::new(Self::RUNTIME_ID, worker_id),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn delete_worker(&self, worker_id: &str) -> crate::hosts::WorkerDeleteResult {
+            let mut workers = self
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous_len = workers.len();
+            workers.retain(|worker| worker.worker.worker_id != worker_id);
+            crate::hosts::WorkerDeleteResult {
+                state: WorkerOperationState::Accepted,
+                worker: RuntimeWorkerRef::new(Self::RUNTIME_ID, worker_id),
+                deleted: workers.len() != previous_len,
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn replace_worker_workspace_api(
+            &self,
+            worker_id: &str,
+            _workspace_api: WorkspaceApiRef,
+        ) -> crate::hosts::WorkerWorkspaceApiResult {
+            crate::hosts::WorkerWorkspaceApiResult {
+                state: WorkerOperationState::Accepted,
+                worker: self.worker(worker_id).worker,
+                diagnostics: Vec::new(),
+            }
         }
     }
 
@@ -26273,6 +26488,9 @@ mod tests {
     async fn worker_spawn_finalize_failure_reports_stage_and_compensation_outcomes() {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
+        register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
+        api.runtime
+            .register_or_replace(WorkdirlessFixtureRuntime::default());
         let mut ticket_input = ticket::NewTicket::new("Compensation test Ticket");
         ticket_input.workflow_state = Some(TicketWorkflowState::InProgress);
         let ticket_id = browser_ticket_backend(&api)
@@ -26313,13 +26531,13 @@ mod tests {
             State(api.clone()),
             AxumPath(ScopedRuntimePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.to_string(),
             }),
             Json(request),
         )
         .await
         .unwrap();
-        let worker = created.worker.unwrap();
+        let mut worker = created.worker.unwrap();
         assert!(
             api.store
                 .get_worker_registry(TEST_WORKSPACE_ID, &worker.worker)
@@ -26327,34 +26545,98 @@ mod tests {
                 .is_some()
         );
 
+        let spawned_workdir_ids = vec![
+            "spawned-workdir-left".to_string(),
+            "spawned-workdir-right".to_string(),
+        ];
+        for workdir_id in &spawned_workdir_ids {
+            seed_cleanup_workdir_for_runtime(
+                &api,
+                workdir_id,
+                WorkdirlessFixtureRuntime::RUNTIME_ID,
+                "present",
+                "clean",
+            );
+        }
+        worker.workdir_attachments = spawned_workdir_ids
+            .iter()
+            .enumerate()
+            .map(|(index, workdir_id)| {
+                let mut working_directory = WorkdirlessFixtureRuntime::workdir_status(workdir_id);
+                if index == 1 {
+                    working_directory.summary.display_name =
+                        Some("inject-registry-upsert-failure".to_string());
+                }
+                WorkingDirectoryAttachmentStatus {
+                    alias: workdir::WorkdirAttachmentAlias::new(if index == 0 {
+                        "left"
+                    } else {
+                        "right"
+                    })
+                    .unwrap(),
+                    working_directory,
+                }
+            })
+            .collect();
+        let worker_record = api
+            .store
+            .get_worker_registry(TEST_WORKSPACE_ID, &worker.worker)
+            .unwrap()
+            .unwrap();
+        rusqlite::Connection::open(&api.config.database_path)
+            .unwrap()
+            .execute_batch(
+                r#"
+                CREATE TABLE spawn_finalize_attachment_audit(alias TEXT NOT NULL);
+                CREATE TRIGGER audit_spawn_finalize_attachment
+                AFTER INSERT ON worker_workdir_links
+                BEGIN
+                    INSERT INTO spawn_finalize_attachment_audit(alias) VALUES (NEW.alias);
+                END;
+                CREATE TRIGGER fail_second_spawn_workdir_upsert
+                BEFORE UPDATE ON workdir_registry
+                WHEN NEW.display_name = 'inject-registry-upsert-failure'
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected second Workdir registry failure');
+                END;
+                "#,
+            )
+            .unwrap();
+
         let context = WorkerSpawnCompensationContext {
             assignment: Some(&assignment),
-            prepared_workdir_id: None,
-            cleanup_spawned_workdir: false,
+            spawned_workdir_ids: &spawned_workdir_ids,
         };
-        let error = finalize_worker_spawn_stage::<()>(
-            &api,
-            &worker,
-            &context,
-            WorkerSpawnFinalizeStage::WorkdirAttachment,
-            Err(Error::RegistryInconsistency("injected finalize failure".to_string()).into()),
-        )
-        .unwrap_err();
+        let error =
+            finalize_spawned_worker_workdir_attachments(&api, &worker, &worker_record, &context)
+                .unwrap_err();
         assert!(matches!(
             error.error,
             Error::RuntimeOperationFailed { ref code, .. }
-                if code == "worker_spawn_finalize_workdir_attachment_failed"
+                if code == "worker_spawn_finalize_workdir_registry_failed"
         ));
         assert!(error.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "worker_spawn_finalize_workdir_attachment_failed"
+            diagnostic.code == "worker_spawn_finalize_workdir_registry_failed"
                 && diagnostic.message.contains(&worker.worker.runtime_id)
                 && diagnostic.message.contains(&worker.worker.worker_id)
         }));
+        let audit_connection = rusqlite::Connection::open(&api.config.database_path).unwrap();
+        let mut audit_statement = audit_connection
+            .prepare("SELECT alias FROM spawn_finalize_attachment_audit ORDER BY rowid")
+            .unwrap();
+        let finalized_aliases = audit_statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(finalized_aliases, ["left"]);
         assert!(
             error
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "worker_spawn_compensated")
+                .any(|diagnostic| diagnostic.code == "worker_spawn_compensated"),
+            "{:?}",
+            error.diagnostics
         );
         assert!(matches!(
             api.runtime.worker(&worker.worker),
@@ -26379,12 +26661,59 @@ mod tests {
                 .is_none()
         );
 
+        for workdir_id in &spawned_workdir_ids {
+            assert!(
+                api.store
+                    .get_workdir_registry(TEST_WORKSPACE_ID, workdir_id)
+                    .unwrap()
+                    .is_none(),
+                "spawn compensation must clean every created Workdir: {workdir_id}"
+            );
+        }
+
+        let missing_summary_workdir_ids = vec![
+            "missing-summary-workdir-left".to_string(),
+            "missing-summary-workdir-right".to_string(),
+        ];
+        for workdir_id in &missing_summary_workdir_ids {
+            seed_cleanup_workdir_for_runtime(
+                &api,
+                workdir_id,
+                WorkdirlessFixtureRuntime::RUNTIME_ID,
+                "present",
+                "clean",
+            );
+        }
+        let missing_summary_context = WorkerSpawnCompensationContext {
+            assignment: None,
+            spawned_workdir_ids: &missing_summary_workdir_ids,
+        };
+        let reservation_worker_id = WorkerId::now_v7();
+        let _ = compensate_failed_workspace_worker_create(
+            &api,
+            EMBEDDED_WORKER_RUNTIME_ID,
+            reservation_worker_id,
+            "missing-summary-fingerprint",
+            "runtime_spawn_missing_summary",
+            None,
+            &missing_summary_context,
+            &[],
+        );
+        for workdir_id in &missing_summary_workdir_ids {
+            assert!(
+                api.store
+                    .get_workdir_registry(TEST_WORKSPACE_ID, workdir_id)
+                    .unwrap()
+                    .is_none(),
+                "missing-summary compensation must clean every created Workdir: {workdir_id}"
+            );
+        }
+
         let mut residual_worker = worker.clone();
         residual_worker.worker.runtime_id = "missing-runtime".to_string();
         let residual_context = WorkerSpawnCompensationContext {
             assignment: None,
-            prepared_workdir_id: None,
-            cleanup_spawned_workdir: false,
+            spawned_workdir_ids: &[],
         };
         let residual_error = finalize_worker_spawn_stage::<()>(
             &api,
@@ -27889,6 +28218,16 @@ mod tests {
     }
 
     fn seed_cleanup_workdir(api: &WorkspaceApi, workdir_id: &str, status: &str, cleanliness: &str) {
+        seed_cleanup_workdir_for_runtime(api, workdir_id, "runtime-test", status, cleanliness);
+    }
+
+    fn seed_cleanup_workdir_for_runtime(
+        api: &WorkspaceApi,
+        workdir_id: &str,
+        runtime_id: &str,
+        status: &str,
+        cleanliness: &str,
+    ) {
         seed_test_repository(api, "repo-test");
         let now = now_registry_timestamp();
         api.store
@@ -27896,7 +28235,7 @@ mod tests {
                 workspace_id: api.config.workspace_id.clone(),
                 workdir_id: workdir_id.to_string(),
                 display_name: None,
-                runtime_id: "runtime-test".to_string(),
+                runtime_id: runtime_id.to_string(),
                 repository_id: "repo-test".to_string(),
                 creation_selector: Some("HEAD".to_string()),
                 creation_ref: None,
@@ -30850,35 +31189,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_worker_create_rejects_non_embedded_no_workdir() {
+    async fn runtime_and_browser_worker_create_allow_non_embedded_zero_attachments() {
         let dir = tempfile::tempdir().unwrap();
-        let app = test_app(dir.path()).await;
-        let response = request_json(
-            app,
-            "POST",
-            "/api/workers",
-            Some(serde_json::json!({
-                "runtime_id": "remote-runtime",
-                "display_name": "Remote Worker",
-                "profile": "builtin:companion",
-                "initial_submit": []
-            })),
-            StatusCode::BAD_REQUEST,
+        let api = test_api(dir.path()).await;
+        register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
+        api.runtime
+            .register_or_replace(WorkdirlessFixtureRuntime::default());
+
+        let Json(runtime_response) = create_runtime_worker(
+            State(api.clone()),
+            AxumPath(WorkdirlessFixtureRuntime::RUNTIME_ID.to_string()),
+            Json(WorkerSpawnRequest {
+                intent: WorkerSpawnIntent::WorkspaceCompanion,
+                requested_worker_name: Some("Runtime Worker".to_string()),
+                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                    expected_segments: 0,
+                },
+                profile: ProfileSelector::Builtin("builtin:companion".to_string()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachments: Vec::new(),
+                resolved_config_bundle: None,
+                resolved_worker_observation_enabled: false,
+                resolved_worker_observation_grants: Vec::new(),
+                resolved_workspace_api: None,
+                resolved_memory_settings: None,
+                resolved_control_operation: None,
+            }),
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
-            response["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("workspace_worker_workdir_required")
-        );
-        assert!(
-            response["diagnostics"]
-                .as_array()
+            runtime_response
+                .worker
+                .as_ref()
                 .unwrap()
-                .iter()
-                .any(|diagnostic| { diagnostic["code"] == "workspace_worker_workdir_required" })
+                .workdir_attachments
+                .is_empty()
         );
+
+        let Json(response) = create_workspace_worker_inner(
+            api,
+            HeaderMap::new(),
+            CreateWorkspaceWorkerRequest {
+                runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.to_string(),
+                display_name: "Remote Worker".to_string(),
+                profile: Some("builtin:companion".to_string()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachments: Vec::new(),
+                control_operation_id: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.runtime_id, WorkdirlessFixtureRuntime::RUNTIME_ID);
+        assert!(response.worker.workdir_attachments.is_empty());
     }
 
     #[tokio::test]
