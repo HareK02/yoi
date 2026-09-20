@@ -16,7 +16,7 @@ use agen::llm_client::types::Item;
 use agen::llm_client::{ClientError, LlmClient, Request};
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use protocol::{Event, Method, RunResult};
 use session_store::{
     CombinedStore, FsStore, FsWorkerStore, LogEntry, Store, WorkerMetadata, WorkerMetadataStore,
@@ -170,6 +170,49 @@ impl LlmClient for MockClient {
         let events = self.responses[count].clone();
         let stream = futures::stream::iter(events.into_iter().map(Ok));
         Ok(Box::pin(stream))
+    }
+}
+
+#[derive(Clone)]
+struct PauseAfterUsageClient {
+    responses: Arc<Vec<Vec<LlmEvent>>>,
+    call_count: Arc<AtomicUsize>,
+    hanging_call: usize,
+}
+
+impl PauseAfterUsageClient {
+    fn new(responses: Vec<Vec<LlmEvent>>, hanging_call: usize) -> Self {
+        Self {
+            responses: Arc::new(responses),
+            call_count: Arc::new(AtomicUsize::new(0)),
+            hanging_call,
+        }
+    }
+}
+
+#[async_trait]
+impl LlmClient for PauseAfterUsageClient {
+    fn clone_boxed(&self) -> Box<dyn LlmClient> {
+        Box::new(self.clone())
+    }
+
+    async fn stream(
+        &self,
+        _request: Request,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, ClientError>> + Send>>, ClientError>
+    {
+        let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+        let events = self
+            .responses
+            .get(count)
+            .cloned()
+            .ok_or_else(|| ClientError::Config("pause mock client exhausted".into()))?;
+        let finite = futures::stream::iter(events.into_iter().map(Ok));
+        if count == self.hanging_call {
+            Ok(Box::pin(finite.chain(futures::stream::pending())))
+        } else {
+            Ok(Box::pin(finite))
+        }
     }
 }
 
@@ -1212,6 +1255,187 @@ async fn completed_post_compact_usage_rearms_within_one_tool_loop() {
     let restored = session_store::restore(&store, session_id, worker.segment_id()).unwrap();
     assert_eq!(restored.usage_history.len(), 1);
     assert_eq!(restored.usage_history[0].input_total_tokens, 800);
+}
+
+#[tokio::test]
+async fn post_compact_pause_bills_partial_without_rearming_or_consuming_correlation() {
+    let client = PauseAfterUsageClient::new(
+        vec![
+            text_events_with_usage("seed", 100_000),
+            write_summary_tool_use_events("manual-compact", "pause test summary"),
+            single_text_events("done"),
+            vec![
+                LlmEvent::text_block_start(0),
+                LlmEvent::text_delta(0, "partial"),
+                LlmEvent::usage(90, 2),
+            ],
+            grow_tool_use_events("grow-after-resume", 80),
+            write_summary_tool_use_events("automatic-compact", "rearmed summary"),
+            single_text_events("done"),
+            text_events_with_usage("finished", 50),
+        ],
+        3,
+    );
+    let call_count = Arc::clone(&client.call_count);
+    let manifest = MID_TURN_MANIFEST_TOML.replace(
+        "compact_request_threshold = 100",
+        "compact_threshold = 80000\ncompact_request_threshold = 50000",
+    );
+    let (worker, store) = make_worker_with_manifest_and_store(&manifest, client).await;
+    let session_id = worker.session_id();
+
+    let runtime_tmp = tempfile::tempdir().unwrap();
+    let bash_output_dir = runtime_tmp.path().join("bash-output");
+    let (handle, shutdown_receiver) =
+        WorkerController::spawn(worker, runtime_tmp.path(), &bash_output_dir)
+            .await
+            .unwrap();
+    let mut rx = handle.subscribe();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "seed history",
+        ))
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timeout waiting for seed")
+                .expect("event"),
+            Event::RunEnd {
+                result: RunResult::Finished
+            }
+        ) {
+            break;
+        }
+    }
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "pause the first post-compact request",
+        ))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while call_count.load(Ordering::SeqCst) < 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("post-compact provider request should start");
+    handle
+        .send(Method::Pause {
+            command: protocol::WorkerCommandEnvelope::new(1),
+        })
+        .await
+        .unwrap();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for pause")
+            .expect("event");
+        if matches!(
+            event,
+            Event::RunEnd {
+                result: RunResult::Paused
+            }
+        ) {
+            break;
+        }
+    }
+
+    let paused_usage = store
+        .list_segments(session_id)
+        .unwrap()
+        .into_iter()
+        .flat_map(|segment_id| store.read_all(session_id, segment_id).unwrap())
+        .filter_map(|entry| match entry {
+            LogEntry::LlmUsage {
+                input_total_tokens, ..
+            } => Some(input_total_tokens),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paused_usage.iter().filter(|tokens| **tokens == 90).count(),
+        1
+    );
+    let paused_metrics = session_metrics::read_session_metrics(&store, session_id).unwrap();
+    assert!(
+        paused_metrics
+            .iter()
+            .all(|record| record.metric.name != "compact.post_request"),
+        "partial Pause usage must not consume compact correlation or rearm"
+    );
+
+    handle
+        .send(Method::Resume {
+            command: protocol::WorkerCommandEnvelope::new(2),
+        })
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timeout waiting for resume completion")
+                .expect("event"),
+            Event::RunEnd {
+                result: RunResult::Finished
+            }
+        ) {
+            break;
+        }
+    }
+
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        8,
+        "the completed resumed request must rearm and permit request-threshold compaction"
+    );
+    let metrics = session_metrics::read_session_metrics(&store, session_id).unwrap();
+    let compact_starts = metrics
+        .iter()
+        .filter(|record| record.metric.name == "compact.start")
+        .collect::<Vec<_>>();
+    assert_eq!(compact_starts.len(), 2);
+    let pre_run_correlation = compact_starts
+        .iter()
+        .find(|record| {
+            record.metric.dimensions.get("trigger").map(String::as_str) == Some("pre_run")
+        })
+        .and_then(|record| record.metric.correlation_id.as_deref())
+        .expect("pre-run automatic compact correlation");
+    let pre_run_posts = metrics
+        .iter()
+        .filter(|record| {
+            record.metric.name == "compact.post_request"
+                && record.metric.correlation_id.as_deref() == Some(pre_run_correlation)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(pre_run_posts.len(), 1);
+    assert_eq!(
+        pre_run_posts[0].metric.dimensions["input_total_tokens"],
+        "80"
+    );
+    assert!(metrics.iter().all(|record| {
+        record.metric.name != "compact.post_request"
+            || record.metric.dimensions["input_total_tokens"] != "90"
+    }));
+
+    handle
+        .send(Method::Shutdown {
+            command: protocol::WorkerCommandEnvelope::new(3),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), shutdown_receiver)
+        .await
+        .expect("controller shutdown timeout")
+        .expect("shutdown confirmation");
 }
 
 #[tokio::test]

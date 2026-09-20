@@ -4478,6 +4478,15 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.handle_worker_result(result, history_before).await
     }
 
+    fn ensure_no_pending_usage_for_segment_replacement(&self) -> Result<(), WorkerError> {
+        let pending_records = self.usage_tracker.pending_record_count();
+        if pending_records == 0 {
+            Ok(())
+        } else {
+            Err(WorkerError::PendingUsagePersistence { pending_records })
+        }
+    }
+
     /// Ensure the session exists and the writer's tally still matches
     /// the on-disk entry count.
     ///
@@ -4519,6 +4528,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         if store_count == entries_written {
             return Ok(());
         }
+        self.ensure_no_pending_usage_for_segment_replacement()?;
         // Auto-fork within the same Session: mint a fresh Segment and
         // switch to it. The source segment is left immutable (no terminal
         // marker is written back); the fork relationship is recorded
@@ -5146,10 +5156,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
         trigger: CompactionTrigger,
     ) -> Result<SegmentId, WorkerError> {
-        let pending_records = self.usage_tracker.pending_record_count();
-        if pending_records > 0 {
-            return Err(WorkerError::PendingUsagePersistence { pending_records });
-        }
+        self.ensure_no_pending_usage_for_segment_replacement()?;
         self.release_pending_compaction_service().await?;
         let _rewrite_guard = self
             .prepare_session_rewrite(SessionRewriteKind::Compact)
@@ -8625,6 +8632,33 @@ mod build_summary_prompt_tests {
         .expect_err("first usage append must fail");
         assert!(append_error.to_string().contains("synthetic failure"));
         assert_eq!(worker.usage_tracker.pending_record_count(), 1);
+
+        // Simulate another writer extending the active Segment. The normal run
+        // prelude must not auto-fork while the failed record still belongs to
+        // this Segment.
+        store
+            .append(
+                session_id,
+                source_segment,
+                &LogEntry::TurnEnd {
+                    ts: segment_log::now_millis(),
+                    turn_count: 99,
+                },
+            )
+            .unwrap();
+        let run_error = worker
+            .run_text("must stop before provider ownership")
+            .await
+            .expect_err("head drift must not fork past pending usage");
+        assert!(matches!(
+            run_error,
+            WorkerError::PendingUsagePersistence { pending_records: 1 }
+        ));
+        assert_eq!(worker.segment_id(), source_segment);
+        assert_eq!(
+            store.list_segments(session_id).unwrap(),
+            vec![source_segment]
+        );
 
         let error = worker
             .compact(0)
