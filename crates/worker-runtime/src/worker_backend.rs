@@ -4472,10 +4472,10 @@ mod tests {
             )]
         );
         let names = captured_tool_names(&client, 0);
-        for forbidden in core_filesystem_tool_names() {
+        for expected in core_filesystem_tool_names() {
             assert!(
-                !names.contains(forbidden),
-                "no-workdir Worker unexpectedly exposed {forbidden}; tools={names:?}"
+                names.contains(expected),
+                "no-workdir Worker did not expose stable routed tool {expected}; tools={names:?}"
             );
         }
         let observations = runtime
