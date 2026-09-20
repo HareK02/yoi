@@ -9,15 +9,18 @@ use serde::Deserialize;
 
 use crate::error::ToolsError;
 use crate::tracker::Tracker;
-use workdir::{EditRequest, WorkdirPath, WorkdirSessionHandle};
+use workdir::{EditRequest, WorkdirPath, WorkdirSessionHandle, WorkdirSessionRouter};
 
-const DESCRIPTION: &str = "Replace a substring in an existing file. By default \
+const DESCRIPTION: &str = "Replace a substring in an existing file in the selected Workdir attachment. By default \
 `old_string` must be unique in the file; set `replace_all: true` to replace \
-every occurrence. The file must have been read first (via the Read tool) in \
-this session. Paths are relative to the bound Workdir.";
+every occurrence. The file must have been read first through the same attachment. \
+When exactly one Workdir is attached, target_workdir may be omitted.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct EditParams {
+    /// Worker-local alias of the Workdir attachment to use.
+    #[serde(default)]
+    pub target_workdir: Option<String>,
     /// Logical path relative to the bound Workdir root.
     pub file_path: String,
     /// String to replace. Must be unique in the file unless `replace_all` is true.
@@ -30,7 +33,7 @@ pub(crate) struct EditParams {
 }
 
 pub(crate) struct EditTool {
-    session: WorkdirSessionHandle,
+    router: Arc<WorkdirSessionRouter>,
     tracker: Tracker,
 }
 
@@ -44,6 +47,12 @@ impl Tool for EditTool {
         let params: EditParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid Edit input: {e}")))?;
 
+        let selected = crate::routing::resolve_session(
+            &self.router,
+            params.target_workdir.as_deref(),
+            workdir::WorkdirSessionCapability::Edit,
+        )?;
+        let tracker = self.tracker.scoped(selected.alias.as_str());
         let path = WorkdirPath::new(&params.file_path).map_err(ToolsError::from)?;
         tracing::debug!(path = %path, replace_all = params.replace_all, "Edit");
 
@@ -59,9 +68,9 @@ impl Tool for EditTool {
         }
 
         let mutation_key = PathBuf::from(path.as_str());
-        let _mutation_permit = self.tracker.acquire_mutation(&mutation_key, &ctx).await;
-        let expected_hash = self.tracker.expected_workdir_hash(&path)?;
-        let result = self
+        let _mutation_permit = tracker.acquire_mutation(&mutation_key, &ctx).await;
+        let expected_hash = tracker.expected_workdir_hash(&path)?;
+        let result = selected
             .session
             .edit(EditRequest {
                 path: path.clone(),
@@ -73,7 +82,7 @@ impl Tool for EditTool {
             .await
             .map_err(ToolsError::from)?;
         let replacements = result.replacements;
-        self.tracker.record_workdir_edit(
+        tracker.record_workdir_edit(
             &path,
             result.content_hash,
             replacements,
@@ -122,8 +131,15 @@ fn make_preview(text: &str, needle: &str) -> String {
     out
 }
 
-/// Factory for the `Edit` tool.
+/// Factory for the `Edit` tool bound to one compatibility session.
 pub fn edit_tool(session: WorkdirSessionHandle, tracker: Tracker) -> ToolDefinition {
+    routed_edit_tool(crate::routing::singleton_router(session), tracker)
+}
+
+pub(crate) fn routed_edit_tool(
+    router: Arc<WorkdirSessionRouter>,
+    tracker: Tracker,
+) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(EditParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
@@ -131,7 +147,7 @@ pub fn edit_tool(session: WorkdirSessionHandle, tracker: Tracker) -> ToolDefinit
             .description(DESCRIPTION)
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(EditTool {
-            session: session.clone(),
+            router: router.clone(),
             tracker: tracker.clone(),
         });
         (meta, tool)

@@ -8,18 +8,22 @@ use serde::Deserialize;
 
 use crate::error::ToolsError;
 use crate::tracker::Tracker;
-use workdir::{ReadRequest, WorkdirPath, WorkdirSessionHandle};
+use workdir::{ReadRequest, WorkdirPath, WorkdirSessionHandle, WorkdirSessionRouter};
 
-const DESCRIPTION: &str = "Read a text file from the local filesystem. \
+const DESCRIPTION: &str = "Read a text file from a Workdir attachment selected by its Worker-local alias. \
 Supports offset/limit for large files. Returns line-numbered output (1-based). \
 Directories cannot be read. The file must be read before Write or Edit can \
-modify it. Paths are Workdir-relative unless an absolute path is explicitly readable.";
+modify it. Paths are Workdir-relative unless an absolute path is explicitly readable. \
+When exactly one Workdir is attached, target_workdir may be omitted.";
 
 const DEFAULT_LIMIT: usize = 2000;
 const PROVIDER_BYTE_LIMIT: usize = 256 * 1024;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ReadParams {
+    /// Worker-local alias of the Workdir attachment to use.
+    #[serde(default)]
+    pub target_workdir: Option<String>,
     /// Workdir-relative path, or an absolute path covered by readable scope.
     pub file_path: String,
     /// 0-based line offset from the start. Defaults to 0.
@@ -31,7 +35,7 @@ pub(crate) struct ReadParams {
 }
 
 pub(crate) struct ReadTool {
-    session: WorkdirSessionHandle,
+    router: Arc<WorkdirSessionRouter>,
     tracker: Tracker,
 }
 
@@ -44,13 +48,19 @@ impl Tool for ReadTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: ReadParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid Read input: {e}")))?;
+        let selected = crate::routing::resolve_session(
+            &self.router,
+            params.target_workdir.as_deref(),
+            workdir::WorkdirSessionCapability::Read,
+        )?;
+        let tracker = self.tracker.scoped(selected.alias.as_str());
         let offset = params.offset.unwrap_or(0);
         let limit = params.limit.unwrap_or(DEFAULT_LIMIT).max(1);
 
         let path = WorkdirPath::new_scoped(&params.file_path).map_err(ToolsError::from)?;
         tracing::debug!(path = %path, offset, limit, "Read");
 
-        let result = self
+        let result = selected
             .session
             .read(ReadRequest {
                 path: path.clone(),
@@ -60,7 +70,7 @@ impl Tool for ReadTool {
             })
             .await
             .map_err(ToolsError::from)?;
-        self.tracker.record_workdir_hash(&path, result.content_hash);
+        tracker.record_workdir_hash(&path, result.content_hash);
 
         let text = String::from_utf8_lossy(&result.bytes).into_owned();
         let rendered = render_provider_read(
@@ -144,8 +154,15 @@ fn render_numbered(text: &str, offset: usize, limit: usize) -> Rendered {
     }
 }
 
-/// Factory for the `Read` tool.
+/// Factory for the `Read` tool bound to one compatibility session.
 pub fn read_tool(session: WorkdirSessionHandle, tracker: Tracker) -> ToolDefinition {
+    routed_read_tool(crate::routing::singleton_router(session), tracker)
+}
+
+pub(crate) fn routed_read_tool(
+    router: Arc<WorkdirSessionRouter>,
+    tracker: Tracker,
+) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(ReadParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
@@ -153,7 +170,7 @@ pub fn read_tool(session: WorkdirSessionHandle, tracker: Tracker) -> ToolDefinit
             .description(DESCRIPTION)
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(ReadTool {
-            session: session.clone(),
+            router: router.clone(),
             tracker: tracker.clone(),
         });
         (meta, tool)
@@ -199,6 +216,7 @@ mod tests {
         // History recorded
         assert!(
             tracker
+                .scoped("workdir")
                 .expected_workdir_hash(&WorkdirPath::new("a.txt").unwrap())
                 .is_ok()
         );

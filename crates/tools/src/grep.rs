@@ -4,7 +4,9 @@ use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use workdir::{GrepOutputMode, GrepRequest, WorkdirPath, WorkdirSessionHandle};
+use workdir::{
+    GrepOutputMode, GrepRequest, WorkdirPath, WorkdirSessionHandle, WorkdirSessionRouter,
+};
 
 use crate::ToolsError;
 
@@ -21,6 +23,9 @@ enum OutputMode {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GrepParams {
+    /// Worker-local alias of the Workdir attachment to use.
+    #[serde(default)]
+    target_workdir: Option<String>,
     pattern: String,
     /// Workdir-relative path, or an absolute path covered by readable scope. Defaults to the Workdir root.
     #[serde(default)]
@@ -48,7 +53,7 @@ struct GrepParams {
 }
 
 struct GrepTool {
-    session: WorkdirSessionHandle,
+    router: Arc<WorkdirSessionRouter>,
 }
 
 #[async_trait]
@@ -60,6 +65,11 @@ impl Tool for GrepTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: GrepParams = serde_json::from_str(input_json)
             .map_err(|error| ToolError::InvalidArgument(format!("invalid Grep input: {error}")))?;
+        let selected = crate::routing::resolve_session(
+            &self.router,
+            params.target_workdir.as_deref(),
+            workdir::WorkdirSessionCapability::Grep,
+        )?;
         let path = match params.path {
             Some(path) => WorkdirPath::new_scoped(&path).map_err(ToolsError::from)?,
             None => WorkdirPath::root(),
@@ -74,7 +84,7 @@ impl Tool for GrepTool {
             .map(|context| (context, context))
             .unwrap_or((params.before.unwrap_or(0), params.after.unwrap_or(0)));
         let head_limit = params.head_limit.unwrap_or(DEFAULT_HEAD_LIMIT);
-        let result = self
+        let result = selected
             .session
             .grep(GrepRequest {
                 pattern: params.pattern,
@@ -126,13 +136,17 @@ impl Tool for GrepTool {
 }
 
 pub fn grep_tool(session: WorkdirSessionHandle) -> ToolDefinition {
+    routed_grep_tool(crate::routing::singleton_router(session))
+}
+
+pub(crate) fn routed_grep_tool(router: Arc<WorkdirSessionRouter>) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(GrepParams);
         let meta = ToolMeta::new("Grep")
-            .description("Search a Workdir file or directory with a regex. Content results group lines by file; `>` marks matching lines and unmarked lines are context. Directory traversal executes inside the WorkdirSession provider. Results are bounded and Workdir-relative.")
+            .description("Search a file or directory in the selected Workdir with a regex. Content results group lines by file; `>` marks matching lines and unmarked lines are context. Directory traversal executes inside the WorkdirSession provider. Results are bounded and Workdir-relative.")
             .input_schema(serde_json::to_value(schema).expect("Grep schema serialization"));
         let tool: Arc<dyn Tool> = Arc::new(GrepTool {
-            session: session.clone(),
+            router: router.clone(),
         });
         (meta, tool)
     })

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -281,6 +281,204 @@ impl std::ops::Deref for WorkdirScopeLease {
 impl Drop for WorkdirScopeLease {
     fn drop(&mut self) {
         self.finish_release();
+    }
+}
+
+/// Alias-keyed parent authority used to attenuate one or more Workdir
+/// attachments for an Internal SubWorker.
+#[derive(Clone)]
+pub struct WorkdirToolBrokerRouter {
+    sessions: Arc<crate::WorkdirSessionRouter>,
+    brokers: Arc<Mutex<BTreeMap<crate::WorkdirAttachmentAlias, (u64, WorkdirToolBroker)>>>,
+}
+
+impl std::fmt::Debug for WorkdirToolBrokerRouter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkdirToolBrokerRouter")
+            .field("aliases", &self.sessions.aliases())
+            .finish_non_exhaustive()
+    }
+}
+
+impl WorkdirToolBrokerRouter {
+    pub fn from_single(
+        alias: crate::WorkdirAttachmentAlias,
+        session: WorkdirSessionHandle,
+    ) -> Result<Self, WorkdirError> {
+        let sessions = Arc::new(crate::WorkdirSessionRouter::new());
+        sessions.attach(alias, session)?;
+        Ok(Self::new(sessions))
+    }
+
+    pub fn new(sessions: Arc<crate::WorkdirSessionRouter>) -> Self {
+        Self {
+            sessions,
+            brokers: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    pub fn sessions(&self) -> Arc<crate::WorkdirSessionRouter> {
+        self.sessions.clone()
+    }
+
+    pub fn resolve_alias(
+        &self,
+        target_workdir: Option<&str>,
+    ) -> Result<crate::WorkdirAttachmentAlias, crate::WorkdirRouteError> {
+        self.sessions
+            .resolve(target_workdir)
+            .map(|selected| selected.alias)
+    }
+
+    fn broker(
+        &self,
+        alias: &crate::WorkdirAttachmentAlias,
+    ) -> Result<WorkdirToolBroker, WorkdirError> {
+        let selected = self
+            .sessions
+            .resolve(Some(alias.as_str()))
+            .map_err(|error| WorkdirError::InvalidArgument(error.to_string()))?;
+        let mut brokers = self.brokers.lock().map_err(|_| {
+            WorkdirError::Unavailable("Workdir tool broker router is poisoned".to_string())
+        })?;
+        if let Some((generation, broker)) = brokers.get(alias)
+            && *generation == selected.generation
+        {
+            return Ok(broker.clone());
+        }
+        let broker = WorkdirToolBroker::new(selected.session);
+        brokers.insert(alias.clone(), (selected.generation, broker.clone()));
+        Ok(broker)
+    }
+
+    pub async fn scope(
+        &self,
+        targets: Vec<(crate::WorkdirAttachmentAlias, WorkdirToolScope)>,
+    ) -> Result<WorkdirScopeLeaseSet, WorkdirError> {
+        if targets.is_empty() {
+            return Err(WorkdirError::InvalidArgument(
+                "at least one Workdir attachment scope is required".to_string(),
+            ));
+        }
+        let child_sessions = Arc::new(crate::WorkdirSessionRouter::new());
+        let mut child_brokers = BTreeMap::new();
+        let mut leases = Vec::with_capacity(targets.len());
+        for (alias, request) in targets {
+            if leases.iter().any(
+                |(existing, _): &(crate::WorkdirAttachmentAlias, WorkdirScopeLease)| {
+                    existing == &alias
+                },
+            ) {
+                for (_, lease) in &leases {
+                    let _ = lease.close().await;
+                }
+                return Err(WorkdirError::InvalidArgument(format!(
+                    "duplicate Workdir attachment scope `{alias}`"
+                )));
+            }
+            let lease = match self.broker(&alias)?.scope(request).await {
+                Ok(lease) => lease,
+                Err(error) => {
+                    for (_, lease) in &leases {
+                        let _ = lease.close().await;
+                    }
+                    return Err(error);
+                }
+            };
+            if let Err(error) = child_sessions.attach(alias.clone(), lease.tool_session()) {
+                let _ = lease.close().await;
+                for (_, existing) in &leases {
+                    let _ = existing.close().await;
+                }
+                return Err(error);
+            }
+            let child_generation = child_sessions
+                .resolve(Some(alias.as_str()))
+                .expect("newly attached child route resolves")
+                .generation;
+            child_brokers.insert(alias.clone(), (child_generation, lease.broker()));
+            leases.push((alias, lease));
+        }
+        Ok(WorkdirScopeLeaseSet {
+            broker_router: WorkdirToolBrokerRouter {
+                sessions: child_sessions,
+                brokers: Arc::new(Mutex::new(child_brokers)),
+            },
+            leases,
+        })
+    }
+}
+
+pub struct WorkdirScopeLeaseSet {
+    broker_router: WorkdirToolBrokerRouter,
+    leases: Vec<(crate::WorkdirAttachmentAlias, WorkdirScopeLease)>,
+}
+
+impl std::fmt::Debug for WorkdirScopeLeaseSet {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkdirScopeLeaseSet")
+            .field(
+                "aliases",
+                &self
+                    .leases
+                    .iter()
+                    .map(|(alias, _)| alias)
+                    .collect::<Vec<_>>(),
+            )
+            .field("active", &self.is_active())
+            .finish()
+    }
+}
+
+impl WorkdirScopeLeaseSet {
+    pub fn from_single(
+        alias: crate::WorkdirAttachmentAlias,
+        lease: WorkdirScopeLease,
+    ) -> Result<Self, WorkdirError> {
+        let sessions = Arc::new(crate::WorkdirSessionRouter::new());
+        sessions.attach(alias.clone(), lease.tool_session())?;
+        let generation = sessions
+            .resolve(Some(alias.as_str()))
+            .expect("newly attached single route resolves")
+            .generation;
+        let brokers = BTreeMap::from([(alias.clone(), (generation, lease.broker()))]);
+        Ok(Self {
+            broker_router: WorkdirToolBrokerRouter {
+                sessions,
+                brokers: Arc::new(Mutex::new(brokers)),
+            },
+            leases: vec![(alias, lease)],
+        })
+    }
+
+    pub fn broker_router(&self) -> WorkdirToolBrokerRouter {
+        self.broker_router.clone()
+    }
+
+    pub fn session_router(&self) -> Arc<crate::WorkdirSessionRouter> {
+        self.broker_router.sessions()
+    }
+
+    pub async fn close(&self) -> Result<(), WorkdirError> {
+        let mut first_error = None;
+        for (_, lease) in &self.leases {
+            if let Err(error) = lease.close().await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.leases.iter().all(|(_, lease)| lease.is_active())
+    }
+
+    pub fn revoke(&self) {
+        for (_, lease) in &self.leases {
+            lease.revoke();
+        }
     }
 }
 
@@ -2301,6 +2499,69 @@ mod tests {
 
         nested.close().await.unwrap();
         child.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn broker_router_delegates_multiple_aliases_without_namespace_mixing() {
+        let left = TempDir::new().unwrap();
+        let right = TempDir::new().unwrap();
+        fs::write(left.path().join("same.txt"), "left").unwrap();
+        fs::write(right.path().join("same.txt"), "right").unwrap();
+        let sessions = Arc::new(crate::WorkdirSessionRouter::new());
+        sessions
+            .attach(
+                crate::WorkdirAttachmentAlias::new("left").unwrap(),
+                Arc::new(crate::LocalWorkdirSession::new(
+                    manifest::Scope::writable(left.path()).unwrap(),
+                    left.path().to_path_buf(),
+                )),
+            )
+            .unwrap();
+        sessions
+            .attach(
+                crate::WorkdirAttachmentAlias::new("right").unwrap(),
+                Arc::new(crate::LocalWorkdirSession::new(
+                    manifest::Scope::writable(right.path()).unwrap(),
+                    right.path().to_path_buf(),
+                )),
+            )
+            .unwrap();
+        let brokers = WorkdirToolBrokerRouter::new(sessions);
+        let leases = brokers
+            .scope(vec![
+                (
+                    crate::WorkdirAttachmentAlias::new("left").unwrap(),
+                    request("", WorkdirToolScopePermission::Read),
+                ),
+                (
+                    crate::WorkdirAttachmentAlias::new("right").unwrap(),
+                    request("", WorkdirToolScopePermission::Read),
+                ),
+            ])
+            .await
+            .unwrap();
+
+        let child = leases.session_router();
+        let left_content = child
+            .resolve(Some("left"))
+            .unwrap()
+            .session
+            .read(read("same.txt"))
+            .await
+            .unwrap();
+        let right_content = child
+            .resolve(Some("right"))
+            .unwrap()
+            .session
+            .read(read("same.txt"))
+            .await
+            .unwrap();
+        assert_eq!(left_content.bytes, b"left");
+        assert_eq!(right_content.bytes, b"right");
+        assert!(child.resolve(None).is_err());
+
+        leases.close().await.unwrap();
+        assert!(!leases.is_active());
     }
 
     #[tokio::test]

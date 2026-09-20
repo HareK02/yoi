@@ -4,7 +4,7 @@ use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use workdir::{GlobRequest, WorkdirPath, WorkdirSessionHandle};
+use workdir::{GlobRequest, WorkdirPath, WorkdirSessionHandle, WorkdirSessionRouter};
 
 use crate::ToolsError;
 
@@ -12,6 +12,9 @@ const RESULT_LIMIT: usize = 1000;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GlobParams {
+    /// Worker-local alias of the Workdir attachment to use.
+    #[serde(default)]
+    target_workdir: Option<String>,
     /// Glob pattern, for example `**/*.rs` or `src/**/test_*.py`.
     pattern: String,
     /// Logical Workdir-relative directory. Defaults to the Workdir root.
@@ -20,7 +23,7 @@ struct GlobParams {
 }
 
 struct GlobTool {
-    session: WorkdirSessionHandle,
+    router: Arc<WorkdirSessionRouter>,
 }
 
 #[async_trait]
@@ -32,13 +35,18 @@ impl Tool for GlobTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: GlobParams = serde_json::from_str(input_json)
             .map_err(|error| ToolError::InvalidArgument(format!("invalid Glob input: {error}")))?;
+        let selected = crate::routing::resolve_session(
+            &self.router,
+            params.target_workdir.as_deref(),
+            workdir::WorkdirSessionCapability::Glob,
+        )?;
         let path = match params.path {
             Some(path) => WorkdirPath::new(&path).map_err(ToolsError::from)?,
             None => WorkdirPath::root(),
         };
         let pattern = params.pattern;
         tracing::debug!(%pattern, %path, "Glob");
-        let result = self
+        let result = selected
             .session
             .glob(GlobRequest {
                 pattern: pattern.clone(),
@@ -75,13 +83,17 @@ impl Tool for GlobTool {
 }
 
 pub fn glob_tool(session: WorkdirSessionHandle) -> ToolDefinition {
+    routed_glob_tool(crate::routing::singleton_router(session))
+}
+
+pub(crate) fn routed_glob_tool(router: Arc<WorkdirSessionRouter>) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(GlobParams);
         let meta = ToolMeta::new("Glob")
-            .description("Find files matching a glob pattern inside the bound Workdir. Results are sorted and capped at 1000 entries. Paths are Workdir-relative.")
+            .description("Find files matching a glob pattern inside the selected Workdir. Results are sorted and capped at 1000 entries. Paths are Workdir-relative.")
             .input_schema(serde_json::to_value(schema).expect("Glob schema serialization"));
         let tool: Arc<dyn Tool> = Arc::new(GlobTool {
-            session: session.clone(),
+            router: router.clone(),
         });
         (meta, tool)
     })

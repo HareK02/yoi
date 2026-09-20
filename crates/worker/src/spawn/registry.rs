@@ -27,7 +27,7 @@ use session_store::{
 };
 use tokio::sync::{Notify, broadcast};
 use tracing::warn;
-use workdir::WorkdirScopeLease;
+use workdir::WorkdirScopeLeaseSet;
 
 use crate::internal_worker::{InternalWorkerSessionHandle, InternalWorkerVisibility};
 use crate::runtime::dir::{RuntimeDir, SpawnedWorkerRecord};
@@ -70,7 +70,7 @@ pub(crate) struct SubWorkerStopSummary {
 pub(crate) struct InternalSpawnedWorkerRecord {
     pub worker_name: String,
     pub scope_delegated: Vec<ScopeRule>,
-    pub workdir_tool_scope: Arc<WorkdirScopeLease>,
+    pub workdir_tool_scope: Arc<WorkdirScopeLeaseSet>,
     #[cfg(test)]
     pub installed_tools: Arc<[String]>,
     pub session: InternalWorkerSessionHandle,
@@ -89,7 +89,7 @@ impl InternalSpawnedWorkerRecord {
     pub(crate) fn new(
         worker_name: String,
         scope_delegated: Vec<ScopeRule>,
-        workdir_tool_scope: WorkdirScopeLease,
+        workdir_tool_scope: WorkdirScopeLeaseSet,
         #[cfg(test)] installed_tools: Vec<String>,
         session: InternalWorkerSessionHandle,
         child_registry: Arc<SpawnedWorkerRegistry>,
@@ -1179,7 +1179,11 @@ mod tests {
             InternalSpawnedWorkerRecord::new(
                 name.into(),
                 Vec::new(),
-                delegation,
+                workdir::WorkdirScopeLeaseSet::from_single(
+                    workdir::WorkdirAttachmentAlias::new("workdir").unwrap(),
+                    delegation,
+                )
+                .unwrap(),
                 Vec::new(),
                 session,
                 registry(),

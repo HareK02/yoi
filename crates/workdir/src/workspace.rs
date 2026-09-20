@@ -240,5 +240,7 @@ mod tests {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceWorkdirSessionOperationRequest {
+    /// Worker-local attachment alias selected by the calling tool router.
+    pub target_workdir: String,
     pub operation: crate::http::WorkdirSessionOperation,
 }

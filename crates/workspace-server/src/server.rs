@@ -406,10 +406,6 @@ struct WorkdirSessionRegistry {
 }
 
 impl WorkdirSessionRegistry {
-    fn attachment(&self, worker: &RuntimeWorkerRef) -> Option<WorkdirSessionHandle> {
-        self.attachments.get(worker).cloned()
-    }
-
     fn insert_attachment(
         &mut self,
         worker: RuntimeWorkerRef,
@@ -8416,57 +8412,6 @@ fn current_worker_identity(
     authenticate_worker_mutation_source(api, workspace_id, headers)
 }
 
-fn current_worker_active_attachment(
-    api: &WorkspaceApi,
-    worker: &RuntimeWorkerRef,
-) -> ApiResult<WorkerWorkdirLinkRecord> {
-    let active_links = api
-        .store
-        .list_worker_workdir_links(&api.config.workspace_id, worker)?
-        .into_iter()
-        .filter(|link| link.unlinked_at.is_none())
-        .collect::<Vec<_>>();
-    if active_links.len() == 1 {
-        return Ok(active_links.into_iter().next().expect("one active link"));
-    }
-    if active_links.len() > 1 {
-        return Err(Error::WorkdirAttachmentConflict(format!(
-            "Worker {}:{} has multiple Workdir attachments; implicit operation routing is unavailable",
-            worker.runtime_id, worker.worker_id
-        ))
-        .into());
-    }
-
-    if api
-        .store
-        .worker_workdir_link_history_exists(&api.config.workspace_id, worker)?
-    {
-        return Err(Error::WorkdirAttachmentConflict(format!(
-            "Worker {}:{} has no active Workdir attachment",
-            worker.runtime_id, worker.worker_id
-        ))
-        .into());
-    }
-
-    // A Runtime can start the Worker immediately after reserving its local binding, before the
-    // outer spawn handler has projected that binding into the Backend registry. Import the same
-    // binding transactionally on the first identity-bound operation so initial input cannot race
-    // attachment authority.
-    let observed_worker = api
-        .runtime
-        .worker(worker)
-        .map_err(|error| error.into_error())?;
-    if !observed_worker.workdir_attachments.is_empty() {
-        sync_worker_observation(api, &observed_worker)?;
-        return current_worker_active_attachment(api, worker);
-    }
-    Err(Error::WorkdirAttachmentConflict(format!(
-        "Worker {}:{} has no active Workdir attachment",
-        worker.runtime_id, worker.worker_id
-    ))
-    .into())
-}
-
 fn current_worker_session_lock(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
@@ -8529,13 +8474,11 @@ async fn open_current_worker_workdir_session_locked(
         api.runtime
             .authorize_working_directory_repository_access(&workdir.runtime_id, access)
             .map_err(RuntimeRegistryError::into_error)?;
-    } else if let Some(session) = api
-        .workdir_sessions
-        .lock()
-        .expect("Workdir session registry lock poisoned")
-        .attachment(worker)
-    {
-        return Ok(session);
+    } else {
+        // The registry is an operation-session cache, not routing authority.
+        // Close any prior alias session before opening the explicitly selected
+        // attachment so multiple aliases can never share one provider namespace.
+        close_current_worker_attachment_session_locked(api, worker).await?;
     }
     let owner_worker_id = runtime_local_owner_worker_id(worker, &workdir.runtime_id);
     let session = api
@@ -8843,8 +8786,43 @@ async fn scoped_detach_current_worker_workdir(
 fn validated_current_worker_attachment(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
+    target_workdir: &str,
 ) -> ApiResult<WorkerWorkdirLinkRecord> {
-    current_worker_active_attachment(api, worker)
+    let find = || -> Result<Option<WorkerWorkdirLinkRecord>> {
+        Ok(api
+            .store
+            .list_worker_workdir_links(&api.config.workspace_id, worker)?
+            .into_iter()
+            .find(|link| link.unlinked_at.is_none() && link.alias == target_workdir))
+    };
+    if let Some(link) = find()? {
+        return Ok(link);
+    }
+
+    // A Runtime can start the Worker immediately after reserving its local
+    // bindings, before the outer spawn handler projects them into the Backend.
+    // Import that exact alias set once; never substitute another attachment.
+    if !api
+        .store
+        .worker_workdir_link_history_exists(&api.config.workspace_id, worker)?
+    {
+        let observed_worker = api
+            .runtime
+            .worker(worker)
+            .map_err(|error| error.into_error())?;
+        if !observed_worker.workdir_attachments.is_empty() {
+            sync_worker_observation(api, &observed_worker)?;
+            if let Some(link) = find()? {
+                return Ok(link);
+            }
+        }
+    }
+
+    Err(Error::WorkdirAttachmentConflict(format!(
+        "Worker {}:{} has no Workdir attachment alias `{target_workdir}`",
+        worker.runtime_id, worker.worker_id
+    ))
+    .into())
 }
 
 #[derive(Debug)]
@@ -8899,11 +8877,12 @@ async fn scoped_execute_current_worker_workdir_operation(
 ) -> std::result::Result<Json<WorkdirSessionOperationResult>, WorkdirOperationApiError> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let worker = current_worker_identity(&api, &path.workspace_id, &headers)?;
+    let target_workdir = request.target_workdir;
     let result = match request.operation {
         WorkdirSessionOperation::CommandStart(command) => {
             let session_lock = current_worker_session_lock(&api, &worker);
             let _session_guard = session_lock.lock().await;
-            let link = validated_current_worker_attachment(&api, &worker)?;
+            let link = validated_current_worker_attachment(&api, &worker, &target_workdir)?;
             let source = open_current_worker_workdir_session_locked(&api, &worker, &link).await?;
             let provider_handle = source
                 .start_command(command)
@@ -8929,7 +8908,7 @@ async fn scoped_execute_current_worker_workdir_operation(
         }
         WorkdirSessionOperation::CommandStatus(external_handle) => {
             let (session, provider_handle) =
-                current_worker_command_session(&api, &worker, &external_handle)?;
+                current_worker_command_session(&api, &worker, &target_workdir, &external_handle)?;
             session
                 .command_status(provider_handle)
                 .await
@@ -8938,7 +8917,7 @@ async fn scoped_execute_current_worker_workdir_operation(
         }
         WorkdirSessionOperation::CommandOutput(mut output) => {
             let (session, provider_handle) =
-                current_worker_command_session(&api, &worker, &output.handle)?;
+                current_worker_command_session(&api, &worker, &target_workdir, &output.handle)?;
             output.handle = provider_handle;
             session
                 .command_output(output)
@@ -8948,7 +8927,7 @@ async fn scoped_execute_current_worker_workdir_operation(
         }
         WorkdirSessionOperation::CommandCancel(external_handle) => {
             let (session, provider_handle) =
-                current_worker_command_session(&api, &worker, &external_handle)?;
+                current_worker_command_session(&api, &worker, &target_workdir, &external_handle)?;
             session
                 .cancel_command(provider_handle)
                 .await
@@ -8966,7 +8945,7 @@ async fn scoped_execute_current_worker_workdir_operation(
         | WorkdirSessionOperation::Grep(_)) => {
             let session_lock = current_worker_session_lock(&api, &worker);
             let _session_guard = session_lock.lock().await;
-            let link = validated_current_worker_attachment(&api, &worker)?;
+            let link = validated_current_worker_attachment(&api, &worker, &target_workdir)?;
             let source = open_current_worker_workdir_session_locked(&api, &worker, &link).await?;
             execute_workdir_session_operation(&source, operation)
                 .await
@@ -8979,9 +8958,10 @@ async fn scoped_execute_current_worker_workdir_operation(
 fn current_worker_command_session(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
+    target_workdir: &str,
     external_handle: &CommandHandle,
 ) -> std::result::Result<(WorkdirSessionHandle, CommandHandle), WorkdirOperationApiError> {
-    let _link = validated_current_worker_attachment(api, worker)?;
+    let _link = validated_current_worker_attachment(api, worker, target_workdir)?;
     let command = api
         .workdir_sessions
         .lock()
