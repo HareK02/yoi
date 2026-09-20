@@ -22,7 +22,7 @@ impl WorkerExecutionBackend for TestExecutionBackend {
             protocol::WorkerStateSnapshot {
                 ..protocol::WorkerStatus::Idle.into()
             },
-            None,
+            Vec::new(),
         )
     }
 
@@ -64,8 +64,8 @@ fn create_request(name: &str) -> CreateWorkerRequest {
             .unwrap(),
         },
         initial_input: None,
-        working_directory_request: None,
-        working_directory: None,
+        workdir_attachment_requests: Vec::new(),
+        workdir_attachments: Vec::new(),
         worker_observation_enabled: false,
         worker_observation_grants: Vec::new(),
         workspace_api: None,

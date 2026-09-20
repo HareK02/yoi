@@ -11,18 +11,12 @@ use tokio::task::JoinHandle;
 use crate::runtime_subscription::{
     BrokerSubscriptionEvent, RuntimeSubscriptionBroker, RuntimeSubscriptionBrokerError,
 };
-use crate::store::{
-    ControlPlaneStore, WorkerRegistryProjectionCommit, WorkerRegistryProjectionRecord,
-};
+use crate::store::{ControlPlaneStore, WorkerCatalogChange, WorkerRegistryProjectionCommit};
 use worker_runtime::identity::RuntimeWorkerRef;
 
 const PROJECTION_EVENT_CAPACITY: usize = 256;
 
-#[derive(Debug, Clone)]
-pub enum WorkerProjectionChange {
-    Upsert(WorkerRegistryProjectionRecord),
-    Removed(RuntimeWorkerRef),
-}
+pub type WorkerProjectionChange = WorkerCatalogChange;
 
 #[derive(Debug, Clone)]
 pub struct WorkerProjectionEvent {
@@ -144,25 +138,11 @@ impl WorkerProjectionService {
         self.publish_commit(commit)
     }
 
-    pub fn publish_catalog_change(&self, worker: &RuntimeWorkerRef) -> crate::Result<()> {
+    pub fn refresh(&self, worker: &RuntimeWorkerRef) -> crate::Result<()> {
         let commit = self
             .store
-            .publish_worker_registry_catalog_change(self.workspace_id.as_str(), worker)?;
+            .commit_worker_registry_projection_refresh(self.workspace_id.as_str(), worker)?;
         self.publish_commit(commit)
-    }
-
-    pub fn publish_removed(&self, worker: RuntimeWorkerRef) -> crate::Result<()> {
-        let commit = self
-            .store
-            .publish_worker_registry_removal(self.workspace_id.as_str(), &worker)?;
-        if commit.changed_workers.is_empty() {
-            return Ok(());
-        }
-        let _ = self.events.send(WorkerProjectionEvent {
-            revision: commit.revision,
-            changes: vec![WorkerProjectionChange::Removed(worker)],
-        });
-        Ok(())
     }
 
     async fn apply_broker_event(
@@ -236,38 +216,21 @@ impl WorkerProjectionService {
         self.publish_commit(commit)
     }
 
-    fn publish_commit(&self, commit: WorkerRegistryProjectionCommit) -> crate::Result<()> {
-        if commit.changed_workers.is_empty() {
+    /// Broadcast an already committed catalog payload. Persistence always happens
+    /// before this call; a process crash therefore closes subscribers, whose next
+    /// subscription starts from the durable snapshot. Retrying a removal returns
+    /// the same durable change and can heal an in-process missed broadcast.
+    pub(crate) fn publish_commit(
+        &self,
+        commit: WorkerRegistryProjectionCommit,
+    ) -> crate::Result<()> {
+        if commit.changes.is_empty() {
             return Ok(());
         }
-        let changes = commit
-            .changed_workers
-            .iter()
-            .filter_map(|worker| {
-                match self
-                    .store
-                    .worker_registry_projection(self.workspace_id.as_str(), worker)
-                {
-                    Ok(Some(record)) => Some(WorkerProjectionChange::Upsert(record)),
-                    Ok(None) => None,
-                    Err(error) => {
-                        tracing::warn!(
-                            runtime_id = %worker.runtime_id,
-                            worker_id = %worker.worker_id,
-                            error = %error,
-                            "failed to load committed Worker projection"
-                        );
-                        None
-                    }
-                }
-            })
-            .collect::<Vec<_>>();
-        if !changes.is_empty() {
-            let _ = self.events.send(WorkerProjectionEvent {
-                revision: commit.revision,
-                changes,
-            });
-        }
+        let _ = self.events.send(WorkerProjectionEvent {
+            revision: commit.revision,
+            changes: commit.changes,
+        });
         Ok(())
     }
 }

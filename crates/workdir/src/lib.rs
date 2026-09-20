@@ -8,6 +8,7 @@
 pub mod http;
 mod local;
 mod operation;
+mod router;
 mod scope;
 pub mod workspace;
 
@@ -27,10 +28,14 @@ pub use local::{
     LocalWorkdirSession, SymlinkInfo, WorkdirSessionResource, direct_symlink, first_symlink,
 };
 pub use operation::*;
+pub use router::{
+    ResolvedWorkdirSession, RoutedWorkdirSession, WorkdirAttachmentAlias, WorkdirRouteError,
+    WorkdirRouteErrorCode, WorkdirSessionRouter,
+};
 pub use scope::{
     ReadOnlyWorkdirSession, WorkdirScopeAuthorizationRequest, WorkdirScopeLease,
-    WorkdirScopeOverlapRequest, WorkdirToolBroker, WorkdirToolScope, WorkdirToolScopePermission,
-    WorkdirToolScopeRule,
+    WorkdirScopeLeaseSet, WorkdirScopeOverlapRequest, WorkdirToolBroker, WorkdirToolBrokerRouter,
+    WorkdirToolScope, WorkdirToolScopePermission, WorkdirToolScopeRule,
 };
 
 /// Persistent, opaque identity of one materialized Workdir.
@@ -121,6 +126,12 @@ impl WorkdirSessionCapabilities {
     pub const READ_ONLY: Self = Self {
         bits: Self::READ | Self::GLOB | Self::GREP,
     };
+
+    pub const fn union(self, other: Self) -> Self {
+        Self {
+            bits: self.bits | other.bits,
+        }
+    }
 
     pub const fn supports(self, capability: WorkdirSessionCapability) -> bool {
         let bit = match capability {

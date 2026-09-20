@@ -165,7 +165,7 @@ where
     })?;
     worker.disable_manifest_lifecycle_features();
     if let Some(session) = inherited_workdir_session {
-        worker.bind_workdir_session(Some(session));
+        worker.bind_single_workdir_session(Some(session));
     }
 
     let install_report = worker.install_features(features);
@@ -608,7 +608,7 @@ pub(crate) async fn spawn_internal_worker_session(
     })?;
     worker.disable_manifest_lifecycle_features();
     if let Some(session) = inherited_workdir_session {
-        worker.bind_workdir_session(Some(session));
+        worker.bind_single_workdir_session(Some(session));
     }
     let install_report = worker.install_features(features);
     let installed_tools = install_report.installed_tool_names();
@@ -701,7 +701,7 @@ pub(crate) fn prepare_internal_worker_from_spec(
         })?;
         worker.disable_manifest_lifecycle_features();
         if let Some(session) = inherited_workdir_session {
-            worker.bind_workdir_session(Some(session));
+            worker.bind_single_workdir_session(Some(session));
         }
         let install_report = worker.install_features(features);
         let installed_tools = install_report.installed_tool_names();
@@ -772,7 +772,7 @@ pub(crate) async fn prepare_internal_worker_session(
     visibility: InternalWorkerVisibility,
     child_registry: Option<Arc<SpawnedWorkerRegistry>>,
     on_turn_end: Option<Arc<dyn Fn(InternalWorkerSessionStatus) + Send + Sync>>,
-    command_event_broker: Option<workdir::WorkdirToolBroker>,
+    command_event_broker: Option<workdir::WorkdirToolBrokerRouter>,
 ) -> Result<InternalWorkerSessionHandle, InternalWorkerSessionError> {
     let (event_tx, _event_rx) = broadcast::channel(256);
     let sink = worker.sink();
@@ -780,9 +780,14 @@ pub(crate) async fn prepare_internal_worker_session(
     let alerter = Alerter::new(event_tx.clone());
     let in_flight = InFlightEvents::new(event_tx.clone());
     if let Some(broker) = command_event_broker.as_ref() {
-        wire_workdir_command_events(&broker.tool_session(), &in_flight);
+        let sessions = broker.sessions();
+        for alias in sessions.aliases() {
+            if let Ok(selected) = sessions.resolve(Some(alias.as_str())) {
+                wire_workdir_command_events(&selected.session, &in_flight);
+            }
+        }
     } else if let Some(session) = worker.workdir_session() {
-        wire_workdir_command_events(session, &in_flight);
+        wire_workdir_command_events(&session, &in_flight);
     }
     let actor_in_flight = in_flight.clone();
     worker.attach_alerter(alerter.clone());

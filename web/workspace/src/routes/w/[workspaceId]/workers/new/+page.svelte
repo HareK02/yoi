@@ -11,7 +11,12 @@
     parseWorkerLaunchOptionsResponse,
   } from '$lib/workspace/api/workers';
   import { formatCurrentWorkdirRevision } from '$lib/workspace/settings/workdir-revision';
-  import { buildCreateWorkspaceWorkerRequest, defaultWorkerLaunchForm } from '$lib/workspace/sidebar/worker-launch';
+  import {
+    buildCreateWorkspaceWorkerRequest,
+    defaultWorkerLaunchForm,
+    workerLaunchAttachmentError,
+  } from '$lib/workspace/sidebar/worker-launch';
+  import type { WorkerLaunchAttachmentFormState } from '$lib/workspace/sidebar/worker-launch';
   import type {
     Diagnostic,
     WorkerLaunchOptionsResponse,
@@ -33,7 +38,8 @@
   function workdirOptionLabel(directory: WorkingDirectorySummary): string {
     const provider = data.repositories?.items.find((repository) => repository.repository_key === directory.repository_key)
       ?.provider;
-    return `${directory.repository_key} · ${formatCurrentWorkdirRevision(directory, provider)}`;
+    const label = directory.display_name ?? directory.repository_key;
+    return `${label} · ${formatCurrentWorkdirRevision(directory, provider)}`;
   }
 
   let { data }: PageProps = $props();
@@ -61,31 +67,37 @@
       : '',
   );
   let initialText = $state(ticketContext?.initialInput ?? '');
-  let workingDirectoryId = $state('');
+  let workdirAttachments = $state<WorkerLaunchAttachmentFormState[]>([]);
+  let workingDirectoryDisplayName = $state('');
   let workingDirectoryRepositoryKey = $state(ticketContext?.repositoryKey ?? '');
   let workingDirectorySelector = $state(ticketContext?.refSelector ?? 'HEAD');
-  let relativeCwd = $state('');
   let creatingWorkingDirectory = $state(false);
-  let isNewWorkingDirectorySelected = $derived(workingDirectoryId === NEW_WORKING_DIRECTORY_VALUE);
+  let newWorkingDirectoryAttachmentIndex = $derived(
+    workdirAttachments.findIndex((attachment) => attachment.working_directory_id === NEW_WORKING_DIRECTORY_VALUE),
+  );
+  let isNewWorkingDirectorySelected = $derived(newWorkingDirectoryAttachmentIndex >= 0);
   let selectedRuntime = $derived(options?.runtimes.find((runtime) => runtime.runtime_id === runtimeId));
   let selectedRuntimeAllowsNoWorkdir = $derived(selectedRuntime?.working_directory_required === false);
-  let hasSelectedExistingWorkdir = $derived(Boolean(
-    workingDirectoryId && !isNewWorkingDirectorySelected && !selectedRuntimeAllowsNoWorkdir,
-  ));
   let availableWorkingDirectories = $derived(
     selectedRuntimeAllowsNoWorkdir
       ? []
       : (options?.working_directories ?? []).filter((directory) =>
         directory.status === 'active' &&
         directory.cleanliness === 'clean' &&
-        directory.primary_worker_id == null &&
         directory.occupied_by == null
       ),
+  );
+  let attachmentValidationError = $derived(
+    isNewWorkingDirectorySelected
+      ? 'Create the new Workdir before starting the Worker.'
+      : workerLaunchAttachmentError(workdirAttachments),
   );
   let canStartWorker = $derived(Boolean(
     runtimeId &&
       profile &&
-      (hasSelectedExistingWorkdir || (selectedRuntimeAllowsNoWorkdir && !isNewWorkingDirectorySelected)),
+      (selectedRuntimeAllowsNoWorkdir
+        ? workdirAttachments.length === 0
+        : workdirAttachments.length > 0 && !attachmentValidationError),
   ));
 
   function workerApiPath(path: string): string {
@@ -104,11 +116,48 @@
   });
 
   $effect(() => {
-    if (selectedRuntimeAllowsNoWorkdir && workingDirectoryId) {
-      workingDirectoryId = '';
-      relativeCwd = '';
+    if (selectedRuntimeAllowsNoWorkdir && workdirAttachments.length > 0) {
+      workdirAttachments = [];
+    } else if (selectedRuntime?.working_directory_required === true && workdirAttachments.length === 0) {
+      workdirAttachments = [{
+        alias: 'workdir',
+        working_directory_id: availableWorkingDirectories[0]?.working_directory_id ?? '',
+        relative_cwd: '',
+      }];
     }
   });
+
+  function nextAttachmentAlias(): string {
+    const aliases = new Set(workdirAttachments.map((attachment) => attachment.alias.trim()));
+    if (!aliases.has('workdir')) return 'workdir';
+    let suffix = 2;
+    while (aliases.has(`workdir${suffix}`)) suffix += 1;
+    return `workdir${suffix}`;
+  }
+
+  function addAttachment(): void {
+    const selectedWorkdirs = new Set(
+      workdirAttachments.map((attachment) => attachment.working_directory_id),
+    );
+    const available = availableWorkingDirectories.find((directory) =>
+      !selectedWorkdirs.has(directory.working_directory_id)
+    );
+    workdirAttachments = [...workdirAttachments, {
+      alias: nextAttachmentAlias(),
+      working_directory_id: available?.working_directory_id ?? '',
+      relative_cwd: '',
+    }];
+  }
+
+  function removeAttachment(index: number): void {
+    workdirAttachments = workdirAttachments.filter((_, candidateIndex) => candidateIndex !== index);
+  }
+
+  function workdirSelectedByAnotherAttachment(workdirId: string, index: number): boolean {
+    return workdirAttachments.some((attachment, candidateIndex) =>
+      candidateIndex !== index && attachment.working_directory_id === workdirId
+    );
+  }
 
   async function loadLaunchOptions(signal?: AbortSignal) {
     loading = true;
@@ -125,19 +174,30 @@
         display_name: displayName,
         profile,
         initial_text: initialText,
-        working_directory_id: workingDirectoryId,
+        workdir_attachments: workdirAttachments,
         working_directory_repository_key: workingDirectoryRepositoryKey,
         working_directory_selector: workingDirectorySelector,
-        relative_cwd: relativeCwd,
       });
       runtimeId = form.runtime_id;
       displayName = form.display_name;
       profile = form.profile;
-      workingDirectoryId = form.working_directory_id ||
-        (ticketContext?.repositoryKey ? NEW_WORKING_DIRECTORY_VALUE : '');
+      const runtimeRequiresWorkdir = payload.runtimes.find((runtime) =>
+        runtime.runtime_id === form.runtime_id
+      )?.working_directory_required !== false;
+      workdirAttachments = form.workdir_attachments;
+      if (
+        runtimeRequiresWorkdir &&
+        ticketContext?.repositoryKey &&
+        workdirAttachments.every((attachment) => !attachment.working_directory_id)
+      ) {
+        workdirAttachments = [{
+          alias: 'workdir',
+          working_directory_id: NEW_WORKING_DIRECTORY_VALUE,
+          relative_cwd: '',
+        }];
+      }
       workingDirectoryRepositoryKey = form.working_directory_repository_key;
       workingDirectorySelector = form.working_directory_selector;
-      relativeCwd = form.relative_cwd;
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
         return;
@@ -151,6 +211,11 @@
   }
 
   async function createWorkingDirectory() {
+    const attachmentIndex = newWorkingDirectoryAttachmentIndex;
+    if (attachmentIndex < 0) {
+      submitError = { message: 'select New workdir on an attachment first', diagnostics: [] };
+      return;
+    }
     if (!runtimeId) {
       submitError = { message: 'select a runtime before creating a workdir', diagnostics: [] };
       return;
@@ -168,6 +233,7 @@
     try {
       const request = validateWorkingDirectoryCreateRequest({
         runtime_id: runtimeId,
+        ...(workingDirectoryDisplayName.trim() ? { display_name: workingDirectoryDisplayName.trim() } : {}),
         repository_key: workingDirectoryRepositoryKey,
         ...(workingDirectorySelector ? { selector: workingDirectorySelector } : {}),
       });
@@ -193,7 +259,11 @@
           ],
         }
         : options;
-      workingDirectoryId = payload.item.working_directory_id;
+      workdirAttachments = workdirAttachments.map((attachment, index) =>
+        index === attachmentIndex && attachment.working_directory_id === NEW_WORKING_DIRECTORY_VALUE
+          ? { ...attachment, working_directory_id: payload.item.working_directory_id }
+          : attachment
+      );
     } catch (err) {
       submitError = exceptionDisplayError(err, 'workdir create failed');
     } finally {
@@ -206,8 +276,16 @@
       submitError = { message: 'workspace id is unavailable', diagnostics: [] };
       return;
     }
-    if (isNewWorkingDirectorySelected || (!workingDirectoryId && !selectedRuntimeAllowsNoWorkdir)) {
-      submitError = { message: 'select or create a workdir before starting a Worker; only embedded Runtime can start without one', diagnostics: [] };
+    if (selectedRuntimeAllowsNoWorkdir && workdirAttachments.length > 0) {
+      submitError = { message: 'the selected Runtime must start without Workdir attachments', diagnostics: [] };
+      return;
+    }
+    if (!selectedRuntimeAllowsNoWorkdir && workdirAttachments.length === 0) {
+      submitError = { message: 'add at least one Workdir attachment before starting a Worker; only embedded Runtime can start without one', diagnostics: [] };
+      return;
+    }
+    if (attachmentValidationError) {
+      submitError = { message: attachmentValidationError, diagnostics: [] };
       return;
     }
 
@@ -222,10 +300,9 @@
           display_name: displayName,
           profile,
           initial_text: initialText,
-          working_directory_id: workingDirectoryId,
+          workdir_attachments: workdirAttachments,
           working_directory_repository_key: workingDirectoryRepositoryKey,
           working_directory_selector: workingDirectorySelector,
-          relative_cwd: relativeCwd,
         })),
       });
       if (!response.ok) {
@@ -302,21 +379,7 @@
         <h2 id="worker-location-heading">Location</h2>
 
         <div class="worker-launch-sentence">
-          <span>Run at</span>
-          <select class="worker-inline-select wd-select" bind:value={workingDirectoryId} aria-label="Workdir">
-            {#if selectedRuntimeAllowsNoWorkdir}
-              <option value="">No workdir</option>
-            {:else}
-              <option value="" disabled>Select workdir</option>
-              {#each availableWorkingDirectories as directory}
-                <option value={directory.working_directory_id}>
-                  {workdirOptionLabel(directory)}
-                </option>
-              {/each}
-              <option value={NEW_WORKING_DIRECTORY_VALUE}>New workdir…</option>
-            {/if}
-          </select>
-          <span>in</span>
+          <span>Run in</span>
           <select class="worker-inline-select runtime-select" bind:value={runtimeId} required aria-label="Runtime">
             {#if options?.runtimes.length}
               {#each options.runtimes as runtime}
@@ -330,16 +393,78 @@
           </select>
         </div>
 
-        {#if !selectedRuntimeAllowsNoWorkdir && !workingDirectoryId && !isNewWorkingDirectorySelected}
-          <p class="worker-workdir-note">This Runtime requires a selected workdir before starting a Worker.</p>
-        {:else if selectedRuntimeAllowsNoWorkdir && !workingDirectoryId}
-          <p class="worker-workdir-note">No filesystem tools or Bash will be available without a workdir.</p>
+        {#if selectedRuntimeAllowsNoWorkdir}
+          <p class="worker-workdir-note">No filesystem tools or Bash will be available without a Workdir.</p>
+        {:else}
+          <div class="worker-attachment-heading">
+            <h3>Initial Workdir attachments</h3>
+            <button type="button" class="secondary-button" onclick={addAttachment}>Add attachment</button>
+          </div>
+
+          <div class="worker-attachment-list">
+            {#each workdirAttachments as attachment, index}
+              <div class="worker-attachment-row">
+                <label>
+                  <span>Alias</span>
+                  <input
+                    bind:value={attachment.alias}
+                    autocomplete="off"
+                    maxlength="64"
+                    placeholder="workdir"
+                    aria-label={`Attachment ${index + 1} alias`}
+                  />
+                </label>
+                <label>
+                  <span>Workdir</span>
+                  <select bind:value={attachment.working_directory_id} aria-label={`Attachment ${index + 1} Workdir`}>
+                    <option value="" disabled>Select Workdir</option>
+                    {#each availableWorkingDirectories as directory}
+                      <option
+                        value={directory.working_directory_id}
+                        disabled={workdirSelectedByAnotherAttachment(directory.working_directory_id, index)}
+                      >
+                        {workdirOptionLabel(directory)}
+                      </option>
+                    {/each}
+                    <option
+                      value={NEW_WORKING_DIRECTORY_VALUE}
+                      disabled={isNewWorkingDirectorySelected && newWorkingDirectoryAttachmentIndex !== index}
+                    >New Workdir…</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Relative cwd</span>
+                  <input
+                    bind:value={attachment.relative_cwd}
+                    autocomplete="off"
+                    placeholder="Optional path inside Workdir"
+                    aria-label={`Attachment ${index + 1} relative cwd`}
+                  />
+                </label>
+                <button
+                  type="button"
+                  class="worker-attachment-remove"
+                  onclick={() => removeAttachment(index)}
+                  disabled={creatingWorkingDirectory && newWorkingDirectoryAttachmentIndex === index}
+                  aria-label={`Remove attachment ${index + 1}`}
+                >Remove</button>
+              </div>
+            {/each}
+          </div>
+
+          {#if attachmentValidationError}
+            <p class="worker-workdir-note error">{attachmentValidationError}</p>
+          {/if}
         {/if}
 
         {#if isNewWorkingDirectorySelected}
           <div class="new-working-directory-panel">
-            <h3>New workdir</h3>
+            <h3>New Workdir for “{workdirAttachments[newWorkingDirectoryAttachmentIndex]?.alias || `attachment ${newWorkingDirectoryAttachmentIndex + 1}`}”</h3>
             <div class="new-working-directory-fields">
+              <label>
+                <span>Display name</span>
+                <input bind:value={workingDirectoryDisplayName} autocomplete="off" placeholder="Optional label" maxlength="80" />
+              </label>
               <label>
                 <span>Repository</span>
                 <select bind:value={workingDirectoryRepositoryKey}>
@@ -358,16 +483,9 @@
               </label>
             </div>
             <button type="button" disabled={creatingWorkingDirectory || !runtimeId || !workingDirectoryRepositoryKey} onclick={() => void createWorkingDirectory()}>
-              {creatingWorkingDirectory ? 'Creating…' : 'Create workdir'}
+              {creatingWorkingDirectory ? 'Creating…' : 'Create Workdir'}
             </button>
           </div>
-        {/if}
-
-        {#if hasSelectedExistingWorkdir || isNewWorkingDirectorySelected}
-          <label class="relative-cwd-field">
-            <span>Relative cwd inside workdir</span>
-            <input bind:value={relativeCwd} autocomplete="off" placeholder="Optional path inside workdir" />
-          </label>
         {/if}
       </section>
 

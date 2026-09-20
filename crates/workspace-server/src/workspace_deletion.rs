@@ -1198,7 +1198,7 @@ mod tests {
         );
 
         assert!(
-            store
+            !store
                 .delete_worker_registry(
                     &workspace_id,
                     &worker_runtime::identity::RuntimeWorkerRef {
@@ -1207,6 +1207,8 @@ mod tests {
                     },
                 )
                 .expect("remove worker registry")
+                .changes
+                .is_empty()
         );
         let state: String = store
             .with_conn(|conn| {

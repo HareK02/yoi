@@ -52,9 +52,9 @@ const DETACH_TOOL: &str = "WorkdirDetach";
 const DELETE_TOOL: &str = "WorkdirDelete";
 
 const LIST_DESCRIPTION: &str = "List persistent Workdirs in the current Workspace through Backend Workspace API authority. The result contains safe summaries and diagnostics, never host paths or Runtime connection details.";
-const CREATE_DESCRIPTION: &str = "Materialize a persistent Workdir on a selected Runtime from a Workspace repository and optional selector. This does not change this Worker's attachment; use WorkdirAttach explicitly after creation.";
-const ATTACH_DESCRIPTION: &str = "Attach this Worker to one existing Workdir. The Backend enforces one active Workdir per Worker and one active Worker per Workdir, then opens an ephemeral operation session.";
-const DETACH_DESCRIPTION: &str = "Detach this Worker from its active Workdir and release Workdir occupancy. Any ephemeral operation session is closed.";
+const CREATE_DESCRIPTION: &str = "Materialize a persistent Workdir with an optional human-facing display name on a selected Runtime from a Workspace repository and optional selector. The display name is independent of attachment aliases. This does not change this Worker's attachment; use WorkdirAttach explicitly after creation.";
+const ATTACH_DESCRIPTION: &str = "Attach one existing Workdir to this Worker under a stable Worker-local alias. The Backend preserves one active Worker per Workdir while allowing this Worker to own multiple aliases.";
+const DETACH_DESCRIPTION: &str = "Detach one Workdir attachment by its Worker-local alias. Active operations, commands, or Internal SubWorkers cause safe rejection rather than implicit authority loss.";
 pub(crate) type BeforeWorkdirRelease =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> + Send + Sync>;
 pub(crate) type AfterWorkdirAttach = Arc<dyn Fn() + Send + Sync>;
@@ -64,6 +64,7 @@ const DELETE_DESCRIPTION: &str = "Request removal of one persistent Workdir by i
 #[derive(Clone)]
 pub struct ManageWorkdirFeature {
     client: Arc<dyn WorkspaceClient>,
+    session_router: Arc<workdir::WorkdirSessionRouter>,
     before_workdir_release: Option<BeforeWorkdirRelease>,
     after_workdir_attach: Option<AfterWorkdirAttach>,
 }
@@ -82,6 +83,7 @@ impl ManageWorkdirFeature {
     pub fn new(client: Arc<dyn WorkspaceClient>) -> Self {
         Self {
             client,
+            session_router: Arc::new(workdir::WorkdirSessionRouter::new()),
             before_workdir_release: None,
             after_workdir_attach: None,
         }
@@ -89,11 +91,13 @@ impl ManageWorkdirFeature {
 
     pub(crate) fn with_child_lifecycle(
         client: Arc<dyn WorkspaceClient>,
+        session_router: Arc<workdir::WorkdirSessionRouter>,
         before_workdir_release: BeforeWorkdirRelease,
         after_workdir_attach: AfterWorkdirAttach,
     ) -> Self {
         Self {
             client,
+            session_router,
             before_workdir_release: Some(before_workdir_release),
             after_workdir_attach: Some(after_workdir_attach),
         }
@@ -116,10 +120,12 @@ impl FeatureModule for ManageWorkdirFeature {
     }
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
-        let backend = WorkspaceHttpWorkdirBackend::new(self.client.clone()).with_child_lifecycle(
-            self.before_workdir_release.clone(),
-            self.after_workdir_attach.clone(),
-        );
+        let backend = WorkspaceHttpWorkdirBackend::new(self.client.clone())
+            .with_session_router(self.session_router.clone())
+            .with_child_lifecycle(
+                self.before_workdir_release.clone(),
+                self.after_workdir_attach.clone(),
+            );
         for (name, definition) in [
             (
                 LIST_TOOL,
@@ -183,6 +189,8 @@ impl FeatureModule for ManageWorkdirFeature {
 #[derive(Clone)]
 struct WorkspaceHttpWorkdirBackend {
     client: Arc<dyn WorkspaceClient>,
+    session_router: Arc<workdir::WorkdirSessionRouter>,
+    attachment_mutation_lock: Arc<tokio::sync::Mutex<()>>,
     before_workdir_release: Option<BeforeWorkdirRelease>,
     after_workdir_attach: Option<AfterWorkdirAttach>,
 }
@@ -205,14 +213,27 @@ impl std::fmt::Debug for WorkspaceHttpWorkdirBackend {
 #[derive(Debug)]
 pub struct WorkspaceAttachedWorkdirSession {
     client: Arc<dyn WorkspaceClient>,
+    target_workdir: String,
     workdir: Workdir,
 }
 
 impl WorkspaceAttachedWorkdirSession {
-    pub fn handle(client: Arc<dyn WorkspaceClient>) -> WorkdirSessionHandle {
+    pub fn handle(
+        client: Arc<dyn WorkspaceClient>,
+        target_workdir: impl Into<String>,
+    ) -> WorkdirSessionHandle {
+        Self::handle_for_workdir(client, target_workdir, "workspace-attachment")
+    }
+
+    pub fn handle_for_workdir(
+        client: Arc<dyn WorkspaceClient>,
+        target_workdir: impl Into<String>,
+        workdir_id: impl Into<String>,
+    ) -> WorkdirSessionHandle {
         Arc::new(Self {
             client,
-            workdir: Workdir::new("workspace-attachment"),
+            target_workdir: target_workdir.into(),
+            workdir: Workdir::new(workdir_id),
         })
     }
 
@@ -229,13 +250,15 @@ impl WorkspaceAttachedWorkdirSession {
                 "/api/w/{}/workers/self/workdir-session/operations",
                 encode_path_segment(workspace_id)
             ),
-            serde_json::to_string(&WorkspaceWorkdirSessionOperationRequest { operation }).map_err(
-                |error| {
-                    WorkdirError::Transport(format!(
-                        "failed to encode Workspace Workdir operation: {error}"
-                    ))
-                },
-            )?,
+            serde_json::to_string(&WorkspaceWorkdirSessionOperationRequest {
+                target_workdir: self.target_workdir.clone(),
+                operation,
+            })
+            .map_err(|error| {
+                WorkdirError::Transport(format!(
+                    "failed to encode Workspace Workdir operation: {error}"
+                ))
+            })?,
         );
         let response = self
             .client
@@ -399,9 +422,16 @@ impl WorkspaceHttpWorkdirBackend {
     fn new(client: Arc<dyn WorkspaceClient>) -> Self {
         Self {
             client,
+            session_router: Arc::new(workdir::WorkdirSessionRouter::new()),
+            attachment_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             before_workdir_release: None,
             after_workdir_attach: None,
         }
+    }
+
+    fn with_session_router(mut self, session_router: Arc<workdir::WorkdirSessionRouter>) -> Self {
+        self.session_router = session_router;
+        self
     }
 
     fn with_child_lifecycle(
@@ -449,10 +479,12 @@ impl WorkspaceHttpWorkdirBackend {
             .transpose()?;
         let repository_key =
             validate_identity(&input.repository_key, CREATE_TOOL, "repository_key")?;
+        let display_name = validate_optional_display_name(input.display_name)?;
         let selector = validate_optional_selector(input.selector)?;
         let workspace_id = encode_path_segment(self.workspace_id()?);
         let request = WorkdirCreateRequest {
             runtime_id: runtime_id.map(str::to_string),
+            display_name,
             repository_key: repository_key.to_string(),
             selector,
             operation_id: Some(operation_id),
@@ -472,32 +504,71 @@ impl WorkspaceHttpWorkdirBackend {
     }
 
     fn attach(&self, input: WorkdirAttachInput) -> Result<ToolOutput, ToolError> {
-        let workdir_id = validate_identity(&input.workdir_id, ATTACH_TOOL, "workdir_id")?;
-        let response = self.attach_response(workdir_id)?;
-        workdir_output(format!("Attached to Workdir {workdir_id}"), &response)
+        let alias = validate_identity(&input.alias, ATTACH_TOOL, "alias")?;
+        workdir::WorkdirAttachmentAlias::new(alias)
+            .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
+        let working_directory_id = validate_identity(
+            &input.working_directory_id,
+            ATTACH_TOOL,
+            "working_directory_id",
+        )?;
+        let alias_key = workdir::WorkdirAttachmentAlias::new(alias)
+            .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
+        if self.session_router.session(&alias_key).is_some() {
+            return Err(ToolError::InvalidArgument(format!(
+                "attachment alias `{alias}` already exists"
+            )));
+        }
+        let response = self.attach_response(alias, working_directory_id)?;
+        if let Err(error) = self.session_router.attach(
+            alias_key.clone(),
+            WorkspaceAttachedWorkdirSession::handle_for_workdir(
+                self.client.clone(),
+                alias,
+                working_directory_id,
+            ),
+        ) {
+            let _ = self.detach(alias);
+            return Err(ToolError::ExecutionFailed(format!(
+                "attach Workdir session route: {error}"
+            )));
+        }
+        workdir_output(
+            format!("Attached Workdir {working_directory_id} as {alias}"),
+            &response,
+        )
     }
 
-    fn attach_response(&self, workdir_id: &str) -> Result<WorkdirAttachmentResponse, ToolError> {
+    fn attach_response(
+        &self,
+        alias: &str,
+        working_directory_id: &str,
+    ) -> Result<WorkdirAttachmentResponse, ToolError> {
         let workspace_id = encode_path_segment(self.workspace_id()?);
         self.execute_json::<WorkdirAttachmentResponse>(WorkspaceRequest::json(
             WorkspaceRequestMethod::Post,
-            format!("/api/w/{workspace_id}/workers/self/workdir-attachment"),
+            format!("/api/w/{workspace_id}/workers/self/workdir-attachments"),
             serde_json::to_string(&WorkdirAttachRequest {
-                workdir_id: workdir_id.to_string(),
+                alias: alias.to_string(),
+                working_directory_id: working_directory_id.to_string(),
             })
             .map_err(decode_error)?,
         ))
     }
 
-    fn detach(&self) -> Result<ToolOutput, ToolError> {
+    fn detach(&self, alias: &str) -> Result<ToolOutput, ToolError> {
         let workspace_id = encode_path_segment(self.workspace_id()?);
+        let alias_path = encode_path_segment(alias);
         let response = self.execute_json::<WorkdirAttachmentResponse>(WorkspaceRequest {
             method: WorkspaceRequestMethod::Delete,
-            path: format!("/api/w/{workspace_id}/workers/self/workdir-attachment"),
+            path: format!("/api/w/{workspace_id}/workers/self/workdir-attachments/{alias_path}"),
             body: None,
         })?;
         workdir_output(
-            format!("Detached from Workdir {}", response.workdir_id),
+            format!(
+                "Detached Workdir {} ({})",
+                response.working_directory_id, response.alias
+            ),
             &response,
         )
     }
@@ -590,6 +661,7 @@ impl Tool for WorkspaceHttpWorkdirTool {
                 ctx.call_id.to_string(),
             ),
             WorkdirOperation::Attach => {
+                let _mutation_guard = self.backend.attachment_mutation_lock.lock().await;
                 let result = self
                     .backend
                     .attach(parse_input::<WorkdirAttachInput>(input_json)?);
@@ -601,15 +673,41 @@ impl Tool for WorkspaceHttpWorkdirTool {
                 result
             }
             WorkdirOperation::Detach => {
-                let _input = parse_input::<WorkdirDetachInput>(input_json)?;
-                if let Some(before_release) = &self.backend.before_workdir_release {
-                    before_release().await.map_err(|error| {
+                let _mutation_guard = self.backend.attachment_mutation_lock.lock().await;
+                let input = parse_input::<WorkdirDetachInput>(input_json)?;
+                let alias = validate_identity(&input.alias, DETACH_TOOL, "alias")?;
+                let alias_key = workdir::WorkdirAttachmentAlias::new(alias)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
+                self.backend
+                    .session_router
+                    .begin_detach(&alias_key)
+                    .await
+                    .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+                if let Some(before_release) = &self.backend.before_workdir_release
+                    && let Err(error) = before_release().await
+                {
+                    self.backend.session_router.cancel_detach(&alias_key);
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "stop Internal SubWorkers before Workdir detach: {error}"
+                    )));
+                }
+                let result = match self.backend.detach(alias) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.backend.session_router.cancel_detach(&alias_key);
+                        return Err(error);
+                    }
+                };
+                self.backend
+                    .session_router
+                    .finish_detach(&alias_key)
+                    .await
+                    .map_err(|error| {
                         ToolError::ExecutionFailed(format!(
-                            "stop Internal SubWorkers before Workdir detach: {error}"
+                            "detach Workdir session route after Backend release: {error}"
                         ))
                     })?;
-                }
-                self.backend.detach()
+                Ok(result)
             }
             WorkdirOperation::Delete => self
                 .backend
@@ -672,6 +770,25 @@ fn validate_delete_reason(reason: &str) -> Result<&str, ToolError> {
     Ok(reason)
 }
 
+fn validate_optional_display_name(
+    display_name: Option<String>,
+) -> Result<Option<String>, ToolError> {
+    let Some(display_name) = display_name else {
+        return Ok(None);
+    };
+    let display_name = display_name.trim();
+    if display_name.is_empty()
+        || display_name.len() > 80
+        || display_name.chars().any(char::is_control)
+    {
+        return Err(ToolError::InvalidArgument(
+            "WorkdirCreate display_name must be non-empty, contain no control characters, and be at most 80 bytes"
+                .to_string(),
+        ));
+    }
+    Ok(Some(display_name.to_string()))
+}
+
 fn validate_optional_selector(selector: Option<String>) -> Result<Option<String>, ToolError> {
     let Some(selector) = selector else {
         return Ok(None);
@@ -725,6 +842,7 @@ fn create_schema() -> serde_json::Value {
         "required": ["repository_key"],
         "properties": {
             "runtime_id": {"type": ["string", "null"], "minLength": 1},
+            "display_name": {"type": ["string", "null"], "minLength": 1, "maxLength": 80},
             "repository_key": {"type": "string", "minLength": 1},
             "selector": {"type": ["string", "null"], "minLength": 1}
         }
@@ -735,15 +853,23 @@ fn attach_schema() -> serde_json::Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["workdir_id"],
+        "required": ["alias", "working_directory_id"],
         "properties": {
-            "workdir_id": {"type": "string", "minLength": 1}
+            "alias": {"type": "string", "minLength": 1, "maxLength": 64},
+            "working_directory_id": {"type": "string", "minLength": 1}
         }
     })
 }
 
 fn detach_schema() -> serde_json::Value {
-    list_schema()
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["alias"],
+        "properties": {
+            "alias": {"type": "string", "minLength": 1, "maxLength": 64}
+        }
+    })
 }
 
 fn delete_schema() -> serde_json::Value {
@@ -767,6 +893,8 @@ struct WorkdirListInput {}
 struct WorkdirCreateInput {
     #[serde(default)]
     runtime_id: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
     repository_key: String,
     #[serde(default)]
     selector: Option<String>,
@@ -775,22 +903,27 @@ struct WorkdirCreateInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkdirAttachInput {
-    workdir_id: String,
+    alias: String,
+    working_directory_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WorkdirDetachInput {}
+struct WorkdirDetachInput {
+    alias: String,
+}
 
 #[derive(Debug, Serialize)]
 struct WorkdirAttachRequest {
-    workdir_id: String,
+    alias: String,
+    working_directory_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct WorkdirAttachmentResponse {
     workspace_id: String,
-    workdir_id: String,
+    alias: String,
+    working_directory_id: String,
     attached: bool,
 }
 
@@ -1021,7 +1154,10 @@ mod tests {
         );
         assert!(create["properties"].get("path").is_none());
         assert!(create["properties"].get("session_id").is_none());
-        assert_eq!(attach_schema()["required"], json!(["workdir_id"]));
+        assert_eq!(
+            attach_schema()["required"],
+            json!(["alias", "working_directory_id"])
+        );
         assert!(attach_schema()["properties"].get("session_id").is_none());
         assert_eq!(
             delete_schema()["required"],
@@ -1057,12 +1193,14 @@ mod tests {
             })),
             response(json!({
                 "workspace_id": "workspace/test",
-                "workdir_id": "wd-created",
+                "alias": "checkout",
+                "working_directory_id": "wd-created",
                 "attached": true
             })),
             response(json!({
                 "workspace_id": "workspace/test",
-                "workdir_id": "wd-created",
+                "alias": "checkout",
+                "working_directory_id": "wd-created",
                 "attached": false
             })),
             response(json!({
@@ -1089,6 +1227,7 @@ mod tests {
             .create(
                 WorkdirCreateInput {
                     runtime_id: Some("runtime/one".to_string()),
+                    display_name: Some("Review checkout".to_string()),
                     repository_key: "main".to_string(),
                     selector: Some("refs/heads/topic".to_string()),
                 },
@@ -1106,10 +1245,11 @@ mod tests {
         assert_eq!(client.requests().len(), 2);
         backend
             .attach(WorkdirAttachInput {
-                workdir_id: "wd-created".to_string(),
+                alias: "checkout".to_string(),
+                working_directory_id: "wd-created".to_string(),
             })
             .unwrap();
-        backend.detach().unwrap();
+        backend.detach("checkout").unwrap();
         backend
             .delete(WorkdirDeleteInput {
                 working_directory_id: "wd-created".to_string(),
@@ -1132,16 +1272,17 @@ mod tests {
             serde_json::from_str(requests[1].body.as_deref().unwrap()).unwrap();
         assert_eq!(body["repository_key"], "main");
         assert_eq!(body["runtime_id"], "runtime/one");
+        assert_eq!(body["display_name"], "Review checkout");
         assert_eq!(body["operation_id"], "call-create-1");
         assert_eq!(body["selector"], "refs/heads/topic");
         assert_eq!(
             requests[2].path,
-            "/api/w/workspace%2Ftest/workers/self/workdir-attachment"
+            "/api/w/workspace%2Ftest/workers/self/workdir-attachments"
         );
         assert_eq!(requests[2].method, WorkspaceRequestMethod::Post);
         assert_eq!(
             requests[3].path,
-            "/api/w/workspace%2Ftest/workers/self/workdir-attachment"
+            "/api/w/workspace%2Ftest/workers/self/workdir-attachments/checkout"
         );
         assert_eq!(requests[3].method, WorkspaceRequestMethod::Delete);
         assert_eq!(
@@ -1160,7 +1301,7 @@ mod tests {
             "operation": "stat",
             "result": {"path": "visible.txt", "kind": "file", "size": 8}
         }))]));
-        let session = WorkspaceAttachedWorkdirSession::handle(client.clone());
+        let session = WorkspaceAttachedWorkdirSession::handle(client.clone(), "workdir");
         let result = session
             .stat(StatRequest {
                 path: workdir::WorkdirPath::new("visible.txt").unwrap(),
@@ -1176,6 +1317,7 @@ mod tests {
         );
         let body: serde_json::Value =
             serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["target_workdir"], "workdir");
         assert_eq!(body["operation"]["operation"], "stat");
         assert!(body.get("expected_session_fence").is_none());
         assert!(body.get("runtime_id").is_none());
@@ -1188,7 +1330,7 @@ mod tests {
             "operation": "command_start",
             "result": "command-1"
         }))]));
-        let session = WorkspaceAttachedWorkdirSession::handle(client.clone());
+        let session = WorkspaceAttachedWorkdirSession::handle(client.clone(), "workdir");
 
         let handle = session
             .start_command(CommandRequest {
@@ -1226,7 +1368,7 @@ mod tests {
             workdir::http::WorkdirTransportErrorCode::InvalidRequest,
             "Workdir operation request is invalid",
         )]));
-        let session = WorkspaceAttachedWorkdirSession::handle(client);
+        let session = WorkspaceAttachedWorkdirSession::handle(client, "workdir");
 
         let error = session
             .glob(workdir::GlobRequest {
@@ -1246,7 +1388,7 @@ mod tests {
             status: 502,
             body: "secret token and /host/private/path".to_string(),
         }]));
-        let session = WorkspaceAttachedWorkdirSession::handle(client);
+        let session = WorkspaceAttachedWorkdirSession::handle(client, "workdir");
 
         let error = session
             .stat(StatRequest {
@@ -1273,6 +1415,7 @@ mod tests {
         ]));
         let broker = workdir::WorkdirToolBroker::new(WorkspaceAttachedWorkdirSession::handle(
             client.clone(),
+            "workdir",
         ));
         let scoped = broker
             .scope(workdir::WorkdirToolScope {
@@ -1323,6 +1466,7 @@ mod tests {
             .create(
                 WorkdirCreateInput {
                     runtime_id: None,
+                    display_name: None,
                     repository_key: "main".to_string(),
                     selector: None,
                 },
@@ -1348,6 +1492,7 @@ mod tests {
             .create(
                 WorkdirCreateInput {
                     runtime_id: Some(" ".to_string()),
+                    display_name: None,
                     repository_key: "main".to_string(),
                     selector: None,
                 },
@@ -1363,9 +1508,17 @@ mod tests {
     async fn detach_stops_internal_subworkers_before_backend_release() {
         let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
             "workspace_id": "workspace/test",
-            "workdir_id": "wd-attached",
+            "alias": "checkout",
+            "working_directory_id": "wd-attached",
             "attached": false
         }))]));
+        let router = Arc::new(workdir::WorkdirSessionRouter::new());
+        router
+            .attach(
+                workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
+                WorkspaceAttachedWorkdirSession::handle(client.clone(), "workdir"),
+            )
+            .unwrap();
         let cleanup_calls = Arc::new(AtomicUsize::new(0));
         let cleanup_calls_for_guard = cleanup_calls.clone();
         let before_release: BeforeWorkdirRelease = Arc::new(move || {
@@ -1377,11 +1530,12 @@ mod tests {
         });
         let tool = WorkspaceHttpWorkdirTool {
             backend: WorkspaceHttpWorkdirBackend::new(client.clone())
+                .with_session_router(router)
                 .with_child_lifecycle(Some(before_release), None),
             operation: WorkdirOperation::Detach,
         };
 
-        tool.execute("{}", ToolExecutionContext::default())
+        tool.execute(r#"{"alias":"checkout"}"#, ToolExecutionContext::default())
             .await
             .unwrap();
 
@@ -1389,23 +1543,31 @@ mod tests {
         assert_eq!(client.requests().len(), 1);
         assert_eq!(
             client.requests()[0].path,
-            "/api/w/workspace%2Ftest/workers/self/workdir-attachment"
+            "/api/w/workspace%2Ftest/workers/self/workdir-attachments/checkout"
         );
     }
 
     #[tokio::test]
     async fn detach_does_not_release_backend_when_child_cleanup_fails() {
         let client = Arc::new(RecordingWorkspaceClient::new(Vec::new()));
+        let router = Arc::new(workdir::WorkdirSessionRouter::new());
+        router
+            .attach(
+                workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
+                WorkspaceAttachedWorkdirSession::handle(client.clone(), "workdir"),
+            )
+            .unwrap();
         let before_release: BeforeWorkdirRelease =
             Arc::new(|| Box::pin(async { Err(std::io::Error::other("child cleanup failed")) }));
         let tool = WorkspaceHttpWorkdirTool {
             backend: WorkspaceHttpWorkdirBackend::new(client.clone())
+                .with_session_router(router)
                 .with_child_lifecycle(Some(before_release), None),
             operation: WorkdirOperation::Detach,
         };
 
         let error = tool
-            .execute("{}", ToolExecutionContext::default())
+            .execute(r#"{"alias":"checkout"}"#, ToolExecutionContext::default())
             .await
             .unwrap_err();
 
@@ -1414,10 +1576,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detach_reconciles_naturally_completed_workspace_command() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![
+            response(json!({
+                "workspace_id": "workspace/test",
+                "alias": "checkout",
+                "working_directory_id": "wd-attached",
+                "attached": true
+            })),
+            response(json!({
+                "operation": "command_start",
+                "result": "command-1"
+            })),
+            response(json!({
+                "operation": "command_status",
+                "result": "completed"
+            })),
+            response(json!({
+                "workspace_id": "workspace/test",
+                "alias": "checkout",
+                "working_directory_id": "wd-attached",
+                "attached": false
+            })),
+        ]));
+        let backend = WorkspaceHttpWorkdirBackend::new(client.clone());
+        backend
+            .attach(WorkdirAttachInput {
+                alias: "checkout".to_string(),
+                working_directory_id: "wd-attached".to_string(),
+            })
+            .unwrap();
+        let alias = workdir::WorkdirAttachmentAlias::new("checkout").unwrap();
+        backend
+            .session_router
+            .session(&alias)
+            .unwrap()
+            .start_command(CommandRequest {
+                command: "printf done".to_string(),
+                timeout_secs: 5,
+                output_limit: 1024,
+                cwd: None,
+                spill_dir: None,
+                tool_call_id: None,
+            })
+            .await
+            .unwrap();
+        let tool = WorkspaceHttpWorkdirTool {
+            backend,
+            operation: WorkdirOperation::Detach,
+        };
+
+        tool.execute(r#"{"alias":"checkout"}"#, ToolExecutionContext::default())
+            .await
+            .unwrap();
+
+        let requests = client.requests();
+        assert_eq!(requests.len(), 4);
+        assert!(
+            requests[2]
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains("command_status"))
+        );
+    }
+
+    #[tokio::test]
     async fn successful_attach_reopens_internal_subworker_admission() {
         let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
             "workspace_id": "workspace/test",
-            "workdir_id": "wd-attached",
+            "alias": "checkout",
+            "working_directory_id": "wd-attached",
             "attached": true
         }))]));
         let reopen_calls = Arc::new(AtomicUsize::new(0));
@@ -1432,7 +1660,7 @@ mod tests {
         };
 
         tool.execute(
-            r#"{"workdir_id":"wd-attached"}"#,
+            r#"{"alias":"checkout","working_directory_id":"wd-attached"}"#,
             ToolExecutionContext::default(),
         )
         .await

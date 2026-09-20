@@ -1,7 +1,8 @@
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, ProfileSelector, ProfileSourceArchiveSource,
     RepositoryRefObservation, RepositoryRefObservationRequest, WorkerDetail, WorkerLifecycleAck,
-    WorkerRestoreIntent, WorkerStatus, WorkerSummary, WorkingDirectoryRepositoryAccessRequest,
+    WorkerRestoreIntent, WorkerStatus, WorkerSummary, WorkingDirectoryAttachmentClaim,
+    WorkingDirectoryAttachmentStatus, WorkingDirectoryRepositoryAccessRequest,
     WorkingDirectoryRequest, WorkingDirectoryStatus as CatalogWorkingDirectoryStatus,
     WorkspaceApiRef,
 };
@@ -43,7 +44,7 @@ use crate::retention::{
 use protocol::subscription::{
     EventSubscriptionSelector, SubscriptionEventPayload, SubscriptionSnapshot,
     SubscriptionValidationError, SubscriptionWorkdirId, SubscriptionWorker, SubscriptionWorkerId,
-    SubscriptionWorkerState,
+    SubscriptionWorkerState, SubscriptionWorkerWorkdirAttachment,
 };
 use protocol::{Event, Method};
 use server_api::WorkerRestoreState;
@@ -729,8 +730,9 @@ impl Runtime {
                     .get(&worker_ref.worker_id)
                     .is_some_and(|worker| {
                         worker.belongs_to_workspace(&scope.workspace_id)
-                            && worker.working_directory.as_ref().is_some_and(|status| {
-                                status.summary.working_directory_id == working_directory_id
+                            && worker.workdir_attachments.iter().any(|attachment| {
+                                attachment.working_directory.summary.working_directory_id
+                                    == working_directory_id
                             })
                     });
                 if !owns_workdir {
@@ -764,7 +766,7 @@ impl Runtime {
         let backend = {
             let state = self.lock()?;
             state.ensure_running()?;
-            if let Some(worker_id) = state.primary_worker_id_for_workdir(working_directory_id) {
+            if let Some(worker_id) = state.worker_id_for_workdir(working_directory_id) {
                 return Err(RuntimeError::InvalidRequest(format!(
                     "working directory {working_directory_id} is assigned to worker {worker_id}"
                 )));
@@ -792,12 +794,8 @@ impl Runtime {
 
     fn annotate_working_directory_status(
         &self,
-        mut status: CatalogWorkingDirectoryStatus,
+        status: CatalogWorkingDirectoryStatus,
     ) -> Result<CatalogWorkingDirectoryStatus, RuntimeError> {
-        let state = self.lock()?;
-        status.summary.primary_worker_id = state
-            .primary_worker_id_for_workdir(status.summary.working_directory_id.as_str())
-            .map(|worker_id| worker_id.to_string());
         Ok(status)
     }
 
@@ -1023,10 +1021,8 @@ impl Runtime {
                 return Ok(existing.detail());
             }
             state.validate_worker_config_boundary(&request)?;
-            if let Some(working_directory_id) = requested_primary_workdir_id(&request) {
-                if let Some(owner_worker_id) =
-                    state.primary_worker_id_for_workdir(working_directory_id)
-                {
+            for working_directory_id in requested_workdir_ids(&request) {
+                if let Some(owner_worker_id) = state.worker_id_for_workdir(working_directory_id) {
                     return Err(RuntimeError::InvalidRequest(format!(
                         "working directory {working_directory_id} is already assigned to worker {owner_worker_id}"
                     )));
@@ -1064,7 +1060,7 @@ impl Runtime {
                 execution_metadata_available: true,
                 execution_bound: true,
                 restore_intent: WorkerRestoreIntent::Explicit,
-                working_directory: None,
+                workdir_attachments: Vec::new(),
                 execution_handle: None,
                 internal_workers: InternalWorkerActivityProjection::default(),
             };
@@ -1076,19 +1072,19 @@ impl Runtime {
                 request,
                 workspace_scope: scope.cloned(),
                 context: self.execution_context(worker_ref.clone()),
-                working_directory: None,
+                workdir_attachments: BTreeMap::new(),
                 config_bundle,
             };
             (backend, worker_ref, spawn_request)
         };
 
         let spawn_result = backend.spawn_worker(spawn_request);
-        let (handle, initial_worker_state, working_directory) = match spawn_result {
+        let (handle, initial_worker_state, workdir_attachments) = match spawn_result {
             WorkerExecutionSpawnResult::Connected {
                 handle,
                 worker_state,
-                working_directory,
-            } => (handle, worker_state, working_directory),
+                workdir_attachments,
+            } => (handle, worker_state, workdir_attachments),
             WorkerExecutionSpawnResult::Rejected(result)
             | WorkerExecutionSpawnResult::RolledBack(result)
             | WorkerExecutionSpawnResult::Errored(result) => {
@@ -1101,8 +1097,30 @@ impl Runtime {
                     result,
                 });
             }
-            WorkerExecutionSpawnResult::ReconciliationRequired { result, .. } => {
-                self.rollback_failed_create(&worker_ref)?;
+            WorkerExecutionSpawnResult::ReconciliationRequired {
+                result,
+                handle,
+                worker_state,
+                workdir_attachments,
+            } => {
+                let retain_result =
+                    if let (Some(handle), Some(worker_state)) = (handle, worker_state) {
+                        self.retain_restore_execution_evidence(
+                            &worker_ref,
+                            handle,
+                            worker_state,
+                            workdir_attachments,
+                        )
+                    } else {
+                        self.retain_create_reconciliation_pending(&worker_ref, workdir_attachments)
+                    };
+                if let Err(error) = retain_result {
+                    tracing::error!(
+                        worker_id = %worker_ref.worker_id,
+                        %error,
+                        "failed to persist Worker create reconciliation evidence"
+                    );
+                }
                 return Err(RuntimeError::WorkerExecutionRejected {
                     worker_id: worker_ref.worker_id.clone(),
                     operation: result.operation,
@@ -1160,7 +1178,7 @@ impl Runtime {
                 &worker_ref,
                 handle.clone(),
                 initial_worker_state.clone(),
-                working_directory,
+                workdir_attachments,
                 dispatch_result,
             ) {
                 Ok(detail) => detail,
@@ -1179,7 +1197,7 @@ impl Runtime {
                 &worker_ref,
                 handle.clone(),
                 initial_worker_state,
-                working_directory,
+                workdir_attachments,
                 WorkerExecutionResult::accepted(WorkerExecutionOperation::Spawn),
             ) {
                 Ok(detail) => Ok(detail),
@@ -1425,6 +1443,119 @@ impl Runtime {
         Ok(state.worker(worker_ref)?.detail())
     }
 
+    pub fn replace_worker_workdir_attachments_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        worker_ref: &WorkerRef,
+        attachments: Vec<WorkingDirectoryAttachmentClaim>,
+    ) -> Result<WorkerDetail, RuntimeError> {
+        self.ensure_worker_in_workspace(scope, worker_ref)?;
+        self.replace_worker_workdir_attachments(worker_ref, attachments)
+    }
+
+    /// Persist the exact current attachment set used by live mutation and future restore.
+    pub fn replace_worker_workdir_attachments(
+        &self,
+        worker_ref: &WorkerRef,
+        mut attachments: Vec<WorkingDirectoryAttachmentClaim>,
+    ) -> Result<WorkerDetail, RuntimeError> {
+        let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
+        let _operation_guard = operation_lock
+            .lock()
+            .map_err(|_| RuntimeError::StatePoisoned)?;
+
+        let backend = {
+            let state = self.lock()?;
+            let worker = state.worker(worker_ref)?;
+            if worker.execution_handle.is_none() || !worker.status.is_active() {
+                return Err(RuntimeError::WorkerExecutionUnavailable {
+                    worker_id: worker.worker_id,
+                    message: "Workdir attachments can only be changed for a live Worker"
+                        .to_string(),
+                });
+            }
+            let request = worker.request.as_ref().ok_or_else(|| {
+                RuntimeError::WorkerExecutionUnavailable {
+                    worker_id: worker.worker_id,
+                    message: "persisted Worker restore request is unavailable".to_string(),
+                }
+            })?;
+            for attachment in &mut attachments {
+                if attachment.relative_cwd.is_none()
+                    && let Some(previous) = request.workdir_attachments.iter().find(|previous| {
+                        previous.alias == attachment.alias
+                            && previous.working_directory_id == attachment.working_directory_id
+                    })
+                {
+                    attachment.relative_cwd = previous.relative_cwd.clone();
+                }
+            }
+            let mut candidate = request.clone();
+            candidate.workdir_attachment_requests.clear();
+            candidate.workdir_attachments = attachments.clone();
+            validate_create_worker_request(&candidate)?;
+            state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::ExecutionBackendUnavailable {
+                    message: "Workdir attachment mutation requires an execution backend"
+                        .to_string(),
+                }
+            })?
+        };
+
+        let statuses = attachments
+            .iter()
+            .map(|attachment| {
+                backend
+                    .working_directory(&attachment.working_directory_id)
+                    .map(|working_directory| WorkingDirectoryAttachmentStatus {
+                        alias: attachment.alias.clone(),
+                        working_directory,
+                    })
+                    .map_err(RuntimeError::from)
+            })
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
+        if let Some(inactive) = statuses.iter().find(|attachment| {
+            attachment.working_directory.summary.status
+                != workdir::workspace::WorkingDirectoryStatusKind::Active
+        }) {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "working directory {} is not active ({})",
+                inactive.working_directory.summary.working_directory_id,
+                inactive.working_directory.summary.status
+            )));
+        }
+
+        let mut state = self.lock()?;
+        for attachment in &attachments {
+            if let Some(owner_worker_id) =
+                state.worker_id_for_workdir(&attachment.working_directory_id)
+                && owner_worker_id != worker_ref.worker_id
+            {
+                return Err(RuntimeError::InvalidRequest(format!(
+                    "working directory {} is already assigned to worker {owner_worker_id}",
+                    attachment.working_directory_id
+                )));
+            }
+        }
+        let previous = state.worker(worker_ref)?.clone();
+        {
+            let worker = state.worker_mut(worker_ref)?;
+            let request = worker
+                .request
+                .as_mut()
+                .expect("restore request checked above");
+            request.workdir_attachment_requests.clear();
+            request.workdir_attachments = attachments;
+            worker.workdir_attachments = statuses;
+        }
+        if let Err(error) = state.persist_worker(&worker_ref.worker_id) {
+            state.workers.insert(worker_ref.worker_id, previous);
+            return Err(error);
+        }
+        state.publish_worker_upsert(worker_ref.worker_id)?;
+        Ok(state.worker(worker_ref)?.detail())
+    }
+
     /// Observe a Worker's live protocol availability or its retained Session.
     /// The same lifecycle lock used by stop/restore fences the decision and read.
     pub fn worker_session_scoped(
@@ -1570,8 +1701,8 @@ impl Runtime {
                 request: worker_request,
                 workspace_scope,
                 context: self.execution_context(worker_ref.clone()),
-                previous_working_directory: worker.working_directory.clone(),
-                working_directory: None,
+                previous_workdir_attachments: worker.workdir_attachments.clone(),
+                workdir_attachments: BTreeMap::new(),
                 config_bundle: None,
             };
             (backend, request)
@@ -1589,14 +1720,14 @@ impl Runtime {
             WorkerExecutionSpawnResult::Connected {
                 handle,
                 worker_state,
-                working_directory,
+                workdir_attachments,
             } => {
                 let commit = self.commit_restored_worker_execution(
                     worker_ref,
                     handle.clone(),
                     worker_state.clone(),
                     WorkerStatus::Idle,
-                    working_directory.clone(),
+                    workdir_attachments.clone(),
                 );
                 match commit {
                     Ok(worker) => Ok(RuntimeWorkerRestoreResult::accepted(worker)),
@@ -1625,7 +1756,7 @@ impl Runtime {
                                     worker_ref,
                                     handle,
                                     worker_state,
-                                    working_directory,
+                                    workdir_attachments,
                                 ) {
                                     tracing::error!(
                                         worker_id = %worker_ref.worker_id,
@@ -1663,14 +1794,14 @@ impl Runtime {
                 result: _result,
                 handle,
                 worker_state,
-                working_directory,
+                workdir_attachments,
             } => {
                 if let (Some(handle), Some(worker_state)) = (handle, worker_state) {
                     if let Err(retain_error) = self.retain_restore_execution_evidence(
                         worker_ref,
                         handle,
                         worker_state,
-                        working_directory,
+                        workdir_attachments,
                     ) {
                         tracing::error!(
                             worker_id = %worker_ref.worker_id,
@@ -2079,7 +2210,7 @@ impl Runtime {
         worker_ref: &WorkerRef,
         handle: WorkerExecutionHandle,
         initial_worker_state: protocol::WorkerStateSnapshot,
-        working_directory: Option<CatalogWorkingDirectoryStatus>,
+        workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
         result: WorkerExecutionResult,
     ) -> Result<WorkerDetail, RuntimeError> {
         let mut state = self.lock()?;
@@ -2094,7 +2225,7 @@ impl Runtime {
                 let _ = worker.apply_worker_state(snapshot);
             }
             worker.restore_intent = restore_intent_for_status(worker.status);
-            worker.working_directory = working_directory;
+            worker.workdir_attachments = workdir_attachments;
             worker.detail()
         };
         state.publish_worker_upsert(worker_ref.worker_id)?;
@@ -2367,9 +2498,13 @@ impl Runtime {
             state.ensure_running()?;
             state.ensure_worker_ref(worker_ref)?;
             let worker = state.worker(worker_ref)?;
-            if worker.execution_handle.is_some() && worker.status.is_active() {
+            if worker.status.is_active()
+                && (worker.execution_handle.is_some()
+                    || (!worker.execution_metadata_available
+                        && !worker.workdir_attachments.is_empty()))
+            {
                 return Err(RuntimeError::InvalidRequest(format!(
-                    "worker {} is running and must be stopped before deletion",
+                    "worker {} is active or requires reconciliation and must be stopped before deletion",
                     worker_ref.worker_id
                 )));
             }
@@ -2398,9 +2533,12 @@ impl Runtime {
         state.ensure_running()?;
         state.ensure_worker_ref(worker_ref)?;
         let worker = state.worker(worker_ref)?;
-        if worker.execution_handle.is_some() && worker.status.is_active() {
+        if worker.status.is_active()
+            && (worker.execution_handle.is_some()
+                || (!worker.execution_metadata_available && !worker.workdir_attachments.is_empty()))
+        {
             return Err(RuntimeError::InvalidRequest(format!(
-                "worker {} became active before deletion",
+                "worker {} became active or reconciliation-required before deletion",
                 worker_ref.worker_id
             )));
         }
@@ -2662,7 +2800,7 @@ impl Runtime {
         handle: WorkerExecutionHandle,
         worker_state: protocol::WorkerStateSnapshot,
         status: WorkerStatus,
-        working_directory: Option<CatalogWorkingDirectoryStatus>,
+        workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
     ) -> Result<WorkerDetail, RuntimeError> {
         let mut state = self.lock()?;
         state.ensure_worker_ref(worker_ref)?;
@@ -2679,7 +2817,7 @@ impl Runtime {
         candidate.status = status;
         let _ = candidate.apply_worker_state(&worker_state);
         candidate.restore_intent = restore_intent_for_status(candidate.status);
-        candidate.working_directory = working_directory;
+        candidate.workdir_attachments = workdir_attachments;
 
         // Validate the exact subscription projection before persistence. The
         // subsequent publish uses the same pure projection while the Worker
@@ -2708,7 +2846,7 @@ impl Runtime {
         worker_ref: &WorkerRef,
         handle: WorkerExecutionHandle,
         worker_state: protocol::WorkerStateSnapshot,
-        working_directory: Option<CatalogWorkingDirectoryStatus>,
+        workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
     ) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
         let mut candidate = state.worker(worker_ref)?.clone();
@@ -2718,7 +2856,26 @@ impl Runtime {
         candidate.status = WorkerStatus::Idle;
         let _ = candidate.apply_worker_state(&worker_state);
         candidate.restore_intent = WorkerRestoreIntent::Automatic;
-        candidate.working_directory = working_directory;
+        candidate.workdir_attachments = workdir_attachments;
+        state.workers.insert(worker_ref.worker_id, candidate);
+        state.publish_worker_upsert(worker_ref.worker_id)?;
+        state.persist_worker(&worker_ref.worker_id)?;
+        Ok(())
+    }
+
+    fn retain_create_reconciliation_pending(
+        &self,
+        worker_ref: &WorkerRef,
+        workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.lock()?;
+        let mut candidate = state.worker(worker_ref)?.clone();
+        candidate.execution_handle = None;
+        candidate.execution_metadata_available = false;
+        candidate.execution_bound = true;
+        candidate.status = WorkerStatus::Idle;
+        candidate.restore_intent = WorkerRestoreIntent::Explicit;
+        candidate.workdir_attachments = workdir_attachments;
         state.workers.insert(worker_ref.worker_id, candidate);
         state.publish_worker_upsert(worker_ref.worker_id)?;
         state.persist_worker(&worker_ref.worker_id)?;
@@ -3078,7 +3235,7 @@ impl RuntimeState {
                     execution_metadata_available,
                     execution_bound,
                     restore_intent,
-                    working_directory: worker.working_directory,
+                    workdir_attachments: worker.workdir_attachments,
                     execution_handle: None,
                     internal_workers: InternalWorkerActivityProjection::default(),
                 },
@@ -3394,18 +3551,25 @@ impl RuntimeState {
     ) -> Result<SubscriptionWorker, RuntimeError> {
         let worker_id = SubscriptionWorkerId::new(worker.worker_id.to_string())
             .map_err(subscription_validation_error)?;
-        let repository_id = worker
-            .working_directory
-            .as_ref()
-            .map(|working_directory| working_directory.summary.repository_id.clone());
-        let working_directory_id = worker
-            .working_directory
-            .as_ref()
-            .map(|working_directory| {
-                SubscriptionWorkdirId::new(working_directory.summary.working_directory_id.clone())
-                    .map_err(subscription_validation_error)
+        let workdir_attachments = worker
+            .workdir_attachments
+            .iter()
+            .map(|attachment| {
+                Ok(SubscriptionWorkerWorkdirAttachment {
+                    alias: attachment.alias.to_string(),
+                    repository_id: Some(attachment.working_directory.summary.repository_id.clone()),
+                    repository_key: None,
+                    working_directory_id: SubscriptionWorkdirId::new(
+                        attachment
+                            .working_directory
+                            .summary
+                            .working_directory_id
+                            .clone(),
+                    )
+                    .map_err(subscription_validation_error)?,
+                })
             })
-            .transpose()?;
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
         let profile = match &worker.profile {
             ProfileSelector::Builtin(name) | ProfileSelector::Named(name) => Some(name.clone()),
         };
@@ -3425,9 +3589,7 @@ impl RuntimeState {
             workspace_id: worker.workspace_id.clone(),
             display_name: worker.display_name.clone(),
             profile,
-            repository_id,
-            repository_key: None,
-            working_directory_id,
+            workdir_attachments,
         })
     }
 
@@ -3525,22 +3687,15 @@ impl RuntimeState {
         }
     }
 
-    fn primary_worker_id_for_workdir(&self, working_directory_id: &str) -> Option<WorkerId> {
+    fn worker_id_for_workdir(&self, working_directory_id: &str) -> Option<WorkerId> {
         self.workers.values().find_map(|worker| {
-            if worker
-                .working_directory
-                .as_ref()
-                .is_some_and(|binding| binding.summary.working_directory_id == working_directory_id)
-                || worker
-                    .request
-                    .as_ref()
-                    .and_then(requested_primary_workdir_id)
-                    == Some(working_directory_id)
-            {
-                Some(worker.worker_id)
-            } else {
-                None
-            }
+            let has_status = worker.workdir_attachments.iter().any(|attachment| {
+                attachment.working_directory.summary.working_directory_id == working_directory_id
+            });
+            let has_request = worker.request.as_ref().is_some_and(|request| {
+                requested_workdir_ids(request).contains(&working_directory_id)
+            });
+            (has_status || has_request).then_some(worker.worker_id)
         })
     }
 
@@ -3976,7 +4131,7 @@ struct WorkerRecord {
     execution_metadata_available: bool,
     execution_bound: bool,
     restore_intent: WorkerRestoreIntent,
-    working_directory: Option<CatalogWorkingDirectoryStatus>,
+    workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
     execution_handle: Option<WorkerExecutionHandle>,
     internal_workers: InternalWorkerActivityProjection,
 }
@@ -3999,7 +4154,7 @@ impl WorkerRecord {
             execution_metadata_available: self.execution_metadata_available,
             worker_state: self.worker_state.clone(),
             workspace_id: self.workspace_id.clone(),
-            working_directory: self.working_directory.clone(),
+            workdir_attachments: self.workdir_attachments.clone(),
             profile: self.profile.clone(),
             display_name: self.display_name.clone(),
             profile_source: self.profile_source.clone(),
@@ -4016,7 +4171,7 @@ impl WorkerRecord {
             execution_metadata_available: self.execution_metadata_available,
             worker_state: self.worker_state.clone(),
             workspace_id: self.workspace_id.clone(),
-            working_directory: self.working_directory.clone(),
+            workdir_attachments: self.workdir_attachments.clone(),
             profile: self.profile.clone(),
             display_name: self.display_name.clone(),
             profile_source: self.profile_source.clone(),
@@ -4049,7 +4204,7 @@ impl WorkerRecord {
             status: self.status,
             execution_state,
             workspace_id: self.workspace_id.clone(),
-            working_directory: self.working_directory.clone(),
+            workdir_attachments: self.workdir_attachments.clone(),
         }
     }
 }
@@ -4100,25 +4255,28 @@ fn repository_resource_error(error: BackendResourceError) -> RuntimeError {
 
 fn durable_create_worker_request(request: &CreateWorkerRequest) -> CreateWorkerRequest {
     let mut durable = request.clone();
-    if let Some(working_directory) = durable.working_directory_request.as_mut()
-        && let Some(materialization) = working_directory.materialization.as_mut()
-    {
-        materialization.ssh = None;
+    for attachment in &mut durable.workdir_attachment_requests {
+        if let Some(materialization) = attachment.working_directory.materialization.as_mut() {
+            materialization.ssh = None;
+        }
     }
     durable
 }
 
-fn requested_primary_workdir_id(request: &CreateWorkerRequest) -> Option<&str> {
+fn requested_workdir_ids(request: &CreateWorkerRequest) -> Vec<&str> {
     request
-        .working_directory
-        .as_ref()
+        .workdir_attachments
+        .iter()
         .map(|claim| claim.working_directory_id.as_str())
-        .or_else(|| {
+        .chain(
             request
-                .working_directory_request
-                .as_ref()
-                .and_then(|request| request.backend_workdir_id.as_deref())
-        })
+                .workdir_attachment_requests
+                .iter()
+                .filter_map(|attachment| {
+                    attachment.working_directory.backend_workdir_id.as_deref()
+                }),
+        )
+        .collect()
 }
 
 fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), RuntimeError> {
@@ -4126,6 +4284,42 @@ fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), R
         return Err(RuntimeError::InvalidRequest(
             "create_fingerprint must not be empty".to_string(),
         ));
+    }
+    let mut aliases = std::collections::BTreeSet::new();
+    let mut workdir_ids = std::collections::BTreeSet::new();
+    for (alias, workdir_id) in request
+        .workdir_attachments
+        .iter()
+        .map(|attachment| {
+            (
+                &attachment.alias,
+                Some(attachment.working_directory_id.as_str()),
+            )
+        })
+        .chain(
+            request
+                .workdir_attachment_requests
+                .iter()
+                .map(|attachment| {
+                    (
+                        &attachment.alias,
+                        attachment.working_directory.backend_workdir_id.as_deref(),
+                    )
+                }),
+        )
+    {
+        if !aliases.insert(alias.as_str()) {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "duplicate Workdir attachment alias `{alias}`"
+            )));
+        }
+        if let Some(workdir_id) = workdir_id
+            && !workdir_ids.insert(workdir_id)
+        {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "working directory `{workdir_id}` cannot be attached more than once"
+            )));
+        }
     }
     match &request.profile_source {
         crate::catalog::ProfileSourceArchiveSource::Embedded { archive } => {
@@ -4420,8 +4614,8 @@ mod tests {
     use crate::catalog::{
         ConfigBundleRef, MaterializerKind, ProfileSelector, RepositoryMaterializationContext,
         RepositorySshCredentialCandidate, RepositorySshMaterializationAccess, SensitiveString,
-        WorkingDirectoryClaim, WorkingDirectoryRepository, WorkingDirectoryRequest,
-        WorkspaceApiRef,
+        WorkingDirectoryAttachmentClaim, WorkingDirectoryAttachmentRequest,
+        WorkingDirectoryRepository, WorkingDirectoryRequest, WorkspaceApiRef,
     };
     use crate::config_bundle::{
         ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigDeclaration,
@@ -4913,8 +5107,8 @@ mod tests {
                 digest: bundle.metadata.digest,
             }),
             initial_input: None,
-            working_directory_request: None,
-            working_directory: None,
+            workdir_attachment_requests: Vec::new(),
+            workdir_attachments: Vec::new(),
             worker_observation_enabled: false,
             worker_observation_grants: Vec::new(),
             workspace_api: None,
@@ -4929,60 +5123,64 @@ mod tests {
     #[test]
     fn durable_worker_request_omits_repository_credentials() {
         let mut request = task_request("worker-secret-redaction");
-        request.working_directory_request = Some(WorkingDirectoryRequest {
-            repository: WorkingDirectoryRepository {
-                id: "repository-1".to_string(),
-                provider: "git".to_string(),
-                source: server_api::RepositorySource {
-                    kind: server_api::RepositorySourceKind::Ssh,
-                    uri: "ssh://git@example.test/repo.git".to_string(),
+        request.workdir_attachment_requests = vec![WorkingDirectoryAttachmentRequest {
+            alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
+            working_directory: WorkingDirectoryRequest {
+                repository: WorkingDirectoryRepository {
+                    id: "repository-1".to_string(),
+                    provider: "git".to_string(),
+                    source: server_api::RepositorySource {
+                        kind: server_api::RepositorySourceKind::Ssh,
+                        uri: "ssh://git@example.test/repo.git".to_string(),
+                    },
+                    source_revision: 1,
+                    source_fingerprint: "sha256:source".to_string(),
+                    selector: None,
                 },
-                source_revision: 1,
-                source_fingerprint: "sha256:source".to_string(),
-                selector: None,
-            },
-            materializer: MaterializerKind::RuntimeGitClone,
-            backend_workdir_id: Some("working-directory-1".to_string()),
-            materialization: Some(RepositoryMaterializationContext {
-                workspace_id: "workspace-1".to_string(),
-                runtime_id: "runtime-1".to_string(),
-                operation_id: "operation-1".to_string(),
-                config_revision: 1,
-                config_projection_digest: "sha256:projection".to_string(),
-                ssh: Some(RepositorySshMaterializationAccess {
-                    credential_candidates: vec![RepositorySshCredentialCandidate {
-                        credential_id: "credential-1".to_string(),
-                        credential_revision: 1,
-                        private_key: SensitiveString::new("private-key-bytes"),
-                    }],
-                    host_trust_id: "host-trust-1".to_string(),
-                    host_trust_revision: 1,
-                    access: server_api::RepositoryAccessMode::ReadOnly,
-                    expires_at_epoch_seconds: u64::MAX,
-                    repository_id: "repository-1".to_string(),
-                    repository_source_fingerprint: "sha256:source".to_string(),
-                    repository_uri: "ssh://git@example.test/repo.git".to_string(),
-                    secret_resource: repository_resource_handle(),
-                    known_hosts_entry: SensitiveString::new("known-hosts-entry"),
+                display_name: None,
+                materializer: MaterializerKind::RuntimeGitClone,
+                backend_workdir_id: Some("working-directory-1".to_string()),
+                materialization: Some(RepositoryMaterializationContext {
+                    workspace_id: "workspace-1".to_string(),
+                    runtime_id: "runtime-1".to_string(),
+                    operation_id: "operation-1".to_string(),
+                    config_revision: 1,
+                    config_projection_digest: "sha256:projection".to_string(),
+                    ssh: Some(RepositorySshMaterializationAccess {
+                        credential_candidates: vec![RepositorySshCredentialCandidate {
+                            credential_id: "credential-1".to_string(),
+                            credential_revision: 1,
+                            private_key: SensitiveString::new("private-key-bytes"),
+                        }],
+                        host_trust_id: "host-trust-1".to_string(),
+                        host_trust_revision: 1,
+                        access: server_api::RepositoryAccessMode::ReadOnly,
+                        expires_at_epoch_seconds: u64::MAX,
+                        repository_id: "repository-1".to_string(),
+                        repository_source_fingerprint: "sha256:source".to_string(),
+                        repository_uri: "ssh://git@example.test/repo.git".to_string(),
+                        secret_resource: repository_resource_handle(),
+                        known_hosts_entry: SensitiveString::new("known-hosts-entry"),
+                    }),
                 }),
-            }),
-        });
+            },
+        }];
 
         let durable = durable_create_worker_request(&request);
 
         assert!(
             request
-                .working_directory_request
-                .as_ref()
-                .and_then(|working_directory| working_directory.materialization.as_ref())
+                .workdir_attachment_requests
+                .first()
+                .and_then(|attachment| attachment.working_directory.materialization.as_ref())
                 .and_then(|materialization| materialization.ssh.as_ref())
                 .is_some()
         );
         assert!(
             durable
-                .working_directory_request
-                .as_ref()
-                .and_then(|working_directory| working_directory.materialization.as_ref())
+                .workdir_attachment_requests
+                .first()
+                .and_then(|attachment| attachment.working_directory.materialization.as_ref())
                 .and_then(|materialization| materialization.ssh.as_ref())
                 .is_none()
         );
@@ -5172,6 +5370,7 @@ mod tests {
                 source_fingerprint: "sha256:source".to_string(),
                 selector: None,
             },
+            display_name: None,
             materializer: MaterializerKind::RuntimeGitClone,
             backend_workdir_id: Some("working-directory-1".to_string()),
             materialization: Some(RepositoryMaterializationContext {
@@ -5342,6 +5541,7 @@ mod tests {
 
     #[derive(Default)]
     struct TestExecutionBackend {
+        spawn_result: Mutex<Option<WorkerExecutionSpawnResult>>,
         dispatch_result: Mutex<Option<WorkerExecutionResult>>,
         stop_result: Mutex<Option<WorkerExecutionResult>>,
         stop_gate: Mutex<Option<Arc<RestoreGate>>>,
@@ -5447,6 +5647,9 @@ mod tests {
         }
 
         fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
+            if let Some(result) = self.spawn_result.lock().unwrap().take() {
+                return result;
+            }
             self.config_bundles
                 .lock()
                 .unwrap()
@@ -5460,10 +5663,16 @@ mod tests {
                 worker_state: protocol::WorkerStateSnapshot {
                     ..protocol::WorkerStatus::Idle.into()
                 },
-                working_directory: request
-                    .working_directory
-                    .as_ref()
-                    .map(|binding| binding.status()),
+                workdir_attachments: request
+                    .workdir_attachments
+                    .iter()
+                    .map(
+                        |(alias, binding)| crate::catalog::WorkingDirectoryAttachmentStatus {
+                            alias: alias.clone(),
+                            working_directory: binding.status(),
+                        },
+                    )
+                    .collect(),
             }
         }
 
@@ -5502,10 +5711,16 @@ mod tests {
                 worker_state: protocol::WorkerStateSnapshot {
                     ..protocol::WorkerStatus::Idle.into()
                 },
-                working_directory: request
-                    .working_directory
-                    .as_ref()
-                    .map(|binding| binding.status()),
+                workdir_attachments: request
+                    .workdir_attachments
+                    .iter()
+                    .map(
+                        |(alias, binding)| crate::catalog::WorkingDirectoryAttachmentStatus {
+                            alias: alias.clone(),
+                            working_directory: binding.status(),
+                        },
+                    )
+                    .collect(),
             }
         }
 
@@ -6263,10 +6478,11 @@ mod tests {
         let runtime = runtime_with_backend();
         let mut request = task_request("idempotent");
         request.create_fingerprint = "sha256:input-1".to_string();
-        request.working_directory = Some(WorkingDirectoryClaim {
+        request.workdir_attachments = vec![WorkingDirectoryAttachmentClaim {
+            alias: workdir::WorkdirAttachmentAlias::new("workdir").unwrap(),
             working_directory_id: "workdir-idempotent".to_string(),
             relative_cwd: None,
-        });
+        }];
 
         let first = runtime.create_worker(request.clone()).unwrap();
         let workdir_count_after_first = runtime.list_working_directories().unwrap().len();
@@ -6632,6 +6848,49 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_required_create_retains_durable_worker_evidence() {
+        let (runtime, backend) = runtime_and_backend();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        *backend.spawn_result.lock().unwrap() =
+            Some(WorkerExecutionSpawnResult::ReconciliationRequired {
+                result: WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Spawn,
+                    "Workdir cleanup could not be proven",
+                ),
+                handle: None,
+                worker_state: None,
+                workdir_attachments: vec![WorkingDirectoryAttachmentStatus {
+                    alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
+                    working_directory: serde_json::from_value(serde_json::json!({
+                        "summary": {
+                            "working_directory_id": "wd-uncertain",
+                            "repository_id": "repo",
+                            "materializer_kind": "runtime_git_clone",
+                            "status": "active"
+                        }
+                    }))
+                    .unwrap(),
+                }],
+            });
+        let request = task_request("uncertain create cleanup");
+        let worker_ref = WorkerRef::new(request.worker_id);
+
+        let error = runtime.create_worker(request).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RuntimeError::WorkerExecutionRejected { .. }
+        ));
+        let retained = runtime.worker_detail(&worker_ref).unwrap();
+        assert_eq!(retained.status, WorkerStatus::Idle);
+        assert!(!retained.execution_metadata_available);
+        assert!(matches!(
+            runtime.delete_worker(&worker_ref),
+            Err(RuntimeError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
     fn create_worker_without_execution_backend_is_rejected_and_not_persisted() {
         let runtime = Runtime::new_memory();
         runtime.store_config_bundle(test_bundle()).unwrap();
@@ -6804,10 +7063,16 @@ mod tests {
                 worker_state: protocol::WorkerStateSnapshot {
                     ..protocol::WorkerStatus::Idle.into()
                 },
-                working_directory: request
-                    .working_directory
-                    .as_ref()
-                    .map(|binding| binding.status()),
+                workdir_attachments: request
+                    .workdir_attachments
+                    .iter()
+                    .map(
+                        |(alias, binding)| crate::catalog::WorkingDirectoryAttachmentStatus {
+                            alias: alias.clone(),
+                            working_directory: binding.status(),
+                        },
+                    )
+                    .collect(),
             }
         }
 
@@ -7667,7 +7932,7 @@ mod tests {
                 ),
                 handle: None,
                 worker_state: None,
-                working_directory: None,
+                workdir_attachments: Vec::new(),
             },
         );
 

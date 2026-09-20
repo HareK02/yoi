@@ -9,15 +9,20 @@ use serde::Deserialize;
 
 use crate::error::ToolsError;
 use crate::tracker::Tracker;
-use workdir::{StatRequest, WorkdirError, WorkdirPath, WorkdirSessionHandle, WriteRequest};
+use workdir::{
+    StatRequest, WorkdirError, WorkdirPath, WorkdirSessionHandle, WorkdirSessionRouter,
+    WriteRequest,
+};
 
-const DESCRIPTION: &str = "Create a new file or overwrite an existing one with \
-the given content. Missing parent directories within scope are created \
-automatically. Existing files must have been read first (via the Read tool) \
-in this session. Paths are relative to the bound Workdir.";
+const DESCRIPTION: &str = "Create a new file or overwrite an existing one in the selected Workdir attachment. \
+Missing parent directories within scope are created automatically. Existing files must have been read first \
+through the same attachment. When exactly one Workdir is attached, target_workdir may be omitted.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct WriteParams {
+    /// Worker-local alias of the Workdir attachment to use.
+    #[serde(default)]
+    pub target_workdir: Option<String>,
     /// Logical path relative to the bound Workdir root.
     pub file_path: String,
     /// Full content to write. Overwrites any existing content.
@@ -25,7 +30,7 @@ pub(crate) struct WriteParams {
 }
 
 pub(crate) struct WriteTool {
-    session: WorkdirSessionHandle,
+    router: Arc<WorkdirSessionRouter>,
     tracker: Tracker,
 }
 
@@ -39,19 +44,31 @@ impl Tool for WriteTool {
         let params: WriteParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid Write input: {e}")))?;
 
+        let selected = crate::routing::resolve_session(
+            &self.router,
+            params.target_workdir.as_deref(),
+            workdir::WorkdirSessionCapability::Write,
+        )?;
+        let tracker = self
+            .tracker
+            .scoped_attachment(&selected.alias, selected.generation);
         let path = WorkdirPath::new(&params.file_path).map_err(ToolsError::from)?;
         tracing::debug!(path = %path, bytes = params.content.len(), "Write");
 
         let mutation_key = PathBuf::from(path.as_str());
-        let _mutation_permit = self.tracker.acquire_mutation(&mutation_key, &ctx).await;
-        let expected_hash = match self.session.stat(StatRequest { path: path.clone() }).await {
-            Ok(_) => Some(self.tracker.expected_workdir_hash(&path)?),
+        let _mutation_permit = tracker.acquire_mutation(&mutation_key, &ctx).await;
+        let expected_hash = match selected
+            .session
+            .stat(StatRequest { path: path.clone() })
+            .await
+        {
+            Ok(_) => Some(tracker.expected_workdir_hash(&path)?),
             Err(WorkdirError::NotFound(_)) => None,
             Err(error) => return Err(ToolsError::from(error).into()),
         };
 
-        let old_line_count = self.tracker.observed_workdir_line_count(&path).unwrap_or(0);
-        let outcome = self
+        let old_line_count = tracker.observed_workdir_line_count(&path).unwrap_or(0);
+        let outcome = selected
             .session
             .write(WriteRequest {
                 path: path.clone(),
@@ -61,10 +78,8 @@ impl Tool for WriteTool {
             .await
             .map_err(ToolsError::from)?;
 
-        self.tracker
-            .record_change(params.content.lines().count(), old_line_count);
-        self.tracker
-            .record_workdir_content(&path, params.content.as_bytes());
+        tracker.record_change(params.content.lines().count(), old_line_count);
+        tracker.record_workdir_content(&path, params.content.as_bytes());
 
         let summary = format!(
             "{} {} ({} bytes)",
@@ -84,8 +99,15 @@ impl Tool for WriteTool {
     }
 }
 
-/// Factory for the `Write` tool.
+/// Factory for the `Write` tool bound to one compatibility session.
 pub fn write_tool(session: WorkdirSessionHandle, tracker: Tracker) -> ToolDefinition {
+    routed_write_tool(crate::routing::singleton_router(session), tracker)
+}
+
+pub(crate) fn routed_write_tool(
+    router: Arc<WorkdirSessionRouter>,
+    tracker: Tracker,
+) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(WriteParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
@@ -93,7 +115,7 @@ pub fn write_tool(session: WorkdirSessionHandle, tracker: Tracker) -> ToolDefini
             .description(DESCRIPTION)
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(WriteTool {
-            session: session.clone(),
+            router: router.clone(),
             tracker: tracker.clone(),
         });
         (meta, tool)

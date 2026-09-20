@@ -716,7 +716,7 @@ fn load_workdir_record(
     workdir_id: &str,
 ) -> Result<Option<WorkdirRegistryRecord>> {
     conn.query_row(
-        r#"SELECT workspace_id, workdir_id, runtime_id, repository_id,
+        r#"SELECT workspace_id, workdir_id, display_name, runtime_id, repository_id,
                   creation_selector, creation_ref, creation_tree,
                   current_selector, current_ref, current_tree, observed_at_epoch_seconds,
                   materialization_status, cleanliness, created_at, updated_at
@@ -726,19 +726,20 @@ fn load_workdir_record(
             Ok(WorkdirRegistryRecord {
                 workspace_id: row.get(0)?,
                 workdir_id: row.get(1)?,
-                runtime_id: row.get(2)?,
-                repository_id: row.get(3)?,
-                creation_selector: row.get(4)?,
-                creation_ref: row.get(5)?,
-                creation_tree: row.get(6)?,
-                current_selector: row.get(7)?,
-                current_ref: row.get(8)?,
-                current_tree: row.get(9)?,
-                observed_at_epoch_seconds: row.get::<_, Option<i64>>(10)?.map(|value| value as u64),
-                materialization_status: row.get(11)?,
-                cleanliness: row.get(12)?,
-                created_at: row.get(13)?,
-                updated_at: row.get(14)?,
+                display_name: row.get(2)?,
+                runtime_id: row.get(3)?,
+                repository_id: row.get(4)?,
+                creation_selector: row.get(5)?,
+                creation_ref: row.get(6)?,
+                creation_tree: row.get(7)?,
+                current_selector: row.get(8)?,
+                current_ref: row.get(9)?,
+                current_tree: row.get(10)?,
+                observed_at_epoch_seconds: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
+                materialization_status: row.get(12)?,
+                cleanliness: row.get(13)?,
+                created_at: row.get(14)?,
+                updated_at: row.get(15)?,
             })
         },
     )
@@ -934,6 +935,7 @@ mod tests {
         let workdir = WorkdirRegistryRecord {
             workspace_id: "workspace-a".to_string(),
             workdir_id: "workdir-a".to_string(),
+            display_name: None,
             runtime_id: "runtime-a".to_string(),
             repository_id: "repository-a".to_string(),
             creation_selector: Some("refs/heads/develop".to_string()),

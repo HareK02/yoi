@@ -1,6 +1,7 @@
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerRestoreIntent, WorkerStatus,
-    WorkingDirectoryStatus,
+    WorkingDirectoryAttachmentClaim, WorkingDirectoryAttachmentRequest,
+    WorkingDirectoryAttachmentStatus, WorkingDirectoryRequest,
 };
 use crate::config_bundle::ConfigBundle;
 use crate::diagnostics::{DiagnosticSeverity, RuntimeDiagnostic};
@@ -442,7 +443,7 @@ pub(crate) struct PersistedWorkerRecord {
     pub(crate) status: WorkerStatus,
     pub(crate) execution_state: PersistedWorkerExecutionState,
     pub(crate) workspace_id: Option<String>,
-    pub(crate) working_directory: Option<WorkingDirectoryStatus>,
+    pub(crate) workdir_attachments: Vec<WorkingDirectoryAttachmentStatus>,
 }
 
 fn runtime_io_error(operation: &'static str, path: &Path, source: std::io::Error) -> RuntimeError {
@@ -1685,11 +1686,18 @@ struct WorkerIdentityRecord {
     status: WorkerStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workspace_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    working_directory: Option<WorkingDirectoryStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    workdir_attachments: Vec<WorkingDirectoryAttachmentStatus>,
+    /// Schema-v8 compatibility input. New records serialize only `workdir_attachments`.
+    #[serde(
+        default,
+        rename = "working_directory",
+        skip_serializing_if = "Option::is_none"
+    )]
+    legacy_working_directory: Option<crate::catalog::WorkingDirectoryStatus>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerExecutionRecord {
     schema_version: u32,
@@ -1697,6 +1705,72 @@ struct WorkerExecutionRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     binding: Option<PersistedWorkerExecutionBinding>,
     restore_intent: WorkerRestoreIntent,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWorkerExecutionRecord {
+    schema_version: u32,
+    request: serde_json::Value,
+    #[serde(default)]
+    binding: Option<PersistedWorkerExecutionBinding>,
+    restore_intent: WorkerRestoreIntent,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyWorkingDirectoryClaim {
+    working_directory_id: String,
+    #[serde(default)]
+    relative_cwd: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for WorkerExecutionRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawWorkerExecutionRecord::deserialize(deserializer)?;
+        let mut request_value = raw.request;
+        let request_object = request_value
+            .as_object_mut()
+            .ok_or_else(|| serde::de::Error::custom("Worker create request must be an object"))?;
+        let legacy_request = request_object.remove("working_directory_request");
+        let legacy_claim = request_object.remove("working_directory");
+        let mut request: CreateWorkerRequest =
+            serde_json::from_value(request_value).map_err(serde::de::Error::custom)?;
+        if request.workdir_attachment_requests.is_empty() && request.workdir_attachments.is_empty()
+        {
+            let alias = workdir::WorkdirAttachmentAlias::new("workdir")
+                .expect("static compatibility alias is valid");
+            if let Some(value) = legacy_request.filter(|value| !value.is_null()) {
+                let working_directory: WorkingDirectoryRequest =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                request
+                    .workdir_attachment_requests
+                    .push(WorkingDirectoryAttachmentRequest {
+                        alias,
+                        working_directory,
+                    });
+            } else if let Some(value) = legacy_claim.filter(|value| !value.is_null()) {
+                let claim: LegacyWorkingDirectoryClaim =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                request
+                    .workdir_attachments
+                    .push(WorkingDirectoryAttachmentClaim {
+                        alias,
+                        working_directory_id: claim.working_directory_id,
+                        relative_cwd: claim.relative_cwd,
+                    });
+            }
+        }
+        Ok(Self {
+            schema_version: raw.schema_version,
+            request,
+            binding: raw.binding,
+            restore_intent: raw.restore_intent,
+        })
+    }
 }
 
 impl WorkerIdentityRecord {
@@ -1712,7 +1786,8 @@ impl WorkerIdentityRecord {
             created_at_ms: worker.created_at_ms,
             status: worker.status,
             workspace_id: worker.workspace_id.clone(),
-            working_directory: worker.working_directory.clone(),
+            workdir_attachments: worker.workdir_attachments.clone(),
+            legacy_working_directory: None,
         }
     }
 
@@ -1760,6 +1835,19 @@ impl WorkerIdentityRecord {
         self,
         execution_state: PersistedWorkerExecutionState,
     ) -> PersistedWorkerRecord {
+        let workdir_attachments = if self.workdir_attachments.is_empty() {
+            self.legacy_working_directory
+                .map(|working_directory| {
+                    vec![WorkingDirectoryAttachmentStatus {
+                        alias: workdir::WorkdirAttachmentAlias::new("workdir")
+                            .expect("static compatibility alias is valid"),
+                        working_directory,
+                    }]
+                })
+                .unwrap_or_default()
+        } else {
+            self.workdir_attachments
+        };
         PersistedWorkerRecord {
             worker_ref: self.worker_ref,
             worker_id: self.worker_id,
@@ -1771,7 +1859,7 @@ impl WorkerIdentityRecord {
             status: self.status,
             execution_state,
             workspace_id: self.workspace_id,
-            working_directory: self.working_directory,
+            workdir_attachments,
         }
     }
 }
@@ -2213,6 +2301,72 @@ mod tests {
         document["execution"]["last_run_generation"] = serde_json::json!(7);
         document["execution"]["binding"] = serde_json::json!({ "run_generation": 7 });
         document
+    }
+
+    #[test]
+    fn schema_v8_singular_workdir_fields_normalize_to_one_attachment() {
+        let worker_id = WorkerId::now_v7();
+        let workdir_status = serde_json::json!({
+            "summary": {
+                "working_directory_id": "wd-legacy",
+                "repository_id": "repo",
+                "materializer_kind": "runtime_git_clone",
+                "status": "active"
+            }
+        });
+        let identity: WorkerIdentityRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "worker_ref": { "worker_id": worker_id },
+            "worker_id": worker_id,
+            "profile": { "kind": "builtin", "value": "builtin:coder" },
+            "display_name": null,
+            "profile_source": {
+                "id": "archive-1",
+                "digest": "sha256:archive",
+                "size_bytes": 0,
+                "source_graph": {
+                    "source_count": 0,
+                    "total_source_bytes": 0,
+                    "entrypoints": {},
+                    "import_count": 0
+                }
+            },
+            "config_bundle": null,
+            "status": "stopped",
+            "working_directory": workdir_status
+        }))
+        .unwrap();
+        let persisted = identity.into_persisted(PersistedWorkerExecutionState::Unavailable);
+        assert_eq!(persisted.workdir_attachments.len(), 1);
+        assert_eq!(persisted.workdir_attachments[0].alias.as_str(), "workdir");
+        assert_eq!(
+            persisted.workdir_attachments[0]
+                .working_directory
+                .summary
+                .working_directory_id,
+            "wd-legacy"
+        );
+
+        let mut request = schema_v7_worker_document(worker_id)["request"].clone();
+        request["working_directory"] = serde_json::json!({
+            "working_directory_id": "wd-legacy",
+            "relative_cwd": "crates/yoi"
+        });
+        let execution: WorkerExecutionRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "request": request,
+            "binding": null,
+            "restore_intent": "explicit"
+        }))
+        .unwrap();
+        assert!(execution.request.workdir_attachment_requests.is_empty());
+        assert_eq!(execution.request.workdir_attachments.len(), 1);
+        let attachment = &execution.request.workdir_attachments[0];
+        assert_eq!(attachment.alias.as_str(), "workdir");
+        assert_eq!(attachment.working_directory_id, "wd-legacy");
+        assert_eq!(attachment.relative_cwd.as_deref(), Some("crates/yoi"));
+        let serialized = serde_json::to_value(execution).unwrap();
+        assert!(serialized["request"].get("working_directory").is_none());
     }
 
     #[test]

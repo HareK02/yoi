@@ -145,7 +145,7 @@ where
         .map_err(WorkerBootstrapError::Worker)?;
 
         if let Some(workdir_session) = self.workdir_session {
-            worker.bind_workdir_session(Some(workdir_session));
+            worker.bind_single_workdir_session(Some(workdir_session));
         }
         Ok(PreparedWorker::new(worker, self.layout, self.transport))
     }
@@ -168,7 +168,7 @@ where
             .map_err(WorkerBootstrapError::Worker)?;
 
         if let Some(workdir_session) = self.workdir_session {
-            worker.bind_workdir_session(Some(workdir_session));
+            worker.bind_single_workdir_session(Some(workdir_session));
         }
         Ok(PreparedWorker::new(worker, self.layout, self.transport))
     }
@@ -222,7 +222,7 @@ where
     C: LlmClient + Clone + 'static,
     St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
 {
-    let cleanup_session = worker.workdir_session().cloned();
+    let cleanup_sessions = worker.workdir_sessions();
     let controller = match layout {
         WorkerBootstrapLayout::Direct {
             runtime_base,
@@ -257,10 +257,7 @@ where
             controller_task,
         }),
         Err(source) => {
-            let cleanup_failed = match cleanup_session {
-                Some(session) => session.close().await.is_err(),
-                None => false,
-            };
+            let cleanup_failed = cleanup_sessions.close_all().await.is_err();
             Err(WorkerBootstrapError::Controller {
                 source,
                 cleanup_failed,

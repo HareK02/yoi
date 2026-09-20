@@ -5,6 +5,7 @@
 //! in-process Internal Worker session actor. No Runtime Worker record, OS process, PID, Unix socket,
 //! or machine-wide child allocation is created.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,7 +23,7 @@ use manifest::{
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use workdir::{
-    WorkdirToolBroker, WorkdirToolScope, WorkdirToolScopePermission, WorkdirToolScopeRule,
+    WorkdirToolBrokerRouter, WorkdirToolScope, WorkdirToolScopePermission, WorkdirToolScopeRule,
 };
 
 use crate::PromptCatalogSource;
@@ -81,6 +82,10 @@ struct ReviewerHandoffInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ScopeRuleInput {
+    /// Worker-local alias of the parent Workdir attachment. May be omitted only
+    /// when the parent has exactly one attachment.
+    #[serde(default)]
+    target_workdir: Option<String>,
     /// Logical Workdir-relative target such as `.` or `src`. Absolute host
     /// paths and parent traversal are rejected.
     target: String,
@@ -310,7 +315,7 @@ pub struct SubWorkerSpawnTool {
     /// Directory the spawned SubWorker's tools should use when the LLM did not
     /// override it. Defaults to the spawner's cwd.
     /// Parent-owned broker for scoped Workdir tool execution.
-    workdir_tool_broker: Option<WorkdirToolBroker>,
+    workdir_tool_broker: Option<WorkdirToolBrokerRouter>,
     /// Parent-owned in-memory registry shared by the five SubWorker tools.
     registry: Arc<SpawnedWorkerRegistry>,
     /// Spawner's resolved Manifest. `profile = "inherit"` derives the
@@ -337,7 +342,7 @@ impl SubWorkerSpawnTool {
         runtime_base: PathBuf,
         bash_output_dir: PathBuf,
         workspace_root: PathBuf,
-        workdir_tool_broker: Option<WorkdirToolBroker>,
+        workdir_tool_broker: Option<WorkdirToolBrokerRouter>,
         registry: Arc<SpawnedWorkerRegistry>,
         spawner_manifest: WorkerManifest,
         prompt_loader: PromptCatalogSource,
@@ -428,14 +433,19 @@ impl Tool for SubWorkerSpawnTool {
                 ))
             })?;
         let workdir_tool_broker = require_workdir_tool_broker(self.workdir_tool_broker.as_ref())?;
-        let tool_scope = workdir_tool_scope(input.cwd.as_deref(), workdir_rules, input.command)?;
+        let tool_scopes = routed_workdir_tool_scopes(
+            workdir_tool_broker,
+            input.cwd.as_deref(),
+            workdir_rules,
+            input.command,
+        )?;
         let workdir_scope = workdir_tool_broker
-            .scope(tool_scope)
+            .scope(tool_scopes)
             .await
             .map_err(|error| {
                 ToolError::InvalidArgument(format!("scope parent-owned Workdir tools: {error}"))
             })?;
-        let child_workdir_tool_broker = workdir_scope.broker();
+        let child_workdir_tool_broker = workdir_scope.broker_router();
 
         let spawn_selector =
             parse_spawn_profile_selector(input.profile.as_deref()).map_err(|msg| {
@@ -537,6 +547,7 @@ impl Tool for SubWorkerSpawnTool {
                 ))
             })?;
         let child_scope = child.scope().clone();
+        child.bind_workdir_sessions(workdir_scope.session_router());
         let child_registry = SpawnedWorkerRegistry::new_internal(input.name.clone(), child_scope);
         register_worker_tools(
             &mut child,
@@ -717,22 +728,27 @@ fn logical_workdir_path(value: &str, field: &str) -> Result<FsPath, ToolError> {
     })
 }
 
-fn parse_workdir_scope(rules: &[ScopeRuleInput]) -> Result<Vec<WorkdirToolScopeRule>, ToolError> {
+fn parse_workdir_scope(
+    rules: &[ScopeRuleInput],
+) -> Result<Vec<(Option<String>, WorkdirToolScopeRule)>, ToolError> {
     if rules.is_empty() {
         return Err(ToolError::InvalidArgument("scope must not be empty".into()));
     }
     rules
         .iter()
         .map(|rule| {
-            Ok(WorkdirToolScopeRule {
-                target: logical_workdir_path(&rule.target, "scope.target")?,
-                permission: match rule.permission {
-                    PermissionInput::Read => WorkdirToolScopePermission::Read,
-                    PermissionInput::Write => WorkdirToolScopePermission::Write,
+            Ok((
+                rule.target_workdir.clone(),
+                WorkdirToolScopeRule {
+                    target: logical_workdir_path(&rule.target, "scope.target")?,
+                    permission: match rule.permission {
+                        PermissionInput::Read => WorkdirToolScopePermission::Read,
+                        PermissionInput::Write => WorkdirToolScopePermission::Write,
+                    },
+                    recursive: rule.recursive,
+                    symlink_policy: rule.symlink_policy.into(),
                 },
-                recursive: rule.recursive,
-                symlink_policy: rule.symlink_policy.into(),
-            })
+            ))
         })
         .collect()
 }
@@ -749,9 +765,28 @@ fn workdir_tool_scope(
     })
 }
 
+fn routed_workdir_tool_scopes(
+    broker: &WorkdirToolBrokerRouter,
+    cwd: Option<&str>,
+    rules: Vec<(Option<String>, WorkdirToolScopeRule)>,
+    command: bool,
+) -> Result<Vec<(workdir::WorkdirAttachmentAlias, WorkdirToolScope)>, ToolError> {
+    let mut grouped = BTreeMap::<workdir::WorkdirAttachmentAlias, Vec<WorkdirToolScopeRule>>::new();
+    for (target_workdir, rule) in rules {
+        let alias = broker
+            .resolve_alias(target_workdir.as_deref())
+            .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
+        grouped.entry(alias).or_default().push(rule);
+    }
+    grouped
+        .into_iter()
+        .map(|(alias, rules)| workdir_tool_scope(cwd, rules, command).map(|scope| (alias, scope)))
+        .collect()
+}
+
 fn require_workdir_tool_broker(
-    broker: Option<&WorkdirToolBroker>,
-) -> Result<&WorkdirToolBroker, ToolError> {
+    broker: Option<&WorkdirToolBrokerRouter>,
+) -> Result<&WorkdirToolBrokerRouter, ToolError> {
     broker.ok_or_else(|| {
         ToolError::InvalidArgument(
             "SubWorkerSpawn requires parent-owned Workdir tools; attach a Workdir before granting filesystem access"
@@ -992,7 +1027,7 @@ pub(crate) fn sub_worker_spawn_tool(
     runtime_base: PathBuf,
     bash_output_dir: PathBuf,
     workspace_root: PathBuf,
-    workdir_tool_broker: Option<WorkdirToolBroker>,
+    workdir_tool_broker: Option<WorkdirToolBrokerRouter>,
     registry: Arc<SpawnedWorkerRegistry>,
     spawner_manifest: WorkerManifest,
     prompts: Arc<ArcSwap<PromptCatalog>>,
@@ -1018,7 +1053,7 @@ fn sub_worker_spawn_tool_impl(
     runtime_base: PathBuf,
     bash_output_dir: PathBuf,
     workspace_root: PathBuf,
-    workdir_tool_broker: Option<WorkdirToolBroker>,
+    workdir_tool_broker: Option<WorkdirToolBrokerRouter>,
     registry: Arc<SpawnedWorkerRegistry>,
     spawner_manifest: WorkerManifest,
     prompts: Arc<ArcSwap<PromptCatalog>>,
@@ -1096,12 +1131,14 @@ mod tests {
     fn workdir_scope_uses_logical_relative_paths() {
         let rules = parse_workdir_scope(&[
             ScopeRuleInput {
+                target_workdir: None,
                 target: ".".to_string(),
                 permission: PermissionInput::Read,
                 recursive: true,
                 symlink_policy: Default::default(),
             },
             ScopeRuleInput {
+                target_workdir: Some("checkout".to_string()),
                 target: "src".to_string(),
                 permission: PermissionInput::Write,
                 recursive: false,
@@ -1109,12 +1146,14 @@ mod tests {
             },
         ])
         .unwrap();
-        assert_eq!(rules[0].target.as_str(), "");
-        assert_eq!(rules[1].target.as_str(), "src");
-        assert_eq!(rules[0].symlink_policy, SymlinkPolicy::Resolved);
-        assert_eq!(rules[1].symlink_policy, SymlinkPolicy::Logical);
+        assert_eq!(rules[0].1.target.as_str(), "");
+        assert_eq!(rules[1].0.as_deref(), Some("checkout"));
+        assert_eq!(rules[1].1.target.as_str(), "src");
+        assert_eq!(rules[0].1.symlink_policy, SymlinkPolicy::Resolved);
+        assert_eq!(rules[1].1.symlink_policy, SymlinkPolicy::Logical);
         for target in ["/host/path", "../escape"] {
             let error = parse_workdir_scope(&[ScopeRuleInput {
+                target_workdir: None,
                 target: target.to_string(),
                 permission: PermissionInput::Read,
                 recursive: true,
@@ -1278,15 +1317,17 @@ enabled = false
         let fail_requests = Arc::new(AtomicBool::new(false));
         let prompt_loader = PromptCatalogSource::builtins_only();
         let (parent_method_tx, mut parent_method_rx) = mpsc::channel(8);
-        let workdir_tool_broker = workdir::WorkdirToolBroker::new(Arc::new(
-            workdir::LocalWorkdirSession::materialized_bound(
+        let workdir_tool_broker = workdir::WorkdirToolBrokerRouter::from_single(
+            workdir::WorkdirAttachmentAlias::new("workdir").unwrap(),
+            Arc::new(workdir::LocalWorkdirSession::materialized_bound(
                 workdir::Workdir::new("test-workdir"),
                 workspace_root.clone(),
                 workspace_root.clone(),
                 spawner_scope.clone(),
                 workdir::WorkdirSessionCapabilities::ALL,
-            ),
-        ));
+            )),
+        )
+        .unwrap();
         let tool = SubWorkerSpawnTool::new(
             "parent".into(),
             workspace_context,
@@ -1528,9 +1569,11 @@ enabled = false
             Arc::new(AvailableWorkspaceClient),
         );
         let remote_client = Arc::new(StrictRemoteWorkdirWorkspaceClient::default());
-        let workdir_tool_broker = workdir::WorkdirToolBroker::new(
-            WorkspaceAttachedWorkdirSession::handle(remote_client.clone()),
-        );
+        let workdir_tool_broker = workdir::WorkdirToolBrokerRouter::from_single(
+            workdir::WorkdirAttachmentAlias::new("workdir").unwrap(),
+            WorkspaceAttachedWorkdirSession::handle(remote_client.clone(), "workdir"),
+        )
+        .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let (parent_method_tx, _parent_method_rx) = mpsc::channel(8);
         let tool = SubWorkerSpawnTool::new(
@@ -1607,6 +1650,7 @@ enabled = false
         assert!(properties.contains_key("command"), "schema: {schema}");
         let schema_text = serde_json::to_string(&schema).unwrap();
         assert!(schema_text.contains("symlink_policy"), "schema: {schema}");
+        assert!(schema_text.contains("target_workdir"), "schema: {schema}");
         assert!(schema_text.contains("logical"), "schema: {schema}");
         let required = schema
             .get("required")

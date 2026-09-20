@@ -11,6 +11,7 @@ import type {
 
 const SUMMARY_KEYS = new Set([
   "working_directory_id",
+  "display_name",
   "repository_key",
   "creation_selector",
   "creation_ref",
@@ -23,11 +24,11 @@ const SUMMARY_KEYS = new Set([
   "cleanup_target",
   "status",
   "cleanliness",
-  "primary_worker_id",
   "occupied_by",
 ]);
 const CREATE_REQUEST_KEYS = new Set([
   "runtime_id",
+  "display_name",
   "repository_key",
   "selector",
   "operation_id",
@@ -84,6 +85,7 @@ export function validateWorkingDirectoryCreateRequest(
     repository_key: stringField(record, "repository_key"),
   };
   assignOptionalString(request, record, "runtime_id");
+  assignOptionalString(request, record, "display_name");
   assignOptionalString(request, record, "selector");
   assignOptionalString(request, record, "operation_id");
   return request;
@@ -124,6 +126,7 @@ export function parseWorkingDirectorySummary(
       "unknown",
     ]),
   };
+  assignOptionalString(summary, record, "display_name");
   assignOptionalString(summary, record, "creation_selector");
   assignOptionalString(summary, record, "creation_ref");
   assignOptionalString(summary, record, "creation_tree");
@@ -131,7 +134,6 @@ export function parseWorkingDirectorySummary(
   assignOptionalString(summary, record, "current_ref");
   assignOptionalString(summary, record, "current_tree");
   assignOptionalString(summary, record, "cleanliness");
-  assignOptionalString(summary, record, "primary_worker_id");
   if (record.observed_at_epoch_seconds !== undefined) {
     const observedAt = record.observed_at_epoch_seconds;
     if (observedAt === null) {

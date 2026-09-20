@@ -10,6 +10,7 @@ import {
 
 const summary = {
   working_directory_id: "workdir-1",
+  display_name: "Checkout",
   repository_key: "main",
   materializer_kind: "runtime_git_clone",
   status: "active",
@@ -27,6 +28,9 @@ Deno.test("Workdir REST validation accepts the generated list and create contrac
     items: [summary],
     diagnostics: [],
   });
+  if (list.items[0]?.display_name !== "Checkout") {
+    throw new Error("display name was not preserved");
+  }
   if (list.items[0]?.occupied_by?.runtime_id !== "arcadia") {
     throw new Error("occupancy subject was not preserved");
   }
@@ -60,12 +64,16 @@ Deno.test("Workdir REST validation rejects stale response JSON", () => {
 Deno.test("Workdir REST validation enforces create operation fields", () => {
   const request = validateWorkingDirectoryCreateRequest({
     runtime_id: "arcadia",
+    display_name: "Review checkout",
     repository_key: "main",
     selector: "develop",
     operation_id: "operation-1",
   });
   if (request.operation_id !== "operation-1") {
     throw new Error("operation id was not preserved");
+  }
+  if (request.display_name !== "Review checkout") {
+    throw new Error("display name was not preserved");
   }
 
   for (

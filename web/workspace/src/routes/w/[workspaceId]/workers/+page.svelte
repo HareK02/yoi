@@ -145,11 +145,14 @@
   }
 
   function workerDirectory(worker: Worker): string {
-    const directory = worker.working_directory;
-    if (!directory) return '—';
-    const provider = data.repositories?.items.find((repository) => repository.repository_key === directory.repository_key)
-      ?.provider;
-    return `${directory.repository_key} · ${formatCurrentWorkdirRevision(directory, provider)}`;
+    const attachments = worker.workdir_attachments ?? [];
+    if (attachments.length === 0) return '—';
+    return attachments.map(({ alias, working_directory: directory }) => {
+      const provider = data.repositories?.items.find((repository) => repository.repository_key === directory.repository_key)
+        ?.provider;
+      const label = directory.display_name ?? directory.repository_key;
+      return `${alias}: ${label} · ${formatCurrentWorkdirRevision(directory, provider)}`;
+    }).join(', ');
   }
 </script>
 

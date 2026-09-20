@@ -161,6 +161,8 @@ pub struct WorkingDirectoryRepositoryAccessRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingDirectoryRequest {
     pub repository: WorkingDirectoryRepository,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     #[serde(default)]
     pub materializer: MaterializerKind,
     /// Backend-assigned stable Workdir id. Runtimes use this when present so the
@@ -197,10 +199,23 @@ pub struct RepositoryRefObservation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkingDirectoryClaim {
+pub struct WorkingDirectoryAttachmentClaim {
+    pub alias: workdir::WorkdirAttachmentAlias,
     pub working_directory_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relative_cwd: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkingDirectoryAttachmentRequest {
+    pub alias: workdir::WorkdirAttachmentAlias,
+    pub working_directory: WorkingDirectoryRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkingDirectoryAttachmentStatus {
+    pub alias: workdir::WorkdirAttachmentAlias,
+    pub working_directory: WorkingDirectoryStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,10 +262,10 @@ pub struct CreateWorkerRequest {
     pub config_bundle: Option<ConfigBundleRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_input: Option<WorkerInput>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_directory_request: Option<WorkingDirectoryRequest>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_directory: Option<WorkingDirectoryClaim>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workdir_attachment_requests: Vec<WorkingDirectoryAttachmentRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workdir_attachments: Vec<WorkingDirectoryAttachmentClaim>,
     /// Backend-only feature enablement. Grants still define local Runtime peers;
     /// the Workspace provider reauthorizes its dynamic set per operation.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -308,8 +323,8 @@ pub struct WorkerSummary {
     pub worker_state: Option<protocol::WorkerStateSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_directory: Option<WorkingDirectoryStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workdir_attachments: Vec<WorkingDirectoryAttachmentStatus>,
     pub profile: ProfileSelector,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
@@ -333,8 +348,8 @@ pub struct WorkerDetail {
     pub worker_state: Option<protocol::WorkerStateSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_directory: Option<WorkingDirectoryStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workdir_attachments: Vec<WorkingDirectoryAttachmentStatus>,
     pub profile: ProfileSelector,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,

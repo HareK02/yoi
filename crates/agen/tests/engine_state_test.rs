@@ -7,6 +7,7 @@ mod common;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use agen::Item;
 use agen::interceptor::{
@@ -18,16 +19,67 @@ use agen::interceptor::{
 };
 use agen::llm_client::{
     ClientError, LlmClient, Request, ResponseStream,
-    event::{Event, ResponseStatus, StatusEvent},
+    event::{Event, ResponseStatus, StatusEvent, UsageEvent},
 };
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use agen::{Engine, EngineError, EngineRunExit, History, RunInterruptionReason};
 use async_trait::async_trait;
 use common::MockLlmClient;
+use futures::StreamExt;
 
-// =============================================================================
-// Mutable State Tests
-// =============================================================================
+#[derive(Clone)]
+struct UsageThenPendingClient;
+
+#[async_trait]
+impl LlmClient for UsageThenPendingClient {
+    fn clone_boxed(&self) -> Box<dyn LlmClient> {
+        Box::new(self.clone())
+    }
+
+    async fn stream(&self, _request: Request) -> Result<ResponseStream, ClientError> {
+        let usage = Event::Usage(UsageEvent {
+            input_tokens: Some(90),
+            output_tokens: Some(2),
+            total_tokens: Some(92),
+            cache_read_input_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+        });
+        Ok(Box::pin(
+            futures::stream::once(async move { Ok(usage) })
+                .chain(futures::stream::pending::<Result<Event, ClientError>>()),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn pause_during_response_stream_flushes_observed_usage() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let observed_for_callback = Arc::clone(&observed);
+    let mut engine = Engine::new(UsageThenPendingClient);
+    engine.on_usage(move |usage| {
+        observed_for_callback.lock().unwrap().push(usage.clone());
+    });
+    let pause = engine.pause_sender();
+    let mut history = History::new();
+    let mut engine = engine.lock(&history);
+
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        pause.send(()).await.unwrap();
+    });
+
+    let exit = tokio::time::timeout(
+        Duration::from_secs(2),
+        engine.run(&mut history, "pause after usage"),
+    )
+    .await
+    .expect("run should observe pause");
+    assert!(matches!(exit, EngineRunExit::Paused));
+    let observed = observed.lock().unwrap();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0].input_tokens, Some(90));
+    assert_eq!(observed[0].output_tokens, Some(2));
+}
 
 /// Verify that system prompt can be set in Mutable state
 #[test]

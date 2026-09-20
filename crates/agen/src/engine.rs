@@ -2275,6 +2275,9 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                         info!("Paused during response stream");
                     }
                     self.timeline.abort_current_block();
+                    // Preserve any UsageEvent already received for billing, but
+                    // do not treat this paused request as a normal completion.
+                    self.timeline.flush_usage();
                     return Err(EngineError::PauseRequested);
                 }
                 cancel = self.cancel_rx.recv() => {

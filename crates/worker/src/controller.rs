@@ -617,7 +617,7 @@ impl WorkerController {
         C: LlmClient + Clone + 'static,
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
-        let session = worker.workdir_session().cloned();
+        let sessions = worker.workdir_sessions();
         let result = Self::spawn_initialized(
             worker,
             runtime_base,
@@ -628,10 +628,9 @@ impl WorkerController {
         )
         .await;
         if result.is_err()
-            && let Some(session) = session
-            && let Err(error) = session.close().await
+            && let Err(error) = sessions.close_all().await
         {
-            tracing::warn!(%error, "Workdir session close after controller startup failure failed");
+            tracing::warn!(%error, "Workdir sessions close after controller startup failure failed");
         }
         result
     }
@@ -1144,7 +1143,7 @@ pub(crate) async fn register_worker_tools<C, St>(
     runtime_base: PathBuf,
     spawned_registry: Arc<SpawnedWorkerRegistry>,
     parent_method_tx: Option<mpsc::WeakSender<Method>>,
-    inherited_workdir_tool_broker: Option<workdir::WorkdirToolBroker>,
+    inherited_workdir_tool_broker: Option<workdir::WorkdirToolBrokerRouter>,
 ) -> std::io::Result<Option<workdir::WorkdirSessionHandle>>
 where
     C: LlmClient + Clone + 'static,
@@ -1153,26 +1152,13 @@ where
     // Worker-immutable snapshots taken before the mutable worker borrow
     // below so the worker borrow doesn't conflict with reads on `worker`.
     let feature_config = worker.manifest().feature.clone();
-    let mut workdir_tool_broker = inherited_workdir_tool_broker;
-    if feature_config.manage_workdir.enabled && worker.workdir_session().is_none() {
-        let workspace_client = worker.workspace_client_handle();
-        let broker = workdir::WorkdirToolBroker::new(
-            crate::feature::builtin::manage_workdir::WorkspaceAttachedWorkdirSession::handle(
-                workspace_client,
-            ),
-        );
-        worker.bind_workdir_session(Some(broker.tool_session()));
-        workdir_tool_broker = Some(broker);
-    } else if workdir_tool_broker.is_none()
-        && let Some(existing) = worker.workdir_session().cloned()
-    {
-        let broker = workdir::WorkdirToolBroker::new(existing);
-        worker.bind_workdir_session(Some(broker.tool_session()));
-        workdir_tool_broker = Some(broker);
-    }
-    let worker_workdir = workdir_tool_broker
-        .as_ref()
-        .map(workdir::WorkdirToolBroker::tool_session);
+    let workdir_sessions = worker.workdir_sessions();
+    let restrict_workdir_tools_to_current_capabilities = inherited_workdir_tool_broker.is_some();
+    let workdir_tool_broker = Some(
+        inherited_workdir_tool_broker
+            .unwrap_or_else(|| workdir::WorkdirToolBrokerRouter::new(workdir_sessions.clone())),
+    );
+    let workdir_for_view = workdir_sessions.only_session();
     let local_filesystem = worker.local_working_directory().cloned();
     let local_workspace_root = local_filesystem.as_ref().map(|local| local.root.clone());
     let task_feature = worker.task_feature();
@@ -1207,28 +1193,29 @@ where
             paste_store,
             paste_session_id,
         ));
-    // Resolve the existing Worker–Workdir binding into the domain provider.
-    // Tools only consume the provider handle; they do not own its root, cwd,
-    // scope, or lifecycle. No-workdir Workers expose no local tools.
-    let (workdir_for_view, tracker) = if let Some(workdir) = worker_workdir {
-        let tracker = tools::Tracker::new();
+    // Keep the alias-routed schemas installed for the Worker lifetime. The
+    // attachment set may be empty or mutate after registration, so target
+    // resolution and provider capability checks happen per invocation.
+    let tracker = tools::Tracker::new();
+    let workdir_tools = if restrict_workdir_tools_to_current_capabilities {
+        tools::routed_builtin_tools_for_current_capabilities(
+            workdir_sessions.clone(),
+            tracker.clone(),
+            bash_output_dir.clone(),
+        )
+    } else {
+        tools::routed_builtin_tools(
+            workdir_sessions.clone(),
+            tracker.clone(),
+            bash_output_dir.clone(),
+        )
+    };
+    worker.engine_mut().register_tools(workdir_tools);
+    if feature_config.image.enabled && model_supports_image_attachments(&spawner_manifest.model) {
         worker
             .engine_mut()
-            .register_tools(tools::core_builtin_tools(
-                workdir.clone(),
-                tracker.clone(),
-                bash_output_dir.clone(),
-            ));
-        if feature_config.image.enabled && model_supports_image_attachments(&spawner_manifest.model)
-        {
-            worker
-                .engine_mut()
-                .register_tool(tools::view_image_tool(workdir.clone()));
-        }
-        (Some(workdir), Some(tracker))
-    } else {
-        (None, None)
-    };
+            .register_tool(tools::routed_view_image_tool(workdir_sessions));
+    }
     if feature_config.web.enabled {
         worker
             .engine_mut()
@@ -1344,6 +1331,7 @@ where
         feature_registry.add_module(
             crate::feature::builtin::manage_workdir::ManageWorkdirFeature::with_child_lifecycle(
                 workspace_client,
+                worker.workdir_sessions(),
                 Arc::new(move || {
                     let child_registry = shutdown_registry.clone();
                     Box::pin(async move { child_registry.shutdown_internal().await })
@@ -1485,9 +1473,7 @@ where
     if let Some((resident_summary, system_prompt_override)) = memory_prompt_contribution {
         worker.install_system_prompt_contribution(resident_summary, system_prompt_override);
     }
-    if let Some(tracker) = tracker {
-        worker.attach_tracker(tracker);
-    }
+    worker.attach_tracker(tracker);
     Ok(workdir_for_view)
 }
 
@@ -2610,14 +2596,13 @@ async fn controller_loop<C, St>(
         }
     }
 
-    if let Some(session) = worker.workdir_session() {
-        loop {
-            match session.close().await {
-                Ok(()) => break,
-                Err(error) => {
-                    tracing::warn!(%error, "Workdir session close failed; retrying");
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
+    let sessions = worker.workdir_sessions();
+    while !sessions.is_empty() {
+        match sessions.close_all().await {
+            Ok(()) => break,
+            Err(error) => {
+                tracing::warn!(%error, "Workdir session set close failed; retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
     }

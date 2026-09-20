@@ -14,8 +14,12 @@ use agen::tool::{
 use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 use serde_json::json;
 use tempfile::TempDir;
-use tools::{Tracker, core_builtin_tools, view_image_tool};
-use workdir::{LocalWorkdirSession, WorkdirSessionHandle};
+use tools::{
+    Tracker, core_builtin_tools, routed_builtin_tools, routed_view_image_tool, view_image_tool,
+};
+use workdir::{
+    LocalWorkdirSession, WorkdirAttachmentAlias, WorkdirSessionHandle, WorkdirSessionRouter,
+};
 
 fn scope_with_spill(workspace: &Path, spill: &Path) -> Scope {
     let base = Scope::writable(workspace).unwrap();
@@ -66,6 +70,30 @@ fn setup() -> (TempDir, TempDir, Registry) {
     (dir, spill, reg)
 }
 
+fn setup_routed() -> (
+    TempDir,
+    TempDir,
+    TempDir,
+    Arc<WorkdirSessionRouter>,
+    Registry,
+) {
+    let left = TempDir::new().unwrap();
+    let right = TempDir::new().unwrap();
+    let spill = TempDir::new().unwrap();
+    let router = Arc::new(WorkdirSessionRouter::new());
+    for (alias, dir) in [("left", &left), ("right", &right)] {
+        let scope = scope_with_spill(dir.path(), spill.path());
+        let session: WorkdirSessionHandle =
+            Arc::new(LocalWorkdirSession::new(scope, dir.path().to_path_buf()));
+        router
+            .attach(WorkdirAttachmentAlias::new(alias).unwrap(), session)
+            .unwrap();
+    }
+    let definitions =
+        routed_builtin_tools(router.clone(), Tracker::new(), spill.path().to_path_buf());
+    (left, right, spill, router, Registry::new(definitions))
+}
+
 async fn call(tool: &Arc<dyn Tool>, input: serde_json::Value) -> agen::tool::ToolOutput {
     tool.execute(&input.to_string(), Default::default())
         .await
@@ -102,6 +130,273 @@ fn meta_has_description_and_schema() {
             meta.name
         );
     }
+}
+
+#[test]
+fn routed_tool_schemas_share_optional_target_workdir() {
+    let (_left, _right, _spill, router, mut reg) = setup_routed();
+    reg.entries.push(routed_view_image_tool(router)());
+    for (meta, _) in &reg.entries {
+        let target = &meta.input_schema["properties"]["target_workdir"];
+        assert!(target.is_object(), "{} lacks target_workdir", meta.name);
+        assert_eq!(target["type"], json!(["string", "null"]));
+    }
+}
+
+#[tokio::test]
+async fn routed_tools_require_alias_only_when_attachment_set_is_ambiguous() {
+    let (_left, _right, _spill, router, reg) = setup_routed();
+    let error = call_err(&reg.get("Read"), json!({ "file_path": "same.txt" })).await;
+    let message = error.to_string();
+    assert!(message.contains("target_workdir_required"), "{message}");
+    assert!(message.contains("left"), "{message}");
+    assert!(message.contains("right"), "{message}");
+
+    let unknown = call_err(
+        &reg.get("Glob"),
+        json!({ "target_workdir": "missing", "pattern": "*" }),
+    )
+    .await
+    .to_string();
+    assert!(unknown.contains("unknown_target_workdir"), "{unknown}");
+    assert!(unknown.contains("available_aliases"), "{unknown}");
+
+    router.close_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn empty_routed_surface_returns_no_attachment_error() {
+    let router = Arc::new(WorkdirSessionRouter::new());
+    let reg = Registry::new(routed_builtin_tools(
+        router,
+        Tracker::new(),
+        Path::new("unused").to_path_buf(),
+    ));
+    let message = call_err(&reg.get("Read"), json!({ "file_path": "file.txt" }))
+        .await
+        .to_string();
+    assert!(message.contains("no_workdir_attached"), "{message}");
+}
+
+#[tokio::test]
+async fn target_alias_routes_each_tool_and_isolates_read_before_edit() {
+    let (left, right, _spill, router, mut reg) = setup_routed();
+    std::fs::write(left.path().join("same.txt"), "left value\n").unwrap();
+    std::fs::write(right.path().join("same.txt"), "right value\n").unwrap();
+    std::fs::write(left.path().join("only-left.log"), "LEFT-NEEDLE\n").unwrap();
+    std::fs::write(right.path().join("only-right.log"), "RIGHT-NEEDLE\n").unwrap();
+
+    let read = reg.get("Read");
+    let left_read = call(
+        &read,
+        json!({ "target_workdir": "left", "file_path": "same.txt" }),
+    )
+    .await;
+    assert!(left_read.content.unwrap().contains("left value"));
+
+    let edit = reg.get("Edit");
+    let isolated = call_err(
+        &edit,
+        json!({
+            "target_workdir": "right",
+            "file_path": "same.txt",
+            "old_string": "right",
+            "new_string": "edited"
+        }),
+    )
+    .await;
+    assert!(isolated.to_string().contains("has not been read"));
+    call(
+        &read,
+        json!({ "target_workdir": "right", "file_path": "same.txt" }),
+    )
+    .await;
+    call(
+        &edit,
+        json!({
+            "target_workdir": "right",
+            "file_path": "same.txt",
+            "old_string": "right",
+            "new_string": "edited"
+        }),
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(right.path().join("same.txt")).unwrap(),
+        "edited value\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(left.path().join("same.txt")).unwrap(),
+        "left value\n"
+    );
+
+    let glob = call(
+        &reg.get("Glob"),
+        json!({ "target_workdir": "left", "pattern": "*.log" }),
+    )
+    .await;
+    assert!(glob.content.unwrap().contains("only-left.log"));
+    let grep = call(
+        &reg.get("Grep"),
+        json!({
+            "target_workdir": "right",
+            "pattern": "RIGHT-NEEDLE",
+            "output_mode": "content"
+        }),
+    )
+    .await;
+    assert!(grep.content.unwrap().contains("only-right.log"));
+
+    let bash = call(
+        &reg.get("Bash"),
+        json!({ "target_workdir": "right", "command": "pwd" }),
+    )
+    .await;
+    assert_eq!(
+        std::fs::canonicalize(bash.content.unwrap().trim()).unwrap(),
+        std::fs::canonicalize(right.path()).unwrap()
+    );
+
+    let png = b"\x89PNG\r\n\x1a\nrouted";
+    std::fs::write(left.path().join("image.png"), png).unwrap();
+    reg.entries.push(routed_view_image_tool(router.clone())());
+    let image = call(
+        &reg.get("ViewImage"),
+        json!({ "target_workdir": "left", "path": "image.png" }),
+    )
+    .await;
+    let agen::tool::Attachment::Image(image) = &image.attachments[0];
+    assert_eq!(image.data(), png);
+
+    router.close_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn selected_attachment_capability_is_checked_without_fallback() {
+    let left = TempDir::new().unwrap();
+    let right = TempDir::new().unwrap();
+    let spill = TempDir::new().unwrap();
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(
+            WorkdirAttachmentAlias::new("writable").unwrap(),
+            Arc::new(LocalWorkdirSession::new(
+                scope_with_spill(left.path(), spill.path()),
+                left.path().to_path_buf(),
+            )),
+        )
+        .unwrap();
+    router
+        .attach(
+            WorkdirAttachmentAlias::new("readonly").unwrap(),
+            Arc::new(LocalWorkdirSession::materialized_bound(
+                workdir::Workdir::new("readonly"),
+                right.path().to_path_buf(),
+                right.path().to_path_buf(),
+                manifest::SharedScope::new(scope_with_spill(right.path(), spill.path())),
+                workdir::WorkdirSessionCapabilities::READ_ONLY,
+            )),
+        )
+        .unwrap();
+    let reg = Registry::new(routed_builtin_tools(
+        router.clone(),
+        Tracker::new(),
+        spill.path().to_path_buf(),
+    ));
+
+    let message = call_err(
+        &reg.get("Write"),
+        json!({
+            "target_workdir": "readonly",
+            "file_path": "created.txt",
+            "content": "must not be routed elsewhere"
+        }),
+    )
+    .await
+    .to_string();
+    assert!(message.contains("does not support Write"), "{message}");
+    assert!(!left.path().join("created.txt").exists());
+    assert!(!right.path().join("created.txt").exists());
+
+    router.close_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn routed_tools_observe_detach_after_registration() {
+    let (_left, _right, _spill, router, reg) = setup_routed();
+    let alias = WorkdirAttachmentAlias::new("left").unwrap();
+    router.detach(&alias).await.unwrap();
+
+    let message = call_err(
+        &reg.get("Glob"),
+        json!({ "target_workdir": "left", "pattern": "*" }),
+    )
+    .await
+    .to_string();
+    assert!(message.contains("unknown_target_workdir"), "{message}");
+    assert!(message.contains("right"), "{message}");
+
+    router.close_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn detach_and_reattach_same_alias_requires_a_fresh_read() {
+    let first = TempDir::new().unwrap();
+    let second = TempDir::new().unwrap();
+    let spill = TempDir::new().unwrap();
+    std::fs::write(first.path().join("same.txt"), "same bytes\n").unwrap();
+    std::fs::write(second.path().join("same.txt"), "same bytes\n").unwrap();
+
+    let router = Arc::new(WorkdirSessionRouter::new());
+    let alias = WorkdirAttachmentAlias::new("checkout").unwrap();
+    router
+        .attach(
+            alias.clone(),
+            Arc::new(LocalWorkdirSession::new(
+                scope_with_spill(first.path(), spill.path()),
+                first.path().to_path_buf(),
+            )),
+        )
+        .unwrap();
+    let reg = Registry::new(routed_builtin_tools(
+        router.clone(),
+        Tracker::new(),
+        spill.path().to_path_buf(),
+    ));
+    call(
+        &reg.get("Read"),
+        json!({ "target_workdir": "checkout", "file_path": "same.txt" }),
+    )
+    .await;
+
+    router.detach(&alias).await.unwrap();
+    router
+        .attach(
+            alias.clone(),
+            Arc::new(LocalWorkdirSession::new(
+                scope_with_spill(second.path(), spill.path()),
+                second.path().to_path_buf(),
+            )),
+        )
+        .unwrap();
+
+    let error = call_err(
+        &reg.get("Edit"),
+        json!({
+            "target_workdir": "checkout",
+            "file_path": "same.txt",
+            "old_string": "same",
+            "new_string": "changed"
+        }),
+    )
+    .await;
+    assert!(error.to_string().contains("has not been read"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(second.path().join("same.txt")).unwrap(),
+        "same bytes\n"
+    );
+
+    router.close_all().await.unwrap();
 }
 
 #[tokio::test]

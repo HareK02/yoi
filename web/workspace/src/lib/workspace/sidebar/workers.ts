@@ -19,11 +19,15 @@ export function sidebarWorkerActivity(
   return 'none';
 }
 
-export function canShowWorkerInSidebar(worker: Worker): boolean {
+export function canShowWorkerInSidebar(
+  worker: Pick<Worker, 'implementation'>,
+): boolean {
   return worker.implementation.kind !== 'backend_worker_registry';
 }
 
-export function canOpenWorkerConsole(worker: Worker): boolean {
+export function canOpenWorkerConsole(
+  worker: Pick<Worker, 'implementation'>,
+): boolean {
   return canShowWorkerInSidebar(worker);
 }
 

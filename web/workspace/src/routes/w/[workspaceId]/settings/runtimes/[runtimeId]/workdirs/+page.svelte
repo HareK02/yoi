@@ -138,7 +138,10 @@
           {#each workdirs as workdir}
             {@const cleanup = cleanupCandidate(workdir)}
             <tr>
-              <td><code>{workdir.working_directory_id}</code></td>
+              <td>
+                <span>{workdir.display_name ?? '—'}</span>
+                <small><code>{workdir.working_directory_id}</code></small>
+              </td>
               <td>{workdir.repository_key}</td>
               <td><code>{currentRevision(workdir)}</code></td>
               <td>{workdir.status}</td>
