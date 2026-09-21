@@ -7,6 +7,7 @@ pkgs.mkShell {
     playwright-driver.browsers
     rustc
     cargo
+    rustfmt
     pkgs.sccache
   ];
 
