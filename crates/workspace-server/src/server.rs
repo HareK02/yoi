@@ -19569,13 +19569,54 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct WorkdirlessFixtureRuntime {
-        workers: Mutex<Vec<WorkerSummary>>,
+        workers: Arc<Mutex<Vec<WorkerSummary>>>,
+        spawn_requests: Arc<Mutex<Vec<WorkerSpawnRequest>>>,
+        reject_next_spawn: Arc<Mutex<bool>>,
+        workdir_repositories: Arc<Mutex<HashMap<String, String>>>,
     }
 
     impl WorkdirlessFixtureRuntime {
         const RUNTIME_ID: &'static str = "workdirless-runtime";
+
+        fn reject_next_spawn(&self) {
+            *self
+                .reject_next_spawn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        }
+
+        fn spawn_requests(&self) -> Vec<WorkerSpawnRequest> {
+            self.spawn_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn set_workdir_repository(&self, working_directory_id: &str, repository_id: &str) {
+            self.workdir_repositories
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(working_directory_id.to_string(), repository_id.to_string());
+        }
+
+        fn configured_workdir_status(
+            &self,
+            working_directory_id: &str,
+        ) -> worker_runtime::catalog::WorkingDirectoryStatus {
+            let mut status = Self::workdir_status(working_directory_id);
+            if let Some(repository_id) = self
+                .workdir_repositories
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(working_directory_id)
+                .cloned()
+            {
+                status.summary.repository_id = repository_id;
+            }
+            status
+        }
 
         fn workdir_status(
             working_directory_id: &str,
@@ -19708,7 +19749,7 @@ mod tests {
         ) -> crate::hosts::RuntimeWorkingDirectoryResult {
             crate::hosts::RuntimeWorkingDirectoryResult {
                 state: WorkerOperationState::Accepted,
-                working_directory: Some(Self::workdir_status(working_directory_id)),
+                working_directory: Some(self.configured_workdir_status(working_directory_id)),
                 diagnostics: Vec::new(),
             }
         }
@@ -19729,10 +19770,39 @@ mod tests {
             binding: WorkerCreateBinding,
             request: WorkerSpawnRequest,
         ) -> WorkerSpawnResult {
+            self.spawn_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request.clone());
+            if std::mem::take(
+                &mut *self
+                    .reject_next_spawn
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ) {
+                return WorkerSpawnResult {
+                    state: WorkerOperationState::Rejected,
+                    worker: None,
+                    acceptance_evidence: Vec::new(),
+                    diagnostics: vec![RuntimeDiagnostic {
+                        code: "fixture_runtime_rejected".to_string(),
+                        severity: DiagnosticSeverity::Error,
+                        message: "fixture rejected Worker create".to_string(),
+                    }],
+                };
+            }
             assert!(request.workdir_attachment_requests.is_empty());
             assert!(request.resolved_workdir_attachment_requests.is_empty());
-            assert!(request.resolved_workdir_attachments.is_empty());
-            let worker = Self::worker_summary(binding, &request);
+            let mut worker = Self::worker_summary(binding, &request);
+            worker.workdir_attachments = request
+                .resolved_workdir_attachments
+                .iter()
+                .map(|attachment| WorkingDirectoryAttachmentStatus {
+                    alias: attachment.alias.clone(),
+                    working_directory: self
+                        .configured_workdir_status(&attachment.working_directory_id),
+                })
+                .collect();
             self.workers
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -21828,6 +21898,330 @@ mod tests {
         .unwrap();
         assert_eq!(retried.disposition, "created");
         assert!(retried.online);
+    }
+
+    struct GuardedSpawnFixture {
+        _workspace: tempfile::TempDir,
+        api: WorkspaceApi,
+        runtime: WorkdirlessFixtureRuntime,
+        controller: RuntimeWorkerRef,
+        ticket_id: String,
+        workdir_id: String,
+    }
+
+    async fn guarded_spawn_fixture() -> GuardedSpawnFixture {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
+        let runtime = WorkdirlessFixtureRuntime::default();
+        let workdir_id = "guarded-existing-workdir".to_string();
+        let repository_id = test_repository_id(&api);
+        runtime.set_workdir_repository(&workdir_id, &repository_id);
+        api.runtime.register_or_replace(runtime.clone());
+        let now = now_registry_timestamp();
+        api.store
+            .upsert_workdir_registry(&WorkdirRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                workdir_id: workdir_id.clone(),
+                display_name: None,
+                runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.to_string(),
+                repository_id: repository_id.clone(),
+                creation_selector: Some("develop".to_string()),
+                creation_ref: None,
+                creation_tree: None,
+                current_selector: Some("develop".to_string()),
+                current_ref: None,
+                current_tree: None,
+                observed_at_epoch_seconds: None,
+                materialization_status: "present".to_string(),
+                cleanliness: "clean".to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .unwrap();
+        let Json(controller) = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                display_name: "Guarded spawn controller".to_string(),
+                profile: Some("builtin:orchestrator".to_string()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachments: Vec::new(),
+                control_operation_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let controller = RuntimeWorkerRef::new(controller.runtime_id, controller.worker_id);
+        let mut input = ticket::NewTicket::new("Guarded attachment spawn");
+        input.workflow_state = Some(TicketWorkflowState::Queued);
+        input.repository_id = Some(repository_id);
+        input.ref_selector = Some("develop".to_string());
+        let ticket_id = browser_ticket_backend(&api)
+            .unwrap()
+            .create(input)
+            .unwrap()
+            .id;
+        assign_test_orchestrator(&api, &ticket_id);
+        GuardedSpawnFixture {
+            _workspace: workspace,
+            api,
+            runtime,
+            controller,
+            ticket_id,
+            workdir_id,
+        }
+    }
+
+    fn guarded_spawn_payload(fixture: &GuardedSpawnFixture, operation_id: &str) -> Value {
+        json!({
+            "runtime_id": WorkdirlessFixtureRuntime::RUNTIME_ID,
+            "display_name": "Coder · guarded attachment",
+            "profile": "builtin:coder",
+            "ticket_assignment": {
+                "ticket_id": fixture.ticket_id,
+                "operation_id": operation_id,
+            },
+            "initial_submit": [
+                { "kind": "flow", "selector": "builtin:coder-review" },
+                { "kind": "text", "content": "Implement guarded attachment Ticket." },
+            ],
+            "workdir_attachments": [{
+                "alias": "workdir",
+                "working_directory_id": fixture.workdir_id,
+                "relative_cwd": "crates/yoi",
+            }],
+            "control_operation_id": operation_id,
+        })
+    }
+
+    async fn post_guarded_spawn(fixture: &GuardedSpawnFixture, body: Value) -> Response {
+        build_inner_router(fixture.api.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers"))
+                    .header("content-type", "application/json")
+                    .header("x-yoi-runtime-id", &fixture.controller.runtime_id)
+                    .header("x-yoi-worker-id", &fixture.controller.worker_id)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn guarded_spawn_artifact_counts(api: &WorkspaceApi, workdir_id: &str) -> (i64, i64, i64) {
+        api.config_store
+            .with_conn(|conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM worker_registry WHERE workspace_id = ?1 AND runtime_id = ?2",
+                        rusqlite::params![TEST_WORKSPACE_ID, WorkdirlessFixtureRuntime::RUNTIME_ID],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM worker_workdir_attachment_reservations WHERE workspace_id = ?1 AND workdir_id = ?2",
+                        rusqlite::params![TEST_WORKSPACE_ID, workdir_id],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM worker_create_reservations WHERE workspace_id = ?1 AND runtime_id = ?2 AND state = 'reserved'",
+                        rusqlite::params![TEST_WORKSPACE_ID, WorkdirlessFixtureRuntime::RUNTIME_ID],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .unwrap()
+    }
+
+    fn assert_guarded_spawn_rolled_back(fixture: &GuardedSpawnFixture) {
+        assert_eq!(
+            guarded_spawn_artifact_counts(&fixture.api, &fixture.workdir_id),
+            (0, 0, 0)
+        );
+        assert!(
+            fixture
+                .api
+                .store
+                .list_workdir_worker_links(TEST_WORKSPACE_ID, &fixture.workdir_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            fixture
+                .api
+                .store
+                .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixture
+                .runtime
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+        assert_eq!(
+            browser_ticket_backend(&fixture.api)
+                .unwrap()
+                .show(fixture.ticket_id.clone().into())
+                .unwrap()
+                .meta
+                .workflow_state,
+            TicketWorkflowState::Queued
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_spawn_http_boundary_preserves_canonical_initial_attachment() {
+        let fixture = guarded_spawn_fixture().await;
+        let payload = guarded_spawn_payload(&fixture, "guarded-success");
+        assert!(payload.get("working_directory").is_none());
+
+        let response = post_guarded_spawn(&fixture, payload).await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "unexpected guarded spawn response: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let body: BrowserCreateWorkerResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body.worker.workdir_attachments.len(), 1);
+        assert_eq!(body.worker.workdir_attachments[0].alias, "workdir");
+        assert_eq!(
+            body.worker.workdir_attachments[0]
+                .working_directory
+                .working_directory_id,
+            fixture.workdir_id
+        );
+        let requests = fixture.runtime.spawn_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].resolved_workdir_attachments.len(), 1);
+        let attachment = &requests[0].resolved_workdir_attachments[0];
+        assert_eq!(attachment.alias.as_str(), "workdir");
+        assert_eq!(attachment.working_directory_id, fixture.workdir_id);
+        assert_eq!(attachment.relative_cwd.as_deref(), Some("crates/yoi"));
+        assert!(
+            fixture
+                .api
+                .store
+                .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            fixture
+                .api
+                .store
+                .list_workdir_worker_links(TEST_WORKSPACE_ID, &fixture.workdir_id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_attachment_spawn_rolls_back_runtime_rejection() {
+        let fixture = guarded_spawn_fixture().await;
+        fixture.runtime.reject_next_spawn();
+
+        let response = post_guarded_spawn(
+            &fixture,
+            guarded_spawn_payload(&fixture, "guarded-runtime-rejection"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(fixture.runtime.spawn_requests().len(), 1);
+        assert_guarded_spawn_rolled_back(&fixture);
+    }
+
+    #[tokio::test]
+    async fn guarded_attachment_spawn_rolls_back_post_create_assignment_failure() {
+        let fixture = guarded_spawn_fixture().await;
+        rusqlite::Connection::open(&fixture.api.config.database_path)
+            .unwrap()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_guarded_coder_assignment
+                BEFORE INSERT ON ticket_current_worker_assignments
+                WHEN NEW.role = 'coder'
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected guarded Coder assignment failure');
+                END;
+                "#,
+            )
+            .unwrap();
+
+        let response = post_guarded_spawn(
+            &fixture,
+            guarded_spawn_payload(&fixture, "guarded-post-create-failure"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(fixture.runtime.spawn_requests().len(), 1);
+        assert_guarded_spawn_rolled_back(&fixture);
+    }
+
+    #[tokio::test]
+    async fn guarded_attachment_spawn_assignment_conflict_has_no_side_effects() {
+        let fixture = guarded_spawn_fixture().await;
+        fixture
+            .api
+            .store
+            .set_current_ticket_role_assignment(
+                &TicketRoleAssignmentRecord {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    ticket_id: fixture.ticket_id.clone(),
+                    assignment_id: "existing-coder-assignment".to_string(),
+                    role: TicketAssignmentRole::Coder,
+                    principal: TicketAssignmentPrincipal::Worker {
+                        runtime_id: fixture.controller.runtime_id.clone(),
+                        worker_id: fixture.controller.worker_id.clone(),
+                    },
+                    assigned_by: "test".to_string(),
+                    assigned_at: TEST_CREATED_AT.to_string(),
+                },
+                None,
+                "existing-coder-event",
+                "existing-coder-operation",
+                false,
+            )
+            .unwrap();
+
+        let response = post_guarded_spawn(
+            &fixture,
+            guarded_spawn_payload(&fixture, "guarded-assignment-conflict"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(fixture.runtime.spawn_requests().is_empty());
+        assert_eq!(
+            guarded_spawn_artifact_counts(&fixture.api, &fixture.workdir_id),
+            (0, 0, 0)
+        );
+        assert!(
+            fixture
+                .api
+                .store
+                .list_workdir_worker_links(TEST_WORKSPACE_ID, &fixture.workdir_id)
+                .unwrap()
+                .is_empty()
+        );
+        let current = fixture
+            .api
+            .store
+            .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.assignment_id, "existing-coder-assignment");
     }
 
     #[tokio::test]
