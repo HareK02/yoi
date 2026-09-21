@@ -5,10 +5,14 @@ use std::sync::Arc;
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use uuid::Uuid;
 
 use protocol::Segment;
+use server_api::{
+    BrowserWorkerWorkingDirectorySelection, CreateWorkspaceWorkerRequest,
+    CreateWorkspaceWorkerTicketAssignmentRequest,
+};
 
 use crate::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureModule,
@@ -27,6 +31,7 @@ const FEATURE_DESCRIPTION: &str =
 pub const WORKER_LIFECYCLE_SERVICE_ID: &str = "worker.lifecycle";
 pub const WORKER_CONTROL_SERVICE_ID: &str = "worker.control";
 const WORKER_LIFECYCLE_SERVICE_VERSION: &str = "1";
+const INITIAL_WORKDIR_ALIAS: &str = "workdir";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerControlSubject {
@@ -457,40 +462,49 @@ struct WorkspaceWorkerLifecycleService {
     workspace_id: String,
 }
 
+fn workspace_worker_create_request(
+    request: WorkerLifecycleSpawnRequest,
+) -> Result<CreateWorkspaceWorkerRequest, WorkspaceClientError> {
+    let ticket_assignment = match (request.ticket_id, request.operation_id) {
+        (Some(ticket_id), Some(operation_id)) => {
+            Some(CreateWorkspaceWorkerTicketAssignmentRequest {
+                ticket_id,
+                operation_id,
+            })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(WorkspaceClientError::Request(
+                "ticket_id and operation_id must be provided together".to_string(),
+            ));
+        }
+    };
+    let control_operation_id = ticket_assignment
+        .as_ref()
+        .map(|assignment| assignment.operation_id.clone())
+        .unwrap_or_else(|| format!("worker-spawn-{}", Uuid::now_v7()));
+    Ok(CreateWorkspaceWorkerRequest {
+        runtime_id: request.runtime_id,
+        display_name: request.display_name,
+        profile: Some(request.profile),
+        ticket_assignment,
+        initial_submit: request.initial_submit,
+        workdir_attachments: vec![BrowserWorkerWorkingDirectorySelection {
+            alias: INITIAL_WORKDIR_ALIAS.to_string(),
+            working_directory_id: request.working_directory_id,
+            relative_cwd: request.relative_cwd,
+        }],
+        control_operation_id: Some(control_operation_id),
+    })
+}
+
 #[async_trait]
 impl WorkerLifecycleService for WorkspaceWorkerLifecycleService {
     async fn spawn(
         &self,
         request: WorkerLifecycleSpawnRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
-        let ticket_assignment = match (request.ticket_id, request.operation_id) {
-            (Some(ticket_id), Some(operation_id)) => Some(WorkerSpawnTicketAssignmentRequest {
-                ticket_id,
-                operation_id,
-            }),
-            (None, None) => None,
-            _ => {
-                return Err(WorkspaceClientError::Request(
-                    "ticket_id and operation_id must be provided together".to_string(),
-                ));
-            }
-        };
-        let control_operation_id = ticket_assignment
-            .as_ref()
-            .map(|assignment| assignment.operation_id.clone())
-            .unwrap_or_else(|| format!("worker-spawn-{}", Uuid::now_v7()));
-        let body = WorkerSpawnRequest {
-            runtime_id: request.runtime_id,
-            display_name: request.display_name,
-            profile: request.profile,
-            control_operation_id,
-            ticket_assignment,
-            initial_submit: request.initial_submit,
-            working_directory: WorkerWorkingDirectorySelection {
-                working_directory_id: request.working_directory_id,
-                relative_cwd: request.relative_cwd,
-            },
-        };
+        let body = workspace_worker_create_request(request)?;
         self.client.execute(WorkspaceRequest::json(
             WorkspaceRequestMethod::Post,
             format!("/api/w/{}/worker-control/workers", self.workspace_id),
@@ -691,31 +705,6 @@ struct WorkerSpawnInput {
     #[serde(default)]
     initial_submit: Vec<Segment>,
     #[serde(default)]
-    relative_cwd: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct WorkerSpawnTicketAssignmentRequest {
-    ticket_id: String,
-    operation_id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct WorkerSpawnRequest {
-    runtime_id: String,
-    display_name: String,
-    profile: String,
-    control_operation_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ticket_assignment: Option<WorkerSpawnTicketAssignmentRequest>,
-    initial_submit: Vec<Segment>,
-    working_directory: WorkerWorkingDirectorySelection,
-}
-
-#[derive(Debug, Serialize)]
-struct WorkerWorkingDirectorySelection {
-    working_directory_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     relative_cwd: Option<String>,
 }
 
@@ -1445,7 +1434,23 @@ mod tests {
                 "operation_id": "worker-spawn:00001KZ9E0DBS:call-1"
             })
         );
+        assert_eq!(body["workdir_attachments"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["workdir_attachments"][0]["alias"],
+            INITIAL_WORKDIR_ALIAS
+        );
+        assert_eq!(
+            body["workdir_attachments"][0]["working_directory_id"],
+            "workdir-1"
+        );
+        assert_eq!(
+            body["workdir_attachments"][0]["relative_cwd"],
+            serde_json::Value::Null
+        );
+        assert!(body.get("working_directory").is_none());
         assert!(body.get("initial_text").is_none());
+        serde_json::from_value::<CreateWorkspaceWorkerRequest>(body)
+            .expect("guarded spawn body must satisfy the strict Workspace create DTO");
     }
 
     #[tokio::test]
@@ -1714,30 +1719,38 @@ mod tests {
     }
 
     #[test]
-    fn worker_spawn_request_uses_authority_ids_without_runtime_paths() {
-        let request = WorkerSpawnRequest {
+    fn worker_spawn_request_uses_canonical_initial_attachment_contract() {
+        let request = workspace_worker_create_request(WorkerLifecycleSpawnRequest {
             runtime_id: "runtime-1".to_string(),
-            display_name: "Coder".to_string(),
+            working_directory_id: "wd-1".to_string(),
+            relative_cwd: Some("repo".to_string()),
             profile: "builtin:coder".to_string(),
-            control_operation_id: "spawn-operation-1".to_string(),
-            ticket_assignment: None,
+            ticket_id: None,
+            operation_id: None,
+            display_name: "Coder".to_string(),
             initial_submit: vec![
                 Segment::Flow {
                     selector: "builtin:coder-review".to_string(),
                 },
                 Segment::text("Implement the Ticket"),
             ],
-            working_directory: WorkerWorkingDirectorySelection {
-                working_directory_id: "wd-1".to_string(),
-                relative_cwd: Some("repo".to_string()),
-            },
-        };
+        })
+        .unwrap();
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["runtime_id"], "runtime-1");
-        assert_eq!(value["working_directory"]["working_directory_id"], "wd-1");
+        assert_eq!(value["workdir_attachments"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            value["workdir_attachments"][0]["alias"],
+            INITIAL_WORKDIR_ALIAS
+        );
+        assert_eq!(
+            value["workdir_attachments"][0]["working_directory_id"],
+            "wd-1"
+        );
+        assert_eq!(value["workdir_attachments"][0]["relative_cwd"], "repo");
+        assert!(value.get("working_directory").is_none());
         assert!(value.get("cwd").is_none());
         assert!(value.get("runtime_url").is_none());
-        assert!(value["working_directory"].get("mode").is_none());
         assert_eq!(value["initial_submit"][0]["kind"], "flow");
         assert_eq!(
             value["initial_submit"][0]["selector"],
