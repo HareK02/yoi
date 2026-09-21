@@ -21,7 +21,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 63;
+const LATEST_SCHEMA_VERSION: i64 = 64;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -43,6 +43,7 @@ const WORKER_REGISTRY_PROJECTION_MIGRATION_NAME: &str =
     "durable Runtime-backed Worker registry projection";
 const MULTI_WORKDIR_ATTACHMENTS_MIGRATION_NAME: &str =
     "multiple Worker Workdir attachments and Workdir display names";
+const EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME: &str = "typed client-hosted External Workdir grants";
 const WORKER_REGISTRY_PROJECTION_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS worker_registry_observations (
     workspace_id TEXT NOT NULL,
@@ -152,6 +153,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 63,
         name: MULTI_WORKDIR_ATTACHMENTS_MIGRATION_NAME,
         apply: migrate_multi_workdir_attachments_v62_to_v63,
+    },
+    Migration {
+        version: 64,
+        name: EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME,
+        apply: migrate_external_workdir_grants_v63_to_v64,
     },
 ];
 
@@ -785,12 +791,46 @@ pub struct WorkdirCreateOperationRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkdirRegistrySource {
+    Repository {
+        runtime_id: String,
+        repository_id: String,
+    },
+    ExternalGrant {
+        grant_id: String,
+    },
+}
+
+impl WorkdirRegistrySource {
+    pub fn runtime_id(&self) -> Option<&str> {
+        match self {
+            Self::Repository { runtime_id, .. } => Some(runtime_id),
+            Self::ExternalGrant { .. } => None,
+        }
+    }
+
+    pub fn repository_id(&self) -> Option<&str> {
+        match self {
+            Self::Repository { repository_id, .. } => Some(repository_id),
+            Self::ExternalGrant { .. } => None,
+        }
+    }
+
+    pub fn external_grant_id(&self) -> Option<&str> {
+        match self {
+            Self::Repository { .. } => None,
+            Self::ExternalGrant { grant_id } => Some(grant_id),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkdirRegistryRecord {
     pub workspace_id: String,
     pub workdir_id: String,
     pub display_name: Option<String>,
-    pub runtime_id: String,
-    pub repository_id: String,
+    pub source: WorkdirRegistrySource,
     pub creation_selector: Option<String>,
     pub creation_ref: Option<String>,
     pub creation_tree: Option<String>,
@@ -801,6 +841,22 @@ pub struct WorkdirRegistryRecord {
     pub materialization_status: String,
     pub cleanliness: String,
     pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalWorkdirGrantRecord {
+    pub grant_id: String,
+    pub workspace_id: String,
+    pub workdir_id: String,
+    pub provider_instance_id: String,
+    pub display_name: String,
+    pub permissions: String,
+    pub created_by: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub generation: u64,
+    pub status: String,
     pub updated_at: String,
 }
 
@@ -1577,6 +1633,52 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         limit: usize,
     ) -> Result<Vec<WorkdirRegistryRecord>>;
     fn delete_workdir_registry(&self, workspace_id: &str, workdir_id: &str) -> Result<bool>;
+
+    fn create_external_workdir_grant(
+        &self,
+        grant: &ExternalWorkdirGrantRecord,
+        workdir: &WorkdirRegistryRecord,
+    ) -> Result<()>;
+    fn get_external_workdir_grant(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<ExternalWorkdirGrantRecord>>;
+    fn activate_external_workdir_grant(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+        provider_instance_id: &str,
+        generation: u64,
+        updated_at: &str,
+    ) -> Result<bool>;
+    fn update_external_workdir_grant_state(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+        provider_instance_id: &str,
+        generation: u64,
+        status: &str,
+        updated_at: &str,
+    ) -> Result<bool>;
+    fn reconcile_external_workdir_grants_after_restart(
+        &self,
+        workspace_id: &str,
+        now: &str,
+    ) -> Result<Vec<String>>;
+    #[allow(clippy::too_many_arguments)]
+    fn record_external_workdir_audit(
+        &self,
+        workspace_id: &str,
+        actor_kind: &str,
+        actor_key: &str,
+        action: &str,
+        grant_id: &str,
+        operation_id: Option<&str>,
+        outcome: &str,
+        summary: &str,
+        created_at: &str,
+    ) -> Result<()>;
 
     fn reserve_worker_workdir_attachment(
         &self,
@@ -7334,15 +7436,17 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| {
             conn.execute(
                 r#"INSERT INTO workdir_registry (
-                    workspace_id, workdir_id, display_name, runtime_id, repository_id,
-                    creation_selector, creation_ref, creation_tree,
+                    workspace_id, workdir_id, display_name, source_kind, runtime_id, repository_id,
+                    external_grant_id, creation_selector, creation_ref, creation_tree,
                     current_selector, current_ref, current_tree, observed_at_epoch_seconds,
                     materialization_status, cleanliness, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
                 ON CONFLICT(workspace_id, workdir_id) DO UPDATE SET
                     display_name = excluded.display_name,
+                    source_kind = excluded.source_kind,
                     runtime_id = excluded.runtime_id,
                     repository_id = excluded.repository_id,
+                    external_grant_id = excluded.external_grant_id,
                     creation_selector = excluded.creation_selector,
                     creation_ref = excluded.creation_ref,
                     creation_tree = excluded.creation_tree,
@@ -7357,8 +7461,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.workspace_id,
                     record.workdir_id,
                     record.display_name,
-                    record.runtime_id,
-                    record.repository_id,
+                    match &record.source { WorkdirRegistrySource::Repository { .. } => "repository", WorkdirRegistrySource::ExternalGrant { .. } => "external_grant" },
+                    record.source.runtime_id(),
+                    record.source.repository_id(),
+                    record.source.external_grant_id(),
                     record.creation_selector,
                     record.creation_ref,
                     record.creation_tree,
@@ -7439,6 +7545,282 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             tx.commit()?;
             Ok(changed > 0)
+        })
+    }
+
+    fn create_external_workdir_grant(
+        &self,
+        grant: &ExternalWorkdirGrantRecord,
+        workdir: &WorkdirRegistryRecord,
+    ) -> Result<()> {
+        if workdir.workspace_id != grant.workspace_id
+            || workdir.workdir_id != grant.workdir_id
+            || workdir.source.external_grant_id() != Some(grant.grant_id.as_str())
+        {
+            return Err(Error::Store(
+                "External Workdir grant and registry identity do not match".to_string(),
+            ));
+        }
+        self.with_conn(|conn| {
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            tx.execute(
+                r#"INSERT INTO external_workdir_grants (
+                    grant_id, workspace_id, workdir_id, provider_instance_id, display_name,
+                    permissions, created_by, created_at, expires_at, generation, status, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+                params![
+                    grant.grant_id,
+                    grant.workspace_id,
+                    grant.workdir_id,
+                    grant.provider_instance_id,
+                    grant.display_name,
+                    grant.permissions,
+                    grant.created_by,
+                    grant.created_at,
+                    grant.expires_at,
+                    grant.generation as i64,
+                    grant.status,
+                    grant.updated_at,
+                ],
+            )?;
+            tx.execute(
+                r#"INSERT INTO workdir_registry (
+                    workspace_id, workdir_id, display_name, source_kind, runtime_id, repository_id,
+                    external_grant_id, creation_selector, creation_ref, creation_tree,
+                    current_selector, current_ref, current_tree, observed_at_epoch_seconds,
+                    materialization_status, cleanliness, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, 'external_grant', NULL, NULL, ?4, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?5, 'unknown', ?6, ?7)"#,
+                params![
+                    workdir.workspace_id,
+                    workdir.workdir_id,
+                    workdir.display_name,
+                    grant.grant_id,
+                    workdir.materialization_status,
+                    workdir.created_at,
+                    workdir.updated_at,
+                ],
+            )?;
+            tx.execute(
+                r#"INSERT INTO audit_events (
+                    workspace_id, audit_event_id, created_at, actor_kind, actor_key,
+                    actor_display, actor_source_kind, actor_source_key, action,
+                    target_kind, target_id, outcome, request_id, summary
+                ) VALUES (?1, ?2, ?3, 'account', ?4, ?4, NULL, NULL,
+                          'external_workdir_grant_created', 'external_workdir_grant',
+                          ?5, 'completed', NULL, ?6)"#,
+                params![
+                    grant.workspace_id,
+                    format!("audit-{}", Uuid::now_v7()),
+                    grant.created_at,
+                    grant.created_by,
+                    grant.grant_id,
+                    format!(
+                        "workdir_id={} permission={} generation={}",
+                        grant.workdir_id, grant.permissions, grant.generation
+                    ),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    fn get_external_workdir_grant(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<ExternalWorkdirGrantRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT grant_id, workspace_id, workdir_id, provider_instance_id, display_name,
+                          permissions, created_by, created_at, expires_at, generation, status, updated_at
+                   FROM external_workdir_grants WHERE workspace_id = ?1 AND grant_id = ?2"#,
+                params![workspace_id, grant_id],
+                |row| {
+                    Ok(ExternalWorkdirGrantRecord {
+                        grant_id: row.get(0)?,
+                        workspace_id: row.get(1)?,
+                        workdir_id: row.get(2)?,
+                        provider_instance_id: row.get(3)?,
+                        display_name: row.get(4)?,
+                        permissions: row.get(5)?,
+                        created_by: row.get(6)?,
+                        created_at: row.get(7)?,
+                        expires_at: row.get(8)?,
+                        generation: row.get::<_, i64>(9)? as u64,
+                        status: row.get(10)?,
+                        updated_at: row.get(11)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn activate_external_workdir_grant(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+        provider_instance_id: &str,
+        generation: u64,
+        updated_at: &str,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                r#"UPDATE external_workdir_grants
+                   SET generation = ?4, status = 'online', updated_at = ?5
+                   WHERE workspace_id = ?1 AND grant_id = ?2 AND provider_instance_id = ?3
+                     AND ((status = 'pending' AND generation = ?4)
+                       OR (status = 'offline' AND generation + 1 = ?4))
+                     AND expires_at > ?5"#,
+                params![
+                    workspace_id,
+                    grant_id,
+                    provider_instance_id,
+                    generation as i64,
+                    updated_at,
+                ],
+            )?;
+            if changed > 0 {
+                conn.execute(
+                    "UPDATE workdir_registry SET materialization_status = 'present', updated_at = ?3 WHERE workspace_id = ?1 AND external_grant_id = ?2",
+                    params![workspace_id, grant_id, updated_at],
+                )?;
+            }
+            Ok(changed > 0)
+        })
+    }
+
+    fn update_external_workdir_grant_state(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+        provider_instance_id: &str,
+        generation: u64,
+        status: &str,
+        updated_at: &str,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                r#"UPDATE external_workdir_grants SET status = ?5, updated_at = ?6
+                   WHERE workspace_id = ?1 AND grant_id = ?2 AND provider_instance_id = ?3
+                     AND generation = ?4 AND status NOT IN ('revoked', 'expired')"#,
+                params![
+                    workspace_id,
+                    grant_id,
+                    provider_instance_id,
+                    generation as i64,
+                    status,
+                    updated_at,
+                ],
+            )?;
+            if changed > 0 {
+                conn.execute(
+                    "UPDATE workdir_registry SET materialization_status = ?3, updated_at = ?4 WHERE workspace_id = ?1 AND external_grant_id = ?2",
+                    params![
+                        workspace_id,
+                        grant_id,
+                        if status == "online" { "present" } else { "unknown" },
+                        updated_at,
+                    ],
+                )?;
+            }
+            Ok(changed > 0)
+        })
+    }
+
+    fn reconcile_external_workdir_grants_after_restart(
+        &self,
+        workspace_id: &str,
+        now: &str,
+    ) -> Result<Vec<String>> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "UPDATE external_workdir_grants SET status = 'expired', updated_at = ?2
+                 WHERE workspace_id = ?1 AND status IN ('pending', 'online', 'offline')
+                   AND expires_at <= ?2",
+                params![workspace_id, now],
+            )?;
+            tx.execute(
+                "UPDATE external_workdir_grants SET status = 'offline', updated_at = ?2
+                 WHERE workspace_id = ?1 AND status = 'online' AND expires_at > ?2",
+                params![workspace_id, now],
+            )?;
+            tx.execute(
+                "UPDATE workdir_registry SET materialization_status = 'unknown', updated_at = ?2
+                 WHERE workspace_id = ?1 AND source_kind = 'external_grant'
+                   AND external_grant_id IN (
+                       SELECT grant_id FROM external_workdir_grants
+                       WHERE workspace_id = ?1 AND status != 'online'
+                   )",
+                params![workspace_id, now],
+            )?;
+            let cleanup = {
+                let mut statement = tx.prepare(
+                    "SELECT DISTINCT grant.workdir_id
+                     FROM external_workdir_grants grant
+                     JOIN worker_workdir_links link
+                       ON link.workspace_id = grant.workspace_id
+                      AND link.workdir_id = grant.workdir_id
+                      AND link.unlinked_at IS NULL
+                     WHERE grant.workspace_id = ?1
+                       AND grant.status IN ('revoked', 'expired')
+                     ORDER BY grant.workdir_id",
+                )?;
+                statement
+                    .query_map(params![workspace_id], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            tx.commit()?;
+            Ok(cleanup)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_external_workdir_audit(
+        &self,
+        workspace_id: &str,
+        actor_kind: &str,
+        actor_key: &str,
+        action: &str,
+        grant_id: &str,
+        operation_id: Option<&str>,
+        outcome: &str,
+        summary: &str,
+        created_at: &str,
+    ) -> Result<()> {
+        if summary.len() > 500 || summary.chars().any(char::is_control) {
+            return Err(Error::InvalidInput(
+                "External Workdir audit summary is invalid".to_string(),
+            ));
+        }
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO audit_events (
+                    workspace_id, audit_event_id, created_at, actor_kind, actor_key,
+                    actor_display, actor_source_kind, actor_source_key, action,
+                    target_kind, target_id, outcome, request_id, summary
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL, NULL, ?6,
+                          'external_workdir_grant', ?7, ?8, ?9, ?10)"#,
+                params![
+                    workspace_id,
+                    format!("audit-{}", Uuid::now_v7()),
+                    created_at,
+                    actor_kind,
+                    actor_key,
+                    action,
+                    grant_id,
+                    outcome,
+                    operation_id,
+                    summary,
+                ],
+            )?;
+            Ok(())
         })
     }
 
@@ -9356,7 +9738,7 @@ fn require_expected_ticket_assignment(
 
 fn workdir_registry_select_sql(where_clause: &str) -> String {
     format!(
-        "SELECT workspace_id, workdir_id, display_name, runtime_id, repository_id, \
+        "SELECT workspace_id, workdir_id, display_name, source_kind, runtime_id, repository_id, external_grant_id, \
          creation_selector, creation_ref, creation_tree, \
          current_selector, current_ref, current_tree, observed_at_epoch_seconds, \
          materialization_status, cleanliness, created_at, updated_at \
@@ -9367,23 +9749,60 @@ fn workdir_registry_select_sql(where_clause: &str) -> String {
 fn read_workdir_registry_record(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<WorkdirRegistryRecord> {
+    let source_kind = row.get::<_, String>(3)?;
+    let runtime_id = row.get::<_, Option<String>>(4)?;
+    let repository_id = row.get::<_, Option<String>>(5)?;
+    let external_grant_id = row.get::<_, Option<String>>(6)?;
+    let source = match source_kind.as_str() {
+        "repository" => WorkdirRegistrySource::Repository {
+            runtime_id: runtime_id.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnType(
+                    4,
+                    "runtime_id".to_string(),
+                    rusqlite::types::Type::Null,
+                )
+            })?,
+            repository_id: repository_id.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnType(
+                    5,
+                    "repository_id".to_string(),
+                    rusqlite::types::Type::Null,
+                )
+            })?,
+        },
+        "external_grant" => WorkdirRegistrySource::ExternalGrant {
+            grant_id: external_grant_id.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnType(
+                    6,
+                    "external_grant_id".to_string(),
+                    rusqlite::types::Type::Null,
+                )
+            })?,
+        },
+        _ => {
+            return Err(rusqlite::Error::InvalidColumnType(
+                3,
+                "source_kind".to_string(),
+                rusqlite::types::Type::Text,
+            ));
+        }
+    };
     Ok(WorkdirRegistryRecord {
         workspace_id: row.get(0)?,
         workdir_id: row.get(1)?,
         display_name: row.get(2)?,
-        runtime_id: row.get(3)?,
-        repository_id: row.get(4)?,
-        creation_selector: row.get(5)?,
-        creation_ref: row.get(6)?,
-        creation_tree: row.get(7)?,
-        current_selector: row.get(8)?,
-        current_ref: row.get(9)?,
-        current_tree: row.get(10)?,
-        observed_at_epoch_seconds: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
-        materialization_status: row.get(12)?,
-        cleanliness: row.get(13)?,
-        created_at: row.get(14)?,
-        updated_at: row.get(15)?,
+        source,
+        creation_selector: row.get(7)?,
+        creation_ref: row.get(8)?,
+        creation_tree: row.get(9)?,
+        current_selector: row.get(10)?,
+        current_ref: row.get(11)?,
+        current_tree: row.get(12)?,
+        observed_at_epoch_seconds: row.get::<_, Option<i64>>(13)?.map(|value| value as u64),
+        materialization_status: row.get(14)?,
+        cleanliness: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
     })
 }
 
@@ -10651,6 +11070,162 @@ fn migrate_multi_workdir_attachments_v62_to_v63(conn: &Connection) -> Result<()>
     Ok(())
 }
 
+fn migrate_external_workdir_grants_v63_to_v64(conn: &Connection) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    // Migration-chain tests and repaired databases may carry the canonical v64
+    // shape while the durable history still stops at v63. In that case only
+    // advance the marker; rebuilding would discard External grant rows and
+    // collide with the already-created table.
+    if column_exists(&tx, "workdir_registry", "source_kind")?
+        && table_exists(&tx, "external_workdir_grants")?
+    {
+        tx.execute(
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+            params![64, EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME],
+        )?;
+        tx.commit()?;
+        return Ok(());
+    }
+    tx.execute_batch(
+        r#"
+        PRAGMA defer_foreign_keys = ON;
+        DROP TRIGGER IF EXISTS workdir_registry_insert_blocked_by_runtime_removal;
+        DROP TRIGGER IF EXISTS workdir_registry_update_blocked_by_runtime_removal;
+        CREATE TEMP TABLE worker_workdir_attachment_reservations_v64 AS
+            SELECT workspace_id, workdir_id, reservation_id, reserved_at
+            FROM worker_workdir_attachment_reservations;
+        CREATE TEMP TABLE worker_workdir_links_v64 AS
+            SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at
+            FROM worker_workdir_links;
+        DROP TABLE worker_workdir_attachment_reservations;
+        DROP TABLE worker_workdir_links;
+        CREATE TABLE external_workdir_grants (
+            grant_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            workdir_id TEXT NOT NULL,
+            provider_instance_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            permissions TEXT NOT NULL CHECK (permissions = 'read_only'),
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            generation INTEGER NOT NULL CHECK (generation > 0),
+            status TEXT NOT NULL CHECK (status IN ('pending', 'online', 'offline', 'revoked', 'expired')),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, grant_id),
+            UNIQUE (workspace_id, workdir_id),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+            FOREIGN KEY (workspace_id, workdir_id) REFERENCES workdir_registry_v64(workspace_id, workdir_id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+        );
+        CREATE TABLE workdir_registry_v64 (
+            workspace_id TEXT NOT NULL,
+            workdir_id TEXT NOT NULL,
+            display_name TEXT,
+            source_kind TEXT NOT NULL CHECK (source_kind IN ('repository', 'external_grant')),
+            runtime_id TEXT,
+            repository_id TEXT,
+            external_grant_id TEXT,
+            creation_selector TEXT,
+            creation_ref TEXT,
+            creation_tree TEXT,
+            current_selector TEXT,
+            current_ref TEXT,
+            current_tree TEXT,
+            observed_at_epoch_seconds INTEGER,
+            materialization_status TEXT NOT NULL CHECK (materialization_status IN ('pending', 'present', 'not_found', 'corrupted', 'unknown', 'failed')),
+            cleanliness TEXT NOT NULL CHECK (cleanliness IN ('clean', 'dirty', 'unknown')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, workdir_id),
+            CHECK (
+                (source_kind = 'repository' AND runtime_id IS NOT NULL AND repository_id IS NOT NULL AND external_grant_id IS NULL)
+                OR (source_kind = 'external_grant' AND runtime_id IS NULL AND repository_id IS NULL AND external_grant_id IS NOT NULL)
+            ),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+            FOREIGN KEY (workspace_id, repository_id) REFERENCES repositories(workspace_id, repository_id),
+            FOREIGN KEY (workspace_id, external_grant_id) REFERENCES external_workdir_grants(workspace_id, grant_id) DEFERRABLE INITIALLY DEFERRED
+        );
+        INSERT INTO workdir_registry_v64 (
+            workspace_id, workdir_id, display_name, source_kind, runtime_id, repository_id,
+            external_grant_id, creation_selector, creation_ref, creation_tree, current_selector,
+            current_ref, current_tree, observed_at_epoch_seconds, materialization_status,
+            cleanliness, created_at, updated_at
+        ) SELECT workspace_id, workdir_id, display_name, 'repository', runtime_id, repository_id,
+                 NULL, creation_selector, creation_ref, creation_tree, current_selector,
+                 current_ref, current_tree, observed_at_epoch_seconds, materialization_status,
+                 cleanliness, created_at, updated_at
+          FROM workdir_registry;
+        DROP TABLE workdir_registry;
+        ALTER TABLE workdir_registry_v64 RENAME TO workdir_registry;
+        CREATE TABLE worker_workdir_attachment_reservations (
+            workspace_id TEXT NOT NULL,
+            workdir_id TEXT NOT NULL,
+            reservation_id TEXT NOT NULL,
+            reserved_at TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, workdir_id),
+            FOREIGN KEY (workspace_id, workdir_id)
+                REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
+        );
+        INSERT INTO worker_workdir_attachment_reservations
+            (workspace_id, workdir_id, reservation_id, reserved_at)
+            SELECT workspace_id, workdir_id, reservation_id, reserved_at
+            FROM worker_workdir_attachment_reservations_v64;
+        CREATE TABLE worker_workdir_links (
+            workspace_id TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            workdir_id TEXT NOT NULL,
+            alias TEXT NOT NULL,
+            linked_at TEXT NOT NULL,
+            unlinked_at TEXT,
+            PRIMARY KEY (workspace_id, worker_id, workdir_id, alias),
+            FOREIGN KEY (workspace_id, worker_id)
+                REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE,
+            FOREIGN KEY (workspace_id, workdir_id)
+                REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
+        );
+        INSERT INTO worker_workdir_links
+            (workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at)
+            SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at
+            FROM worker_workdir_links_v64;
+        DROP TABLE worker_workdir_attachment_reservations_v64;
+        DROP TABLE worker_workdir_links_v64;
+        CREATE UNIQUE INDEX worker_workdir_links_active_workdir_unique
+            ON worker_workdir_links(workspace_id, workdir_id) WHERE unlinked_at IS NULL;
+        CREATE UNIQUE INDEX worker_workdir_links_active_alias_unique
+            ON worker_workdir_links(workspace_id, worker_id, alias) WHERE unlinked_at IS NULL;
+        CREATE INDEX worker_workdir_links_workdir
+            ON worker_workdir_links(workspace_id, workdir_id);
+        CREATE INDEX idx_workdir_registry_workspace_updated
+            ON workdir_registry(workspace_id, updated_at DESC);
+        CREATE INDEX idx_external_workdir_grants_status_expiry
+            ON external_workdir_grants(workspace_id, status, expires_at);
+        CREATE TRIGGER workdir_registry_insert_blocked_by_runtime_removal
+        BEFORE INSERT ON workdir_registry FOR EACH ROW
+        WHEN NEW.runtime_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM runtime_removal_operations operation
+            WHERE operation.runtime_id = NEW.runtime_id
+              AND operation.state IN ('pending', 'cleanup_pending')
+        )
+        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+        CREATE TRIGGER workdir_registry_update_blocked_by_runtime_removal
+        BEFORE UPDATE ON workdir_registry FOR EACH ROW
+        WHEN NEW.runtime_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM runtime_removal_operations operation
+            WHERE operation.runtime_id = NEW.runtime_id
+              AND operation.state IN ('pending', 'cleanup_pending')
+        )
+        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+        "#,
+    )?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![64, EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(include_str!("latest_schema.sql"))?;
     Ok(())
@@ -10716,7 +11291,7 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
                    AND assignment.assignment_id = current.assignment_id) LIMIT 100"
         };
     for (table, repository_nullable) in [
-        ("workdir_registry", false),
+        ("workdir_registry", true),
         ("artifacts", true),
         ("typed_tickets", true),
         ("merge_requests", false),
@@ -11285,6 +11860,325 @@ fn migrate_workdir_credential_candidate_snapshots_v58_to_v59(conn: &Connection) 
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn external_workdir_grant_persists_typed_source_and_fences_generations() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        store
+            .upsert_account(&AccountRecord {
+                account_id: "owner".to_string(),
+                kind: "user".to_string(),
+                handle: "owner".to_string(),
+                display_name: "Owner".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "workspace-a".to_string(),
+                owner_account_id: "owner".to_string(),
+                display_name: "Workspace A".to_string(),
+                state: "active".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        let grant = ExternalWorkdirGrantRecord {
+            grant_id: "grant-a".to_string(),
+            workspace_id: "workspace-a".to_string(),
+            workdir_id: "external-a".to_string(),
+            provider_instance_id: "provider-a".to_string(),
+            display_name: "Session logs".to_string(),
+            permissions: "read_only".to_string(),
+            created_by: "owner".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+            generation: 1,
+            status: "pending".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let workdir = WorkdirRegistryRecord {
+            workspace_id: "workspace-a".to_string(),
+            workdir_id: "external-a".to_string(),
+            display_name: Some("Session logs".to_string()),
+            source: WorkdirRegistrySource::ExternalGrant {
+                grant_id: "grant-a".to_string(),
+            },
+            creation_selector: None,
+            creation_ref: None,
+            creation_tree: None,
+            current_selector: None,
+            current_ref: None,
+            current_tree: None,
+            observed_at_epoch_seconds: None,
+            materialization_status: "pending".to_string(),
+            cleanliness: "unknown".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        store
+            .create_external_workdir_grant(&grant, &workdir)
+            .unwrap();
+        store
+            .record_external_workdir_audit(
+                "workspace-a",
+                "worker",
+                "runtime-a:worker-a",
+                "external_workdir_operation",
+                "grant-a",
+                Some("operation-a"),
+                "completed",
+                "workdir_id=external-a attachment_alias=sessions operation_kind=read generation=1",
+                "2026-01-01T00:00:01Z",
+            )
+            .unwrap();
+        let audit = store
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT action, actor_kind, actor_key, request_id, summary FROM audit_events WHERE workspace_id = ?1 ORDER BY created_at, action",
+                )?;
+                Ok(statement
+                    .query_map(params!["workspace-a"], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .unwrap();
+        assert_eq!(audit.len(), 2);
+        assert!(
+            audit
+                .iter()
+                .any(|entry| entry.0 == "external_workdir_grant_created")
+        );
+        assert!(audit.iter().any(|entry| {
+            entry.0 == "external_workdir_operation"
+                && entry.1 == "worker"
+                && entry.2 == "runtime-a:worker-a"
+                && entry.3.as_deref() == Some("operation-a")
+                && !entry.4.contains("/home/")
+        }));
+
+        let persisted = store
+            .get_workdir_registry("workspace-a", "external-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.source, workdir.source);
+        assert_eq!(persisted.source.runtime_id(), None);
+        assert_eq!(persisted.source.repository_id(), None);
+        assert!(
+            store
+                .activate_external_workdir_grant(
+                    "workspace-a",
+                    "grant-a",
+                    "provider-a",
+                    1,
+                    "2026-01-01T00:00:01Z",
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .activate_external_workdir_grant(
+                    "workspace-a",
+                    "grant-a",
+                    "provider-a",
+                    1,
+                    "2026-01-01T00:00:02Z",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .reconcile_external_workdir_grants_after_restart(
+                    "workspace-a",
+                    "2026-01-01T00:00:03Z",
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !store
+                .activate_external_workdir_grant(
+                    "workspace-a",
+                    "grant-a",
+                    "provider-a",
+                    1,
+                    "2026-01-01T00:00:04Z",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .activate_external_workdir_grant(
+                    "workspace-a",
+                    "grant-a",
+                    "provider-a",
+                    2,
+                    "2026-01-01T00:00:05Z",
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .update_external_workdir_grant_state(
+                    "workspace-a",
+                    "grant-a",
+                    "provider-a",
+                    1,
+                    "offline",
+                    "2026-01-01T00:00:06Z",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .update_external_workdir_grant_state(
+                    "workspace-a",
+                    "grant-a",
+                    "provider-a",
+                    2,
+                    "revoked",
+                    "2026-01-01T00:00:07Z",
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .activate_external_workdir_grant(
+                    "workspace-a",
+                    "grant-a",
+                    "provider-a",
+                    3,
+                    "2026-01-01T00:00:08Z",
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn external_workdir_migration_preserves_existing_attachment_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE workspaces (workspace_id TEXT PRIMARY KEY);
+            CREATE TABLE repositories (
+                workspace_id TEXT NOT NULL,
+                repository_id TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, repository_id)
+            );
+            CREATE TABLE worker_registry (
+                workspace_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, worker_id)
+            );
+            CREATE TABLE runtime_removal_operations (
+                runtime_id TEXT NOT NULL,
+                state TEXT NOT NULL
+            );
+            CREATE TABLE workdir_registry (
+                workspace_id TEXT NOT NULL,
+                workdir_id TEXT NOT NULL,
+                display_name TEXT,
+                runtime_id TEXT NOT NULL,
+                repository_id TEXT NOT NULL,
+                creation_selector TEXT,
+                creation_ref TEXT,
+                creation_tree TEXT,
+                current_selector TEXT,
+                current_ref TEXT,
+                current_tree TEXT,
+                observed_at_epoch_seconds INTEGER,
+                materialization_status TEXT NOT NULL,
+                cleanliness TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, workdir_id)
+            );
+            CREATE TABLE worker_workdir_attachment_reservations (
+                workspace_id TEXT NOT NULL,
+                workdir_id TEXT NOT NULL,
+                reservation_id TEXT NOT NULL,
+                reserved_at TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, workdir_id),
+                FOREIGN KEY (workspace_id, workdir_id)
+                    REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
+            );
+            CREATE TABLE worker_workdir_links (
+                workspace_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                workdir_id TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                linked_at TEXT NOT NULL,
+                unlinked_at TEXT,
+                PRIMARY KEY (workspace_id, worker_id, workdir_id, alias),
+                FOREIGN KEY (workspace_id, worker_id)
+                    REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE,
+                FOREIGN KEY (workspace_id, workdir_id)
+                    REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
+            );
+            INSERT INTO workspaces VALUES ('workspace-a');
+            INSERT INTO repositories VALUES ('workspace-a', 'repository-a');
+            INSERT INTO worker_registry VALUES ('workspace-a', 'worker-a');
+            INSERT INTO workdir_registry VALUES (
+                'workspace-a', 'workdir-a', 'Checkout', 'runtime-a', 'repository-a',
+                'develop', 'abc', 'tree-a', 'develop', 'abc', 'tree-a', 1,
+                'present', 'clean', '1', '1'
+            );
+            INSERT INTO worker_workdir_attachment_reservations
+                VALUES ('workspace-a', 'workdir-a', 'reservation-a', '1');
+            INSERT INTO worker_workdir_links
+                VALUES ('workspace-a', 'runtime-a', 'worker-a', 'workdir-a', 'repo', '1', NULL);
+            INSERT INTO __yoi_schema_migrations(version, name)
+                VALUES (63, 'workspace schema baseline');
+            "#,
+        )
+        .unwrap();
+
+        migrate_external_workdir_grants_v63_to_v64(&conn).unwrap();
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM worker_workdir_attachment_reservations",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM worker_workdir_links", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT source_kind || ':' || runtime_id || ':' || repository_id FROM workdir_registry",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "repository:runtime-a:repository-a"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+    }
+
     fn runtime_removal_test_store() -> (tempfile::TempDir, SqliteWorkspaceStore) {
         let temp = tempfile::tempdir().unwrap();
         let store = SqliteWorkspaceStore::open(temp.path().join("server.db")).unwrap();
@@ -11383,10 +12277,10 @@ mod tests {
                          'local', '/repo', 1, 'source-a', 'unverified'\
                      ); \
                      INSERT INTO workdir_registry(\
-                         workspace_id, workdir_id, runtime_id, repository_id, materialization_status, \
+                         workspace_id, workdir_id, source_kind, runtime_id, repository_id, materialization_status, \
                          cleanliness, created_at, updated_at\
                      ) VALUES (\
-                         'workspace-a', 'workdir-a', 'runtime-a', 'repository-a', 'present', \
+                         'workspace-a', 'workdir-a', 'repository', 'runtime-a', 'repository-a', 'present', \
                          'clean', '1', '1'\
                      );",
                 )?;
@@ -12030,6 +12924,10 @@ mod tests {
                     version: 63,
                     name: MULTI_WORKDIR_ATTACHMENTS_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 64,
+                    name: EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -12082,6 +12980,7 @@ mod tests {
                         ),
                         (62, WORKER_REGISTRY_PROJECTION_MIGRATION_NAME.to_string()),
                         (63, MULTI_WORKDIR_ATTACHMENTS_MIGRATION_NAME.to_string()),
+                        (64, EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME.to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -12152,7 +13051,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
+            vec![52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
@@ -12160,7 +13059,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 14);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 15);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());
     }
@@ -14876,8 +15775,10 @@ INSERT INTO worker_registry (
             workspace_id: "local-dev".to_string(),
             workdir_id: "0000019a00000000001".to_string(),
             display_name: Some("Checkout".to_string()),
-            runtime_id: "embedded".to_string(),
-            repository_id: "repo".to_string(),
+            source: WorkdirRegistrySource::Repository {
+                runtime_id: "embedded".to_string(),
+                repository_id: "repo".to_string(),
+            },
             creation_selector: Some("develop".to_string()),
             creation_ref: Some("abcdef".to_string()),
             creation_tree: Some("tree-creation".to_string()),
@@ -14895,8 +15796,10 @@ INSERT INTO worker_registry (
             workspace_id: "local-dev".to_string(),
             workdir_id: "runtime-direct".to_string(),
             display_name: None,
-            runtime_id: "embedded".to_string(),
-            repository_id: "repo".to_string(),
+            source: WorkdirRegistrySource::Repository {
+                runtime_id: "embedded".to_string(),
+                repository_id: "repo".to_string(),
+            },
             creation_selector: Some("feature".to_string()),
             creation_ref: Some("123456".to_string()),
             creation_tree: None,

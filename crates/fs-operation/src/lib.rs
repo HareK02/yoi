@@ -14,14 +14,166 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub use glob::run_glob;
-pub use local::{resolve_access_path, run_edit, run_list, run_read, run_stat, run_write};
+pub use local::{
+    resolve_access_path, run_edit, run_list, run_read, run_read_bounded, run_stat, run_write,
+};
 pub use operation::*;
 pub use search::run_grep;
+
+/// Provider-side ceiling for directory/tree traversal, independent of result truncation.
+pub const MAX_TRAVERSAL_ENTRIES: usize = 100_000;
+/// Provider-side ceiling for aggregate retained result paths per operation.
+pub const MAX_RESULT_PATH_BYTES: usize = 1024 * 1024;
+/// Provider-side ceiling for aggregate grep source bytes per operation.
+pub const MAX_GREP_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Open `path` beneath `root` without following any symbolic link. Linux uses
+/// `openat2` so resolution and open are one kernel-enforced operation. Other
+/// platforms fail closed rather than silently weakening an External grant.
+#[cfg(target_os = "linux")]
+pub fn open_root_no_symlinks(root: &Path) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{FromRawFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let root = CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "root contains NUL"))?;
+    // SAFETY: `root` is a valid C string and the returned descriptor is checked
+    // before ownership is transferred to File.
+    let fd: RawFd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd is a new owned descriptor returned by open.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn open_root_no_symlinks(_root: &Path) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "root-confined no-symlink open is unavailable on this platform",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub fn open_beneath_no_symlinks_at(
+    root: &std::fs::File,
+    relative: &Path,
+) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    const RESOLVE_NO_XDEV: u64 = 0x01;
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    const RESOLVE_BENEATH: u64 = 0x08;
+
+    if relative.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path is outside provider root",
+        ));
+    }
+    let relative = if relative.as_os_str().is_empty() {
+        CString::new(".").expect("static path")
+    } else {
+        CString::new(relative.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL")
+        })?
+    };
+    let how = OpenHow {
+        flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK) as u64,
+        mode: 0,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV,
+    };
+    // SAFETY: `how` and the path remain alive for the syscall duration, and the
+    // borrowed root descriptor remains valid for the call.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            relative.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        ) as RawFd
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd is a new owned descriptor returned by openat2.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn open_beneath_no_symlinks_at(
+    _root: &std::fs::File,
+    _relative: &Path,
+) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "root-confined no-symlink open is unavailable on this platform",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub fn open_beneath_no_symlinks(root: &Path, path: &Path) -> std::io::Result<std::fs::File> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path is outside provider root",
+        )
+    })?;
+    let root = open_root_no_symlinks(root)?;
+    open_beneath_no_symlinks_at(&root, relative)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn open_beneath_no_symlinks(_root: &Path, _path: &Path) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "root-confined no-symlink open is unavailable on this platform",
+    ))
+}
 
 /// Provider-owned access policy used by local filesystem operations.
 pub trait FsAccessPolicy: Send + Sync {
     fn is_readable(&self, path: &Path) -> bool;
     fn is_writable(&self, path: &Path) -> bool;
+
+    /// Open an already-authorized readable file. Capability providers override
+    /// this to bind path resolution and open into one root-confined operation.
+    fn open_read_file(&self, _logical: &Path, resolved: &Path) -> std::io::Result<std::fs::File> {
+        std::fs::File::open(resolved)
+    }
+
+    /// Obtain metadata for an already-authorized path. Capability providers
+    /// override this to prevent a path swap between authorization and stat.
+    fn read_metadata(
+        &self,
+        logical: &Path,
+        _resolved: &Path,
+    ) -> std::io::Result<std::fs::Metadata> {
+        std::fs::symlink_metadata(logical)
+    }
+
+    /// Open an already-authorized directory for bounded enumeration.
+    /// Capability providers override this to bind traversal to a confined
+    /// directory descriptor rather than reopening a mutable path.
+    fn open_read_dir(&self, _logical: &Path, resolved: &Path) -> std::io::Result<std::fs::ReadDir> {
+        std::fs::read_dir(resolved)
+    }
 
     /// Authorize both the Workdir-visible path and its provider-resolved
     /// target. Implementations that do not distinguish symbolic-link identity
@@ -199,6 +351,165 @@ mod tests {
     #[test]
     fn deserialization_cannot_bypass_logical_path_validation() {
         assert!(serde_json::from_str::<FsPath>(r#""../secret""#).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn root_confined_open_rejects_a_symlink_swap_between_authorization_and_open() {
+        use std::os::unix::fs::symlink;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SwapAccess {
+            root: PathBuf,
+            selected: PathBuf,
+            outside: PathBuf,
+            swapped: AtomicBool,
+        }
+        impl FsAccessPolicy for SwapAccess {
+            fn is_readable(&self, path: &Path) -> bool {
+                path.starts_with(&self.root)
+            }
+            fn is_writable(&self, _path: &Path) -> bool {
+                false
+            }
+            fn is_readable_paths(&self, _logical: &Path, _resolved: &Path) -> bool {
+                if !self.swapped.swap(true, Ordering::SeqCst) {
+                    std::fs::remove_file(&self.selected).unwrap();
+                    symlink(&self.outside, &self.selected).unwrap();
+                }
+                true
+            }
+            fn open_read_file(
+                &self,
+                _logical: &Path,
+                resolved: &Path,
+            ) -> std::io::Result<std::fs::File> {
+                open_beneath_no_symlinks(&self.root, resolved)
+            }
+        }
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        let outside = outside_dir.path().join("secret.txt");
+        let selected = root.join("selected.txt");
+        std::fs::write(&selected, "safe").unwrap();
+        std::fs::write(&outside, "secret").unwrap();
+        let access = SwapAccess {
+            root: root.clone(),
+            selected,
+            outside,
+            swapped: AtomicBool::new(false),
+        };
+
+        let error = run_read_bounded(
+            &root,
+            ReadRequest {
+                path: FsPath::new("selected.txt").unwrap(),
+                offset: 0,
+                limit: 10,
+                max_bytes: 1024,
+            },
+            &access,
+            BoundedReadLimits::EXTERNAL_DEFAULT,
+        )
+        .expect_err("openat2 must reject the swapped symbolic link");
+        assert!(matches!(error, FsError::Io { .. }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn root_confined_stat_and_list_reject_swaps_after_authorization() {
+        use std::os::unix::fs::symlink;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SwapAccess {
+            root: PathBuf,
+            selected: PathBuf,
+            outside: PathBuf,
+            directory: bool,
+            swapped: AtomicBool,
+        }
+        impl FsAccessPolicy for SwapAccess {
+            fn is_readable(&self, path: &Path) -> bool {
+                path.starts_with(&self.root)
+            }
+            fn is_writable(&self, _path: &Path) -> bool {
+                false
+            }
+            fn is_readable_paths(&self, logical: &Path, _resolved: &Path) -> bool {
+                if logical == self.selected && !self.swapped.swap(true, Ordering::SeqCst) {
+                    if self.directory {
+                        std::fs::remove_dir(&self.selected).unwrap();
+                    } else {
+                        std::fs::remove_file(&self.selected).unwrap();
+                    }
+                    symlink(&self.outside, &self.selected).unwrap();
+                }
+                true
+            }
+            fn read_metadata(
+                &self,
+                _logical: &Path,
+                resolved: &Path,
+            ) -> std::io::Result<std::fs::Metadata> {
+                open_beneath_no_symlinks(&self.root, resolved)?.metadata()
+            }
+            fn open_read_dir(
+                &self,
+                _logical: &Path,
+                resolved: &Path,
+            ) -> std::io::Result<std::fs::ReadDir> {
+                use std::os::fd::AsRawFd;
+                let directory = open_beneath_no_symlinks(&self.root, resolved)?;
+                std::fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+            }
+        }
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        let selected_file = root.join("selected.txt");
+        let outside_file = outside_dir.path().join("secret.txt");
+        std::fs::write(&selected_file, "safe").unwrap();
+        std::fs::write(&outside_file, "secret").unwrap();
+        let stat_error = run_stat(
+            &root,
+            StatRequest {
+                path: FsPath::new("selected.txt").unwrap(),
+            },
+            &SwapAccess {
+                root: root.clone(),
+                selected: selected_file,
+                outside: outside_file,
+                directory: false,
+                swapped: AtomicBool::new(false),
+            },
+        )
+        .expect_err("confined stat must reject a swapped symlink");
+        assert!(matches!(stat_error, FsError::Io { .. }));
+
+        let selected_dir = root.join("selected-dir");
+        let outside_content = outside_dir.path().join("outside-dir");
+        std::fs::create_dir(&selected_dir).unwrap();
+        std::fs::create_dir(&outside_content).unwrap();
+        std::fs::write(outside_content.join("secret.txt"), "secret").unwrap();
+        let list_error = run_list(
+            &root,
+            ListRequest {
+                path: FsPath::new("selected-dir").unwrap(),
+                limit: 10,
+            },
+            &SwapAccess {
+                root: root.clone(),
+                selected: selected_dir,
+                outside: outside_content,
+                directory: true,
+                swapped: AtomicBool::new(false),
+            },
+        )
+        .expect_err("confined list must reject a swapped symlink");
+        assert!(matches!(list_error, FsError::Io { .. }));
     }
 
     #[test]

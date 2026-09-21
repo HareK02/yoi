@@ -817,10 +817,11 @@ fn restored_workdir_router(
         router
             .attach(
                 attachment.alias.clone(),
-                WorkspaceAttachedWorkdirSession::handle_for_workdir(
+                WorkspaceAttachedWorkdirSession::handle_for_workdir_with_capabilities(
                     workspace_client.clone(),
                     attachment.alias.as_str(),
                     &attachment.working_directory_id,
+                    attachment.capabilities,
                 ),
             )
             .map_err(|error| {
@@ -2971,6 +2972,7 @@ mod tests {
             &[LogicalWorkdirAttachment {
                 alias: alias.clone(),
                 working_directory_id: "remote-workdir".to_string(),
+                capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
             }],
             scope,
             client,
@@ -2979,6 +2981,10 @@ mod tests {
 
         let session = router.session(&alias).unwrap();
         assert_eq!(session.workdir().id().as_str(), "remote-workdir");
+        assert_eq!(
+            session.capabilities(),
+            workdir::WorkdirSessionCapabilities::READ_ONLY
+        );
     }
 
     #[test]

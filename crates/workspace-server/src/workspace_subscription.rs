@@ -455,7 +455,7 @@ fn project_working_directory(
             attachments.push(
                 protocol::subscription::SubscriptionWorkerWorkdirAttachment {
                     alias: link.alias,
-                    repository_id: Some(workdir.repository_id),
+                    repository_id: workdir.source.repository_id().map(str::to_string),
                     repository_key: None,
                     working_directory_id,
                 },

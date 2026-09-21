@@ -11,8 +11,8 @@ use crate::{
     CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
     EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
     ReadRequest, ReadResult, StatRequest, StatResult, WorkdirError, WorkdirId,
-    WorkdirScopeAuthorizationRequest, WorkdirScopeOverlapRequest, WorkdirSessionCapabilities,
-    WriteRequest, WriteResult,
+    WorkdirScopeAuthorizationRequest, WorkdirScopeOverlapRequest, WorkdirSession,
+    WorkdirSessionCapabilities, WriteRequest, WriteResult,
 };
 
 /// Opaque Runtime-owned identifier for one ephemeral Workdir session.
@@ -54,7 +54,12 @@ pub struct OpenWorkdirSessionResponse {
 
 /// One provider-side Workdir operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "operation", content = "request", rename_all = "snake_case")]
+#[serde(
+    tag = "operation",
+    content = "request",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum WorkdirSessionOperation {
     AuthorizeScope(WorkdirScopeAuthorizationRequest),
     ScopeRulesOverlap(WorkdirScopeOverlapRequest),
@@ -80,7 +85,12 @@ pub struct WorkdirSessionOperationRequest {
 
 /// Typed result paired with [`WorkdirSessionOperation`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "operation", content = "result", rename_all = "snake_case")]
+#[serde(
+    tag = "operation",
+    content = "result",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum WorkdirSessionOperationResult {
     AuthorizeScope,
     ScopeRulesOverlap { overlaps: bool },
@@ -95,6 +105,72 @@ pub enum WorkdirSessionOperationResult {
     CommandStatus(CommandStatus),
     CommandOutput(CommandOutput),
     CommandCancel,
+}
+
+/// Dispatch one typed operation against any provider-neutral Workdir session.
+///
+/// Runtime HTTP handlers, outbound External providers, and Backend brokers can
+/// share this operation/result pairing while keeping transport authorization,
+/// generation fencing, cancellation timeouts, and session lookup at their own
+/// boundaries.
+pub async fn dispatch_workdir_session_operation(
+    session: &dyn WorkdirSession,
+    operation: WorkdirSessionOperation,
+) -> Result<WorkdirSessionOperationResult, WorkdirError> {
+    match operation {
+        WorkdirSessionOperation::AuthorizeScope(request) => session
+            .authorize_scope_path(request)
+            .await
+            .map(|()| WorkdirSessionOperationResult::AuthorizeScope),
+        WorkdirSessionOperation::ScopeRulesOverlap(request) => session
+            .scope_rules_overlap(request)
+            .await
+            .map(|overlaps| WorkdirSessionOperationResult::ScopeRulesOverlap { overlaps }),
+        WorkdirSessionOperation::Stat(request) => session
+            .stat(request)
+            .await
+            .map(WorkdirSessionOperationResult::Stat),
+        WorkdirSessionOperation::Read(request) => session
+            .read(request)
+            .await
+            .map(WorkdirSessionOperationResult::Read),
+        WorkdirSessionOperation::Write(request) => session
+            .write(request)
+            .await
+            .map(WorkdirSessionOperationResult::Write),
+        WorkdirSessionOperation::Edit(request) => session
+            .edit(request)
+            .await
+            .map(WorkdirSessionOperationResult::Edit),
+        WorkdirSessionOperation::List(request) => session
+            .list(request)
+            .await
+            .map(WorkdirSessionOperationResult::List),
+        WorkdirSessionOperation::Glob(request) => session
+            .glob(request)
+            .await
+            .map(WorkdirSessionOperationResult::Glob),
+        WorkdirSessionOperation::Grep(request) => session
+            .grep(request)
+            .await
+            .map(WorkdirSessionOperationResult::Grep),
+        WorkdirSessionOperation::CommandStart(request) => session
+            .start_command(request)
+            .await
+            .map(WorkdirSessionOperationResult::CommandStart),
+        WorkdirSessionOperation::CommandStatus(handle) => session
+            .command_status(handle)
+            .await
+            .map(WorkdirSessionOperationResult::CommandStatus),
+        WorkdirSessionOperation::CommandOutput(request) => session
+            .command_output(request)
+            .await
+            .map(WorkdirSessionOperationResult::CommandOutput),
+        WorkdirSessionOperation::CommandCancel(handle) => session
+            .cancel_command(handle)
+            .await
+            .map(|()| WorkdirSessionOperationResult::CommandCancel),
+    }
 }
 
 /// Stable, host-path-free error code crossing the Runtime boundary.

@@ -215,6 +215,7 @@ pub struct WorkspaceAttachedWorkdirSession {
     client: Arc<dyn WorkspaceClient>,
     target_workdir: String,
     workdir: Workdir,
+    capabilities: WorkdirSessionCapabilities,
 }
 
 impl WorkspaceAttachedWorkdirSession {
@@ -230,10 +231,25 @@ impl WorkspaceAttachedWorkdirSession {
         target_workdir: impl Into<String>,
         workdir_id: impl Into<String>,
     ) -> WorkdirSessionHandle {
+        Self::handle_for_workdir_with_capabilities(
+            client,
+            target_workdir,
+            workdir_id,
+            WorkdirSessionCapabilities::ALL,
+        )
+    }
+
+    pub fn handle_for_workdir_with_capabilities(
+        client: Arc<dyn WorkspaceClient>,
+        target_workdir: impl Into<String>,
+        workdir_id: impl Into<String>,
+        capabilities: WorkdirSessionCapabilities,
+    ) -> WorkdirSessionHandle {
         Arc::new(Self {
             client,
             target_workdir: target_workdir.into(),
             workdir: Workdir::new(workdir_id),
+            capabilities,
         })
     }
 
@@ -304,7 +320,7 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
     }
 
     fn capabilities(&self) -> WorkdirSessionCapabilities {
-        WorkdirSessionCapabilities::ALL
+        self.capabilities
     }
 
     async fn authorize_scope_path(
@@ -522,10 +538,11 @@ impl WorkspaceHttpWorkdirBackend {
         let response = self.attach_response(alias, working_directory_id)?;
         if let Err(error) = self.session_router.attach(
             alias_key.clone(),
-            WorkspaceAttachedWorkdirSession::handle_for_workdir(
+            WorkspaceAttachedWorkdirSession::handle_for_workdir_with_capabilities(
                 self.client.clone(),
                 alias,
                 working_directory_id,
+                response.capabilities,
             ),
         ) {
             let _ = self.detach(alias);
@@ -924,6 +941,7 @@ struct WorkdirAttachmentResponse {
     workspace_id: String,
     alias: String,
     working_directory_id: String,
+    capabilities: WorkdirSessionCapabilities,
     attached: bool,
 }
 
@@ -1014,7 +1032,7 @@ mod tests {
     fn workdir_json(id: &str) -> serde_json::Value {
         json!({
             "working_directory_id": id,
-            "repository_key": "main",
+            "source": {"kind": "repository", "repository_key": "main"},
             "creation_selector": "refs/heads/main",
             "creation_ref": "0123456789abcdef",
             "materializer_kind": "runtime_git_clone",
@@ -1195,12 +1213,14 @@ mod tests {
                 "workspace_id": "workspace/test",
                 "alias": "checkout",
                 "working_directory_id": "wd-created",
+                "capabilities": {"bits": 63},
                 "attached": true
             })),
             response(json!({
                 "workspace_id": "workspace/test",
                 "alias": "checkout",
                 "working_directory_id": "wd-created",
+                "capabilities": {"bits": 63},
                 "attached": false
             })),
             response(json!({
@@ -1510,6 +1530,7 @@ mod tests {
             "workspace_id": "workspace/test",
             "alias": "checkout",
             "working_directory_id": "wd-attached",
+            "capabilities": {"bits": 63},
             "attached": false
         }))]));
         let router = Arc::new(workdir::WorkdirSessionRouter::new());
@@ -1582,6 +1603,7 @@ mod tests {
                 "workspace_id": "workspace/test",
                 "alias": "checkout",
                 "working_directory_id": "wd-attached",
+                "capabilities": {"bits": 63},
                 "attached": true
             })),
             response(json!({
@@ -1596,6 +1618,7 @@ mod tests {
                 "workspace_id": "workspace/test",
                 "alias": "checkout",
                 "working_directory_id": "wd-attached",
+                "capabilities": {"bits": 63},
                 "attached": false
             })),
         ]));
@@ -1640,12 +1663,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn attach_propagates_provider_read_only_capabilities_to_the_alias_session() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
+            "workspace_id": "workspace/test",
+            "alias": "external",
+            "working_directory_id": "external-workdir",
+            "capabilities": {"bits": 25},
+            "attached": true
+        }))]));
+        let backend = WorkspaceHttpWorkdirBackend::new(client);
+        backend
+            .attach(WorkdirAttachInput {
+                alias: "external".to_string(),
+                working_directory_id: "external-workdir".to_string(),
+            })
+            .unwrap();
+
+        let session = backend
+            .session_router
+            .session(&workdir::WorkdirAttachmentAlias::new("external").unwrap())
+            .unwrap();
+        assert_eq!(
+            session.capabilities(),
+            WorkdirSessionCapabilities::READ_ONLY
+        );
+    }
+
     #[tokio::test]
     async fn successful_attach_reopens_internal_subworker_admission() {
         let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
             "workspace_id": "workspace/test",
             "alias": "checkout",
             "working_directory_id": "wd-attached",
+            "capabilities": {"bits": 63},
             "attached": true
         }))]));
         let reopen_calls = Arc::new(AtomicUsize::new(0));

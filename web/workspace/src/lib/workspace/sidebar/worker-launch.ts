@@ -40,7 +40,8 @@ export function defaultWorkerLaunchForm(
   const availableWorkingDirectories =
     options?.working_directories.filter((directory) =>
       directory.status === "active" &&
-      directory.cleanliness === "clean" &&
+      (directory.source.kind === "external_grant" ||
+        directory.cleanliness === "clean") &&
       directory.occupied_by == null
     ) ?? [];
   const selectedRuntime = current.runtime_id
@@ -54,13 +55,17 @@ export function defaultWorkerLaunchForm(
     ? undefined
     : availableWorkingDirectories.find((directory) =>
       Boolean(current.working_directory_repository_key) &&
-      directory.repository_key === current.working_directory_repository_key &&
+      directory.source.kind === "repository" &&
+      directory.source.repository_key ===
+        current.working_directory_repository_key &&
       (!current.working_directory_selector ||
         (directory.current_selector ?? directory.creation_selector) ===
           current.working_directory_selector)
     ) ?? availableWorkingDirectories.find((directory) =>
       Boolean(current.working_directory_repository_key) &&
-      directory.repository_key === current.working_directory_repository_key
+      directory.source.kind === "repository" &&
+      directory.source.repository_key ===
+        current.working_directory_repository_key
     ) ?? (current.working_directory_repository_key
       ? undefined
       : availableWorkingDirectories[0]);

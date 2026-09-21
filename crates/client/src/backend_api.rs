@@ -7,6 +7,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const TOKEN_FILE_NAME: &str = "backend-tokens.json";
 const MAX_REDIRECTS: usize = 10;
@@ -171,6 +172,37 @@ impl BackendApiClient {
             .asynchronous
             .request(method, url)
             .bearer_auth(&self.access_token.0))
+    }
+
+    pub fn websocket_request(
+        &self,
+        path_and_query: &str,
+    ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, BackendApiClientError> {
+        let mut url = self.origin.url(path_and_query)?;
+        let scheme = match url.scheme() {
+            "http" => "ws",
+            "https" => "wss",
+            _ => unreachable!("Backend origin validates HTTP schemes"),
+        };
+        url.set_scheme(scheme).map_err(|()| {
+            BackendApiClientError::InvalidRequestPath(
+                "Backend WebSocket URL scheme could not be constructed".to_string(),
+            )
+        })?;
+        let mut request = url.as_str().into_client_request().map_err(|error| {
+            BackendApiClientError::InvalidRequestPath(format!(
+                "Backend WebSocket request is invalid: {error}"
+            ))
+        })?;
+        request.headers_mut().insert(
+            tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+            self.authorization_header_value().parse().map_err(|error| {
+                BackendApiClientError::InvalidRequestPath(format!(
+                    "Backend authorization header is invalid: {error}"
+                ))
+            })?,
+        );
+        Ok(request)
     }
 
     pub fn blocking_request(
@@ -741,6 +773,33 @@ mod tests {
             "Bearer normalized-secret"
         );
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn websocket_requests_are_same_origin_and_use_the_stored_bearer() {
+        let client = BackendApiClient::from_access_token_for_test(
+            "https://backend.example:8443",
+            "websocket-secret",
+        )
+        .unwrap();
+        let request = client
+            .websocket_request("/api/w/workspace/external-workdir-grants/grant/provider")
+            .unwrap();
+        assert_eq!(request.uri().scheme_str(), Some("wss"));
+        assert_eq!(request.uri().host(), Some("backend.example"));
+        assert_eq!(request.uri().port_u16(), Some(8443));
+        assert_eq!(
+            request
+                .headers()
+                .get(tokio_tungstenite::tungstenite::http::header::AUTHORIZATION)
+                .unwrap(),
+            "Bearer websocket-secret"
+        );
+        assert!(
+            client
+                .websocket_request("//other.example/provider")
+                .is_err()
+        );
     }
 
     #[test]

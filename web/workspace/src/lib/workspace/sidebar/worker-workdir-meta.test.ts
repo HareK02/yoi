@@ -25,7 +25,7 @@ function workdir(
 ): WorkingDirectorySummary {
   return {
     working_directory_id: "workdir-1234567890abcdef",
-    repository_key: "main",
+    source: { kind: "repository", repository_key: "main" },
     materializer_kind: "runtime_git_clone",
     status: "active",
     ...overrides,
@@ -39,7 +39,9 @@ function attachment(
   const workingDirectory = workdir(overrides);
   return {
     alias,
-    repository_key: workingDirectory.repository_key,
+    repository_key: workingDirectory.source.kind === "repository"
+      ? workingDirectory.source.repository_key
+      : null,
     working_directory_id: workingDirectory.working_directory_id,
     working_directory: workingDirectory,
   };
@@ -105,13 +107,30 @@ Deno.test("Worker sidebar Workdir label has an explicit unavailable-projection f
   assertEquals(meta.text, "main:unknown@workdir-1234");
 });
 
+Deno.test("Worker sidebar Workdir label uses an External Workdir display name without fake repository metadata", () => {
+  const meta = sidebarWorkdirMeta([
+    attachment("sessions", {
+      display_name: "Session analysis",
+      source: { kind: "external_grant", grant_id: "grant-1" },
+      materializer_kind: "client_hosted_external",
+      cleanliness: "unknown",
+    }),
+  ]);
+
+  assertEquals(meta.text, "Session analysis");
+  assert(
+    meta.details.includes("sessions — Session analysis"),
+    "alias should remain visible",
+  );
+});
+
 Deno.test("Worker sidebar Workdir metadata preserves long names for truncated display details", () => {
   const repository = "repository-with-a-name-that-exceeds-the-sidebar-width";
   const branch =
     "feature/workdir-label-with-a-name-that-also-exceeds-the-sidebar-width";
   const meta = sidebarWorkdirMeta([
     attachment("long-checkout", {
-      repository_key: repository,
+      source: { kind: "repository", repository_key: repository },
       current_selector: branch,
     }),
   ]);
@@ -128,7 +147,7 @@ Deno.test("Worker sidebar Workdir metadata keeps multiple attachments distinguis
     attachment("frontend", { current_selector: "develop" }),
     attachment("backend", {
       working_directory_id: "workdir-fedcba0987654321",
-      repository_key: "server",
+      source: { kind: "repository", repository_key: "server" },
       current_selector: "release",
     }),
   ]);

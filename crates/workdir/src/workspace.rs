@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub enum WorkingDirectoryMaterializerKind {
     #[default]
     RuntimeGitClone,
+    ClientHostedExternal,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,13 +100,20 @@ pub struct RuntimeWorkingDirectorySummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkingDirectorySource {
+    Repository { repository_key: String },
+    ExternalGrant { grant_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectorySummary {
     pub working_directory_id: String,
     /// Optional human-facing label. Never used for attachment routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    pub repository_key: String,
+    pub source: WorkingDirectorySource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_selector: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -215,7 +223,9 @@ mod tests {
         let summary = WorkingDirectorySummary {
             working_directory_id: "wd-1".to_string(),
             display_name: Some("Checkout".to_string()),
-            repository_key: "repo-1".to_string(),
+            source: WorkingDirectorySource::Repository {
+                repository_key: "repo-1".to_string(),
+            },
             creation_selector: None,
             creation_ref: None,
             creation_tree: None,

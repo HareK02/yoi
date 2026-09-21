@@ -4,6 +4,7 @@ declare const Deno: {
 
 import {
   parseWorkingDirectoryCreateResponse,
+  parseWorkingDirectoryDetailResponse,
   parseWorkingDirectoryListResponse,
   validateWorkingDirectoryCreateRequest,
 } from "../src/lib/workspace/api/workdirs.ts";
@@ -11,7 +12,7 @@ import {
 const summary = {
   working_directory_id: "workdir-1",
   display_name: "Checkout",
-  repository_key: "main",
+  source: { kind: "repository", repository_key: "main" },
   materializer_kind: "runtime_git_clone",
   status: "active",
   occupied_by: {
@@ -43,6 +44,27 @@ Deno.test("Workdir REST validation accepts the generated list and create contrac
   });
   if (created.runtime_id !== "arcadia") {
     throw new Error("create Runtime was not preserved");
+  }
+});
+
+Deno.test("Workdir REST validation accepts External grant sources without Runtime identity", () => {
+  const detail = parseWorkingDirectoryDetailResponse({
+    workspace_id: "workspace-a",
+    item: {
+      working_directory_id: "external-1",
+      display_name: "Session analysis",
+      source: { kind: "external_grant", grant_id: "grant-1" },
+      materializer_kind: "client_hosted_external",
+      status: "active",
+      cleanliness: "unknown",
+    },
+    diagnostics: [],
+  });
+  if (detail.runtime_id !== undefined) {
+    throw new Error("External Workdir acquired a fake Runtime identity");
+  }
+  if (detail.item.source.kind !== "external_grant") {
+    throw new Error("External Workdir source was not preserved");
   }
 });
 

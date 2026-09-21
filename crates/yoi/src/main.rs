@@ -5,6 +5,7 @@ mod objective_cli;
 mod plugin_cli;
 mod session_cli;
 mod ticket_cli;
+mod workdir_share;
 mod worker_cleanup_cli;
 mod workspace_bootstrap;
 
@@ -53,6 +54,8 @@ enum Mode {
         no_wait: bool,
     },
     Init(InitOptions),
+    WorkdirHelp,
+    WorkdirShare(workdir_share::WorkdirShareOptions),
     WorkerRuntime(Vec<String>),
     Keys,
     SetupModel,
@@ -130,6 +133,17 @@ async fn run(mode: Mode) -> ExitCode {
             }
             Err(error) => {
                 eprintln!("yoi init: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Mode::WorkdirHelp => {
+            print_workdir_help();
+            ExitCode::SUCCESS
+        }
+        Mode::WorkdirShare(options) => match workdir_share::run(options).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("yoi workdir share: {error}");
                 ExitCode::FAILURE
             }
         },
@@ -420,6 +434,9 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
         "--help" | "-h" => return Ok(Mode::Help),
         "resume" => return parse_resume_args(&args[1..], &target_selection, connection_resolver),
         "workers" => return parse_workers_args(&args[1..], &target_selection, connection_resolver),
+        "workdir" => {
+            return parse_workdir_args(&args[1..], &target_selection);
+        }
         "worker" => {
             if let Some(cli) = worker_cleanup_cli::parse_worker_management_args(&args[1..])
                 .map_err(|e| ParseError(e.to_string()))?
@@ -609,6 +626,142 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
     }
 
     parse_console_options(args, &target_selection, connection_resolver)
+}
+
+fn parse_workdir_args(
+    args: &[String],
+    target_selection: &TargetSelection,
+) -> Result<Mode, ParseError> {
+    if target_selection.explicit_local {
+        return Err(ParseError(
+            "yoi workdir share requires a Backend target and cannot use --local".to_string(),
+        ));
+    }
+    let Some((subcommand, args)) = args.split_first() else {
+        return Ok(Mode::WorkdirHelp);
+    };
+    if matches!(subcommand.as_str(), "--help" | "-h") {
+        return Ok(Mode::WorkdirHelp);
+    }
+    if subcommand != "share" {
+        return Err(ParseError(format!(
+            "unknown yoi workdir subcommand `{subcommand}`"
+        )));
+    }
+    let mut path = None;
+    let mut workspace_id = target_selection.workspace_id.clone();
+    let mut backend_url = target_selection.backend_url.clone();
+    let mut display_name = None;
+    let mut ttl = None;
+    let mut read_only = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--workspace-id" => {
+                if workspace_id.is_some() {
+                    return Err(ParseError(
+                        "--workspace-id may only be provided once".to_string(),
+                    ));
+                }
+                workspace_id =
+                    Some(required_option_value(args, index, "--workspace-id")?.to_string());
+                index += 2;
+            }
+            "--backend" => {
+                if backend_url.is_some() {
+                    return Err(ParseError(
+                        "--backend may only be provided once".to_string(),
+                    ));
+                }
+                backend_url = Some(required_option_value(args, index, "--backend")?.to_string());
+                index += 2;
+            }
+            "--display-name" => {
+                if display_name.is_some() {
+                    return Err(ParseError(
+                        "--display-name may only be provided once".to_string(),
+                    ));
+                }
+                display_name =
+                    Some(required_option_value(args, index, "--display-name")?.to_string());
+                index += 2;
+            }
+            "--ttl" => {
+                if ttl.is_some() {
+                    return Err(ParseError("--ttl may only be provided once".to_string()));
+                }
+                ttl = Some(parse_share_ttl(required_option_value(
+                    args, index, "--ttl",
+                )?)?);
+                index += 2;
+            }
+            "--read-only" => {
+                if read_only {
+                    return Err(ParseError(
+                        "--read-only may only be provided once".to_string(),
+                    ));
+                }
+                read_only = true;
+                index += 1;
+            }
+            "--help" | "-h" => return Ok(Mode::WorkdirHelp),
+            option if option.starts_with('-') => {
+                return Err(ParseError(format!(
+                    "unknown yoi workdir share option `{option}`"
+                )));
+            }
+            value => {
+                if path.is_some() {
+                    return Err(ParseError(
+                        "yoi workdir share accepts exactly one directory path".to_string(),
+                    ));
+                }
+                path = Some(PathBuf::from(value));
+                index += 1;
+            }
+        }
+    }
+    if !read_only {
+        return Err(ParseError(
+            "yoi workdir share requires --read-only".to_string(),
+        ));
+    }
+    let workspace_id = workspace_id
+        .ok_or_else(|| ParseError("yoi workdir share requires --workspace-id".to_string()))?;
+    let backend_url = resolve_backend_url(backend_url, Some(&workspace_id))?;
+    Ok(Mode::WorkdirShare(workdir_share::WorkdirShareOptions {
+        path: path
+            .ok_or_else(|| ParseError("yoi workdir share requires a directory path".to_string()))?,
+        workspace_id,
+        backend_url,
+        display_name: display_name
+            .ok_or_else(|| ParseError("yoi workdir share requires --display-name".to_string()))?,
+        ttl: ttl.ok_or_else(|| ParseError("yoi workdir share requires --ttl".to_string()))?,
+    }))
+}
+
+fn parse_share_ttl(value: &str) -> Result<Duration, ParseError> {
+    let (number, multiplier) = if let Some(value) = value.strip_suffix('h') {
+        (value, 60 * 60)
+    } else if let Some(value) = value.strip_suffix('m') {
+        (value, 60)
+    } else if let Some(value) = value.strip_suffix('s') {
+        (value, 1)
+    } else {
+        return Err(ParseError(
+            "--ttl must use an h, m, or s suffix (for example 1h)".to_string(),
+        ));
+    };
+    let amount = number.parse::<u64>().map_err(|_| {
+        ParseError("--ttl must contain a positive integer and h, m, or s suffix".to_string())
+    })?;
+    let seconds = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| ParseError("--ttl is too large".to_string()))?;
+    if !(60..=86_400).contains(&seconds) {
+        return Err(ParseError("--ttl must be between 60s and 24h".to_string()));
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 fn parse_init_args(
@@ -1734,6 +1887,7 @@ Usage:
   yoi --backend <URL> [--workspace-id <ID>] panel
   yoi [--backend <URL>] init --display-name <NAME> --repository-key <KEY> [--repository <PATH>] [--default-ref <REF>]
   yoi [--backend <URL>] login [--no-wait]
+  yoi [--backend <URL>] workdir share <PATH> --workspace-id <ID> --read-only --ttl <TTL> --display-name <NAME>
   yoi <HOST_COMMAND> [OPTIONS]
 
 Target selection:
@@ -1759,6 +1913,7 @@ Console options:
 
 Host commands:
   yoi init                    Register the current Git repository as a new Backend Workspace.
+  yoi workdir share           Share a temporary read-only client-hosted External Workdir.
   keys                         Manage local model/API keys
   setup-model                  Configure a local model provider
   worker [WORKER_OPTIONS]      Run the direct Worker process entrypoint
@@ -1776,6 +1931,12 @@ Standalone binaries:
 Options:
   -h, --help                   Print help
 "#;
+
+fn print_workdir_help() {
+    println!(
+        "yoi workdir share\n\nUsage:\n  yoi [--backend <URL>] workdir share <PATH> --workspace-id <ID> --read-only --ttl <TTL> --display-name <NAME>\n\nThe foreground CLI provides one local directory over an authenticated outbound Backend connection.\nNo host path is sent to the Backend. TTL accepts s, m, or h suffixes from 60s through 24h.\nCtrl-C explicitly revokes the grant before exit.\n"
+    );
+}
 
 fn print_help() {
     println!("{TOP_LEVEL_HELP}");
@@ -1833,6 +1994,81 @@ fn print_memory_lint_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workdir_share_parses_explicit_backend_workspace_and_bounded_ttl() {
+        let args = vec![
+            "share".to_string(),
+            "./session-log".to_string(),
+            "--read-only".to_string(),
+            "--ttl".to_string(),
+            "90m".to_string(),
+            "--display-name".to_string(),
+            "session-analysis".to_string(),
+        ];
+        let target = TargetSelection {
+            backend_url: Some("https://backend.example".to_string()),
+            workspace_id: Some("workspace-a".to_string()),
+            ..TargetSelection::default()
+        };
+        let Mode::WorkdirShare(options) = parse_workdir_args(&args, &target).unwrap() else {
+            panic!("expected Workdir share mode");
+        };
+        assert_eq!(options.path, PathBuf::from("./session-log"));
+        assert_eq!(options.workspace_id, "workspace-a");
+        assert_eq!(options.backend_url, "https://backend.example");
+        assert_eq!(options.display_name, "session-analysis");
+        assert_eq!(options.ttl, Duration::from_secs(5_400));
+    }
+
+    #[test]
+    fn workdir_share_fails_closed_without_explicit_read_only_workspace_or_valid_ttl() {
+        let base = vec![
+            "share".to_string(),
+            ".".to_string(),
+            "--ttl".to_string(),
+            "1h".to_string(),
+            "--display-name".to_string(),
+            "logs".to_string(),
+        ];
+        let target = TargetSelection {
+            backend_url: Some("https://backend.example".to_string()),
+            workspace_id: Some("workspace-a".to_string()),
+            ..TargetSelection::default()
+        };
+        assert!(
+            parse_workdir_args(&base, &target)
+                .err()
+                .unwrap()
+                .0
+                .contains("--read-only")
+        );
+
+        let mut invalid_ttl = base.clone();
+        invalid_ttl.push("--read-only".to_string());
+        invalid_ttl[3] = "25h".to_string();
+        assert!(
+            parse_workdir_args(&invalid_ttl, &target)
+                .err()
+                .unwrap()
+                .0
+                .contains("24h")
+        );
+
+        let missing_workspace = TargetSelection {
+            backend_url: Some("https://backend.example".to_string()),
+            ..TargetSelection::default()
+        };
+        let mut valid = base;
+        valid.push("--read-only".to_string());
+        assert!(
+            parse_workdir_args(&valid, &missing_workspace)
+                .err()
+                .unwrap()
+                .0
+                .contains("--workspace-id")
+        );
+    }
 
     #[test]
     fn cli_parses_connection_before_starting_tokio_runtime() {

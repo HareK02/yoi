@@ -148,9 +148,13 @@
     const attachments = worker.workdir_attachments ?? [];
     if (attachments.length === 0) return '—';
     return attachments.map(({ alias, working_directory: directory }) => {
-      const provider = data.repositories?.items.find((repository) => repository.repository_key === directory.repository_key)
-        ?.provider;
-      const label = directory.display_name ?? directory.repository_key;
+      const repositoryKey = directory.source.kind === 'repository'
+        ? directory.source.repository_key
+        : null;
+      const provider = repositoryKey
+        ? data.repositories?.items.find((repository) => repository.repository_key === repositoryKey)?.provider
+        : null;
+      const label = directory.display_name ?? repositoryKey ?? 'External Workdir';
       return `${alias}: ${label} · ${formatCurrentWorkdirRevision(directory, provider)}`;
     }).join(', ');
   }

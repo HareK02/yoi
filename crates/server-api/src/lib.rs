@@ -1482,6 +1482,7 @@ pub struct Diagnostic {
 pub enum WorkingDirectoryMaterializerKind {
     #[default]
     RuntimeGitClone,
+    ClientHostedExternal,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1612,6 +1613,15 @@ pub struct RuntimeWorkingDirectorySummary {
     pub occupied_by: Option<WorkingDirectoryOccupancy>,
 }
 
+/// Public Workdir source identity. Provider routing details and host paths are intentionally absent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkingDirectorySource {
+    Repository { repository_key: String },
+    ExternalGrant { grant_id: String },
+}
+
 /// Public, provider-neutral Workdir inventory projection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -1622,7 +1632,7 @@ pub struct WorkingDirectorySummary {
     /// Optional human-facing label, never a routing key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    pub repository_key: String,
+    pub source: WorkingDirectorySource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_selector: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1661,6 +1671,9 @@ impl From<workdir::workspace::WorkingDirectoryMaterializerKind>
         match value {
             workdir::workspace::WorkingDirectoryMaterializerKind::RuntimeGitClone => {
                 Self::RuntimeGitClone
+            }
+            workdir::workspace::WorkingDirectoryMaterializerKind::ClientHostedExternal => {
+                Self::ClientHostedExternal
             }
         }
     }
@@ -1738,7 +1751,14 @@ impl From<workdir::workspace::WorkingDirectorySummary> for WorkingDirectorySumma
         Self {
             working_directory_id: value.working_directory_id,
             display_name: value.display_name,
-            repository_key: value.repository_key,
+            source: match value.source {
+                workdir::workspace::WorkingDirectorySource::Repository { repository_key } => {
+                    WorkingDirectorySource::Repository { repository_key }
+                }
+                workdir::workspace::WorkingDirectorySource::ExternalGrant { grant_id } => {
+                    WorkingDirectorySource::ExternalGrant { grant_id }
+                }
+            },
             creation_selector: value.creation_selector,
             creation_ref: value.creation_ref,
             creation_tree: value.creation_tree,
@@ -1753,6 +1773,31 @@ impl From<workdir::workspace::WorkingDirectorySummary> for WorkingDirectorySumma
             occupied_by: value.occupied_by.map(Into::into),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ExternalWorkdirGrantCreateRequest {
+    pub provider_instance_id: String,
+    pub display_name: String,
+    pub ttl_seconds: u64,
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ExternalWorkdirGrantResponse {
+    pub grant_id: String,
+    pub workspace_id: String,
+    pub working_directory_id: String,
+    pub provider_instance_id: String,
+    pub display_name: String,
+    pub permissions: String,
+    pub expires_at: String,
+    pub generation: u64,
+    pub status: String,
 }
 
 /// Browser/Rust-client Workdir materialization request.
@@ -1791,7 +1836,8 @@ pub struct WorkingDirectoryListResponse {
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectoryDetailResponse {
     pub workspace_id: String,
-    pub runtime_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
     pub item: WorkingDirectorySummary,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -3653,6 +3699,7 @@ pub fn workdir_api_typescript() -> String {
         WorkingDirectoryStatusKind::decl(&config),
         WorkingDirectoryCleanupTarget::decl(&config),
         WorkingDirectoryOccupancy::decl(&config),
+        WorkingDirectorySource::decl(&config),
         WorkingDirectorySummary::decl(&config),
         WorkingDirectoryCreateRequest::decl(&config),
         WorkingDirectoryListResponse::decl(&config),
@@ -3683,6 +3730,7 @@ pub fn worker_launch_api_typescript() -> String {
         RuntimeWorkingDirectoryCleanupTarget::decl(&config),
         RuntimeWorkingDirectorySummary::decl(&config),
         WorkingDirectoryOccupancy::decl(&config),
+        WorkingDirectorySource::decl(&config),
         WorkingDirectorySummary::decl(&config),
         WorkerWorkspaceSummary::decl(&config),
         WorkerImplementationSummary::decl(&config),
@@ -5123,7 +5171,9 @@ mod tests {
         let value = serde_json::to_value(WorkingDirectorySummary {
             working_directory_id: "workdir-1".into(),
             display_name: None,
-            repository_key: "main".into(),
+            source: WorkingDirectorySource::Repository {
+                repository_key: "main".into(),
+            },
             creation_selector: None,
             creation_ref: None,
             creation_tree: None,

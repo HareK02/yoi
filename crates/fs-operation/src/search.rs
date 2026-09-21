@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::FsAccessPolicy;
@@ -14,6 +15,35 @@ use crate::{
     FsError, GrepOutputMode, GrepRequest, GrepResult, direct_symlink, resolve_access_path,
 };
 
+struct SourceBoundedReader<'a, R> {
+    inner: R,
+    remaining: &'a mut u64,
+}
+
+impl<R: Read> Read for SourceBoundedReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if *self.remaining == 0 {
+            let mut probe = [0_u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => Ok(0),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "grep source exceeded provider byte limit",
+                )),
+            };
+        }
+        let limit = usize::try_from(*self.remaining)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let read = self.inner.read(&mut buffer[..limit])?;
+        *self.remaining = (*self.remaining).saturating_sub(read as u64);
+        Ok(read)
+    }
+}
+
 struct ContentLine {
     path: PathBuf,
     line_number: Option<u64>,
@@ -27,7 +57,23 @@ struct GrepReport {
     files: Vec<PathBuf>,
     counts: Vec<(PathBuf, usize)>,
     lines: Vec<ContentLine>,
+    retained_bytes: usize,
     truncated: bool,
+}
+
+const MAX_GREP_RESULT_RETAINED_BYTES: usize = 512 * 1024;
+
+fn reserve_report_bytes(report: &mut GrepReport, bytes: usize) -> bool {
+    let Some(next) = report.retained_bytes.checked_add(bytes) else {
+        report.truncated = true;
+        return false;
+    };
+    if next > MAX_GREP_RESULT_RETAINED_BYTES {
+        report.truncated = true;
+        return false;
+    }
+    report.retained_bytes = next;
+    true
 }
 
 impl GrepReport {
@@ -281,12 +327,14 @@ pub fn run_grep(
         files: Vec::new(),
         counts: Vec::new(),
         lines: Vec::new(),
+        retained_bytes: 0,
         truncated: false,
     };
     let mut matching_files_seen = 0;
     let mut matches_seen = 0;
 
     if base_meta.is_file() {
+        let mut source_bytes_remaining = crate::MAX_GREP_SOURCE_BYTES;
         if direct_file_selected(&base, overrides.as_ref(), types.as_ref()) {
             scan_path(
                 &mut searcher,
@@ -298,6 +346,8 @@ pub fn run_grep(
                 &mut matches_seen,
                 offset,
                 head_limit,
+                &mut source_bytes_remaining,
+                access,
             )?;
         }
         return Ok(report.into_result(root));
@@ -319,7 +369,16 @@ pub fn run_grep(
         walker.overrides(overrides);
     }
 
+    let mut visited = 0_usize;
+    let mut source_bytes_remaining = crate::MAX_GREP_SOURCE_BYTES;
     for entry in walker.build().flatten() {
+        visited = visited.saturating_add(1);
+        if visited > crate::MAX_TRAVERSAL_ENTRIES {
+            return Err(FsError::InvalidArgument(format!(
+                "grep traversal exceeds provider limit {}",
+                crate::MAX_TRAVERSAL_ENTRIES
+            )));
+        }
         if !entry
             .file_type()
             .map(|kind| kind.is_file())
@@ -343,6 +402,8 @@ pub fn run_grep(
             &mut matches_seen,
             offset,
             head_limit,
+            &mut source_bytes_remaining,
+            access,
         )? {
             break;
         }
@@ -362,13 +423,38 @@ fn scan_path(
     matches_seen: &mut usize,
     offset: usize,
     head_limit: usize,
+    source_bytes_remaining: &mut u64,
+    access: &dyn FsAccessPolicy,
 ) -> Result<bool, FsError> {
+    let reader = access
+        .open_read_file(path, path)
+        .map_err(|error| FsError::io(path, error))?;
+    let metadata = reader
+        .metadata()
+        .map_err(|error| FsError::io(path, error))?;
+    if !metadata.is_file() {
+        return Err(FsError::InvalidArgument(
+            "grep source must be a regular file".to_string(),
+        ));
+    }
+    if metadata.len() > *source_bytes_remaining {
+        return Err(FsError::InvalidArgument(
+            "grep sources exceed provider byte limit".to_string(),
+        ));
+    }
+    let mut reader = SourceBoundedReader {
+        inner: reader,
+        remaining: source_bytes_remaining,
+    };
     match mode {
         GrepOutputMode::FilesWithMatches => {
-            if !scan_any_match(searcher, matcher, path)? {
+            if !scan_any_match(searcher, matcher, &mut reader, path)? {
                 return Ok(false);
             }
             if *matching_files_seen >= offset {
+                if !reserve_report_bytes(report, path.to_string_lossy().len().saturating_add(1)) {
+                    return Ok(true);
+                }
                 report.files.push(path.to_path_buf());
                 if report.files.len() >= head_limit {
                     report.truncated = true;
@@ -378,11 +464,14 @@ fn scan_path(
             *matching_files_seen += 1;
         }
         GrepOutputMode::Count => {
-            let count = scan_count(searcher, matcher, path)?;
+            let count = scan_count(searcher, matcher, &mut reader, path)?;
             if count == 0 {
                 return Ok(false);
             }
             if *matching_files_seen >= offset {
+                if !reserve_report_bytes(report, path.to_string_lossy().len().saturating_add(32)) {
+                    return Ok(true);
+                }
                 report.counts.push((path.to_path_buf(), count));
                 if report.counts.len() >= head_limit {
                     report.truncated = true;
@@ -396,13 +485,18 @@ fn scan_path(
             let mut sink = ContentSink {
                 path: path.to_path_buf(),
                 lines: &mut report.lines,
+                retained_bytes: &mut report.retained_bytes,
+                truncated: &mut report.truncated,
                 matches_seen,
                 offset,
                 head_limit,
             };
             searcher
-                .search_path(matcher, path, &mut sink)
+                .search_reader(matcher, &mut reader, &mut sink)
                 .map_err(|error| FsError::io(path, error))?;
+            if report.truncated {
+                return Ok(true);
+            }
             if *matches_seen >= offset.saturating_add(head_limit) && *matches_seen > before_count {
                 report.truncated = true;
                 return Ok(true);
@@ -415,6 +509,7 @@ fn scan_path(
 fn scan_any_match(
     searcher: &mut Searcher,
     matcher: &grep_regex::RegexMatcher,
+    reader: &mut dyn Read,
     path: &Path,
 ) -> Result<bool, FsError> {
     let mut hit = false;
@@ -423,7 +518,7 @@ fn scan_any_match(
         Ok(false) // stop searching this file immediately
     });
     searcher
-        .search_path(matcher, path, sink)
+        .search_reader(matcher, reader, sink)
         .map_err(|e| FsError::io(path, e))?;
     Ok(hit)
 }
@@ -431,6 +526,7 @@ fn scan_any_match(
 fn scan_count(
     searcher: &mut Searcher,
     matcher: &grep_regex::RegexMatcher,
+    reader: &mut dyn Read,
     path: &Path,
 ) -> Result<usize, FsError> {
     let mut count = 0usize;
@@ -439,7 +535,7 @@ fn scan_count(
         Ok(true)
     });
     searcher
-        .search_path(matcher, path, sink)
+        .search_reader(matcher, reader, sink)
         .map_err(|e| FsError::io(path, e))?;
     Ok(count)
 }
@@ -447,9 +543,32 @@ fn scan_count(
 struct ContentSink<'a> {
     path: PathBuf,
     lines: &'a mut Vec<ContentLine>,
+    retained_bytes: &'a mut usize,
+    truncated: &'a mut bool,
     matches_seen: &'a mut usize,
     offset: usize,
     head_limit: usize,
+}
+
+impl ContentSink<'_> {
+    fn reserve(&mut self, content_bytes: usize) -> bool {
+        let retained = self
+            .path
+            .to_string_lossy()
+            .len()
+            .saturating_add(content_bytes)
+            .saturating_add(64);
+        let Some(next) = (*self.retained_bytes).checked_add(retained) else {
+            *self.truncated = true;
+            return false;
+        };
+        if next > MAX_GREP_RESULT_RETAINED_BYTES {
+            *self.truncated = true;
+            return false;
+        }
+        *self.retained_bytes = next;
+        true
+    }
 }
 
 impl Sink for ContentSink<'_> {
@@ -468,6 +587,9 @@ impl Sink for ContentSink<'_> {
             return Ok(false);
         }
 
+        if !self.reserve(mat.bytes().len()) {
+            return Ok(false);
+        }
         let text = String::from_utf8_lossy(mat.bytes())
             .trim_end_matches('\n')
             .trim_end_matches('\r')
@@ -493,6 +615,9 @@ impl Sink for ContentSink<'_> {
         if seen >= self.offset.saturating_add(self.head_limit) {
             return Ok(false);
         }
+        if !self.reserve(ctx.bytes().len()) {
+            return Ok(false);
+        }
         let text = String::from_utf8_lossy(ctx.bytes())
             .trim_end_matches('\n')
             .trim_end_matches('\r')
@@ -504,5 +629,33 @@ impl Sink for ContentSink<'_> {
             is_match: false,
         });
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod bounded_reader_tests {
+    use std::io::{Cursor, Read as _};
+
+    use super::SourceBoundedReader;
+
+    #[test]
+    fn source_budget_is_shared_across_candidate_files() {
+        let mut remaining = 3_u64;
+        let mut first = SourceBoundedReader {
+            inner: Cursor::new(b"ab"),
+            remaining: &mut remaining,
+        };
+        let mut output = Vec::new();
+        first.read_to_end(&mut output).unwrap();
+        drop(first);
+        assert_eq!(remaining, 1);
+
+        let mut second = SourceBoundedReader {
+            inner: Cursor::new(b"cd"),
+            remaining: &mut remaining,
+        };
+        let error = second.read_to_end(&mut output).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(output, b"abc");
     }
 }

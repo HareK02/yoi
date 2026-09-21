@@ -17,7 +17,7 @@ function workdir(
 ): WorkingDirectorySummary {
   return {
     working_directory_id: "workdir-1",
-    repository_key: "repository-1",
+    source: { kind: "repository", repository_key: "repository-1" },
     current_selector,
     current_ref,
     materializer_kind: "runtime_git_clone",

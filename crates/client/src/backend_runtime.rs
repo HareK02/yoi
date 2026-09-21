@@ -21,6 +21,7 @@ pub use server_api::{
     WorkingDirectoryCreateResponse as BackendWorkingDirectoryCreateResponse,
     WorkingDirectoryDetailResponse as BackendWorkingDirectoryDetailResponse,
     WorkingDirectoryListResponse as BackendWorkingDirectoryListResponse,
+    WorkingDirectorySource as BackendWorkingDirectorySource,
     WorkingDirectorySummary as BackendWorkingDirectorySummary,
 };
 use std::fmt;
@@ -1018,7 +1019,7 @@ mod tests {
                 "alias": "checkout",
                 "working_directory": {
                     "working_directory_id": "wd-1",
-                    "repository_key": "main",
+                    "source": {"kind": "repository", "repository_key": "main"},
                     "materializer_kind": "runtime_git_clone",
                     "status": "active",
                     "occupied_by": {
@@ -1035,7 +1036,12 @@ mod tests {
         let attachment = worker.workdir_attachments.into_iter().next().unwrap();
         assert_eq!(attachment.alias, "checkout");
         let workdir = attachment.working_directory;
-        assert_eq!(workdir.repository_key, "main");
+        assert_eq!(
+            workdir.source,
+            BackendWorkingDirectorySource::Repository {
+                repository_key: "main".to_string(),
+            }
+        );
         let occupied_by = workdir.occupied_by.expect("occupied Workdir");
         assert_eq!(occupied_by.runtime_id, "arcadia");
         assert_eq!(occupied_by.worker_id, "worker-opaque-64");

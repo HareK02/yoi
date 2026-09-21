@@ -2409,6 +2409,7 @@ mod tests {
             [LogicalWorkdirAttachment {
                 alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
                 working_directory_id: "remote-workdir".to_string(),
+                capabilities: workdir::WorkdirSessionCapabilities::ALL,
             }]
         );
     }

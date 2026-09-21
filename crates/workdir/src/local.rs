@@ -18,17 +18,17 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use manifest::{Permission, Scope, SharedScope, SymlinkPolicy};
+use manifest::{Permission, Scope, ScopeConfig, ScopeRule, SharedScope, SymlinkPolicy};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::JoinHandle;
 
 use crate::{
-    CommandEvent, CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest,
-    CommandSnapshot, CommandStatus, CommandStream, CommandStreamSlice, EditRequest, EditResult,
-    GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult, ReadRequest,
-    ReadResult, StatRequest, StatResult, Workdir, WorkdirError, WorkdirPath,
+    BoundedReadLimits, CommandEvent, CommandHandle, CommandOutput, CommandOutputRequest,
+    CommandRequest, CommandSnapshot, CommandStatus, CommandStream, CommandStreamSlice, EditRequest,
+    EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
+    ReadRequest, ReadResult, StatRequest, StatResult, Workdir, WorkdirError, WorkdirPath,
     WorkdirScopeAuthorizationRequest, WorkdirScopeOverlapRequest, WorkdirSession,
     WorkdirSessionCapabilities, WorkdirSessionCapability, WorkdirToolScopePermission, WriteRequest,
     WriteResult,
@@ -203,26 +203,112 @@ impl CommandTelemetry {
 }
 
 #[derive(Debug)]
-struct ScopeAccess(Arc<Scope>);
+struct ScopeAccess {
+    scope: Arc<Scope>,
+    root: PathBuf,
+    pinned_root: Option<Arc<std::fs::File>>,
+    reject_symlinks: bool,
+}
+
+impl ScopeAccess {
+    fn new(
+        scope: Arc<Scope>,
+        root: &Path,
+        pinned_root: Option<Arc<std::fs::File>>,
+        reject_symlinks: bool,
+    ) -> Self {
+        Self {
+            scope,
+            root: root.to_path_buf(),
+            pinned_root,
+            reject_symlinks,
+        }
+    }
+
+    fn open_confined(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        let root = self.pinned_root.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "External Workdir root handle is unavailable",
+            )
+        })?;
+        let relative = path.strip_prefix(&self.root).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "path is outside provider root",
+            )
+        })?;
+        fs_operation::open_beneath_no_symlinks_at(root, relative)
+    }
+
+    fn path_is_confined(&self, logical: &Path, resolved: &Path) -> bool {
+        !self.reject_symlinks
+            || (logical.starts_with(&self.root)
+                && resolved.starts_with(&self.root)
+                && fs_operation::first_symlink(logical).is_none())
+    }
+}
 
 impl fs_operation::FsAccessPolicy for ScopeAccess {
     fn is_readable(&self, path: &Path) -> bool {
-        self.0.is_readable(path)
+        self.scope.is_readable(path)
     }
 
     fn is_writable(&self, path: &Path) -> bool {
-        self.0.is_writable(path)
+        self.scope.is_writable(path)
+    }
+
+    fn open_read_file(&self, _logical: &Path, resolved: &Path) -> std::io::Result<std::fs::File> {
+        if self.reject_symlinks {
+            self.open_confined(resolved)
+        } else {
+            std::fs::File::open(resolved)
+        }
+    }
+
+    fn read_metadata(&self, logical: &Path, resolved: &Path) -> std::io::Result<std::fs::Metadata> {
+        if self.reject_symlinks {
+            self.open_confined(resolved)?.metadata()
+        } else {
+            std::fs::symlink_metadata(logical)
+        }
+    }
+
+    fn open_read_dir(&self, _logical: &Path, resolved: &Path) -> std::io::Result<std::fs::ReadDir> {
+        if !self.reject_symlinks {
+            return std::fs::read_dir(resolved);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+
+            let directory = self.open_confined(resolved)?;
+            if !directory.metadata()?.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    "path is not a directory",
+                ));
+            }
+            return std::fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        }
+        #[cfg(not(target_os = "linux"))]
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "root-confined directory enumeration is unavailable on this platform",
+        ))
     }
 
     fn is_readable_paths(&self, logical: &Path, resolved: &Path) -> bool {
-        matches!(
-            self.0.permission_at_paths(logical, resolved),
-            Some(Permission::Read | Permission::Write)
-        )
+        self.path_is_confined(logical, resolved)
+            && matches!(
+                self.scope.permission_at_paths(logical, resolved),
+                Some(Permission::Read | Permission::Write)
+            )
     }
 
     fn is_writable_paths(&self, logical: &Path, resolved: &Path) -> bool {
-        self.0.permission_at_paths(logical, resolved) == Some(Permission::Write)
+        self.path_is_confined(logical, resolved)
+            && self.scope.permission_at_paths(logical, resolved) == Some(Permission::Write)
     }
 }
 
@@ -265,9 +351,12 @@ fn rule_targets(
 struct LocalWorkdirSessionInner {
     workdir: Workdir,
     root: PathBuf,
+    pinned_root: Option<Arc<std::fs::File>>,
     scope: SharedScope,
     cwd: PathBuf,
     capabilities: WorkdirSessionCapabilities,
+    read_limits: Option<BoundedReadLimits>,
+    reject_symlinks: bool,
     closed: AtomicBool,
     close_lock: Mutex<()>,
     next_command_id: AtomicU64,
@@ -389,13 +478,112 @@ impl LocalWorkdirSession {
         command_environment: BTreeMap<String, String>,
         resources: Vec<Arc<dyn WorkdirSessionResource>>,
     ) -> Self {
+        Self::materialized_bound_with_policy(
+            workdir,
+            root,
+            cwd,
+            scope,
+            capabilities,
+            command_environment,
+            resources,
+            None,
+            None,
+            false,
+        )
+    }
+
+    /// Construct a strictly read-only provider session for an
+    /// authority-assigned Workdir and an operator-selected local directory.
+    ///
+    /// The selected directory is canonicalized and fixed for the lifetime of
+    /// the session. A symlink selected as the root is rejected, and all
+    /// operation paths are confined below the canonical root without following
+    /// symbolic links. Read source and response sizes are provider-bounded.
+    pub fn external_read_only(
+        workdir: Workdir,
+        directory: impl AsRef<Path>,
+        read_limits: BoundedReadLimits,
+    ) -> Result<Self, WorkdirError> {
+        read_limits.validate().map_err(WorkdirError::from)?;
+        let directory = directory.as_ref();
+        if !directory.is_absolute() {
+            return Err(WorkdirError::InvalidArgument(
+                "External Workdir directory must be absolute".to_string(),
+            ));
+        }
+        let selected_metadata = std::fs::symlink_metadata(directory)
+            .map_err(|error| WorkdirError::io(Path::new("<external-root>"), error))?;
+        if selected_metadata.file_type().is_symlink() {
+            return Err(WorkdirError::Denied(
+                "External Workdir root must not be a symbolic link".to_string(),
+            ));
+        }
+        let root = directory
+            .canonicalize()
+            .map_err(|error| WorkdirError::io(Path::new("<external-root>"), error))?;
+        if !root
+            .metadata()
+            .map_err(|error| WorkdirError::io(Path::new("<external-root>"), error))?
+            .is_dir()
+        {
+            return Err(WorkdirError::InvalidArgument(
+                "External Workdir root must be a directory".to_string(),
+            ));
+        }
+        let pinned_root = Arc::new(
+            fs_operation::open_root_no_symlinks(&root)
+                .map_err(|error| WorkdirError::io(Path::new("<external-root>"), error))?,
+        );
+        let scope = Scope::from_config(&ScopeConfig {
+            allow: vec![ScopeRule {
+                target: root.clone(),
+                permission: Permission::Read,
+                recursive: true,
+                symlink_policy: SymlinkPolicy::Resolved,
+            }],
+            deny: Vec::new(),
+        })
+        .map_err(|_| {
+            WorkdirError::InvalidArgument(
+                "External Workdir read scope could not be established".to_string(),
+            )
+        })?;
+        Ok(Self::materialized_bound_with_policy(
+            workdir,
+            root.clone(),
+            root,
+            SharedScope::new(scope),
+            WorkdirSessionCapabilities::READ_ONLY,
+            BTreeMap::new(),
+            Vec::new(),
+            Some(pinned_root),
+            Some(read_limits),
+            true,
+        ))
+    }
+
+    fn materialized_bound_with_policy(
+        workdir: Workdir,
+        root: PathBuf,
+        cwd: PathBuf,
+        scope: SharedScope,
+        capabilities: WorkdirSessionCapabilities,
+        command_environment: BTreeMap<String, String>,
+        resources: Vec<Arc<dyn WorkdirSessionResource>>,
+        pinned_root: Option<Arc<std::fs::File>>,
+        read_limits: Option<BoundedReadLimits>,
+        reject_symlinks: bool,
+    ) -> Self {
         Self {
             inner: Arc::new(LocalWorkdirSessionInner {
                 workdir,
                 root,
+                pinned_root,
                 scope,
                 cwd,
                 capabilities,
+                read_limits,
+                reject_symlinks,
                 closed: AtomicBool::new(false),
                 close_lock: Mutex::new(()),
                 next_command_id: AtomicU64::new(1),
@@ -592,6 +780,37 @@ impl LocalWorkdirSession {
             self.inner.root.join(path.as_str())
         }
     }
+
+    fn validate_operation_path(&self, path: &WorkdirPath) -> Result<(), WorkdirError> {
+        if !self.inner.reject_symlinks {
+            return Ok(());
+        }
+        let path = Path::new(path.as_str());
+        if path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(WorkdirError::InvalidPath(
+                "External Workdir paths must be root-relative".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn scope_access(&self) -> ScopeAccess {
+        ScopeAccess::new(
+            self.inner.scope.snapshot(),
+            &self.inner.root,
+            self.inner.pinned_root.clone(),
+            self.inner.reject_symlinks,
+        )
+    }
 }
 
 #[async_trait]
@@ -609,7 +828,13 @@ impl WorkdirSession for LocalWorkdirSession {
         request: WorkdirScopeAuthorizationRequest,
     ) -> Result<(), WorkdirError> {
         self.ensure_open()?;
+        self.validate_operation_path(&request.path)?;
         let logical = self.inner.root.join(request.path.as_str());
+        if self.inner.reject_symlinks && fs_operation::first_symlink(&logical).is_some() {
+            return Err(WorkdirError::Denied(
+                "External Workdir scope cannot traverse symbolic links".to_string(),
+            ));
+        }
         let resolved = fs_operation::resolve_access_path(&logical)
             .map_err(|error| WorkdirError::io(&logical, error))?;
         let parent_permission = self
@@ -687,7 +912,8 @@ impl WorkdirSession for LocalWorkdirSession {
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Read)?;
         let logical = request.path.clone();
-        let access = ScopeAccess(self.inner.scope.snapshot());
+        self.validate_operation_path(&request.path)?;
+        let access = self.scope_access();
         fs_operation::run_stat(&self.inner.root, request, &access)
             .map_err(WorkdirError::from)
             .map_err(|error| sanitize_error(error, &logical))
@@ -696,16 +922,23 @@ impl WorkdirSession for LocalWorkdirSession {
     async fn read(&self, request: ReadRequest) -> Result<ReadResult, WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Read)?;
         let logical = request.path.clone();
-        let access = ScopeAccess(self.inner.scope.snapshot());
-        fs_operation::run_read(&self.inner.root, request, &access)
-            .map_err(WorkdirError::from)
-            .map_err(|error| sanitize_error(error, &logical))
+        self.validate_operation_path(&request.path)?;
+        let access = self.scope_access();
+        match self.inner.read_limits {
+            Some(limits) => {
+                fs_operation::run_read_bounded(&self.inner.root, request, &access, limits)
+            }
+            None => fs_operation::run_read(&self.inner.root, request, &access),
+        }
+        .map_err(WorkdirError::from)
+        .map_err(|error| sanitize_error(error, &logical))
     }
 
     async fn write(&self, request: WriteRequest) -> Result<WriteResult, WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Write)?;
         let logical = request.path.clone();
-        let access = ScopeAccess(self.inner.scope.snapshot());
+        self.validate_operation_path(&request.path)?;
+        let access = self.scope_access();
         fs_operation::run_write(&self.inner.root, request, &access)
             .map_err(WorkdirError::from)
             .map_err(|error| sanitize_error(error, &logical))
@@ -714,7 +947,8 @@ impl WorkdirSession for LocalWorkdirSession {
     async fn edit(&self, request: EditRequest) -> Result<EditResult, WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Edit)?;
         let logical = request.path.clone();
-        let access = ScopeAccess(self.inner.scope.snapshot());
+        self.validate_operation_path(&request.path)?;
+        let access = self.scope_access();
         fs_operation::run_edit(&self.inner.root, request, &access)
             .map_err(WorkdirError::from)
             .map_err(|error| sanitize_error(error, &logical))
@@ -723,7 +957,8 @@ impl WorkdirSession for LocalWorkdirSession {
     async fn list(&self, request: ListRequest) -> Result<ListResult, WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Read)?;
         let logical = request.path.clone();
-        let access = ScopeAccess(self.inner.scope.snapshot());
+        self.validate_operation_path(&request.path)?;
+        let access = self.scope_access();
         fs_operation::run_list(&self.inner.root, request, &access)
             .map_err(WorkdirError::from)
             .map_err(|error| sanitize_error(error, &logical))
@@ -733,7 +968,8 @@ impl WorkdirSession for LocalWorkdirSession {
         self.ensure_capability(WorkdirSessionCapability::Glob)?;
         let logical = request.path.clone();
         let base = self.resolve(&request.path);
-        let access = ScopeAccess(self.inner.scope.snapshot());
+        self.validate_operation_path(&request.path)?;
+        let access = self.scope_access();
         fs_operation::run_glob(&self.inner.root, &base, request, &access)
             .map_err(WorkdirError::from)
             .map_err(|error| sanitize_error(error, &logical))
@@ -743,7 +979,8 @@ impl WorkdirSession for LocalWorkdirSession {
         self.ensure_capability(WorkdirSessionCapability::Grep)?;
         let base = self.resolve(&request.path);
         let logical = request.path.clone();
-        let access = ScopeAccess(self.inner.scope.snapshot());
+        self.validate_operation_path(&request.path)?;
+        let access = self.scope_access();
         fs_operation::run_grep(&self.inner.root, base, request, &access)
             .map_err(WorkdirError::from)
             .map_err(|error| sanitize_error(error, &logical))

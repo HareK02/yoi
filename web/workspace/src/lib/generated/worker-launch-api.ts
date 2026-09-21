@@ -7,7 +7,7 @@ export type DiagnosticSeverity = "info" | "warning" | "error";
 
 export type Diagnostic = { code: string, severity: DiagnosticSeverity, message: string, };
 
-export type WorkingDirectoryMaterializerKind = "runtime_git_clone";
+export type WorkingDirectoryMaterializerKind = "runtime_git_clone" | "client_hosted_external";
 
 export type WorkingDirectoryStatusKind = "active" | "cleanup_pending" | "corrupted" | "not_found" | "unknown";
 
@@ -23,11 +23,13 @@ display_name?: string | null, repository_id: string, creation_selector?: string 
 
 export type WorkingDirectoryOccupancy = { runtime_id: string, worker_id: string, display_name: string, linked_at: string, };
 
+export type WorkingDirectorySource = { "kind": "repository", repository_key: string, } | { "kind": "external_grant", grant_id: string, };
+
 export type WorkingDirectorySummary = { working_directory_id: string,
 /**
  * Optional human-facing label, never a routing key.
  */
-display_name?: string | null, repository_key: string, creation_selector?: string | null, creation_ref?: string | null, creation_tree?: string | null, current_selector?: string | null, current_ref?: string | null, current_tree?: string | null, observed_at_epoch_seconds?: number | null, materializer_kind: WorkingDirectoryMaterializerKind, cleanup_target?: WorkingDirectoryCleanupTarget | null, status: WorkingDirectoryStatusKind, cleanliness?: string | null, occupied_by?: WorkingDirectoryOccupancy | null, };
+display_name?: string | null, source: WorkingDirectorySource, creation_selector?: string | null, creation_ref?: string | null, creation_tree?: string | null, current_selector?: string | null, current_ref?: string | null, current_tree?: string | null, observed_at_epoch_seconds?: number | null, materializer_kind: WorkingDirectoryMaterializerKind, cleanup_target?: WorkingDirectoryCleanupTarget | null, status: WorkingDirectoryStatusKind, cleanliness?: string | null, occupied_by?: WorkingDirectoryOccupancy | null, };
 
 export type WorkerWorkspaceSummary = { visibility: string, identity: string, workspace_id?: string | null, };
 

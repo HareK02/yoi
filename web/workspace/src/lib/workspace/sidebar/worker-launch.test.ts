@@ -28,6 +28,33 @@ Deno.test("defaultWorkerLaunchForm uses the Backend-published defaults and initi
   assertEquals(form.working_directory_selector, "HEAD");
 });
 
+Deno.test("defaultWorkerLaunchForm preserves an available read-only External Workdir", () => {
+  const external = {
+    working_directory_id: "external-1",
+    display_name: "Session analysis",
+    source: { kind: "external_grant" as const, grant_id: "grant-1" },
+    materializer_kind: "client_hosted_external" as const,
+    status: "active" as const,
+    cleanliness: "unknown",
+  };
+  const form = defaultWorkerLaunchForm(
+    { ...options, working_directories: [external] },
+    emptyForm({
+      workdir_attachments: [{
+        alias: "sessions",
+        working_directory_id: "external-1",
+        relative_cwd: "",
+      }],
+    }),
+  );
+
+  assertEquals(form.workdir_attachments, [{
+    alias: "sessions",
+    working_directory_id: "external-1",
+    relative_cwd: "",
+  }]);
+});
+
 Deno.test("defaultWorkerLaunchForm preserves an available Ticket role profile", () => {
   const reviewerOptions = {
     ...options,
@@ -87,7 +114,7 @@ Deno.test("defaultWorkerLaunchForm preserves a Ticket repository target", () => 
         {
           ...options.working_directories[0],
           working_directory_id: "ticket-workdir",
-          repository_key: "ticket-repo",
+          source: { kind: "repository", repository_key: "ticket-repo" },
           creation_selector: "work/ticket",
         },
       ],
@@ -318,7 +345,7 @@ const options: WorkerLaunchOptionsResponse = {
   working_directories: [
     {
       working_directory_id: "wd-1-repo",
-      repository_key: "repo",
+      source: { kind: "repository", repository_key: "repo" },
       creation_selector: "HEAD",
       creation_ref: "0123456789abcdef",
       current_selector: null,

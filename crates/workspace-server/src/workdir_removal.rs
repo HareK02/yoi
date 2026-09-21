@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::store::WorkdirRegistryRecord;
+use crate::store::{WorkdirRegistryRecord, WorkdirRegistrySource};
 use crate::{Error, Result, SqliteWorkspaceStore};
 
 const MAX_REASON_BYTES: usize = 500;
@@ -95,8 +95,7 @@ pub fn workdir_materialization_fingerprint(record: &WorkdirRegistryRecord) -> St
     let bytes = serde_json::to_vec(&serde_json::json!([
         record.workspace_id,
         record.workdir_id,
-        record.runtime_id,
-        record.repository_id,
+        record.source,
         record.creation_selector,
         record.creation_ref,
         record.creation_tree,
@@ -116,21 +115,29 @@ pub fn workdir_removal_intent(
     let fingerprint_bytes = serde_json::to_vec(&serde_json::json!([
         record.workspace_id,
         record.workdir_id,
-        record.runtime_id,
-        record.repository_id,
+        record.source,
         materialization_fingerprint,
         source_actor,
         reason,
     ]))
     .map_err(|error| Error::Store(format!("Workdir removal fingerprint failed: {error}")))?;
     let request_fingerprint = hex_sha256(&fingerprint_bytes);
+    let WorkdirRegistrySource::Repository {
+        runtime_id,
+        repository_id,
+    } = &record.source
+    else {
+        return Err(Error::InvalidInput(
+            "External Workdirs must be revoked through their grant authority".to_string(),
+        ));
+    };
     Ok(WorkdirRemovalIntent {
         operation_id: format!("wdr_{}", &request_fingerprint[..32]),
         request_fingerprint,
         workspace_id: record.workspace_id.clone(),
         working_directory_id: record.workdir_id.clone(),
-        runtime_id: record.runtime_id.clone(),
-        repository_id: record.repository_id.clone(),
+        runtime_id: runtime_id.clone(),
+        repository_id: repository_id.clone(),
         materialization_fingerprint,
         source_actor: source_actor.to_string(),
         reason: reason.to_string(),
@@ -682,8 +689,7 @@ fn require_matching_materialization(
 ) -> Result<()> {
     if intent.workspace_id != record.workspace_id
         || intent.working_directory_id != record.workdir_id
-        || intent.runtime_id != record.runtime_id
-        || intent.repository_id != record.repository_id
+        || !matches!(&record.source, WorkdirRegistrySource::Repository { runtime_id, repository_id } if runtime_id == &intent.runtime_id && repository_id == &intent.repository_id)
         || intent.materialization_fingerprint != workdir_materialization_fingerprint(record)
     {
         return Err(Error::WorkdirAttachmentConflict(
@@ -699,8 +705,7 @@ fn require_operation_materialization(
 ) -> Result<()> {
     if operation.workspace_id != record.workspace_id
         || operation.working_directory_id != record.workdir_id
-        || operation.runtime_id != record.runtime_id
-        || operation.repository_id != record.repository_id
+        || !matches!(&record.source, WorkdirRegistrySource::Repository { runtime_id, repository_id } if runtime_id == &operation.runtime_id && repository_id == &operation.repository_id)
         || operation.materialization_fingerprint != workdir_materialization_fingerprint(record)
     {
         return Err(Error::WorkdirAttachmentConflict(
@@ -716,7 +721,7 @@ fn load_workdir_record(
     workdir_id: &str,
 ) -> Result<Option<WorkdirRegistryRecord>> {
     conn.query_row(
-        r#"SELECT workspace_id, workdir_id, display_name, runtime_id, repository_id,
+        r#"SELECT workspace_id, workdir_id, display_name, source_kind, runtime_id, repository_id,
                   creation_selector, creation_ref, creation_tree,
                   current_selector, current_ref, current_tree, observed_at_epoch_seconds,
                   materialization_status, cleanliness, created_at, updated_at
@@ -727,19 +732,30 @@ fn load_workdir_record(
                 workspace_id: row.get(0)?,
                 workdir_id: row.get(1)?,
                 display_name: row.get(2)?,
-                runtime_id: row.get(3)?,
-                repository_id: row.get(4)?,
-                creation_selector: row.get(5)?,
-                creation_ref: row.get(6)?,
-                creation_tree: row.get(7)?,
-                current_selector: row.get(8)?,
-                current_ref: row.get(9)?,
-                current_tree: row.get(10)?,
-                observed_at_epoch_seconds: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
-                materialization_status: row.get(12)?,
-                cleanliness: row.get(13)?,
-                created_at: row.get(14)?,
-                updated_at: row.get(15)?,
+                source: match row.get::<_, String>(3)?.as_str() {
+                    "repository" => WorkdirRegistrySource::Repository {
+                        runtime_id: row.get(4)?,
+                        repository_id: row.get(5)?,
+                    },
+                    _ => {
+                        return Err(rusqlite::Error::InvalidColumnType(
+                            3,
+                            "source_kind".to_string(),
+                            rusqlite::types::Type::Text,
+                        ));
+                    }
+                },
+                creation_selector: row.get(6)?,
+                creation_ref: row.get(7)?,
+                creation_tree: row.get(8)?,
+                current_selector: row.get(9)?,
+                current_ref: row.get(10)?,
+                current_tree: row.get(11)?,
+                observed_at_epoch_seconds: row.get::<_, Option<i64>>(12)?.map(|value| value as u64),
+                materialization_status: row.get(13)?,
+                cleanliness: row.get(14)?,
+                created_at: row.get(15)?,
+                updated_at: row.get(16)?,
             })
         },
     )
@@ -936,8 +952,10 @@ mod tests {
             workspace_id: "workspace-a".to_string(),
             workdir_id: "workdir-a".to_string(),
             display_name: None,
-            runtime_id: "runtime-a".to_string(),
-            repository_id: "repository-a".to_string(),
+            source: WorkdirRegistrySource::Repository {
+                runtime_id: "runtime-a".to_string(),
+                repository_id: "repository-a".to_string(),
+            },
             creation_selector: Some("refs/heads/develop".to_string()),
             creation_ref: Some("abc".to_string()),
             creation_tree: Some("tree-a".to_string()),

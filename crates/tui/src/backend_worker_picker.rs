@@ -3,8 +3,9 @@ use std::io;
 use std::time::Duration;
 
 use client::{
-    BackendRuntimeListTarget, BackendWorkerSummary, WorkerSessionAvailability,
-    list_backend_stopped_workers, list_backend_workers, observe_backend_worker_session,
+    BackendRuntimeListTarget, BackendWorkerSummary, BackendWorkingDirectorySource,
+    WorkerSessionAvailability, list_backend_stopped_workers, list_backend_workers,
+    observe_backend_worker_session,
 };
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -416,10 +417,11 @@ fn working_directory_text(worker: &BackendWorkerSummary) -> String {
     }
     let attachment = &worker.workdir_attachments[0];
     let directory = &attachment.working_directory;
-    let label = directory
-        .display_name
-        .as_deref()
-        .unwrap_or(&directory.repository_key);
+    let source_label = match &directory.source {
+        BackendWorkingDirectorySource::Repository { repository_key } => repository_key.as_str(),
+        BackendWorkingDirectorySource::ExternalGrant { .. } => "external",
+    };
+    let label = directory.display_name.as_deref().unwrap_or(source_label);
     format!(
         "wd:{}:{}・{}",
         attachment.alias, label, directory.working_directory_id
@@ -547,7 +549,7 @@ mod tests {
                 "working_directory": {
                     "working_directory_id": "001a06a9f0202000000",
                     "display_name": "Checkout",
-                    "repository_key": "main",
+                    "source": {"kind": "repository", "repository_key": "main"},
                     "materializer_kind": "runtime_git_clone",
                     "status": "active",
                     "cleanliness": "clean"
@@ -591,7 +593,7 @@ mod tests {
                     "alias": "checkout",
                     "working_directory": {
                         "working_directory_id": "workdir-1",
-                        "repository_key": "main",
+                        "source": {"kind": "repository", "repository_key": "main"},
                         "materializer_kind": "runtime_git_clone",
                         "status": "active"
                     }

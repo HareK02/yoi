@@ -6,13 +6,14 @@ import type {
   WorkingDirectoryDetailResponse,
   WorkingDirectoryListResponse,
   WorkingDirectoryOccupancy,
+  WorkingDirectorySource,
   WorkingDirectorySummary,
 } from "../../generated/workdir-api";
 
 const SUMMARY_KEYS = new Set([
   "working_directory_id",
   "display_name",
-  "repository_key",
+  "source",
   "creation_selector",
   "creation_ref",
   "creation_tree",
@@ -64,13 +65,30 @@ export function parseWorkingDirectoryListResponse(
 export function parseWorkingDirectoryDetailResponse(
   value: unknown,
 ): WorkingDirectoryDetailResponse {
-  return parseDetailLike(value, "Workdir detail response");
+  const record = parseDetailRecord(value, "Workdir detail response");
+  const response: WorkingDirectoryDetailResponse = {
+    workspace_id: stringField(record, "workspace_id"),
+    item: parseWorkingDirectorySummary(record.item),
+    diagnostics: arrayField(record, "diagnostics").map(parseDiagnostic),
+  };
+  if (record.runtime_id !== undefined) {
+    response.runtime_id = record.runtime_id === null
+      ? null
+      : stringField(record, "runtime_id");
+  }
+  return response;
 }
 
 export function parseWorkingDirectoryCreateResponse(
   value: unknown,
 ): WorkingDirectoryCreateResponse {
-  return parseDetailLike(value, "Workdir create response");
+  const record = parseDetailRecord(value, "Workdir create response");
+  return {
+    workspace_id: stringField(record, "workspace_id"),
+    runtime_id: stringField(record, "runtime_id"),
+    item: parseWorkingDirectorySummary(record.item),
+    diagnostics: arrayField(record, "diagnostics").map(parseDiagnostic),
+  };
 }
 
 export function validateWorkingDirectoryCreateRequest(
@@ -91,21 +109,15 @@ export function validateWorkingDirectoryCreateRequest(
   return request;
 }
 
-function parseDetailLike(
+function parseDetailRecord(
   value: unknown,
   label: string,
-): WorkingDirectoryDetailResponse {
-  const record = exactRecord(
+): Record<string, unknown> {
+  return exactRecord(
     value,
     new Set(["workspace_id", "runtime_id", "item", "diagnostics"]),
     label,
   );
-  return {
-    workspace_id: stringField(record, "workspace_id"),
-    runtime_id: stringField(record, "runtime_id"),
-    item: parseWorkingDirectorySummary(record.item),
-    diagnostics: arrayField(record, "diagnostics").map(parseDiagnostic),
-  };
 }
 
 export function parseWorkingDirectorySummary(
@@ -114,9 +126,10 @@ export function parseWorkingDirectorySummary(
   const record = exactRecord(value, SUMMARY_KEYS, "Workdir summary");
   const summary: WorkingDirectorySummary = {
     working_directory_id: stringField(record, "working_directory_id"),
-    repository_key: stringField(record, "repository_key"),
+    source: parseWorkingDirectorySource(record.source),
     materializer_kind: enumField(record, "materializer_kind", [
       "runtime_git_clone",
+      "client_hosted_external",
     ]),
     status: enumField(record, "status", [
       "active",
@@ -158,6 +171,36 @@ export function parseWorkingDirectorySummary(
       : parseOccupancy(record.occupied_by);
   }
   return summary;
+}
+
+function parseWorkingDirectorySource(value: unknown): WorkingDirectorySource {
+  const source = exactRecord(
+    value,
+    new Set(["kind", "repository_key", "grant_id"]),
+    "Workdir source",
+  );
+  const kind = stringField(source, "kind");
+  if (kind === "repository") {
+    if (source.grant_id !== undefined) {
+      throw new Error("Repository Workdir source must not contain grant_id");
+    }
+    return {
+      kind,
+      repository_key: stringField(source, "repository_key"),
+    };
+  }
+  if (kind === "external_grant") {
+    if (source.repository_key !== undefined) {
+      throw new Error(
+        "External Workdir source must not contain repository_key",
+      );
+    }
+    return {
+      kind,
+      grant_id: stringField(source, "grant_id"),
+    };
+  }
+  throw new Error("Workdir source.kind has an unsupported value");
 }
 
 function parseCleanupTarget(value: unknown): WorkingDirectoryCleanupTarget {

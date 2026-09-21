@@ -668,8 +668,10 @@ CREATE TABLE "workdir_registry" (
     workspace_id TEXT NOT NULL,
     workdir_id TEXT NOT NULL,
     display_name TEXT,
-    runtime_id TEXT NOT NULL,
-    repository_id TEXT NOT NULL,
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('repository', 'external_grant')),
+    runtime_id TEXT,
+    repository_id TEXT,
+    external_grant_id TEXT,
     creation_selector TEXT,
     creation_ref TEXT,
     materialization_status TEXT NOT NULL CHECK (materialization_status IN ('pending', 'present', 'not_found', 'corrupted', 'unknown', 'failed')),
@@ -679,9 +681,34 @@ CREATE TABLE "workdir_registry" (
     current_selector TEXT,
     current_ref TEXT, creation_tree TEXT, current_tree TEXT, observed_at_epoch_seconds INTEGER,
     PRIMARY KEY (workspace_id, workdir_id),
+    CHECK (
+        (source_kind = 'repository' AND runtime_id IS NOT NULL AND repository_id IS NOT NULL AND external_grant_id IS NULL)
+        OR (source_kind = 'external_grant' AND runtime_id IS NULL AND repository_id IS NULL AND external_grant_id IS NOT NULL)
+    ),
     FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
     FOREIGN KEY (workspace_id, repository_id)
-        REFERENCES "repositories"(workspace_id, repository_id)
+        REFERENCES "repositories"(workspace_id, repository_id),
+    FOREIGN KEY (workspace_id, external_grant_id)
+        REFERENCES external_workdir_grants(workspace_id, grant_id) DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TABLE external_workdir_grants (
+    grant_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    workdir_id TEXT NOT NULL,
+    provider_instance_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    permissions TEXT NOT NULL CHECK (permissions = 'read_only'),
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'online', 'offline', 'revoked', 'expired')),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, grant_id),
+    UNIQUE (workspace_id, workdir_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, workdir_id)
+        REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 );
 CREATE TABLE workdir_removal_operations (
     workspace_id TEXT NOT NULL,
@@ -1049,6 +1076,8 @@ CREATE INDEX idx_typed_tickets_workspace_updated
     ON typed_tickets(workspace_id, updated_at DESC, ticket_id);
 CREATE INDEX idx_workdir_registry_workspace_updated
     ON workdir_registry(workspace_id, updated_at DESC);
+CREATE INDEX idx_external_workdir_grants_status_expiry
+    ON external_workdir_grants(workspace_id, status, expires_at);
 CREATE UNIQUE INDEX idx_workdir_removal_operations_one_pending
     ON workdir_removal_operations(workspace_id, workdir_id)
     WHERE state = 'pending';

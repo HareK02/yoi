@@ -10,6 +10,7 @@ grep-matcher = "0.1.8"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.16"
 ignore = "0.4.25"
+libc = "0.2"
 serde = { workspace = true, features = ["derive"] }
 sha2 = "0.10.9"
 tempfile.workspace = true

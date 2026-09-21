@@ -5,12 +5,16 @@
 //! bound to one Worker. Tools consume sessions; they do not own Workdir
 //! materialization or cleanup.
 
+pub mod external;
 pub mod http;
 mod local;
 mod operation;
 mod router;
 mod scope;
 pub mod workspace;
+
+#[cfg(test)]
+mod external_local_tests;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,10 +24,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 pub use fs_operation::{
-    ContentHash, EditRequest, EditResult, EntryKind, FsPath as WorkdirPath, GlobRequest,
-    GlobResult, GrepOutputMode, GrepRequest, GrepResult, ListEntry, ListRequest, ListResult,
-    ReadRequest, ReadResult, StatRequest, StatResult, WriteRequest, WriteResult,
+    BoundedReadLimits, ContentHash, EditRequest, EditResult, EntryKind, FsPath as WorkdirPath,
+    GlobRequest, GlobResult, GrepOutputMode, GrepRequest, GrepResult, ListEntry, ListRequest,
+    ListResult, ReadRequest, ReadResult, StatRequest, StatResult, WriteRequest, WriteResult,
 };
+pub use http::dispatch_workdir_session_operation;
 pub use local::{
     LocalWorkdirSession, SymlinkInfo, WorkdirSessionResource, direct_symlink, first_symlink,
 };

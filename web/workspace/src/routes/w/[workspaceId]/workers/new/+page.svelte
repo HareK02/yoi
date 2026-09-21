@@ -36,9 +36,13 @@
   };
 
   function workdirOptionLabel(directory: WorkingDirectorySummary): string {
-    const provider = data.repositories?.items.find((repository) => repository.repository_key === directory.repository_key)
-      ?.provider;
-    const label = directory.display_name ?? directory.repository_key;
+    const repositoryKey = directory.source.kind === 'repository'
+      ? directory.source.repository_key
+      : null;
+    const provider = repositoryKey
+      ? data.repositories?.items.find((repository) => repository.repository_key === repositoryKey)?.provider
+      : null;
+    const label = directory.display_name ?? repositoryKey ?? 'External Workdir';
     return `${label} · ${formatCurrentWorkdirRevision(directory, provider)}`;
   }
 
@@ -83,7 +87,7 @@
       ? []
       : (options?.working_directories ?? []).filter((directory) =>
         directory.status === 'active' &&
-        directory.cleanliness === 'clean' &&
+        (directory.source.kind === 'external_grant' || directory.cleanliness === 'clean') &&
         directory.occupied_by == null
       ),
   );

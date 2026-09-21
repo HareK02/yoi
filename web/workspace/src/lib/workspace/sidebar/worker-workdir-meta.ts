@@ -27,9 +27,13 @@ export function sidebarWorkdirMeta(
 
 function attachmentLabel(attachment: SidebarWorkdirAttachment): string {
   const workdir = attachment.working_directory;
-  const repository = clean(workdir?.repository_key) ??
-    clean(attachment.repository_key) ?? "unknown-repo";
-  return `${repository}:${revisionLabel(attachment)}`;
+  if (workdir?.source.kind === "external_grant") {
+    return clean(workdir.display_name) ?? "external";
+  }
+  const repository = workdir?.source.kind === "repository"
+    ? clean(workdir.source.repository_key)
+    : clean(attachment.repository_key);
+  return `${repository ?? "unknown-repo"}:${revisionLabel(attachment)}`;
 }
 
 function revisionLabel(attachment: SidebarWorkdirAttachment): string {

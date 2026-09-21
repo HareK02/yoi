@@ -352,6 +352,12 @@ pub struct LogicalWorkdirAttachment {
     /// Stable Worker-local routing key. This is not a Workdir id or display name.
     pub alias: workdir::WorkdirAttachmentAlias,
     pub working_directory_id: String,
+    #[serde(default = "default_workdir_session_capabilities")]
+    pub capabilities: workdir::WorkdirSessionCapabilities,
+}
+
+fn default_workdir_session_capabilities() -> workdir::WorkdirSessionCapabilities {
+    workdir::WorkdirSessionCapabilities::ALL
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

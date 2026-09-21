@@ -24,9 +24,15 @@
     workdirs = data.workdirs?.items ?? [];
   });
 
+  function repositoryKey(workdir: WorkingDirectorySummary): string | null {
+    return workdir.source.kind === 'repository' ? workdir.source.repository_key : null;
+  }
+
   function repositoryProvider(workdir: WorkingDirectorySummary): string | null {
-    return data.repositories?.items.find((repository) => repository.repository_key === workdir.repository_key)
-      ?.provider ?? null;
+    const key = repositoryKey(workdir);
+    return key
+      ? data.repositories?.items.find((repository) => repository.repository_key === key)?.provider ?? null
+      : null;
   }
 
   function currentRevision(workdir: WorkingDirectorySummary): string {
@@ -142,7 +148,7 @@
                 <span>{workdir.display_name ?? '—'}</span>
                 <small><code>{workdir.working_directory_id}</code></small>
               </td>
-              <td>{workdir.repository_key}</td>
+              <td>{repositoryKey(workdir) ?? 'External'}</td>
               <td><code>{currentRevision(workdir)}</code></td>
               <td>{workdir.status}</td>
               <td>{workdir.cleanliness ?? 'unknown'}</td>

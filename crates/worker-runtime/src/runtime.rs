@@ -4293,6 +4293,7 @@ fn logical_workdir_attachments_from_statuses(
                 .summary
                 .working_directory_id
                 .clone(),
+            capabilities: workdir::WorkdirSessionCapabilities::ALL,
         })
         .collect()
 }
@@ -6228,6 +6229,7 @@ mod tests {
         let attachment = LogicalWorkdirAttachment {
             alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
             working_directory_id: "workdir-on-another-runtime".to_string(),
+            capabilities: workdir::WorkdirSessionCapabilities::ALL,
         };
 
         let detail = runtime

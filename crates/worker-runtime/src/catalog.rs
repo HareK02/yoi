@@ -204,6 +204,12 @@ pub struct RepositoryRefObservation {
 pub struct LogicalWorkdirAttachment {
     pub alias: workdir::WorkdirAttachmentAlias,
     pub working_directory_id: String,
+    #[serde(default = "default_workdir_session_capabilities")]
+    pub capabilities: workdir::WorkdirSessionCapabilities,
+}
+
+fn default_workdir_session_capabilities() -> workdir::WorkdirSessionCapabilities {
+    workdir::WorkdirSessionCapabilities::ALL
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
