@@ -264,6 +264,7 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
       workersNav.includes("worker-status-spinner") &&
       workersNav.includes("sidebarWorkdirMeta(worker.workdir_attachments)") &&
       workersNav.includes("title={workdir.details}") &&
+      workersNav.includes("aria-label={workdir.details}") &&
       !workersNav.includes("attachment.alias") &&
       workerWorkdirMeta.includes("workdir.current_selector") &&
       workerWorkdirMeta.includes("workdir.creation_selector") &&

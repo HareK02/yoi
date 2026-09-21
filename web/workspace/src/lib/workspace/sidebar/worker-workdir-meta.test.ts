@@ -84,7 +84,18 @@ Deno.test("Worker sidebar Workdir label marks detached HEAD instead of reusing c
   assertEquals(meta.text, "main:detached@0123456789ab");
 });
 
-Deno.test("Worker sidebar Workdir label has an explicit unknown fallback", () => {
+Deno.test("Worker sidebar Workdir label marks an untrusted selector as a detached hash", () => {
+  const meta = sidebarWorkdirMeta([
+    attachment("checkout", {
+      creation_selector: "develop",
+      current_selector: "fedcba9876543210fedcba9876543210fedcba98",
+    }),
+  ]);
+
+  assertEquals(meta.text, "main:detached@fedcba987654");
+});
+
+Deno.test("Worker sidebar Workdir label has an explicit unavailable-projection fallback", () => {
   const meta = sidebarWorkdirMeta([{
     alias: "checkout",
     repository_key: "main",
@@ -92,6 +103,24 @@ Deno.test("Worker sidebar Workdir label has an explicit unknown fallback", () =>
   }]);
 
   assertEquals(meta.text, "main:unknown@workdir-1234");
+});
+
+Deno.test("Worker sidebar Workdir metadata preserves long names for truncated display details", () => {
+  const repository = "repository-with-a-name-that-exceeds-the-sidebar-width";
+  const branch =
+    "feature/workdir-label-with-a-name-that-also-exceeds-the-sidebar-width";
+  const meta = sidebarWorkdirMeta([
+    attachment("long-checkout", {
+      repository_key: repository,
+      current_selector: branch,
+    }),
+  ]);
+
+  assertEquals(meta.text, `${repository}:${branch}`);
+  assert(
+    meta.details.includes(`long-checkout — ${repository}:${branch}`),
+    "full repository and branch should remain available in details when the primary line is truncated",
+  );
 });
 
 Deno.test("Worker sidebar Workdir metadata keeps multiple attachments distinguishable", () => {
