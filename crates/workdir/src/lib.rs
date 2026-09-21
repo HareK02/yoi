@@ -30,7 +30,8 @@ pub use fs_operation::{
 };
 pub use http::dispatch_workdir_session_operation;
 pub use local::{
-    LocalWorkdirSession, SymlinkInfo, WorkdirSessionResource, direct_symlink, first_symlink,
+    ExternalWorkdirRoot, LocalWorkdirSession, SymlinkInfo, WorkdirSessionResource, direct_symlink,
+    first_symlink,
 };
 pub use operation::*;
 pub use router::{

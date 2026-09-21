@@ -2,8 +2,8 @@ use crate::http::{
     WorkdirSessionOperation, WorkdirSessionOperationResult, dispatch_workdir_session_operation,
 };
 use crate::{
-    BoundedReadLimits, CommandRequest, EditRequest, LocalWorkdirSession, ReadRequest, Workdir,
-    WorkdirError, WorkdirPath, WorkdirSession, WorkdirSessionCapabilities,
+    BoundedReadLimits, CommandRequest, EditRequest, ExternalWorkdirRoot, LocalWorkdirSession,
+    ReadRequest, Workdir, WorkdirError, WorkdirPath, WorkdirSession, WorkdirSessionCapabilities,
     WorkdirSessionCapability, WriteRequest,
 };
 
@@ -222,6 +222,41 @@ async fn external_local_provider_rejects_symlink_roots_and_traversal() {
     )
     .unwrap_err();
     assert!(matches!(error, WorkdirError::Denied(_)));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn external_local_provider_keeps_pre_grant_root_when_path_changes_before_session_creation() {
+    let parent = tempfile::tempdir().unwrap();
+    let approved = parent.path().join("shared");
+    std::fs::create_dir(&approved).unwrap();
+    std::fs::write(approved.join("item.txt"), "approved").unwrap();
+
+    // This is the CLI's approval/open boundary. Remote grant creation happens
+    // only after this descriptor has been pinned.
+    let pinned = ExternalWorkdirRoot::pin(&approved).unwrap();
+    std::fs::rename(&approved, parent.path().join("approved-original")).unwrap();
+    std::fs::create_dir(&approved).unwrap();
+    std::fs::write(approved.join("item.txt"), "replacement").unwrap();
+
+    let session = LocalWorkdirSession::external_read_only_pinned(
+        Workdir::new("external-workdir-pre-grant-pin"),
+        pinned,
+        BoundedReadLimits::new(4096, 1024).unwrap(),
+    )
+    .unwrap();
+    let read = WorkdirSession::read(
+        &session,
+        ReadRequest {
+            path: WorkdirPath::new("item.txt").unwrap(),
+            offset: 0,
+            limit: 10,
+            max_bytes: 1024,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(read.bytes, b"approved");
 }
 
 #[cfg(target_os = "linux")]

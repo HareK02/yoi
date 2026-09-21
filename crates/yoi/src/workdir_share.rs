@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use client::BackendApiClient;
@@ -17,7 +17,8 @@ use workdir::external::{
 };
 use workdir::http::{WorkdirTransportError, dispatch_workdir_session_operation};
 use workdir::{
-    BoundedReadLimits, LocalWorkdirSession, Workdir, WorkdirSession, WorkdirSessionCapabilities,
+    BoundedReadLimits, ExternalWorkdirRoot, LocalWorkdirSession, Workdir, WorkdirSession,
+    WorkdirSessionCapabilities,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +29,8 @@ pub(crate) struct WorkdirShareOptions {
     pub display_name: String,
     pub ttl: Duration,
 }
+
+const PROVIDER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderEnd {
@@ -43,6 +46,7 @@ struct OperationCompletion {
 
 struct OperationTask {
     cancelled: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl OperationTask {
@@ -53,6 +57,18 @@ impl OperationTask {
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
+
+    fn join(mut self) -> Result<bool, String> {
+        let cancelled = self.is_cancelled();
+        let thread = self
+            .thread
+            .take()
+            .expect("operation task must retain its executor thread");
+        thread
+            .join()
+            .map_err(|_| "External Workdir operation executor panicked".to_string())?;
+        Ok(cancelled)
+    }
 }
 
 impl Drop for OperationTask {
@@ -62,18 +78,10 @@ impl Drop for OperationTask {
 }
 
 pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
-    let metadata = std::fs::symlink_metadata(&options.path)
-        .map_err(|error| format!("selected path is unavailable: {error}"))?;
-    if metadata.file_type().is_symlink() {
-        return Err("selected External Workdir root must not be a symbolic link".to_string());
-    }
-    let canonical = options
-        .path
-        .canonicalize()
-        .map_err(|error| format!("failed to canonicalize selected directory: {error}"))?;
-    if !canonical.is_dir() {
-        return Err("selected External Workdir path must be a directory".to_string());
-    }
+    // Pin before creating remote authority: the Backend grant can never outlive
+    // a failed local approval/open race, and subsequent path replacement cannot
+    // redirect the provider.
+    let pinned_root = ExternalWorkdirRoot::pin(&options.path).map_err(|error| error.to_string())?;
 
     let client = BackendApiClient::from_stored_token(&options.backend_url)
         .map_err(|error| error.to_string())?;
@@ -105,9 +113,9 @@ pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
         .map_err(|error| format!("Backend returned an invalid External Workdir grant: {error}"))?;
 
     let limits = BoundedReadLimits::EXTERNAL_DEFAULT;
-    let session = LocalWorkdirSession::external_read_only(
+    let session = LocalWorkdirSession::external_read_only_pinned(
         Workdir::new(&grant.working_directory_id),
-        &canonical,
+        pinned_root,
         limits,
     )
     .map_err(|error| error.to_string())?;
@@ -297,49 +305,63 @@ async fn serve_provider_connection(
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|error| format!("failed to wait for Ctrl-C: {error}"))?;
-                abort_operations(&mut operations);
+                stop_operations(&mut operations, &mut completions).await?;
                 revoke(client, &options.workspace_id, &grant.grant_id).await?;
                 return Ok(ProviderEnd::Interrupted);
             }
             completion = completions.recv() => {
                 let Some(completion) = completion else {
-                    abort_operations(&mut operations);
+                    cancel_operations(&operations);
                     return Err("External Workdir operation executor closed".to_string());
                 };
                 let Some(operation) = operations.remove(completion.operation_id.as_str()) else {
                     continue;
                 };
-                if operation.is_cancelled() {
-                    continue;
-                }
+                let cancelled = match operation.join() {
+                    Ok(cancelled) => cancelled,
+                    Err(error) => {
+                        stop_operations(&mut operations, &mut completions).await?;
+                        return Err(error);
+                    }
+                };
+                let outcome = if cancelled {
+                    ExternalWorkdirOperationOutcome::Cancelled
+                } else {
+                    completion.outcome
+                };
                 let result = ExternalWorkdirProviderFrame::current(
                     ExternalWorkdirProviderMessage::OperationResult {
                         generation,
                         operation_id: completion.operation_id,
-                        outcome: completion.outcome,
+                        outcome,
                     },
                 );
                 if send_provider_frame(&mut socket, &result).await.is_err() {
-                    abort_operations(&mut operations);
+                    stop_operations(&mut operations, &mut completions).await?;
                     return Ok(ProviderEnd::Disconnected);
                 }
             }
             incoming = socket.next() => {
                 let Some(incoming) = incoming else {
-                    abort_operations(&mut operations);
+                    stop_operations(&mut operations, &mut completions).await?;
                     return Ok(ProviderEnd::Disconnected);
                 };
                 let incoming = match incoming {
                     Ok(incoming) => incoming,
                     Err(_) => {
-                        abort_operations(&mut operations);
+                        stop_operations(&mut operations, &mut completions).await?;
                         return Ok(ProviderEnd::Disconnected);
                     }
                 };
                 match incoming {
                     Message::Text(text) => {
-                        let frame = serde_json::from_str::<ExternalWorkdirServerFrame>(&text)
-                            .map_err(|error| format!("Backend returned an invalid External Workdir frame: {error}"))?;
+                        let frame = match serde_json::from_str::<ExternalWorkdirServerFrame>(&text) {
+                            Ok(frame) => frame,
+                            Err(error) => {
+                                stop_operations(&mut operations, &mut completions).await?;
+                                return Err(format!("Backend returned an invalid External Workdir frame: {error}"));
+                            }
+                        };
                         match frame.message {
                             ExternalWorkdirServerMessage::Operation {
                                 generation: frame_generation,
@@ -347,26 +369,54 @@ async fn serve_provider_connection(
                                 operation,
                             } if frame_generation == generation => {
                                 if operations.len() >= 16 || operations.contains_key(operation_id.as_str()) {
-                                    abort_operations(&mut operations);
+                                    stop_operations(&mut operations, &mut completions).await?;
                                     return Err("Backend exceeded External Workdir operation bounds".to_string());
                                 }
                                 let key = operation_id.as_str().to_string();
                                 let completion_sender = completion_sender.clone();
-                                let session = session.clone();
                                 let task_operation_id = operation_id.clone();
                                 let cancelled = Arc::new(AtomicBool::new(false));
+                                let guarded_session = session.with_operation_guard(
+                                    cancelled.clone(),
+                                    Instant::now() + PROVIDER_OPERATION_TIMEOUT,
+                                );
                                 let operation = operation.into_inner();
-                                std::thread::Builder::new()
+                                let spawned = std::thread::Builder::new()
                                     .name("external-workdir-operation".to_string())
                                     .spawn(move || {
-                                        let outcome = futures::executor::block_on(execute_operation(&session, operation));
+                                        let outcome = std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(|| {
+                                                futures::executor::block_on(execute_operation(
+                                                    &guarded_session,
+                                                    operation,
+                                                ))
+                                            }),
+                                        )
+                                        .unwrap_or_else(|_| ExternalWorkdirOperationOutcome::Failed {
+                                            error: WorkdirTransportError {
+                                                code: workdir::http::WorkdirTransportErrorCode::Internal,
+                                                message: "External Workdir operation executor failed".to_string(),
+                                            },
+                                        });
                                         let _ = completion_sender.blocking_send(OperationCompletion {
                                             operation_id: task_operation_id,
                                             outcome,
                                         });
-                                    })
-                                    .map_err(|error| format!("failed to start External Workdir operation: {error}"))?;
-                                operations.insert(key, OperationTask { cancelled });
+                                    });
+                                let thread = match spawned {
+                                    Ok(thread) => thread,
+                                    Err(error) => {
+                                        stop_operations(&mut operations, &mut completions).await?;
+                                        return Err(format!("failed to start External Workdir operation: {error}"));
+                                    }
+                                };
+                                operations.insert(
+                                    key,
+                                    OperationTask {
+                                        cancelled,
+                                        thread: Some(thread),
+                                    },
+                                );
                             }
                             ExternalWorkdirServerMessage::Heartbeat {
                                 generation: frame_generation,
@@ -375,29 +425,26 @@ async fn serve_provider_connection(
                                 let heartbeat = ExternalWorkdirProviderFrame::current(
                                     ExternalWorkdirProviderMessage::Heartbeat { generation, sequence },
                                 );
-                                send_provider_frame(&mut socket, &heartbeat).await?;
+                                if send_provider_frame(&mut socket, &heartbeat).await.is_err() {
+                                    stop_operations(&mut operations, &mut completions).await?;
+                                    return Ok(ProviderEnd::Disconnected);
+                                }
                             }
                             ExternalWorkdirServerMessage::Cancel {
                                 generation: frame_generation,
                                 operation_id,
                             } if frame_generation == generation => {
                                 if let Some(operation) = operations.get(operation_id.as_str()) {
+                                    // The terminal Cancelled result is emitted only after the
+                                    // executor reports that filesystem work has actually stopped.
                                     operation.cancel();
-                                    let cancelled = ExternalWorkdirProviderFrame::current(
-                                        ExternalWorkdirProviderMessage::OperationResult {
-                                            generation,
-                                            operation_id,
-                                            outcome: ExternalWorkdirOperationOutcome::Cancelled,
-                                        },
-                                    );
-                                    send_provider_frame(&mut socket, &cancelled).await?;
                                 }
                             }
                             ExternalWorkdirServerMessage::Revoke {
                                 generation: frame_generation,
                                 ..
                             } if frame_generation == generation => {
-                                abort_operations(&mut operations);
+                                stop_operations(&mut operations, &mut completions).await?;
                                 let acknowledged = ExternalWorkdirProviderFrame::current(
                                     ExternalWorkdirProviderMessage::RevokeAcknowledged { generation },
                                 );
@@ -405,7 +452,7 @@ async fn serve_provider_connection(
                                 return Ok(ProviderEnd::Revoked);
                             }
                             _ => {
-                                abort_operations(&mut operations);
+                                stop_operations(&mut operations, &mut completions).await?;
                                 return Err("stale or unexpected External Workdir provider frame".to_string());
                             }
                         }
@@ -417,12 +464,12 @@ async fn serve_provider_connection(
                         )
                         .await;
                         if !matches!(pong, Ok(Ok(()))) {
-                            abort_operations(&mut operations);
+                            stop_operations(&mut operations, &mut completions).await?;
                             return Ok(ProviderEnd::Disconnected);
                         }
                     }
                     Message::Close(_) => {
-                        abort_operations(&mut operations);
+                        stop_operations(&mut operations, &mut completions).await?;
                         return Ok(ProviderEnd::Disconnected);
                     }
                     _ => {}
@@ -452,10 +499,26 @@ async fn execute_operation(
     }
 }
 
-fn abort_operations(operations: &mut HashMap<String, OperationTask>) {
-    for (_, operation) in operations.drain() {
+fn cancel_operations(operations: &HashMap<String, OperationTask>) {
+    for operation in operations.values() {
         operation.cancel();
     }
+}
+
+async fn stop_operations(
+    operations: &mut HashMap<String, OperationTask>,
+    completions: &mut tokio::sync::mpsc::Receiver<OperationCompletion>,
+) -> Result<(), String> {
+    cancel_operations(operations);
+    while !operations.is_empty() {
+        let completion = completions.recv().await.ok_or_else(|| {
+            "External Workdir operation executor closed during cancellation".to_string()
+        })?;
+        if let Some(operation) = operations.remove(completion.operation_id.as_str()) {
+            operation.join()?;
+        }
+    }
+    Ok(())
 }
 
 async fn send_provider_frame<S>(
@@ -555,6 +618,50 @@ fn encode_path_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn operation_shutdown_waits_until_executor_has_stopped() {
+        let operation_id = ExternalWorkdirOperationId::new("op-cancel-test").unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (sender, mut completions) = tokio::sync::mpsc::channel(1);
+        let task_cancelled = cancelled.clone();
+        let task_started = started.clone();
+        let task_stopped = stopped.clone();
+        let task_operation_id = operation_id.clone();
+        let thread = std::thread::spawn(move || {
+            task_started.store(true, Ordering::Release);
+            while !task_cancelled.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            task_stopped.store(true, Ordering::Release);
+            sender
+                .blocking_send(OperationCompletion {
+                    operation_id: task_operation_id,
+                    outcome: ExternalWorkdirOperationOutcome::Cancelled,
+                })
+                .unwrap();
+        });
+        while !started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        let mut operations = HashMap::from([(
+            operation_id.as_str().to_string(),
+            OperationTask {
+                cancelled,
+                thread: Some(thread),
+            },
+        )]);
+
+        stop_operations(&mut operations, &mut completions)
+            .await
+            .unwrap();
+
+        assert!(operations.is_empty());
+        assert!(stopped.load(Ordering::Acquire));
+    }
 
     #[test]
     fn path_segments_are_encoded_without_exposing_structure() {

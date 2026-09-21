@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use manifest::{Permission, Scope, ScopeConfig, ScopeRule, SharedScope, SymlinkPolicy};
@@ -208,6 +208,7 @@ struct ScopeAccess {
     root: PathBuf,
     pinned_root: Option<Arc<std::fs::File>>,
     reject_symlinks: bool,
+    operation_guard: Option<OperationGuard>,
 }
 
 impl ScopeAccess {
@@ -216,12 +217,14 @@ impl ScopeAccess {
         root: &Path,
         pinned_root: Option<Arc<std::fs::File>>,
         reject_symlinks: bool,
+        operation_guard: Option<OperationGuard>,
     ) -> Self {
         Self {
             scope,
             root: root.to_path_buf(),
             pinned_root,
             reject_symlinks,
+            operation_guard,
         }
     }
 
@@ -256,6 +259,26 @@ impl fs_operation::FsAccessPolicy for ScopeAccess {
 
     fn is_writable(&self, path: &Path) -> bool {
         self.scope.is_writable(path)
+    }
+
+    fn check_cancelled(&self) -> std::io::Result<()> {
+        let Some(guard) = &self.operation_guard else {
+            return Ok(());
+        };
+        if guard.cancelled.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "External Workdir operation was cancelled",
+            ));
+        }
+        if Instant::now() >= guard.deadline {
+            guard.cancelled.store(true, Ordering::Release);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "External Workdir operation exceeded its provider deadline",
+            ));
+        }
+        Ok(())
     }
 
     fn open_read_file(&self, _logical: &Path, resolved: &Path) -> std::io::Result<std::fs::File> {
@@ -381,6 +404,98 @@ impl Drop for LocalWorkdirSessionInner {
 pub trait WorkdirSessionResource: Debug + Send + Sync {}
 impl<T> WorkdirSessionResource for T where T: Debug + Send + Sync {}
 
+/// An atomically validated, descriptor-pinned External Workdir root.
+///
+/// Pinning compares the selected path identity with the opened descriptor, so
+/// a rename or replacement between approval and open fails closed. The
+/// descriptor, rather than the pathname, remains the filesystem authority for
+/// the lifetime of every session created from this root.
+#[derive(Debug, Clone)]
+pub struct ExternalWorkdirRoot {
+    canonical_path: PathBuf,
+    handle: Arc<std::fs::File>,
+}
+
+impl ExternalWorkdirRoot {
+    pub fn pin(directory: impl AsRef<Path>) -> Result<Self, WorkdirError> {
+        let directory = directory.as_ref();
+        if !directory.is_absolute() {
+            return Err(WorkdirError::InvalidArgument(
+                "External Workdir directory must be absolute".to_string(),
+            ));
+        }
+        let selected_metadata = std::fs::symlink_metadata(directory)
+            .map_err(|error| WorkdirError::io(Path::new("<external-root>"), error))?;
+        if selected_metadata.file_type().is_symlink() {
+            return Err(WorkdirError::Denied(
+                "External Workdir root must not be a symbolic link".to_string(),
+            ));
+        }
+        if !selected_metadata.is_dir() {
+            return Err(WorkdirError::InvalidArgument(
+                "External Workdir root must be a directory".to_string(),
+            ));
+        }
+
+        let handle = Arc::new(
+            fs_operation::open_root_no_symlinks(directory)
+                .map_err(|error| WorkdirError::io(Path::new("<external-root>"), error))?,
+        );
+        let opened_metadata = handle
+            .metadata()
+            .map_err(|error| WorkdirError::io(Path::new("<external-root>"), error))?;
+        if !opened_metadata.is_dir() {
+            return Err(WorkdirError::InvalidArgument(
+                "External Workdir root must be a directory".to_string(),
+            ));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            if (selected_metadata.dev(), selected_metadata.ino())
+                != (opened_metadata.dev(), opened_metadata.ino())
+            {
+                return Err(WorkdirError::Denied(
+                    "External Workdir root changed while it was being pinned".to_string(),
+                ));
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        let canonical_path = {
+            use std::os::fd::AsRawFd;
+
+            let path = std::fs::read_link(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+                .map_err(|error| WorkdirError::io(Path::new("<external-root>"), error))?;
+            if !path.is_absolute() || path.to_string_lossy().ends_with(" (deleted)") {
+                return Err(WorkdirError::Denied(
+                    "External Workdir root moved while it was being pinned".to_string(),
+                ));
+            }
+            path
+        };
+        #[cfg(not(target_os = "linux"))]
+        let canonical_path = directory.to_path_buf();
+
+        Ok(Self {
+            canonical_path,
+            handle,
+        })
+    }
+
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OperationGuard {
+    cancelled: Arc<AtomicBool>,
+    deadline: Instant,
+}
+
 /// Scope-aware filesystem handle. Clone-cheap (`Arc` inside).
 ///
 /// The wrapped [`SharedScope`] is shared with every clone of this
@@ -391,6 +506,7 @@ impl<T> WorkdirSessionResource for T where T: Debug + Send + Sync {}
 #[derive(Debug, Clone)]
 pub struct LocalWorkdirSession {
     inner: Arc<LocalWorkdirSessionInner>,
+    operation_guard: Option<OperationGuard>,
 }
 
 /// First symlink encountered while resolving a path.
@@ -495,45 +611,29 @@ impl LocalWorkdirSession {
     /// Construct a strictly read-only provider session for an
     /// authority-assigned Workdir and an operator-selected local directory.
     ///
-    /// The selected directory is canonicalized and fixed for the lifetime of
-    /// the session. A symlink selected as the root is rejected, and all
-    /// operation paths are confined below the canonical root without following
+    /// The selected directory is atomically validated and pinned for the
+    /// session lifetime. A symlink selected as the root is rejected, and all
+    /// operation paths are confined below the pinned root without following
     /// symbolic links. Read source and response sizes are provider-bounded.
     pub fn external_read_only(
         workdir: Workdir,
         directory: impl AsRef<Path>,
         read_limits: BoundedReadLimits,
     ) -> Result<Self, WorkdirError> {
+        let root = ExternalWorkdirRoot::pin(directory)?;
+        Self::external_read_only_pinned(workdir, root, read_limits)
+    }
+
+    /// Construct a provider session from a root pinned before remote grant
+    /// creation, preventing any later pathname replacement from changing the
+    /// approved filesystem authority.
+    pub fn external_read_only_pinned(
+        workdir: Workdir,
+        pinned: ExternalWorkdirRoot,
+        read_limits: BoundedReadLimits,
+    ) -> Result<Self, WorkdirError> {
         read_limits.validate().map_err(WorkdirError::from)?;
-        let directory = directory.as_ref();
-        if !directory.is_absolute() {
-            return Err(WorkdirError::InvalidArgument(
-                "External Workdir directory must be absolute".to_string(),
-            ));
-        }
-        let selected_metadata = std::fs::symlink_metadata(directory)
-            .map_err(|error| WorkdirError::io(Path::new("<external-root>"), error))?;
-        if selected_metadata.file_type().is_symlink() {
-            return Err(WorkdirError::Denied(
-                "External Workdir root must not be a symbolic link".to_string(),
-            ));
-        }
-        let root = directory
-            .canonicalize()
-            .map_err(|error| WorkdirError::io(Path::new("<external-root>"), error))?;
-        if !root
-            .metadata()
-            .map_err(|error| WorkdirError::io(Path::new("<external-root>"), error))?
-            .is_dir()
-        {
-            return Err(WorkdirError::InvalidArgument(
-                "External Workdir root must be a directory".to_string(),
-            ));
-        }
-        let pinned_root = Arc::new(
-            fs_operation::open_root_no_symlinks(&root)
-                .map_err(|error| WorkdirError::io(Path::new("<external-root>"), error))?,
-        );
+        let root = pinned.canonical_path;
         let scope = Scope::from_config(&ScopeConfig {
             allow: vec![ScopeRule {
                 target: root.clone(),
@@ -556,10 +656,22 @@ impl LocalWorkdirSession {
             WorkdirSessionCapabilities::READ_ONLY,
             BTreeMap::new(),
             Vec::new(),
-            Some(pinned_root),
+            Some(pinned.handle),
             Some(read_limits),
             true,
         ))
+    }
+
+    /// Return an operation-local clone that cooperatively stops filesystem
+    /// work when cancelled or when its provider-side deadline expires.
+    pub fn with_operation_guard(&self, cancelled: Arc<AtomicBool>, deadline: Instant) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            operation_guard: Some(OperationGuard {
+                cancelled,
+                deadline,
+            }),
+        }
     }
 
     fn materialized_bound_with_policy(
@@ -592,6 +704,7 @@ impl LocalWorkdirSession {
                 command_environment,
                 resources: StdMutex::new(resources),
             }),
+            operation_guard: None,
         }
     }
 
@@ -809,6 +922,7 @@ impl LocalWorkdirSession {
             &self.inner.root,
             self.inner.pinned_root.clone(),
             self.inner.reject_symlinks,
+            self.operation_guard.clone(),
         )
     }
 }

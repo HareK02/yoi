@@ -20,6 +20,9 @@ pub fn run_stat(
     access: &dyn FsAccessPolicy,
 ) -> Result<StatResult, FsError> {
     let logical = request.path;
+    access
+        .check_cancelled()
+        .map_err(|error| map_io(&logical, error))?;
     let path = resolve(root, &logical)?;
     let resolved = resolve_access_path(&path).map_err(|error| map_io(&logical, error))?;
     if !access.is_readable_paths(&path, &resolved) {
@@ -73,6 +76,9 @@ fn run_read_with_limits(
     limits: Option<BoundedReadLimits>,
 ) -> Result<ReadResult, FsError> {
     let logical = request.path;
+    access
+        .check_cancelled()
+        .map_err(|error| map_io(&logical, error))?;
     let path = resolve(root, &logical)?;
     let target = require_access(&path, &logical, access, false, false)?;
     let file = access
@@ -111,6 +117,9 @@ fn run_read_with_limits(
     let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, file);
     let mut buffer = [0u8; READ_BUFFER_BYTES];
     loop {
+        access
+            .check_cancelled()
+            .map_err(|error| map_io(&logical, error))?;
         let read_limit = limits
             .map(|limits| {
                 limits
@@ -190,6 +199,9 @@ pub fn run_write(
     access: &dyn FsAccessPolicy,
 ) -> Result<WriteResult, FsError> {
     let logical = request.path;
+    access
+        .check_cancelled()
+        .map_err(|error| map_io(&logical, error))?;
     let path = resolve(root, &logical)?;
     let created = !path.exists();
     if path.exists() {
@@ -222,6 +234,9 @@ pub fn run_edit(
     access: &dyn FsAccessPolicy,
 ) -> Result<EditResult, FsError> {
     let logical = request.path;
+    access
+        .check_cancelled()
+        .map_err(|error| map_io(&logical, error))?;
     let path = resolve(root, &logical)?;
     let target = require_access(&path, &logical, access, true, false)?;
     let bytes = fs::read(&target).map_err(|error| map_io(&logical, error))?;
@@ -262,6 +277,9 @@ pub fn run_list(
     access: &dyn FsAccessPolicy,
 ) -> Result<ListResult, FsError> {
     let logical = request.path;
+    access
+        .check_cancelled()
+        .map_err(|error| map_io(&logical, error))?;
     let path = resolve(root, &logical)?;
     let logical_base = path.clone();
     let path = require_access(&path, &logical, access, false, true)?;
@@ -279,6 +297,9 @@ pub fn run_list(
         .open_read_dir(&logical_base, &path)
         .map_err(|error| map_io(&logical, error))?;
     for (entry_index, entry) in read_dir.enumerate() {
+        access
+            .check_cancelled()
+            .map_err(|error| map_io(&logical, error))?;
         if entry_index >= crate::MAX_TRAVERSAL_ENTRIES {
             return Err(FsError::InvalidArgument(format!(
                 "directory traversal exceeds provider limit {}",

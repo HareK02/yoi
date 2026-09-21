@@ -15,6 +15,10 @@ pub fn run_glob(
     if !root.is_absolute() {
         return Err(FsError::RelativePath(root.to_path_buf()));
     }
+    access.check_cancelled().map_err(|source| FsError::Io {
+        path: PathBuf::from(request.path.as_str()),
+        source,
+    })?;
     let base_resolved = resolve_access_path(base).map_err(|error| FsError::Io {
         path: PathBuf::from(request.path.as_str()),
         source: error,
@@ -32,6 +36,10 @@ pub fn run_glob(
     walker.hidden(false).follow_links(false);
     let mut visited = 0_usize;
     for entry in walker.build().flatten() {
+        access.check_cancelled().map_err(|source| FsError::Io {
+            path: PathBuf::from(request.path.as_str()),
+            source,
+        })?;
         visited = visited.saturating_add(1);
         if visited > crate::MAX_TRAVERSAL_ENTRIES {
             return Err(FsError::InvalidArgument(format!(

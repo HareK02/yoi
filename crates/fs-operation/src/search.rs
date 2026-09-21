@@ -18,10 +18,12 @@ use crate::{
 struct SourceBoundedReader<'a, R> {
     inner: R,
     remaining: &'a mut u64,
+    access: &'a dyn FsAccessPolicy,
 }
 
 impl<R: Read> Read for SourceBoundedReader<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.access.check_cancelled()?;
         if buffer.is_empty() {
             return Ok(0);
         }
@@ -228,6 +230,9 @@ pub fn run_grep(
     request: GrepRequest,
     access: &dyn FsAccessPolicy,
 ) -> Result<GrepResult, FsError> {
+    access
+        .check_cancelled()
+        .map_err(|error| FsError::io(&base, error))?;
     let p = GrepParams {
         pattern: request.pattern,
         path: Some(base.clone()),
@@ -372,6 +377,9 @@ pub fn run_grep(
     let mut visited = 0_usize;
     let mut source_bytes_remaining = crate::MAX_GREP_SOURCE_BYTES;
     for entry in walker.build().flatten() {
+        access
+            .check_cancelled()
+            .map_err(|error| FsError::io(&base, error))?;
         visited = visited.saturating_add(1);
         if visited > crate::MAX_TRAVERSAL_ENTRIES {
             return Err(FsError::InvalidArgument(format!(
@@ -445,6 +453,7 @@ fn scan_path(
     let mut reader = SourceBoundedReader {
         inner: reader,
         remaining: source_bytes_remaining,
+        access,
     };
     match mode {
         GrepOutputMode::FilesWithMatches => {
@@ -635,8 +644,22 @@ impl Sink for ContentSink<'_> {
 #[cfg(test)]
 mod bounded_reader_tests {
     use std::io::{Cursor, Read as _};
+    use std::path::Path;
 
     use super::SourceBoundedReader;
+    use crate::FsAccessPolicy;
+
+    struct Permit;
+
+    impl FsAccessPolicy for Permit {
+        fn is_readable(&self, _path: &Path) -> bool {
+            true
+        }
+
+        fn is_writable(&self, _path: &Path) -> bool {
+            true
+        }
+    }
 
     #[test]
     fn source_budget_is_shared_across_candidate_files() {
@@ -644,6 +667,7 @@ mod bounded_reader_tests {
         let mut first = SourceBoundedReader {
             inner: Cursor::new(b"ab"),
             remaining: &mut remaining,
+            access: &Permit,
         };
         let mut output = Vec::new();
         first.read_to_end(&mut output).unwrap();
@@ -653,6 +677,7 @@ mod bounded_reader_tests {
         let mut second = SourceBoundedReader {
             inner: Cursor::new(b"cd"),
             remaining: &mut remaining,
+            access: &Permit,
         };
         let error = second.read_to_end(&mut output).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);

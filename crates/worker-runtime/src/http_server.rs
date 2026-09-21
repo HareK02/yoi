@@ -67,7 +67,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use workdir::{
-    CommandOutput, CommandStatus, WorkdirSessionHandle,
+    CommandOutput, CommandStatus, WorkdirSessionHandle, dispatch_workdir_session_operation,
     http::{
         OpenWorkdirSessionRequest, OpenWorkdirSessionResponse, WorkdirSessionId,
         WorkdirSessionOperation, WorkdirSessionOperationRequest, WorkdirSessionOperationResult,
@@ -1030,41 +1030,6 @@ async fn run_workdir_session_operation(
     let operation = request.operation;
 
     let result = match operation {
-        WorkdirSessionOperation::AuthorizeScope(request) => {
-            session.authorize_scope_path(request).await?;
-            WorkdirSessionOperationResult::AuthorizeScope
-        }
-        WorkdirSessionOperation::ScopeRulesOverlap(request) => {
-            let overlaps = session.scope_rules_overlap(request).await?;
-            WorkdirSessionOperationResult::ScopeRulesOverlap { overlaps }
-        }
-        WorkdirSessionOperation::Stat(request) => {
-            WorkdirSessionOperationResult::Stat(session.stat(request).await?)
-        }
-        WorkdirSessionOperation::Read(request) => {
-            WorkdirSessionOperationResult::Read(session.read(request).await?)
-        }
-        WorkdirSessionOperation::Write(request) => {
-            WorkdirSessionOperationResult::Write(session.write(request).await?)
-        }
-        WorkdirSessionOperation::Edit(request) => {
-            WorkdirSessionOperationResult::Edit(session.edit(request).await?)
-        }
-        WorkdirSessionOperation::List(request) => {
-            WorkdirSessionOperationResult::List(session.list(request).await?)
-        }
-        WorkdirSessionOperation::Glob(request) => {
-            WorkdirSessionOperationResult::Glob(session.glob(request).await?)
-        }
-        WorkdirSessionOperation::Grep(request) => {
-            WorkdirSessionOperationResult::Grep(session.grep(request).await?)
-        }
-        WorkdirSessionOperation::CommandStart(request) => {
-            WorkdirSessionOperationResult::CommandStart(session.start_command(request).await?)
-        }
-        WorkdirSessionOperation::CommandStatus(handle) => {
-            WorkdirSessionOperationResult::CommandStatus(session.command_status(handle).await?)
-        }
         WorkdirSessionOperation::CommandOutput(request) if request.wait => {
             let cursor = request.cursor;
             let output = match tokio::time::timeout(
@@ -1086,13 +1051,7 @@ async fn run_workdir_session_operation(
             };
             WorkdirSessionOperationResult::CommandOutput(output)
         }
-        WorkdirSessionOperation::CommandOutput(request) => {
-            WorkdirSessionOperationResult::CommandOutput(session.command_output(request).await?)
-        }
-        WorkdirSessionOperation::CommandCancel(handle) => {
-            session.cancel_command(handle).await?;
-            WorkdirSessionOperationResult::CommandCancel
-        }
+        operation => dispatch_workdir_session_operation(session, operation).await?,
     };
     Ok(Json(result))
 }

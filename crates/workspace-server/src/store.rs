@@ -21,7 +21,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 64;
+const LATEST_SCHEMA_VERSION: i64 = 65;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -44,6 +44,8 @@ const WORKER_REGISTRY_PROJECTION_MIGRATION_NAME: &str =
 const MULTI_WORKDIR_ATTACHMENTS_MIGRATION_NAME: &str =
     "multiple Worker Workdir attachments and Workdir display names";
 const EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME: &str = "typed client-hosted External Workdir grants";
+const EXTERNAL_WORKDIR_CLEANUP_MIGRATION_NAME: &str =
+    "durable External Workdir expiry cleanup state";
 const WORKER_REGISTRY_PROJECTION_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS worker_registry_observations (
     workspace_id TEXT NOT NULL,
@@ -158,6 +160,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 64,
         name: EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME,
         apply: migrate_external_workdir_grants_v63_to_v64,
+    },
+    Migration {
+        version: 65,
+        name: EXTERNAL_WORKDIR_CLEANUP_MIGRATION_NAME,
+        apply: migrate_external_workdir_cleanup_v64_to_v65,
     },
 ];
 
@@ -1644,6 +1651,10 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         workspace_id: &str,
         grant_id: &str,
     ) -> Result<Option<ExternalWorkdirGrantRecord>>;
+    fn list_external_workdir_grants(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<ExternalWorkdirGrantRecord>>;
     fn activate_external_workdir_grant(
         &self,
         workspace_id: &str,
@@ -1666,6 +1677,14 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         workspace_id: &str,
         now: &str,
     ) -> Result<Vec<String>>;
+    fn update_external_workdir_cleanup_state(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+        state: &str,
+        error: Option<&str>,
+        updated_at: &str,
+    ) -> Result<bool>;
     #[allow(clippy::too_many_arguments)]
     fn record_external_workdir_audit(
         &self,
@@ -7661,6 +7680,38 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn list_external_workdir_grants(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<ExternalWorkdirGrantRecord>> {
+        self.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                r#"SELECT grant_id, workspace_id, workdir_id, provider_instance_id, display_name,
+                          permissions, created_by, created_at, expires_at, generation, status, updated_at
+                   FROM external_workdir_grants WHERE workspace_id = ?1 ORDER BY grant_id"#,
+            )?;
+            statement
+                .query_map(params![workspace_id], |row| {
+                    Ok(ExternalWorkdirGrantRecord {
+                        grant_id: row.get(0)?,
+                        workspace_id: row.get(1)?,
+                        workdir_id: row.get(2)?,
+                        provider_instance_id: row.get(3)?,
+                        display_name: row.get(4)?,
+                        permissions: row.get(5)?,
+                        created_by: row.get(6)?,
+                        created_at: row.get(7)?,
+                        expires_at: row.get(8)?,
+                        generation: row.get::<_, i64>(9)? as u64,
+                        status: row.get(10)?,
+                        updated_at: row.get(11)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Error::from)
+        })
+    }
+
     fn activate_external_workdir_grant(
         &self,
         workspace_id: &str,
@@ -7706,7 +7757,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<bool> {
         self.with_conn(|conn| {
             let changed = conn.execute(
-                r#"UPDATE external_workdir_grants SET status = ?5, updated_at = ?6
+                r#"UPDATE external_workdir_grants
+                   SET status = ?5, updated_at = ?6,
+                       cleanup_state = CASE WHEN ?5 IN ('revoked', 'expired') THEN 'pending' ELSE cleanup_state END,
+                       cleanup_error = CASE WHEN ?5 IN ('revoked', 'expired') THEN NULL ELSE cleanup_error END,
+                       cleanup_updated_at = CASE WHEN ?5 IN ('revoked', 'expired') THEN ?6 ELSE cleanup_updated_at END
                    WHERE workspace_id = ?1 AND grant_id = ?2 AND provider_instance_id = ?3
                      AND generation = ?4 AND status NOT IN ('revoked', 'expired')"#,
                 params![
@@ -7741,7 +7796,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
-                "UPDATE external_workdir_grants SET status = 'expired', updated_at = ?2
+                "UPDATE external_workdir_grants
+                 SET status = 'expired', updated_at = ?2, cleanup_state = 'pending',
+                     cleanup_error = NULL, cleanup_updated_at = ?2
                  WHERE workspace_id = ?1 AND status IN ('pending', 'online', 'offline')
                    AND expires_at <= ?2",
                 params![workspace_id, now],
@@ -7762,14 +7819,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             let cleanup = {
                 let mut statement = tx.prepare(
-                    "SELECT DISTINCT grant.workdir_id
+                    "SELECT grant.workdir_id
                      FROM external_workdir_grants grant
-                     JOIN worker_workdir_links link
-                       ON link.workspace_id = grant.workspace_id
-                      AND link.workdir_id = grant.workdir_id
-                      AND link.unlinked_at IS NULL
                      WHERE grant.workspace_id = ?1
                        AND grant.status IN ('revoked', 'expired')
+                       AND grant.cleanup_state IN ('pending', 'retry_required')
                      ORDER BY grant.workdir_id",
                 )?;
                 statement
@@ -7778,6 +7832,32 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             };
             tx.commit()?;
             Ok(cleanup)
+        })
+    }
+
+    fn update_external_workdir_cleanup_state(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+        state: &str,
+        error: Option<&str>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        if !matches!(state, "pending" | "retry_required" | "completed") {
+            return Err(Error::InvalidInput(
+                "invalid External Workdir cleanup state".to_string(),
+            ));
+        }
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE external_workdir_grants
+                 SET cleanup_state = ?3, cleanup_error = ?4, cleanup_updated_at = ?5
+                 WHERE workspace_id = ?1 AND grant_id = ?2
+                   AND status IN ('revoked', 'expired')",
+                params![workspace_id, grant_id, state, error, updated_at],
+            )
+            .map(|changed| changed > 0)
+            .map_err(Error::from)
         })
     }
 
@@ -11226,6 +11306,29 @@ fn migrate_external_workdir_grants_v63_to_v64(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_external_workdir_cleanup_v64_to_v65(conn: &Connection) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    if !column_exists(&tx, "external_workdir_grants", "cleanup_state")? {
+        tx.execute_batch(
+            "ALTER TABLE external_workdir_grants ADD COLUMN cleanup_state TEXT NOT NULL DEFAULT 'not_required' CHECK (cleanup_state IN ('not_required', 'pending', 'retry_required', 'completed'));\
+             ALTER TABLE external_workdir_grants ADD COLUMN cleanup_error TEXT;\
+             ALTER TABLE external_workdir_grants ADD COLUMN cleanup_updated_at TEXT;",
+        )?;
+        tx.execute(
+            "UPDATE external_workdir_grants
+             SET cleanup_state = 'pending', cleanup_updated_at = updated_at
+             WHERE status IN ('revoked', 'expired')",
+            [],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![65, EXTERNAL_WORKDIR_CLEANUP_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(include_str!("latest_schema.sql"))?;
     Ok(())
@@ -12048,6 +12151,45 @@ mod tests {
                     "2026-01-01T00:00:07Z",
                 )
                 .unwrap()
+        );
+        let cleanup_after_fence = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT cleanup_state, cleanup_error FROM external_workdir_grants WHERE workspace_id = 'workspace-a' AND grant_id = 'grant-a'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .map_err(Error::from)
+            })
+            .unwrap();
+        assert_eq!(cleanup_after_fence, ("pending".to_string(), None));
+        assert!(
+            store
+                .update_external_workdir_cleanup_state(
+                    "workspace-a",
+                    "grant-a",
+                    "retry_required",
+                    Some("attachment_release_failed"),
+                    "2026-01-01T00:00:08Z",
+                )
+                .unwrap()
+        );
+        let cleanup_retry = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT cleanup_state, cleanup_error FROM external_workdir_grants WHERE workspace_id = 'workspace-a' AND grant_id = 'grant-a'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .map_err(Error::from)
+            })
+            .unwrap();
+        assert_eq!(
+            cleanup_retry,
+            (
+                "retry_required".to_string(),
+                Some("attachment_release_failed".to_string())
+            )
         );
         assert!(
             !store
@@ -12928,6 +13070,10 @@ mod tests {
                     version: 64,
                     name: EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 65,
+                    name: EXTERNAL_WORKDIR_CLEANUP_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -12981,6 +13127,7 @@ mod tests {
                         (62, WORKER_REGISTRY_PROJECTION_MIGRATION_NAME.to_string()),
                         (63, MULTI_WORKDIR_ATTACHMENTS_MIGRATION_NAME.to_string()),
                         (64, EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME.to_string()),
+                        (65, EXTERNAL_WORKDIR_CLEANUP_MIGRATION_NAME.to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -13051,7 +13198,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64]
+            vec![52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
@@ -13059,7 +13206,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 15);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 16);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());
     }

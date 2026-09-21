@@ -152,6 +152,12 @@ pub trait FsAccessPolicy: Send + Sync {
     fn is_readable(&self, path: &Path) -> bool;
     fn is_writable(&self, path: &Path) -> bool;
 
+    /// Cooperatively stop provider-owned filesystem work. Implementations may
+    /// use this for per-operation cancellation and deadlines.
+    fn check_cancelled(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Open an already-authorized readable file. Capability providers override
     /// this to bind path resolution and open into one root-confined operation.
     fn open_read_file(&self, _logical: &Path, resolved: &Path) -> std::io::Result<std::fs::File> {
@@ -336,6 +342,87 @@ mod tests {
             limit: 10,
             offset: 0,
         }
+    }
+
+    #[test]
+    fn cancellation_stops_a_read_already_in_progress() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+
+        struct CancellableAccess {
+            root: PathBuf,
+            checks: AtomicUsize,
+            cancelled: AtomicBool,
+            state: Mutex<()>,
+            changed: Condvar,
+        }
+
+        impl FsAccessPolicy for CancellableAccess {
+            fn is_readable(&self, path: &Path) -> bool {
+                path.starts_with(&self.root)
+            }
+
+            fn is_writable(&self, _path: &Path) -> bool {
+                false
+            }
+
+            fn check_cancelled(&self) -> std::io::Result<()> {
+                if self.checks.fetch_add(1, Ordering::SeqCst) == 1 {
+                    self.changed.notify_all();
+                    let mut state = self.state.lock().unwrap();
+                    while !self.cancelled.load(Ordering::Acquire) {
+                        state = self.changed.wait(state).unwrap();
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancelled",
+                    ));
+                }
+                Ok(())
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("large.txt"), vec![b'x'; 128 * 1024]).unwrap();
+        let access = Arc::new(CancellableAccess {
+            root: root.clone(),
+            checks: AtomicUsize::new(0),
+            cancelled: AtomicBool::new(false),
+            state: Mutex::new(()),
+            changed: Condvar::new(),
+        });
+        let task_access = access.clone();
+        let task_root = root.clone();
+        let task = std::thread::spawn(move || {
+            run_read_bounded(
+                &task_root,
+                ReadRequest {
+                    path: FsPath::new("large.txt").unwrap(),
+                    offset: 0,
+                    limit: usize::MAX,
+                    max_bytes: 1024,
+                },
+                task_access.as_ref(),
+                BoundedReadLimits::new(256 * 1024, 1024).unwrap(),
+            )
+        });
+
+        let mut state = access.state.lock().unwrap();
+        while access.checks.load(Ordering::SeqCst) < 2 {
+            state = access.changed.wait(state).unwrap();
+        }
+        access.cancelled.store(true, Ordering::Release);
+        access.changed.notify_all();
+        drop(state);
+
+        let error = task
+            .join()
+            .unwrap()
+            .expect_err("read must stop on cancellation");
+        assert!(
+            matches!(error, FsError::Io { source, .. } if source.kind() == std::io::ErrorKind::Interrupted)
+        );
     }
 
     #[test]
