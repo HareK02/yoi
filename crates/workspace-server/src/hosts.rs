@@ -2635,21 +2635,13 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         };
         let workspace_id = workspace_api.workspace_id.clone();
         let config_bundle = spawn_config_bundle_ref(&request);
-        let create_request = CreateWorkerRequest {
-            worker_id: binding.worker_id,
-            create_fingerprint: binding.create_fingerprint,
-            profile,
-            display_name: request.requested_worker_name.clone(),
-            config_bundle,
+        let create_request = runtime_create_worker_request(
+            binding,
+            &request,
             profile_source,
-            initial_input: initial_worker_input(&request.initial_submit),
-            workdir_attachment_requests: request.resolved_workdir_attachment_requests.clone(),
-            workdir_attachments: request.resolved_workdir_attachments.clone(),
-            worker_observation_enabled: request.resolved_worker_observation_enabled,
-            worker_observation_grants: request.resolved_worker_observation_grants.clone(),
-            workspace_api: Some(workspace_api),
-            memory_settings: request.resolved_memory_settings.clone(),
-        };
+            workspace_api,
+            config_bundle,
+        );
         let workspace_scope = RuntimeWorkspaceScope::new(workspace_id, "embedded-backend");
         match self
             .runtime
@@ -4674,21 +4666,13 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             }
         };
         let config_bundle = spawn_config_bundle_ref(&request);
-        let create = CreateWorkerRequest {
-            worker_id: binding.worker_id,
-            create_fingerprint: binding.create_fingerprint,
-            profile,
-            display_name: request.requested_worker_name.clone(),
-            config_bundle,
+        let create = runtime_create_worker_request(
+            binding,
+            &request,
             profile_source,
-            initial_input: initial_worker_input(&request.initial_submit),
-            workdir_attachment_requests: request.resolved_workdir_attachment_requests.clone(),
-            workdir_attachments: request.resolved_workdir_attachments.clone(),
-            worker_observation_enabled: request.resolved_worker_observation_enabled,
-            worker_observation_grants: request.resolved_worker_observation_grants.clone(),
-            workspace_api: Some(workspace_api),
-            memory_settings: request.resolved_memory_settings.clone(),
-        };
+            workspace_api,
+            config_bundle,
+        );
         let create = match runtime_contract_convert(create) {
             Ok(create) => create,
             Err(diagnostic) => {
@@ -5114,6 +5098,30 @@ fn remote_worker_projection_diagnostics(
     )];
     diagnostics.extend(execution_metadata_diagnostic(execution_metadata_available));
     diagnostics
+}
+
+fn runtime_create_worker_request(
+    binding: WorkerCreateBinding,
+    request: &WorkerSpawnRequest,
+    profile_source: ProfileSourceArchiveSource,
+    workspace_api: WorkspaceApiRef,
+    config_bundle: Option<ConfigBundleRef>,
+) -> CreateWorkerRequest {
+    CreateWorkerRequest {
+        worker_id: binding.worker_id,
+        create_fingerprint: binding.create_fingerprint,
+        profile: request.profile.clone(),
+        display_name: request.requested_worker_name.clone(),
+        config_bundle,
+        profile_source,
+        initial_input: initial_worker_input(&request.initial_submit),
+        workdir_attachment_requests: request.resolved_workdir_attachment_requests.clone(),
+        workdir_attachments: request.resolved_workdir_attachments.clone(),
+        worker_observation_enabled: request.resolved_worker_observation_enabled,
+        worker_observation_grants: request.resolved_worker_observation_grants.clone(),
+        workspace_api: Some(workspace_api),
+        memory_settings: request.resolved_memory_settings.clone(),
+    }
 }
 
 fn spawn_config_bundle_ref(request: &WorkerSpawnRequest) -> Option<ConfigBundleRef> {
@@ -6811,6 +6819,41 @@ mod tests {
         let bundle_ref = spawn_config_bundle_ref(&request).expect("bundle reference");
         assert_eq!(bundle_ref.id, expected_id);
         assert_eq!(bundle_ref.digest, expected_digest);
+    }
+
+    #[test]
+    fn runtime_create_request_serializes_only_canonical_workdir_attachments() {
+        let mut request = embedded_spawn_request();
+        request.resolved_workdir_attachments = vec![WorkingDirectoryAttachmentClaim {
+            alias: workdir::WorkdirAttachmentAlias::new("workdir").unwrap(),
+            working_directory_id: "workdir-1".to_string(),
+            relative_cwd: Some("crates/yoi".to_string()),
+        }];
+        let profile_source =
+            profile_source_archive_source(&request, &request.profile).expect("profile source");
+        let create = runtime_create_worker_request(
+            test_create_binding(),
+            &request,
+            profile_source,
+            test_workspace_api(),
+            spawn_config_bundle_ref(&request),
+        );
+
+        let value = serde_json::to_value(create).unwrap();
+        assert!(value.get("working_directory").is_none());
+        assert!(value.get("working_directory_request").is_none());
+        assert_eq!(value["workdir_attachments"].as_array().unwrap().len(), 1);
+        assert_eq!(value["workdir_attachments"][0]["alias"], "workdir");
+        assert_eq!(
+            value["workdir_attachments"][0]["working_directory_id"],
+            "workdir-1"
+        );
+        assert_eq!(
+            value["workdir_attachments"][0]["relative_cwd"],
+            "crates/yoi"
+        );
+        serde_json::from_value::<runtime_api::CreateWorkerRequest>(value)
+            .expect("remote Runtime create payload must satisfy the strict DTO");
     }
 
     #[test]

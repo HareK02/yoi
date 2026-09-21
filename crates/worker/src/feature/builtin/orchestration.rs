@@ -260,7 +260,8 @@ mod tests {
             &serde_json::json!({
                 "ticket_id": "T-482",
                 "runtime_id": "runtime-1",
-                "working_directory_id": "workdir-1"
+                "working_directory_id": "workdir-1",
+                "relative_cwd": "crates/yoi"
             })
             .to_string(),
             ToolExecutionContext::new("call-7", "batch-1", 0),
@@ -277,6 +278,8 @@ mod tests {
             Some("spawn-ticket-coder:00001KZXN51C7:call-7")
         );
         assert_eq!(request.display_name, "Coder · T-482");
+        assert_eq!(request.working_directory_id, "workdir-1");
+        assert_eq!(request.relative_cwd.as_deref(), Some("crates/yoi"));
         assert_eq!(
             request.initial_submit,
             vec![
