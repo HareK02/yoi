@@ -259,6 +259,7 @@ pub struct WorkerExecutionRestoreRequest {
     pub workspace_scope: Option<crate::runtime::RuntimeWorkspaceScope>,
     pub context: WorkerExecutionContext,
     pub previous_workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
+    pub logical_workdir_attachments: Vec<crate::catalog::LogicalWorkdirAttachment>,
     pub workdir_attachments: BTreeMap<workdir::WorkdirAttachmentAlias, WorkingDirectoryBinding>,
     pub config_bundle: Option<ConfigBundle>,
 }

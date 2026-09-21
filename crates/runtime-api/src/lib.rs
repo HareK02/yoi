@@ -345,6 +345,15 @@ pub struct WorkingDirectoryRequest {
     pub materialization: Option<RepositoryMaterializationContext>,
 }
 
+/// Workspace-authoritative alias-to-Workdir mapping, independent of any
+/// Runtime-local materialized binding.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LogicalWorkdirAttachment {
+    /// Stable Worker-local routing key. This is not a Workdir id or display name.
+    pub alias: workdir::WorkdirAttachmentAlias,
+    pub working_directory_id: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkingDirectoryAttachmentClaim {
     /// Stable Worker-local routing key. This is not a Workdir id or display name.
@@ -356,7 +365,9 @@ pub struct WorkingDirectoryAttachmentClaim {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerWorkdirAttachmentsRequest {
-    pub workdir_attachments: Vec<WorkingDirectoryAttachmentClaim>,
+    /// Exact current logical attachment set. Runtime-local bindings are not
+    /// inferred from these identities.
+    pub logical_workdir_attachments: Vec<LogicalWorkdirAttachment>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

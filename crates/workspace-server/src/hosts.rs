@@ -29,8 +29,8 @@ use workdir::{
 };
 use worker_runtime::RuntimeWorkspaceScope;
 use worker_runtime::catalog::{
-    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, ProfileSourceArchiveSource,
-    RepositoryRefObservation, RepositoryRefObservationRequest,
+    ConfigBundleRef, CreateWorkerRequest, LogicalWorkdirAttachment, ProfileSelector,
+    ProfileSourceArchiveSource, RepositoryRefObservation, RepositoryRefObservationRequest,
     WorkerDetail as EmbeddedWorkerDetail, WorkerStatus as EmbeddedWorkerStatus,
     WorkingDirectoryAttachmentClaim, WorkingDirectoryAttachmentRequest,
     WorkingDirectoryAttachmentStatus, WorkingDirectoryRepositoryAccessRequest,
@@ -914,7 +914,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
     fn replace_worker_workdir_attachments(
         &self,
         worker_id: &str,
-        _attachments: Vec<WorkingDirectoryAttachmentClaim>,
+        _attachments: Vec<LogicalWorkdirAttachment>,
     ) -> WorkerWorkspaceApiResult {
         WorkerWorkspaceApiResult {
             state: WorkerOperationState::Unsupported,
@@ -1516,7 +1516,7 @@ impl RuntimeRegistry {
     pub fn replace_worker_workdir_attachments(
         &self,
         worker: &RuntimeWorkerRef,
-        attachments: Vec<WorkingDirectoryAttachmentClaim>,
+        attachments: Vec<LogicalWorkdirAttachment>,
     ) -> Result<WorkerWorkspaceApiResult, RuntimeRegistryError> {
         let runtime_id = worker.runtime_id.as_str();
         let worker_id = worker.worker_id.as_str();
@@ -2469,7 +2469,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
     fn replace_worker_workdir_attachments(
         &self,
         worker_id: &str,
-        attachments: Vec<WorkingDirectoryAttachmentClaim>,
+        attachments: Vec<LogicalWorkdirAttachment>,
     ) -> WorkerWorkspaceApiResult {
         let Some(worker_ref) = self.worker_ref(worker_id) else {
             return WorkerWorkspaceApiResult {
@@ -4453,7 +4453,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
     fn replace_worker_workdir_attachments(
         &self,
         worker_id: &str,
-        attachments: Vec<WorkingDirectoryAttachmentClaim>,
+        attachments: Vec<LogicalWorkdirAttachment>,
     ) -> WorkerWorkspaceApiResult {
         let workdir_attachments = match runtime_contract_convert(attachments) {
             Ok(attachments) => attachments,
@@ -4466,7 +4466,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             }
         };
         let request = runtime_api::WorkerWorkdirAttachmentsRequest {
-            workdir_attachments,
+            logical_workdir_attachments: workdir_attachments,
         };
         let worker_id = worker_id.to_string();
         match self

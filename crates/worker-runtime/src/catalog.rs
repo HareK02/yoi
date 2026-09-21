@@ -198,6 +198,14 @@ pub struct RepositoryRefObservation {
     pub observed_at_epoch_seconds: u64,
 }
 
+/// Workspace-authoritative alias-to-Workdir mapping. This carries no claim that
+/// the Worker Runtime materialized or can bind the referenced Workdir locally.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogicalWorkdirAttachment {
+    pub alias: workdir::WorkdirAttachmentAlias,
+    pub working_directory_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingDirectoryAttachmentClaim {
     pub alias: workdir::WorkdirAttachmentAlias,

@@ -1,10 +1,9 @@
 use crate::catalog::{
-    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, ProfileSourceArchiveSource,
-    RepositoryRefObservation, RepositoryRefObservationRequest, WorkerDetail, WorkerLifecycleAck,
-    WorkerRestoreIntent, WorkerStatus, WorkerSummary, WorkingDirectoryAttachmentClaim,
-    WorkingDirectoryAttachmentStatus, WorkingDirectoryRepositoryAccessRequest,
-    WorkingDirectoryRequest, WorkingDirectoryStatus as CatalogWorkingDirectoryStatus,
-    WorkspaceApiRef,
+    ConfigBundleRef, CreateWorkerRequest, LogicalWorkdirAttachment, ProfileSelector,
+    ProfileSourceArchiveSource, RepositoryRefObservation, RepositoryRefObservationRequest,
+    WorkerDetail, WorkerLifecycleAck, WorkerRestoreIntent, WorkerStatus, WorkerSummary,
+    WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest,
+    WorkingDirectoryStatus as CatalogWorkingDirectoryStatus, WorkspaceApiRef,
 };
 use crate::config_bundle::{
     ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary, validate_config_bundle,
@@ -1061,6 +1060,7 @@ impl Runtime {
                 execution_bound: true,
                 restore_intent: WorkerRestoreIntent::Explicit,
                 workdir_attachments: Vec::new(),
+                logical_workdir_attachments: Vec::new(),
                 execution_handle: None,
                 internal_workers: InternalWorkerActivityProjection::default(),
             };
@@ -1447,106 +1447,95 @@ impl Runtime {
         &self,
         scope: &RuntimeWorkspaceScope,
         worker_ref: &WorkerRef,
-        attachments: Vec<WorkingDirectoryAttachmentClaim>,
+        attachments: Vec<LogicalWorkdirAttachment>,
     ) -> Result<WorkerDetail, RuntimeError> {
         self.ensure_worker_in_workspace(scope, worker_ref)?;
         self.replace_worker_workdir_attachments(worker_ref, attachments)
     }
 
-    /// Persist the exact current attachment set used by live mutation and future restore.
+    /// Persist the Workspace-authoritative logical attachment set used by live
+    /// mutation and future restore. Runtime-local bindings remain a separate,
+    /// optional implementation detail and never authorize logical attachment.
     pub fn replace_worker_workdir_attachments(
         &self,
         worker_ref: &WorkerRef,
-        mut attachments: Vec<WorkingDirectoryAttachmentClaim>,
+        mut attachments: Vec<LogicalWorkdirAttachment>,
     ) -> Result<WorkerDetail, RuntimeError> {
         let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
         let _operation_guard = operation_lock
             .lock()
             .map_err(|_| RuntimeError::StatePoisoned)?;
-
-        let backend = {
-            let state = self.lock()?;
-            let worker = state.worker(worker_ref)?;
-            if worker.execution_handle.is_none() || !worker.status.is_active() {
-                return Err(RuntimeError::WorkerExecutionUnavailable {
-                    worker_id: worker.worker_id,
-                    message: "Workdir attachments can only be changed for a live Worker"
-                        .to_string(),
-                });
-            }
-            let request = worker.request.as_ref().ok_or_else(|| {
-                RuntimeError::WorkerExecutionUnavailable {
-                    worker_id: worker.worker_id,
-                    message: "persisted Worker restore request is unavailable".to_string(),
-                }
-            })?;
-            for attachment in &mut attachments {
-                if attachment.relative_cwd.is_none()
-                    && let Some(previous) = request.workdir_attachments.iter().find(|previous| {
-                        previous.alias == attachment.alias
-                            && previous.working_directory_id == attachment.working_directory_id
-                    })
-                {
-                    attachment.relative_cwd = previous.relative_cwd.clone();
-                }
-            }
-            let mut candidate = request.clone();
-            candidate.workdir_attachment_requests.clear();
-            candidate.workdir_attachments = attachments.clone();
-            validate_create_worker_request(&candidate)?;
-            state.execution_backend.clone().ok_or_else(|| {
-                RuntimeError::ExecutionBackendUnavailable {
-                    message: "Workdir attachment mutation requires an execution backend"
-                        .to_string(),
-                }
-            })?
-        };
-
-        let statuses = attachments
-            .iter()
-            .map(|attachment| {
-                backend
-                    .working_directory(&attachment.working_directory_id)
-                    .map(|working_directory| WorkingDirectoryAttachmentStatus {
-                        alias: attachment.alias.clone(),
-                        working_directory,
-                    })
-                    .map_err(RuntimeError::from)
-            })
-            .collect::<Result<Vec<_>, RuntimeError>>()?;
-        if let Some(inactive) = statuses.iter().find(|attachment| {
-            attachment.working_directory.summary.status
-                != workdir::workspace::WorkingDirectoryStatusKind::Active
-        }) {
-            return Err(RuntimeError::InvalidRequest(format!(
-                "working directory {} is not active ({})",
-                inactive.working_directory.summary.working_directory_id,
-                inactive.working_directory.summary.status
-            )));
-        }
+        validate_logical_workdir_attachments(&attachments)?;
+        attachments.sort_by(|left, right| left.alias.cmp(&right.alias));
 
         let mut state = self.lock()?;
-        for attachment in &attachments {
-            if let Some(owner_worker_id) =
-                state.worker_id_for_workdir(&attachment.working_directory_id)
-                && owner_worker_id != worker_ref.worker_id
-            {
-                return Err(RuntimeError::InvalidRequest(format!(
-                    "working directory {} is already assigned to worker {owner_worker_id}",
-                    attachment.working_directory_id
-                )));
-            }
-        }
         let previous = state.worker(worker_ref)?.clone();
         {
             let worker = state.worker_mut(worker_ref)?;
+            if !attachments.is_empty() && worker.workspace_id.is_none() {
+                return Err(RuntimeError::InvalidRequest(
+                    "logical Workdir attachments require Workspace authority".to_string(),
+                ));
+            }
+            if worker.request.is_none() {
+                return Err(RuntimeError::WorkerExecutionUnavailable {
+                    worker_id: worker.worker_id,
+                    message: "persisted Worker restore request is unavailable".to_string(),
+                });
+            }
+            let logical_by_alias = attachments
+                .iter()
+                .map(|attachment| {
+                    (
+                        attachment.alias.clone(),
+                        attachment.working_directory_id.as_str(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            for local in &worker.workdir_attachments {
+                let local_id = local
+                    .working_directory
+                    .summary
+                    .working_directory_id
+                    .as_str();
+                if let Some(logical_id) = logical_by_alias.get(&local.alias)
+                    && *logical_id != local_id
+                {
+                    return Err(RuntimeError::InvalidRequest(format!(
+                        "logical Workdir attachment alias `{}` conflicts with Runtime-local Workdir {}",
+                        local.alias, local_id
+                    )));
+                }
+            }
+            let retained_local = worker
+                .workdir_attachments
+                .iter()
+                .filter_map(|local| {
+                    let local_id = local
+                        .working_directory
+                        .summary
+                        .working_directory_id
+                        .as_str();
+                    (logical_by_alias.get(&local.alias).copied() == Some(local_id))
+                        .then(|| (local.alias.clone(), local_id.to_string()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            worker
+                .workdir_attachments
+                .retain(|local| retained_local.contains_key(&local.alias));
             let request = worker
                 .request
                 .as_mut()
-                .expect("restore request checked above");
-            request.workdir_attachment_requests.clear();
-            request.workdir_attachments = attachments;
-            worker.workdir_attachments = statuses;
+                .expect("restore request existence checked above");
+            request
+                .workdir_attachment_requests
+                .retain(|local| retained_local.contains_key(&local.alias));
+            request.workdir_attachments.retain(|local| {
+                retained_local
+                    .get(&local.alias)
+                    .is_some_and(|workdir_id| workdir_id == &local.working_directory_id)
+            });
+            worker.logical_workdir_attachments = attachments;
         }
         if let Err(error) = state.persist_worker(&worker_ref.worker_id) {
             state.workers.insert(worker_ref.worker_id, previous);
@@ -1702,6 +1691,7 @@ impl Runtime {
                 workspace_scope,
                 context: self.execution_context(worker_ref.clone()),
                 previous_workdir_attachments: worker.workdir_attachments.clone(),
+                logical_workdir_attachments: worker.logical_workdir_attachments.clone(),
                 workdir_attachments: BTreeMap::new(),
                 config_bundle: None,
             };
@@ -2225,6 +2215,8 @@ impl Runtime {
                 let _ = worker.apply_worker_state(snapshot);
             }
             worker.restore_intent = restore_intent_for_status(worker.status);
+            worker.logical_workdir_attachments =
+                logical_workdir_attachments_from_statuses(&workdir_attachments);
             worker.workdir_attachments = workdir_attachments;
             worker.detail()
         };
@@ -2875,6 +2867,8 @@ impl Runtime {
         candidate.execution_bound = true;
         candidate.status = WorkerStatus::Idle;
         candidate.restore_intent = WorkerRestoreIntent::Explicit;
+        candidate.logical_workdir_attachments =
+            logical_workdir_attachments_from_statuses(&workdir_attachments);
         candidate.workdir_attachments = workdir_attachments;
         state.workers.insert(worker_ref.worker_id, candidate);
         state.publish_worker_upsert(worker_ref.worker_id)?;
@@ -3218,6 +3212,11 @@ impl RuntimeState {
                         (None, false, false, restore_intent_for_status(worker.status))
                     }
                 };
+            let logical_workdir_attachments = if worker.logical_workdir_attachments.is_empty() {
+                logical_workdir_attachments_from_statuses(&worker.workdir_attachments)
+            } else {
+                worker.logical_workdir_attachments
+            };
             workers.insert(
                 worker_id,
                 WorkerRecord {
@@ -3236,6 +3235,7 @@ impl RuntimeState {
                     execution_bound,
                     restore_intent,
                     workdir_attachments: worker.workdir_attachments,
+                    logical_workdir_attachments,
                     execution_handle: None,
                     internal_workers: InternalWorkerActivityProjection::default(),
                 },
@@ -4132,6 +4132,7 @@ struct WorkerRecord {
     execution_bound: bool,
     restore_intent: WorkerRestoreIntent,
     workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
+    logical_workdir_attachments: Vec<LogicalWorkdirAttachment>,
     execution_handle: Option<WorkerExecutionHandle>,
     internal_workers: InternalWorkerActivityProjection,
 }
@@ -4205,6 +4206,7 @@ impl WorkerRecord {
             execution_state,
             workspace_id: self.workspace_id.clone(),
             workdir_attachments: self.workdir_attachments.clone(),
+            logical_workdir_attachments: self.logical_workdir_attachments.clone(),
         }
     }
 }
@@ -4277,6 +4279,50 @@ fn requested_workdir_ids(request: &CreateWorkerRequest) -> Vec<&str> {
                 }),
         )
         .collect()
+}
+
+fn logical_workdir_attachments_from_statuses(
+    attachments: &[crate::catalog::WorkingDirectoryAttachmentStatus],
+) -> Vec<LogicalWorkdirAttachment> {
+    attachments
+        .iter()
+        .map(|attachment| LogicalWorkdirAttachment {
+            alias: attachment.alias.clone(),
+            working_directory_id: attachment
+                .working_directory
+                .summary
+                .working_directory_id
+                .clone(),
+        })
+        .collect()
+}
+
+fn validate_logical_workdir_attachments(
+    attachments: &[LogicalWorkdirAttachment],
+) -> Result<(), RuntimeError> {
+    let mut aliases = std::collections::BTreeSet::new();
+    let mut workdir_ids = std::collections::BTreeSet::new();
+    for attachment in attachments {
+        let workdir_id = attachment.working_directory_id.trim();
+        if workdir_id.is_empty() || workdir_id.chars().any(char::is_control) {
+            return Err(RuntimeError::InvalidRequest(
+                "logical Workdir attachment id must not be empty or contain control characters"
+                    .to_string(),
+            ));
+        }
+        if !aliases.insert(attachment.alias.as_str()) {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "duplicate logical Workdir attachment alias `{}`",
+                attachment.alias
+            )));
+        }
+        if !workdir_ids.insert(workdir_id) {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "logical working directory `{workdir_id}` cannot be attached more than once"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), RuntimeError> {
@@ -4615,7 +4661,8 @@ mod tests {
         ConfigBundleRef, MaterializerKind, ProfileSelector, RepositoryMaterializationContext,
         RepositorySshCredentialCandidate, RepositorySshMaterializationAccess, SensitiveString,
         WorkingDirectoryAttachmentClaim, WorkingDirectoryAttachmentRequest,
-        WorkingDirectoryRepository, WorkingDirectoryRequest, WorkspaceApiRef,
+        WorkingDirectoryAttachmentStatus, WorkingDirectoryRepository, WorkingDirectoryRequest,
+        WorkspaceApiRef,
     };
     use crate::config_bundle::{
         ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigDeclaration,
@@ -6165,6 +6212,59 @@ mod tests {
                 .as_ref()
                 .and_then(|request| request.workspace_api.clone()),
             Some(replacement)
+        );
+    }
+
+    #[test]
+    fn logical_workdir_attachments_do_not_require_local_materialization() {
+        let runtime = runtime_with_backend();
+        let workspace_scope = scope("workspace-a", "server-a");
+        let worker = runtime
+            .create_worker_scoped(
+                &workspace_scope,
+                scoped_task_request("logical attachment", "workspace-a"),
+            )
+            .unwrap();
+        let attachment = LogicalWorkdirAttachment {
+            alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
+            working_directory_id: "workdir-on-another-runtime".to_string(),
+        };
+
+        let detail = runtime
+            .replace_worker_workdir_attachments_scoped(
+                &workspace_scope,
+                &worker.worker_ref,
+                vec![attachment.clone()],
+            )
+            .unwrap();
+
+        assert!(detail.workdir_attachments.is_empty());
+        {
+            let state = runtime.lock().unwrap();
+            assert_eq!(
+                state
+                    .worker(&worker.worker_ref)
+                    .unwrap()
+                    .logical_workdir_attachments,
+                [attachment.clone()]
+            );
+        }
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        runtime
+            .replace_worker_workdir_attachments_scoped(
+                &workspace_scope,
+                &worker.worker_ref,
+                vec![attachment.clone()],
+            )
+            .unwrap();
+        runtime.restore_worker(&worker.worker_ref).unwrap();
+        let state = runtime.lock().unwrap();
+        assert_eq!(
+            state
+                .worker(&worker.worker_ref)
+                .unwrap()
+                .logical_workdir_attachments,
+            [attachment]
         );
     }
 

@@ -428,7 +428,7 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         worker_id: String,
         value: runtime_api::WorkerWorkdirAttachmentsRequest,
     ) -> Result<runtime_api::WorkerResponse, runtime_api::RuntimeApiError> {
-        let attachments = request(value.workdir_attachments)?;
+        let attachments = request(value.logical_workdir_attachments)?;
         let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
         let worker = match auth_workspace_scope(&self.state, auth_extension().as_ref())
             .map_err(api_error)?

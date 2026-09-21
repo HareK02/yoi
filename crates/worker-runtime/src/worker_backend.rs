@@ -115,6 +115,7 @@ use workdir::{
 
 #[cfg(test)]
 use worker::WorkerController;
+use worker::feature::builtin::manage_workdir::WorkspaceAttachedWorkdirSession;
 use worker::feature::builtin::{
     CompositeWorkerObservationProvider, WorkerObservationError, WorkerObservationProvider,
     WorkerObservationSubject, WorkerObservationSubjectRef, WorkerSessionCapture,
@@ -796,6 +797,42 @@ fn runtime_local_workdir_router(
     Ok(router)
 }
 
+fn restored_workdir_router(
+    local_attachments: &BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
+    logical_attachments: &[crate::catalog::LogicalWorkdirAttachment],
+    scope: manifest::SharedScope,
+    workspace_client: Arc<dyn WorkspaceClient>,
+) -> Result<Arc<WorkdirSessionRouter>, String> {
+    let router = runtime_local_workdir_router(local_attachments, scope)?;
+    for attachment in logical_attachments {
+        if let Some(local) = local_attachments.get(&attachment.alias) {
+            if local.working_directory.id != attachment.working_directory_id {
+                return Err(format!(
+                    "logical Workdir attachment `{}` conflicts with Runtime-local Workdir {}",
+                    attachment.alias, local.working_directory.id
+                ));
+            }
+            continue;
+        }
+        router
+            .attach(
+                attachment.alias.clone(),
+                WorkspaceAttachedWorkdirSession::handle_for_workdir(
+                    workspace_client.clone(),
+                    attachment.alias.as_str(),
+                    &attachment.working_directory_id,
+                ),
+            )
+            .map_err(|error| {
+                format!(
+                    "bind logical Workdir attachment `{}`: {error}",
+                    attachment.alias
+                )
+            })?;
+    }
+    Ok(router)
+}
+
 fn bind_workspace_memory_settings(
     manifest: &mut manifest::WorkerManifest,
     request: &CreateWorkerRequest,
@@ -1259,10 +1296,13 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         };
         validate_worker_memory_settings(worker.manifest(), &request.request)?;
         let flow_transition_enabled = worker.manifest().feature.flow.enabled;
-        worker.bind_workdir_sessions(runtime_local_workdir_router(
+        let workdir_sessions = restored_workdir_router(
             &request.workdir_attachments,
+            &request.logical_workdir_attachments,
             worker.scope().clone(),
-        )?);
+            worker.workspace_client_handle(),
+        )?;
+        worker.bind_workdir_sessions(workdir_sessions);
         if let (Some(runtime_id), Some(workspace_id)) =
             (observation_runtime_id, observation_workspace_id.clone())
             && observation_enabled
@@ -2897,9 +2937,10 @@ mod tests {
 
     use crate::Runtime as EmbeddedRuntime;
     use crate::catalog::{
-        ConfigBundleRef, CreateWorkerRequest, MaterializerKind, ProfileSelector,
-        RepositorySelector, WorkingDirectoryAttachmentClaim, WorkingDirectoryAttachmentRequest,
-        WorkingDirectoryRepository, WorkingDirectoryRequest, WorkspaceApiRef,
+        ConfigBundleRef, CreateWorkerRequest, LogicalWorkdirAttachment, MaterializerKind,
+        ProfileSelector, RepositorySelector, WorkingDirectoryAttachmentClaim,
+        WorkingDirectoryAttachmentRequest, WorkingDirectoryRepository, WorkingDirectoryRequest,
+        WorkspaceApiRef,
     };
     use crate::execution::WorkerExecutionContext;
     use crate::identity::WorkerId;
@@ -2914,6 +2955,31 @@ mod tests {
     use futures::{Stream, StreamExt};
     use manifest::{Scope, WorkerManifest};
     use session_store::{LogEntry, WorkerMetadataStore};
+
+    #[test]
+    fn restored_router_uses_workspace_proxy_for_logical_only_attachment() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = manifest::SharedScope::new(manifest::Scope::writable(root.path()).unwrap());
+        let client = WorkerWorkspaceContext::local_filesystem(Some(
+            WorkspaceId::new("workspace-a").unwrap(),
+        ))
+        .client_handle();
+        let alias = WorkdirAttachmentAlias::new("checkout").unwrap();
+
+        let router = restored_workdir_router(
+            &BTreeMap::new(),
+            &[LogicalWorkdirAttachment {
+                alias: alias.clone(),
+                working_directory_id: "remote-workdir".to_string(),
+            }],
+            scope,
+            client,
+        )
+        .unwrap();
+
+        let session = router.session(&alias).unwrap();
+        assert_eq!(session.workdir().id().as_str(), "remote-workdir");
+    }
 
     #[test]
     fn profile_factory_routes_workspace_requests_by_workspace_id() {
@@ -3990,6 +4056,7 @@ mod tests {
                 )),
                 context: test_execution_context(worker_ref),
                 previous_workdir_attachments: Vec::new(),
+                logical_workdir_attachments: Vec::new(),
                 workdir_attachments: BTreeMap::new(),
                 config_bundle: None,
             })
@@ -4080,6 +4147,7 @@ mod tests {
                 workspace_scope: None,
                 context: test_execution_context(worker_ref),
                 previous_workdir_attachments: Vec::new(),
+                logical_workdir_attachments: Vec::new(),
                 workdir_attachments: BTreeMap::new(),
                 config_bundle: None,
             })
@@ -4550,47 +4618,6 @@ mod tests {
             &[("unavailable".to_string(), None, false)]
         );
 
-        let workdir_id = detail.workdir_attachments[0]
-            .working_directory
-            .summary
-            .working_directory_id
-            .clone();
-        let second = runtime.create_worker(create_request("second")).unwrap();
-        let conflict = runtime
-            .replace_worker_workdir_attachments(
-                &second.worker_ref,
-                vec![WorkingDirectoryAttachmentClaim {
-                    alias: workdir::WorkdirAttachmentAlias::new("conflict").unwrap(),
-                    working_directory_id: workdir_id.clone(),
-                    relative_cwd: None,
-                }],
-            )
-            .unwrap_err();
-        assert!(matches!(
-            conflict,
-            crate::error::RuntimeError::InvalidRequest(_)
-        ));
-        let inactive = runtime
-            .create_working_directory(working_directory_request(repo.path()))
-            .unwrap();
-        let inactive_id = inactive.summary.working_directory_id;
-        runtime.cleanup_working_directory(&inactive_id).unwrap();
-        let inactive_error = runtime
-            .replace_worker_workdir_attachments(
-                &second.worker_ref,
-                vec![WorkingDirectoryAttachmentClaim {
-                    alias: workdir::WorkdirAttachmentAlias::new("inactive").unwrap(),
-                    working_directory_id: inactive_id,
-                    relative_cwd: None,
-                }],
-            )
-            .unwrap_err();
-        assert!(matches!(
-            inactive_error,
-            crate::error::RuntimeError::InvalidRequest(_)
-                | crate::error::RuntimeError::WorkingDirectory(_)
-        ));
-
         let detached = runtime
             .replace_worker_workdir_attachments(&detail.worker_ref, Vec::new())
             .unwrap();
@@ -4598,22 +4625,6 @@ mod tests {
         runtime.stop_worker(&detail.worker_ref, None).unwrap();
         let restored_without_workdir = runtime.restore_worker(&detail.worker_ref).unwrap();
         assert!(restored_without_workdir.workdir_attachments.is_empty());
-
-        let alias = workdir::WorkdirAttachmentAlias::new("restored").unwrap();
-        runtime
-            .replace_worker_workdir_attachments(
-                &detail.worker_ref,
-                vec![WorkingDirectoryAttachmentClaim {
-                    alias: alias.clone(),
-                    working_directory_id: workdir_id,
-                    relative_cwd: None,
-                }],
-            )
-            .unwrap();
-        runtime.stop_worker(&detail.worker_ref, None).unwrap();
-        let stopped = runtime.worker_detail(&detail.worker_ref).unwrap();
-        assert_eq!(stopped.workdir_attachments.len(), 1);
-        assert_eq!(stopped.workdir_attachments[0].alias, alias);
     }
 
     #[test]

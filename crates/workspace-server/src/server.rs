@@ -192,12 +192,12 @@ use crate::workspace_signing_identity::{
 };
 use crate::{Error, Result};
 use worker_runtime::catalog::{
-    ConfigBundleRef, ProfileSelector, RepositoryMaterializationContext, RepositoryRefObservation,
-    RepositoryRefObservationRequest, RepositorySelector as RuntimeRepositorySelector,
-    RepositorySshCredentialCandidate, RepositorySshMaterializationAccess, SensitiveString,
-    WorkingDirectoryAttachmentClaim, WorkingDirectoryAttachmentRequest,
-    WorkingDirectoryAttachmentStatus, WorkingDirectoryRepository, WorkingDirectoryRequest,
-    WorkspaceApiRef,
+    ConfigBundleRef, LogicalWorkdirAttachment, ProfileSelector, RepositoryMaterializationContext,
+    RepositoryRefObservation, RepositoryRefObservationRequest,
+    RepositorySelector as RuntimeRepositorySelector, RepositorySshCredentialCandidate,
+    RepositorySshMaterializationAccess, SensitiveString, WorkingDirectoryAttachmentClaim,
+    WorkingDirectoryAttachmentRequest, WorkingDirectoryAttachmentStatus,
+    WorkingDirectoryRepository, WorkingDirectoryRequest, WorkspaceApiRef,
 };
 use worker_runtime::config_bundle::ConfigBundle;
 use worker_runtime::http_server::MAX_WORKER_FILE_UPLOAD_BYTES;
@@ -3064,6 +3064,7 @@ impl WorkspaceApi {
                 diagnostics: binding.diagnostics,
             });
         }
+        sync_runtime_worker_workdir_attachments(self, worker)?;
         Ok(self
             .runtime
             .restore_worker(worker)
@@ -8601,11 +8602,10 @@ fn sync_runtime_worker_workdir_attachments(
         .into_iter()
         .filter(|link| link.unlinked_at.is_none())
         .map(|link| {
-            Ok(WorkingDirectoryAttachmentClaim {
+            Ok(LogicalWorkdirAttachment {
                 alias: workdir::WorkdirAttachmentAlias::new(link.alias)
                     .map_err(|error| Error::InvalidInput(error.to_string()))?,
                 working_directory_id: link.workdir_id,
-                relative_cwd: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -8678,6 +8678,18 @@ async fn scoped_attach_current_worker_workdir(
     }
     let session_lock = current_worker_session_lock(&api, &worker);
     let _session_guard = session_lock.lock().await;
+    if !api
+        .store
+        .worker_workdir_link_history_exists(&api.config.workspace_id, &worker)?
+    {
+        let observed_worker = api
+            .runtime
+            .worker(&worker)
+            .map_err(|error| error.into_error())?;
+        if !observed_worker.workdir_attachments.is_empty() {
+            sync_worker_observation(&api, &observed_worker)?;
+        }
+    }
     if let Some(existing) = api
         .store
         .list_worker_workdir_links(&api.config.workspace_id, &worker)?
@@ -21664,6 +21676,90 @@ mod tests {
         let error =
             authenticate_worker_mutation_source(&api, "other-workspace", &headers).unwrap_err();
         assert!(matches!(error, Error::WorkerSourceIdentity(_)));
+    }
+
+    #[tokio::test]
+    async fn cross_runtime_attachment_sync_does_not_require_worker_runtime_materialization() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let Json(created) = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                display_name: "Cross-runtime Worker".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachments: Vec::new(),
+                control_operation_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let worker = RuntimeWorkerRef::new(&created.runtime_id, &created.worker_id);
+        let workdir_id = "cross-runtime-workdir";
+        api.store
+            .upsert_workdir_registry(&WorkdirRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                workdir_id: workdir_id.to_string(),
+                display_name: Some("Cross-runtime checkout".to_string()),
+                runtime_id: "arcadia".to_string(),
+                repository_id: test_repository_id(&api),
+                creation_selector: Some("HEAD".to_string()),
+                creation_ref: None,
+                creation_tree: None,
+                current_selector: Some("HEAD".to_string()),
+                current_ref: None,
+                current_tree: None,
+                observed_at_epoch_seconds: None,
+                materialization_status: "present".to_string(),
+                cleanliness: "clean".to_string(),
+                created_at: TEST_CREATED_AT.to_string(),
+                updated_at: TEST_CREATED_AT.to_string(),
+            })
+            .unwrap();
+        api.store
+            .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                worker: worker.clone(),
+                workdir_id: workdir_id.to_string(),
+                alias: "checkout".to_string(),
+                linked_at: TEST_CREATED_AT.to_string(),
+                unlinked_at: None,
+            })
+            .unwrap();
+
+        sync_runtime_worker_workdir_attachments(&api, &worker).unwrap();
+
+        assert!(
+            api.runtime
+                .worker(&worker)
+                .unwrap()
+                .workdir_attachments
+                .is_empty(),
+            "logical attachment must not fabricate a Runtime-local binding"
+        );
+        api.runtime
+            .stop_worker(
+                &worker,
+                WorkerLifecycleRequest {
+                    reason: Some("exercise logical attachment reconciliation".to_string()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        sync_runtime_worker_workdir_attachments(&api, &worker).unwrap();
+        assert_eq!(
+            api.store
+                .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
+                .unwrap()
+                .into_iter()
+                .filter(|link| link.unlinked_at.is_none())
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

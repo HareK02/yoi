@@ -1,7 +1,7 @@
 use crate::catalog::{
-    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerRestoreIntent, WorkerStatus,
-    WorkingDirectoryAttachmentClaim, WorkingDirectoryAttachmentRequest,
-    WorkingDirectoryAttachmentStatus, WorkingDirectoryRequest,
+    ConfigBundleRef, CreateWorkerRequest, LogicalWorkdirAttachment, ProfileSelector,
+    WorkerRestoreIntent, WorkerStatus, WorkingDirectoryAttachmentClaim,
+    WorkingDirectoryAttachmentRequest, WorkingDirectoryAttachmentStatus, WorkingDirectoryRequest,
 };
 use crate::config_bundle::ConfigBundle;
 use crate::diagnostics::{DiagnosticSeverity, RuntimeDiagnostic};
@@ -444,6 +444,7 @@ pub(crate) struct PersistedWorkerRecord {
     pub(crate) execution_state: PersistedWorkerExecutionState,
     pub(crate) workspace_id: Option<String>,
     pub(crate) workdir_attachments: Vec<WorkingDirectoryAttachmentStatus>,
+    pub(crate) logical_workdir_attachments: Vec<LogicalWorkdirAttachment>,
 }
 
 fn runtime_io_error(operation: &'static str, path: &Path, source: std::io::Error) -> RuntimeError {
@@ -1688,6 +1689,8 @@ struct WorkerIdentityRecord {
     workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     workdir_attachments: Vec<WorkingDirectoryAttachmentStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    logical_workdir_attachments: Vec<LogicalWorkdirAttachment>,
     /// Schema-v8 compatibility input. New records serialize only `workdir_attachments`.
     #[serde(
         default,
@@ -1787,6 +1790,7 @@ impl WorkerIdentityRecord {
             status: worker.status,
             workspace_id: worker.workspace_id.clone(),
             workdir_attachments: worker.workdir_attachments.clone(),
+            logical_workdir_attachments: worker.logical_workdir_attachments.clone(),
             legacy_working_directory: None,
         }
     }
@@ -1860,6 +1864,7 @@ impl WorkerIdentityRecord {
             execution_state,
             workspace_id: self.workspace_id,
             workdir_attachments,
+            logical_workdir_attachments: self.logical_workdir_attachments,
         }
     }
 }
@@ -2337,6 +2342,7 @@ mod tests {
         }))
         .unwrap();
         let persisted = identity.into_persisted(PersistedWorkerExecutionState::Unavailable);
+        assert!(persisted.logical_workdir_attachments.is_empty());
         assert_eq!(persisted.workdir_attachments.len(), 1);
         assert_eq!(persisted.workdir_attachments[0].alias.as_str(), "workdir");
         assert_eq!(
@@ -2367,6 +2373,44 @@ mod tests {
         assert_eq!(attachment.relative_cwd.as_deref(), Some("crates/yoi"));
         let serialized = serde_json::to_value(execution).unwrap();
         assert!(serialized["request"].get("working_directory").is_none());
+    }
+
+    #[test]
+    fn worker_identity_round_trips_logical_workdir_attachments() {
+        let worker_id = WorkerId::now_v7();
+        let identity: WorkerIdentityRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "worker_ref": { "worker_id": worker_id },
+            "worker_id": worker_id,
+            "profile": { "kind": "builtin", "value": "builtin:coder" },
+            "display_name": null,
+            "profile_source": {
+                "id": "archive-1",
+                "digest": "sha256:archive",
+                "size_bytes": 0,
+                "source_graph": {
+                    "source_count": 0,
+                    "total_source_bytes": 0,
+                    "entrypoints": {},
+                    "import_count": 0
+                }
+            },
+            "config_bundle": null,
+            "status": "stopped",
+            "logical_workdir_attachments": [{
+                "alias": "checkout",
+                "working_directory_id": "remote-workdir"
+            }]
+        }))
+        .unwrap();
+        let persisted = identity.into_persisted(PersistedWorkerExecutionState::Unavailable);
+        assert_eq!(
+            persisted.logical_workdir_attachments,
+            [LogicalWorkdirAttachment {
+                alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
+                working_directory_id: "remote-workdir".to_string(),
+            }]
+        );
     }
 
     #[test]
