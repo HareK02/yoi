@@ -21998,6 +21998,123 @@ mod tests {
         })
     }
 
+    const STRICT_REMOTE_RUNTIME_ID: &str = "strict-remote-runtime";
+
+    #[derive(Clone)]
+    struct StrictRemoteSpawnState {
+        workdir_status: worker_runtime::catalog::WorkingDirectoryStatus,
+        create_requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    fn assert_strict_remote_request_headers(headers: &HeaderMap) {
+        assert_eq!(
+            headers
+                .get(worker_runtime::http_server::RUNTIME_WORKSPACE_SCOPE_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(TEST_WORKSPACE_ID)
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer workspace-server-test-runtime-token")
+        );
+    }
+
+    async fn strict_remote_workdir(
+        State(state): State<StrictRemoteSpawnState>,
+        headers: HeaderMap,
+        AxumPath(working_directory_id): AxumPath<String>,
+    ) -> Json<Value> {
+        assert_strict_remote_request_headers(&headers);
+        assert_eq!(
+            state.workdir_status.summary.working_directory_id,
+            working_directory_id
+        );
+        Json(json!({ "working_directory": state.workdir_status }))
+    }
+
+    fn strict_remote_worker_response(
+        state: &StrictRemoteSpawnState,
+        request: &runtime_api::CreateWorkerRequest,
+    ) -> Value {
+        let attachment = &request.workdir_attachments[0];
+        let profile_source = match &request.profile_source {
+            runtime_api::ProfileSourceArchiveSource::Embedded { archive } => {
+                archive.reference.clone()
+            }
+            runtime_api::ProfileSourceArchiveSource::WorkspaceConfig { archive } => archive.clone(),
+        };
+        json!({
+            "worker": {
+                "worker_ref": { "worker_id": request.worker_id },
+                "worker_id": request.worker_id,
+                "status": "idle",
+                "execution_metadata_available": true,
+                "workspace_id": TEST_WORKSPACE_ID,
+                "workdir_attachments": [{
+                    "alias": attachment.alias,
+                    "working_directory": state.workdir_status,
+                }],
+                "profile": request.profile,
+                "display_name": request.display_name,
+                "profile_source": profile_source,
+                "config_bundle": request.config_bundle,
+            }
+        })
+    }
+
+    async fn strict_remote_create_worker(
+        State(state): State<StrictRemoteSpawnState>,
+        headers: HeaderMap,
+        body: axum::body::Bytes,
+    ) -> Json<Value> {
+        assert_strict_remote_request_headers(&headers);
+        let raw: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            raw.get("working_directory").is_none(),
+            "legacy singular working_directory reached Runtime HTTP: {raw}"
+        );
+        let request: runtime_api::CreateWorkerRequest =
+            serde_json::from_value(raw.clone()).unwrap();
+        assert!(request.workdir_attachment_requests.is_empty());
+        assert_eq!(request.workdir_attachments.len(), 1);
+        let attachment = &request.workdir_attachments[0];
+        assert_eq!(attachment.alias.as_str(), "workdir");
+        assert_eq!(
+            attachment.working_directory_id,
+            state.workdir_status.summary.working_directory_id
+        );
+        assert_eq!(attachment.relative_cwd.as_deref(), Some("crates/yoi"));
+        state
+            .create_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(raw);
+
+        Json(strict_remote_worker_response(&state, &request))
+    }
+
+    async fn strict_remote_replace_workspace_api(
+        State(state): State<StrictRemoteSpawnState>,
+        headers: HeaderMap,
+        AxumPath(worker_id): AxumPath<String>,
+        Json(workspace_api): Json<runtime_api::WorkerWorkspaceApiRequest>,
+    ) -> Json<Value> {
+        assert_strict_remote_request_headers(&headers);
+        assert_eq!(workspace_api.workspace_api.workspace_id, TEST_WORKSPACE_ID);
+        let raw = state
+            .create_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last()
+            .cloned()
+            .expect("workspace API replacement follows Runtime create");
+        let request: runtime_api::CreateWorkerRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(request.worker_id.to_string(), worker_id);
+        Json(strict_remote_worker_response(&state, &request))
+    }
+
     async fn post_guarded_spawn(fixture: &GuardedSpawnFixture, body: Value) -> Response {
         build_inner_router(fixture.api.clone())
             .oneshot(
@@ -22126,6 +22243,183 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guarded_spawn_crosses_strict_remote_runtime_http_boundary() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        register_test_runtime(&api, STRICT_REMOTE_RUNTIME_ID).await;
+
+        let workdir_id = "guarded-strict-remote-workdir".to_string();
+        let repository_id = test_repository_id(&api);
+        let mut workdir_status = WorkdirlessFixtureRuntime::workdir_status(&workdir_id);
+        workdir_status.summary.repository_id = repository_id.clone();
+        let strict_state = StrictRemoteSpawnState {
+            workdir_status,
+            create_requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let runtime_endpoint = format!("http://{}", runtime_listener.local_addr().unwrap());
+        let runtime_app = Router::new()
+            .route(
+                "/v1/working-directories/{working_directory_id}",
+                get(strict_remote_workdir),
+            )
+            .route("/v1/workers", post(strict_remote_create_worker))
+            .route(
+                "/v1/workers/{worker_id}/workspace-api",
+                post(strict_remote_replace_workspace_api),
+            )
+            .with_state(strict_state.clone());
+        let runtime_server =
+            tokio::spawn(async move { axum::serve(runtime_listener, runtime_app).await.unwrap() });
+        api.runtime.register_or_replace(
+            RemoteWorkerRuntime::new(
+                RemoteRuntimeConfig {
+                    runtime_id: STRICT_REMOTE_RUNTIME_ID.to_string(),
+                    workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
+                    display_name: "Strict remote Runtime".to_string(),
+                    base_url: runtime_endpoint,
+                    bearer_token: Some(TEST_RUNTIME_HTTP_TOKEN.to_string()),
+                    workspace_authorization: None,
+                    strict_public_egress: false,
+                    cached_worker_creation_available: true,
+                    cached_os: "linux".to_string(),
+                    cached_arch: "x86_64".to_string(),
+                    cached_status: "active".to_string(),
+                    timeout: std::time::Duration::from_secs(2),
+                },
+                TEST_WORKSPACE_ID.to_string(),
+                "http://127.0.0.1:1".to_string(),
+            )
+            .unwrap(),
+        );
+        let now = now_registry_timestamp();
+        api.store
+            .upsert_workdir_registry(&WorkdirRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                workdir_id: workdir_id.clone(),
+                display_name: None,
+                runtime_id: STRICT_REMOTE_RUNTIME_ID.to_string(),
+                repository_id: repository_id.clone(),
+                creation_selector: Some("develop".to_string()),
+                creation_ref: None,
+                creation_tree: None,
+                current_selector: Some("develop".to_string()),
+                current_ref: None,
+                current_tree: None,
+                observed_at_epoch_seconds: None,
+                materialization_status: "present".to_string(),
+                cleanliness: "clean".to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .unwrap();
+        let Json(controller) = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                display_name: "Strict remote spawn controller".to_string(),
+                profile: Some("builtin:orchestrator".to_string()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachments: Vec::new(),
+                control_operation_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let controller = RuntimeWorkerRef::new(controller.runtime_id, controller.worker_id);
+        let mut ticket = ticket::NewTicket::new("Strict remote guarded attachment spawn");
+        ticket.workflow_state = Some(TicketWorkflowState::Queued);
+        ticket.repository_id = Some(repository_id);
+        ticket.ref_selector = Some("develop".to_string());
+        let ticket_id = browser_ticket_backend(&api)
+            .unwrap()
+            .create(ticket)
+            .unwrap()
+            .id;
+        assign_test_orchestrator(&api, &ticket_id);
+        let payload = json!({
+            "runtime_id": STRICT_REMOTE_RUNTIME_ID,
+            "display_name": "Coder · strict remote attachment",
+            "profile": "builtin:coder",
+            "ticket_assignment": {
+                "ticket_id": ticket_id,
+                "operation_id": "guarded-strict-remote-success",
+            },
+            "initial_submit": [
+                { "kind": "flow", "selector": "builtin:coder-review" },
+                { "kind": "text", "content": "Implement strict remote attachment Ticket." },
+            ],
+            "workdir_attachments": [{
+                "alias": "workdir",
+                "working_directory_id": workdir_id,
+                "relative_cwd": "crates/yoi",
+            }],
+            "control_operation_id": "guarded-strict-remote-success",
+        });
+        assert!(payload.get("working_directory").is_none());
+
+        let response = build_inner_router(api.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers"))
+                    .header("content-type", "application/json")
+                    .header("x-yoi-runtime-id", &controller.runtime_id)
+                    .header("x-yoi-worker-id", &controller.worker_id)
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "unexpected guarded remote spawn response: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let body: BrowserCreateWorkerResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body.worker.runtime_id, STRICT_REMOTE_RUNTIME_ID);
+        assert_eq!(body.worker.workdir_attachments.len(), 1);
+        assert_eq!(body.worker.workdir_attachments[0].alias.as_str(), "workdir");
+        assert_eq!(
+            body.worker.workdir_attachments[0]
+                .working_directory
+                .working_directory_id,
+            workdir_id
+        );
+        let requests = strict_state
+            .create_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].get("working_directory").is_none());
+        assert_eq!(
+            requests[0]["workdir_attachments"].as_array().unwrap().len(),
+            1
+        );
+        drop(requests);
+        assert!(
+            api.store
+                .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &ticket_id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            api.store
+                .list_workdir_worker_links(TEST_WORKSPACE_ID, &workdir_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        runtime_server.abort();
     }
 
     #[tokio::test]
