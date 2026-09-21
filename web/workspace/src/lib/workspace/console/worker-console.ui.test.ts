@@ -222,6 +222,9 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
   const workerWorkdirMeta = await Deno.readTextFile(
     new URL("../sidebar/worker-workdir-meta.ts", import.meta.url),
   );
+  const workerSubscription = await Deno.readTextFile(
+    new URL("../sidebar/worker-subscription.ts", import.meta.url),
+  );
   const sidebar = await Deno.readTextFile(
     new URL("../sidebar/WorkspaceSidebar.svelte", import.meta.url),
   );
@@ -266,6 +269,10 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
       workerWorkdirMeta.includes("workdir.creation_selector") &&
       workerWorkdirMeta.includes("explicitReferenceFallback(") &&
       workerWorkdirMeta.includes('"detached"') &&
+      workerSubscription.includes(
+        'workspaceApiPath(workspaceId, "/working-directories")',
+      ) &&
+      !workerSubscription.includes('topic: "workspace_workdirs"') &&
       sidebarCss.includes(".worker-nav-meta") &&
       sidebarCss.includes("text-overflow: ellipsis") &&
       sidebarCss.includes("white-space: nowrap") &&

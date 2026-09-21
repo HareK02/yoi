@@ -47,22 +47,20 @@ export function workspaceWorkersStore(
       let loading = true;
       let error: string | null = null;
       let disposed = false;
-      let workdirRequest = 0;
       const publish = () => {
         const workers = [...projection.workers.values()]
           .map((worker) => projectWorker(worker, workdirs))
           .sort(compareWorkersForSidebar);
         set({ loading, error, workers });
       };
-      const refreshWorkdirs = async () => {
-        const request = ++workdirRequest;
+      const loadWorkdirs = async () => {
         const result = await loadJson(
           fetch,
           workspaceApiPath(workspaceId, "/working-directories"),
           undefined,
           parseWorkingDirectoryListResponse,
         );
-        if (disposed || request !== workdirRequest || !result.data) return;
+        if (disposed || !result.data) return;
         workdirs = new Map(
           result.data.items.map((
             workdir,
@@ -70,8 +68,7 @@ export function workspaceWorkersStore(
         );
         publish();
       };
-      const multiplexer = workspaceMultiplexer(workspaceId);
-      const subscription = multiplexer.subscribe(
+      const subscription = workspaceMultiplexer(workspaceId).subscribe(
         { topic: "workspace_workers" },
         {
           onFrame: (frame) => {
@@ -114,25 +111,10 @@ export function workspaceWorkersStore(
           },
         },
       );
-      const workdirSubscription = multiplexer.subscribe(
-        { topic: "workspace_workdirs" },
-        {
-          onFrame: (frame) => {
-            const isSnapshot = frame.frame === "response" &&
-              frame.message.result === "subscribed";
-            const isUpdate = frame.frame === "event" &&
-              frame.message.event === "event" &&
-              (frame.message.data.payload.event === "workdir_upserted" ||
-                frame.message.data.payload.event === "workdir_removed");
-            if (isSnapshot || isUpdate) void refreshWorkdirs();
-          },
-        },
-      );
-      void refreshWorkdirs();
+      void loadWorkdirs();
       return () => {
         disposed = true;
         subscription.close();
-        workdirSubscription.close();
       };
     },
   );
