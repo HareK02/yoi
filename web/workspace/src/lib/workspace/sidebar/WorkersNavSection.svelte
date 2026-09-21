@@ -12,6 +12,7 @@
     type SidebarWorker,
   } from './worker-subscription';
   import { canShowWorkerInSidebar, sidebarWorkerActivity } from './workers';
+  import { sidebarWorkdirMeta } from './worker-workdir-meta';
 
   const COLLAPSED_WORKER_COUNT = 6;
   type WorkerActionKind = 'stop' | 'delete';
@@ -36,14 +37,6 @@
   let hiddenWorkerCount = $derived(
     Math.max(0, workers.length - COLLAPSED_WORKER_COUNT),
   );
-
-  function workdirMeta(worker: SidebarWorker): string {
-    const attachments = worker.workdir_attachments;
-    if (attachments.length === 0) return '—';
-    return attachments
-      .map((attachment) => `${attachment.alias}: ${attachment.repository_key ?? '—'}・${attachment.working_directory_id}`)
-      .join(', ');
-  }
 
   function workerKey(worker: SidebarWorker): string {
     return `${worker.runtime_id}:${worker.worker_id}`;
@@ -180,6 +173,7 @@
         {@const activity = sidebarWorkerActivity(worker)}
         {@const key = workerKey(worker)}
         {@const label = worker.display_name || worker.label}
+        {@const workdir = sidebarWorkdirMeta(worker.workdir_attachments)}
         <li class="worker-nav-item" data-worker-actions={key}>
           <a
             href={href}
@@ -197,8 +191,8 @@
               {/if}
             </span>
             <span class="worker-nav-label">{label}</span>
-            <small class="worker-nav-meta">
-              {workdirMeta(worker)}
+            <small class="worker-nav-meta" title={workdir.details} aria-label={workdir.details}>
+              {workdir.text}
             </small>
           </a>
           <button

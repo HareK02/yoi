@@ -219,6 +219,12 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
   const workersNav = await Deno.readTextFile(
     new URL("../sidebar/WorkersNavSection.svelte", import.meta.url),
   );
+  const workerWorkdirMeta = await Deno.readTextFile(
+    new URL("../sidebar/worker-workdir-meta.ts", import.meta.url),
+  );
+  const workerSubscription = await Deno.readTextFile(
+    new URL("../sidebar/worker-subscription.ts", import.meta.url),
+  );
   const sidebar = await Deno.readTextFile(
     new URL("../sidebar/WorkspaceSidebar.svelte", import.meta.url),
   );
@@ -256,12 +262,23 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
       workersNav.includes("worker.display_name || worker.label") &&
       workersNav.includes("worker-status-dot") &&
       workersNav.includes("worker-status-spinner") &&
-      workersNav.includes("workdirMeta(worker)") &&
-      workersNav.includes("attachment.alias") &&
-      workersNav.includes("attachment.repository_key ?? '—'") &&
-      workersNav.includes("attachment.working_directory_id") &&
+      workersNav.includes("sidebarWorkdirMeta(worker.workdir_attachments)") &&
+      workersNav.includes("title={workdir.details}") &&
+      workersNav.includes("aria-label={workdir.details}") &&
+      !workersNav.includes("attachment.alias") &&
+      workerWorkdirMeta.includes("workdir.current_selector") &&
+      workerWorkdirMeta.includes("workdir.creation_selector") &&
+      workerWorkdirMeta.includes("explicitReferenceFallback(") &&
+      workerWorkdirMeta.includes('"detached"') &&
+      workerSubscription.includes(
+        'workspaceApiPath(workspaceId, "/working-directories")',
+      ) &&
+      !workerSubscription.includes('topic: "workspace_workdirs"') &&
+      sidebarCss.includes(".worker-nav-meta") &&
+      sidebarCss.includes("text-overflow: ellipsis") &&
+      sidebarCss.includes("white-space: nowrap") &&
       !workersNav.includes('aria-disabled="true"'),
-    "Workers sidebar should link to the Worker list page and show state indicators with repository/workdir metadata",
+    "Workers sidebar should show truncated repo:branch Workdir metadata with detached fallback and detail-only attachment identifiers",
   );
   assert(
     workersNav.includes("COLLAPSED_WORKER_COUNT = 6") &&
