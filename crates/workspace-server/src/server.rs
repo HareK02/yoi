@@ -1082,13 +1082,6 @@ impl WorkerRemovalService {
                 ));
             }
         };
-        if worker.singleton_key.is_some() {
-            return Ok(worker_remove_error_response(
-                StatusCode::CONFLICT,
-                "internal_worker_forbidden",
-                "Internal service Workers cannot be removed with WorkerRemove",
-            ));
-        }
         if !worker.state.eq_ignore_ascii_case("stopped") {
             return Ok(worker_remove_error_response(
                 StatusCode::CONFLICT,
@@ -1362,22 +1355,13 @@ impl WorkspaceServerApi {
         {
             let worker_key = registry_worker.display_name;
             match api.runtime.worker(&registry_worker.worker) {
-                Ok(worker) if worker.state == "stopped" && worker.singleton_key.is_none() => {}
-                Ok(worker) => preflight.blockers.push(WorkspaceDeletionBlocker {
-                    kind: if worker.singleton_key.is_some() {
-                        WorkspaceDeletionBlockerKind::RetentionHold
-                    } else {
-                        WorkspaceDeletionBlockerKind::WorkerRemovalBlocked
-                    },
+                Ok(worker) if worker.state == "stopped" => {}
+                Ok(_) => preflight.blockers.push(WorkspaceDeletionBlocker {
+                    kind: WorkspaceDeletionBlockerKind::WorkerRemovalBlocked,
                     resource_kind: Some("worker".to_string()),
                     resource_key: Some(worker_key),
-                    message: if worker.singleton_key.is_some() {
-                        "Internal or singleton Workers must be released by their owning service first."
-                            .to_string()
-                    } else {
-                        "Stop running, restoring, or otherwise active Workers before deleting the Workspace."
-                            .to_string()
-                    },
+                    message: "Stop running, restoring, or otherwise active Workers before deleting the Workspace."
+                        .to_string(),
                 }),
                 Err(_) => preflight.blockers.push(WorkspaceDeletionBlocker {
                     kind: WorkspaceDeletionBlockerKind::CleanupUnavailable,
@@ -12331,11 +12315,6 @@ fn build_runtime_cleanup_plan(
             &record.worker,
         )?;
         let is_running = live_running_worker_ids.contains(&record.worker);
-        let is_internal = api
-            .runtime
-            .worker(&record.worker)
-            .ok()
-            .is_some_and(|worker| worker.singleton_key.is_some());
         let pinned = record.retention_state == "pinned";
         let blocking_reason = if let Some(assignment) = current_assignment {
             Some(format!(
@@ -12345,8 +12324,6 @@ fn build_runtime_cleanup_plan(
             ))
         } else if pinned {
             Some("worker is pinned".to_string())
-        } else if is_internal {
-            Some("internal service Worker cannot be deleted".to_string())
         } else if is_running {
             Some("worker is running".to_string())
         } else {
@@ -30036,7 +30013,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_service_rejects_internal_worker_before_runtime_removal() {
+    async fn cleanup_service_deletes_stopped_singleton_worker() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
@@ -30054,45 +30031,69 @@ mod tests {
             .stop_worker(
                 &worker,
                 WorkerLifecycleRequest {
-                    reason: Some("prepare internal cleanup guard".to_string()),
+                    reason: Some("prepare singleton cleanup".to_string()),
                     ticket_assignment: None,
                 },
             )
             .unwrap();
+        let worker_root = workspace
+            .path()
+            .join(".test-embedded-runtime-store/workers")
+            .join(&worker.worker_id);
+        fs::create_dir_all(worker_root.join("session/segments")).unwrap();
+        fs::write(
+            worker_root.join("session/session.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "session_id": "singleton-cleanup-session"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            worker_root.join("session/segments/segment-a.jsonl"),
+            b"singleton cleanup retention evidence\n",
+        )
+        .unwrap();
         let plan = build_runtime_cleanup_plan(&api, worker.runtime_id.as_str())
             .unwrap_or_else(|error| panic!("cleanup plan: {}", error.error));
         let candidate = plan
             .workers
             .iter()
             .find(|candidate| candidate.runtime_worker_id == worker.worker_id)
-            .expect("internal Worker cleanup candidate")
+            .expect("singleton Worker cleanup candidate")
             .clone();
-        assert_eq!(
-            candidate.blocking_reason.as_deref(),
-            Some("internal service Worker cannot be deleted")
-        );
+        assert_eq!(candidate.blocking_reason, None);
         let mut subscriber = api.worker_projection.subscribe();
 
-        let error = WorkerRemovalService::new(&api)
+        WorkerRemovalService::new(&api)
             .execute_cleanup_removal(&candidate)
             .await
-            .unwrap_err();
-        assert!(matches!(
-            error.error,
-            Error::RuntimeOperationFailed { ref code, .. }
-                if code == "workspace_cleanup_worker_removal_rejected"
-        ));
-        assert!(api.runtime.worker(&worker).is_ok());
+            .unwrap();
+
+        assert!(api.runtime.worker(&worker).is_err());
         assert!(
             api.store
                 .get_worker_registry(TEST_WORKSPACE_ID, &worker)
                 .unwrap()
-                .is_some()
+                .is_none()
         );
+        let event = subscriber.try_recv().expect("singleton catalog removal");
         assert!(matches!(
-            subscriber.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            event.changes.as_slice(),
+            [crate::store::WorkerCatalogChange::Removed(removed)] if removed == &worker
         ));
+
+        let Json(recreated) = scoped_start_workspace_orchestrator(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let recreated = recreated.worker.expect("recreated Orchestrator");
+        assert_ne!(recreated.worker_id, worker.worker_id);
     }
 
     #[tokio::test]
