@@ -1,4 +1,8 @@
-import type { Event, WorkerStateSnapshot, WorkerStatus } from "$lib/generated/protocol";
+import type {
+  Event,
+  WorkerStateSnapshot,
+  WorkerStatus,
+} from "$lib/generated/protocol";
 import {
   type ConsoleEventInput,
   type ConsoleLine,
@@ -22,15 +26,13 @@ declare const Deno: {
 function workerState(status: WorkerStatus): WorkerStateSnapshot {
   return {
     last_command_id: 0,
-    state: status === "idle"
-      ? { kind: "idle" }
-      : {
-        kind: "busy",
-        state: {
-          kind: "run",
-          state: status === "paused" ? "paused" : "running",
-        },
+    state: status === "idle" ? { kind: "idle" } : {
+      kind: "busy",
+      state: {
+        kind: "run",
+        state: status === "paused" ? "paused" : "running",
       },
+    },
   };
 }
 
@@ -61,7 +63,8 @@ function consoleLine(id: string, kind: ConsoleLine["kind"]): ConsoleLine {
 function canonicalSession(logEntries: unknown[]): Event extends {
   event: "snapshot";
   data: infer D;
-} ? D extends { session: infer S } ? S : never : never {
+} ? D extends { session: infer S } ? S : never
+  : never {
   const entries: Record<string, unknown>[] = [];
   let sequence = 0;
   const itemEntry = (item: Record<string, unknown>) => {
@@ -80,9 +83,15 @@ function canonicalSession(logEntries: unknown[]): Event extends {
       case "segment_start":
       case "annotated_segment_start":
         entries.length = 0;
-        for (const history of Array.isArray(entry["history"]) ? entry["history"] : []) {
+        for (
+          const history of Array.isArray(entry["history"])
+            ? entry["history"]
+            : []
+        ) {
           const value = history as Record<string, unknown>;
-          itemEntry((value["item"] as Record<string, unknown> | undefined) ?? value);
+          itemEntry(
+            (value["item"] as Record<string, unknown> | undefined) ?? value,
+          );
         }
         break;
       case "user_input":
@@ -99,15 +108,18 @@ function canonicalSession(logEntries: unknown[]): Event extends {
       case "annotated_assistant_item":
       case "annotated_tool_result": {
         const annotated = entry["entry"] as Record<string, unknown> | undefined;
-        itemEntry((annotated?.["item"] as Record<string, unknown> | undefined) ??
-          (entry["item"] as Record<string, unknown>));
+        itemEntry(
+          (annotated?.["item"] as Record<string, unknown> | undefined) ??
+            (entry["item"] as Record<string, unknown>),
+        );
         break;
       }
       case "system_item":
       case "annotated_system_item": {
         const annotated = entry["entry"] as Record<string, unknown> | undefined;
-        const item = (annotated?.["item"] as Record<string, unknown> | undefined) ??
-          (entry["item"] as Record<string, unknown>);
+        const item =
+          (annotated?.["item"] as Record<string, unknown> | undefined) ??
+            (entry["item"] as Record<string, unknown>);
         entries.push({
           entry_id: `legacy-test-${sequence++}`,
           provenance: "legacy_unknown",
@@ -168,7 +180,10 @@ Deno.test("large paste segments project compact artifact metadata", () => {
       source_entry_id: "entry-1",
     },
   }]);
-  assert(text.includes("019ca7c8-57b6-7f05-8edf-524147aba7b2"), "artifact id is visible");
+  assert(
+    text.includes("019ca7c8-57b6-7f05-8edf-524147aba7b2"),
+    "artifact id is visible",
+  );
   assert(text.includes("65536 bytes"), "bounded size metadata is visible");
   assert(text.includes("text_plain_utf8"), "media type is visible");
   assert(text.includes("available"), "availability is visible");
@@ -267,7 +282,9 @@ Deno.test("Worker state events and acknowledgements replace the full state", () 
   assertEquals(projection.workerState, freshIdle);
   assertEquals(projection.status, "idle");
   assert(
-    !projection.lines.some((line) => line.eventId?.includes("worker-state-conflict")),
+    !projection.lines.some((line) =>
+      line.eventId?.includes("worker-state-conflict")
+    ),
     "full snapshots must not be rejected by a client-side version comparison",
   );
 });
@@ -284,7 +301,10 @@ Deno.test("snapshot replaces a live error with one durable run_errored row", () 
     },
     {
       eventId: "idle-after-error",
-      event: { event: "worker_state", data: { snapshot: workerState("idle") } } satisfies Event,
+      event: {
+        event: "worker_state",
+        data: { snapshot: workerState("idle") },
+      } satisfies Event,
     },
   ]);
 
@@ -722,7 +742,9 @@ Deno.test("projectConsole streams distinct Bash stdout and stderr through termin
 
 Deno.test("snapshot restores bounded in-flight Bash command output", () => {
   const snapshot = snapshotEvent("/repo");
-  if (snapshot.event !== "snapshot") throw new Error("snapshot fixture expected");
+  if (snapshot.event !== "snapshot") {
+    throw new Error("snapshot fixture expected");
+  }
   snapshot.data.state = workerState("running");
   snapshot.data.in_flight = {
     blocks: [{
@@ -750,7 +772,10 @@ Deno.test("snapshot restores bounded in-flight Bash command output", () => {
     }],
   };
 
-  const projection = projectConsole([{ eventId: "snapshot-command", event: snapshot }]);
+  const projection = projectConsole([{
+    eventId: "snapshot-command",
+    event: snapshot,
+  }]);
   const [line] = projection.lines.filter((line) => line.kind === "tool");
   assertEquals(line.toolCallLabel, "Bash($ slow)");
   assertEquals(line.toolStatus, "running…");
@@ -798,14 +823,20 @@ Deno.test("projectConsole caps default preview but keeps complete detail body", 
 
   const [line] = projection.lines.filter((line) => line.kind === "tool");
   assertEquals(line.title, "Call · CustomTool");
-  assertEquals(line.toolCallLabel, 'CustomTool("first":"one","second":"two","third":"three","fourth":"four")');
+  assertEquals(
+    line.toolCallLabel,
+    'CustomTool("first":"one","second":"two","third":"three","fourth":"four")',
+  );
   assertEquals(line.toolStatus, "done");
   assertEquals(line.body.split("\n").length, 3);
   assert(
     line.body.includes("out1") && line.body.includes("… +3 more lines"),
     "normal display should retain the capped response preview",
   );
-  assert(!line.body.includes("first"), "request arguments should stay in the Call signature and detail");
+  assert(
+    !line.body.includes("first"),
+    "request arguments should stay in the Call signature and detail",
+  );
   assert(
     line.detail?.includes("arguments:\nfirst: one") === true &&
       line.detail?.includes("fourth: four") === true,
@@ -873,7 +904,9 @@ Deno.test("projectConsole renders JSON tool responses as YAML", () => {
 
   const toolLines = projection.lines.filter((line) => line.kind === "tool");
   const jsonLine = toolLines.find((line) => line.id.includes("json-tool"));
-  const invalidLine = toolLines.find((line) => line.id.includes("invalid-json-tool"));
+  const invalidLine = toolLines.find((line) =>
+    line.id.includes("invalid-json-tool")
+  );
   assert(jsonLine, "JSON tool line should be projected");
   assert(invalidLine, "invalid JSON tool line should be projected");
   assert(
@@ -924,7 +957,10 @@ Deno.test("projectConsole caps Grep preview but keeps complete detail body", () 
   assertEquals(line.toolStatus, "done");
   assert(line.body.includes("hit1"), "first result should be shown");
   assert(line.body.includes("hit5"), "fifth result should be shown");
-  assert(!line.body.includes("hit6"), "normal preview should retain its result cap");
+  assert(
+    !line.body.includes("hit6"),
+    "normal preview should retain its result cap",
+  );
   assert(
     line.body.includes("… +1 more results"),
     "preview should show the omitted result count",
@@ -1018,7 +1054,7 @@ Deno.test("projectConsole renders alert events", () => {
   assertEquals(projection.lines[1].error, true);
 });
 
-Deno.test("projectConsole upserts compaction lifecycle by stable id", () => {
+Deno.test("legacy compaction lifecycle events are inert", () => {
   const running = {
     schema_version: 2,
     compaction_id: "compaction-1",
@@ -1033,23 +1069,14 @@ Deno.test("projectConsole upserts compaction lifecycle by stable id", () => {
   } as const;
   const projection = projectConsole([
     {
-      eventId: "compact-1",
-      event: { event: "compact_start", data: { lifecycle: running } } satisfies Event,
-    },
-  ]);
-
-  assertEquals(projection.lines.length, 1);
-  assertEquals(projection.lines[0].id, "compaction-compaction-1");
-  assertEquals(projection.lines[0].compaction?.state, "running");
-  assertEquals(projection.lines[0].streaming, true);
-
-  const completed = projectConsole([
-    {
-      eventId: "compact-1",
-      event: { event: "compact_start", data: { lifecycle: running } } satisfies Event,
+      eventId: "compact-start",
+      event: {
+        event: "compact_start",
+        data: { lifecycle: running },
+      } satisfies Event,
     },
     {
-      eventId: "compact-2",
+      eventId: "compact-done",
       event: {
         event: "compact_done",
         data: {
@@ -1064,17 +1091,32 @@ Deno.test("projectConsole upserts compaction lifecycle by stable id", () => {
         },
       } satisfies Event,
     },
+    {
+      eventId: "compact-failed",
+      event: {
+        event: "compact_failed",
+        data: {
+          lifecycle: {
+            ...running,
+            revision: 3,
+            state: "failed",
+            ended_at_ms: 5_000,
+            error: "legacy failure",
+          },
+        },
+      } satisfies Event,
+    },
   ]);
 
-  assertEquals(completed.lines.length, 1);
-  assertEquals(completed.lines[0].id, "compaction-compaction-1");
-  assertEquals(completed.lines[0].compaction?.state, "done");
-  assertEquals(completed.lines[0].compaction?.summary, "accepted summary");
-  assertEquals(completed.lines[0].streaming, false);
+  assertEquals(projection.lines, []);
+  assertEquals(projection.compaction, null);
 });
 
 Deno.test("snapshot restores running compaction without staged content", () => {
-  const snapshot = snapshotEvent("/repo") as Extract<Event, { event: "snapshot" }>;
+  const snapshot = snapshotEvent("/repo") as Extract<
+    Event,
+    { event: "snapshot" }
+  >;
   snapshot.data.in_flight = {
     blocks: [],
     compaction: {
@@ -1083,37 +1125,223 @@ Deno.test("snapshot restores running compaction without staged content", () => {
       trigger: "manual",
     },
   };
+  snapshot.data.internal_workers = [{
+    worker: {
+      session_id: "snapshot-compactor",
+      name: "Compaction",
+      parent_session_id: "parent-session",
+      kind: { service: { kind: "compaction" } },
+    },
+    revision: 1,
+    session: canonicalSession([]),
+    status: "running",
+    in_flight: {
+      blocks: [{
+        kind: "tool_call",
+        id: "snapshot-read",
+        name: "ReadEntry",
+        args: JSON.stringify({ entry_ref: "E1" }),
+        state: "pending",
+      }],
+    },
+    internal_workers: [],
+  }];
 
   const projection = projectConsole([{ eventId: "snapshot", event: snapshot }]);
 
-  assertEquals(projection.lines.length, 0);
+  assertEquals(projection.lines.length, 1);
+  assertEquals(projection.lines[0].id, "compaction-runtime");
+  assertEquals(projection.lines[0].compaction?.phase, "summarizing");
+  assertEquals(
+    projection.lines[0].compaction?.internalWorkerSessionId,
+    "snapshot-compactor",
+  );
+  assertEquals(projection.lines[0].compaction?.activity, [
+    "ReadEntry — pending",
+  ]);
   assertEquals(projection.compaction?.phase, "summarizing");
   assertEquals(projection.compaction?.trigger, "manual");
 });
 
-Deno.test("compaction service activity stays nested in one lifecycle item", () => {
+Deno.test("snapshot authoritatively clears and restores compaction progress", () => {
+  const projector = createConsoleProjector();
+  let projection = projector.append([{
+    eventId: "live-progress",
+    event: {
+      event: "compaction_progress",
+      data: {
+        compaction: {
+          phase: "summarizing",
+          started_at_ms: 1_000,
+          trigger: "manual",
+        },
+      },
+    } satisfies Event,
+  }]);
+  assertEquals(projection.lines[0]?.id, "compaction-runtime");
+
+  projection = projector.append([{
+    eventId: "clear-snapshot",
+    event: snapshotEvent("/repo"),
+  }]);
+  assertEquals(projection.compaction, null);
+  assertEquals(projection.lines, []);
+
+  const restore = snapshotEvent("/repo") as Extract<
+    Event,
+    { event: "snapshot" }
+  >;
+  restore.data.in_flight = {
+    blocks: [],
+    compaction: {
+      phase: "committing",
+      started_at_ms: 2_000,
+      trigger: "request_threshold",
+    },
+  };
+  projection = projector.append([{
+    eventId: "restore-snapshot",
+    event: restore,
+  }]);
+  assertEquals(projection.lines.length, 1);
+  assertEquals(projection.lines[0].id, "compaction-runtime");
+  assertEquals(projection.lines[0].compaction?.phase, "committing");
+  assertEquals(projection.compaction?.started_at_ms, 2_000);
+});
+
+Deno.test("snapshot does not guess between multiple compaction services", () => {
+  const snapshot = snapshotEvent("/repo") as Extract<
+    Event,
+    { event: "snapshot" }
+  >;
+  snapshot.data.in_flight = {
+    blocks: [],
+    compaction: {
+      phase: "summarizing",
+      started_at_ms: 1_000,
+      trigger: "manual",
+    },
+  };
+  snapshot.data.internal_workers = ["compactor-a", "compactor-b"].map(
+    (sessionId) => ({
+      worker: {
+        session_id: sessionId,
+        name: "Compaction",
+        parent_session_id: "parent-session",
+        kind: { service: { kind: "compaction" } },
+      },
+      revision: 1,
+      session: canonicalSession([]),
+      status: "running" as const,
+      in_flight: {
+        blocks: [{
+          kind: "tool_call" as const,
+          id: `read-${sessionId}`,
+          name: "ReadEntry",
+          args: "{}",
+          state: "pending" as const,
+        }],
+      },
+      internal_workers: [],
+    }),
+  );
+
+  const projection = projectConsole([{ eventId: "snapshot", event: snapshot }]);
+
+  assertEquals(projection.lines.length, 1);
+  assertEquals(
+    projection.lines[0].compaction?.internalWorkerSessionId,
+    undefined,
+  );
+  assertEquals(projection.lines[0].compaction?.activity, []);
+  assertEquals(consoleWorkerViews(projection).length, 1);
+});
+
+Deno.test("live compaction keeps its first service binding until terminal progress", () => {
+  const workerA = {
+    session_id: "compactor-a",
+    name: "Compaction A",
+    parent_session_id: "parent-session",
+    kind: { service: { kind: "compaction" } },
+  } as const;
+  const workerB = {
+    ...workerA,
+    session_id: "compactor-b",
+    name: "Compaction B",
+  } as const;
+  const projection = projectConsole([
+    {
+      eventId: "compaction-progress",
+      event: {
+        event: "compaction_progress",
+        data: {
+          compaction: {
+            phase: "summarizing",
+            started_at_ms: 1_000,
+            trigger: "manual",
+          },
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "compactor-a-read",
+      event: {
+        event: "internal_worker",
+        data: {
+          worker: workerA,
+          revision: 1,
+          event: {
+            event: "tool_call_start",
+            data: { id: "read-a", name: "ReadEntry" },
+          },
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "compactor-b-search",
+      event: {
+        event: "internal_worker",
+        data: {
+          worker: workerB,
+          revision: 1,
+          event: {
+            event: "tool_call_start",
+            data: { id: "search-b", name: "SearchSessionEntries" },
+          },
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  assertEquals(
+    projection.lines[0].compaction?.internalWorkerSessionId,
+    workerA.session_id,
+  );
+  assertEquals(projection.lines[0].compaction?.activity, [
+    "ReadEntry — pending",
+  ]);
+});
+
+Deno.test("compaction summary candidate stays private", () => {
   const worker = {
     session_id: "compactor-session",
     name: "Compaction",
     parent_session_id: "parent-session",
     kind: { service: { kind: "compaction" } },
   } as const;
-  const lifecycle = {
-    schema_version: 2,
-    compaction_id: "compaction-nested",
-    revision: 2,
-    internal_worker: worker,
-    state: "running",
-    started_at_ms: 1_000,
-    ended_at_ms: null,
-    summary: null,
-    error: null,
-    new_segment_id: null,
-  } as const;
   const projection = projectConsole([
     {
-      eventId: "compaction-start",
-      event: { event: "compact_start", data: { lifecycle } } satisfies Event,
+      eventId: "compaction-progress",
+      event: {
+        event: "compaction_progress",
+        data: {
+          compaction: {
+            phase: "summarizing",
+            started_at_ms: 1_000,
+            trigger: "manual",
+          },
+        },
+      } satisfies Event,
     },
     {
       eventId: "compaction-tool",
@@ -1150,13 +1378,113 @@ Deno.test("compaction service activity stays nested in one lifecycle item", () =
   ]);
 
   assertEquals(projection.lines.length, 1);
-  assertEquals(projection.lines[0].id, "compaction-compaction-nested");
-  assertEquals(projection.lines[0].compaction?.activity, ["write_summary — running"]);
-  assertEquals(projection.lines[0].compaction?.candidate, "draft candidate");
+  assertEquals(projection.lines[0].id, "compaction-runtime");
+  assertEquals(projection.lines[0].compaction?.activity, [
+    "write_summary — running",
+  ]);
+  assert(
+    !JSON.stringify(projection.lines[0]).includes("draft candidate"),
+    "uncommitted summary content is not projected into the parent Console",
+  );
   assert(
     consoleWorkerViews(projection).length === 1,
     "service is not a selectable SubWorker pane",
   );
+});
+
+Deno.test("runtime compaction progress nests service activity and clears it", () => {
+  const worker = {
+    session_id: "runtime-compactor-session",
+    name: "Compaction",
+    parent_session_id: "parent-session",
+    kind: { service: { kind: "compaction" } },
+  } as const;
+  const projector = createConsoleProjector();
+  let projection = projector.append([{
+    eventId: "compaction-progress",
+    event: {
+      event: "compaction_progress",
+      data: {
+        compaction: {
+          phase: "summarizing",
+          started_at_ms: 1_000,
+          trigger: "request_threshold",
+        },
+      },
+    } satisfies Event,
+  }, {
+    eventId: "compaction-read",
+    event: {
+      event: "internal_worker",
+      data: {
+        worker,
+        revision: 1,
+        event: {
+          event: "tool_call_done",
+          data: {
+            id: "call-read",
+            name: "ReadEntry",
+            arguments: JSON.stringify({ entry_ref: "E1" }),
+          },
+        },
+      },
+    } satisfies Event,
+  }, {
+    eventId: "compaction-mark",
+    event: {
+      event: "internal_worker",
+      data: {
+        worker,
+        revision: 2,
+        event: {
+          event: "tool_call_done",
+          data: {
+            id: "call-mark",
+            name: "mark_read_required",
+            arguments: JSON.stringify({ path: "src/lib.rs" }),
+          },
+        },
+      },
+    } satisfies Event,
+  }]);
+
+  assertEquals(projection.lines.length, 1);
+  assertEquals(projection.lines[0].id, "compaction-runtime");
+  assertEquals(
+    projection.lines[0].compaction?.internalWorkerSessionId,
+    worker.session_id,
+  );
+  assertEquals(projection.lines[0].compaction?.activity, [
+    "ReadEntry — running",
+    "mark_read_required — running",
+  ]);
+  assert(
+    consoleWorkerViews(projection).length === 1,
+    "service activity remains nested instead of becoming a selectable Worker view",
+  );
+
+  projection = projector.append([{
+    eventId: "compaction-service-removed",
+    event: {
+      event: "internal_worker_removed",
+      data: { worker, revision: 3 },
+    } satisfies Event,
+  }]);
+  assertEquals(projection.internalWorkers, []);
+  assertEquals(projection.lines[0].compaction?.activity, [
+    "ReadEntry — running",
+    "mark_read_required — running",
+  ]);
+
+  projection = projector.append([{
+    eventId: "compaction-clear",
+    event: {
+      event: "compaction_progress",
+      data: { compaction: null },
+    } satisfies Event,
+  }]);
+  assertEquals(projection.compaction, null);
+  assertEquals(projection.lines, []);
 });
 
 Deno.test("snapshot excludes storage-only compaction extension records", () => {
@@ -1186,61 +1514,126 @@ Deno.test("snapshot excludes storage-only compaction extension records", () => {
   assertEquals(projection.lines.length, 0);
 });
 
-Deno.test("createConsoleProjector ignores stale compaction revisions", () => {
-  const projector = createConsoleProjector();
-  const base = {
-    schema_version: 2,
-    compaction_id: "compaction-identity",
-    revision: 1,
-    internal_worker: null,
-    state: "running",
-    started_at_ms: 1_000,
-    ended_at_ms: null,
-    summary: null,
-    error: null,
-    new_segment_id: null,
+Deno.test("segment rotation preserves compaction progress in either event order", () => {
+  const progress = {
+    event: "compaction_progress",
+    data: {
+      compaction: {
+        phase: "committing",
+        started_at_ms: 1_000,
+        trigger: "manual",
+      },
+    },
+  } satisfies Event;
+  const rotation = {
+    event: "segment_rotated",
+    data: { session: canonicalSession([]) },
+  } satisfies Event;
+
+  const progressThenRotation = projectConsole([
+    { eventId: "progress-first", event: progress },
+    { eventId: "rotation-second", event: rotation },
+  ]);
+  assertEquals(progressThenRotation.lines.length, 1);
+  assertEquals(progressThenRotation.lines[0].id, "compaction-runtime");
+  assertEquals(progressThenRotation.lines[0].compaction?.phase, "committing");
+
+  const rotationThenProgress = projectConsole([
+    { eventId: "rotation-first", event: rotation },
+    { eventId: "progress-second", event: progress },
+  ]);
+  assertEquals(rotationThenProgress.lines.length, 1);
+  assertEquals(rotationThenProgress.lines[0].id, "compaction-runtime");
+  assertEquals(rotationThenProgress.lines[0].compaction?.phase, "committing");
+});
+
+Deno.test("back-to-back compactions do not retain prior activity", () => {
+  const worker = {
+    session_id: "first-compactor",
+    name: "Compaction",
+    parent_session_id: "parent-session",
+    kind: { service: { kind: "compaction" } },
   } as const;
+  const projector = createConsoleProjector();
   let projection = projector.append([
     {
-      eventId: "compact-identity-1",
+      eventId: "first-progress",
       event: {
-        event: "user_message",
-        data: { segments: [{ kind: "text", content: "hello" }] },
-      } satisfies Event,
-    },
-    {
-      eventId: "compact-identity-2",
-      event: { event: "compact_start", data: { lifecycle: base } } satisfies Event,
-    },
-  ]);
-  const userLine = projection.lines[0];
-
-  projection = projector.append([
-    {
-      eventId: "compact-identity-3",
-      event: {
-        event: "compact_done",
+        event: "compaction_progress",
         data: {
-          lifecycle: {
-            ...base,
-            revision: 2,
-            state: "done",
-            ended_at_ms: 2_000,
-            summary: "accepted",
-            new_segment_id: "00000000-0000-0000-0000-000000000001",
+          compaction: {
+            phase: "summarizing",
+            started_at_ms: 1_000,
+            trigger: "manual",
           },
         },
       } satisfies Event,
     },
     {
-      eventId: "compact-identity-stale",
-      event: { event: "compact_start", data: { lifecycle: base } } satisfies Event,
+      eventId: "first-read",
+      event: {
+        event: "internal_worker",
+        data: {
+          worker,
+          revision: 1,
+          event: {
+            event: "tool_call_done",
+            data: { id: "read-1", name: "ReadEntry", arguments: "{}" },
+          },
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "first-removed",
+      event: {
+        event: "internal_worker_removed",
+        data: { worker, revision: 2 },
+      } satisfies Event,
+    },
+    {
+      eventId: "first-clear",
+      event: {
+        event: "compaction_progress",
+        data: { compaction: null },
+      } satisfies Event,
+    },
+    {
+      eventId: "second-progress",
+      event: {
+        event: "compaction_progress",
+        data: {
+          compaction: {
+            phase: "preparing",
+            started_at_ms: 2_000,
+            trigger: "request_threshold",
+          },
+        },
+      } satisfies Event,
     },
   ]);
 
-  assert(projection.lines[0] === userLine, "unrelated line retains identity");
-  assertEquals(projection.lines[1].compaction?.state, "done");
-  assertEquals(projection.lines[1].compaction?.summary, "accepted");
+  assertEquals(projection.lines.length, 1);
+  assertEquals(projection.lines[0].compaction?.startedAtMs, 2_000);
+  assertEquals(
+    projection.lines[0].compaction?.internalWorkerSessionId,
+    undefined,
+  );
+  assertEquals(projection.lines[0].compaction?.activity, []);
+
+  projection = projector.append([{
+    eventId: "second-commit",
+    event: {
+      event: "compaction_progress",
+      data: {
+        compaction: {
+          phase: "committing",
+          started_at_ms: 2_000,
+          trigger: "request_threshold",
+        },
+      },
+    } satisfies Event,
+  }]);
+  assertEquals(projection.lines[0].compaction?.activity, []);
 });
 
 Deno.test("projectConsole keeps streaming tool call updates in the same Call block", () => {
@@ -1491,7 +1884,10 @@ Deno.test("projectConsole hides lifecycle events and renders system items", () =
   const projection = projectConsole([
     {
       eventId: "30",
-      event: { event: "worker_state", data: { snapshot: workerState("running") } } satisfies Event,
+      event: {
+        event: "worker_state",
+        data: { snapshot: workerState("running") },
+      } satisfies Event,
     },
     {
       eventId: "31",
@@ -1629,7 +2025,9 @@ Deno.test("projectConsole renders snapshot entries and in-flight output", () => 
   assertEquals(projection.status, "running");
   assertEquals(
     projection.lines.map((line) =>
-      `${line.kind}:${line.toolCallLabel ? `${line.toolCallLabel}\n${line.body}` : line.body}:${line.streaming}`
+      `${line.kind}:${
+        line.toolCallLabel ? `${line.toolCallLabel}\n${line.body}` : line.body
+      }:${line.streaming}`
     ),
     [
       "user:seed user:false",
@@ -1872,7 +2270,8 @@ Deno.test("projectConsole relativizes known tool path displays from snapshot cwd
   );
   assert(
     toolLines.some((line) =>
-      line.toolCallLabel === "Write(out.txt)" && line.body.includes("Wrote out.txt")
+      line.toolCallLabel === "Write(out.txt)" &&
+      line.body.includes("Wrote out.txt")
     ),
     "Write signature and known result path should be relative",
   );
@@ -2010,7 +2409,10 @@ Deno.test("console Worker views expose only direct Internal Workers", () => {
               kind: "sub_worker",
             },
             revision: 1,
-            event: { event: "worker_state", data: { snapshot: workerState("running") } },
+            event: {
+              event: "worker_state",
+              data: { snapshot: workerState("running") },
+            },
           },
         },
       },
@@ -2029,7 +2431,10 @@ Deno.test("console Worker views expose only direct Internal Workers", () => {
           kind: "sub_worker",
         },
         revision: 1,
-        event: { event: "worker_state", data: { snapshot: workerState("idle") } },
+        event: {
+          event: "worker_state",
+          data: { snapshot: workerState("idle") },
+        },
       },
     },
   }]);
@@ -2121,7 +2526,10 @@ Deno.test("parent snapshot authoritatively replaces Internal Worker projections"
           kind: "sub_worker",
         },
         revision: 1,
-        event: { event: "worker_state", data: { snapshot: workerState("running") } },
+        event: {
+          event: "worker_state",
+          data: { snapshot: workerState("running") },
+        },
       },
     },
   }]);

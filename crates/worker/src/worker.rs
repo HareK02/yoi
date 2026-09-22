@@ -5298,7 +5298,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     }
 
     pub(crate) async fn retry_pending_compaction_cleanup(&self) -> Result<(), WorkerError> {
-        self.release_pending_compaction_service().await
+        let cleanup_pending = self.has_pending_compaction_cleanup();
+        self.release_pending_compaction_service().await?;
+        if cleanup_pending {
+            self.set_compaction_progress(None);
+        }
+        Ok(())
     }
 
     pub(crate) async fn finish_pending_compaction_cleanup_for_shutdown(
@@ -8979,6 +8984,15 @@ mod build_summary_prompt_tests {
         let (cleanup_session_id, _events) = registry.install_service_for_test();
         registry.fail_service_stops_for_test(&cleanup_session_id, 4);
         worker.internal_worker_registry = Some(Arc::clone(&registry));
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+        worker.attach_working_event_tx(event_tx.clone());
+        let in_flight = InFlightEvents::new(event_tx);
+        worker.attach_in_flight_events(in_flight.clone());
+        worker.set_compaction_progress(Some(InFlightCompaction {
+            phase: CompactionPhase::Summarizing,
+            started_at_ms: 1,
+            trigger: CompactionTrigger::Manual,
+        }));
         *worker
             .pending_compaction_cleanup
             .lock()
@@ -8995,12 +9009,44 @@ mod build_summary_prompt_tests {
         }
         assert!(worker.has_pending_compaction_cleanup());
         assert!(registry.has_service_for_test(&cleanup_session_id));
+        let in_flight_guard = in_flight.snapshot_guard();
+        assert!(
+            crate::in_flight::snapshot_from_guard(&in_flight_guard)
+                .compaction
+                .is_some(),
+            "failed cleanup retries must keep reconnect compaction state active"
+        );
+        drop(in_flight_guard);
+        while let Ok(event) = event_rx.try_recv() {
+            assert!(
+                !matches!(event, Event::CompactionProgress { compaction: None }),
+                "terminal progress must not publish before the service stops"
+            );
+        }
         tokio::time::timeout(Duration::from_secs(1), cleanup)
             .await
             .expect("shutdown cleanup must converge after retry")
             .unwrap();
         assert!(!worker.has_pending_compaction_cleanup());
         assert!(!registry.has_service_for_test(&cleanup_session_id));
+        let in_flight_guard = in_flight.snapshot_guard();
+        assert!(
+            crate::in_flight::snapshot_from_guard(&in_flight_guard)
+                .compaction
+                .is_none(),
+            "successful cleanup retry must clear reconnect compaction state"
+        );
+        drop(in_flight_guard);
+        let mut saw_clear = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if matches!(event, Event::CompactionProgress { compaction: None }) {
+                saw_clear = true;
+            }
+        }
+        assert!(
+            saw_clear,
+            "successful cleanup retry must publish terminal progress"
+        );
     }
 
     #[tokio::test]

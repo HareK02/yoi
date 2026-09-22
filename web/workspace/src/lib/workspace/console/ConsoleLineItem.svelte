@@ -12,7 +12,7 @@
   let nowMs = $state(Date.now());
 
   $effect(() => {
-    if (item.compaction?.state !== 'running') return;
+    if (!item.compaction) return;
     nowMs = Date.now();
     const timer = window.setInterval(() => {
       nowMs = Date.now();
@@ -23,7 +23,7 @@
   function compactionElapsedMs(line: ConsoleLine): number {
     const compaction = line.compaction;
     if (!compaction) return 0;
-    return Math.max(0, (compaction.endedAtMs ?? nowMs) - compaction.startedAtMs);
+    return Math.max(0, nowMs - compaction.startedAtMs);
   }
 
   function formatElapsed(ms: number): string {
@@ -33,8 +33,12 @@
     return `${minutes}m ${seconds % 60}s`;
   }
 
-  function compactionState(line: ConsoleLine): string {
-    return line.compaction?.state.replace('_', ' ') ?? '';
+  function compactionHeading(line: ConsoleLine): string {
+    const compaction = line.compaction;
+    if (!compaction) return '';
+    return compaction.phase
+      ? `Compacting · ${compaction.phase.replace('_', ' ')}`
+      : 'Compacting…';
   }
 
   function lineClass(line: ConsoleLine): string {
@@ -80,7 +84,7 @@
 >
   {#if item.compaction}
     <div class="compaction-heading">
-      <span>Compaction · {compactionState(item)}</span>
+      <span>{compactionHeading(item)}</span>
       <span>{formatElapsed(compactionElapsedMs(item))}</span>
     </div>
     {#if item.compaction.activity.length > 0}
@@ -89,16 +93,6 @@
           <li>{activity}</li>
         {/each}
       </ul>
-    {/if}
-    {#if item.compaction.summary}
-      <div class="compaction-summary">{item.compaction.summary}</div>
-    {:else if item.compaction.candidate}
-      <div class="compaction-candidate">
-        <span class="compaction-candidate-label">candidate</span>
-        {item.compaction.candidate}
-      </div>
-    {:else if item.compaction.error}
-      <div class="compaction-error">{item.compaction.error}</div>
     {/if}
   {:else if shouldRenderHeading(item)}
     <div class="message-heading">
@@ -119,7 +113,7 @@
     </div>
   {/if}
   {#if item.compaction}
-    <!-- rendered as one lifecycle item above -->
+    <!-- rendered as one runtime activity item above -->
   {:else if item.kind === 'tool'}
     {#if toolBodyText(item)}
       <p class="console-plain-text">
@@ -214,24 +208,6 @@
     color: var(--tui-dark-gray);
     font-family: var(--font-mono);
     font-size: var(--font-size-compact);
-  }
-
-  .compaction-summary,
-  .compaction-candidate,
-  .compaction-error {
-    margin-top: var(--space-1);
-    white-space: pre-wrap;
-  }
-
-  .compaction-candidate-label {
-    display: block;
-    color: var(--text-muted);
-    font-family: var(--font-mono);
-    font-size: var(--font-size-compact);
-  }
-
-  .compaction-error {
-    color: var(--danger);
   }
 
   .activity-summary {

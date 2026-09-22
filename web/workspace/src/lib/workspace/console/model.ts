@@ -3,7 +3,6 @@ import type {
   CommandEvent,
   CommandSnapshot,
   CommandStreamSlice,
-  CompactionLifecycle,
   Event as ProtocolEvent,
   InFlightBlock,
   InFlightCompaction,
@@ -73,14 +72,8 @@ export type ConsoleDiffLine = {
 export type ConsoleViewMode = "overview" | "normal";
 
 export type ConsoleCompaction = {
-  id: string;
-  revision: number;
-  state: "running" | "done" | "failed" | "interrupted";
+  phase?: InFlightCompaction["phase"];
   startedAtMs: number;
-  endedAtMs?: number;
-  summary?: string;
-  candidate?: string;
-  error?: string;
   internalWorkerSessionId?: string;
   activity: string[];
 };
@@ -514,7 +507,9 @@ function appendSnapshotCommands(
   commands: CommandSnapshot[],
   eventId: string,
 ): void {
-  commands.forEach((command) => upsertCommandSnapshot(projection, eventId, command));
+  commands.forEach((command) =>
+    upsertCommandSnapshot(projection, eventId, command)
+  );
 }
 
 function upsertCommandSnapshot(
@@ -631,7 +626,8 @@ function appendCommandStream(
     start_offset: endOffset - tail.length,
     end_offset: endOffset,
     content: tail,
-    truncated: existing.truncated || !contiguous || tail.length < combined.length ||
+    truncated: existing.truncated || !contiguous ||
+      tail.length < combined.length ||
       startOffset > 0,
   };
 }
@@ -678,107 +674,115 @@ function projectInternalWorkerSnapshot(
   return { worker: snapshot.worker, revision: snapshot.revision, console };
 }
 
-function compactionCandidate(
+const RUNTIME_COMPACTION_LINE_ID = "compaction-runtime";
+
+function isCompactionService(worker: InternalWorkerRef): boolean {
+  return worker.kind !== "sub_worker" &&
+    worker.kind.service.kind === "compaction";
+}
+
+function activeCompactionServiceSessionId(
   projection: ConsoleProjection,
-  sessionId: string | undefined,
 ): string | undefined {
-  if (!sessionId) return undefined;
-  const worker = projection.internalWorkers.find(
-    (candidate) => candidate.worker.session_id === sessionId,
+  const candidates = projection.internalWorkers.filter((worker) =>
+    isCompactionService(worker.worker)
   );
-  const calls = worker?.console.lines
-    .map((line) => line.toolCall)
-    .filter((call): call is ToolCallView => call?.name === "write_summary") ?? [];
-  const latest = calls.at(-1);
-  const raw = latest?.arguments ?? latest?.argsStream;
-  if (!raw) return undefined;
-  try {
-    const parsed = JSON.parse(raw) as { text?: unknown };
-    return typeof parsed.text === "string" ? parsed.text : undefined;
-  } catch {
-    return undefined;
-  }
+  return candidates.length === 1 ? candidates[0]?.worker.session_id : undefined;
 }
 
 function compactionActivity(
   projection: ConsoleProjection,
-  sessionId: string | undefined
+  sessionId: string | undefined,
 ): string[] {
   if (!sessionId) return [];
   const worker = projection.internalWorkers.find(
-    (candidate) => candidate.worker.session_id === sessionId
+    (candidate) => candidate.worker.session_id === sessionId,
   );
   if (!worker) return [];
   return worker.console.lines
-    .filter((line) => line.kind === "tool" || line.kind === "status" || line.kind === "error")
+    .filter((line) => line.kind === "tool")
     .slice(-12)
     .map((line) =>
-      line.toolCall?.name === "write_summary"
-        ? `write_summary — ${line.toolCall.state}`
+      line.toolCall
+        ? `${line.toolCall.name} — ${line.toolCall.state}`
         : line.body || line.title
     )
-    .filter((value, index, values) => value.length > 0 && values.indexOf(value) === index);
+    .filter((value, index, values) =>
+      value.length > 0 && values.indexOf(value) === index
+    );
 }
 
 function applyInFlightCompaction(
   projection: ConsoleProjection,
   progress: InFlightCompaction | null,
 ): ConsoleProjection {
-  return { ...projection, compaction: progress };
-}
+  const lineIndex = projection.lines.findIndex((line) =>
+    line.id === RUNTIME_COMPACTION_LINE_ID
+  );
+  const existing = lineIndex >= 0
+    ? projection.lines[lineIndex]?.compaction
+    : undefined;
+  if (!progress) {
+    return {
+      ...projection,
+      compaction: null,
+      lines: projection.lines.filter((line) =>
+        line.id !== RUNTIME_COMPACTION_LINE_ID
+      ),
+    };
+  }
 
-function applyCompactionLifecycle(
-  projection: ConsoleProjection,
-  lifecycle: CompactionLifecycle
-): ConsoleProjection {
-  const lineId = `compaction-${lifecycle.compaction_id}`;
-  const existing = projection.lines.find((line) => line.id === lineId)?.compaction;
-  if (existing && existing.revision >= lifecycle.revision) return projection;
-  const internalWorkerSessionId = lifecycle.internal_worker?.session_id;
-  const compaction: ConsoleCompaction = {
-    id: lifecycle.compaction_id,
-    revision: lifecycle.revision,
-    state: lifecycle.state,
-    startedAtMs: lifecycle.started_at_ms,
-    endedAtMs: lifecycle.ended_at_ms ?? undefined,
-    summary: lifecycle.summary ?? undefined,
-    candidate: compactionCandidate(projection, internalWorkerSessionId),
-    error: lifecycle.error ?? undefined,
+  const internalWorkerSessionId = existing?.internalWorkerSessionId ??
+    activeCompactionServiceSessionId(projection);
+  const observedActivity = compactionActivity(
+    projection,
     internalWorkerSessionId,
-    activity: compactionActivity(projection, internalWorkerSessionId)
+  );
+  const compaction: ConsoleCompaction = {
+    phase: progress.phase,
+    startedAtMs: progress.started_at_ms,
+    internalWorkerSessionId,
+    activity: observedActivity.length > 0
+      ? observedActivity
+      : existing?.activity ?? [],
   };
   const line: ConsoleLine = {
-    id: lineId,
+    id: RUNTIME_COMPACTION_LINE_ID,
     source: "event",
-    kind: compaction.state === "failed" ? "error" : "status",
+    kind: "status",
     title: "Compaction",
-    body: compaction.summary ?? compaction.error ?? "",
-    streaming: compaction.state === "running",
-    error: compaction.state === "failed",
-    compaction
+    body: "",
+    streaming: true,
+    compaction,
   };
-  const index = projection.lines.findIndex((candidate) => candidate.id === lineId);
   const lines = [...projection.lines];
-  if (index >= 0) lines[index] = line;
+  if (lineIndex >= 0) lines[lineIndex] = line;
   else lines.push(line);
-  return { ...projection, lines };
+  return { ...projection, compaction: progress, lines };
 }
 
 function refreshCompactionActivity(
   projection: ConsoleProjection,
-  sessionId: string
+  worker: InternalWorkerRef,
 ): ConsoleProjection {
   let changed = false;
   const lines = projection.lines.map((line) => {
-    if (line.compaction?.internalWorkerSessionId !== sessionId) return line;
+    const compaction = line.compaction;
+    if (!compaction) return line;
+    const internalWorkerSessionId = compaction.internalWorkerSessionId ??
+      (line.id === RUNTIME_COMPACTION_LINE_ID && isCompactionService(worker) &&
+          activeCompactionServiceSessionId(projection) === worker.session_id
+        ? worker.session_id
+        : undefined);
+    if (internalWorkerSessionId !== worker.session_id) return line;
     changed = true;
     return {
       ...line,
       compaction: {
-        ...line.compaction,
-        candidate: compactionCandidate(projection, sessionId),
-        activity: compactionActivity(projection, sessionId)
-      }
+        ...compaction,
+        internalWorkerSessionId,
+        activity: compactionActivity(projection, internalWorkerSessionId),
+      },
     };
   });
   return changed ? { ...projection, lines } : projection;
@@ -938,26 +942,12 @@ export function applyProtocolEvent(
         projectInternalWorkerSnapshot(worker, envelope.eventId, next.cwd)
       );
       next.removedInternalWorkers = {};
-      if (event.data.in_flight?.compaction) {
-        const withCompaction = applyInFlightCompaction(
-          next,
-          event.data.in_flight.compaction,
-        );
-        next.lines = withCompaction.lines;
-        next.compaction = withCompaction.compaction;
-      }
-      for (const line of next.lines) {
-        const compaction = line.compaction;
-        if (!compaction) continue;
-        const sessionId = compaction.internalWorkerSessionId;
-        if (sessionId) {
-          line.compaction = {
-            ...compaction,
-            candidate: compactionCandidate(next, sessionId),
-            activity: compactionActivity(next, sessionId),
-          };
-        }
-      }
+      const withCompaction = applyInFlightCompaction(
+        next,
+        event.data.in_flight?.compaction ?? null,
+      );
+      next.lines = withCompaction.lines;
+      next.compaction = withCompaction.compaction;
       applyWorkerStateSnapshot(next, event.data.state);
       break;
     }
@@ -991,7 +981,7 @@ export function applyProtocolEvent(
       };
       if (existingIndex >= 0) next.internalWorkers[existingIndex] = updated;
       else next.internalWorkers.push(updated);
-      return refreshCompactionActivity(next, event.data.worker.session_id);
+      return refreshCompactionActivity(next, event.data.worker);
     }
     case "internal_worker_removed": {
       const existingIndex = next.internalWorkers.findIndex((worker) =>
@@ -1017,12 +1007,15 @@ export function applyProtocolEvent(
       break;
     case "segment_rotated": {
       const retainedErrors = next.lines.filter((line) => line.kind === "error");
+      const retainedCompaction = next.lines.filter((line) =>
+        line.id === RUNTIME_COMPACTION_LINE_ID
+      );
       const segment = snapshotProjectionFromSession(
         envelope.eventId,
         event.data.session,
         next.cwd,
       );
-      next.lines = [...segment.lines, ...retainedErrors];
+      next.lines = [...segment.lines, ...retainedErrors, ...retainedCompaction];
       next.tasks = segment.tasks;
       next.taskNextId = segment.taskNextId;
       break;
@@ -1062,7 +1055,9 @@ export function applyProtocolEvent(
     case "compact_start":
     case "compact_done":
     case "compact_failed":
-      return applyCompactionLifecycle(next, event.data.lifecycle);
+      // Durable lifecycle events are retained only as historical protocol
+      // compatibility. Runtime progress is the sole Console block authority.
+      break;
     case "shutdown":
       next.status = "shutdown";
       break;
@@ -1432,16 +1427,25 @@ function toolCallSignature(toolCall: ToolCallView): string {
       return `Read(${readPath(toolCall)})`;
     case "Write":
     case "Edit": {
-      const path = displayPath(stringField(args, "file_path") ?? "?", toolCall.cwd);
+      const path = displayPath(
+        stringField(args, "file_path") ?? "?",
+        toolCall.cwd,
+      );
       return `${toolCall.name}(${path})`;
     }
     case "Glob":
-      return `Glob(${stringField(args, "pattern") ?? genericCallArguments(toolCall)})`;
+      return `Glob(${
+        stringField(args, "pattern") ?? genericCallArguments(toolCall)
+      })`;
     case "Grep":
-      return `Grep(${stringField(args, "pattern") ?? genericCallArguments(toolCall)})`;
+      return `Grep(${
+        stringField(args, "pattern") ?? genericCallArguments(toolCall)
+      })`;
     case "Bash": {
       const command = stringField(args, "command");
-      return `Bash(${command ? `$ ${singleLine(command)}` : genericCallArguments(toolCall)})`;
+      return `Bash(${
+        command ? `$ ${singleLine(command)}` : genericCallArguments(toolCall)
+      })`;
     }
     default:
       return `${toolCall.name}(${genericCallArguments(toolCall)})`;
@@ -1462,7 +1466,9 @@ function singleLine(value: string): string {
 }
 
 function toolCallStatus(toolCall: ToolCallView): string {
-  return toolCall.name === "Bash" ? commandStateSuffix(toolCall) : stateSuffix(toolCall.state);
+  return toolCall.name === "Bash"
+    ? commandStateSuffix(toolCall)
+    : stateSuffix(toolCall.state);
 }
 
 function aggregateReadToolLines(lines: ConsoleLine[]): ConsoleLine[] {
@@ -1661,7 +1667,9 @@ function commandStateSuffix(toolCall: ToolCallView): string {
       : `completed (exit ${command.exit_code})`;
   }
   if (command.status === "failed") {
-    return command.exit_code === null ? "failed" : `failed (exit ${command.exit_code})`;
+    return command.exit_code === null
+      ? "failed"
+      : `failed (exit ${command.exit_code})`;
   }
   if (command.status === "timed_out") return "timed out";
   if (command.status === "cancelled") return "cancelled";
@@ -1679,7 +1687,9 @@ function commandTiming(command?: CommandSnapshot): string | undefined {
     0,
     command.last_output_at_ms - command.started_at_ms,
   );
-  return `elapsed ${durationLabel(elapsed)} · last output at +${durationLabel(lastOutputElapsed)}`;
+  return `elapsed ${durationLabel(elapsed)} · last output at +${
+    durationLabel(lastOutputElapsed)
+  }`;
 }
 
 function durationLabel(milliseconds: number): string {
@@ -1687,7 +1697,9 @@ function durationLabel(milliseconds: number): string {
   return `${(milliseconds / 1000).toFixed(milliseconds < 10_000 ? 1 : 0)}s`;
 }
 
-function renderLiveCommandOutput(command?: CommandSnapshot): string | undefined {
+function renderLiveCommandOutput(
+  command?: CommandSnapshot,
+): string | undefined {
   if (!command) return undefined;
   const stdout = compactLines([
     command.stdout.truncated ? "[… earlier stdout omitted]" : undefined,
@@ -1712,7 +1724,9 @@ function toolCallDetail(toolCall: ToolCallView): string {
   return compactLines([
     `id: ${toolCall.id}`,
     `state: ${stateSuffix(toolCall.state)}`,
-    toolCall.command ? `command: ${commandTiming(toolCall.command)}` : undefined,
+    toolCall.command
+      ? `command: ${commandTiming(toolCall.command)}`
+      : undefined,
     toolCall.summary
       ? `summary: ${
         normalizeKnownToolResult(toolCall.name, toolCall.summary, toolCall.cwd)
@@ -2029,63 +2043,6 @@ function applySessionEntry(
       break;
     default:
       break;
-  }
-}
-
-function applyExtensionEntry(
-  projection: ConsoleProjection,
-  eventId: string,
-  entry: Record<string, unknown>,
-) {
-  if (entry["domain"] !== "yoi.compaction") {
-    return;
-  }
-  const payload = entry["payload"];
-  if (!isRecord(payload)) return;
-  if (
-    typeof payload["compaction_id"] === "string" &&
-    typeof payload["revision"] === "number" &&
-    typeof payload["state"] === "string" &&
-    typeof payload["started_at_ms"] === "number"
-  ) {
-    const updated = applyCompactionLifecycle(
-      projection,
-      payload as unknown as CompactionLifecycle,
-    );
-    projection.lines = updated.lines;
-    return;
-  }
-  // Schema v1 remains readable historical evidence.
-  if (payload["kind"] !== "compaction_block") {
-    return;
-  }
-  const blockId = stringField(payload, "block_id") || "compact";
-  const state = stringField(payload, "state") || "running";
-  const message = stringField(payload, "message") ||
-    compactMessageForState(state, payload);
-  upsertStatusLine(
-    projection,
-    blockId,
-    eventId,
-    message,
-    state === "running",
-    state === "failed",
-  );
-}
-
-function compactMessageForState(
-  state: string,
-  payload: Record<string, unknown>,
-): string {
-  switch (state) {
-    case "done":
-      return "Compacted.";
-    case "failed": {
-      const error = stringField(payload, "error");
-      return error ? `Compact failed: ${error}` : "Compact failed.";
-    }
-    default:
-      return "Compacting…";
   }
 }
 

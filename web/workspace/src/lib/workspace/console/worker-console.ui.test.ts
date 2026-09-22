@@ -560,6 +560,20 @@ Deno.test("Worker Console owns its narrower centered shell width", async () => {
   );
 });
 
+Deno.test("Worker Console renders runtime compaction as one activity block", async () => {
+  const consoleLine = await Deno.readTextFile(
+    new URL("./ConsoleLineItem.svelte", import.meta.url),
+  );
+
+  assert(
+    consoleLine.includes("function compactionHeading") &&
+      consoleLine.includes("Compacting ·") &&
+      consoleLine.includes("{#each item.compaction.activity as activity}") &&
+      consoleLine.includes("<li>{activity}</li>"),
+    "Compaction should render as one live block with nested service activity",
+  );
+});
+
 Deno.test("Worker Console overview activity summaries use 14px text", async () => {
   const consoleLine = await Deno.readTextFile(
     new URL("./ConsoleLineItem.svelte", import.meta.url),
