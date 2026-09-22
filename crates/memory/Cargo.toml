@@ -7,19 +7,12 @@ license.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
-libc = { workspace = true }
 lint-common = { workspace = true }
 agen = { workspace = true }
-manifest = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
-serde_yaml = "0.9.34"
-thiserror = { workspace = true }
-tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7", "serde"] }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

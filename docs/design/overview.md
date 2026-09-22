@@ -6,7 +6,7 @@ That rule shapes the crate split. The runtime can restart, attach, compact, or d
 
 ## Core layers
 
-- `yoi` owns the product CLI and top-level command shape. It is the façade that wires profile selection, memory linting, and normal TUI launch.
+- `yoi` owns the product CLI and top-level command shape. It is the façade that wires connection selection, product commands, and normal TUI launch.
 - `worker` turns a `Engine` into a named runtime entity with scope, session persistence, protocol handling, tools, and Worker metadata integration.
 - `agen` owns model-facing turns: history append, retries, continuation, pruning/compaction mechanics, tool loops, and provider-independent callbacks.
 - `session-store` owns replayable append-only conversation/session logs.
@@ -16,7 +16,7 @@ That rule shapes the crate split. The runtime can restart, attach, compact, or d
 - `client` contains reusable Backend Workspace/Runtime clients plus the shared `Target` boundary. Its normal targets are exactly Standalone and Backend; it is not a subprocess launcher or repository-local product backend.
 - `manifest` resolves Profiles, Manifests, model/provider references, scopes, prompts, and tool permission policy into a runtime contract.
 - `tools` implements built-in tools with bounded output and policy-aware execution.
-- `memory` owns generated memory summary/decision/request records, linting, staging, and audit observations.
+- `memory` owns shared Memory domain, extraction, audit-event, and Workspace API transport types. Persistence and lifecycle execution belong to the Workspace Server control plane.
 - `workspace-server` is the local Workspace control-plane seam. It can project Tickets, Workers, lifecycle, usage, and orchestration events, but browser/API operations must stay on opaque backend identities instead of raw local paths, sockets, Worker names, or session files.
 - `tui` is a UI over either one in-process Standalone session or Backend Workspace/Runtime Worker authority; it should not invent a local Worker catalog or durable product state.
 

@@ -1,6 +1,5 @@
 mod cli_connection;
 mod mcp_cli;
-mod memory_lint;
 mod objective_cli;
 mod plugin_cli;
 mod session_cli;
@@ -23,7 +22,6 @@ use cli_connection::{
     resolve_local_cli_connection,
 };
 use client::{BackendAuthTarget, Target, TargetKind, start_device_login, wait_for_device_login};
-use memory_lint::{LintCliOptions, LintStatus};
 use serde::Deserialize;
 use tui::{LaunchMode, LaunchOptions};
 use workspace_bootstrap::{
@@ -35,8 +33,6 @@ enum Mode {
     Help,
     ResumeHelp,
     WorkersHelp,
-    MemoryLintHelp,
-    MemoryLint(LintCliOptions),
     Mcp(mcp_cli::McpCliCommand),
     Plugin(plugin_cli::PluginCliCommand),
     Objective {
@@ -109,10 +105,6 @@ async fn run(mode: Mode) -> ExitCode {
             print_workers_help();
             ExitCode::SUCCESS
         }
-        Mode::MemoryLintHelp => {
-            print_memory_lint_help();
-            ExitCode::SUCCESS
-        }
         Mode::Login {
             backend_url,
             no_wait,
@@ -144,14 +136,6 @@ async fn run(mode: Mode) -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("yoi workdir share: {error}");
-                ExitCode::FAILURE
-            }
-        },
-        Mode::MemoryLint(options) => match memory_lint::run(&options) {
-            Ok(LintStatus::Clean) => ExitCode::SUCCESS,
-            Ok(LintStatus::Failed) => ExitCode::FAILURE,
-            Err(e) => {
-                eprintln!("yoi memory lint: {e}");
                 ExitCode::FAILURE
             }
         },
@@ -602,22 +586,6 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             let _target =
                 resolve_local_cli_connection(connection_resolver, CliCommand::SetupModel)?;
             return Ok(Mode::SetupModel);
-        }
-        "memory" if args.get(1).map(String::as_str) == Some("lint") => {
-            let _target =
-                resolve_local_cli_connection(connection_resolver, CliCommand::MemoryLint)?;
-            let lint_args = &args[2..];
-            if lint_args.iter().any(|arg| arg == "--help" || arg == "-h") {
-                return Ok(Mode::MemoryLintHelp);
-            }
-            let options =
-                memory_lint::parse_lint_args(lint_args).map_err(|e| ParseError(e.to_string()))?;
-            return Ok(Mode::MemoryLint(options));
-        }
-        "memory" => {
-            return Err(ParseError(
-                "yoi memory requires the `lint` subcommand".to_string(),
-            ));
         }
         other if !other.starts_with('-') => {
             return Err(ParseError(format!("unknown command `{other}`")));
@@ -1921,7 +1889,6 @@ Host commands:
   objective <COMMAND>          Manage Objectives through a Backend target
   plugin <COMMAND>             Author/check/pack explicit Plugin packages
   mcp <COMMAND>                Inspect configured MCP servers
-  memory lint                  Lint local memory files
   session <COMMAND>            Inspect/prune Standalone session logs
 
 Standalone binaries:
@@ -1983,12 +1950,6 @@ Options:
 
 fn print_resume_help() {
     println!("{RESUME_HELP}");
-}
-
-fn print_memory_lint_help() {
-    println!(
-        "yoi memory lint\n\nUsage:\n  yoi memory lint [OPTIONS]\n\nOptions:\n      --workspace <PATH>       Workspace root to lint (defaults to cwd)\n      --json                   Emit a JSON report\n      --warnings-as-errors     Return failure when warnings are present\n  -h, --help                   Print help\n"
-    );
 }
 
 #[cfg(test)]
@@ -2621,9 +2582,36 @@ backend = "shared"
     }
 
     #[test]
-    fn parse_memory_without_lint_is_usage_error() {
-        let err = parse_args_from(["memory"]).unwrap_err();
-        assert_eq!(err.to_string(), "yoi memory requires the `lint` subcommand");
+    fn removed_memory_command_is_unknown_without_touching_legacy_trees() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join(".yoi/memory");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let malformed = legacy.join("summary.md");
+        std::fs::write(&malformed, "not: [valid").unwrap();
+
+        let workspace = temp.path().to_string_lossy().into_owned();
+        for args in [
+            vec!["memory"],
+            vec!["memory", "lint"],
+            vec!["memory", "lint", "--help"],
+            vec!["memory", "lint", "--workspace", workspace.as_str()],
+        ] {
+            let err = parse_args_from(args).unwrap_err();
+            assert_eq!(err.to_string(), "unknown command `memory`");
+        }
+        assert_eq!(std::fs::read_to_string(malformed).unwrap(), "not: [valid");
+        assert_eq!(std::fs::read_dir(&legacy).unwrap().count(), 1);
+
+        let production = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .map(|(production, _)| production)
+            .expect("CLI test module marker");
+        for forbidden in ["MemoryLint", "memory_lint", ".yoi/memory"] {
+            assert!(
+                !production.contains(forbidden),
+                "repository-local Memory CLI returned through {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -3036,27 +3024,6 @@ backend = "shared"
     }
 
     #[test]
-    fn parse_memory_lint_mode() {
-        match parse_args_from([
-            "memory",
-            "lint",
-            "--workspace",
-            "/tmp/ws",
-            "--json",
-            "--warnings-as-errors",
-        ])
-        .unwrap()
-        {
-            Mode::MemoryLint(options) => {
-                assert_eq!(options.workspace, Some(PathBuf::from("/tmp/ws")));
-                assert!(options.json);
-                assert!(options.warnings_as_errors);
-            }
-            _ => panic!("expected MemoryLint mode"),
-        }
-    }
-
-    #[test]
     fn plugin_cli_rejects_ambient_catalog_commands_and_options() {
         for args in [
             vec!["plugin", "list"],
@@ -3129,30 +3096,6 @@ backend = "shared"
             err.to_string(),
             "yoi mcp list does not accept positional arguments"
         );
-    }
-
-    #[test]
-    fn parse_memory_lint_rejects_usage_errors() {
-        let err = parse_args_from(["memory", "lint", "--workspace"]).unwrap_err();
-        assert_eq!(err.to_string(), "--workspace requires a value");
-    }
-
-    #[test]
-    fn parse_memory_lint_workspace_equals() {
-        match parse_args_from(["memory", "lint", "--workspace=/tmp/ws"]).unwrap() {
-            Mode::MemoryLint(options) => {
-                assert_eq!(options.workspace, Some(PathBuf::from("/tmp/ws")));
-                assert!(!options.json);
-                assert!(!options.warnings_as_errors);
-            }
-            _ => panic!("expected MemoryLint mode"),
-        }
-    }
-
-    #[test]
-    fn memory_lint_with_other_second_word_is_usage_error() {
-        let err = parse_args_from(["memory", "other"]).unwrap_err();
-        assert_eq!(err.to_string(), "yoi memory requires the `lint` subcommand");
     }
 
     #[test]
@@ -3287,13 +3230,6 @@ backend = "shared"
         assert!(!RESUME_HELP.contains("local workspace"));
     }
 
-    #[test]
-    fn parse_memory_lint_help() {
-        match parse_args_from(["memory", "lint", "--help"]).unwrap() {
-            Mode::MemoryLintHelp => {}
-            _ => panic!("expected MemoryLintHelp mode"),
-        }
-    }
     #[test]
     fn parse_backend_panel_uses_backend_dashboard_only() {
         match parse_args_from([

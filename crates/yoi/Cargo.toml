@@ -13,7 +13,6 @@ project-record = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 client = { workspace = true }
-memory = { workspace = true }
 futures = { workspace = true }
 manifest = { workspace = true }
 worker = { workspace = true }
@@ -26,7 +25,6 @@ ticket = { workspace = true }
 tui = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-serde_yaml = "0.9.34"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 toml = { workspace = true }
 uuid = { workspace = true }

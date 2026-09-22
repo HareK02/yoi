@@ -26,7 +26,6 @@ pub(crate) enum CliCommand {
     Objective,
     Plugin,
     Mcp,
-    MemoryLint,
     Session,
     Login,
 }
@@ -46,7 +45,6 @@ impl CliCommand {
             CliCommand::Objective => "yoi objective",
             CliCommand::Plugin => "yoi plugin",
             CliCommand::Mcp => "yoi mcp",
-            CliCommand::MemoryLint => "yoi memory lint",
             CliCommand::Session => "yoi session",
             CliCommand::Login => "yoi login",
         }
@@ -67,7 +65,6 @@ impl CliCommand {
             | CliCommand::WorkerCleanup
             | CliCommand::Plugin
             | CliCommand::Mcp
-            | CliCommand::MemoryLint
             | CliCommand::Session => CliConnectionRequirement::LocalOnly,
         }
     }
@@ -319,7 +316,6 @@ mod tests {
             CliCommand::WorkerCleanup,
             CliCommand::Plugin,
             CliCommand::Mcp,
-            CliCommand::MemoryLint,
             CliCommand::Session,
         ] {
             assert_eq!(

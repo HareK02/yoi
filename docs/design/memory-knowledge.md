@@ -1,15 +1,17 @@
-# Generated memory records
+# Workspace Memory authority
 
-Yoi keeps generated memory under `.yoi/memory/` for durable, low-volume context:
+Generated Memory is durable Workspace context owned by the Workspace Server control plane. Runtime Workers query and mutate it through typed Workspace API operations; they do not read or write repository-local paths.
 
-- `summary.md` is optional resident context.
-- `decisions/*.md` capture durable decisions and rationale.
-- `requests/*.md` capture durable user preferences or standing requests.
+The active Memory document and staging/audit lifecycle are stored by the Server-owned backend. Worker-side `memory` code contains only shared schema, extraction, audit, and transport types needed to construct those operations.
 
-Memory records are not workspace record authority for exact implementation state. Use tickets, objectives, repository files, git history, and session logs for exact current facts.
+Repository or ancestor `.yoi/memory`, `.yoi/knowledge`, and malformed marker trees are ignored. There is no cwd/ancestor discovery, dual read, startup import, or automatic migration. The removed `yoi memory lint` command is intentionally not a compatibility surface; invoking `yoi memory ...` is an unknown command.
 
-## Historical Knowledge records
+Memory remains supporting context rather than implementation authority. Use Tickets, Objectives, repository files, Git history, and append-only session records for exact current facts.
 
-Older workspaces may contain `.yoi/knowledge/`. Knowledge is no longer an active supported feature or workspace record authority. Current memory tooling ignores it; archive or inspect those files manually if needed.
+## Upgrade guidance
 
-Future Agent Skills are intentionally separate and are not implemented by this design note.
+Old repository-local Memory data is not imported automatically. Before upgrading from a version that used `.yoi/memory`, explicitly export any data that must be retained with that old version and import it into the Workspace-backed product surface available to the deployment. Stale files may be archived or deleted after verification.
+
+## Preserved filesystem boundaries
+
+This removal does not affect repository checkouts, Git metadata, Runtime-owned Workdirs/session logs/artifacts, Server data directories, or XDG client/server configuration. It removes only ambient repository-local Memory authority.

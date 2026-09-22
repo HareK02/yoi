@@ -1493,15 +1493,6 @@ pub struct WorkerRuntimeExecutionBackend<F = ProfileRuntimeWorkerFactory> {
     spawn_restore_timeout: Duration,
 }
 
-impl WorkerRuntimeExecutionBackend<ProfileRuntimeWorkerFactory> {
-    pub fn from_workspace(workspace_root: impl Into<PathBuf>) -> Result<Self, String> {
-        let workspace_root = workspace_root.into();
-        let factory = ProfileRuntimeWorkerFactory::new(&workspace_root)
-            .with_runtime_store_dir(workspace_root.join(".yoi/runtime-store"));
-        Self::new(factory)
-    }
-}
-
 impl<F> WorkerRuntimeExecutionBackend<F>
 where
     F: RuntimeWorkerFactory,
@@ -2956,6 +2947,20 @@ mod tests {
     use futures::{Stream, StreamExt};
     use manifest::{Scope, WorkerManifest};
     use session_store::{LogEntry, WorkerMetadataStore};
+
+    #[test]
+    fn production_source_has_no_repository_derived_runtime_store() {
+        let production = include_str!("worker_backend.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .map(|(production, _)| production)
+            .expect("worker backend test module marker");
+        for forbidden in ["from_workspace", ".yoi/runtime-store"] {
+            assert!(
+                !production.contains(forbidden),
+                "repository-derived Runtime store returned through {forbidden}"
+            );
+        }
+    }
 
     #[test]
     fn restored_router_uses_workspace_proxy_for_logical_only_attachment() {
@@ -4593,6 +4598,10 @@ mod tests {
         }];
 
         let detail = runtime.create_worker(request).unwrap();
+        assert!(
+            !repo.path().join(".yoi").exists(),
+            "Worker launch must not create repository-local authority"
+        );
         runtime
             .send_input(&detail.worker_ref, WorkerInput::user("inspect tools"))
             .unwrap();
@@ -4631,6 +4640,10 @@ mod tests {
         runtime.stop_worker(&detail.worker_ref, None).unwrap();
         let restored_without_workdir = runtime.restore_worker(&detail.worker_ref).unwrap();
         assert!(restored_without_workdir.workdir_attachments.is_empty());
+        assert!(
+            !repo.path().join(".yoi").exists(),
+            "Worker restore must not create repository-local authority"
+        );
     }
 
     #[test]

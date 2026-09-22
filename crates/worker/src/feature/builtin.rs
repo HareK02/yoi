@@ -21,10 +21,7 @@ pub mod worker_observation;
 pub mod workspace_worker_discovery;
 
 pub use task::{TaskFeature, task_tools_feature};
-pub use ticket::{
-    TicketFeature, TicketFeatureAccess, ticket_tools_feature, ticket_tools_feature_with_access,
-    ticket_tools_feature_with_backend,
-};
+pub use ticket::{TicketFeature, TicketFeatureAccess, ticket_tools_feature};
 pub use worker_observation::{
     CompositeWorkerObservationProvider, WorkerObservationError, WorkerObservationFeature,
     WorkerObservationProvider, WorkerObservationSubject, WorkerObservationSubjectRef,

@@ -1,34 +1,28 @@
 //! Built-in Ticket feature adapter.
 //!
 //! The ticket crate owns Ticket domain logic and Tool implementations. This
-//! module only resolves the local backend root, declares the built-in feature,
-//! and contributes those tools through the normal feature registry path.
+//! module binds an authority-scoped Workspace client, declares the built-in
+//! feature, and contributes those tools through the normal registry path.
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use ticket::{
-    LocalTicketBackend, MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent,
-    NewTicketRelation, OrchestrationPlanKind, OrchestrationPlanRecord, Result as TicketResult,
-    Ticket, TicketBackend, TicketBackendOperation, TicketBackendOperationResult,
-    TicketDoctorReport, TicketError, TicketIdOrSlug, TicketIntakeSummary, TicketListQuery,
-    TicketRef, TicketRelation, TicketRelationKind, TicketRelationView, TicketStateChange,
-    TicketSummary, TicketWorkflowState,
-    config::{DEFAULT_TICKET_BACKEND_RELATIVE_PATH, TicketConfig},
+    MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent, NewTicketRelation,
+    OrchestrationPlanKind, OrchestrationPlanRecord, Result as TicketResult, Ticket, TicketBackend,
+    TicketBackendOperation, TicketBackendOperationResult, TicketDoctorReport, TicketError,
+    TicketIdOrSlug, TicketIntakeSummary, TicketListQuery, TicketRef, TicketRelation,
+    TicketRelationKind, TicketRelationView, TicketStateChange, TicketSummary, TicketWorkflowState,
     tool::{TICKET_TOOL_NAMES, TicketToolBackend, ticket_tool_description, ticket_tools},
 };
 
 use crate::feature::{
-    FeatureDescriptor, FeatureDiagnostic, FeatureInstallContext, FeatureInstallError,
-    FeatureInstructionContribution, FeatureInstructionDeclaration, FeatureInstructionId,
-    FeatureModule, ServiceDeclaration, ServiceId, ToolContribution, ToolDeclaration,
-    ToolDefinition,
+    FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureInstructionContribution,
+    FeatureInstructionDeclaration, FeatureInstructionId, FeatureModule, ServiceDeclaration,
+    ServiceId, ToolContribution, ToolDeclaration, ToolDefinition,
 };
 use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
 use agen::tool::{Tool, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
@@ -278,8 +272,8 @@ fn workspace_ticket_read_definition(
 
 const FEATURE_ID: &str = "ticket";
 const FEATURE_NAME: &str = "Ticket tools";
-const FEATURE_DESCRIPTION: &str = "Typed local Ticket work-item operations over a bounded backend root. \
-The tools operate through the ticket crate backend and do not grant generic filesystem write scope.";
+const FEATURE_DESCRIPTION: &str =
+    "Typed Ticket operations through the authoritative Workspace API.";
 const TICKET_WORKFLOW_INSTRUCTION_ID: &str = "ticket.workflow";
 const TICKET_WORKFLOW_PROMPT_REF: &str = "common.tickets";
 pub const TICKET_SERVICE_ID: &str = "ticket.authority";
@@ -302,10 +296,6 @@ fn is_canonical_ticket_resource_key(resource_key: &str) -> bool {
     })
 }
 
-struct BackendTicketService {
-    backend: TicketToolBackend,
-}
-
 struct WorkspaceTicketService {
     backend: WorkspaceHttpTicketBackend,
 }
@@ -321,12 +311,6 @@ fn ticket_handoff_from_record(ticket: Ticket) -> Result<TicketHandoff, TicketErr
         resource_key,
         workflow_state: ticket.meta.workflow_state,
     })
-}
-
-impl TicketService for BackendTicketService {
-    fn ticket_handoff(&self, ticket_ref: &str) -> Result<TicketHandoff, TicketError> {
-        ticket_handoff_from_record(self.backend.show(ticket_ref.into())?)
-    }
 }
 
 impl TicketService for WorkspaceTicketService {
@@ -479,94 +463,16 @@ const WORKFLOW_ADDITIONAL_TOOL_NAMES: &[&str] = &[
 ];
 
 #[derive(Clone, Debug)]
-pub enum TicketFeatureBackend {
-    Local { root: PathBuf },
-    WorkspaceClient(Arc<dyn WorkspaceClient>),
-}
-
-impl From<PathBuf> for TicketFeatureBackend {
-    fn from(root: PathBuf) -> Self {
-        Self::Local { root }
-    }
-}
-
-impl From<&Path> for TicketFeatureBackend {
-    fn from(root: &Path) -> Self {
-        Self::Local {
-            root: root.to_path_buf(),
-        }
-    }
-}
-
-impl From<&PathBuf> for TicketFeatureBackend {
-    fn from(root: &PathBuf) -> Self {
-        Self::Local { root: root.clone() }
-    }
-}
-
-#[derive(Clone, Debug)]
 pub struct TicketFeature {
-    backend: TicketFeatureBackend,
-    record_language: Option<String>,
-    config_error: Option<String>,
+    workspace_client: Arc<dyn WorkspaceClient>,
     access: TicketFeatureAccess,
 }
 
 impl TicketFeature {
-    pub fn new(backend_root: impl Into<PathBuf>) -> Self {
-        Self::new_with_access(backend_root, TicketFeatureAccess::workspace_authoring())
-    }
-
-    pub fn new_with_access(backend_root: impl Into<PathBuf>, access: TicketFeatureAccess) -> Self {
-        Self::with_backend(
-            TicketFeatureBackend::Local {
-                root: backend_root.into(),
-            },
-            access,
-        )
-    }
-
-    pub fn with_backend(backend: TicketFeatureBackend, access: TicketFeatureAccess) -> Self {
+    pub fn new(workspace_client: Arc<dyn WorkspaceClient>, access: TicketFeatureAccess) -> Self {
         Self {
-            backend,
-            record_language: None,
-            config_error: None,
+            workspace_client,
             access,
-        }
-    }
-
-    pub fn for_workspace(workspace: impl AsRef<Path>) -> Self {
-        Self::for_workspace_with_access(workspace, TicketFeatureAccess::workspace_authoring())
-    }
-
-    pub fn for_workspace_with_access(
-        workspace: impl AsRef<Path>,
-        access: TicketFeatureAccess,
-    ) -> Self {
-        let workspace = workspace.as_ref();
-        match TicketConfig::load_workspace(workspace) {
-            Ok(config) => {
-                let backend_root = config.backend_root().to_path_buf();
-                let record_language = config.ticket_record_language().map(str::to_string);
-                let mut feature = Self::new_with_access(backend_root, access);
-                feature.record_language = record_language;
-                feature
-            }
-            Err(error) => Self {
-                backend: TicketFeatureBackend::Local {
-                    root: workspace.join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH),
-                },
-                record_language: None,
-                config_error: Some(error.to_string()),
-                access,
-            },
-        }
-    }
-
-    pub fn backend_root(&self) -> Option<&Path> {
-        match &self.backend {
-            TicketFeatureBackend::Local { root } => Some(root),
-            TicketFeatureBackend::WorkspaceClient(_) => None,
         }
     }
 
@@ -578,46 +484,12 @@ impl TicketFeature {
         self.access.tool_names()
     }
 
-    fn usable_backend_root(&self) -> Result<PathBuf, String> {
-        let Some(root) = self.backend_root() else {
-            return Err("ticket backend is not local filesystem backed".to_string());
-        };
-        let root = root
-            .canonicalize()
-            .map_err(|error| format!("ticket backend root is not usable: {error}"))?;
-        if !root.is_dir() {
-            return Err("ticket backend root is not a directory".to_string());
-        }
-        Ok(root)
+    fn workspace_client(&self) -> Arc<dyn WorkspaceClient> {
+        self.workspace_client.clone()
     }
-    fn tool_backend(&self, context: &mut FeatureInstallContext<'_>) -> Option<TicketToolBackend> {
-        match &self.backend {
-            TicketFeatureBackend::Local { root: _ } => {
-                let usable_root = match self.usable_backend_root() {
-                    Ok(root) => root,
-                    Err(reason) => {
-                        context
-                            .diagnostics()
-                            .push(FeatureDiagnostic::warning(format!(
-                                "Ticket tools not registered: {reason}; root={} ",
-                                self.backend_root()
-                                    .map(|root| root.display().to_string())
-                                    .unwrap_or_else(|| "<non-local>".to_string())
-                            )));
-                        return None;
-                    }
-                };
-                Some(
-                    LocalTicketBackend::new(usable_root)
-                        .with_record_language(self.record_language.as_deref())
-                        .into(),
-                )
-            }
-            TicketFeatureBackend::WorkspaceClient(client) => Some(
-                TicketToolBackend::new(WorkspaceHttpTicketBackend::new(client.clone()))
-                    .with_record_language(self.record_language.as_deref()),
-            ),
-        }
+
+    fn tool_backend(&self) -> TicketToolBackend {
+        TicketToolBackend::new(WorkspaceHttpTicketBackend::new(self.workspace_client()))
     }
 }
 
@@ -635,32 +507,18 @@ impl FeatureModule for TicketFeature {
         for name in enabled_tool_names {
             descriptor = descriptor.with_tool(ToolDeclaration::new(
                 name,
-                ticket_tool_description(name, self.record_language.as_deref()),
+                ticket_tool_description(name, None),
             ));
         }
         descriptor
     }
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
-        if let Some(error) = &self.config_error {
-            context
-                .diagnostics()
-                .push(FeatureDiagnostic::warning(format!(
-                    "Ticket tools not registered: {error}"
-                )));
-            return Ok(());
-        }
-        let Some(backend) = self.tool_backend(context) else {
-            return Ok(());
-        };
-        let ticket_service: Arc<dyn TicketService> = match &self.backend {
-            TicketFeatureBackend::WorkspaceClient(client) => Arc::new(WorkspaceTicketService {
-                backend: WorkspaceHttpTicketBackend::new(client.clone()),
-            }),
-            TicketFeatureBackend::Local { .. } => Arc::new(BackendTicketService {
-                backend: backend.clone(),
-            }),
-        };
+        let backend = self.tool_backend();
+        let workspace_client = self.workspace_client();
+        let ticket_service: Arc<dyn TicketService> = Arc::new(WorkspaceTicketService {
+            backend: WorkspaceHttpTicketBackend::new(workspace_client.clone()),
+        });
         context.services().provide(
             ServiceDeclaration::new(
                 ServiceId::builtin(TICKET_SERVICE_ID),
@@ -675,10 +533,6 @@ impl FeatureModule for TicketFeature {
                 ticket_workflow_instruction(),
             ))?;
         let allowed_tool_names = self.enabled_tool_names();
-        let workspace_client = match &self.backend {
-            TicketFeatureBackend::WorkspaceClient(client) => Some(client.clone()),
-            TicketFeatureBackend::Local { .. } => None,
-        };
         let mut tools = context.tools();
         for definition in ticket_tools(backend) {
             let (meta, _) = definition();
@@ -689,13 +543,15 @@ impl FeatureModule for TicketFeature {
             {
                 continue;
             }
-            let definition = match (name.as_str(), workspace_client.as_ref()) {
-                ("QueryTicket", Some(client)) => {
-                    workspace_ticket_read_definition(client.clone(), WorkspaceTicketReadKind::Query)
-                }
-                ("ShowTicket", Some(client)) => {
-                    workspace_ticket_read_definition(client.clone(), WorkspaceTicketReadKind::Show)
-                }
+            let definition = match name.as_str() {
+                "QueryTicket" => workspace_ticket_read_definition(
+                    workspace_client.clone(),
+                    WorkspaceTicketReadKind::Query,
+                ),
+                "ShowTicket" => workspace_ticket_read_definition(
+                    workspace_client.clone(),
+                    WorkspaceTicketReadKind::Show,
+                ),
                 _ => definition,
             };
             tools.register(ToolContribution::new(name, definition))?;
@@ -1371,22 +1227,11 @@ impl TicketBackend for WorkspaceHttpTicketBackend {
     }
 }
 
-pub fn ticket_tools_feature(workspace: impl AsRef<Path>) -> TicketFeature {
-    TicketFeature::for_workspace(workspace)
-}
-
-pub fn ticket_tools_feature_with_access(
-    workspace: impl AsRef<Path>,
+pub fn ticket_tools_feature(
+    workspace_client: Arc<dyn WorkspaceClient>,
     access: TicketFeatureAccess,
 ) -> TicketFeature {
-    TicketFeature::for_workspace_with_access(workspace, access)
-}
-
-pub fn ticket_tools_feature_with_backend(
-    backend: impl Into<TicketFeatureBackend>,
-    access: TicketFeatureAccess,
-) -> TicketFeature {
-    TicketFeature::with_backend(backend.into(), access)
+    TicketFeature::new(workspace_client, access)
 }
 
 #[cfg(test)]
@@ -1397,29 +1242,31 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
-    use tempfile::TempDir;
 
-    fn make_ticket_root(root: &Path) {
-        std::fs::create_dir_all(root).unwrap();
+    #[test]
+    fn production_source_has_no_local_ticket_feature_backend() {
+        let production = include_str!("ticket.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .map(|(production, _)| production)
+            .expect("Ticket feature test module marker");
+        for forbidden in [
+            "TicketFeatureBackend",
+            "LocalTicketBackend",
+            "for_workspace",
+            ".yoi/tickets",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "repository-local Ticket feature returned through {forbidden}"
+            );
+        }
     }
 
-    fn write_ticket_config(workspace: &Path, content: &str) {
-        let yoi_dir = workspace.join(".yoi");
-        std::fs::create_dir_all(&yoi_dir).unwrap();
-        std::fs::write(yoi_dir.join("workspace.toml"), content).unwrap();
-    }
-
-    fn pending_tool_description(
-        pending_tools: &[agen::tool::ToolDefinition],
-        name: &str,
-    ) -> String {
-        pending_tools
-            .iter()
-            .find_map(|definition| {
-                let (meta, _) = definition();
-                (meta.name == name).then_some(meta.description)
-            })
-            .expect("tool exists")
+    fn workspace_feature(access: TicketFeatureAccess) -> TicketFeature {
+        let client: Arc<dyn WorkspaceClient> = Arc::new(
+            crate::worker::TestWorkspaceHttpClient::new("workspace", "http://backend"),
+        );
+        ticket_tools_feature(client, access)
     }
 
     #[test]
@@ -1482,8 +1329,7 @@ mod tests {
 
     #[test]
     fn descriptor_declares_ticket_tools() {
-        let temp = TempDir::new().unwrap();
-        let feature = ticket_tools_feature(temp.path());
+        let feature = workspace_feature(TicketFeatureAccess::workspace_authoring());
         let descriptor = feature.descriptor();
         assert_eq!(descriptor.id.to_string(), "builtin:ticket");
         assert_eq!(descriptor.runtime, FeatureRuntimeKind::Builtin);
@@ -1500,9 +1346,7 @@ mod tests {
 
     #[test]
     fn read_only_descriptor_declares_only_state_tools() {
-        let temp = TempDir::new().unwrap();
-        let feature =
-            ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::read_only());
+        let feature = workspace_feature(TicketFeatureAccess::read_only());
         let descriptor = feature.descriptor();
         assert_eq!(feature.access(), TicketFeatureAccess::read_only());
         assert_eq!(descriptor.tools.len(), READ_ONLY_TOOL_NAMES.len());
@@ -1518,9 +1362,7 @@ mod tests {
 
     #[test]
     fn workflow_descriptor_declares_workflow_tools() {
-        let temp = TempDir::new().unwrap();
-        let feature =
-            ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::workflow());
+        let feature = workspace_feature(TicketFeatureAccess::workflow());
         let descriptor = feature.descriptor();
         assert_eq!(feature.access(), TicketFeatureAccess::workflow());
         assert_eq!(
@@ -1535,12 +1377,7 @@ mod tests {
 
     #[test]
     fn additive_ticket_capabilities_expose_expected_tool_surfaces() {
-        let temp = TempDir::new().unwrap();
-
-        let workspace_authoring = ticket_tools_feature_with_access(
-            temp.path(),
-            TicketFeatureAccess::workspace_authoring(),
-        );
+        let workspace_authoring = workspace_feature(TicketFeatureAccess::workspace_authoring());
         let workspace_descriptor = workspace_authoring.descriptor();
         let workspace_tools = workspace_descriptor
             .tools
@@ -1552,8 +1389,7 @@ mod tests {
         assert!(workspace_tools.contains(&"TicketQueue"));
         assert!(!workspace_tools.contains(&"TicketWorkflowState"));
 
-        let orchestration =
-            ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::workflow());
+        let orchestration = workspace_feature(TicketFeatureAccess::workflow());
         let orchestration_descriptor = orchestration.descriptor();
         let orchestration_tools = orchestration_descriptor
             .tools
@@ -1567,8 +1403,7 @@ mod tests {
         assert!(!orchestration_tools.contains(&"TicketEditItem"));
         assert!(!orchestration_tools.contains(&"TicketQueue"));
 
-        let work_report =
-            ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::work_report());
+        let work_report = workspace_feature(TicketFeatureAccess::work_report());
         let work_report_descriptor = work_report.descriptor();
         let work_report_tools = work_report_descriptor
             .tools
@@ -1578,7 +1413,7 @@ mod tests {
         assert!(work_report_tools.contains(&"TicketComment"));
         assert!(!work_report_tools.contains(&"TicketWorkflowState"));
 
-        let review = ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::review());
+        let review = workspace_feature(TicketFeatureAccess::review());
         let review_descriptor = review.descriptor();
         let review_tools = review_descriptor
             .tools
@@ -1590,15 +1425,10 @@ mod tests {
 
     #[test]
     fn read_only_installation_does_not_expose_mutating_tools() {
-        let temp = TempDir::new().unwrap();
-        make_ticket_root(&temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
         let mut pending_tools = Vec::new();
         let mut hooks = HookRegistryBuilder::default();
         let report = FeatureRegistryBuilder::new()
-            .with_module(ticket_tools_feature_with_access(
-                temp.path(),
-                TicketFeatureAccess::read_only(),
-            ))
+            .with_module(workspace_feature(TicketFeatureAccess::read_only()))
             .install_into_pending(&mut pending_tools, &mut hooks);
 
         assert_eq!(pending_tools.len(), READ_ONLY_TOOL_NAMES.len());
@@ -1620,53 +1450,11 @@ mod tests {
     }
 
     #[test]
-    fn read_only_companion_style_context_exposes_ticket_language_guidance() {
-        let temp = TempDir::new().unwrap();
-        write_ticket_config(
-            temp.path(),
-            r#"
-[ticket]
-language = "Japanese"
-"#,
-        );
-        make_ticket_root(&temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
-        let feature =
-            ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::read_only());
-        let descriptor = feature.descriptor();
-        let descriptor_description = descriptor
-            .tools
-            .iter()
-            .find(|tool| tool.name == "ShowTicket")
-            .expect("ShowTicket declared")
-            .description
-            .clone();
-        assert!(descriptor_description.contains("Ticket record language: Japanese"));
-
-        let mut pending_tools = Vec::new();
-        let mut hooks = HookRegistryBuilder::default();
-        let report = FeatureRegistryBuilder::new()
-            .with_module(feature)
-            .install_into_pending(&mut pending_tools, &mut hooks);
-
-        assert_eq!(pending_tools.len(), READ_ONLY_TOOL_NAMES.len());
-        assert_eq!(report.reports[0].installed_tools, READ_ONLY_TOOL_NAMES);
-        let description = pending_tool_description(&pending_tools, "ShowTicket");
-        assert!(description.contains("Ticket record language: Japanese"));
-        assert!(description.contains("distinct from worker.language"));
-        assert!(description.contains("Preserve protocol literals"));
-    }
-
-    #[test]
     fn workspace_authoring_installation_exposes_authoring_tools() {
-        let temp = TempDir::new().unwrap();
-        make_ticket_root(&temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
         let mut pending_tools = Vec::new();
         let mut hooks = HookRegistryBuilder::default();
         let report = FeatureRegistryBuilder::new()
-            .with_module(ticket_tools_feature_with_access(
-                temp.path(),
-                TicketFeatureAccess::workspace_authoring(),
-            ))
+            .with_module(workspace_feature(TicketFeatureAccess::workspace_authoring()))
             .install_into_pending(&mut pending_tools, &mut hooks);
 
         assert_eq!(pending_tools.len(), WORKSPACE_AUTHORING_TOOL_NAMES.len());
@@ -1690,169 +1478,28 @@ language = "Japanese"
     }
 
     #[test]
-    fn workspace_authoring_context_exposes_ticket_language_guidance() {
-        let temp = TempDir::new().unwrap();
-        write_ticket_config(
-            temp.path(),
-            r#"
-[ticket]
-language = "Japanese"
-"#,
-        );
-        make_ticket_root(&temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
+    fn workspace_only_ticket_feature_preserves_unrelated_stale_repository_trees() {
+        let ancestor = tempfile::tempdir().unwrap();
+        let repository = ancestor.path().join("repository");
+        std::fs::create_dir_all(repository.join(".yoi/tickets/broken")).unwrap();
+        std::fs::create_dir_all(ancestor.path().join(".yoi")).unwrap();
+        std::fs::write(
+            ancestor.path().join(".yoi/workspace.toml"),
+            "not valid toml",
+        )
+        .unwrap();
+        std::fs::write(
+            repository.join(".yoi/tickets/broken/item.md"),
+            "not a Ticket",
+        )
+        .unwrap();
+
+        // TicketFeature accepts only an injected Workspace client and access policy;
+        // there is deliberately no repository/cwd path to pass to this installation.
         let mut pending_tools = Vec::new();
         let mut hooks = HookRegistryBuilder::default();
         let report = FeatureRegistryBuilder::new()
-            .with_module(ticket_tools_feature_with_access(
-                temp.path(),
-                TicketFeatureAccess::workspace_authoring(),
-            ))
-            .install_into_pending(&mut pending_tools, &mut hooks);
-
-        assert_eq!(pending_tools.len(), WORKSPACE_AUTHORING_TOOL_NAMES.len());
-        assert_eq!(
-            report.reports[0].installed_tools,
-            WORKSPACE_AUTHORING_TOOL_NAMES
-        );
-        let description = pending_tool_description(&pending_tools, "TicketComment");
-        assert!(description.contains("Ticket record language: Japanese"));
-        assert!(description.contains("durable Ticket record and Ticket tool body text"));
-        assert!(description.contains("distinct from worker.language"));
-        assert!(description.contains("memory.language"));
-    }
-
-    #[test]
-    fn installs_ticket_tools_when_default_root_is_usable() {
-        let temp = TempDir::new().unwrap();
-        make_ticket_root(&temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
-        let mut pending_tools = Vec::new();
-        let mut hooks = HookRegistryBuilder::default();
-        let report = FeatureRegistryBuilder::new()
-            .with_module(ticket_tools_feature(temp.path()))
-            .install_into_pending(&mut pending_tools, &mut hooks);
-
-        assert_eq!(pending_tools.len(), WORKSPACE_AUTHORING_TOOL_NAMES.len());
-        assert_eq!(report.reports.len(), 1);
-        assert!(report.reports[0].installed);
-        assert_eq!(
-            report.reports[0].installed_tools,
-            WORKSPACE_AUTHORING_TOOL_NAMES
-        );
-        assert!(report.reports[0].skipped.is_empty());
-    }
-
-    #[test]
-    fn installs_ticket_tools_with_configured_backend_root() {
-        let temp = TempDir::new().unwrap();
-        write_ticket_config(
-            temp.path(),
-            r#"
-[ticket.backend]
-provider = "builtin:yoi_local"
-root = "tickets"
-
-[ticket.roles.coder]
-profile = "project:coder"
-"#,
-        );
-        make_ticket_root(&temp.path().join("tickets"));
-
-        let feature = ticket_tools_feature(temp.path());
-        assert_eq!(
-            feature.backend_root(),
-            Some(temp.path().join("tickets").as_path())
-        );
-
-        let mut pending_tools = Vec::new();
-        let mut hooks = HookRegistryBuilder::default();
-        let report = FeatureRegistryBuilder::new()
-            .with_module(feature)
-            .install_into_pending(&mut pending_tools, &mut hooks);
-
-        assert_eq!(pending_tools.len(), WORKSPACE_AUTHORING_TOOL_NAMES.len());
-        assert!(report.reports[0].diagnostics.is_empty());
-    }
-
-    #[test]
-    fn malformed_ticket_config_fails_closed() {
-        let temp = TempDir::new().unwrap();
-        make_ticket_root(&temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
-        write_ticket_config(
-            temp.path(),
-            r#"
-[ticket.roles.operator]
-profile = "inherit"
-"#,
-        );
-        let mut pending_tools = Vec::new();
-        let mut hooks = HookRegistryBuilder::default();
-        let report = FeatureRegistryBuilder::new()
-            .with_module(ticket_tools_feature(temp.path()))
-            .install_into_pending(&mut pending_tools, &mut hooks);
-
-        assert!(pending_tools.is_empty());
-        assert!(report.reports[0].installed_tools.is_empty());
-        assert_eq!(report.reports[0].diagnostics.len(), 1);
-        let message = &report.reports[0].diagnostics[0].message;
-        assert!(message.contains("Ticket tools not registered"));
-        assert!(message.contains("unsupported Ticket role `operator`"));
-    }
-
-    #[test]
-    fn unsupported_ticket_backend_provider_fails_closed() {
-        let temp = TempDir::new().unwrap();
-        make_ticket_root(&temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
-        write_ticket_config(
-            temp.path(),
-            r#"
-[ticket.backend]
-provider = "github"
-"#,
-        );
-        let mut pending_tools = Vec::new();
-        let mut hooks = HookRegistryBuilder::default();
-        let report = FeatureRegistryBuilder::new()
-            .with_module(ticket_tools_feature(temp.path()))
-            .install_into_pending(&mut pending_tools, &mut hooks);
-
-        assert!(pending_tools.is_empty());
-        assert!(report.reports[0].installed_tools.is_empty());
-        assert_eq!(report.reports[0].diagnostics.len(), 1);
-        let message = &report.reports[0].diagnostics[0].message;
-        assert!(message.contains("Ticket tools not registered"));
-        assert!(message.contains("unsupported Ticket backend provider `github`"));
-    }
-
-    #[test]
-    fn does_not_register_ticket_tools_when_root_is_missing() {
-        let temp = TempDir::new().unwrap();
-        let mut pending_tools = Vec::new();
-        let mut hooks = HookRegistryBuilder::default();
-        let report = FeatureRegistryBuilder::new()
-            .with_module(ticket_tools_feature(temp.path()))
-            .install_into_pending(&mut pending_tools, &mut hooks);
-
-        assert!(pending_tools.is_empty());
-        assert_eq!(report.reports.len(), 1);
-        assert!(report.reports[0].installed);
-        assert!(report.reports[0].installed_tools.is_empty());
-        assert_eq!(report.reports[0].diagnostics.len(), 1);
-        assert!(
-            report.reports[0].diagnostics[0]
-                .message
-                .contains("Ticket tools not registered")
-        );
-    }
-
-    #[test]
-    fn registers_ticket_tools_for_flat_backend_root() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH);
-        std::fs::create_dir_all(&root).unwrap();
-        let mut pending_tools = Vec::new();
-        let mut hooks = HookRegistryBuilder::default();
-        let report = FeatureRegistryBuilder::new()
-            .with_module(ticket_tools_feature(temp.path()))
+            .with_module(workspace_feature(TicketFeatureAccess::workspace_authoring()))
             .install_into_pending(&mut pending_tools, &mut hooks);
 
         assert_eq!(pending_tools.len(), WORKSPACE_AUTHORING_TOOL_NAMES.len());
@@ -1861,9 +1508,14 @@ provider = "github"
             WORKSPACE_AUTHORING_TOOL_NAMES
         );
         assert!(report.reports[0].diagnostics.is_empty());
-        assert!(!root.join("open").exists());
-        assert!(!root.join("pending").exists());
-        assert!(!root.join("closed").exists());
+        assert_eq!(
+            std::fs::read_to_string(ancestor.path().join(".yoi/workspace.toml")).unwrap(),
+            "not valid toml"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join(".yoi/tickets/broken/item.md")).unwrap(),
+            "not a Ticket"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2057,10 +1709,12 @@ provider = "github"
 
     #[test]
     fn workspace_ticket_service_preserves_internal_identity_for_handoff() {
-        let temp = TempDir::new().unwrap();
-        let local = LocalTicketBackend::new(temp.path().join("tickets"));
-        let created = local.create(NewTicket::new("Ticket handoff")).unwrap();
-        let mut ticket = local.show(TicketIdOrSlug::Id(created.id.clone())).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let sqlite =
+            ticket::SqliteTicketBackend::open(temp.path().join("tickets.db"), "workspace-test")
+                .unwrap();
+        let created = sqlite.create(NewTicket::new("Ticket handoff")).unwrap();
+        let mut ticket = sqlite.show(TicketIdOrSlug::Id(created.id.clone())).unwrap();
         ticket.meta.resource_key = Some("T-548".to_string());
         ticket.meta.workflow_state = TicketWorkflowState::Queued;
 
