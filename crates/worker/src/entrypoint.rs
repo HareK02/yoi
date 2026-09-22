@@ -833,6 +833,20 @@ permission = "write"
     }
 
     #[test]
+    fn clean_workspace_manifest_resolution_does_not_create_repository_local_yoi() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("runtime-workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let cli = Cli::try_parse_from(["yoi worker", "--workspace", workspace.to_str().unwrap()])
+            .unwrap();
+
+        let (manifest, _loader) = resolve_manifest(&cli).unwrap();
+
+        assert_eq!(manifest.worker.name, "runtime-workspace");
+        assert!(!workspace.join(".yoi").exists());
+    }
+
+    #[test]
     fn normal_startup_uses_builtin_defaults_without_local_profile_discovery() {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path().join("runtime-workspace");

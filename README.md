@@ -50,7 +50,7 @@ Typical flow:
 3. Use explicit tools and scoped delegation for multi-agent work.
 4. Record project work through Tickets, workflow files, and git history.
 
-Runtime surfaces use `yoi`, `.yoi`, `~/.yoi`, and `YOI_*`.
+Client and execution surfaces use the `yoi` binaries, XDG client/server configuration and data directories, Runtime-owned Workdirs/session artifacts, Server data directories, `YOI_*`, and the preserved legacy home secret-store boundary under `~/.yoi`. Repository-local `.yoi` trees are ignored legacy input, not runtime authority.
 
 ## 4. Documentation
 
@@ -68,7 +68,7 @@ Key docs:
 
 ## 5. Development
 
-This repository dogfoods Yoi to develop Yoi. Work is tracked through `.yoi/tickets/` and `yoi ticket ...`; git history plus Ticket files are the authoritative project record.
+This repository dogfoods Yoi to develop Yoi. Work is tracked through Workspace Server-backed Tickets and `yoi ticket ...`; Git history plus append-only Ticket and Merge Request evidence are the authoritative project record. Repository-local `.yoi/tickets` trees are ignored legacy input.
 
 Common checks:
 

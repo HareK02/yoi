@@ -1,9 +1,7 @@
-//! Frontmatter schemas for memory records.
+//! Typed frontmatter schemas for Memory documents.
 //!
-//! Each record kind has its own typed `*Frontmatter` struct. The linter
-//! deserializes the YAML between the leading `---` markers into the
-//! kind-appropriate struct; field-level errors are surfaced as
-//! [`LintError::MissingField`] / [`LintError::InvalidField`].
+//! These structures and pure parsing helpers are shared by Workspace-backed
+//! validation. They do not select or traverse a repository-local Memory tree.
 
 mod common;
 mod decision;

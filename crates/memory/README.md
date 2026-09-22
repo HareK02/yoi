@@ -2,28 +2,20 @@
 
 ## Role
 
-`memory` owns generated memory, records, staging/consolidation mechanics, linting, and audit observations.
+`memory` owns the shared types used by Workspace-backed Memory operations:
+
+- Memory API request/response DTOs
+- extraction candidate and evidence schemas
+- audit event schemas
+- pure Memory document frontmatter schemas and parsing helpers
 
 ## Boundaries
 
-Owns:
+The crate does **not** own persistence. Workspace Memory records, staging candidates, and audit observations are stored by the Workspace Server control plane and accessed by Workers through typed API operations.
 
-- memory/record parsing and validation
-- memory lint subcommand backend behavior
-- staging and consolidation file mechanics
-- audit log observation writes
-- generated memory prompt support where it belongs below the CLI
+The crate intentionally contains no repository-local layout, cwd/ancestor discovery, resident-file reader, staging writer, audit/usage log writer, generic filesystem scope helper, or local backend executor. The product CLI does not expose `yoi memory lint`.
 
-Does not own:
-
-- authoritative project records (`.yoi/tickets/`, git history)
-- normal Worker turn orchestration (`agen`)
-- product CLI command shape (`yoi`)
-- curated workflow definitions (`workflow`)
-
-## Design notes
-
-Memory is useful context, not authority. It should preserve small durable preferences and rationale without duplicating tickets, docs, or implementation reports.
+Memory is useful context, not implementation authority. Tickets, Objectives, repository files, Git history, and append-only session records remain the exact evidence surfaces for implementation state.
 
 ## See also
 

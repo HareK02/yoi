@@ -1,19 +1,19 @@
 # Tickets and development workflow
 
-Yoi project work is tracked through Tickets. For normal use, interact with Tickets through `yoi panel`, Ticket tools, the `yoi ticket ...` CLI, and typed role surfaces. Git history plus Ticket files remain the authoritative state-transition record behind those interfaces.
+Yoi project work is tracked through Tickets. For normal use, interact with Tickets through `yoi panel`, Ticket tools, the `yoi ticket ...` CLI, and typed role surfaces. Workspace Server control-plane records plus the append-only Ticket event and Merge Request evidence streams are authoritative.
 
-The current local backend stores each Ticket in the flat `.yoi/tickets/<ticket-id>/` layout. The directory name is the canonical opaque Ticket id: a fixed-width Crockford base32 Unix epoch millisecond timestamp. Slugs and frontmatter `id`/`slug` fields are not current-state authority. That storage detail matters for maintainers and backend compatibility, but it is not the primary user-facing workflow.
+Ticket and Objective records are stored in the Workspace Server database. Repository-local `.yoi/tickets`, `.yoi/objectives`, and config files are ignored legacy input, not a debugging or compatibility backend.
 
 Do not treat ad-hoc chat summaries, memory records, or Worker notifications as the final source of project state. Notifications are hints to inspect concrete state, not proof of completion.
 
 ## Concepts
 
 - `Ticket`: durable project/orchestration record. It contains requirements, decisions, plans, implementation reports, reviews, artifacts, and resolution history.
-- `Objective`: first-class medium-term goal record. It stores goal, motivation/background, strategy/design direction, success criteria/exit conditions, decision context, current Objective lifecycle, and canonical Ticket links under `.yoi/objectives/<objective-id>/item.md`. Objective context is judgment/background context; it is not implementation authority and does not replace reading each Ticket body/thread/artifacts.
+- `Objective`: first-class medium-term goal record stored by the Workspace Server. It stores goal, motivation/background, strategy/design direction, success criteria/exit conditions, decision context, current Objective lifecycle, and canonical Ticket links. Objective context is judgment/background context; it is not implementation authority and does not replace reading each Ticket body, thread, and evidence.
 - `Task`: session-local progress tracking inside a Worker. It is not the project record.
 - `Assignment`: a concrete delegation from an Orchestrator to a coder/reviewer Worker or task-specific helper Worker.
 - `IntentPacket`: the short implementation/review contract derived from a Ticket and handed to an Assignment.
-- `LocalTicketBackend`: the current `.yoi/tickets/` markdown/thread/artifacts storage backend.
+- `Ticket backend`: the Workspace Server control-plane database exposed through typed Workspace APIs.
 - `Ticket relation`: durable project-level Ticket-to-Ticket metadata stored as forward canonical-id relations (`depends_on`, `blocks`, `related`, `supersedes`, `duplicate_of`). Inverse views such as `blocked_by` are derived, not stored.
 
 A Ticket may represent a feature, bug, cleanup, design decision, investigation, workflow change, release task, or orchestration task. The common requirement is that the Ticket is a concrete work item that can be implemented, reviewed, validated, and closed on its own terms.
@@ -27,7 +27,7 @@ Use the highest-level interface that matches the work:
 - Inside Workers, use typed Ticket tools for Ticket records and typed Merge Request tools for immutable implementation/review/completion evidence.
 - For multi-step work, follow the typed Ticket role surfaces and recorded Ticket lifecycle gates.
 
-Maintainers can inspect the local `.yoi/tickets/` files directly when debugging storage, but normal user instructions should go through `yoi panel`, Ticket tools, or `yoi ticket ...`.
+Maintainers inspect Ticket state through the authenticated Workspace API, Server administration surfaces, and database diagnostics. Repository-local Ticket files are not storage authority.
 
 ## Ticket tools inside Workers
 
@@ -45,7 +45,7 @@ Workers with the Ticket and operation-specific Merge Request built-in features c
 
 Profile-visible Ticket catalogs are intentionally smaller than the former broad read catalog: Workspace authoring exposes 9 tools instead of 13, workflow exposes 10 instead of 12, and review exposes only `QueryTicket` plus `ShowTicket` (2 instead of 6). The `QueryTicket` schema is regression-guarded below 8 KiB while consolidating relation/evidence/attention discovery; diagnostics are not projected into normal profiles, while specialized orchestration-plan commands remain visible only to workflow roles that need their distinct semantics.
 
-These tools operate through the typed Ticket backend. They are not arbitrary filesystem write permission to `.yoi/tickets/`.
+These tools operate through the typed Workspace Ticket API. They do not grant arbitrary filesystem access and never select repository-local Ticket storage.
 
 Relation tools are for non-hierarchical project metadata only. Use canonical opaque Ticket ids, store forward relations only, and keep runtime execution planning (capacity, ordering decisions, do-not-parallelize notes, Worker/session/worktree ownership) in OrchestrationPlan or session-local records instead of relation metadata. Unresolved `depends_on` and incoming unresolved `blocks` are queue/acceptance blockers; `related` is not blocking, and `supersedes` / `duplicate_of` are diagnostics rather than automatic lifecycle transitions.
 
@@ -60,51 +60,11 @@ Do not bypass Ticket lifecycle gates just because Ticket tools are available. Ti
 
 ## Objective records
 
-Objectives are lightweight medium-term project records, not Tickets, Ticket relations, OrchestrationPlan execution records, or Worker/session claims. Use them when a goal spans several concrete Tickets and the durable motivation, design direction, success criteria, or decision context would otherwise be repeated or lost.
+Objectives are Workspace Server control-plane records, not files in a checkout. Use typed Objective tools or `yoi objective ...`; both resolve the selected Backend/Workspace through the shared client target and call the Workspace API.
 
-The local Objective surface stores records under:
+Objective-to-Ticket links are context links only: they are not dependency, blocking, ordering, ownership, or scheduling relations. Objective lifecycle does not drive Ticket state or authorize implementation. A role reading Objective context must still inspect each Ticket and its current Merge Request evidence.
 
-```text
-.yoi/objectives/<objective-id>
-  item.md
-```
-
-`<objective-id>` is the canonical opaque path-derived id: a fixed-width Crockford base32 Unix epoch millisecond timestamp. Do not treat Objective titles or slug words as link authority.
-
-`item.md` uses YAML frontmatter plus Markdown body:
-
-```yaml
----
-title: "Improve orchestration evidence"
-state: "active"        # active|paused|done|archived
-created_at: "2026-06-09T00:00:00Z"
-updated_at: "2026-06-09T00:00:00Z"
-linked_tickets: ["00001KTKMS0VG"]
----
-```
-
-The Markdown body should include these sections:
-
-- `## Goal`
-- `## Motivation / background`
-- `## Strategy / design direction`
-- `## Success criteria / exit conditions`
-- `## Decision context`
-
-Linked Tickets must be canonical opaque Ticket ids that exist in the configured Ticket backend root. Objective-to-Ticket links are context links only: they are not dependency, blocking, ordering, ownership, or scheduling relations. Use typed Ticket relations for Ticket-to-Ticket dependency/blocking/related metadata, OrchestrationPlan records for routing/execution plans, and Worker/session claims for runtime ownership hints.
-
-Objective lifecycle is only Objective lifecycle. `active`, `paused`, `done`, and `archived` do not drive Ticket `state`, do not authorize implementation, and do not close linked Tickets. A role reading Objective context must still inspect each Ticket body, thread, artifacts, explicit Ticket relations, and OrchestrationPlan records before acting.
-
-The maintainer CLI is:
-
-```sh
-yoi objective create --title "..." [--ticket <ticket-id> ...]
-yoi objective list [--state active|paused|done|archived|all]
-yoi objective show <objective-id>
-yoi objective doctor
-```
-
-The first version intentionally does not implement roadmap scheduling, milestones, OKRs, graph solving, Objective-mandatory Ticket creation, Objective thread/artifact history, or broad panel UX. Future UX can surface Objective context around Tickets as long as it remains background context and never substitutes for reading the Ticket.
+Repository-local `.yoi/objectives` trees are ignored. There is no automatic import or cwd/ancestor fallback.
 
 ## Ticket configuration
 
@@ -268,40 +228,15 @@ A useful Ticket states:
 - reviews;
 - final resolution when closed.
 
-Keep long research dumps out of the item body. Put necessary artifacts under the Ticket's `artifacts/` directory and summarize the conclusion in the thread.
+Keep long research dumps out of the item body. Attach necessary bounded artifacts through the Ticket evidence surface and summarize the conclusion in the thread.
 
 Do not store secrets, credentials, private prompt contents, or raw logs containing secrets in Ticket bodies, thread entries, artifacts, diagnostics, or model-visible prompts.
 
-## Backend/maintainer CLI: `yoi ticket`
+## Backend CLI: `yoi ticket`
 
-The product CLI exposes the typed Ticket backend for repository maintenance and validation. It operates on the configured `.yoi/tickets/` storage and is the preferred command-line surface when editing Tickets outside a Worker.
+The product CLI resolves an explicit or configured Backend target and performs Ticket operations through the Workspace API. It does not open a repository-local backend. Use command help for the current typed command surface.
 
-```sh
-yoi ticket create --title "..." [--priority P2]
-yoi ticket list [--state planning|ready|queued|inprogress|done|closed|all] [--limit n]
-yoi ticket show <id>
-yoi ticket comment <id> [--role comment|plan|decision|implementation_report] [--file path]
-yoi ticket review <id> --approve|--request-changes [--file path]
-yoi ticket state <id> <planning|ready|queued|inprogress|done>
-yoi ticket close <id> [--resolution text|--file path]
-yoi ticket doctor
-```
-
-`yoi ticket list` is a capped overview/selection command. It should remain readable for humans and safe for model context: use it to find a canonical id, then use `yoi ticket show <id>` before routing, closing, planning, or implementation decisions.
-
-`yoi ticket state` records current lifecycle transitions among active states. Closing must use `yoi ticket close` so the backend writes the required `resolution.md` and passes `yoi ticket doctor`; `done` and `closed` remain distinct states.
-
-The current LocalTicketBackend stores records under:
-
-```text
-.yoi/tickets/<ticket-id>
-  item.md
-  thread.md
-  artifacts/
-  resolution.md   # closed Tickets only
-```
-
-Backend integrations must preserve this format until an explicit migration changes it. `thread.md` is an append-only typed event log: existing events such as `create`, `comment`, `plan`, `decision`, `implementation_report`, `review`, `state_changed`, and `close` remain valid, while `state_changed` records durable transition metadata (`from`, `to`, `reason`, optional `field`, plus `author` and `at`) and `intake_summary` records the bounded Intake outcome body. Thread events are audit history, not current-state authority; current state belongs in `item.md` frontmatter or the owning backend record. The repository-root `work-items/` path is no longer a live mutable backend; do not recreate it for Ticket records. Human users should prefer `yoi panel`, Ticket tools, or `yoi ticket ...` when working directly with repository records.
+Legacy `ticket init` and `ticket import-local` workflows are unsupported. No automatic migration reads old `.yoi/tickets` trees; export data with an older version before upgrading if it must be retained, then import it through an explicit supported Workspace surface.
 
 ## Validation
 

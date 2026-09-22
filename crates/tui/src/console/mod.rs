@@ -624,6 +624,16 @@ fn read_terminal_events(stop: Arc<AtomicBool>, tx: mpsc::UnboundedSender<Termina
 }
 
 #[cfg(feature = "e2e-test")]
+pub(crate) async fn run_e2e_rewind(worker_name: String) -> Result<(), Box<dyn std::error::Error>> {
+    let mut terminal = enter_fullscreen()?;
+    let result = run_e2e_rewind_fixture(&mut terminal, worker_name).await;
+    let leave_result = leave_fullscreen(&mut terminal);
+    result?;
+    leave_result?;
+    Ok(())
+}
+
+#[cfg(feature = "e2e-test")]
 async fn run_e2e_rewind_fixture(
     terminal: &mut ConsoleTerminal,
     worker_name: String,
@@ -637,6 +647,8 @@ async fn run_e2e_rewind_fixture(
             entries: Vec::new(),
         },
         state: WorkerStatus::Idle.into(),
+        in_flight: protocol::InFlightSnapshot::default(),
+        internal_workers: Vec::new(),
         greeting: Greeting {
             worker_name: worker_name.clone(),
             cwd: workspace_root.display().to_string(),

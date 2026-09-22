@@ -6,7 +6,7 @@ This decision records the layout policy for Ticket `00001KTTB479X`.
 
 ## Roots
 
-- `role_workspace_root`: the launched role runtime workspace root and Ticket backend context.
+- `role_workspace_root`: the launched role Runtime's explicit execution/workdir root. Ticket authority remains the Workspace Server control-plane database reached through the Workspace API.
 - `original_workspace_root`: the repository root from which implementation worktrees should be created.
 - `implementation_worktree_root`: `<original_workspace_root>/.worktree`.
 - `merge_target_workspace_root`: the workspace/branch where merge-completion validates and merges.
@@ -15,9 +15,9 @@ When these roots differ, implementation worktrees must be created under `impleme
 
 ## Policy
 
-- The filesystem Ticket backend remains authoritative for project records; this design does not introduce a Git-external Ticket store.
+- Workspace Server Ticket records remain authoritative; none of these filesystem roots selects or hosts a Ticket backend.
 - Main-workspace draft Tickets are not an implicit Orchestrator queue. Queue acceptance still requires explicit Ticket state and routing checks.
-- Implementation branches should not include unrelated Orchestrator Ticket churn. Orchestration progress stays in the Orchestrator workspace/Ticket backend; child implementation worktrees contain implementation diffs and branch-local artifacts only when needed.
+- Implementation branches should not include unrelated Orchestrator bookkeeping. Orchestration progress stays in the Workspace Server Ticket/event record; child implementation worktrees contain implementation diffs and branch-local artifacts only when needed.
 - Prompt and workflow guidance must treat merge-ready dossier as a checkpoint. If reviewer approval, clean/safe target workspace, and standing/user merge authority are present, Orchestrator should continue through merge, validation, Ticket close, and cleanup instead of stopping solely because a dossier exists.
 
 ## Implemented in this branch

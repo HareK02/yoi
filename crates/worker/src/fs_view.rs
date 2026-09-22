@@ -467,7 +467,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn resolve_file_ref_directory_listing_marks_readable_symlink_entries() {
+    async fn resolve_file_ref_directory_listing_resolves_symlinks_under_default_scope() {
         use std::os::unix::fs::symlink;
 
         let dir = TempDir::new().unwrap();
@@ -478,7 +478,8 @@ mod tests {
 
         let item = view.resolve_file_ref("docs", 4096).await.unwrap();
         let text = system_text(&item);
-        assert!(text.contains("link.txt@"));
+        assert!(text.contains("docs/link.txt"), "{text}");
+        assert!(!text.contains("link.txt@"), "{text}");
     }
 
     #[tokio::test]

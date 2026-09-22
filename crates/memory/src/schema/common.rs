@@ -1,9 +1,8 @@
 //! Common frontmatter helpers and shared types.
 
+use lint_common::RecordLintError;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-
-use crate::error::LintError;
 
 pub use lint_common::Frontmatter;
 
@@ -138,14 +137,13 @@ pub struct SourceEvidenceRef {
 }
 
 /// Split a markdown document into `(yaml_frontmatter, body)`.
-pub fn split_frontmatter(content: &str) -> Result<(&str, &str), LintError> {
-    lint_common::split_frontmatter(content).map_err(Into::into)
+pub fn split_frontmatter(content: &str) -> Result<(&str, &str), RecordLintError> {
+    lint_common::split_frontmatter(content)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lint_common::RecordLintError;
 
     #[test]
     fn splits_simple() {
@@ -158,19 +156,13 @@ mod tests {
     #[test]
     fn no_leading_delim_errors() {
         let err = split_frontmatter("hello").unwrap_err();
-        assert!(matches!(
-            err,
-            LintError::Record(RecordLintError::MissingFrontmatter)
-        ));
+        assert!(matches!(err, RecordLintError::MissingFrontmatter));
     }
 
     #[test]
     fn no_closing_delim_errors() {
         let err = split_frontmatter("---\nfoo: 1\nno close\n").unwrap_err();
-        assert!(matches!(
-            err,
-            LintError::Record(RecordLintError::MalformedFrontmatter(_))
-        ));
+        assert!(matches!(err, RecordLintError::MalformedFrontmatter(_)));
     }
 
     #[test]

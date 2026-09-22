@@ -3051,11 +3051,47 @@ mod tests {
             })
             .await
             .unwrap();
-        SqliteTicketBackend::open(&db_path, "workspace-test")
+        // Seed the active control-plane authority directly. The malformed legacy
+        // tree above is retained only as ignored regression input.
+        SqliteTicketBackend::open_verified(&db_path, "workspace-test").unwrap();
+        rusqlite::Connection::open(&db_path)
             .unwrap()
-            .import_from_local_backend(&ticket::LocalTicketBackend::new(
-                dir.path().join(".yoi/tickets"),
-            ))
+            .execute_batch(
+                r#"
+INSERT INTO typed_tickets (
+    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    created_at, updated_at, workflow_state, workflow_state_explicit
+) VALUES
+    ('workspace-test', '00000000001J2', '00000000001J2', 'Read bridge', 'open', 'ticket', 'P2',
+     'Ticket body. Deep Ticket marker. This body is intentionally long enough for bounded projection tests.',
+     '2026-01-01T00:00:00Z', '2026-01-03T00:00:00Z', 'ready', 1),
+    ('workspace-test', '00000000001J5', '00000000001J5', 'Second ticket', 'open', 'ticket', 'P2',
+     'Ticket body', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', 'queued', 1),
+    ('workspace-test', '00000000001J6', '00000000001J6', 'Third ticket', 'open', 'ticket', 'P2',
+     'Ticket body', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'planning', 1);
+
+INSERT INTO typed_ticket_events (
+    workspace_id, ticket_id, event_index, kind, author, at, heading, body
+) VALUES
+    ('workspace-test', '00000000001J2', 0, 'create', 'test', '2026-01-01T00:00:00Z', 'Created', 'created'),
+    ('workspace-test', '00000000001J5', 0, 'create', 'test', '2026-01-01T00:00:00Z', 'Created', 'created'),
+    ('workspace-test', '00000000001J6', 0, 'create', 'test', '2026-01-01T00:00:00Z', 'Created', 'created');
+"#,
+            )
+            .unwrap();
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE typed_tickets SET body = ?3 WHERE workspace_id = ?1 AND ticket_id = ?2",
+                rusqlite::params![
+                    "workspace-test",
+                    "00000000001J2",
+                    format!(
+                        "Ticket body.\n{}\nDeep Ticket marker.\n",
+                        "x".repeat(70_000)
+                    )
+                ],
+            )
             .unwrap();
         rusqlite::Connection::open(&db_path)
             .unwrap()

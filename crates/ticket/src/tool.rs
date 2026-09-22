@@ -12,13 +12,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    AcceptedOrchestrationPlan, LocalTicketBackend, MarkdownText, NewOrchestrationPlanRecord,
-    NewTicket, NewTicketEvent, NewTicketRelation, OrchestrationPlanKind, OrchestrationPlanRecord,
-    Result as TicketResult, Ticket, TicketBackend, TicketBodyReplacement, TicketDoctorDiagnostic,
-    TicketDoctorReport, TicketDoctorSeverity, TicketError, TicketEventKind, TicketIdOrSlug,
-    TicketIntakeSummary, TicketListState, TicketMarkReady, TicketRef, TicketRelation,
-    TicketRelationKind, TicketRelationView, TicketStateChange, TicketSummary, TicketWorkflowState,
-    default_author,
+    AcceptedOrchestrationPlan, MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent,
+    NewTicketRelation, OrchestrationPlanKind, OrchestrationPlanRecord, Result as TicketResult,
+    Ticket, TicketBackend, TicketBodyReplacement, TicketDoctorDiagnostic, TicketDoctorReport,
+    TicketDoctorSeverity, TicketError, TicketEventKind, TicketIdOrSlug, TicketIntakeSummary,
+    TicketListState, TicketMarkReady, TicketRef, TicketRelation, TicketRelationKind,
+    TicketRelationView, TicketStateChange, TicketSummary, TicketWorkflowState, default_author,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -119,16 +118,15 @@ pub const TICKET_MUTATING_TOOL_NAMES: [&str; 14] = [
 ];
 
 const CREATE_DESCRIPTION: &str = "Create a Ticket through the configured typed Ticket backend. \
-Inputs mirror the Ticket `item.md` fields; `title` is required, `body` is Markdown, and the \
-backend assigns the id and writes the local Ticket file layout under the configured backend root.";
+`title` is required, `body` is Markdown, and the backend assigns the id.";
 const EDIT_ITEM_DESCRIPTION: &str = "Edit a Ticket item through the configured typed Ticket backend. \
-This updates the current item title/body and appends an audited item_edit thread event. Intended for \
+This updates the current item title/body and appends an audited item_edit event. Intended for \
 User/Companion authoring surfaces, not Orchestrator implementation control.";
 const LIST_DESCRIPTION: &str = "Query Tickets from the configured typed Ticket backend as a bounded \
-overview. The local backend supports workflow-state selection; Workspace-backed Workers replace this \
-definition with the richer authoritative text/event/evidence/relation/Objective/time/attention query.";
+overview. Workspace-backed Workers replace this definition with the richer authoritative \
+text/event/evidence/relation/Objective/time/attention query.";
 const SHOW_DESCRIPTION: &str = "Show one Ticket by id or exact query through the configured typed \
-Ticket backend. Output includes bounded Markdown body, recent thread events, resolution, and artifact \
+Ticket backend. Output includes bounded Markdown body, recent events, resolution, and artifact \
 metadata; Workspace-backed Workers replace this definition with the richer authoritative evidence projection.";
 const COMMENT_DESCRIPTION: &str = "Append a typed Ticket comment event. `body` is Markdown.";
 const PLAN_DESCRIPTION: &str = "Append a typed Ticket plan event. `body` is Markdown.";
@@ -149,8 +147,7 @@ Ticket backend with a bounded `state_changed` event. Treat `queued -> inprogress
 as the implementation acceptance step: implementation side effects should happen only after that \
 transition is accepted and recorded. Orchestrator may return `ready` or `queued` Tickets to `planning` only with a concrete missing decision/information reason.";
 const CLOSE_DESCRIPTION: &str = "Close a Ticket with a Markdown resolution through the typed Ticket \
-backend. The backend sets `state: closed`, writes resolution.md, updates item.md, and appends \
-a close event.";
+backend. The backend sets the Ticket state to closed and appends a close event.";
 const RELATION_RECORD_DESCRIPTION: &str = "Record a forward typed Ticket-to-Ticket relation as durable \
 project-level metadata. Supported kinds are depends_on, blocks, related, supersedes, and duplicate_of; \
 inverse views are derived, not stored.";
@@ -215,7 +212,7 @@ pub fn ticket_tool_description(name: &str, record_language: Option<&str>) -> Str
 /// Backend object used by the LLM-facing Ticket tools.
 ///
 /// Tool execution is intentionally parameterized by this wrapper rather than by
-/// `LocalTicketBackend` so Worker hosts can supply an API-backed implementation
+/// `TicketBackend` so Worker hosts can supply an API-backed implementation
 /// without changing the model-visible tool surface.
 #[derive(Clone)]
 pub struct TicketToolBackend {
@@ -247,8 +244,8 @@ impl TicketToolBackend {
     }
 }
 
-impl From<LocalTicketBackend> for TicketToolBackend {
-    fn from(backend: LocalTicketBackend) -> Self {
+impl From<crate::SqliteTicketBackend> for TicketToolBackend {
+    fn from(backend: crate::SqliteTicketBackend) -> Self {
         let record_language = backend.record_language().map(str::to_string);
         Self::new(backend).with_record_language(record_language.as_deref())
     }
@@ -1950,9 +1947,8 @@ mod tests {
         }
     }
 
-    fn backend(temp: &TempDir) -> LocalTicketBackend {
-        LocalTicketBackend::new(temp.path().join("tickets"))
-            .with_target_authority(Arc::new(TestTargetAuthority))
+    fn backend(temp: &TempDir) -> crate::SqliteTicketBackend {
+        sqlite_backend(temp)
     }
 
     fn sqlite_backend(temp: &TempDir) -> crate::SqliteTicketBackend {
@@ -2323,7 +2319,6 @@ mod tests {
         let close = tool_by_name(backend.clone(), "TicketClose");
         let body_secret = "ITEM_BODY_SECRET_DO_NOT_LIST";
         let thread_secret = "THREAD_SECRET_DO_NOT_LIST";
-        let artifact_secret = "ARTIFACT_SECRET_DO_NOT_LIST";
         let resolution_secret = "RESOLUTION_SECRET_DO_NOT_LIST";
         let mut ticket = NewTicket::new("Leak Probe");
         ticket.body = MarkdownText::new(format!("Item body {body_secret}"));
@@ -2335,15 +2330,6 @@ mod tests {
                 NewTicketEvent::new(TicketEventKind::Comment, format!("Thread {thread_secret}")),
             )
             .unwrap();
-        std::fs::write(
-            temp.path()
-                .join("tickets")
-                .join(&created.id)
-                .join("artifacts")
-                .join("secret.txt"),
-            artifact_secret,
-        )
-        .unwrap();
         close
             .execute(
                 &json!({
@@ -2364,12 +2350,7 @@ mod tests {
             .await
             .unwrap();
         let listed_content = listed.content.unwrap();
-        for secret in [
-            body_secret,
-            thread_secret,
-            artifact_secret,
-            resolution_secret,
-        ] {
+        for secret in [body_secret, thread_secret, resolution_secret] {
             assert!(!listed_content.contains(secret));
         }
         let listed_json: Value = serde_json::from_str(&listed_content).unwrap();
@@ -2584,7 +2565,7 @@ mod tests {
             closed
                 .events
                 .iter()
-                .any(|event| event.kind == TicketEventKind::StateChanged)
+                .any(|event| event.kind == TicketEventKind::Close)
         );
     }
 
@@ -2889,7 +2870,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("state changed concurrently"));
+        assert!(matches!(error, ToolError::ExecutionFailed(_)));
         let record = backend.show(TicketIdOrSlug::Id(created.id)).unwrap();
         assert_eq!(record.meta.workflow_state, TicketWorkflowState::Planning);
         assert!(!record.events.iter().any(|event| {
@@ -3068,7 +3049,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_create_uses_opaque_id_under_backend_root() {
+    async fn ticket_create_uses_opaque_id_without_repository_local_writes() {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
         let create = tool_by_name(backend.clone(), "TicketCreate");
@@ -3083,7 +3064,9 @@ mod tests {
         let id = value["id"].as_str().unwrap();
         assert!(!id.contains("escape"));
         assert!(!temp.path().join("escape").exists());
-        assert!(temp.path().join("tickets").join(id).is_dir());
+        assert!(!temp.path().join(".yoi").exists());
+        assert!(!temp.path().join("tickets").exists());
+        assert!(temp.path().join("tickets.db").is_file());
         assert_eq!(
             backend.list(crate::TicketListQuery::all()).unwrap().len(),
             1

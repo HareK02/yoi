@@ -1287,15 +1287,10 @@ where
                 "ticket tools require Backend Workspace API authority",
             ));
         }
-        let ticket_backend = crate::feature::builtin::ticket::TicketFeatureBackend::WorkspaceClient(
+        feature_registry.add_module(crate::feature::builtin::ticket::ticket_tools_feature(
             workspace_client,
-        );
-        feature_registry.add_module(
-            crate::feature::builtin::ticket::ticket_tools_feature_with_backend(
-                ticket_backend,
-                ticket_access,
-            ),
-        );
+            ticket_access,
+        ));
     }
     if feature_config.merge_request.any() {
         let workspace_client = worker.workspace_client_handle();
