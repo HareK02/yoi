@@ -6,9 +6,9 @@ Ticket: T-452
 
 ## Baseline and method
 
-The implementation branch was created from `develop` at `043cb7bf22bd59d1d553e3f5a7c86c20502fad30` after confirming that ref was the then-current provider-resolved `origin/develop`. This audit follows normal entrypoints through constructors and typed backends to their I/O boundary. A raw `.yoi` string search was used only to enumerate candidates; strings in comments, negative regression fixtures, explicit artifacts, and preserved storage boundaries are not treated as authority by themselves.
+The implementation branch was created from `develop` at `043cb7bf22bd59d1d553e3f5a7c86c20502fad30` after confirming that ref was the then-current provider-resolved `origin/develop`, then refreshed by a normal merge from final T-629-integrated `develop` at `a6890727560af09a1b6a2e46c021fa4d6d26f8bd` before publication and review. This audit follows normal entrypoints through constructors and typed backends to their I/O boundary. A raw `.yoi` string search was used only to enumerate candidates; strings in comments, negative regression fixtures, explicit artifacts, and preserved storage boundaries are not treated as authority by themselves.
 
-The final pre-review pass must refresh from `develop` after T-629 is integrated. T-629 owns conversion of the existing panel E2E setup; this change neither restores nor duplicates that legacy fixture.
+T-629 owns conversion of the panel E2E setup to the Backend-owned dashboard fixture. The integrated fixture is preserved unchanged by T-452 and is included in the final non-interference/no-write validation; no legacy `yoi ticket init` setup was restored or duplicated.
 
 ## Reachability and disposition
 
@@ -24,7 +24,7 @@ The final pre-review pass must refresh from `develop` after T-629 is integrated.
 | Profile/Skill/Prompt | Workspace projections were already sourced from the Server virtual config tree; direct Worker startup uses explicit manifest/builtin authority. | Preserved. Existing malformed local profile/prompt/skill fixtures are negative tests. A clean direct Worker-startup regression now verifies that manifest resolution does not create `.yoi`. |
 | Plugin | T-603 already removed ambient `.yoi/plugins` discovery. | Preserved the source assertions and explicit `.yoi-plugin` offline package operations. No install/runtime fallback was added. |
 | Objective | Worker Objective tools already require Workspace API authority; Workspace Server stores Objective rows in SQLite. | Preserved. Filesystem-only Objective fixtures are ignored-input regressions, not import setup. |
-| Web/TUI | Both consume Workspace HTTP/client models and do not construct repository Ticket/Memory backends. | Preserved. Their checks validate the current typed API/routing surfaces; T-629 separately owns the panel E2E fixture modernization. |
+| Web/TUI | Both consume Workspace HTTP/client models and do not construct repository Ticket/Memory backends. | Preserved. Their checks validate the current typed API/routing surfaces; the integrated T-629 panel E2E uses the Backend-owned dashboard fixture and no repository-local Ticket setup. |
 
 ## Regression evidence added or strengthened
 
