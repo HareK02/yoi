@@ -759,6 +759,12 @@ impl App {
             }
             return None;
         }
+        if self.worker_status != WorkerStatus::Idle {
+            self.push_error(
+                "Submit requires an idle Worker; use Alt-n Notify for work already in progress.",
+            );
+            return None;
+        }
         self.record_input_history(segments.clone());
         self.input.clear();
         Some(self.method_for_run(segments))
@@ -773,7 +779,9 @@ impl App {
             .iter()
             .any(|segment| matches!(segment, Segment::UploadedFile { .. }))
         {
-            self.push_error("Notify accepts text only; remove attachments or queue a Submit.");
+            self.push_error(
+                "Notify accepts text only; remove attachments or wait until the Worker is idle to Submit.",
+            );
             return None;
         }
         let message = Segment::flatten_to_text(&segments);
@@ -3514,16 +3522,22 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn running_submit_is_sent_to_the_worker_and_not_queued_locally() {
+    fn running_submit_is_rejected_locally_and_preserves_the_draft() {
         let mut app = App::new("test".into());
         app.set_worker_status(WorkerStatus::Running);
-        insert_text(&mut app, "queued turn");
+        insert_text(&mut app, "advisory context");
 
         let method = app.submit_input();
 
-        assert!(matches!(method, Some(Method::Submit { .. })));
+        assert!(method.is_none());
         assert_eq!(app.queued_input_count(), 0);
-        assert_eq!(input_text(&app), "");
+        assert_eq!(input_text(&app), "advisory context");
+        assert!(app.blocks.iter().any(|block| matches!(
+            block,
+            Block::Alert { message, .. }
+                if message.contains("requires an idle Worker")
+                    && message.contains("Alt-n Notify")
+        )));
     }
 
     #[test]
@@ -3552,6 +3566,17 @@ mod completion_flow_tests {
             .is_none()
         );
         assert_eq!(app.queued_input_count(), 1);
+    }
+
+    #[test]
+    fn paused_non_empty_submit_is_rejected_locally_and_preserves_the_draft() {
+        let mut app = App::new("test".into());
+        app.set_worker_status(WorkerStatus::Paused);
+        insert_text(&mut app, "different request");
+
+        assert!(app.submit_input().is_none());
+        assert_eq!(input_text(&app), "different request");
+        assert_eq!(app.queued_input_count(), 0);
     }
 
     #[test]
@@ -4609,13 +4634,18 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn input_history_records_running_submits_and_suppresses_consecutive_duplicates() {
+    fn input_history_records_only_an_idle_submit_after_running_rejection() {
         let mut app = App::new("test".into());
-        app.running = true;
+        app.set_worker_status(WorkerStatus::Running);
 
         for c in "repeat".chars() {
             app.insert_char(c);
         }
+        assert!(app.submit_input().is_none());
+        assert_eq!(app.input_history_len(), 0);
+        assert_eq!(input_text(&app), "repeat");
+
+        app.set_worker_status(WorkerStatus::Idle);
         assert!(app.submit_input().is_some());
         assert_eq!(app.input_history_len(), 1);
         assert_eq!(app.queued_input_count(), 0);

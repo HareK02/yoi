@@ -913,6 +913,9 @@ mod tests {
                 "missing canonical tool {name}"
             );
         }
+        assert!(orchestration.contains("Idle-only Submit"));
+        assert!(orchestration.contains("use `WorkerNotify` instead"));
+        assert!(orchestration.contains("do not create a queued Submit"));
         for alias in ["SubWorkerList", "SubWorkerSend", "SubWorkerStop"] {
             assert!(
                 !orchestration.contains(alias),

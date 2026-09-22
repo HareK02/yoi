@@ -1477,6 +1477,51 @@ where
     Ok(workdir_for_view)
 }
 
+const SUBMIT_REQUIRES_IDLE_MESSAGE: &str =
+    "Submit requires an idle Worker; use Notify for work already in progress";
+
+fn reject_submit_while_not_idle(
+    submission_request_id: String,
+    working_event_tx: &broadcast::Sender<Event>,
+) {
+    let _ = working_event_tx.send(Event::SubmissionRejected {
+        submission_request_id,
+        message: SUBMIT_REQUIRES_IDLE_MESSAGE.into(),
+    });
+}
+
+fn replay_or_reject_submit_while_not_idle<St>(
+    pending_submissions: &PendingSubmissionHandle<St>,
+    submission_request_id: String,
+    input: Vec<protocol::Segment>,
+    source_namespace: String,
+    working_event_tx: &broadcast::Sender<Event>,
+) where
+    St: session_store::Store + Clone,
+{
+    let request_id = submission_request_id.clone();
+    match pending_submissions.replay_acceptance_from_source(
+        submission_request_id,
+        input,
+        source_namespace,
+    ) {
+        Ok(Some(acceptance)) => {
+            let _ = working_event_tx.send(Event::SubmissionAccepted {
+                submission_request_id: acceptance.submission_request_id,
+                submission_id: acceptance.submission_id,
+                disposition: acceptance.disposition,
+            });
+        }
+        Ok(None) => reject_submit_while_not_idle(request_id, working_event_tx),
+        Err(error) => {
+            let _ = working_event_tx.send(Event::SubmissionRejected {
+                submission_request_id: request_id,
+                message: error.to_string(),
+            });
+        }
+    }
+}
+
 fn durably_accept_method_while_busy<St>(
     method: Method,
     pending_submissions: &PendingSubmissionHandle<St>,
@@ -1490,28 +1535,13 @@ where
             submission_request_id,
             input,
         } => {
-            let request_id = submission_request_id.clone();
-            match pending_submissions.accept_from_source(
+            replay_or_reject_submit_while_not_idle(
+                pending_submissions,
                 submission_request_id,
                 input,
                 pending_submissions.direct_client_namespace(),
-                session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
-                false,
-            ) {
-                Ok(acceptance) => {
-                    let _ = working_event_tx.send(Event::SubmissionAccepted {
-                        submission_request_id: acceptance.submission_request_id,
-                        submission_id: acceptance.submission_id,
-                        disposition: acceptance.disposition,
-                    });
-                }
-                Err(error) => {
-                    let _ = working_event_tx.send(Event::SubmissionRejected {
-                        submission_request_id: request_id,
-                        message: error.to_string(),
-                    });
-                }
-            }
+                working_event_tx,
+            );
             None
         }
         Method::SubmitTracked {
@@ -1519,30 +1549,14 @@ where
             input,
             source,
         } => {
-            let request_id = submission_request_id.clone();
-            let (source_namespace, provenance) =
-                resolved_input_source(pending_submissions, &source);
-            match pending_submissions.accept_from_source(
+            let (source_namespace, _) = resolved_input_source(pending_submissions, &source);
+            replay_or_reject_submit_while_not_idle(
+                pending_submissions,
                 submission_request_id,
                 input,
                 source_namespace,
-                provenance,
-                false,
-            ) {
-                Ok(acceptance) => {
-                    let _ = working_event_tx.send(Event::SubmissionAccepted {
-                        submission_request_id: acceptance.submission_request_id,
-                        submission_id: acceptance.submission_id,
-                        disposition: acceptance.disposition,
-                    });
-                }
-                Err(error) => {
-                    let _ = working_event_tx.send(Event::SubmissionRejected {
-                        submission_request_id: request_id,
-                        message: error.to_string(),
-                    });
-                }
-            }
+                working_event_tx,
+            );
             None
         }
         Method::Notify {
@@ -1955,13 +1969,22 @@ async fn controller_loop<C, St>(
                 submission_request_id,
                 input,
             } => {
+                if shared_state.catalog_status() != WorkerStatus::Idle {
+                    replay_or_reject_submit_while_not_idle(
+                        &pending_submissions,
+                        submission_request_id,
+                        input,
+                        pending_submissions.direct_client_namespace(),
+                        &working_event_tx,
+                    );
+                    continue;
+                }
                 let request_id = submission_request_id.clone();
-                match pending_submissions.accept_from_source(
+                match pending_submissions.accept_idle_from_source(
                     submission_request_id,
                     input,
                     pending_submissions.direct_client_namespace(),
                     session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
-                    true,
                 ) {
                     Ok(acceptance) => {
                         let _ = working_event_tx.send(Event::SubmissionAccepted {
@@ -1986,15 +2009,24 @@ async fn controller_loop<C, St>(
                 input,
                 source,
             } => {
-                let request_id = submission_request_id.clone();
                 let (source_namespace, provenance) =
                     resolved_input_source(&pending_submissions, &source);
-                match pending_submissions.accept_from_source(
+                if shared_state.catalog_status() != WorkerStatus::Idle {
+                    replay_or_reject_submit_while_not_idle(
+                        &pending_submissions,
+                        submission_request_id,
+                        input,
+                        source_namespace,
+                        &working_event_tx,
+                    );
+                    continue;
+                }
+                let request_id = submission_request_id.clone();
+                match pending_submissions.accept_idle_from_source(
                     submission_request_id,
                     input,
                     source_namespace,
                     provenance,
-                    true,
                 ) {
                     Ok(acceptance) => {
                         let _ = working_event_tx.send(Event::SubmissionAccepted {
@@ -2951,64 +2983,28 @@ where
                         submission_request_id,
                         input,
                     }) => {
-                        let request_id = submission_request_id.clone();
-                        match pending_submissions.accept_from_source(
+                        replay_or_reject_submit_while_not_idle(
+                            pending_submissions,
                             submission_request_id,
                             input,
                             pending_submissions.direct_client_namespace(),
-                            session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
-                            false,
-                        ) {
-                            Ok(acceptance) => {
-                                let _ = working_event_tx.send(Event::SubmissionAccepted {
-                                    submission_request_id: acceptance.submission_request_id,
-                                    submission_id: acceptance.submission_id,
-                                    disposition: acceptance.disposition,
-                                });
-                                let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
-                                    pending: pending_submissions.snapshot(),
-                                });
-                            }
-                            Err(error) => {
-                                let _ = working_event_tx.send(Event::SubmissionRejected {
-                                    submission_request_id: request_id,
-                                    message: error.to_string(),
-                                });
-                            }
-                        }
+                            working_event_tx,
+                        );
                     }
                     Some(Method::SubmitTracked {
                         submission_request_id,
                         input,
                         source,
                     }) => {
-                        let request_id = submission_request_id.clone();
-                        let (source_namespace, provenance) =
+                        let (source_namespace, _) =
                             resolved_input_source(pending_submissions, &source);
-                        match pending_submissions.accept_from_source(
+                        replay_or_reject_submit_while_not_idle(
+                            pending_submissions,
                             submission_request_id,
                             input,
                             source_namespace,
-                            provenance,
-                            false,
-                        ) {
-                            Ok(acceptance) => {
-                                let _ = working_event_tx.send(Event::SubmissionAccepted {
-                                    submission_request_id: acceptance.submission_request_id,
-                                    submission_id: acceptance.submission_id,
-                                    disposition: acceptance.disposition,
-                                });
-                                let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
-                                    pending: pending_submissions.snapshot(),
-                                });
-                            }
-                            Err(error) => {
-                                let _ = working_event_tx.send(Event::SubmissionRejected {
-                                    submission_request_id: request_id,
-                                    message: error.to_string(),
-                                });
-                            }
-                        }
+                            working_event_tx,
+                        );
                     }
                     Some(Method::Resume { command }) => {
                         if let Err(disposition) =
@@ -3566,6 +3562,38 @@ mod tests {
             WorkerEvent::TurnEnded { worker_name } => assert_eq!(worker_name, "child-worker"),
             other => panic!("expected TurnEnded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn busy_submit_is_rejected_without_queueing() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = PendingSubmissionHandle::for_test(dir.path());
+        let (event_tx, mut event_rx) = broadcast::channel(4);
+
+        assert!(
+            durably_accept_method_while_busy(
+                Method::SubmitTracked {
+                    submission_request_id: "request-1".into(),
+                    input: vec![protocol::Segment::text("follow-up")],
+                    source: protocol::AuthenticatedInputSource::Backend {
+                        operation_id: "operation-1".into(),
+                    },
+                },
+                &pending,
+                &event_tx,
+            )
+            .is_none()
+        );
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            Event::SubmissionRejected {
+                submission_request_id,
+                message,
+            } if submission_request_id == "request-1"
+                && message == SUBMIT_REQUIRES_IDLE_MESSAGE
+        ));
+        assert!(pending.snapshot().submissions.is_empty());
+        assert!(pending.persisted_entries_for_test().is_empty());
     }
 
     #[test]

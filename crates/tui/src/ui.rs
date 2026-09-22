@@ -1868,7 +1868,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
-            " — Enter to resume, Ctrl-X to cancel, type to start new turn",
+            " — Enter to resume, Ctrl-X to cancel, Alt-n to notify",
             Style::default().fg(Color::DarkGray),
         ));
     } else if !app.running {

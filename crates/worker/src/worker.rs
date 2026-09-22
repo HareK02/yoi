@@ -1434,7 +1434,60 @@ where
         )
     }
 
-    pub(crate) fn accept_from_source(
+    pub(crate) fn accept_idle_from_source(
+        &self,
+        submission_request_id: String,
+        input: Vec<Segment>,
+        source_namespace: String,
+        provenance: WorkerHistoryProvenance,
+    ) -> Result<SubmissionAcceptance, PendingSubmissionError> {
+        self.accept_from_source(
+            submission_request_id,
+            input,
+            source_namespace,
+            provenance,
+            true,
+        )
+    }
+
+    pub(crate) fn replay_acceptance_from_source(
+        &self,
+        submission_request_id: String,
+        input: Vec<Segment>,
+        source_namespace: String,
+    ) -> Result<Option<SubmissionAcceptance>, PendingSubmissionError> {
+        if submission_request_id.trim().is_empty() {
+            return Err(PendingSubmissionError::EmptyRequestId);
+        }
+        if submission_request_id.len() > MAX_ACTIVATION_REQUEST_ID_BYTES {
+            return Err(PendingSubmissionError::RequestIdLimit);
+        }
+        if input.is_empty() {
+            return Err(PendingSubmissionError::EmptyInput);
+        }
+        let payload_digest = submission_payload_digest(&input);
+        let current = self
+            .state
+            .lock()
+            .expect("pending activation state poisoned");
+        let Some(receipt) = current.receipts.iter().find(|receipt| {
+            receipt.submission_request_id == submission_request_id
+                && receipt.source_namespace == source_namespace
+        }) else {
+            return Ok(None);
+        };
+        if receipt.payload_digest != payload_digest {
+            return Err(PendingSubmissionError::IdempotencyConflict);
+        }
+        Ok(Some(SubmissionAcceptance {
+            submission_request_id,
+            submission_id: receipt.submission_id.clone(),
+            disposition: receipt.disposition,
+            activation: None,
+        }))
+    }
+
+    fn accept_from_source(
         &self,
         submission_request_id: String,
         input: Vec<Segment>,

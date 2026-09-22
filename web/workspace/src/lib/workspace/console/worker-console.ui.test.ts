@@ -1239,7 +1239,7 @@ Deno.test("Web Console switches main and direct SubWorker views from the Tasks r
   );
 });
 
-Deno.test("Web Console uses Notify while running and exposes durable pending controls", async () => {
+Deno.test("Web Console uses Notify while running and keeps recovery pending controls", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
       "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
@@ -1257,12 +1257,8 @@ Deno.test("Web Console uses Notify while running and exposes durable pending con
       'method: "cancel_pending_submission"',
       'method: "clear_pending_submissions"',
       'method: "continue_pending"',
-      "handleQueueSubmit",
       "handleNotifySubmit",
-      'submitDraft(composerInputElement?.snapshot() ?? draft, "queue")',
-      "disabled={!canQueueDraft}",
       "disabled={!canNotifyDraft}",
-      ">Queue Submit</button>",
       ">Notify</button>",
     ]
   ) {
@@ -1271,6 +1267,13 @@ Deno.test("Web Console uses Notify while running and exposes durable pending con
       `missing durable pending control token: ${token}`,
     );
   }
+
+  assert(
+    !consolePage.includes("handleQueueSubmit") &&
+      !consolePage.includes(">Queue Submit</button>") &&
+      !consolePage.includes('delivery: "queue"'),
+    "running Console must not offer Submit queueing; callers should use Notify",
+  );
 
   const userCase = consolePage.slice(
     consolePage.indexOf('case "user":'),

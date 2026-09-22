@@ -20,15 +20,7 @@ const base = {
   hasAttachments: false,
 };
 
-Deno.test("running Composer enables Queue Submit and Notify but not immediate Submit", () => {
-  assertEquals(
-    canDeliverComposerDraft({
-      ...base,
-      delivery: "queue",
-      workerState: "running",
-    }),
-    true,
-  );
+Deno.test("running Composer enables Notify but not Submit", () => {
   assertEquals(
     canDeliverComposerDraft({
       ...base,
@@ -47,16 +39,8 @@ Deno.test("running Composer enables Queue Submit and Notify but not immediate Su
   );
 });
 
-Deno.test("running Queue Submit and Notify dispatch their protocol methods", () => {
+Deno.test("running Notify dispatches its protocol method", () => {
   const sent: string[] = [];
-  assertEquals(
-    sendComposerDelivery(
-      { ...base, delivery: "queue", workerState: "running" },
-      "submit",
-      (method) => sent.push(method),
-    ),
-    true,
-  );
   assertEquals(
     sendComposerDelivery(
       { ...base, delivery: "notify", workerState: "running" },
@@ -65,10 +49,10 @@ Deno.test("running Queue Submit and Notify dispatch their protocol methods", () 
     ),
     true,
   );
-  assertEquals(sent.join(","), "submit,notify");
+  assertEquals(sent.join(","), "notify");
 });
 
-Deno.test("idle Composer enables only immediate Submit", () => {
+Deno.test("idle Composer enables only Submit", () => {
   assertEquals(
     canDeliverComposerDraft({
       ...base,
@@ -80,14 +64,6 @@ Deno.test("idle Composer enables only immediate Submit", () => {
   assertEquals(
     canDeliverComposerDraft({
       ...base,
-      delivery: "queue",
-      workerState: "idle",
-    }),
-    false,
-  );
-  assertEquals(
-    canDeliverComposerDraft({
-      ...base,
       delivery: "notify",
       workerState: "idle",
     }),
@@ -95,11 +71,30 @@ Deno.test("idle Composer enables only immediate Submit", () => {
   );
 });
 
-Deno.test("running delivery remains fenced by protocol, send state, and payload kind", () => {
+Deno.test("paused Composer enables neither Submit nor Notify", () => {
   assertEquals(
     canDeliverComposerDraft({
       ...base,
-      delivery: "queue",
+      delivery: "submit",
+      workerState: "paused",
+    }),
+    false,
+  );
+  assertEquals(
+    canDeliverComposerDraft({
+      ...base,
+      delivery: "notify",
+      workerState: "paused",
+    }),
+    false,
+  );
+});
+
+Deno.test("running Notify remains fenced by protocol, send state, and payload kind", () => {
+  assertEquals(
+    canDeliverComposerDraft({
+      ...base,
+      delivery: "notify",
       workerState: "running",
       protocolOpen: false,
     }),
@@ -122,15 +117,5 @@ Deno.test("running delivery remains fenced by protocol, send state, and payload 
       hasAttachments: true,
     }),
     false,
-  );
-  assertEquals(
-    canDeliverComposerDraft({
-      ...base,
-      delivery: "queue",
-      workerState: "running",
-      hasText: false,
-      hasAttachments: true,
-    }),
-    true,
   );
 });

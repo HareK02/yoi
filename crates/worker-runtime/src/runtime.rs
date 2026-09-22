@@ -1866,18 +1866,20 @@ impl Runtime {
         mut input: WorkerInput,
     ) -> Result<WorkerInteractionAck, RuntimeError> {
         validate_worker_input(&input)?;
-        let expected_submission_id =
-            if matches!(input.kind, WorkerInputKind::User | WorkerInputKind::Notify) {
-                let submission_id = input
-                    .submission_request_id
-                    .clone()
-                    .filter(|request_id| !request_id.trim().is_empty())
-                    .unwrap_or_else(|| Uuid::now_v7().to_string());
-                input.submission_request_id = Some(submission_id.clone());
-                Some(submission_id)
-            } else {
-                None
-            };
+        if matches!(input.kind, WorkerInputKind::User | WorkerInputKind::Notify) {
+            let request_id = input
+                .submission_request_id
+                .clone()
+                .filter(|request_id| !request_id.trim().is_empty())
+                .unwrap_or_else(|| Uuid::now_v7().to_string());
+            input.submission_request_id = Some(request_id);
+        }
+        let expected_submission_id = (input.kind == WorkerInputKind::User).then(|| {
+            input
+                .submission_request_id
+                .clone()
+                .expect("User input request id must be assigned before dispatch")
+        });
         self.ensure_worker_execution(worker_ref)?;
         let (backend, handle) = {
             let state = self.lock()?;

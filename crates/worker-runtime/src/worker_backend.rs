@@ -4360,7 +4360,7 @@ mod tests {
     }
 
     #[test]
-    fn running_worker_accepts_a_second_submit_as_queued() {
+    fn running_worker_replays_retry_but_rejects_a_new_submit() {
         let client = MockClient::sequential(vec![MockResponse::Hang(vec![])]);
         let runtime_base = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
@@ -4404,13 +4404,50 @@ mod tests {
 
         let mut second_input = WorkerInput::user("second");
         second_input.submission_request_id = Some("request-second".into());
-        let second = runtime
+        let error = runtime
             .send_input(&detail.worker_ref, second_input)
+            .expect_err("a new Submit must be rejected while the Worker is running");
+        assert!(error.to_string().contains("requires an idle Worker"));
+        assert!(error.to_string().contains("use Notify"));
+    }
+
+    #[test]
+    fn running_worker_accepts_notify_without_a_submit_receipt() {
+        let client = MockClient::sequential(vec![MockResponse::Hang(vec![])]);
+        let runtime_base = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let factory = MockFactory {
+            client,
+            runtime_base: runtime_base.path().to_path_buf(),
+            cwd: cwd.path().to_path_buf(),
+            store_dir: store.path().join("sessions"),
+            worker_metadata_dir: store.path().join("workers"),
+            observed_cwds: Arc::new(Mutex::new(Vec::new())),
+            observed_workspace_clients: Arc::new(Mutex::new(Vec::new())),
+        };
+        let backend = Arc::new(WorkerRuntimeExecutionBackend::new(factory).unwrap());
+        let runtime =
+            EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), backend.clone())
+                .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let detail = runtime
+            .create_worker(create_request("running-notify"))
             .unwrap();
-        assert_eq!(
-            second.submission.as_ref().map(|ack| ack.disposition),
-            Some(protocol::SubmissionDisposition::Queued)
-        );
+
+        runtime
+            .send_input(&detail.worker_ref, WorkerInput::user("first"))
+            .unwrap();
+        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Running);
+
+        let mut notification = WorkerInput::notify("advisory context");
+        notification.submission_request_id = Some("notification-request".into());
+        let acknowledgement = runtime
+            .send_input(&detail.worker_ref, notification)
+            .expect("Running Worker must accept Notify without a Submit receipt");
+
+        assert!(acknowledgement.submission.is_none());
+        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Running);
     }
 
     #[test]

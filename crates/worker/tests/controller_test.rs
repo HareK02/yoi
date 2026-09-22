@@ -1376,8 +1376,48 @@ async fn events_are_broadcast() {
 }
 
 #[tokio::test]
-async fn submit_while_running_is_durably_queued() {
-    // Keep the first turn in-flight until the second Submit is accepted.
+async fn submit_requires_an_idle_worker() {
+    async fn wait_for_rejection(
+        rx: &mut tokio::sync::broadcast::Receiver<Event>,
+        expected_request_id: &str,
+    ) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Ok(Event::SubmissionRejected {
+                    submission_request_id,
+                    message,
+                }) = rx.recv().await
+                    && submission_request_id == expected_request_id
+                {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("Submit rejection")
+    }
+
+    async fn wait_for_acceptance(
+        rx: &mut tokio::sync::broadcast::Receiver<Event>,
+        expected_request_id: &str,
+    ) -> protocol::SubmissionDisposition {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Ok(Event::SubmissionAccepted {
+                    submission_request_id,
+                    disposition,
+                    ..
+                }) = rx.recv().await
+                    && submission_request_id == expected_request_id
+                {
+                    break disposition;
+                }
+            }
+        })
+        .await
+        .expect("Submit acceptance")
+    }
+
     let events = vec![
         LlmEvent::text_block_start(0),
         LlmEvent::text_delta(0, "slow..."),
@@ -1391,40 +1431,38 @@ async fn submit_while_running_is_durably_queued() {
         .send(Method::submit_text("request-first", "first"))
         .await
         .unwrap();
+    let first = wait_for_acceptance(&mut rx, "request-first").await;
+    assert_eq!(first, protocol::SubmissionDisposition::Started);
     wait_for_status(&handle, WorkerStatus::Running).await;
+
     handle
-        .send(Method::submit_text("request-second", "second"))
+        .send(Method::submit_text("request-first", "first"))
+        .await
+        .unwrap();
+    let replay = wait_for_acceptance(&mut rx, "request-first").await;
+    assert_eq!(replay, protocol::SubmissionDisposition::Started);
+
+    handle
+        .send(Method::submit_text("request-running", "second"))
         .await
         .unwrap();
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    let mut accepted = None;
-    let mut pending_snapshot = None;
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
-            Ok(Ok(Event::SubmissionAccepted {
-                submission_request_id,
-                disposition,
-                ..
-            })) if submission_request_id == "request-second" => accepted = Some(disposition),
-            Ok(Ok(Event::PendingSubmissionsChanged { pending }))
-                if pending.submissions.len() == 1 =>
-            {
-                pending_snapshot = Some(pending)
-            }
-            Ok(Ok(Event::Error { code, message })) if code == worker::ErrorCode::AlreadyRunning => {
-                panic!("Submit was busy-rejected: {message}")
-            }
-            _ => {}
-        }
-        if accepted.is_some() && pending_snapshot.is_some() {
-            break;
-        }
-    }
+    let running_rejection = wait_for_rejection(&mut rx, "request-running").await;
+    assert!(running_rejection.contains("requires an idle Worker"));
+    assert!(running_rejection.contains("use Notify"));
 
-    assert_eq!(accepted, Some(protocol::SubmissionDisposition::Queued));
-    let pending_snapshot = pending_snapshot.expect("pending snapshot");
-    assert_eq!(pending_snapshot.submissions.len(), 1);
+    handle.send(Method::ListPendingSubmissions).await.unwrap();
+    let pending = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if let Ok(Event::PendingSubmissionsChanged { pending }) = rx.recv().await {
+                break pending;
+            }
+        }
+    })
+    .await
+    .expect("pending snapshot");
+    assert!(pending.submissions.is_empty());
+
     handle
         .send(Method::Pause {
             command: worker_command(&handle),
@@ -1433,25 +1471,13 @@ async fn submit_while_running_is_durably_queued() {
         .unwrap();
     wait_for_status(&handle, WorkerStatus::Paused).await;
     handle
-        .send(Method::ContinuePending {
-            expected_revision: pending_snapshot.revision,
-            expected_head_id: pending_snapshot.head_id.expect("pending head"),
-        })
+        .send(Method::submit_text("request-paused", "third"))
         .await
         .unwrap();
-    let rejection = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            if let Ok(Event::Error { code, message }) = rx.recv().await
-                && code == worker::ErrorCode::InvalidRequest
-                && message.contains("requires an idle Worker")
-            {
-                break message;
-            }
-        }
-    })
-    .await
-    .expect("paused ContinuePending rejection");
-    assert!(rejection.contains("Resume or Cancel"));
+
+    let paused_rejection = wait_for_rejection(&mut rx, "request-paused").await;
+    assert!(paused_rejection.contains("requires an idle Worker"));
+    assert!(paused_rejection.contains("use Notify"));
     assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Paused);
 }
 
@@ -2783,12 +2809,12 @@ async fn pause_then_resume_preserves_notifications_and_history_consistency() {
     assert!(!has_tool_call, "no orphan tool_call in history");
 }
 
-/// Paused with an orphan `tool_use` in history + a fresh `Method::Submit`
-/// must produce a wire-valid next LLM request: the orphan is closed
-/// with a synthetic `tool_result`, a system note is inserted, and the
-/// new user input is appended.
+/// Paused with an orphan `tool_use` in history must reject a fresh Submit.
+/// After explicit Cancel returns the Worker to Idle, a new Submit must produce
+/// a wire-valid next LLM request: the orphan is closed with a synthetic
+/// `tool_result`, a system note is inserted, and the new user input is appended.
 #[tokio::test]
-async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
+async fn paused_submit_is_rejected_before_cancel_and_fresh_run() {
     // Response 1: emit a tool_use block (complete with stop) targeting
     // our hanging tool. The Engine commits the ToolCall to history,
     // then parks inside `execute_tools` waiting on the tool — which is
@@ -2858,10 +2884,44 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Paused);
 
-    // New user input while Paused → `Worker::run` observes
-    // `last_run_interrupted` and runs its interrupt-prep step, which
-    // closes the orphan + injects a system note before the fresh user
-    // message.
+    let paused_request_id = protocol::new_submission_request_id();
+    handle
+        .send(Method::submit_text(
+            paused_request_id.clone(),
+            "new request",
+        ))
+        .await
+        .unwrap();
+    assert!(
+        drain_until(&mut rx, std::time::Duration::from_secs(2), |event| {
+            matches!(
+                event,
+                Event::SubmissionRejected {
+                    submission_request_id,
+                    message,
+                } if submission_request_id == &paused_request_id
+                    && message.contains("requires an idle Worker")
+            )
+        })
+        .await,
+        "Paused Submit must be rejected"
+    );
+    assert_eq!(
+        client_for_assert.captured_requests().len(),
+        1,
+        "rejected Paused Submit must not start another LLM request"
+    );
+
+    handle
+        .send(Method::Cancel {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
+    wait_for_status(&handle, WorkerStatus::Idle).await;
+
+    // Once explicitly returned to Idle, fresh user input runs interrupt prep,
+    // which closes the orphan and inserts a system note before the user message.
     handle
         .send(Method::submit_text(
             protocol::new_submission_request_id(),
@@ -2877,7 +2937,7 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
             }
         ))
         .await,
-        "expected RunEnd::Finished after Paused→Run"
+        "expected RunEnd::Finished after Cancel→Submit"
     );
 
     // The second LLM request carries the closure chain. Walk its items

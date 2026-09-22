@@ -269,16 +269,6 @@
             hasAttachments: draftHasAttachments,
         }),
     );
-    const canQueueDraft = $derived(
-        canDeliverComposerDraft({
-            delivery: "queue",
-            workerState,
-            protocolOpen: protocolState === "open",
-            sending,
-            hasText: draftHasText,
-            hasAttachments: draftHasAttachments,
-        }),
-    );
     const canNotifyDraft = $derived(
         canDeliverComposerDraft({
             delivery: "notify",
@@ -729,10 +719,6 @@
         void submitDraft(composerInputElement?.snapshot() ?? draft);
     }
 
-    function handleQueueSubmit() {
-        void submitDraft(composerInputElement?.snapshot() ?? draft, "queue");
-    }
-
     function handleNotifySubmit() {
         void submitDraft(composerInputElement?.snapshot() ?? draft, "notify");
     }
@@ -842,7 +828,7 @@
     ) {
         if (delivery === "notify" && attachments.length > 0) {
             composerNotice = null;
-            sendError = "Notify accepts text only; remove attachments or queue a Submit.";
+            sendError = "Notify accepts text only; remove attachments or wait until the Worker is idle to Submit.";
             return;
         }
         const incompleteAttachment = attachments.find((attachment) =>
@@ -2151,11 +2137,6 @@
         </div>
         <div class="composer-actions">
             {#if workerRunning}
-                <button
-                    type="button"
-                    disabled={!canQueueDraft}
-                    onclick={handleQueueSubmit}
-                >Queue Submit</button>
                 <button
                     type="button"
                     disabled={!canNotifyDraft}

@@ -827,8 +827,12 @@ impl WorkerOperation {
             Self::Spawn => {
                 "Spawn a Backend/Runtime Worker session in an existing Workspace Workdir. The Workdir id is authority; filesystem paths and Runtime URLs are not accepted. `initial_submit` carries the normal typed user submission. After the Orchestrator has committed a Ticket to `inprogress`, set `ticket_id` with a Flow segment in `initial_submit` to atomically assign the new Coder Worker; the operation id is derived from the durable tool call rather than model input."
             }
-            Self::SendInput => "Send user input to a known Runtime Worker when allowed.",
-            Self::Notify => "Send an advisory notification to a known Runtime Worker when allowed.",
+            Self::SendInput => {
+                "Start a fresh turn by sending user input to a known Idle Worker. Running or Paused targets reject Submit; use WorkerNotify for advisory information during work already in progress."
+            }
+            Self::Notify => {
+                "Send an advisory notification to a known Runtime Worker so information can be incorporated into work already in progress without creating a queued Submit."
+            }
             Self::Cancel => "Cancel the current turn of a known Runtime Worker when allowed.",
             Self::Stop => "Stop a known Runtime Worker when allowed.",
             Self::Restore => {
@@ -1079,7 +1083,9 @@ fn format_elapsed(elapsed_ms: u64) -> String {
 fn sub_worker_tool_declaration(operation: WorkerOperation) -> ToolDeclaration {
     let description = match operation {
         WorkerOperation::List => "List this Worker's direct SubWorkers.",
-        WorkerOperation::SendInput => "Send a new user turn to a direct SubWorker.",
+        WorkerOperation::SendInput => {
+            "Start a fresh user turn for an Idle direct SubWorker. Running or Paused SubWorkers reject Submit."
+        }
         WorkerOperation::Stop => {
             "Stop a direct SubWorker and release all authority delegated to its child session."
         }
