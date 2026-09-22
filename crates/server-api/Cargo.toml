@@ -33,7 +33,6 @@ required-features = ["typescript"]
 
 [[example]]
 name = "generate_workdir_api_types"
-required-features = ["typescript"]
 
 [[example]]
 name = "generate_worker_launch_api_types"

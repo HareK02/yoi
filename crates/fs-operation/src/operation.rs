@@ -1,6 +1,7 @@
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::FsError;
@@ -11,9 +12,11 @@ use crate::FsError;
 /// while computing line and content metadata. `max_response_bytes` limits the
 /// bytes retained for the response independently of the caller's requested
 /// `ReadRequest::max_bytes`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct BoundedReadLimits {
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub max_source_bytes: u64,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub max_response_bytes: usize,
 }
 
@@ -72,7 +75,7 @@ impl<'de> Deserialize<'de> for BoundedReadLimits {
 
 /// Scope-checked filesystem path. Relative paths resolve below the bound
 /// Workdir root; absolute paths require an explicit matching scope rule.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
 #[serde(transparent)]
 pub struct FsPath(String);
 
@@ -153,21 +156,22 @@ impl fmt::Display for FsPath {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StatRequest {
     pub path: FsPath,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StatResult {
     pub path: FsPath,
     pub kind: EntryKind,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub size: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
     File,
@@ -178,27 +182,32 @@ pub enum EntryKind {
 
 pub type ContentHash = [u8; 32];
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadRequest {
     pub path: FsPath,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub offset: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub limit: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub max_bytes: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadResult {
     pub path: FsPath,
     pub bytes: Vec<u8>,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub start_line: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub total_lines: usize,
     pub content_hash: ContentHash,
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WriteRequest {
     pub path: FsPath,
@@ -206,13 +215,14 @@ pub struct WriteRequest {
     pub expected_hash: Option<ContentHash>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WriteResult {
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub bytes_written: usize,
     pub created: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EditRequest {
     pub path: FsPath,
@@ -222,54 +232,61 @@ pub struct EditRequest {
     pub expected_hash: ContentHash,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EditResult {
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub replacements: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub bytes_written: usize,
     pub content_hash: ContentHash,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListRequest {
     pub path: FsPath,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub limit: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListEntry {
     pub path: FsPath,
     pub kind: EntryKind,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub size: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListResult {
     pub entries: Vec<ListEntry>,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub total_entries: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub total_bytes: u64,
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GlobRequest {
     pub pattern: String,
     pub path: FsPath,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub limit: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GlobResult {
     pub paths: Vec<FsPath>,
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GrepOutputMode {
     Content,
@@ -283,7 +300,7 @@ impl Default for GrepOutputMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GrepRequest {
     pub pattern: String,
@@ -291,21 +308,27 @@ pub struct GrepRequest {
     pub glob: Option<String>,
     pub file_type: Option<String>,
     pub case_insensitive: bool,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub before_context: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub after_context: usize,
     pub multiline: bool,
     pub output_mode: GrepOutputMode,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub limit: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub offset: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GrepResult {
     /// Provider-rendered bounded grep report. Keeping rendering here avoids
     /// transferring candidate files across a remote provider boundary.
     pub output: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub match_count: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub matched_files: usize,
     pub truncated: bool,
 }

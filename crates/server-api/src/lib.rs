@@ -77,6 +77,64 @@ impl api_macros::HttpRequestError for RepositoryApiError {
     }
 }
 
+/// Error body for current-Worker Workdir operations.
+///
+/// Domain/service failures preserve the existing Repository-style API envelope,
+/// while provider failures preserve the established typed Workdir transport
+/// envelope and HTTP status classification.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkdirOperationApiError {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<workdir::http::WorkdirTransportErrorCode>,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Vec<Diagnostic>>,
+    #[serde(skip, default = "default_repository_error_status")]
+    status: u16,
+}
+
+impl WorkdirOperationApiError {
+    pub fn api(error: RepositoryApiError) -> Self {
+        Self {
+            error: Some(error.error),
+            code: None,
+            message: error.message,
+            diagnostics: Some(error.diagnostics),
+            status: error.status,
+        }
+    }
+
+    pub fn provider(error: workdir::http::WorkdirTransportError) -> Self {
+        let status = error.code.http_status();
+        Self {
+            error: None,
+            code: Some(error.code),
+            message: error.message,
+            diagnostics: None,
+            status,
+        }
+    }
+}
+
+impl api_macros::HttpError for WorkdirOperationApiError {
+    fn status_code(&self) -> u16 {
+        self.code.map_or(self.status, |code| code.http_status())
+    }
+}
+
+impl api_macros::HttpRequestError for WorkdirOperationApiError {
+    fn from_request_rejection(status: u16, message: String) -> Self {
+        Self::api(
+            <RepositoryApiError as api_macros::HttpRequestError>::from_request_rejection(
+                status, message,
+            ),
+        )
+    }
+}
+
 macro_rules! impl_openapi_schema {
     ($($ty:ty),+ $(,)?) => {
         $(impl api_macros::openapi::OpenApiSchema for $ty {})+
@@ -109,8 +167,29 @@ impl_openapi_schema!(
     CreateWorkspaceRepositoryRequest,
     CreateWorkspaceRepositoryResponse,
     RepositoryApiError,
+    WorkdirOperationApiError,
     RepositoryListResponse,
     RepositoryDetailResponse,
+    RepositorySshConnectionProbeRequest,
+    RepositorySshConnectionProbeResponse,
+    ConfirmRepositorySshHostTrustRequest,
+    RepositoryLogQuery,
+    RepositoryLogResponse,
+    HostListResponse,
+    HostWorkerListResponse,
+    HostSummary,
+    WorkingDirectoryRemovalRequest,
+    WorkingDirectoryRemovalResponse,
+    WorkingDirectoryCreateRequest,
+    WorkingDirectoryListResponse,
+    WorkingDirectoryDetailResponse,
+    WorkingDirectoryCreateResponse,
+    CurrentWorkerWorkdirAttachRequest,
+    CurrentWorkerWorkdirAttachmentResponse,
+    CurrentWorkerWorkdirOperationRequest,
+    CurrentWorkerWorkdirOperationResponse,
+    ExternalWorkdirGrantCreateRequest,
+    ExternalWorkdirGrantResponse,
     WorkspaceResponse,
     WorkspaceMetadataSettingsResponse,
     UpdateWorkspaceMetadataRequest,
@@ -980,6 +1059,324 @@ pub trait ServerApi {
         #[body] request: CreateWorkspaceRepositoryRequest,
     ) -> Result<CreateWorkspaceRepositoryResponse, RepositoryApiError>;
 
+    #[post(
+        "/api/w/{workspace_id}/repositories/{repository_key}/ssh-connection-test",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_ssh_connection_probe(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] repository_key: String,
+        #[body] request: RepositorySshConnectionProbeRequest,
+    ) -> Result<RepositorySshConnectionProbeResponse, RepositoryApiError>;
+
+    #[put(
+        "/api/w/{workspace_id}/repositories/{repository_key}/ssh-connection-test",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_ssh_host_trust_confirm(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] repository_key: String,
+        #[body] request: ConfirmRepositorySshHostTrustRequest,
+    ) -> Result<RepositorySshHostTrust, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/repositories/{repository_key}/log",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_log(
+        &self,
+        #[path] workspace_id: String,
+        #[path] repository_key: String,
+        #[query] query: RepositoryLogQuery,
+    ) -> Result<RepositoryLogResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/repositories/{repository_key}/log",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_log_alias(
+        &self,
+        #[path] repository_key: String,
+        #[query] query: RepositoryLogQuery,
+    ) -> Result<RepositoryLogResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/hosts",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn host_list(
+        &self,
+        #[path] workspace_id: String,
+    ) -> Result<HostListResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/hosts",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn host_list_alias(&self) -> Result<HostListResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/hosts/{host_id}/workers",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn host_worker_list(
+        &self,
+        #[path] workspace_id: String,
+        #[path] host_id: String,
+    ) -> Result<HostWorkerListResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/hosts/{host_id}/workers",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn host_worker_list_alias(
+        &self,
+        #[path] host_id: String,
+    ) -> Result<HostWorkerListResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn runtime_workdir_list(
+        &self,
+        #[path] workspace_id: String,
+        #[path] runtime_id: String,
+    ) -> Result<WorkingDirectoryListResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories",
+        status = 201,
+        alternate_status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn runtime_workdir_create(
+        &self,
+        #[path] workspace_id: String,
+        #[path] runtime_id: String,
+        #[body] request: WorkingDirectoryCreateRequest,
+    ) -> Result<WorkingDirectoryCreateResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories/{working_directory_id}",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn runtime_workdir_detail(
+        &self,
+        #[path] workspace_id: String,
+        #[path] runtime_id: String,
+        #[path] working_directory_id: String,
+    ) -> Result<WorkingDirectoryDetailResponse, RepositoryApiError>;
+
+    #[delete(
+        "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories/{working_directory_id}",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn runtime_workdir_cleanup(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] runtime_id: String,
+        #[path] working_directory_id: String,
+        #[body] request: WorkingDirectoryRemovalRequest,
+    ) -> Result<WorkingDirectoryRemovalResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/workers/self/workdir-attachments",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        bearer_auth = true
+    )]
+    async fn current_worker_workdir_attach(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: CurrentWorkerWorkdirAttachRequest,
+    ) -> Result<CurrentWorkerWorkdirAttachmentResponse, RepositoryApiError>;
+
+    #[delete(
+        "/api/w/{workspace_id}/workers/self/workdir-attachments/{alias}",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        bearer_auth = true
+    )]
+    async fn current_worker_workdir_detach(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] alias: String,
+    ) -> Result<CurrentWorkerWorkdirAttachmentResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/workers/self/workdir-session/operations",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        bearer_auth = true
+    )]
+    async fn current_worker_workdir_operation(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: CurrentWorkerWorkdirOperationRequest,
+    ) -> Result<CurrentWorkerWorkdirOperationResponse, WorkdirOperationApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/external-workdir-grants",
+        status = 201,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn external_workdir_grant_create(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[body] request: ExternalWorkdirGrantCreateRequest,
+    ) -> Result<ExternalWorkdirGrantResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/external-workdir-grants/{grant_id}",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn external_workdir_grant_get(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] grant_id: String,
+    ) -> Result<ExternalWorkdirGrantResponse, RepositoryApiError>;
+
+    #[delete(
+        "/api/w/{workspace_id}/external-workdir-grants/{grant_id}",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn external_workdir_grant_revoke(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] grant_id: String,
+    ) -> Result<ExternalWorkdirGrantResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/working-directories",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_workdir_list(
+        &self,
+        #[path] workspace_id: String,
+    ) -> Result<WorkingDirectoryListResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/working-directories",
+        status = 201,
+        alternate_status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_workdir_create(
+        &self,
+        #[path] workspace_id: String,
+        #[body] request: WorkingDirectoryCreateRequest,
+    ) -> Result<WorkingDirectoryCreateResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/working-directories/{working_directory_id}",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_workdir_detail(
+        &self,
+        #[path] workspace_id: String,
+        #[path] working_directory_id: String,
+    ) -> Result<WorkingDirectoryDetailResponse, RepositoryApiError>;
+
+    #[delete(
+        "/api/w/{workspace_id}/working-directories/{working_directory_id}",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_workdir_cleanup(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] working_directory_id: String,
+        #[body] request: WorkingDirectoryRemovalRequest,
+    ) -> Result<WorkingDirectoryRemovalResponse, RepositoryApiError>;
+
     #[get("/api/tickets", status = 200, error_status = 400, additional_error_statuses = [500])]
     async fn ticket_list_alias(
         &self,
@@ -1488,9 +1885,16 @@ pub fn canonical_openapi_document()
 ///
 /// Generated clients and OpenAPI omit extension parameters; operation implementations use this
 /// value instead of re-parsing transport headers inside domain handlers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerWorkerSource {
+    pub runtime_id: String,
+    pub worker_id: String,
+}
+
 #[derive(Clone)]
 pub struct ServerRequestContext {
     pub actor: Option<RequestActor>,
+    pub worker_source: Option<ServerWorkerSource>,
     pub origin: Option<String>,
     /// Transport headers retained for Server-side authentication adapters.
     ///
@@ -2991,7 +3395,7 @@ pub struct RepositorySummary {
     pub diagnostics: Option<Vec<RepositoryDiagnostic>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct GitCommitSummary {
@@ -3024,14 +3428,14 @@ pub struct RepositoryDetailResponse {
     pub source: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositorySshConnectionProbeRequest {
     pub runtime_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositorySshHostKeyCandidate {
@@ -3040,7 +3444,7 @@ pub struct RepositorySshHostKeyCandidate {
     pub fingerprint: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RepositorySshConnectionTrustState {
@@ -3049,7 +3453,7 @@ pub enum RepositorySshConnectionTrustState {
     Changed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositorySshConnectionProbeResponse {
@@ -3061,11 +3465,12 @@ pub struct RepositorySshConnectionProbeResponse {
     pub trust_state: RepositorySshConnectionTrustState,
     pub host_trust_id: String,
     #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub expected_host_trust_revision: Option<u64>,
     pub candidates: Vec<RepositorySshHostKeyCandidate>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct ConfirmRepositorySshHostTrustRequest {
@@ -3073,10 +3478,19 @@ pub struct ConfirmRepositorySshHostTrustRequest {
     pub runtime_id: String,
     pub host_key: String,
     #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub expected_host_trust_revision: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryLogQuery {
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 200))]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryLogResponse {
@@ -3085,6 +3499,7 @@ pub struct RepositoryLogResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
     pub default_selector: Option<String>,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub limit: usize,
     pub items: Vec<GitCommitSummary>,
     pub diagnostics: Vec<Diagnostic>,
@@ -3115,7 +3530,7 @@ pub struct Diagnostic {
 ///
 /// The value identifies stable materialization provenance without exposing a
 /// provider path, Runtime handle, or session identity.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkingDirectoryMaterializerKind {
@@ -3124,7 +3539,7 @@ pub enum WorkingDirectoryMaterializerKind {
     ClientHostedExternal,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkingDirectoryStatusKind {
@@ -3153,7 +3568,7 @@ impl std::fmt::Display for WorkingDirectoryStatusKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectoryCleanupTarget {
@@ -3162,14 +3577,14 @@ pub struct WorkingDirectoryCleanupTarget {
     pub repository_key: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectoryRemovalRequest {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkingDirectoryRemovalDisposition {
@@ -3178,7 +3593,7 @@ pub enum WorkingDirectoryRemovalDisposition {
     AttentionRequired,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
 #[serde(deny_unknown_fields)]
@@ -3191,7 +3606,7 @@ pub struct WorkingDirectoryRemovalResponse {
 }
 
 /// Durable Workspace occupancy projection for one Workdir.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectoryOccupancy {
@@ -3204,7 +3619,7 @@ pub struct WorkingDirectoryOccupancy {
 /// Runtime-internal Workdir cleanup authority. This transport intentionally
 /// retains the Backend-generated Repository id and is never a Workspace public
 /// projection.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
 #[serde(deny_unknown_fields)]
@@ -3217,7 +3632,7 @@ pub struct RuntimeWorkingDirectoryCleanupTarget {
 /// Runtime-internal Workdir inventory transport. Workspace REST and model-facing
 /// surfaces must project this through [`WorkingDirectorySummary`] so the UUID is
 /// replaced with `repository_key`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
 #[serde(deny_unknown_fields)]
@@ -3241,6 +3656,7 @@ pub struct RuntimeWorkingDirectorySummary {
     pub current_tree: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub observed_at_epoch_seconds: Option<u64>,
     pub materializer_kind: WorkingDirectoryMaterializerKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3253,7 +3669,7 @@ pub struct RuntimeWorkingDirectorySummary {
 }
 
 /// Public Workdir source identity. Provider routing details and host paths are intentionally absent.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkingDirectorySource {
@@ -3262,7 +3678,7 @@ pub enum WorkingDirectorySource {
 }
 
 /// Public, provider-neutral Workdir inventory projection.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
 #[serde(deny_unknown_fields)]
@@ -3286,6 +3702,7 @@ pub struct WorkingDirectorySummary {
     pub current_tree: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional, type = "number | null"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub observed_at_epoch_seconds: Option<u64>,
     pub materializer_kind: WorkingDirectoryMaterializerKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3414,17 +3831,18 @@ impl From<workdir::workspace::WorkingDirectorySummary> for WorkingDirectorySumma
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct ExternalWorkdirGrantCreateRequest {
     pub provider_instance_id: String,
     pub display_name: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub ttl_seconds: u64,
     pub read_only: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct ExternalWorkdirGrantResponse {
@@ -3435,6 +3853,7 @@ pub struct ExternalWorkdirGrantResponse {
     pub display_name: String,
     pub permissions: String,
     pub expires_at: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub generation: u64,
     pub status: String,
 }
@@ -3444,7 +3863,7 @@ pub struct ExternalWorkdirGrantResponse {
 /// `runtime_id = None` requests Workspace default Runtime resolution and
 /// `operation_id = Some(_)` fences exact replay. All four fields deliberately
 /// preserve the Server's existing optionality.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
 #[serde(deny_unknown_fields)]
@@ -3461,7 +3880,7 @@ pub struct WorkingDirectoryCreateRequest {
     pub operation_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectoryListResponse {
@@ -3470,7 +3889,7 @@ pub struct WorkingDirectoryListResponse {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectoryDetailResponse {
@@ -3481,7 +3900,72 @@ pub struct WorkingDirectoryDetailResponse {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostSummary {
+    pub runtime_id: String,
+    pub host_id: String,
+    pub label: String,
+    pub kind: String,
+    pub status: String,
+    pub observed_at: String,
+    pub last_seen_at: Option<String>,
+    pub os: String,
+    pub arch: String,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostListResponse {
+    pub workspace_id: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub limit: usize,
+    pub items: Vec<HostSummary>,
+    pub source: String,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostWorkerListResponse {
+    pub workspace_id: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub limit: usize,
+    pub items: Vec<WorkerSummary>,
+    pub source: String,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentWorkerWorkdirAttachRequest {
+    pub alias: String,
+    pub working_directory_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentWorkerWorkdirAttachmentResponse {
+    pub workspace_id: String,
+    pub alias: String,
+    pub working_directory_id: String,
+    pub capabilities: workdir::WorkdirSessionCapabilities,
+    pub attached: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentWorkerWorkdirOperationRequest {
+    pub target_workdir: String,
+    pub operation: workdir::http::WorkdirSessionOperation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(transparent)]
+pub struct CurrentWorkerWorkdirOperationResponse(pub workdir::http::WorkdirSessionOperationResult);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectoryCreateResponse {
@@ -3489,6 +3973,20 @@ pub struct WorkingDirectoryCreateResponse {
     pub runtime_id: String,
     pub item: WorkingDirectorySummary,
     pub diagnostics: Vec<Diagnostic>,
+    #[serde(skip, default = "default_workdir_create_status")]
+    #[cfg_attr(feature = "typescript", ts(skip))]
+    #[schemars(skip)]
+    pub http_status: u16,
+}
+
+const fn default_workdir_create_status() -> u16 {
+    201
+}
+
+impl api_macros::HttpSuccess for WorkingDirectoryCreateResponse {
+    fn status_code(&self) -> u16 {
+        self.http_status
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -4962,7 +5460,7 @@ pub struct RuntimeConnectionTestResponse {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkerWorkspaceSummary {
     pub visibility: String,
@@ -4971,14 +5469,14 @@ pub struct WorkerWorkspaceSummary {
     pub workspace_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkerImplementationSummary {
     pub kind: String,
     pub display_hint: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkerCapabilitySummary {
     pub can_stop: bool,
@@ -5149,7 +5647,7 @@ pub struct WorkspaceWorkerDiscoveryPage {
 
 /// One Workspace Worker Workdir attachment. `alias` is the stable Worker-local
 /// routing key; the nested Workdir id and display name are inventory metadata.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkerWorkdirAttachmentSummary {
@@ -5170,7 +5668,7 @@ pub struct RuntimeWorkerWorkdirAttachmentSummary {
 /// `resource_key` is required here even though Runtime-internal Worker summaries
 /// do not carry one. The Workspace Server must resolve it from Workspace
 /// authority before constructing this response.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkerSummary {
     pub runtime_id: String,
@@ -5190,6 +5688,7 @@ pub struct WorkerSummary {
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
+    #[schemars(with = "Option<serde_json::Value>")]
     pub worker_state: Option<protocol::WorkerStateSnapshot>,
     pub last_seen_at: Option<String>,
     #[serde(default)]

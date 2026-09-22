@@ -71,19 +71,6 @@ export type Runtime = {
   };
 };
 
-export type Host = {
-  runtime_id: string;
-  host_id: string;
-  label: string;
-  kind: string;
-  status: string;
-  observed_at: string;
-  last_seen_at: string | null;
-  os: string;
-  arch: string;
-  diagnostics: Diagnostic[];
-};
-
 export type WorkerCapabilities = {
   can_stop: boolean;
   can_spawn_followup: boolean;

@@ -3641,11 +3641,13 @@ fn build_server_auth_router(api: ServerAuthApi) -> Router {
 
 fn server_request_context(
     actor: Option<RequestActor>,
+    worker_source: Option<server_api::ServerWorkerSource>,
     origin: Option<String>,
     headers: &HeaderMap,
 ) -> server_api::ServerRequestContext {
     server_api::ServerRequestContext {
         actor,
+        worker_source,
         origin,
         transport_headers: headers
             .iter()
@@ -3683,7 +3685,7 @@ fn contract_request_headers(
 async fn attach_server_origin_context(mut request: Request, next: Next) -> Response {
     let actor = request.extensions().get::<RequestActor>().cloned();
     let origin = request_origin(request.headers());
-    let context = server_request_context(actor, origin, request.headers());
+    let context = server_request_context(actor, None, origin, request.headers());
     request.extensions_mut().insert(context);
     next.run(request).await
 }
@@ -3708,8 +3710,15 @@ async fn attach_server_request_context(
             Err(error) => return server_error_response(error),
         }
     };
+    let worker_source = request
+        .extensions()
+        .get::<crate::worker_source::VerifiedWorkerMutationSource>()
+        .map(|source| server_api::ServerWorkerSource {
+            runtime_id: source.runtime_id.clone(),
+            worker_id: source.worker_id.clone(),
+        });
     let origin = request_origin(request.headers());
-    let context = server_request_context(actor, origin, request.headers());
+    let context = server_request_context(actor, worker_source, origin, request.headers());
     request.extensions_mut().insert(context);
     next.run(request).await
 }
@@ -3863,6 +3872,62 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
             service.clone(),
         ))
         .merge(server_api::server_api_axum::repository_create(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::repository_ssh_connection_probe(service.clone()))
+        .merge(server_api::server_api_axum::repository_ssh_host_trust_confirm(service.clone()))
+        .merge(server_api::server_api_axum::repository_log(service.clone()))
+        .merge(server_api::server_api_axum::repository_log_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::host_list(service.clone()))
+        .merge(server_api::server_api_axum::host_list_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::host_worker_list(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::host_worker_list_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_workdir_list(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_workdir_create(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_workdir_detail(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_workdir_cleanup(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::current_worker_workdir_attach(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::current_worker_workdir_detach(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::current_worker_workdir_operation(service.clone()))
+        .merge(server_api::server_api_axum::external_workdir_grant_create(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::external_workdir_grant_get(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::external_workdir_grant_revoke(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_workdir_list(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_workdir_create(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_workdir_detail(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_workdir_cleanup(
             service.clone(),
         ))
         .merge(server_api::server_api_axum::ticket_list_alias(
@@ -6103,6 +6168,451 @@ impl server_api::ServerApi for ServerApiContractService {
         .map_err(ApiError::into_repository_api_error)?;
         project_contract_dto(&response)
     }
+
+    async fn repository_ssh_connection_probe(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        repository_key: String,
+        request: server_api::RepositorySshConnectionProbeRequest,
+    ) -> std::result::Result<
+        server_api::RepositorySshConnectionProbeResponse,
+        server_api::RepositoryApiError,
+    > {
+        let Json(response) = scoped_probe_repository_ssh_connection(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRepositoryPath {
+                workspace_id,
+                repository_key,
+            }),
+            Extension(actor),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(response)
+    }
+
+    async fn repository_ssh_host_trust_confirm(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        repository_key: String,
+        request: server_api::ConfirmRepositorySshHostTrustRequest,
+    ) -> std::result::Result<server_api::RepositorySshHostTrust, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_confirm_repository_ssh_host_trust(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRepositoryPath {
+                workspace_id,
+                repository_key,
+            }),
+            Extension(actor),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(response)
+    }
+
+    async fn repository_log(
+        &self,
+        workspace_id: String,
+        repository_key: String,
+        query: server_api::RepositoryLogQuery,
+    ) -> std::result::Result<server_api::RepositoryLogResponse, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_repository_log(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRepositoryPath {
+                workspace_id,
+                repository_key,
+            }),
+            Query(LogQuery { limit: query.limit }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(response)
+    }
+
+    async fn repository_log_alias(
+        &self,
+        repository_key: String,
+        query: server_api::RepositoryLogQuery,
+    ) -> std::result::Result<server_api::RepositoryLogResponse, server_api::RepositoryApiError>
+    {
+        let Json(response) = repository_log(
+            State(self.workspace_api()?.clone()),
+            AxumPath(repository_key),
+            Query(LogQuery { limit: query.limit }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(response)
+    }
+
+    async fn host_list(
+        &self,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::HostListResponse, server_api::RepositoryApiError> {
+        let Json(response) = scoped_list_hosts(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::HostListResponse {
+            workspace_id: response.workspace_id,
+            limit: response.limit,
+            items: response.items.into_iter().map(Into::into).collect(),
+            source: response.source,
+            diagnostics: response.diagnostics.into_iter().map(Into::into).collect(),
+        })
+    }
+
+    async fn host_list_alias(
+        &self,
+    ) -> std::result::Result<server_api::HostListResponse, server_api::RepositoryApiError> {
+        let Json(response) = list_hosts(State(self.workspace_api()?.clone()))
+            .await
+            .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::HostListResponse {
+            workspace_id: response.workspace_id,
+            limit: response.limit,
+            items: response.items.into_iter().map(Into::into).collect(),
+            source: response.source,
+            diagnostics: response.diagnostics.into_iter().map(Into::into).collect(),
+        })
+    }
+
+    async fn host_worker_list(
+        &self,
+        workspace_id: String,
+        host_id: String,
+    ) -> std::result::Result<server_api::HostWorkerListResponse, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_list_host_workers(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedHostPath {
+                workspace_id,
+                host_id,
+            }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(response)
+    }
+
+    async fn host_worker_list_alias(
+        &self,
+        host_id: String,
+    ) -> std::result::Result<server_api::HostWorkerListResponse, server_api::RepositoryApiError>
+    {
+        let Json(response) =
+            list_host_workers(State(self.workspace_api()?.clone()), AxumPath(host_id))
+                .await
+                .map_err(ApiError::into_repository_api_error)?;
+        Ok(response)
+    }
+
+    async fn runtime_workdir_list(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+    ) -> std::result::Result<server_api::WorkingDirectoryListResponse, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_list_runtime_working_directories(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id,
+                runtime_id,
+            }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(response)
+    }
+
+    async fn runtime_workdir_create(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+        request: server_api::WorkingDirectoryCreateRequest,
+    ) -> std::result::Result<
+        server_api::WorkingDirectoryCreateResponse,
+        server_api::RepositoryApiError,
+    > {
+        let (_, Json(response)) = scoped_create_runtime_working_directory(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id,
+                runtime_id,
+            }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(response)
+    }
+
+    async fn runtime_workdir_detail(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+        working_directory_id: String,
+    ) -> std::result::Result<
+        server_api::WorkingDirectoryDetailResponse,
+        server_api::RepositoryApiError,
+    > {
+        let Json(response) = scoped_runtime_working_directory_detail(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimeWorkingDirectoryPath {
+                workspace_id,
+                runtime_id,
+                working_directory_id,
+            }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(response)
+    }
+
+    async fn runtime_workdir_cleanup(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        runtime_id: String,
+        working_directory_id: String,
+        request: server_api::WorkingDirectoryRemovalRequest,
+    ) -> std::result::Result<
+        server_api::WorkingDirectoryRemovalResponse,
+        server_api::RepositoryApiError,
+    > {
+        cleanup_runtime_working_directory_contract(
+            self.workspace_api()?.clone(),
+            workspace_id,
+            runtime_id,
+            working_directory_id,
+            context,
+            request,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn current_worker_workdir_attach(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::CurrentWorkerWorkdirAttachRequest,
+    ) -> std::result::Result<
+        server_api::CurrentWorkerWorkdirAttachmentResponse,
+        server_api::RepositoryApiError,
+    > {
+        let Json(response) = scoped_attach_current_worker_workdir(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            contract_request_headers(&context)?,
+            Json(AttachCurrentWorkerWorkdirRequest {
+                alias: request.alias,
+                working_directory_id: request.working_directory_id,
+            }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::CurrentWorkerWorkdirAttachmentResponse {
+            workspace_id: response.workspace_id,
+            alias: response.alias,
+            working_directory_id: response.working_directory_id,
+            capabilities: response.capabilities,
+            attached: response.attached,
+        })
+    }
+
+    async fn current_worker_workdir_detach(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        alias: String,
+    ) -> std::result::Result<
+        server_api::CurrentWorkerWorkdirAttachmentResponse,
+        server_api::RepositoryApiError,
+    > {
+        let Json(response) = scoped_detach_current_worker_workdir(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, alias)),
+            contract_request_headers(&context)?,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::CurrentWorkerWorkdirAttachmentResponse {
+            workspace_id: response.workspace_id,
+            alias: response.alias,
+            working_directory_id: response.working_directory_id,
+            capabilities: response.capabilities,
+            attached: response.attached,
+        })
+    }
+
+    async fn current_worker_workdir_operation(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::CurrentWorkerWorkdirOperationRequest,
+    ) -> std::result::Result<
+        server_api::CurrentWorkerWorkdirOperationResponse,
+        server_api::WorkdirOperationApiError,
+    > {
+        let Json(response) = scoped_execute_current_worker_workdir_operation(
+            State(
+                self.workspace_api()
+                    .map_err(server_api::WorkdirOperationApiError::api)?
+                    .clone(),
+            ),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            contract_request_headers(&context)
+                .map_err(server_api::WorkdirOperationApiError::api)?,
+            Json(WorkspaceWorkdirSessionOperationRequest {
+                target_workdir: request.target_workdir,
+                operation: request.operation,
+            }),
+        )
+        .await
+        .map_err(|error| match error {
+            WorkdirOperationApiError::Api(error) => {
+                server_api::WorkdirOperationApiError::api(error.into_repository_api_error())
+            }
+            WorkdirOperationApiError::Provider(error) => {
+                server_api::WorkdirOperationApiError::provider(error)
+            }
+        })?;
+        Ok(server_api::CurrentWorkerWorkdirOperationResponse(response))
+    }
+
+    async fn external_workdir_grant_create(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        request: server_api::ExternalWorkdirGrantCreateRequest,
+    ) -> std::result::Result<server_api::ExternalWorkdirGrantResponse, server_api::RepositoryApiError>
+    {
+        let (_, Json(response)) = scoped_create_external_workdir_grant(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Extension(actor),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(response)
+    }
+
+    async fn external_workdir_grant_get(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        grant_id: String,
+    ) -> std::result::Result<server_api::ExternalWorkdirGrantResponse, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_get_external_workdir_grant(
+            State(self.workspace_api()?.clone()),
+            Extension(actor),
+            AxumPath((workspace_id, grant_id)),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(response)
+    }
+
+    async fn external_workdir_grant_revoke(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        grant_id: String,
+    ) -> std::result::Result<server_api::ExternalWorkdirGrantResponse, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_revoke_external_workdir_grant(
+            State(self.workspace_api()?.clone()),
+            Extension(actor),
+            AxumPath((workspace_id, grant_id)),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(response)
+    }
+
+    async fn workspace_workdir_list(
+        &self,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::WorkingDirectoryListResponse, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_list_working_directories(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(response)
+    }
+
+    async fn workspace_workdir_create(
+        &self,
+        workspace_id: String,
+        request: server_api::WorkingDirectoryCreateRequest,
+    ) -> std::result::Result<
+        server_api::WorkingDirectoryCreateResponse,
+        server_api::RepositoryApiError,
+    > {
+        let (_, Json(response)) = scoped_create_working_directory(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(response)
+    }
+
+    async fn workspace_workdir_detail(
+        &self,
+        workspace_id: String,
+        working_directory_id: String,
+    ) -> std::result::Result<
+        server_api::WorkingDirectoryDetailResponse,
+        server_api::RepositoryApiError,
+    > {
+        let Json(response) = scoped_working_directory_detail(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkingDirectoryPath {
+                workspace_id,
+                working_directory_id,
+            }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(response)
+    }
+
+    async fn workspace_workdir_cleanup(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        working_directory_id: String,
+        request: server_api::WorkingDirectoryRemovalRequest,
+    ) -> std::result::Result<
+        server_api::WorkingDirectoryRemovalResponse,
+        server_api::RepositoryApiError,
+    > {
+        cleanup_working_directory_contract(
+            self.workspace_api()?.clone(),
+            workspace_id,
+            working_directory_id,
+            context,
+            request,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)
+    }
 }
 
 fn build_inner_router(api: WorkspaceApi) -> Router {
@@ -6110,62 +6620,15 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
     let auth = build_server_auth_router(ServerAuthApi::from(&api))
         .merge(generated_auth_contract_router(contract_service.clone()));
     let workspace = Router::new()
-        .route(
-            "/api/w/{workspace_id}/repositories/{repository_key}/ssh-connection-test",
-            post(scoped_probe_repository_ssh_connection)
-                .put(scoped_confirm_repository_ssh_host_trust),
-        )
-        .route("/api/repositories/{repository_key}/log", get(repository_log))
-        .route(
-            "/api/w/{workspace_id}/repositories/{repository_key}/log",
-            get(scoped_repository_log),
-        )
-        .route("/api/hosts", get(list_hosts))
-        .route("/api/w/{workspace_id}/hosts", get(scoped_list_hosts))
-        .route(
-            "/api/w/{workspace_id}/runtime-config",
-            get(get_latest_workspace_runtime_config),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories",
-            get(scoped_list_runtime_working_directories).post(scoped_create_runtime_working_directory),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories/{working_directory_id}",
-            get(scoped_runtime_working_directory_detail).delete(scoped_cleanup_runtime_working_directory),
-        )
-        .route(
-            "/api/w/{workspace_id}/workers/self/workdir-attachments",
-            post(scoped_attach_current_worker_workdir),
-        )
-        .route(
-            "/api/w/{workspace_id}/workers/self/workdir-attachments/{alias}",
-            delete(scoped_detach_current_worker_workdir),
-        )
-        .route(
-            "/api/w/{workspace_id}/workers/self/workdir-session/operations",
-            post(scoped_execute_current_worker_workdir_operation),
-        )
-        .route(
-            "/api/w/{workspace_id}/external-workdir-grants",
-            post(scoped_create_external_workdir_grant),
-        )
-        .route(
-            "/api/w/{workspace_id}/external-workdir-grants/{grant_id}",
-            get(scoped_get_external_workdir_grant)
-                .delete(scoped_revoke_external_workdir_grant),
-        )
+        // WebSocket provider transport is intentionally outside the generated
+        // JSON REST contract.
         .route(
             "/api/w/{workspace_id}/external-workdir-grants/{grant_id}/provider",
             get(scoped_external_workdir_provider_ws),
         )
         .route(
-            "/api/w/{workspace_id}/working-directories",
-            get(scoped_list_working_directories).post(scoped_create_working_directory),
-        )
-        .route(
-            "/api/w/{workspace_id}/working-directories/{working_directory_id}",
-            get(scoped_working_directory_detail).delete(scoped_cleanup_working_directory),
+            "/api/w/{workspace_id}/runtime-config",
+            get(get_latest_workspace_runtime_config),
         )
         .route("/api/runtimes", get(list_runtimes))
         .route(
@@ -6380,11 +6843,6 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/protocol/ws",
             get(scoped_worker_protocol_ws),
-        )
-        .route("/api/hosts/{host_id}/workers", get(list_host_workers))
-        .route(
-            "/api/w/{workspace_id}/hosts/{host_id}/workers",
-            get(scoped_list_host_workers),
         )
         .fallback(get(static_or_spa_fallback))
         .with_state(api)
@@ -13759,13 +14217,81 @@ async fn scoped_runtime_working_directory_detail(
     working_directory_detail_for_runtime(api, &path.runtime_id, &path.working_directory_id)
 }
 
-async fn scoped_cleanup_runtime_working_directory(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRuntimeWorkingDirectoryPath>,
-    worker_source: Option<Extension<crate::worker_source::VerifiedWorkerMutationSource>>,
-    request_actor: Option<Extension<RequestActor>>,
-    Json(request): Json<WorkingDirectoryRemovalRequest>,
-) -> ApiResult<Json<WorkingDirectoryRemovalResponse>> {
+fn workdir_removal_source_actor(
+    worker_source: Option<(&str, &str)>,
+    request_actor: Option<&RequestActor>,
+) -> ApiResult<String> {
+    if let Some((runtime_id, worker_id)) = worker_source {
+        Ok(format!("worker:{runtime_id}:{worker_id}"))
+    } else if let Some(actor) = request_actor {
+        Ok(format!("account:{}", actor.account_id))
+    } else {
+        Err(ApiError::from(Error::WorkspacePermissionDenied(
+            "Workdir removal requires authenticated source authority".to_string(),
+        )))
+    }
+}
+
+fn contract_workdir_removal_source_actor(
+    context: &server_api::ServerRequestContext,
+) -> ApiResult<String> {
+    workdir_removal_source_actor(
+        context
+            .worker_source
+            .as_ref()
+            .map(|source| (source.runtime_id.as_str(), source.worker_id.as_str())),
+        context.actor.as_ref(),
+    )
+}
+
+async fn cleanup_runtime_working_directory_contract(
+    api: WorkspaceApi,
+    workspace_id: String,
+    runtime_id: String,
+    working_directory_id: String,
+    context: server_api::ServerRequestContext,
+    request: WorkingDirectoryRemovalRequest,
+) -> ApiResult<WorkingDirectoryRemovalResponse> {
+    let source_actor = contract_workdir_removal_source_actor(&context)?;
+    cleanup_runtime_working_directory(
+        api,
+        ScopedRuntimeWorkingDirectoryPath {
+            workspace_id,
+            runtime_id,
+            working_directory_id,
+        },
+        source_actor,
+        request,
+    )
+    .await
+}
+
+async fn cleanup_working_directory_contract(
+    api: WorkspaceApi,
+    workspace_id: String,
+    working_directory_id: String,
+    context: server_api::ServerRequestContext,
+    request: WorkingDirectoryRemovalRequest,
+) -> ApiResult<WorkingDirectoryRemovalResponse> {
+    let source_actor = contract_workdir_removal_source_actor(&context)?;
+    cleanup_working_directory(
+        api,
+        ScopedWorkingDirectoryPath {
+            workspace_id,
+            working_directory_id,
+        },
+        source_actor,
+        request,
+    )
+    .await
+}
+
+async fn cleanup_runtime_working_directory(
+    api: WorkspaceApi,
+    path: ScopedRuntimeWorkingDirectoryPath,
+    source_actor: String,
+    request: WorkingDirectoryRemovalRequest,
+) -> ApiResult<WorkingDirectoryRemovalResponse> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     require_active_workspace_runtime_binding(&api, &path.runtime_id).await?;
     let registered_runtime = registered_workdir_runtime_id(&api, &path.working_directory_id)?;
@@ -13774,22 +14300,12 @@ async fn scoped_cleanup_runtime_working_directory(
             "Workdir does not belong to the requested Runtime".to_string(),
         )));
     }
-    let source_actor = if let Some(Extension(source)) = worker_source {
-        format!("worker:{}:{}", source.runtime_id, source.worker_id)
-    } else if let Some(Extension(actor)) = request_actor {
-        format!("account:{}", actor.account_id)
-    } else {
-        return Err(ApiError::from(Error::WorkspacePermissionDenied(
-            "Workdir removal requires authenticated source authority".to_string(),
-        )));
-    };
     execute_workdir_removal(
         &api,
         &path.working_directory_id,
         &source_actor,
         &request.reason,
     )
-    .map(Json)
     .map_err(ApiError::from)
 }
 
@@ -14736,30 +15252,19 @@ async fn scoped_working_directory_detail(
     }
 }
 
-async fn scoped_cleanup_working_directory(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkingDirectoryPath>,
-    worker_source: Option<Extension<crate::worker_source::VerifiedWorkerMutationSource>>,
-    request_actor: Option<Extension<RequestActor>>,
-    Json(request): Json<WorkingDirectoryRemovalRequest>,
-) -> ApiResult<Json<WorkingDirectoryRemovalResponse>> {
+async fn cleanup_working_directory(
+    api: WorkspaceApi,
+    path: ScopedWorkingDirectoryPath,
+    source_actor: String,
+    request: WorkingDirectoryRemovalRequest,
+) -> ApiResult<WorkingDirectoryRemovalResponse> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let source_actor = if let Some(Extension(source)) = worker_source {
-        format!("worker:{}:{}", source.runtime_id, source.worker_id)
-    } else if let Some(Extension(actor)) = request_actor {
-        format!("account:{}", actor.account_id)
-    } else {
-        return Err(ApiError::from(Error::WorkspacePermissionDenied(
-            "Workdir removal requires authenticated source authority".to_string(),
-        )));
-    };
     execute_workdir_removal(
         &api,
         &path.working_directory_id,
         &source_actor,
         &request.reason,
     )
-    .map(Json)
     .map_err(ApiError::from)
 }
 
@@ -15022,6 +15527,7 @@ async fn create_workspace_working_directory(
                         .expect("Repository Workdir detail has Runtime"),
                     item: response.item,
                     diagnostics: response.diagnostics,
+                    http_status: StatusCode::OK.as_u16(),
                 }),
             )
         });
@@ -15217,6 +15723,7 @@ async fn create_workspace_working_directory(
             runtime_id: reserved.resolved_runtime_id,
             item: summary.into(),
             diagnostics: working_directory_diagnostics(result.diagnostics),
+            http_status: StatusCode::CREATED.as_u16(),
         }),
     ))
 }
@@ -16894,7 +17401,7 @@ async fn scoped_worker_protocol_ws(
 async fn scoped_list_host_workers(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedHostPath>,
-) -> ApiResult<Json<server_api::ListResponse<server_api::WorkerSummary>>> {
+) -> ApiResult<Json<server_api::HostWorkerListResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     list_host_workers(State(api), AxumPath(path.host_id)).await
 }
@@ -20394,14 +20901,14 @@ fn protocol_error_event(message: impl Into<String>) -> protocol::Event {
 async fn list_host_workers(
     State(api): State<WorkspaceApi>,
     AxumPath(host_id): AxumPath<String>,
-) -> ApiResult<Json<server_api::ListResponse<server_api::WorkerSummary>>> {
+) -> ApiResult<Json<server_api::HostWorkerListResponse>> {
     let limit = api.config.max_records.min(200);
     let runtime_workers = api
         .runtime
         .list_workers_for_host(&host_id, limit)
         .map_err(|err| err.into_error())?;
     let items = project_observed_workspace_workers(&api, runtime_workers.items)?;
-    Ok(Json(server_api::ListResponse {
+    Ok(Json(server_api::HostWorkerListResponse {
         workspace_id: api.workspace_id().to_string(),
         limit,
         items,

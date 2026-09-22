@@ -473,6 +473,143 @@
         },
         "type": "object"
       },
+      "CommandOutput": {
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "exit_code": {
+            "format": "int32",
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "next_cursor": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "output_path": {
+            "description": "Complete output retained by the provider when `truncated` is true.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/CommandStatus"
+          },
+          "timed_out": {
+            "type": "boolean"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "status",
+          "timed_out",
+          "content",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "CommandOutputRequest": {
+        "properties": {
+          "cursor": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "handle": {
+            "type": "string"
+          },
+          "limit": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "wait": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "handle",
+          "cursor",
+          "limit",
+          "wait"
+        ],
+        "type": "object"
+      },
+      "CommandRequest": {
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "cwd": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FsPath"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Workdir-relative command directory. Providers validate it against the\nactive session before process start."
+          },
+          "output_limit": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "spill_dir": {
+            "description": "Provider-local directory where complete output is retained when the\ninline result exceeds `output_limit`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timeout_secs": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tool_call_id": {
+            "description": "Optional caller-owned correlation id. Bash supplies its tool-call id so\nuser-facing command telemetry can update the corresponding Console row\nwithout exposing provider/session handles.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "command",
+          "timeout_secs",
+          "output_limit"
+        ],
+        "type": "object"
+      },
+      "CommandStatus": {
+        "enum": [
+          "running",
+          "completed",
+          "failed",
+          "timed_out",
+          "cancelled"
+        ],
+        "type": "string"
+      },
       "CompiledFlowDefinition": {
         "additionalProperties": false,
         "properties": {
@@ -844,6 +981,35 @@
         ],
         "type": "object"
       },
+      "ConfirmRepositorySshHostTrustRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_host_trust_revision": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "host_key": {
+            "type": "string"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "runtime_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "runtime_id",
+          "host_key"
+        ],
+        "type": "object"
+      },
       "ConflictResolution": {
         "enum": [
           "none",
@@ -965,6 +1131,66 @@
           "workspace_id",
           "repository_key",
           "replayed"
+        ],
+        "type": "object"
+      },
+      "CurrentWorkerWorkdirAttachRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "working_directory_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "alias",
+          "working_directory_id"
+        ],
+        "type": "object"
+      },
+      "CurrentWorkerWorkdirAttachmentResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "attached": {
+            "type": "boolean"
+          },
+          "capabilities": {
+            "$ref": "#/components/schemas/WorkdirSessionCapabilities"
+          },
+          "working_directory_id": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "alias",
+          "working_directory_id",
+          "capabilities",
+          "attached"
+        ],
+        "type": "object"
+      },
+      "CurrentWorkerWorkdirOperationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "$ref": "#/components/schemas/WorkdirSessionOperation"
+          },
+          "target_workdir": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_workdir",
+          "operation"
         ],
         "type": "object"
       },
@@ -1219,6 +1445,76 @@
         ],
         "type": "string"
       },
+      "EditRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_hash": {
+            "items": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 32,
+            "minItems": 32,
+            "type": "array"
+          },
+          "new_string": {
+            "type": "string"
+          },
+          "old_string": {
+            "type": "string"
+          },
+          "path": {
+            "$ref": "#/components/schemas/FsPath"
+          },
+          "replace_all": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "old_string",
+          "new_string",
+          "replace_all",
+          "expected_hash"
+        ],
+        "type": "object"
+      },
+      "EditResult": {
+        "additionalProperties": false,
+        "properties": {
+          "bytes_written": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "content_hash": {
+            "items": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 32,
+            "minItems": 32,
+            "type": "array"
+          },
+          "replacements": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "replacements",
+          "bytes_written",
+          "content_hash"
+        ],
+        "type": "object"
+      },
       "EffectivePromptCatalog": {
         "additionalProperties": false,
         "properties": {
@@ -1255,6 +1551,15 @@
           "catalog_digest"
         ],
         "type": "object"
+      },
+      "EntryKind": {
+        "enum": [
+          "file",
+          "directory",
+          "symlink",
+          "other"
+        ],
+        "type": "string"
       },
       "EvidenceKind": {
         "description": "Extensible evidence kind tag used by staging source anchors.\n\nKnown values include `message`, `tool_call`, `tool_result`, `file_ref`,\n`ticket_ref`, and `objective_ref`, but callers may use newer bounded tags\nwithout changing the schema.",
@@ -1353,6 +1658,80 @@
             "type": "object"
           }
         ]
+      },
+      "ExternalWorkdirGrantCreateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "provider_instance_id": {
+            "type": "string"
+          },
+          "read_only": {
+            "type": "boolean"
+          },
+          "ttl_seconds": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "provider_instance_id",
+          "display_name",
+          "ttl_seconds",
+          "read_only"
+        ],
+        "type": "object"
+      },
+      "ExternalWorkdirGrantResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": "string"
+          },
+          "generation": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "grant_id": {
+            "type": "string"
+          },
+          "permissions": {
+            "type": "string"
+          },
+          "provider_instance_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "working_directory_id": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "grant_id",
+          "workspace_id",
+          "working_directory_id",
+          "provider_instance_id",
+          "display_name",
+          "permissions",
+          "expires_at",
+          "generation",
+          "status"
+        ],
+        "type": "object"
       },
       "ExtractAudit": {
         "properties": {
@@ -1542,6 +1921,10 @@
         ],
         "type": "object"
       },
+      "FsPath": {
+        "description": "Scope-checked filesystem path. Relative paths resolve below the bound\nWorkdir root; absolute paths require an explicit matching scope rule.",
+        "type": "string"
+      },
       "GenerateRepositorySshCredentialRequest": {
         "additionalProperties": false,
         "properties": {
@@ -1559,6 +1942,52 @@
           "operation_id",
           "credential_id",
           "name"
+        ],
+        "type": "object"
+      },
+      "GitCommitSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "author_date": {
+            "type": "string"
+          },
+          "author_email": {
+            "type": "string"
+          },
+          "author_name": {
+            "type": "string"
+          },
+          "hash": {
+            "type": "string"
+          },
+          "parents": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "refs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "short_hash": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "hash",
+          "short_hash",
+          "summary",
+          "author_name",
+          "author_email",
+          "author_date",
+          "parents",
+          "refs"
         ],
         "type": "object"
       },
@@ -1613,6 +2042,155 @@
         ],
         "type": "object"
       },
+      "GlobRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "$ref": "#/components/schemas/FsPath"
+          },
+          "pattern": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern",
+          "path",
+          "limit"
+        ],
+        "type": "object"
+      },
+      "GlobResult": {
+        "additionalProperties": false,
+        "properties": {
+          "paths": {
+            "items": {
+              "$ref": "#/components/schemas/FsPath"
+            },
+            "type": "array"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "paths",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "GrepOutputMode": {
+        "enum": [
+          "content",
+          "files_with_matches",
+          "count"
+        ],
+        "type": "string"
+      },
+      "GrepRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "after_context": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "before_context": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "case_insensitive": {
+            "type": "boolean"
+          },
+          "file_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "glob": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "multiline": {
+            "type": "boolean"
+          },
+          "offset": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_mode": {
+            "$ref": "#/components/schemas/GrepOutputMode"
+          },
+          "path": {
+            "$ref": "#/components/schemas/FsPath"
+          },
+          "pattern": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern",
+          "path",
+          "case_insensitive",
+          "before_context",
+          "after_context",
+          "multiline",
+          "output_mode",
+          "limit",
+          "offset"
+        ],
+        "type": "object"
+      },
+      "GrepResult": {
+        "additionalProperties": false,
+        "properties": {
+          "match_count": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "matched_files": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output": {
+            "description": "Provider-rendered bounded grep report. Keeping rendering here avoids\ntransferring candidate files across a remote provider boundary.",
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "output",
+          "match_count",
+          "matched_files",
+          "truncated"
+        ],
+        "type": "object"
+      },
       "HealthResponse": {
         "additionalProperties": false,
         "properties": {
@@ -1622,6 +2200,133 @@
         },
         "required": [
           "status"
+        ],
+        "type": "object"
+      },
+      "HostListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/HostSummary"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "limit",
+          "items",
+          "source",
+          "diagnostics"
+        ],
+        "type": "object"
+      },
+      "HostSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "arch": {
+            "type": "string"
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "last_seen_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "observed_at": {
+            "type": "string"
+          },
+          "os": {
+            "type": "string"
+          },
+          "runtime_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "runtime_id",
+          "host_id",
+          "label",
+          "kind",
+          "status",
+          "observed_at",
+          "os",
+          "arch",
+          "diagnostics"
+        ],
+        "type": "object"
+      },
+      "HostWorkerListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/WorkerSummary"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "limit",
+          "items",
+          "source",
+          "diagnostics"
         ],
         "type": "object"
       },
@@ -1663,6 +2368,81 @@
         "required": [
           "label",
           "reason"
+        ],
+        "type": "object"
+      },
+      "ListEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/EntryKind"
+          },
+          "path": {
+            "$ref": "#/components/schemas/FsPath"
+          },
+          "size": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path",
+          "kind",
+          "size"
+        ],
+        "type": "object"
+      },
+      "ListRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "$ref": "#/components/schemas/FsPath"
+          }
+        },
+        "required": [
+          "path",
+          "limit"
+        ],
+        "type": "object"
+      },
+      "ListResult": {
+        "additionalProperties": false,
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/ListEntry"
+            },
+            "type": "array"
+          },
+          "total_bytes": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_entries": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "entries",
+          "total_entries",
+          "total_bytes",
+          "truncated"
         ],
         "type": "object"
       },
@@ -4461,6 +5241,91 @@
         ],
         "type": "object"
       },
+      "ReadRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_bytes": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "offset": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "$ref": "#/components/schemas/FsPath"
+          }
+        },
+        "required": [
+          "path",
+          "offset",
+          "limit",
+          "max_bytes"
+        ],
+        "type": "object"
+      },
+      "ReadResult": {
+        "additionalProperties": false,
+        "properties": {
+          "bytes": {
+            "items": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "content_hash": {
+            "items": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 32,
+            "minItems": 32,
+            "type": "array"
+          },
+          "path": {
+            "$ref": "#/components/schemas/FsPath"
+          },
+          "start_line": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_lines": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "bytes",
+          "start_line",
+          "total_lines",
+          "content_hash",
+          "truncated"
+        ],
+        "type": "object"
+      },
       "RecordOperationAudit": {
         "properties": {
           "after_hash": {
@@ -4738,6 +5603,65 @@
         ],
         "type": "object"
       },
+      "RepositoryLogQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "default": null,
+            "format": "uint",
+            "maximum": 200,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "RepositoryLogResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "default_selector": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/GitCommitSummary"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "repository_key": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "repository_key",
+          "limit",
+          "items",
+          "diagnostics"
+        ],
+        "type": "object"
+      },
       "RepositoryObservedStatus": {
         "enum": [
           "unverified",
@@ -4806,6 +5730,81 @@
         ],
         "type": "object"
       },
+      "RepositorySshConnectionProbeRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "runtime_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "runtime_id"
+        ],
+        "type": "object"
+      },
+      "RepositorySshConnectionProbeResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "candidates": {
+            "items": {
+              "$ref": "#/components/schemas/RepositorySshHostKeyCandidate"
+            },
+            "type": "array"
+          },
+          "expected_host_trust_revision": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "host_trust_id": {
+            "type": "string"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "port": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "repository_key": {
+            "type": "string"
+          },
+          "runtime_id": {
+            "type": "string"
+          },
+          "trust_state": {
+            "$ref": "#/components/schemas/RepositorySshConnectionTrustState"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "repository_key",
+          "runtime_id",
+          "hostname",
+          "port",
+          "trust_state",
+          "host_trust_id",
+          "candidates"
+        ],
+        "type": "object"
+      },
+      "RepositorySshConnectionTrustState": {
+        "enum": [
+          "untrusted",
+          "verified",
+          "changed"
+        ],
+        "type": "string"
+      },
       "RepositorySshCredential": {
         "additionalProperties": false,
         "description": "Public metadata for one Workspace-scoped Repository SSH credential.\n\nSecret references and secret material are deliberately not part of this DTO.",
@@ -4860,6 +5859,26 @@
           "current_revision",
           "status",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "RepositorySshHostKeyCandidate": {
+        "additionalProperties": false,
+        "properties": {
+          "algorithm": {
+            "type": "string"
+          },
+          "fingerprint": {
+            "type": "string"
+          },
+          "host_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "algorithm",
+          "host_key",
+          "fingerprint"
         ],
         "type": "object"
       },
@@ -5823,6 +6842,41 @@
         "required": [
           "id",
           "kind"
+        ],
+        "type": "object"
+      },
+      "StatRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "$ref": "#/components/schemas/FsPath"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "StatResult": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/EntryKind"
+          },
+          "path": {
+            "$ref": "#/components/schemas/FsPath"
+          },
+          "size": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path",
+          "kind",
+          "size"
         ],
         "type": "object"
       },
@@ -8271,6 +9325,636 @@
         },
         "type": "object"
       },
+      "WorkdirOperationApiError": {
+        "additionalProperties": false,
+        "description": "Error body for current-Worker Workdir operations.\n\nDomain/service failures preserve the existing Repository-style API envelope,\nwhile provider failures preserve the established typed Workdir transport\nenvelope and HTTP status classification.",
+        "properties": {
+          "code": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkdirTransportErrorCode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "type": "object"
+      },
+      "WorkdirScopeAuthorizationRequest": {
+        "additionalProperties": false,
+        "description": "Provider-side check for one operation under an attenuated tool scope.",
+        "properties": {
+          "path": {
+            "$ref": "#/components/schemas/FsPath"
+          },
+          "permission": {
+            "$ref": "#/components/schemas/WorkdirToolScopePermission"
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/WorkdirToolScopeRule"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "rules",
+          "path",
+          "permission"
+        ],
+        "type": "object"
+      },
+      "WorkdirScopeOverlapRequest": {
+        "additionalProperties": false,
+        "description": "Provider-side overlap comparison that keeps resolved host paths private.",
+        "properties": {
+          "left": {
+            "$ref": "#/components/schemas/WorkdirToolScopeRule"
+          },
+          "right": {
+            "$ref": "#/components/schemas/WorkdirToolScopeRule"
+          }
+        },
+        "required": [
+          "left",
+          "right"
+        ],
+        "type": "object"
+      },
+      "WorkdirSessionCapabilities": {
+        "properties": {
+          "bits": {
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "bits"
+        ],
+        "type": "object"
+      },
+      "WorkdirSessionOperation": {
+        "description": "One provider-side Workdir operation.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "authorize_scope",
+                "type": "string"
+              },
+              "request": {
+                "$ref": "#/components/schemas/WorkdirScopeAuthorizationRequest"
+              }
+            },
+            "required": [
+              "operation",
+              "request"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "scope_rules_overlap",
+                "type": "string"
+              },
+              "request": {
+                "$ref": "#/components/schemas/WorkdirScopeOverlapRequest"
+              }
+            },
+            "required": [
+              "operation",
+              "request"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "stat",
+                "type": "string"
+              },
+              "request": {
+                "$ref": "#/components/schemas/StatRequest"
+              }
+            },
+            "required": [
+              "operation",
+              "request"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "read",
+                "type": "string"
+              },
+              "request": {
+                "$ref": "#/components/schemas/ReadRequest"
+              }
+            },
+            "required": [
+              "operation",
+              "request"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "write",
+                "type": "string"
+              },
+              "request": {
+                "$ref": "#/components/schemas/WriteRequest"
+              }
+            },
+            "required": [
+              "operation",
+              "request"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "edit",
+                "type": "string"
+              },
+              "request": {
+                "$ref": "#/components/schemas/EditRequest"
+              }
+            },
+            "required": [
+              "operation",
+              "request"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "list",
+                "type": "string"
+              },
+              "request": {
+                "$ref": "#/components/schemas/ListRequest"
+              }
+            },
+            "required": [
+              "operation",
+              "request"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "glob",
+                "type": "string"
+              },
+              "request": {
+                "$ref": "#/components/schemas/GlobRequest"
+              }
+            },
+            "required": [
+              "operation",
+              "request"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "grep",
+                "type": "string"
+              },
+              "request": {
+                "$ref": "#/components/schemas/GrepRequest"
+              }
+            },
+            "required": [
+              "operation",
+              "request"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "command_start",
+                "type": "string"
+              },
+              "request": {
+                "$ref": "#/components/schemas/CommandRequest"
+              }
+            },
+            "required": [
+              "operation",
+              "request"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "command_status",
+                "type": "string"
+              },
+              "request": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "operation",
+              "request"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "command_output",
+                "type": "string"
+              },
+              "request": {
+                "$ref": "#/components/schemas/CommandOutputRequest"
+              }
+            },
+            "required": [
+              "operation",
+              "request"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "command_cancel",
+                "type": "string"
+              },
+              "request": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "operation",
+              "request"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WorkdirSessionOperationResult": {
+        "description": "Typed result paired with [`WorkdirSessionOperation`].",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "authorize_scope",
+                "type": "string"
+              }
+            },
+            "required": [
+              "operation"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "scope_rules_overlap",
+                "type": "string"
+              },
+              "result": {
+                "additionalProperties": false,
+                "properties": {
+                  "overlaps": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "overlaps"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "operation",
+              "result"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "stat",
+                "type": "string"
+              },
+              "result": {
+                "$ref": "#/components/schemas/StatResult"
+              }
+            },
+            "required": [
+              "operation",
+              "result"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "read",
+                "type": "string"
+              },
+              "result": {
+                "$ref": "#/components/schemas/ReadResult"
+              }
+            },
+            "required": [
+              "operation",
+              "result"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "write",
+                "type": "string"
+              },
+              "result": {
+                "$ref": "#/components/schemas/WriteResult"
+              }
+            },
+            "required": [
+              "operation",
+              "result"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "edit",
+                "type": "string"
+              },
+              "result": {
+                "$ref": "#/components/schemas/EditResult"
+              }
+            },
+            "required": [
+              "operation",
+              "result"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "list",
+                "type": "string"
+              },
+              "result": {
+                "$ref": "#/components/schemas/ListResult"
+              }
+            },
+            "required": [
+              "operation",
+              "result"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "glob",
+                "type": "string"
+              },
+              "result": {
+                "$ref": "#/components/schemas/GlobResult"
+              }
+            },
+            "required": [
+              "operation",
+              "result"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "grep",
+                "type": "string"
+              },
+              "result": {
+                "$ref": "#/components/schemas/GrepResult"
+              }
+            },
+            "required": [
+              "operation",
+              "result"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "command_start",
+                "type": "string"
+              },
+              "result": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "operation",
+              "result"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "command_status",
+                "type": "string"
+              },
+              "result": {
+                "$ref": "#/components/schemas/CommandStatus"
+              }
+            },
+            "required": [
+              "operation",
+              "result"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "command_output",
+                "type": "string"
+              },
+              "result": {
+                "$ref": "#/components/schemas/CommandOutput"
+              }
+            },
+            "required": [
+              "operation",
+              "result"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "command_cancel",
+                "type": "string"
+              }
+            },
+            "required": [
+              "operation"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WorkdirToolScopePermission": {
+        "enum": [
+          "read",
+          "write"
+        ],
+        "type": "string"
+      },
+      "WorkdirToolScopeRule": {
+        "additionalProperties": false,
+        "properties": {
+          "permission": {
+            "$ref": "#/components/schemas/WorkdirToolScopePermission"
+          },
+          "recursive": {
+            "type": "boolean"
+          },
+          "symlink_policy": {
+            "default": "resolved",
+            "type": "string"
+          },
+          "target": {
+            "$ref": "#/components/schemas/FsPath"
+          }
+        },
+        "required": [
+          "target",
+          "permission",
+          "recursive"
+        ],
+        "type": "object"
+      },
+      "WorkdirTransportErrorCode": {
+        "description": "Stable, host-path-free error code crossing the Runtime boundary.",
+        "enum": [
+          "not_found",
+          "conflict",
+          "unsupported",
+          "invalid_request",
+          "denied",
+          "out_of_scope",
+          "symlink_out_of_scope",
+          "broken_symlink",
+          "symlink_target_is_directory",
+          "read_only",
+          "is_directory",
+          "symlink_directory_not_traversed",
+          "unknown_command",
+          "unavailable",
+          "io",
+          "transport",
+          "internal"
+        ],
+        "type": "string"
+      },
+      "WorkerCapabilitySummary": {
+        "properties": {
+          "can_spawn_followup": {
+            "type": "boolean"
+          },
+          "can_stop": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "can_stop",
+          "can_spawn_followup"
+        ],
+        "type": "object"
+      },
+      "WorkerImplementationSummary": {
+        "properties": {
+          "display_hint": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "display_hint"
+        ],
+        "type": "object"
+      },
       "WorkerLifecycleAudit": {
         "properties": {
           "consolidation": {
@@ -8357,6 +10041,511 @@
           "cancelled"
         ],
         "type": "string"
+      },
+      "WorkerSummary": {
+        "description": "Workspace-authoritative Worker projection.\n\n`resource_key` is required here even though Runtime-internal Worker summaries\ndo not carry one. The Workspace Server must resolve it from Workspace\nauthority before constructing this response.",
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/WorkerCapabilitySummary"
+          },
+          "diagnostics": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "display_name": {
+            "default": "",
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "implementation": {
+            "$ref": "#/components/schemas/WorkerImplementationSummary"
+          },
+          "label": {
+            "type": "string"
+          },
+          "last_seen_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pinned": {
+            "default": false,
+            "type": "boolean"
+          },
+          "profile": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resource_key": {
+            "type": "string"
+          },
+          "retention_state": {
+            "default": "",
+            "type": "string"
+          },
+          "runtime_id": {
+            "type": "string"
+          },
+          "singleton_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "Runtime catalog lifecycle compatibility state. Live foreground state, when\navailable, is carried separately in `worker_state`.",
+            "type": "string"
+          },
+          "tags": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "workdir_attachments": {
+            "items": {
+              "$ref": "#/components/schemas/WorkerWorkdirAttachmentSummary"
+            },
+            "type": "array"
+          },
+          "worker_id": {
+            "type": "string"
+          },
+          "worker_state": true,
+          "workspace": {
+            "$ref": "#/components/schemas/WorkerWorkspaceSummary"
+          }
+        },
+        "required": [
+          "runtime_id",
+          "worker_id",
+          "resource_key",
+          "host_id",
+          "label",
+          "workspace",
+          "state",
+          "implementation",
+          "capabilities"
+        ],
+        "type": "object"
+      },
+      "WorkerWorkdirAttachmentSummary": {
+        "additionalProperties": false,
+        "description": "One Workspace Worker Workdir attachment. `alias` is the stable Worker-local\nrouting key; the nested Workdir id and display name are inventory metadata.",
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "working_directory": {
+            "$ref": "#/components/schemas/WorkingDirectorySummary"
+          }
+        },
+        "required": [
+          "alias",
+          "working_directory"
+        ],
+        "type": "object"
+      },
+      "WorkerWorkspaceSummary": {
+        "properties": {
+          "identity": {
+            "type": "string"
+          },
+          "visibility": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "visibility",
+          "identity"
+        ],
+        "type": "object"
+      },
+      "WorkingDirectoryCleanupTarget": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "repository_key": {
+            "type": "string"
+          },
+          "working_directory_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "working_directory_id",
+          "repository_key"
+        ],
+        "type": "object"
+      },
+      "WorkingDirectoryCreateRequest": {
+        "additionalProperties": false,
+        "description": "Browser/Rust-client Workdir materialization request.\n\n`runtime_id = None` requests Workspace default Runtime resolution and\n`operation_id = Some(_)` fences exact replay. All four fields deliberately\npreserve the Server's existing optionality.",
+        "properties": {
+          "display_name": {
+            "description": "Optional human-facing label, independent of every Worker attachment alias.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operation_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repository_key": {
+            "type": "string"
+          },
+          "runtime_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "selector": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "repository_key"
+        ],
+        "type": "object"
+      },
+      "WorkingDirectoryCreateResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "item": {
+            "$ref": "#/components/schemas/WorkingDirectorySummary"
+          },
+          "runtime_id": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "runtime_id",
+          "item",
+          "diagnostics"
+        ],
+        "type": "object"
+      },
+      "WorkingDirectoryDetailResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "item": {
+            "$ref": "#/components/schemas/WorkingDirectorySummary"
+          },
+          "runtime_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "item",
+          "diagnostics"
+        ],
+        "type": "object"
+      },
+      "WorkingDirectoryListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/WorkingDirectorySummary"
+            },
+            "type": "array"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "items",
+          "diagnostics"
+        ],
+        "type": "object"
+      },
+      "WorkingDirectoryMaterializerKind": {
+        "description": "Public Workdir materializer classification.\n\nThe value identifies stable materialization provenance without exposing a\nprovider path, Runtime handle, or session identity.",
+        "enum": [
+          "runtime_git_clone",
+          "client_hosted_external"
+        ],
+        "type": "string"
+      },
+      "WorkingDirectoryOccupancy": {
+        "additionalProperties": false,
+        "description": "Durable Workspace occupancy projection for one Workdir.",
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "linked_at": {
+            "type": "string"
+          },
+          "runtime_id": {
+            "type": "string"
+          },
+          "worker_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "runtime_id",
+          "worker_id",
+          "display_name",
+          "linked_at"
+        ],
+        "type": "object"
+      },
+      "WorkingDirectoryRemovalDisposition": {
+        "enum": [
+          "removed",
+          "retained",
+          "attention_required"
+        ],
+        "type": "string"
+      },
+      "WorkingDirectoryRemovalRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
+      "WorkingDirectoryRemovalResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "disposition": {
+            "$ref": "#/components/schemas/WorkingDirectoryRemovalDisposition"
+          },
+          "failure_category": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "working_directory_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "working_directory_id",
+          "disposition",
+          "retryable"
+        ],
+        "type": "object"
+      },
+      "WorkingDirectorySource": {
+        "description": "Public Workdir source identity. Provider routing details and host paths are intentionally absent.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "repository",
+                "type": "string"
+              },
+              "repository_key": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "repository_key"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "grant_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "external_grant",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "grant_id"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WorkingDirectoryStatusKind": {
+        "enum": [
+          "active",
+          "cleanup_pending",
+          "corrupted",
+          "not_found",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "WorkingDirectorySummary": {
+        "additionalProperties": false,
+        "description": "Public, provider-neutral Workdir inventory projection.",
+        "properties": {
+          "cleanliness": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cleanup_target": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkingDirectoryCleanupTarget"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "creation_ref": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "creation_selector": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "creation_tree": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current_ref": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current_selector": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current_tree": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "description": "Optional human-facing label, never a routing key.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "materializer_kind": {
+            "$ref": "#/components/schemas/WorkingDirectoryMaterializerKind"
+          },
+          "observed_at_epoch_seconds": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "occupied_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkingDirectoryOccupancy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source": {
+            "$ref": "#/components/schemas/WorkingDirectorySource"
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkingDirectoryStatusKind"
+          },
+          "working_directory_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "working_directory_id",
+          "source",
+          "materializer_kind",
+          "status"
+        ],
+        "type": "object"
       },
       "WorkspaceAuthConfig": {
         "description": "Browser authentication configuration exposed by the scoped Workspace summary.",
@@ -9303,6 +11492,60 @@
         ],
         "type": "object"
       },
+      "WriteRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "items": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "expected_hash": {
+            "items": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 32,
+            "minItems": 32,
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "path": {
+            "$ref": "#/components/schemas/FsPath"
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ],
+        "type": "object"
+      },
+      "WriteResult": {
+        "properties": {
+          "bytes_written": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "created": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "bytes_written",
+          "created"
+        ],
+        "type": "object"
+      },
       "string": {
         "type": "string"
       }
@@ -9322,7 +11565,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:0026ff3d0f1d267e4de3f154a14f4ef3f7554b603a376820f0775e5deb16a083"
+    "x-yoi-source-digest": "sha256:e3f776a17079ce202725bb97de607426f4bfad9afe390ba7bbf76186e871be59"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -9740,6 +11983,188 @@
         }
       }
     },
+    "/api/hosts": {
+      "get": {
+        "operationId": "host_list_alias",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostListResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/hosts/{host_id}/workers": {
+      "get": {
+        "operationId": "host_worker_list_alias",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostWorkerListResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
     "/api/objectives": {
       "get": {
         "operationId": "objective_list_alias",
@@ -9944,6 +12369,103 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryDetailResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/repositories/{repository_key}/log": {
+      "get": {
+        "operationId": "repository_log_alias",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "repository_key",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/RepositoryLogQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryLogResponse"
                 }
               }
             },
@@ -10585,6 +13107,315 @@
         ]
       }
     },
+    "/api/w/{workspace_id}/external-workdir-grants": {
+      "post": {
+        "operationId": "external_workdir_grant_create",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExternalWorkdirGrantCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalWorkdirGrantResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/external-workdir-grants/{grant_id}": {
+      "delete": {
+        "operationId": "external_workdir_grant_revoke",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "grant_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalWorkdirGrantResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "get": {
+        "operationId": "external_workdir_grant_get",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "grant_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalWorkdirGrantResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
     "/api/w/{workspace_id}/flows": {
       "get": {
         "operationId": "flow_list",
@@ -10937,6 +13768,210 @@
             "description": "Error response"
           }
         }
+      }
+    },
+    "/api/w/{workspace_id}/hosts": {
+      "get": {
+        "operationId": "host_list",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostListResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/hosts/{host_id}/workers": {
+      "get": {
+        "operationId": "host_worker_list",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostWorkerListResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
       }
     },
     "/api/w/{workspace_id}/internal/reviewer-child-sessions": {
@@ -12889,6 +15924,919 @@
             "description": "Error response"
           },
           "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/repositories/{repository_key}/log": {
+      "get": {
+        "operationId": "repository_log",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "repository_key",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/RepositoryLogQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryLogResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/repositories/{repository_key}/ssh-connection-test": {
+      "post": {
+        "operationId": "repository_ssh_connection_probe",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "repository_key",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RepositorySshConnectionProbeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositorySshConnectionProbeResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "put": {
+        "operationId": "repository_ssh_host_trust_confirm",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "repository_key",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfirmRepositorySshHostTrustRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositorySshHostTrust"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories": {
+      "get": {
+        "operationId": "runtime_workdir_list",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "runtime_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkingDirectoryListResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "post": {
+        "operationId": "runtime_workdir_create",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "runtime_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkingDirectoryCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkingDirectoryCreateResponse"
+                }
+              }
+            },
+            "description": "Alternate successful response"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkingDirectoryCreateResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories/{working_directory_id}": {
+      "delete": {
+        "operationId": "runtime_workdir_cleanup",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "runtime_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "working_directory_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkingDirectoryRemovalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkingDirectoryRemovalResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "get": {
+        "operationId": "runtime_workdir_detail",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "runtime_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "working_directory_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkingDirectoryDetailResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
             "content": {
               "application/json": {
                 "schema": {
@@ -19624,6 +23572,872 @@
             "description": "Error response"
           }
         }
+      }
+    },
+    "/api/w/{workspace_id}/workers/self/workdir-attachments": {
+      "post": {
+        "operationId": "current_worker_workdir_attach",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CurrentWorkerWorkdirAttachRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CurrentWorkerWorkdirAttachmentResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/workers/self/workdir-attachments/{alias}": {
+      "delete": {
+        "operationId": "current_worker_workdir_detach",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "alias",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CurrentWorkerWorkdirAttachmentResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/workers/self/workdir-session/operations": {
+      "post": {
+        "operationId": "current_worker_workdir_operation",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CurrentWorkerWorkdirOperationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkdirSessionOperationResult"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkdirOperationApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkdirOperationApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkdirOperationApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkdirOperationApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkdirOperationApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkdirOperationApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkdirOperationApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkdirOperationApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/working-directories": {
+      "get": {
+        "operationId": "workspace_workdir_list",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkingDirectoryListResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "post": {
+        "operationId": "workspace_workdir_create",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkingDirectoryCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkingDirectoryCreateResponse"
+                }
+              }
+            },
+            "description": "Alternate successful response"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkingDirectoryCreateResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/working-directories/{working_directory_id}": {
+      "delete": {
+        "operationId": "workspace_workdir_cleanup",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "working_directory_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkingDirectoryRemovalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkingDirectoryRemovalResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "get": {
+        "operationId": "workspace_workdir_detail",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "working_directory_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkingDirectoryDetailResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
       }
     },
     "/api/w/{workspace_id}/workspace": {

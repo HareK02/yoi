@@ -5,6 +5,7 @@
 //! optional so Runtime servers can share these DTOs without depending on a
 //! client stack.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -16,7 +17,7 @@ use crate::{
 };
 
 /// Opaque Runtime-owned identifier for one ephemeral Workdir session.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct WorkdirSessionId(String);
 
@@ -37,7 +38,7 @@ impl WorkdirSessionId {
 }
 
 /// Open a fresh session for a persisted Workdir identity.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct OpenWorkdirSessionRequest {
     /// Optional Runtime Worker whose persisted binding establishes workspace
     /// ownership of the Workdir. Runtime servers reject cross-workspace owners.
@@ -45,7 +46,7 @@ pub struct OpenWorkdirSessionRequest {
     pub owner_worker_id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct OpenWorkdirSessionResponse {
     pub session_id: WorkdirSessionId,
     pub workdir_id: WorkdirId,
@@ -53,7 +54,7 @@ pub struct OpenWorkdirSessionResponse {
 }
 
 /// One provider-side Workdir operation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(
     tag = "operation",
     content = "request",
@@ -77,14 +78,14 @@ pub enum WorkdirSessionOperation {
 }
 
 /// Wire envelope for one provider operation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkdirSessionOperationRequest {
     pub operation: WorkdirSessionOperation,
 }
 
 /// Typed result paired with [`WorkdirSessionOperation`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(
     tag = "operation",
     content = "result",
@@ -174,7 +175,7 @@ pub async fn dispatch_workdir_session_operation(
 }
 
 /// Stable, host-path-free error code crossing the Runtime boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkdirTransportErrorCode {
     NotFound,
@@ -238,7 +239,7 @@ impl WorkdirTransportErrorCode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkdirTransportError {
     pub code: WorkdirTransportErrorCode,
     pub message: String,

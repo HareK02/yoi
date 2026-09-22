@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -45,7 +46,7 @@ pub use scope::{
 };
 
 /// Persistent, opaque identity of one materialized Workdir.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct Workdir {
     id: WorkdirId,
 }
@@ -63,7 +64,7 @@ impl Workdir {
 }
 
 /// Opaque Workdir identifier assigned by the materialization authority.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct WorkdirId(String);
 
@@ -79,7 +80,7 @@ impl std::fmt::Display for WorkdirId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkdirSessionCapability {
     Read,
@@ -90,7 +91,7 @@ pub enum WorkdirSessionCapability {
     Command,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkdirSessionCapabilities {
     bits: u8,
 }

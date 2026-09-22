@@ -1,10 +1,5 @@
 import type { ApiResult } from "$lib/workspace/api/http";
 import type {
-  GitCommitSummary,
-  RepositoryLogResponse,
-  RepositorySshConnectionProbeResponse,
-  RepositorySshConnectionTrustState,
-  RepositorySshHostKeyCandidate,
   WorkspaceAuthConfig,
   WorkspaceCatalogListResponse,
   WorkspaceCreateResponse,
@@ -24,22 +19,25 @@ import type {
 import type {
   CreateWorkspaceRepositoryResponse,
   Diagnostic,
+  GitCommitSummary,
   GitRemoteSummary,
   GitRepositorySummary,
+  HostListResponse,
+  HostSummary,
   RepositoryApiError,
   RepositoryDetailResponse,
   RepositoryDiagnostic,
   RepositoryListResponse,
+  RepositoryLogResponse,
   RepositorySource,
   RepositorySourceKind,
+  RepositorySshConnectionProbeResponse,
+  RepositorySshConnectionTrustState,
+  RepositorySshHostKeyCandidate,
   RepositorySummary,
 } from "$lib/generated/repository-api.ts";
 
 export type {
-  GitCommitSummary,
-  RepositoryLogResponse,
-  RepositorySshConnectionProbeResponse,
-  RepositorySshHostKeyCandidate,
   WorkspaceCatalogListResponse,
   WorkspaceCreateResponse,
   WorkspaceDeletionOperationResponse,
@@ -51,13 +49,19 @@ export type {
 export type {
   CreateWorkspaceRepositoryRequest,
   CreateWorkspaceRepositoryResponse,
+  GitCommitSummary,
   GitRemoteSummary,
   GitRepositorySummary,
+  HostListResponse,
+  HostSummary,
   RepositoryApiError,
   RepositoryDetailResponse,
   RepositoryListResponse,
+  RepositoryLogResponse,
   RepositorySource,
   RepositorySourceKind,
+  RepositorySshConnectionProbeResponse,
+  RepositorySshHostKeyCandidate,
   RepositorySummary,
 } from "$lib/generated/repository-api.ts";
 
@@ -1091,6 +1095,77 @@ export function parseWorkspaceDeletionOperationResponse(
       item.completed_at,
       "Workspace deletion operation.completed_at",
     ) ?? null,
+  };
+}
+
+export function parseHostListResponse(value: unknown): HostListResponse {
+  const response = object(value, "host list response");
+  exactKeys(
+    response,
+    ["workspace_id", "limit", "items", "source", "diagnostics"],
+    "host list response",
+  );
+  const limit = repositorySourceRevision(
+    response.limit,
+    "host list response.limit",
+  );
+  return {
+    workspace_id: repositoryString(
+      response.workspace_id,
+      "host list response.workspace_id",
+    ),
+    limit,
+    items: repositoryArray(response.items, "host list response.items").map(
+      (item, index) => parseHostSummary(item, `host list response.items[${index}]`),
+    ),
+    source: repositoryString(response.source, "host list response.source"),
+    diagnostics: repositoryArray(
+      response.diagnostics,
+      "host list response.diagnostics",
+    ).map((item, index) =>
+      repositoryApiDiagnostic(
+        item,
+        `host list response.diagnostics[${index}]`,
+      )
+    ),
+  };
+}
+
+function parseHostSummary(value: unknown, path: string): HostSummary {
+  const host = object(value, path);
+  exactKeys(
+    host,
+    [
+      "runtime_id",
+      "host_id",
+      "label",
+      "kind",
+      "status",
+      "observed_at",
+      "last_seen_at",
+      "os",
+      "arch",
+      "diagnostics",
+    ],
+    path,
+  );
+  return {
+    runtime_id: repositoryString(host.runtime_id, `${path}.runtime_id`),
+    host_id: repositoryString(host.host_id, `${path}.host_id`),
+    label: repositoryString(host.label, `${path}.label`),
+    kind: repositoryString(host.kind, `${path}.kind`),
+    status: repositoryString(host.status, `${path}.status`),
+    observed_at: repositoryString(host.observed_at, `${path}.observed_at`),
+    last_seen_at: optionalNullableRepositoryString(
+      host.last_seen_at,
+      `${path}.last_seen_at`,
+    ),
+    os: repositoryString(host.os, `${path}.os`),
+    arch: repositoryString(host.arch, `${path}.arch`),
+    diagnostics: repositoryArray(host.diagnostics, `${path}.diagnostics`).map(
+      (item, index) =>
+        repositoryApiDiagnostic(item, `${path}.diagnostics[${index}]`),
+    ),
   };
 }
 

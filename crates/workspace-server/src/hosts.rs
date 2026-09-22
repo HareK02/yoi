@@ -291,6 +291,23 @@ impl From<RuntimeDiagnostic> for server_api::Diagnostic {
     }
 }
 
+impl From<HostSummary> for server_api::HostSummary {
+    fn from(host: HostSummary) -> Self {
+        Self {
+            runtime_id: host.runtime_id,
+            host_id: host.host_id,
+            label: host.label,
+            kind: host.kind,
+            status: host.status,
+            observed_at: host.observed_at,
+            last_seen_at: host.last_seen_at,
+            os: host.os,
+            arch: host.arch,
+            diagnostics: host.diagnostics.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 impl From<RuntimeSourceSummary> for server_api::RuntimeSourceSummary {
     fn from(source: RuntimeSourceSummary) -> Self {
         let kind = match source.kind {
