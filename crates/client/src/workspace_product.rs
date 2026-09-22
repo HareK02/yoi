@@ -345,24 +345,40 @@ impl BackendWorkspaceProductClient {
     pub fn list_runtimes(
         &self,
     ) -> Result<ListResponse<WorkspaceRuntimeResource>, BackendWorkspaceClientError> {
-        self.get_json("/runtimes")
+        let workspace_id = self.workspace_id.clone();
+        let response =
+            self.generated(move |client| async move { client.runtime_list(workspace_id).await })?;
+        Ok(ListResponse {
+            workspace_id: response.workspace_id,
+            limit: response.limit,
+            items: response.items,
+            source: response.source,
+            diagnostics: response.diagnostics,
+        })
     }
 
     pub fn runtime_detail(
         &self,
         runtime_id: &str,
     ) -> Result<WorkspaceRuntimeDetail, BackendWorkspaceClientError> {
-        self.get_json(&format!("/runtimes/{}", encode_path_segment(runtime_id)))
+        let workspace_id = self.workspace_id.clone();
+        let runtime_id = runtime_id.to_string();
+        self.generated(move |client| async move {
+            client.runtime_detail(workspace_id, runtime_id).await
+        })
     }
 
     pub fn reveal_runtime_trust_key(
         &self,
         runtime_id: &str,
     ) -> Result<RuntimeTrustKeyRevealResponse, BackendWorkspaceClientError> {
-        self.get_json(&format!(
-            "/runtimes/{}/trust-key",
-            encode_path_segment(runtime_id)
-        ))
+        let workspace_id = self.workspace_id.clone();
+        let runtime_id = runtime_id.to_string();
+        self.generated(move |client| async move {
+            client
+                .runtime_trust_key_reveal(workspace_id, runtime_id)
+                .await
+        })
     }
 
     pub fn revoke_runtime_trust_key(
@@ -370,11 +386,20 @@ impl BackendWorkspaceProductClient {
         runtime_id: &str,
         request: &RevokeRuntimeTrustKeyRequest,
     ) -> Result<WorkspaceRuntimeDetail, BackendWorkspaceClientError> {
-        self.send_json(
-            Method::DELETE,
-            &format!("/runtimes/{}/trust-key", encode_path_segment(runtime_id)),
-            Some(request),
-        )
+        let client = crate::backend_workspace::server_api_client(&self.api)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?;
+        runtime
+            .block_on(client.runtime_trust_key_revoke(
+                self.workspace_id.clone(),
+                runtime_id.to_string(),
+                request.clone(),
+            ))
+            .map_err(|error| {
+                crate::backend_workspace::runtime_management_client_error(&self.api, error)
+            })
     }
 
     pub fn memory_document(&self) -> Result<MemoryDocumentResponse, BackendWorkspaceClientError> {

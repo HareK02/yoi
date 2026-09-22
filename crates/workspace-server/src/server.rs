@@ -14,7 +14,7 @@ use axum::http::header::{
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{Duration, SecondsFormat, Utc};
 use config_source::ConfigTreeSnapshot;
@@ -48,16 +48,15 @@ use server_api::{
     RepositoryDetailResponse, RepositoryListResponse, RepositoryLogResponse,
     RepositorySshConnectionProbeRequest, RepositorySshConnectionProbeResponse,
     RepositorySshConnectionTrustState, RepositorySshCredential, RepositorySshHostKeyCandidate,
-    RepositorySshHostTrust, RepositorySshPublicKey, RequestActor, RevokeRuntimeTrustKeyRequest,
+    RepositorySshHostTrust, RepositorySshPublicKey, RequestActor,
     RotateRepositorySshCredentialRequest, RuntimeConnectionDisplayState,
     RuntimeConnectionTestFailureKind, RuntimeConnectionTestResponse, RuntimeConnectionTestStatus,
     RuntimeManagementSummary, RuntimeRemovalOperationResponse,
     RuntimeRemovalOperationState as ApiRuntimeRemovalOperationState, RuntimeTrustAuditAction,
-    RuntimeTrustAuditEntry, RuntimeTrustConflictKind, RuntimeTrustConflictResponse,
-    RuntimeTrustKeyRevealResponse, RuntimeTrustKeyState, RuntimeTrustKeyStatus,
-    UpdateRemoteRuntimeRequest, UpdateWorkspaceMetadataRequest, WhoamiResponse,
-    WorkerLaunchOptionsResponse, WorkerLaunchProfileCandidate, WorkerLaunchRuntimeOption,
-    WorkerLaunchWorkerSummary,
+    RuntimeTrustAuditEntry, RuntimeTrustKeyRevealResponse, RuntimeTrustKeyState,
+    RuntimeTrustKeyStatus, UpdateRemoteRuntimeRequest, UpdateWorkspaceMetadataRequest,
+    WhoamiResponse, WorkerLaunchOptionsResponse, WorkerLaunchProfileCandidate,
+    WorkerLaunchRuntimeOption, WorkerLaunchWorkerSummary,
     WorkingDirectoryCreateRequest as BrowserWorkingDirectoryCreateRequest,
     WorkingDirectoryCreateResponse as BrowserWorkingDirectoryCreateResponse,
     WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
@@ -5049,6 +5048,791 @@ impl server_api::ServerApi for ServerApiContractService {
         })
     }
 
+    async fn runtime_list_alias(
+        &self,
+    ) -> std::result::Result<server_api::RuntimeListResponse, server_api::RepositoryApiError> {
+        let Json(response) = list_runtimes(State(self.workspace_api()?.clone()))
+            .await
+            .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_list(
+        &self,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::WorkspaceRuntimeListResponse, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_list_runtimes(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_create(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        request: server_api::CreateRemoteRuntimeRequest,
+    ) -> std::result::Result<server_api::WorkspaceRuntimeResource, server_api::RepositoryApiError>
+    {
+        let (status, Json(mut response)) = scoped_create_remote_runtime(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Extension(actor),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        response.http_status = status.as_u16();
+        Ok(response)
+    }
+
+    async fn runtime_detail(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+    ) -> std::result::Result<server_api::WorkspaceRuntimeDetail, server_api::RepositoryApiError>
+    {
+        scoped_get_runtime_detail(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id,
+                runtime_id,
+            }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn runtime_update(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        runtime_id: String,
+        request: server_api::UpdateRemoteRuntimeRequest,
+    ) -> std::result::Result<server_api::WorkspaceRuntimeDetail, server_api::RepositoryApiError>
+    {
+        scoped_update_remote_runtime(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id,
+                runtime_id,
+            }),
+            Extension(actor),
+            Json(request),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn runtime_remove(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        runtime_id: String,
+        request: server_api::RemoveRuntimeRequest,
+    ) -> std::result::Result<
+        server_api::RuntimeRemovalOperationResponse,
+        server_api::RepositoryApiError,
+    > {
+        scoped_remove_remote_runtime(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id,
+                runtime_id,
+            }),
+            Extension(actor),
+            Json(request),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn runtime_trust_key_reveal(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        runtime_id: String,
+    ) -> std::result::Result<
+        server_api::RuntimeTrustKeyRevealResponse,
+        server_api::RepositoryApiError,
+    > {
+        scoped_reveal_runtime_trust_key(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id,
+                runtime_id,
+            }),
+            Extension(actor),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn runtime_trust_key_revoke(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        runtime_id: String,
+        request: server_api::RevokeRuntimeTrustKeyRequest,
+    ) -> std::result::Result<
+        server_api::WorkspaceRuntimeDetail,
+        server_api::RuntimeManagementApiError,
+    > {
+        let api = self
+            .workspace_api()
+            .map_err(server_api::RuntimeManagementApiError::from)?
+            .clone();
+        let map_error = |error: ApiError| {
+            server_api::RuntimeManagementApiError::from(error.into_repository_api_error())
+        };
+        validate_workspace_scope(&api, &workspace_id).map_err(map_error)?;
+        require_workspace_owner(&api, &workspace_id, &actor, "Runtime trust changes")
+            .await
+            .map_err(map_error)?;
+        if runtime_id == EMBEDDED_WORKER_RUNTIME_ID {
+            return Err(map_error(settings_bad_request(
+                "embedded_runtime_trust_managed_internally",
+                "the embedded Runtime trust key is managed by the embedded Runtime authority",
+            )));
+        }
+        if request.expected_revision == 0 {
+            return Err(map_error(settings_bad_request(
+                "invalid_runtime_binding_revision",
+                "expected_revision must be greater than zero",
+            )));
+        }
+        let now = Utc::now().to_rfc3339();
+        if let Err(error) = api
+            .store
+            .revoke_workspace_runtime_binding_key(
+                &workspace_id,
+                &runtime_id,
+                request.expected_revision,
+                &actor.account_id,
+                &now,
+            )
+            .await
+        {
+            let kind = match error {
+                Error::RuntimeBindingRevisionConflict { .. } => {
+                    Some(server_api::RuntimeTrustConflictKind::StaleRevision)
+                }
+                Error::RuntimeBindingFingerprintConflict { .. } => {
+                    Some(server_api::RuntimeTrustConflictKind::FingerprintInUse)
+                }
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                let current = api
+                    .store
+                    .get_workspace_runtime_binding(&workspace_id, &runtime_id)
+                    .await
+                    .map_err(|error| map_error(ApiError::from(error)))?;
+                return Err(server_api::RuntimeManagementApiError::trust_conflict(
+                    server_api::RuntimeTrustConflictResponse {
+                        error: kind,
+                        message: match kind {
+                            server_api::RuntimeTrustConflictKind::StaleRevision => {
+                                "the Runtime trust binding changed; reload before retrying".to_string()
+                            }
+                            server_api::RuntimeTrustConflictKind::FingerprintInUse => {
+                                "the public key is already bound to another Runtime in this Workspace".to_string()
+                            }
+                        },
+                        current_revision: current.as_ref().map(|binding| binding.binding_revision),
+                        current_fingerprint: current
+                            .as_ref()
+                            .map(|binding| binding.public_key_fingerprint.clone()),
+                    },
+                ));
+            }
+            return Err(map_error(ApiError::from(error)));
+        }
+        api.runtime_binding_expectations
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(workspace_id.clone(), runtime_id.clone()));
+        api.runtime_subscription_broker
+            .unregister_runtime(&runtime_id);
+        workspace_runtime_detail(&api, &workspace_id, &runtime_id)
+            .await
+            .map_err(map_error)
+    }
+
+    async fn runtime_connection_test(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        runtime_id: String,
+    ) -> std::result::Result<
+        server_api::RuntimeConnectionTestResponse,
+        server_api::RepositoryApiError,
+    > {
+        scoped_test_runtime_connection(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id,
+                runtime_id,
+            }),
+            Extension(actor),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn runtime_worker_list_alias(
+        &self,
+        runtime_id: String,
+        query: server_api::RuntimeWorkersQuery,
+    ) -> std::result::Result<server_api::RuntimeWorkerListResponse, server_api::RepositoryApiError>
+    {
+        let query = project_contract_dto(&query)?;
+        let Json(response) = list_runtime_workers(
+            State(self.workspace_api()?.clone()),
+            AxumPath(runtime_id),
+            Query(query),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_worker_create_alias(
+        &self,
+        runtime_id: String,
+        request: server_api::RuntimeWorkerSpawnRequest,
+    ) -> std::result::Result<server_api::RuntimeWorkerSpawnResponse, server_api::RepositoryApiError>
+    {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = create_runtime_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath(runtime_id),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_worker_list(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+        query: server_api::RuntimeWorkersQuery,
+    ) -> std::result::Result<server_api::RuntimeWorkerListResponse, server_api::RepositoryApiError>
+    {
+        let query = project_contract_dto(&query)?;
+        let Json(response) = scoped_list_runtime_workers(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id,
+                runtime_id,
+            }),
+            Query(query),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_worker_create(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+        request: server_api::RuntimeWorkerSpawnRequest,
+    ) -> std::result::Result<server_api::RuntimeWorkerSpawnResponse, server_api::RepositoryApiError>
+    {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_create_runtime_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id,
+                runtime_id,
+            }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_config_bundle_sync_alias(
+        &self,
+        runtime_id: String,
+        request: server_api::RuntimeConfigBundleSyncRequest,
+    ) -> std::result::Result<server_api::RuntimeConfigBundleResult, server_api::RepositoryApiError>
+    {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = sync_runtime_config_bundle(
+            State(self.workspace_api()?.clone()),
+            AxumPath(runtime_id),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_config_bundle_sync(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+        request: server_api::RuntimeConfigBundleSyncRequest,
+    ) -> std::result::Result<server_api::RuntimeConfigBundleResult, server_api::RepositoryApiError>
+    {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_sync_runtime_config_bundle(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id,
+                runtime_id,
+            }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_config_bundle_availability_alias(
+        &self,
+        runtime_id: String,
+        bundle_id: String,
+        query: server_api::RuntimeConfigBundleAvailabilityQuery,
+    ) -> std::result::Result<server_api::RuntimeConfigBundleResult, server_api::RepositoryApiError>
+    {
+        let query = project_contract_dto(&query)?;
+        let Json(response) = check_runtime_config_bundle(
+            State(self.workspace_api()?.clone()),
+            AxumPath((runtime_id, bundle_id)),
+            Query(query),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_config_bundle_availability(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+        bundle_id: String,
+        query: server_api::RuntimeConfigBundleAvailabilityQuery,
+    ) -> std::result::Result<server_api::RuntimeConfigBundleResult, server_api::RepositoryApiError>
+    {
+        let query = project_contract_dto(&query)?;
+        let Json(response) = scoped_check_runtime_config_bundle(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedConfigBundlePath {
+                workspace_id,
+                runtime_id,
+                bundle_id,
+            }),
+            Query(query),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_worker_detail_alias(
+        &self,
+        runtime_id: String,
+        worker_id: String,
+    ) -> std::result::Result<server_api::RuntimeWorkerShowResponse, server_api::RepositoryApiError>
+    {
+        let Json(response) = get_runtime_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath((runtime_id, worker_id)),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_worker_detail(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+    ) -> std::result::Result<server_api::RuntimeWorkerShowResponse, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_get_runtime_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimeWorkerPath {
+                workspace_id,
+                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+            }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_worker_restore_alias(
+        &self,
+        runtime_id: String,
+        worker_id: String,
+    ) -> std::result::Result<server_api::WorkerRestoreResponse, server_api::RepositoryApiError>
+    {
+        restore_runtime_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath((runtime_id, worker_id)),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn runtime_worker_restore(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+        query: server_api::RestoreTicketAssignmentQuery,
+    ) -> std::result::Result<server_api::WorkerRestoreResponse, server_api::RepositoryApiError>
+    {
+        let query = project_contract_dto(&query)?;
+        scoped_restore_runtime_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimeWorkerPath {
+                workspace_id,
+                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+            }),
+            Query(query),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn runtime_worker_pin(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+    ) -> std::result::Result<server_api::WorkerRetentionResponse, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_pin_runtime_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimeWorkerPath {
+                workspace_id,
+                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+            }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_worker_unpin(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+    ) -> std::result::Result<server_api::WorkerRetentionResponse, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_unpin_runtime_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimeWorkerPath {
+                workspace_id,
+                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+            }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_cleanup_plan(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+    ) -> std::result::Result<server_api::RuntimeCleanupPlanResponse, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_runtime_cleanup_plan(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id,
+                runtime_id,
+            }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_cleanup_execute(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+        request: server_api::ExecuteRuntimeCleanupRequest,
+    ) -> std::result::Result<
+        server_api::RuntimeCleanupExecutionResponse,
+        server_api::RepositoryApiError,
+    > {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_execute_runtime_cleanup(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id,
+                runtime_id,
+            }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_worker_input_alias(
+        &self,
+        runtime_id: String,
+        worker_id: String,
+        request: server_api::RuntimeWorkerInputRequest,
+    ) -> std::result::Result<server_api::RuntimeWorkerInputResult, server_api::RepositoryApiError>
+    {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = send_runtime_worker_input(
+            State(self.workspace_api()?.clone()),
+            AxumPath((runtime_id, worker_id)),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_worker_input(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+        request: server_api::RuntimeWorkerInputRequest,
+    ) -> std::result::Result<server_api::RuntimeWorkerInputResult, server_api::RepositoryApiError>
+    {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_send_runtime_worker_input(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimeWorkerPath {
+                workspace_id,
+                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+            }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_worker_attachment_upload_grant(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+        query: server_api::WorkerFileUploadQuery,
+    ) -> std::result::Result<
+        server_api::AttachmentUploadGrantResponse,
+        server_api::RepositoryApiError,
+    > {
+        let query = project_contract_dto(&query)?;
+        let Json(response) = scoped_create_attachment_upload_grant(
+            State(self.workspace_api()?.clone()),
+            Extension(actor),
+            AxumPath(ScopedRuntimeWorkerPath {
+                workspace_id,
+                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+            }),
+            Query(query),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_worker_attachment_upload_cancel(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+        upload_id: String,
+    ) -> std::result::Result<
+        server_api::AttachmentUploadCancelResponse,
+        server_api::RepositoryApiError,
+    > {
+        let Json(response) = scoped_cancel_attachment_upload(
+            State(self.workspace_api()?.clone()),
+            Extension(actor),
+            AxumPath(ScopedAttachmentUploadPath {
+                workspace_id,
+                runtime_id,
+                worker_id,
+                upload_id,
+            }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_worker_attachment_delete(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+        artifact_id: String,
+    ) -> std::result::Result<server_api::WorkerFileDeleteResponse, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_delete_runtime_worker_uploaded_file(
+            State(self.workspace_api()?.clone()),
+            AxumPath((
+                ScopedRuntimeWorkerPath {
+                    workspace_id,
+                    worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+                },
+                artifact_id,
+            )),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_worker_completions_alias(
+        &self,
+        runtime_id: String,
+        worker_id: String,
+        request: server_api::RuntimeWorkerCompletionsRequest,
+    ) -> std::result::Result<
+        server_api::RuntimeWorkerCompletionsResult,
+        server_api::RepositoryApiError,
+    > {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = runtime_worker_completions(
+            State(self.workspace_api()?.clone()),
+            AxumPath((runtime_id, worker_id)),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_worker_completions(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+        request: server_api::RuntimeWorkerCompletionsRequest,
+    ) -> std::result::Result<
+        server_api::RuntimeWorkerCompletionsResult,
+        server_api::RepositoryApiError,
+    > {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_runtime_worker_completions(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimeWorkerPath {
+                workspace_id,
+                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+            }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_worker_stop_alias(
+        &self,
+        runtime_id: String,
+        worker_id: String,
+        request: server_api::RuntimeWorkerLifecycleRequest,
+    ) -> std::result::Result<server_api::RuntimeWorkerLifecycleResult, server_api::RepositoryApiError>
+    {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = stop_runtime_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath((runtime_id, worker_id)),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_worker_stop(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+        request: server_api::RuntimeWorkerLifecycleRequest,
+    ) -> std::result::Result<server_api::RuntimeWorkerLifecycleResult, server_api::RepositoryApiError>
+    {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_stop_runtime_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimeWorkerPath {
+                workspace_id,
+                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+            }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_worker_cancel_alias(
+        &self,
+        runtime_id: String,
+        worker_id: String,
+        request: server_api::RuntimeWorkerLifecycleRequest,
+    ) -> std::result::Result<server_api::RuntimeWorkerLifecycleResult, server_api::RepositoryApiError>
+    {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = cancel_runtime_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath((runtime_id, worker_id)),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn runtime_worker_cancel(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+        request: server_api::RuntimeWorkerLifecycleRequest,
+    ) -> std::result::Result<server_api::RuntimeWorkerLifecycleResult, server_api::RepositoryApiError>
+    {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_cancel_runtime_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimeWorkerPath {
+                workspace_id,
+                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+            }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
     async fn repository_list(
         &self,
         workspace_id: String,
@@ -6630,25 +7414,6 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
             "/api/w/{workspace_id}/runtime-config",
             get(get_latest_workspace_runtime_config),
         )
-        .route("/api/runtimes", get(list_runtimes))
-        .route(
-            "/api/w/{workspace_id}/runtimes",
-            get(scoped_list_runtimes).post(scoped_create_remote_runtime),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}",
-            get(scoped_get_runtime_detail)
-                .post(scoped_update_remote_runtime)
-                .delete(scoped_remove_remote_runtime),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/trust-key",
-            get(scoped_reveal_runtime_trust_key).delete(scoped_revoke_runtime_trust_key),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/connection-tests",
-            post(scoped_test_runtime_connection),
-        )
         .route(
             "/api/workers",
             get(list_workers).post(create_workspace_worker),
@@ -6739,102 +7504,9 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
             post(scoped_worker_remove_source_boundary),
         )
         .route(
-            "/api/runtimes/{runtime_id}/workers",
-            get(list_runtime_workers).post(create_runtime_worker),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers",
-            get(scoped_list_runtime_workers).post(scoped_create_runtime_worker),
-        )
-        .route(
-            "/api/runtimes/{runtime_id}/config-bundles",
-            post(sync_runtime_config_bundle),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/config-bundles",
-            post(scoped_sync_runtime_config_bundle),
-        )
-        .route(
-            "/api/runtimes/{runtime_id}/config-bundles/{bundle_id}/availability",
-            get(check_runtime_config_bundle),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/config-bundles/{bundle_id}/availability",
-            get(scoped_check_runtime_config_bundle),
-        )
-        .route(
-            "/api/runtimes/{runtime_id}/workers/{worker_id}",
-            get(get_runtime_worker),
-        )
-        .route(
-            "/api/runtimes/{runtime_id}/workers/{worker_id}/restore",
-            post(restore_runtime_worker),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}",
-            get(scoped_get_runtime_worker),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/restore",
-            post(scoped_restore_runtime_worker),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/pin",
-            put(scoped_pin_runtime_worker).delete(scoped_unpin_runtime_worker),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/cleanup-plan",
-            get(scoped_runtime_cleanup_plan),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/cleanup-executions",
-            post(scoped_execute_runtime_cleanup),
-        )
-        .route(
-            "/api/runtimes/{runtime_id}/workers/{worker_id}/input",
-            post(send_runtime_worker_input),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/input",
-            post(scoped_send_runtime_worker_input),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachment-upload-grants",
-            post(scoped_create_attachment_upload_grant),
-        )
-        .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachment-uploads/{upload_id}",
             put(scoped_upload_runtime_worker_file)
-                .delete(scoped_cancel_attachment_upload)
                 .layer(DefaultBodyLimit::max(MAX_WORKER_FILE_UPLOAD_BYTES)),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachments/{artifact_id}",
-            delete(scoped_delete_runtime_worker_uploaded_file),
-        )
-        .route(
-            "/api/runtimes/{runtime_id}/workers/{worker_id}/completions",
-            post(runtime_worker_completions),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/completions",
-            post(scoped_runtime_worker_completions),
-        )
-        .route(
-            "/api/runtimes/{runtime_id}/workers/{worker_id}/stop",
-            post(stop_runtime_worker),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/stop",
-            post(scoped_stop_runtime_worker),
-        )
-        .route(
-            "/api/runtimes/{runtime_id}/workers/{worker_id}/cancel",
-            post(cancel_runtime_worker),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/cancel",
-            post(scoped_cancel_runtime_worker),
         )
         .route(
             "/api/runtimes/{runtime_id}/workers/{worker_id}/protocol/ws",
@@ -16713,101 +17385,6 @@ async fn scoped_reveal_runtime_trust_key(
     }))
 }
 
-async fn scoped_revoke_runtime_trust_key(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRuntimePath>,
-    Extension(actor): Extension<RequestActor>,
-    Json(request): Json<RevokeRuntimeTrustKeyRequest>,
-) -> std::result::Result<Response, ApiError> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    require_workspace_owner(&api, &path.workspace_id, &actor, "Runtime trust changes").await?;
-    let actor_account_id = actor.account_id.clone();
-    if path.runtime_id == EMBEDDED_WORKER_RUNTIME_ID {
-        return Err(settings_bad_request(
-            "embedded_runtime_trust_managed_internally",
-            "the embedded Runtime trust key is managed by the embedded Runtime authority",
-        ));
-    }
-    if request.expected_revision == 0 {
-        return Err(settings_bad_request(
-            "invalid_runtime_binding_revision",
-            "expected_revision must be greater than zero",
-        ));
-    }
-    let now = Utc::now().to_rfc3339();
-    let mutation = api
-        .store
-        .revoke_workspace_runtime_binding_key(
-            &path.workspace_id,
-            &path.runtime_id,
-            request.expected_revision,
-            &actor_account_id,
-            &now,
-        )
-        .await;
-    let _ = match mutation {
-        Ok(result) => result,
-        Err(error) => {
-            if let Some(response) = runtime_trust_conflict_response(&api, &path, &error).await {
-                return Ok(response);
-            }
-            return Err(error.into());
-        }
-    };
-    api.runtime_binding_expectations
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&(path.workspace_id.clone(), path.runtime_id.clone()));
-    api.runtime_subscription_broker
-        .unregister_runtime(&path.runtime_id);
-    Ok(
-        Json(workspace_runtime_detail(&api, &path.workspace_id, &path.runtime_id).await?)
-            .into_response(),
-    )
-}
-
-async fn runtime_trust_conflict_response(
-    api: &WorkspaceApi,
-    path: &ScopedRuntimePath,
-    error: &Error,
-) -> Option<Response> {
-    let kind = match error {
-        Error::RuntimeBindingRevisionConflict { .. } => RuntimeTrustConflictKind::StaleRevision,
-        Error::RuntimeBindingFingerprintConflict { .. } => {
-            RuntimeTrustConflictKind::FingerprintInUse
-        }
-        _ => return None,
-    };
-    let current = api
-        .store
-        .get_workspace_runtime_binding(&path.workspace_id, &path.runtime_id)
-        .await
-        .ok()
-        .flatten();
-    Some(
-        (
-            StatusCode::CONFLICT,
-            Json(RuntimeTrustConflictResponse {
-                error: kind,
-                message: match kind {
-                    RuntimeTrustConflictKind::StaleRevision => {
-                        "the Runtime trust binding changed; reload before retrying".to_string()
-                    }
-                    RuntimeTrustConflictKind::FingerprintInUse => {
-                        "the public key is already bound to another Runtime in this Workspace"
-                            .to_string()
-                    }
-                },
-                current_revision: current.as_ref().map(|binding| binding.binding_revision),
-                current_fingerprint: current
-                    .as_ref()
-                    .map(|binding| binding.public_key_fingerprint.clone()),
-            }),
-        )
-            .into_response(),
-    )
-}
-
 async fn scoped_remove_remote_runtime(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
@@ -21059,6 +21636,7 @@ async fn workspace_runtime_resources_response(
                         runtime_binding_summary(binding, verifications.get(&binding.runtime_id))
                     }),
                 },
+                http_status: StatusCode::OK.as_u16(),
             }
         })
         .collect::<Vec<_>>();
@@ -21108,6 +21686,7 @@ async fn workspace_runtime_resources_response(
                     verifications.get(&binding.runtime_id),
                 )),
             },
+            http_status: StatusCode::OK.as_u16(),
         });
     }
 
@@ -21229,6 +21808,7 @@ async fn workspace_runtime_detail(
                 token_ref_configured: false,
                 binding: Some(runtime_binding_summary(&binding, None)),
             },
+            http_status: StatusCode::OK.as_u16(),
         });
     }
     let mut resource = resource.ok_or_else(|| Error::UnknownRuntime(runtime_id.to_string()))?;
@@ -32802,34 +33382,30 @@ mod tests {
         .unwrap_err();
         assert_eq!(denied.into_response().status(), StatusCode::FORBIDDEN);
 
-        let denied = scoped_revoke_runtime_trust_key(
-            State(api.clone()),
-            AxumPath(ScopedRuntimePath {
-                workspace_id: TEST_WORKSPACE_ID.to_owned(),
-                runtime_id: "runtime-a".to_owned(),
-            }),
-            Extension(non_owner),
-            Json(RevokeRuntimeTrustKeyRequest {
+        let contract_service = ServerApiContractService::Workspace(api.clone());
+        let denied = <ServerApiContractService as server_api::ServerApi>::runtime_trust_key_revoke(
+            &contract_service,
+            non_owner,
+            TEST_WORKSPACE_ID.to_owned(),
+            "runtime-a".to_owned(),
+            server_api::RevokeRuntimeTrustKeyRequest {
                 expected_revision: 1,
-            }),
+            },
         )
         .await
         .unwrap_err();
-        assert_eq!(denied.into_response().status(), StatusCode::FORBIDDEN);
-        let response = scoped_revoke_runtime_trust_key(
-            State(api.clone()),
-            AxumPath(ScopedRuntimePath {
-                workspace_id: TEST_WORKSPACE_ID.to_owned(),
-                runtime_id: "runtime-a".to_owned(),
-            }),
-            Extension(owner),
-            Json(RevokeRuntimeTrustKeyRequest {
+        assert_eq!(denied.error, "Forbidden");
+        <ServerApiContractService as server_api::ServerApi>::runtime_trust_key_revoke(
+            &contract_service,
+            owner,
+            TEST_WORKSPACE_ID.to_owned(),
+            "runtime-a".to_owned(),
+            server_api::RevokeRuntimeTrustKeyRequest {
                 expected_revision: 1,
-            }),
+            },
         )
         .await
         .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
         let binding = api
             .store
             .get_workspace_runtime_binding(TEST_WORKSPACE_ID, "runtime-a")

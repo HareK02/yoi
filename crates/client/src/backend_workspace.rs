@@ -31,6 +31,9 @@ pub enum BackendWorkspaceClientError {
     Api(BackendApiClientError),
     Http(reqwest::Error),
     ServerApi(server_api::client_support::ClientError<server_api::RepositoryApiError>),
+    RuntimeManagementApi(
+        server_api::client_support::ClientError<server_api::RuntimeManagementApiError>,
+    ),
 }
 
 impl fmt::Display for BackendWorkspaceClientError {
@@ -40,6 +43,7 @@ impl fmt::Display for BackendWorkspaceClientError {
             Self::Api(error) => write!(f, "{error}"),
             Self::Http(error) => write!(f, "{error}"),
             Self::ServerApi(error) => write!(f, "{error}"),
+            Self::RuntimeManagementApi(error) => write!(f, "{error}"),
         }
     }
 }
@@ -88,6 +92,29 @@ pub(crate) fn server_client_error(
             })
         }
         _ => BackendWorkspaceClientError::ServerApi(error),
+    }
+}
+
+pub(crate) fn runtime_management_client_error(
+    backend: &BackendApiClient,
+    error: server_api::client_support::ClientError<server_api::RuntimeManagementApiError>,
+) -> BackendWorkspaceClientError {
+    let status = match &error {
+        server_api::client_support::ClientError::Public { status, .. } => Some(*status),
+        server_api::client_support::ClientError::Failure(_) => None,
+    };
+    match status {
+        Some(reqwest::StatusCode::UNAUTHORIZED) => {
+            BackendWorkspaceClientError::Api(BackendApiClientError::Unauthorized {
+                origin: backend.origin().clone(),
+            })
+        }
+        Some(reqwest::StatusCode::FORBIDDEN) => {
+            BackendWorkspaceClientError::Api(BackendApiClientError::Forbidden {
+                origin: backend.origin().clone(),
+            })
+        }
+        _ => BackendWorkspaceClientError::RuntimeManagementApi(error),
     }
 }
 

@@ -3,7 +3,7 @@
   import type {
     RevokeRuntimeTrustKeyRequest,
     RuntimeTrustKeyStatus,
-  } from '$lib/generated/legacy-server-api';
+  } from '$lib/generated/runtime-api';
   import {
     createRemoteRuntime,
     removeRemoteRuntime,
@@ -414,9 +414,9 @@
         <div><dt>Updated</dt><dd>{formatTimestamp(trust.updated_at)}</dd></div>
         <div><dt>Revoked</dt><dd>{formatTimestamp(trust.revoked_at)}</dd></div>
       </dl>
-      {#if runtime.diagnostics.length > 0}
+      {#if (runtime.diagnostics ?? []).length > 0}
         <ul class="settings-diagnostics-list">
-          {#each runtime.diagnostics as diagnostic}
+          {#each runtime.diagnostics ?? [] as diagnostic}
             <li class:error={diagnostic.severity === 'error'} class:warning={diagnostic.severity === 'warning'}>
               <strong>{diagnostic.code}</strong>
               <span>{diagnostic.message}</span>

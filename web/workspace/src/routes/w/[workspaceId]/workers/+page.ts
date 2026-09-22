@@ -1,4 +1,5 @@
 import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
+import { parseRuntimeCleanupPlan } from "$lib/workspace/api/runtime-workers";
 import type {
   ListResponse,
   RuntimeCleanupPlanResponse,
@@ -16,12 +17,14 @@ export const load: PageLoad = async ({ fetch, params }) => {
   );
   const cleanupPlanEntries = await Promise.all(
     runtimeIds.map(async (runtimeId) => {
-      const cleanupPlan = await loadJson<RuntimeCleanupPlanResponse>(
+      const cleanupPlan = await loadJson(
         fetch,
         workspaceApiPath(
           params.workspaceId,
           `/runtimes/${encodeURIComponent(runtimeId)}/cleanup-plan`,
         ),
+        undefined,
+        parseRuntimeCleanupPlan,
       );
       return [runtimeId, cleanupPlan] as const;
     }),

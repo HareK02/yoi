@@ -1,10 +1,10 @@
 <script lang="ts">
   import { pushWorkspaceAlert } from '$lib/workspace/alerts/store';
   import { workspaceApiPath } from '$lib/workspace/api/http';
+  import { parseRuntimeCleanupExecution } from '$lib/workspace/api/runtime-workers';
   import { formatCurrentWorkdirRevision } from '$lib/workspace/settings/workdir-revision';
   import type {
     CleanupWorkdirCandidate,
-    RuntimeCleanupExecutionResponse,
     RuntimeCleanupPlanResponse,
     WorkingDirectorySummary,
   } from '$lib/workspace/sidebar/types';
@@ -83,14 +83,11 @@
           }),
         },
       );
-      const payload = (await response.json().catch(() => null)) as RuntimeCleanupExecutionResponse | unknown;
+      const payload = await response.json().catch(() => null);
       if (!response.ok) throw new Error(errorMessage(payload, response.statusText));
-      if (payload && typeof payload === 'object' && 'plan_after' in payload) {
-        cleanupPlan = (payload as RuntimeCleanupExecutionResponse).plan_after;
-      }
-      const result = payload && typeof payload === 'object' && 'results' in payload
-        ? (payload as RuntimeCleanupExecutionResponse).results.find((entry) => entry.target_id === candidate.target_id)
-        : undefined;
+      const execution = parseRuntimeCleanupExecution(payload);
+      cleanupPlan = execution.plan_after;
+      const result = execution.results.find((entry) => entry.target_id === candidate.target_id);
       if (!result || result.status !== 'deleted') {
         throw new Error(result?.message ?? 'Runtime did not delete the selected Workdir');
       }

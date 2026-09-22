@@ -1,18 +1,16 @@
 import { workspaceApiPath } from "$lib/workspace/api/http";
+import {
+  parseRuntimeCleanupExecution,
+  parseRuntimeCleanupPlan,
+  parseRuntimeWorkerLifecycleResult,
+} from "$lib/workspace/api/runtime-workers";
 import type {
   Diagnostic,
-  RuntimeCleanupExecutionResponse,
-  RuntimeCleanupPlanResponse,
   Worker,
 } from "./types";
 
 type FetchFn = typeof fetch;
 type WorkerActionTarget = Pick<Worker, "runtime_id" | "worker_id" | "state">;
-
-type WorkerLifecycleResponse = {
-  state: string;
-  diagnostics?: Diagnostic[];
-};
 
 function workerPath(workspaceId: string, worker: WorkerActionTarget): string {
   return workspaceApiPath(
@@ -62,7 +60,7 @@ export async function stopSidebarWorker(
   });
   if (!response.ok) throw new Error(await responseError(response));
 
-  const result = await response.json() as WorkerLifecycleResponse;
+  const result = parseRuntimeWorkerLifecycleResult(await response.json());
   if (result.state !== "accepted") {
     throw new Error(
       diagnosticMessage(result.diagnostics, `Worker stop was ${result.state}`),
@@ -81,7 +79,7 @@ export async function deleteSidebarWorker(
   );
   if (!planResponse.ok) throw new Error(await responseError(planResponse));
 
-  const plan = await planResponse.json() as RuntimeCleanupPlanResponse;
+  const plan = parseRuntimeCleanupPlan(await planResponse.json());
   const candidate = plan.workers.find((item) =>
     item.runtime_id === worker.runtime_id &&
     item.runtime_worker_id === worker.worker_id
@@ -107,8 +105,7 @@ export async function deleteSidebarWorker(
     throw new Error(await responseError(executionResponse));
   }
 
-  const execution = await executionResponse
-    .json() as RuntimeCleanupExecutionResponse;
+  const execution = parseRuntimeCleanupExecution(await executionResponse.json());
   const outcome = execution.results.find((result) =>
     result.target_id === candidate.target_id
   );
