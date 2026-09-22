@@ -263,6 +263,8 @@ impl WorkerE2eEnvironment {
             serde_json::to_vec_pretty(&binaries)?,
         )?;
         let client = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(1))
             .timeout(Duration::from_secs(3))
             .build()
@@ -295,6 +297,11 @@ impl WorkerE2eEnvironment {
     }
 
     pub fn start(&mut self) -> Result<()> {
+        self.start_backend()?;
+        self.start_runtime()
+    }
+
+    pub fn start_backend(&mut self) -> Result<()> {
         assert_absent_or_empty(&self.server_data_dir, "Server data directory")?;
         assert_absent_or_empty(&self.runtime_data_dir, "Runtime data directory")?;
         let server_binary = self.binaries.binary("yoi-server")?;
@@ -369,7 +376,14 @@ impl WorkerE2eEnvironment {
         })?;
         let bundle_path = self.root.join("workspace-public-identity.json");
         fs::write(&bundle_path, serde_json::to_vec_pretty(&public_bundle)?)?;
+        self.write_metadata("backend-running")?;
+        Ok(())
+    }
 
+    fn start_runtime(&mut self) -> Result<()> {
+        let bundle_path = self.root.join("workspace-public-identity.json");
+        let server_url = self.required_server_url()?.to_string();
+        let workspace_id = self.required_workspace_id()?.to_string();
         let runtime_binary = self.binaries.binary("yoi-runtime")?;
         self.run_command(
             &runtime_binary,
@@ -499,6 +513,91 @@ impl WorkerE2eEnvironment {
             )));
         }
         Ok(())
+    }
+
+    pub fn install_backend_token(&self, config_home: &Path) -> Result<PathBuf> {
+        let server_url = self.required_server_url()?;
+        let access_token = self.access_token.as_deref().ok_or_else(|| {
+            HarnessError::Protocol("Backend access token is not initialized".to_string())
+        })?;
+        let token_path = config_home.join("yoi/backend-tokens.json");
+        if let Some(parent) = token_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(
+            &token_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "tokens": {
+                    server_url: {
+                        "token_type": "Bearer",
+                        "access_token": access_token,
+                    }
+                }
+            }))?,
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(token_path)
+    }
+
+    pub fn create_planning_ticket(&self, title: &str) -> Result<String> {
+        let server_url = self.required_server_url()?;
+        let workspace_id = self.required_workspace_id()?;
+        let created = self.request_json(
+            self.client
+                .post(format!("{server_url}/api/w/{workspace_id}/tickets"))
+                .json(&serde_json::json!({
+                    "title": title,
+                    "slug": null,
+                    "kind": "task",
+                    "priority": "P2",
+                    "labels": [],
+                    "body": "Backend-owned panel E2E fixture.",
+                    "author": null,
+                    "assignee": null,
+                    "readiness": null,
+                    "risk_flags": [],
+                    "workflow_state": "planning",
+                    "queued_by": null,
+                    "queued_at": null,
+                    "repository_key": null,
+                    "ref_selector": null,
+                })),
+            "create Ticket",
+        )?;
+        json_string(&created, "/id")
+    }
+
+    pub fn capture_panel_seed(&self) -> Result<()> {
+        let server_url = self.required_server_url()?;
+        let workspace_id = self.required_workspace_id()?;
+        let tickets = self.request_json(
+            self.client.get(format!(
+                "{server_url}/api/w/{workspace_id}/tickets/search?state=active"
+            )),
+            "list panel fixture Tickets",
+        )?;
+        let objectives = self.request_json(
+            self.client.get(format!(
+                "{server_url}/api/w/{workspace_id}/objectives?limit=1000"
+            )),
+            "list panel fixture Objectives",
+        )?;
+        fs::write(
+            self.artifacts_dir.join("panel-seed.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "tickets": tickets,
+                "objectives": objectives,
+            }))?,
+        )?;
+        Ok(())
+    }
+
+    pub fn backend_target(&self) -> Result<(&str, &str)> {
+        Ok((self.required_server_url()?, self.required_workspace_id()?))
     }
 
     pub fn server_port(&self) -> Result<u16> {
@@ -652,7 +751,12 @@ impl WorkerE2eEnvironment {
                 "binary": binary,
                 "args": args,
                 "status": output.status.code(),
-                "stdout": if redact_stdout { "<redacted>" } else { "captured-not-persisted" },
+                "stdout": if redact_stdout {
+                    "<redacted>".to_string()
+                } else {
+                    bounded_text(&output.stdout, MAX_COMMAND_OUTPUT_BYTES)
+                },
+                "stderr": bounded_text(&output.stderr, MAX_COMMAND_OUTPUT_BYTES),
                 "env_clear": true,
             }),
         )?;

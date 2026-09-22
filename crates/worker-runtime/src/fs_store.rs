@@ -140,25 +140,11 @@ impl FsRuntimeStore {
             })?;
         }
         let snapshot_exists = root.join(RUNTIME_FILE).is_file();
-        let workers_dir = root.join(WORKERS_DIR);
-        if !snapshot_exists
-            && workers_dir.is_dir()
-            && fs::read_dir(&workers_dir)
-                .map_err(|source| RuntimeError::StoreIo {
-                    operation: "inspect uninitialized runtime store",
-                    path: workers_dir.clone(),
-                    source,
-                })?
-                .next()
-                .is_some()
-        {
-            return Err(RuntimeError::StoreCorrupt {
-                operation: "open runtime store",
-                path: root,
-                message: "Worker records exist without a Runtime snapshot".to_string(),
-            });
+        if root_existed && !snapshot_exists {
+            validate_fresh_runtime_store_layout(&root)?;
         }
 
+        let workers_dir = root.join(WORKERS_DIR);
         fs::create_dir_all(&workers_dir).map_err(|source| RuntimeError::StoreIo {
             operation: "create runtime store",
             path: workers_dir,
@@ -360,6 +346,38 @@ impl FsRuntimeStore {
     fn worker_dir(&self, worker_id: &WorkerId) -> PathBuf {
         self.root.join(WORKERS_DIR).join(worker_id.to_string())
     }
+}
+
+fn validate_fresh_runtime_store_layout(root: &Path) -> Result<(), RuntimeError> {
+    let entries = fs::read_dir(root).map_err(|source| RuntimeError::StoreIo {
+        operation: "inspect uninitialized runtime store",
+        path: root.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| RuntimeError::StoreIo {
+            operation: "inspect uninitialized runtime store",
+            path: root.to_path_buf(),
+            source,
+        })?;
+        let file_type = entry.file_type().map_err(|source| RuntimeError::StoreIo {
+            operation: "inspect uninitialized runtime store entry",
+            path: entry.path(),
+            source,
+        })?;
+        if entry.file_name() == "auth.toml" && file_type.is_file() {
+            continue;
+        }
+        return Err(RuntimeError::StoreCorrupt {
+            operation: "open runtime store",
+            path: root.to_path_buf(),
+            message: format!(
+                "unexpected persistence `{}` exists without a Runtime snapshot",
+                entry.file_name().to_string_lossy()
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn acquire_runtime_store_owner_lock(
@@ -2171,6 +2189,41 @@ mod tests {
             fs::read(root.join("auth.toml")).unwrap(),
             b"fixture auth material"
         );
+    }
+
+    #[test]
+    fn snapshotless_directory_rejects_non_auth_persistence() {
+        for unexpected in ["events.jsonl", "unknown.json"] {
+            let parent = tempfile::tempdir().unwrap();
+            let root = parent.path().join("runtime");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("auth.toml"), b"fixture auth material").unwrap();
+            fs::write(root.join(unexpected), b"must remain").unwrap();
+
+            let error = FsRuntimeStore::open_or_create(root.clone(), "runtime-test").unwrap_err();
+
+            assert!(matches!(
+                error,
+                RuntimeError::StoreCorrupt { path, .. } if path == root
+            ));
+            assert_eq!(fs::read(root.join(unexpected)).unwrap(), b"must remain");
+            assert!(!root.join(WORKERS_DIR).exists());
+        }
+    }
+
+    #[test]
+    fn orphan_archive_without_runtime_snapshot_is_rejected() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("runtime");
+        fs::create_dir_all(root.join(ORPHANED_WORKERS_DIR).join("worker-a")).unwrap();
+
+        let error = FsRuntimeStore::open_or_create(root.clone(), "runtime-test").unwrap_err();
+
+        assert!(matches!(
+            error,
+            RuntimeError::StoreCorrupt { path, .. } if path == root
+        ));
+        assert!(root.join(ORPHANED_WORKERS_DIR).join("worker-a").is_dir());
     }
 
     #[test]

@@ -628,6 +628,7 @@ impl PanelHarness {
 
         let mut command = Command::new(&config.binary);
         command
+            .current_dir(&config.workspace)
             .args(&config.command_args)
             .env_clear()
             .env("YOI_TUI_TEST_EVENTS", &artifacts.events_jsonl)
@@ -1338,8 +1339,8 @@ pub struct FixtureCleanupReport {
     pub report_path: PathBuf,
 }
 
-pub const READY_FIXTURE_TICKET_TITLE: &str = "Ready E2E Ticket";
-pub const PLANNING_FIXTURE_TICKET_TITLE: &str = "Planning E2E Ticket";
+pub const READY_FIXTURE_TICKET_TITLE: &str = "Planning E2E Ticket A";
+pub const PLANNING_FIXTURE_TICKET_TITLE: &str = "Planning E2E Ticket B";
 
 #[derive(Debug)]
 pub struct FixtureWorkspace {
@@ -1354,6 +1355,7 @@ pub struct FixtureWorkspace {
     pub artifacts_dir: PathBuf,
     pub ready_ticket_id: String,
     pub planning_ticket_id: String,
+    backend_environment: Option<WorkerE2eEnvironment>,
 }
 
 impl FixtureWorkspace {
@@ -1365,7 +1367,7 @@ impl FixtureWorkspace {
         Self::new_inner(binary, false)
     }
 
-    fn new_inner(binary: &Path, setup_dashboard: bool) -> Result<Self> {
+    fn new_inner(_binary: &Path, setup_dashboard: bool) -> Result<Self> {
         let allocation = allocate_fixture("tui")?;
         let root = allocation.root;
         let artifacts_dir = allocation.artifacts_dir;
@@ -1384,163 +1386,45 @@ impl FixtureWorkspace {
             artifacts_dir,
             ready_ticket_id: String::new(),
             planning_ticket_id: String::new(),
+            backend_environment: None,
         };
         fixture.write_fixture_metadata("created", None)?;
 
         if setup_dashboard {
-            let worker_metadata_root = active_worker_metadata_root(&fixture.home);
-            write_blocking_worker_metadata(&worker_metadata_root, "workspace")?;
-            write_blocking_worker_metadata(&worker_metadata_root, "workspace-orchestrator")?;
-            run_yoi(
-                binary,
-                &fixture.workspace,
-                &fixture.home,
-                &fixture.xdg_data_home,
-                &fixture.xdg_state_home,
-                &fixture.xdg_config_home,
-                &fixture.xdg_runtime_dir,
-                &fixture.artifacts_dir,
-                &["ticket", "init"],
-            )?;
-            let first = create_ticket(
-                binary,
-                &fixture.workspace,
-                &fixture.home,
-                &fixture.xdg_data_home,
-                &fixture.xdg_state_home,
-                &fixture.xdg_config_home,
-                &fixture.xdg_runtime_dir,
-                &fixture.artifacts_dir,
-                READY_FIXTURE_TICKET_TITLE,
-            )?;
-            run_yoi(
-                binary,
-                &fixture.workspace,
-                &fixture.home,
-                &fixture.xdg_data_home,
-                &fixture.xdg_state_home,
-                &fixture.xdg_config_home,
-                &fixture.xdg_runtime_dir,
-                &fixture.artifacts_dir,
-                &["ticket", "state", &first, "ready"],
-            )?;
-            let second = create_ticket(
-                binary,
-                &fixture.workspace,
-                &fixture.home,
-                &fixture.xdg_data_home,
-                &fixture.xdg_state_home,
-                &fixture.xdg_config_home,
-                &fixture.xdg_runtime_dir,
-                &fixture.artifacts_dir,
-                PLANNING_FIXTURE_TICKET_TITLE,
-            )?;
-            fixture.ready_ticket_id = first;
-            fixture.planning_ticket_id = second;
-            fixture.setup_orchestration_overlay(binary)?;
+            let mut backend = WorkerE2eEnvironment::new()?;
+            backend.start_backend()?;
+            backend.install_backend_token(&fixture.xdg_config_home)?;
+            fixture.ready_ticket_id = backend.create_planning_ticket(READY_FIXTURE_TICKET_TITLE)?;
+            fixture.planning_ticket_id =
+                backend.create_planning_ticket(PLANNING_FIXTURE_TICKET_TITLE)?;
+            backend.capture_panel_seed()?;
+            fixture.backend_environment = Some(backend);
         }
         fixture.write_fixture_metadata("ready", None)?;
         Ok(fixture)
     }
 
-    pub fn ready_fixture_ticket_row(&self) -> ExpectedPanelTicketRow {
-        ExpectedPanelTicketRow::new(
-            self.ready_ticket_id.clone(),
-            READY_FIXTURE_TICKET_TITLE,
-            "ready",
-        )
-        .with_action("Queue")
-        .with_local_state("ready")
-    }
-
-    pub fn ready_overlay_ticket_row(&self) -> ExpectedPanelTicketRow {
-        ExpectedPanelTicketRow::new(
-            self.ready_ticket_id.clone(),
-            READY_FIXTURE_TICKET_TITLE,
-            "ready→prog",
-        )
-        .with_action("Wait")
-        .with_disabled_reason("orchestration worktree overlay shows Ticket state inprogress")
-        .with_local_state("ready")
-        .with_overlay_state("inprogress")
-    }
-
-    pub fn planning_fixture_ticket_row(&self) -> ExpectedPanelTicketRow {
-        ExpectedPanelTicketRow::new(
-            self.planning_ticket_id.clone(),
-            PLANNING_FIXTURE_TICKET_TITLE,
-            "planning",
-        )
-        .with_action("Clarify")
-        .with_disabled_reason("Ticket is still in planning")
-        .with_local_state("planning")
-    }
-
-    pub fn expected_dashboard_content(&self) -> ExpectedDashboardContent {
-        ExpectedDashboardContent {
-            tickets: vec![
-                self.ready_overlay_ticket_row(),
-                self.planning_fixture_ticket_row(),
-            ],
-            worker_names: vec!["workspace".to_string()],
-            companion_status: "spawned".to_string(),
-            orchestrator_status: "unavailable".to_string(),
-        }
-    }
-
-    fn setup_orchestration_overlay(&self, binary: &Path) -> Result<()> {
-        run_git(&self.workspace, &["init"])?;
-        run_git(&self.workspace, &["checkout", "-B", "develop"])?;
-        run_git(
-            &self.workspace,
-            &["config", "user.email", "fixture@example.invalid"],
-        )?;
-        run_git(&self.workspace, &["config", "user.name", "Yoi E2E Fixture"])?;
-        run_git(&self.workspace, &["add", ".yoi"])?;
-        run_git(&self.workspace, &["commit", "-m", "fixture tickets"])?;
-        let orchestration = self.workspace.join(".worktree/orchestration");
-        run_git(
-            &self.workspace,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "orchestration",
-                orchestration.to_string_lossy().as_ref(),
-                "HEAD",
-            ],
-        )?;
-        run_yoi(
-            binary,
-            &orchestration,
-            &self.home,
-            &self.xdg_data_home,
-            &self.xdg_state_home,
-            &self.xdg_config_home,
-            &self.xdg_runtime_dir,
-            &self.artifacts_dir,
-            &["ticket", "state", &self.ready_ticket_id, "queued"],
-        )?;
-        run_yoi(
-            binary,
-            &orchestration,
-            &self.home,
-            &self.xdg_data_home,
-            &self.xdg_state_home,
-            &self.xdg_config_home,
-            &self.xdg_runtime_dir,
-            &self.artifacts_dir,
-            &["ticket", "state", &self.ready_ticket_id, "inprogress"],
-        )?;
-        run_git(&orchestration, &["add", ".yoi"])?;
-        run_git(
-            &orchestration,
-            &["commit", "-m", "fixture orchestration overlay"],
-        )?;
-        Ok(())
+    pub fn backend_target(&self) -> Option<(&str, &str)> {
+        self.backend_environment
+            .as_ref()
+            .and_then(|backend| backend.backend_target().ok())
     }
 
     pub fn panel_config(&self, binary: PathBuf) -> PanelHarnessConfig {
+        let command_args = if let Some(backend) = self.backend_environment.as_ref() {
+            let (server_url, workspace_id) = backend
+                .backend_target()
+                .expect("started Backend panel fixture has a target");
+            vec![
+                "--backend".to_string(),
+                server_url.to_string(),
+                "--workspace-id".to_string(),
+                workspace_id.to_string(),
+                "panel".to_string(),
+            ]
+        } else {
+            Vec::new()
+        };
         PanelHarnessConfig {
             binary,
             workspace: self.workspace.clone(),
@@ -1553,11 +1437,7 @@ impl FixtureWorkspace {
             terminal_size: (100, 32),
             hold_background_task: None,
             rewind_fixture: false,
-            command_args: vec![
-                "panel".to_string(),
-                "--workspace".to_string(),
-                self.workspace.display().to_string(),
-            ],
+            command_args,
             artifacts_dir: self.artifacts_dir.clone(),
         }
     }
@@ -1590,18 +1470,34 @@ impl FixtureWorkspace {
     }
 
     fn cleanup_inner(&mut self, strict: bool) -> Result<FixtureCleanupReport> {
+        let mut cleanup_errors = Vec::new();
+        let token_path = self.xdg_config_home.join("yoi/backend-tokens.json");
+        match fs::remove_file(&token_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => cleanup_errors.push(format!(
+                "remove Backend client credential {}: {error}",
+                token_path.display()
+            )),
+        }
+        if let Some(backend) = self.backend_environment.take()
+            && let Err(error) = backend.cleanup()
+        {
+            cleanup_errors.push(format!("cleanup Backend panel environment: {error}"));
+        }
+
         let snapshot_dir = self.artifacts_dir.join("fixture-snapshot");
         if snapshot_dir.exists() {
             fs::remove_dir_all(&snapshot_dir)?;
         }
         copy_dir_recursive(&self.root, &snapshot_dir)?;
 
-        let mut cleanup_error = None;
-        if let Some(temp_root) = self.temp_root.take() {
-            if let Err(err) = temp_root.close() {
-                cleanup_error = Some(err.to_string());
-            }
+        if let Some(temp_root) = self.temp_root.take()
+            && let Err(err) = temp_root.close()
+        {
+            cleanup_errors.push(err.to_string());
         }
+        let cleanup_error = (!cleanup_errors.is_empty()).then(|| cleanup_errors.join("; "));
         let fixture_root_exists_after = self.root.exists();
         let cleanup_success = cleanup_error.is_none() && !fixture_root_exists_after;
         let report = FixtureCleanupReport {
@@ -1648,7 +1544,7 @@ impl FixtureWorkspace {
                     "ready": {
                         "id": &self.ready_ticket_id,
                         "title": READY_FIXTURE_TICKET_TITLE,
-                        "state": "ready"
+                        "state": "planning"
                     },
                     "planning": {
                         "id": &self.planning_ticket_id,
@@ -1661,8 +1557,10 @@ impl FixtureWorkspace {
                     "host_runtime_inherited": false,
                     "host_xdg_runtime_dir_present": std::env::var_os("XDG_RUNTIME_DIR").is_some(),
                     "tested_yoi_runtime_source": "fixture XDG_RUNTIME_DIR",
-                    "tested_yoi_worker_allocation": self.xdg_runtime_dir.join("yoi").join("workers.json"),
-                    "fixture_worker_metadata_root": active_worker_metadata_root(&self.home)
+                    "backend_target": self.backend_target().map(|(base_url, workspace_id)| serde_json::json!({
+                        "base_url": base_url,
+                        "workspace_id": workspace_id,
+                    })),
                 },
                 "tested_yoi_env_policy": tested_yoi_env_policy_overview(),
                 "cleanup": cleanup,
@@ -1873,145 +1771,6 @@ fn open_pty(size: (u16, u16)) -> Result<(File, File)> {
     Ok((master, slave))
 }
 
-fn create_ticket(
-    binary: &Path,
-    workspace: &Path,
-    home: &Path,
-    data: &Path,
-    state: &Path,
-    config: &Path,
-    runtime: &Path,
-    artifacts_dir: &Path,
-    title: &str,
-) -> Result<String> {
-    let output = run_yoi_capture(
-        binary,
-        workspace,
-        home,
-        data,
-        state,
-        config,
-        runtime,
-        artifacts_dir,
-        &["ticket", "create", "--title", title],
-    )?;
-    output
-        .split_whitespace()
-        .find(|part| part.len() >= 13 && part.chars().all(|ch| ch.is_ascii_alphanumeric()))
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| HarnessError::Protocol(format!("could not parse ticket id from {output:?}")))
-}
-
-fn run_git(workspace: &Path, args: &[&str]) -> Result<()> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(workspace)
-        .output()?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(HarnessError::CommandFailed {
-        program: PathBuf::from("git"),
-        args: args.iter().map(|arg| (*arg).to_string()).collect(),
-        status: output.status,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
-}
-
-fn run_yoi(
-    binary: &Path,
-    workspace: &Path,
-    home: &Path,
-    data: &Path,
-    state: &Path,
-    config: &Path,
-    runtime: &Path,
-    artifacts_dir: &Path,
-    args: &[&str],
-) -> Result<()> {
-    let output = run_yoi_capture(
-        binary,
-        workspace,
-        home,
-        data,
-        state,
-        config,
-        runtime,
-        artifacts_dir,
-        args,
-    )?;
-    drop(output);
-    Ok(())
-}
-
-fn run_yoi_capture(
-    binary: &Path,
-    workspace: &Path,
-    home: &Path,
-    data: &Path,
-    state: &Path,
-    config: &Path,
-    runtime: &Path,
-    artifacts_dir: &Path,
-    args: &[&str],
-) -> Result<String> {
-    let env_policy = fixture_setup_env_policy();
-    append_fixture_command_artifact(artifacts_dir, workspace, binary, args, &env_policy)?;
-
-    let mut command = Command::new(binary);
-    command
-        .args(args)
-        .current_dir(workspace)
-        .env_clear()
-        .env("HOME", home)
-        .env("XDG_DATA_HOME", data)
-        .env("XDG_STATE_HOME", state)
-        .env("XDG_CONFIG_HOME", config)
-        .env("XDG_RUNTIME_DIR", runtime)
-        .env("YOI_POD_RUNTIME_COMMAND", binary);
-
-    let output = command.output()?;
-    if !output.status.success() {
-        return Err(HarnessError::CommandFailed {
-            program: binary.to_path_buf(),
-            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
-            status: output.status,
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        });
-    }
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    Ok(text)
-}
-
-fn append_fixture_command_artifact(
-    artifacts_dir: &Path,
-    workspace: &Path,
-    binary: &Path,
-    args: &[&str],
-    env_policy: &EnvPolicy,
-) -> Result<()> {
-    fs::create_dir_all(artifacts_dir)?;
-    let mut file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(artifacts_dir.join("fixture-commands.jsonl"))?;
-    serde_json::to_writer(
-        &mut file,
-        &serde_json::json!({
-            "ts_ms": now_ms(),
-            "binary": binary,
-            "workspace": workspace,
-            "args": args,
-            "tested_yoi_env_policy": env_policy,
-        }),
-    )?;
-    writeln!(file)?;
-    Ok(())
-}
-
 fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
     if !source.exists() {
         return Ok(());
@@ -2034,17 +1793,6 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
             )?;
         }
     }
-    Ok(())
-}
-
-fn active_worker_metadata_root(home: &Path) -> PathBuf {
-    home.join(".yoi").join("workers")
-}
-
-fn write_blocking_worker_metadata(worker_metadata_root: &Path, worker_name: &str) -> Result<()> {
-    let dir = worker_metadata_root.join(worker_name);
-    fs::create_dir_all(&dir)?;
-    fs::write(dir.join("metadata.json"), b"not valid metadata for e2e\n")?;
     Ok(())
 }
 
