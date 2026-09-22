@@ -395,6 +395,27 @@ function workspaceRepositoryRecord(
   };
 }
 
+function workspaceString(value: unknown, path: string): string {
+  const parsed = string(value, path);
+  if (parsed.length > REPOSITORY_API_LIMITS.maxStringCodeUnits) {
+    throw new Error(`${path} exceeds the Workspace API string limit`);
+  }
+  return parsed;
+}
+
+function workspaceDiagnostics(value: unknown, path: string): Diagnostic[] {
+  const entries = array(value, path);
+  if (entries.length > 100) {
+    throw new Error(`${path} exceeds the Workspace API collection limit`);
+  }
+  return entries.map((entry, index) => {
+    const parsed = diagnostic(entry, `${path}[${index}]`);
+    workspaceString(parsed.code, `${path}[${index}].code`);
+    workspaceString(parsed.message, `${path}[${index}].message`);
+    return parsed;
+  });
+}
+
 function extensionPoint(
   value: unknown,
   path: string,
@@ -402,12 +423,9 @@ function extensionPoint(
   const item = object(value, path);
   exactKeys(item, ["status", "note", "diagnostics"], path);
   return {
-    status: string(item.status, `${path}.status`),
-    note: string(item.note, `${path}.note`),
-    diagnostics: array(item.diagnostics, `${path}.diagnostics`).map((
-      entry,
-      index,
-    ) => diagnostic(entry, `${path}.diagnostics[${index}]`)),
+    status: workspaceString(item.status, `${path}.status`),
+    note: workspaceString(item.note, `${path}.note`),
+    diagnostics: workspaceDiagnostics(item.diagnostics, `${path}.diagnostics`),
   };
 }
 
@@ -423,7 +441,7 @@ function extensionPoints(
     "companion_console",
   ], path);
   return {
-    store: string(item.store, `${path}.store`),
+    store: workspaceString(item.store, `${path}.store`),
     event_stream: extensionPoint(item.event_stream, `${path}.event_stream`),
     host_worker_bridge: extensionPoint(
       item.host_worker_bridge,
@@ -447,13 +465,16 @@ function authConfig(value: unknown, path: string): WorkspaceAuthConfig {
   );
   return {
     Passkey: {
-      rp_id: string(passkey.rp_id, `${path}.Passkey.rp_id`),
-      origin: string(passkey.origin, `${path}.Passkey.origin`),
-      public_base_url: string(
+      rp_id: workspaceString(passkey.rp_id, `${path}.Passkey.rp_id`),
+      origin: workspaceString(passkey.origin, `${path}.Passkey.origin`),
+      public_base_url: workspaceString(
         passkey.public_base_url,
         `${path}.Passkey.public_base_url`,
       ),
-      cookie_name: string(passkey.cookie_name, `${path}.Passkey.cookie_name`),
+      cookie_name: workspaceString(
+        passkey.cookie_name,
+        `${path}.Passkey.cookie_name`,
+      ),
     },
   };
 }
@@ -575,23 +596,27 @@ export function parseWorkspaceResponse(value: unknown): WorkspaceResponse {
     ],
     "workspace response",
   );
+  const schemaVersion = integer(
+    response.schema_version,
+    "workspace response.schema_version",
+  );
+  if (schemaVersion < 0) {
+    throw new Error("workspace response.schema_version must be non-negative");
+  }
   return {
-    workspace_id: string(
+    workspace_id: workspaceString(
       response.workspace_id,
       "workspace response.workspace_id",
     ),
-    display_name: string(
+    display_name: workspaceString(
       response.display_name,
       "workspace response.display_name",
     ),
-    record_authority: string(
+    record_authority: workspaceString(
       response.record_authority,
       "workspace response.record_authority",
     ),
-    schema_version: integer(
-      response.schema_version,
-      "workspace response.schema_version",
-    ),
+    schema_version: schemaVersion,
     auth: authConfig(response.auth, "workspace response.auth"),
     permissions: permissions(
       response.permissions,

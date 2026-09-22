@@ -1,5 +1,9 @@
 import { error } from "@sveltejs/kit";
-import { RepositoryAccessSchemaError } from "./repository-access.ts";
+import { readBoundedJson } from "./http.ts";
+import {
+  REPOSITORY_ACCESS_MAX_RESPONSE_BYTES,
+  RepositoryAccessSchemaError,
+} from "./repository-access.ts";
 
 export async function loadRepositoryAccessJson<T>(
   fetcher: typeof fetch,
@@ -27,7 +31,10 @@ export async function loadRepositoryAccessJson<T>(
 
   let payload: unknown;
   try {
-    payload = await response.json();
+    payload = await readBoundedJson(
+      response,
+      REPOSITORY_ACCESS_MAX_RESPONSE_BYTES,
+    );
   } catch {
     error(502, {
       message: "Repository Access returned an invalid JSON response.",

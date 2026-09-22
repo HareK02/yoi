@@ -13,6 +13,12 @@ import type {
   WorkspaceSigningIdentityResponse,
   WorkspaceSigningIdentityState,
 } from "$lib/generated/legacy-server-api";
+import { readBoundedJson } from "$lib/workspace/api/http.ts";
+
+const MAX_PROFILE_RESPONSE_BYTES = 4 * 1024 * 1024;
+const MAX_PROFILE_ERROR_BYTES = 4 * 1024;
+const MAX_PROFILE_STRING_BYTES = 1024 * 1024;
+const MAX_PROFILE_COLLECTION_ITEMS = 1000;
 
 export class ProfileApiError extends Error {
   constructor(
@@ -49,10 +55,7 @@ function exactKeys(
 }
 
 function stringValue(value: unknown, context: string): string {
-  if (typeof value !== "string") {
-    throw new ProfileApiError(`${context} returned an invalid response.`, 502);
-  }
-  return value;
+  return boundedStringValue(value, context, MAX_PROFILE_STRING_BYTES);
 }
 
 function boundedStringValue(
@@ -60,7 +63,10 @@ function boundedStringValue(
   context: string,
   maxBytes: number,
 ): string {
-  const text = stringValue(value, context);
+  if (typeof value !== "string") {
+    throw new ProfileApiError(`${context} returned an invalid response.`, 502);
+  }
+  const text = value;
   if (new TextEncoder().encode(text).byteLength > maxBytes) {
     throw new ProfileApiError(`${context} returned an invalid response.`, 502);
   }
@@ -107,7 +113,7 @@ function arrayValue<T>(
   parser: (item: unknown) => T,
   context: string,
 ): T[] {
-  if (!Array.isArray(value)) {
+  if (!Array.isArray(value) || value.length > MAX_PROFILE_COLLECTION_ITEMS) {
     throw new ProfileApiError(`${context} returned an invalid response.`, 502);
   }
   return value.map(parser);
@@ -502,17 +508,23 @@ export function parseWorkspaceSigningIdentityResponse(
   };
 }
 
+async function boundedErrorText(response: Response): Promise<string> {
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength > MAX_PROFILE_ERROR_BYTES) return "";
+  return new TextDecoder().decode(bytes);
+}
+
 async function parseResponse<T>(
   response: Response,
   parser: (value: unknown) => T,
 ): Promise<T> {
   if (!response.ok) {
     throw new ProfileApiError(
-      (await response.text()) || response.statusText,
+      (await boundedErrorText(response)) || response.statusText,
       response.status,
     );
   }
-  return parser(await response.json() as unknown);
+  return parser(await readBoundedJson(response, MAX_PROFILE_RESPONSE_BYTES));
 }
 
 export async function fetchWorkspaceMetadata(

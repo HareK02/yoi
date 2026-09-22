@@ -8,6 +8,7 @@ mod decision;
 mod request;
 mod summary;
 
+pub(crate) use common::JsonSafeU64Pair;
 pub use common::{
     EvidenceKind, EvidenceOrigin, EvidenceOriginKind, Frontmatter, SourceEvidenceRef, SourceRef,
     split_frontmatter,

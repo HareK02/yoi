@@ -12,10 +12,12 @@
     RotateRepositorySshCredentialRequest,
   } from '$lib/generated/repository-access-api';
   import {
+    REPOSITORY_ACCESS_MAX_RESPONSE_BYTES,
     parseRepositorySshCredential,
     parseRepositorySshHostTrust,
     parseRepositorySshPublicKey,
   } from '$lib/workspace/api/repository-access';
+  import { readBoundedJson } from '$lib/workspace/api/http';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
@@ -71,13 +73,21 @@
       body: JSON.stringify(body)
     });
     if (!response.ok) {
+      await response.body?.cancel();
       throw new Error(`Repository Access request failed with status ${response.status}.`);
     }
-    if (response.status === 204) return undefined;
-    const payload: unknown = await response.json();
     if (parse === null) {
-      throw new Error('Repository Access returned an unexpected response body.');
+      if (response.status !== 204) {
+        await response.body?.cancel();
+        throw new Error('Repository Access returned an unexpected response body.');
+      }
+      await response.body?.cancel();
+      return undefined;
     }
+    if (response.status === 204) {
+      throw new Error('Repository Access returned an unexpected empty response.');
+    }
+    const payload = await readBoundedJson(response, REPOSITORY_ACCESS_MAX_RESPONSE_BYTES);
     return parse(payload);
   }
 
@@ -86,10 +96,11 @@
       `${base}/credentials/${encodeURIComponent(credentialId)}/public-key`,
       { headers: { accept: 'application/json' } }
     );
-    const body = await response.json();
     if (!response.ok) {
+      await response.body?.cancel();
       throw new Error(`Repository Access request failed with status ${response.status}.`);
     }
+    const body = await readBoundedJson(response, REPOSITORY_ACCESS_MAX_RESPONSE_BYTES);
     return parseRepositorySshPublicKey(body);
   }
 

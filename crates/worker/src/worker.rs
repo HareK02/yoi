@@ -3889,8 +3889,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .ok_or_else(|| {
                 WorkerError::FlowInput("Workspace client has no Workspace scope".to_string())
             })?;
-        let request = flow::FlowSourceResolveRequest {
-            selector: selector.clone(),
+        let request = server_api::FlowSourceResolveRequest {
+            selector: selector.to_string(),
         };
         let response = workspace
             .execute(WorkspaceRequest {
@@ -3915,13 +3915,19 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 response.status
             )));
         }
-        let source: flow::ResolvedFlowSource = serde_json::from_str(&response.body)
+        let wire_source: server_api::ResolvedFlowSource = serde_json::from_str(&response.body)
             .map_err(|error| WorkerError::FlowInput(format!("decode Flow source: {error}")))?;
-        if source.workspace_id != workspace_id || source.selector != selector {
+        if wire_source.workspace_id != workspace_id || wire_source.selector != selector.to_string()
+        {
             return Err(WorkerError::FlowInput(
                 "Workspace returned a Flow source outside the requested scope".to_string(),
             ));
         }
+        let source: flow::ResolvedFlowSource =
+            serde_json::from_value(serde_json::to_value(wire_source).map_err(|error| {
+                WorkerError::FlowInput(format!("project Flow source transport: {error}"))
+            })?)
+            .map_err(|error| WorkerError::FlowInput(format!("convert Flow source: {error}")))?;
         let (state, initial_instructions) =
             flow::FlowRuntimeState::start(&source, uuid::Uuid::now_v7().to_string())
                 .map_err(|error| WorkerError::FlowInput(error.to_string()))?;

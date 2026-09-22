@@ -4,6 +4,8 @@
 //! by Rust clients. Runtime-internal projections remain in their owning crates;
 //! callers must explicitly construct these Server-authoritative resources.
 
+use std::collections::BTreeMap;
+
 use api_macros::api;
 pub use api_macros::axum as server_support;
 pub use api_macros::reqwest as client_support;
@@ -16,6 +18,11 @@ use webauthn_rs_proto::{
     CreationChallengeResponse, PublicKeyCredential, RegisterPublicKeyCredential,
     RequestChallengeResponse,
 };
+
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+struct ServerJsonSafeU64(#[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))] u64);
+type JsonSafeU64Pair = [ServerJsonSafeU64; 2];
 
 pub type ServerApiError = runtime_api::RuntimeApiError;
 pub type ServerApiClientError = client_support::ClientError<ServerApiError>;
@@ -104,6 +111,47 @@ impl_openapi_schema!(
     RepositoryApiError,
     RepositoryListResponse,
     RepositoryDetailResponse,
+    WorkspaceResponse,
+    WorkspaceMetadataSettingsResponse,
+    UpdateWorkspaceMetadataRequest,
+    WorkspaceMetadataMutationResponse,
+    WorkspaceSigningIdentityResponse,
+    WorkspaceMemorySettings,
+    UpdateWorkspaceMemorySettingsRequest,
+    RepositoryAccessProjection,
+    RepositorySshCredentialListResponse,
+    RepositorySshCredential,
+    CreateRepositorySshCredentialRequest,
+    GenerateRepositorySshCredentialRequest,
+    RepositorySshPublicKey,
+    RotateRepositorySshCredentialRequest,
+    DeleteRepositorySshCredentialRequest,
+    RepositorySshHostTrustListResponse,
+    RepositorySshHostTrust,
+    PutRepositorySshHostTrustRequest,
+    RepositorySshHostTrustMutationResponse,
+    DeleteRepositorySshHostTrustRequest,
+    WorkspaceConfigTreeResponse,
+    WorkspacePromptProjection,
+    ConfigCommitRequest,
+    ConfigTreeSnapshot,
+    ConfigEntry,
+    ProfileSettingsResponse,
+    FlowSourceListResponse,
+    FlowSourceRecord,
+    PutFlowRequest,
+    FlowSourceResolveRequest,
+    ResolvedFlowSource,
+    MemoryDocumentResponse,
+    MemoryStagingQuery,
+    MemoryStagingListResponse,
+    MemoryBackendRequest,
+    MemoryBackendResponse,
+    MemoryConsolidateStagingRequest,
+    MemoryConsolidationResponse,
+    SkillCatalogResponse,
+    SkillDetailResponse,
+    SkillActivationResponse,
 );
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -270,6 +318,518 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[path] operation_id: String,
     ) -> Result<WorkspaceDeletionOperationResponse, RepositoryApiError>;
+
+    #[get("/api/workspace", status = 200, error_status = 400)]
+    async fn workspace_current(
+        &self,
+        #[extension] context: ServerRequestContext,
+    ) -> Result<WorkspaceResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/workspace",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_scoped(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+    ) -> Result<WorkspaceResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/settings",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_metadata_settings(
+        &self,
+        #[path] workspace_id: String,
+    ) -> Result<WorkspaceMetadataSettingsResponse, RepositoryApiError>;
+
+    #[put(
+        "/api/w/{workspace_id}/settings",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_metadata_settings_update(
+        &self,
+        #[path] workspace_id: String,
+        #[body] request: UpdateWorkspaceMetadataRequest,
+    ) -> Result<WorkspaceMetadataMutationResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/settings/signing-identity",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_signing_identity(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+    ) -> Result<WorkspaceSigningIdentityResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/settings/signing-identity/provision",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_signing_identity_provision(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+    ) -> Result<WorkspaceSigningIdentityResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/settings/memory",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_memory_settings(
+        &self,
+        #[path] workspace_id: String,
+    ) -> Result<WorkspaceMemorySettings, RepositoryApiError>;
+
+    #[put(
+        "/api/w/{workspace_id}/settings/memory",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_memory_settings_update(
+        &self,
+        #[path] workspace_id: String,
+        #[body] request: UpdateWorkspaceMemorySettingsRequest,
+    ) -> Result<WorkspaceMemorySettings, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/settings/repository-access",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_access_projection(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+    ) -> Result<RepositoryAccessProjection, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/settings/repository-access/credentials",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_ssh_credential_list(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+    ) -> Result<RepositorySshCredentialListResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/settings/repository-access/credentials",
+        status = 201,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_ssh_credential_create(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[body] request: CreateRepositorySshCredentialRequest,
+    ) -> Result<RepositorySshCredential, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/settings/repository-access/credentials/generate",
+        status = 201,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_ssh_credential_generate(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[body] request: GenerateRepositorySshCredentialRequest,
+    ) -> Result<RepositorySshCredential, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}",
+        status = 200,
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_ssh_credential_get(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] credential_id: String,
+    ) -> Result<RepositorySshCredential, RepositoryApiError>;
+
+    #[delete(
+        "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}",
+        status = 204,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_ssh_credential_delete(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] credential_id: String,
+        #[body] request: DeleteRepositorySshCredentialRequest,
+    ) -> Result<(), RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}/public-key",
+        status = 200,
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_ssh_credential_public_key(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] credential_id: String,
+    ) -> Result<RepositorySshPublicKey, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}/rotate",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_ssh_credential_rotate(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] credential_id: String,
+        #[body] request: RotateRepositorySshCredentialRequest,
+    ) -> Result<RepositorySshCredential, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/settings/repository-access/host-trusts",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_ssh_host_trust_list(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+    ) -> Result<RepositorySshHostTrustListResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/settings/repository-access/host-trusts",
+        status = 201,
+        alternate_status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_ssh_host_trust_put(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[body] request: PutRepositorySshHostTrustRequest,
+    ) -> Result<RepositorySshHostTrustMutationResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/settings/repository-access/host-trusts/{host_trust_id}",
+        status = 200,
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_ssh_host_trust_get(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] host_trust_id: String,
+    ) -> Result<RepositorySshHostTrust, RepositoryApiError>;
+
+    #[delete(
+        "/api/w/{workspace_id}/settings/repository-access/host-trusts/{host_trust_id}",
+        status = 204,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn repository_ssh_host_trust_delete(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] host_trust_id: String,
+        #[body] request: DeleteRepositorySshHostTrustRequest,
+    ) -> Result<(), RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/config/source-tree",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_config_tree(
+        &self,
+        #[path] workspace_id: String,
+    ) -> Result<WorkspaceConfigTreeResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/config/projections/prompts",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500]
+    )]
+    async fn workspace_prompt_projection(
+        &self,
+        #[path] workspace_id: String,
+    ) -> Result<WorkspacePromptProjection, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/config/source-tree/commit",
+        status = 201,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_config_tree_commit(
+        &self,
+        #[path] workspace_id: String,
+        #[body] request: ConfigCommitRequest,
+    ) -> Result<WorkspaceConfigTreeResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/config/source-tree/revisions/{revision}",
+        status = 200,
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_config_revision(
+        &self,
+        #[path] workspace_id: String,
+        #[path] revision: String,
+    ) -> Result<ConfigTreeSnapshot, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/config/source-tree/entries/{path}",
+        status = 200,
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_config_entry(
+        &self,
+        #[path] workspace_id: String,
+        #[path] path: String,
+    ) -> Result<ConfigEntry, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/settings/profiles",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn profile_settings(
+        &self,
+        #[path] workspace_id: String,
+    ) -> Result<ProfileSettingsResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/flows",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500]
+    )]
+    async fn flow_list(
+        &self,
+        #[path] workspace_id: String,
+    ) -> Result<FlowSourceListResponse, RepositoryApiError>;
+
+    #[put(
+        "/api/w/{workspace_id}/flows",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500]
+    )]
+    async fn flow_put(
+        &self,
+        #[path] workspace_id: String,
+        #[body] request: PutFlowRequest,
+    ) -> Result<FlowSourceRecord, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/flows/resolve",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500]
+    )]
+    async fn flow_resolve(
+        &self,
+        #[path] workspace_id: String,
+        #[body] request: FlowSourceResolveRequest,
+    ) -> Result<ResolvedFlowSource, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/flows/{flow_id}",
+        status = 200,
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 500]
+    )]
+    async fn flow_get(
+        &self,
+        #[path] workspace_id: String,
+        #[path] flow_id: String,
+    ) -> Result<FlowSourceRecord, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/memory",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn memory_document(
+        &self,
+        #[path] workspace_id: String,
+    ) -> Result<MemoryDocumentResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/memory/staging",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn memory_staging_list(
+        &self,
+        #[path] workspace_id: String,
+        #[query] query: MemoryStagingQuery,
+    ) -> Result<MemoryStagingListResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/memory/backend",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500]
+    )]
+    async fn memory_backend(
+        &self,
+        #[path] workspace_id: String,
+        #[body] request: MemoryBackendRequest,
+    ) -> Result<MemoryBackendResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/memory/consolidation",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503]
+    )]
+    async fn memory_consolidation(
+        &self,
+        #[path] workspace_id: String,
+        #[body] request: MemoryConsolidateStagingRequest,
+    ) -> Result<MemoryConsolidationResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/skills",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn skill_list(
+        &self,
+        #[path] workspace_id: String,
+    ) -> Result<SkillCatalogResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/skills/lint",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn skill_lint(
+        &self,
+        #[path] workspace_id: String,
+    ) -> Result<SkillCatalogResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/skills/{name}",
+        status = 200,
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn skill_get(
+        &self,
+        #[path] workspace_id: String,
+        #[path] name: String,
+    ) -> Result<SkillDetailResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/skills/{name}/activate",
+        status = 200,
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 409, 500]
+    )]
+    async fn skill_activate(
+        &self,
+        #[path] workspace_id: String,
+        #[path] name: String,
+    ) -> Result<SkillActivationResponse, RepositoryApiError>;
 
     #[get(
         "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/session",
@@ -967,7 +1527,7 @@ impl api_macros::HttpSuccess for WorkspaceCreateResponse {
 }
 
 /// Browser authentication configuration exposed by the scoped Workspace summary.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum WorkspaceAuthConfig {
     Passkey {
@@ -979,7 +1539,7 @@ pub enum WorkspaceAuthConfig {
 }
 
 /// Backend-authoritative permissions for the current Workspace actor.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkspacePermissionSummary {
@@ -989,7 +1549,7 @@ pub struct WorkspacePermissionSummary {
     pub delete_workspace: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceExtensionPointState {
@@ -998,7 +1558,7 @@ pub struct WorkspaceExtensionPointState {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceExtensionPoints {
@@ -1009,7 +1569,7 @@ pub struct WorkspaceExtensionPoints {
 }
 
 /// Scoped Workspace metadata and current-actor permission projection.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceResponse {
@@ -1017,6 +1577,7 @@ pub struct WorkspaceResponse {
     pub display_name: String,
     pub record_authority: String,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_i64))]
     pub schema_version: i64,
     pub auth: WorkspaceAuthConfig,
     pub permissions: WorkspacePermissionSummary,
@@ -1024,7 +1585,7 @@ pub struct WorkspaceResponse {
 }
 
 /// Workspace display metadata exposed from the Server DB settings authority.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceMetadataSettingsResponse {
@@ -1037,7 +1598,7 @@ pub struct WorkspaceMetadataSettingsResponse {
 }
 
 /// Compare-and-swap update for Workspace identity display metadata.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct UpdateWorkspaceMetadataRequest {
@@ -1045,7 +1606,7 @@ pub struct UpdateWorkspaceMetadataRequest {
     pub revision: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceMetadataMutationResponse {
@@ -1054,7 +1615,7 @@ pub struct WorkspaceMetadataMutationResponse {
 }
 
 /// Lifecycle state for a Workspace-scoped Ed25519 signing identity.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceSigningIdentityState {
@@ -1064,7 +1625,7 @@ pub enum WorkspaceSigningIdentityState {
 
 /// Public metadata for a Workspace signing identity. Private material and its
 /// storage reference are deliberately not part of this wire authority.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceSigningIdentityPublic {
@@ -1078,6 +1639,7 @@ pub struct WorkspaceSigningIdentityPublic {
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub public_key_fingerprint: Option<String>,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub revision: u64,
     pub state: WorkspaceSigningIdentityState,
     pub created_at: String,
@@ -1087,7 +1649,7 @@ pub struct WorkspaceSigningIdentityPublic {
 }
 
 /// Copyable public trust bundle consumed by future Runtime enrollment work.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkspacePublicIdentityBundle {
@@ -1098,10 +1660,11 @@ pub struct WorkspacePublicIdentityBundle {
     pub public_key: String,
     pub public_key_fingerprint: String,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub revision: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceSigningIdentityResponse {
@@ -1109,6 +1672,288 @@ pub struct WorkspaceSigningIdentityResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub public_bundle: Option<WorkspacePublicIdentityBundle>,
+}
+
+/// Source content kinds accepted by the Workspace configuration tree.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigContentType {
+    Decodal,
+    Text,
+}
+
+/// One source entry in the Workspace configuration tree.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ConfigEntry {
+    pub path: String,
+    pub content_type: ConfigContentType,
+    pub content: String,
+    pub content_digest: String,
+}
+
+/// Immutable Workspace configuration tree snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ConfigTreeSnapshot {
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub revision: u64,
+    pub digest: String,
+    pub entries: BTreeMap<String, ConfigEntry>,
+}
+
+/// Base-relative change applied by a Workspace configuration commit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConfigTreeChange {
+    Create {
+        path: String,
+        content_type: ConfigContentType,
+        content: String,
+    },
+    Update {
+        path: String,
+        expected_digest: String,
+        content: String,
+    },
+    Rename {
+        from: String,
+        to: String,
+        expected_digest: String,
+    },
+    Delete {
+        path: String,
+        expected_digest: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConfigProjectionValidator {
+    StaticTemplateCatalog {
+        namespace: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        key_aliases: BTreeMap<String, String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ConfigSchemaContribution {
+    pub provider_id: String,
+    pub namespace: String,
+    pub version: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub projection_validator: Option<ConfigProjectionValidator>,
+    pub source_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceConfigSchemaBundle {
+    pub contributions: Vec<ConfigSchemaContribution>,
+    pub source: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ToolchainContract {
+    pub contract_version: u32,
+    pub decodal_version: String,
+    pub schema_version: u32,
+    pub entrypoints: Vec<String>,
+    pub import_policy_version: u32,
+    pub schema_bundle: WorkspaceConfigSchemaBundle,
+    pub fingerprint: String,
+}
+
+/// Workspace configuration tree plus the exact evaluation contract that produced it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceConfigTreeResponse {
+    pub snapshot: ConfigTreeSnapshot,
+    pub contract: ToolchainContract,
+    pub projection_digest: String,
+}
+
+/// Compare-and-swap request for applying a complete set of source-tree changes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ConfigCommitRequest {
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub base_revision: u64,
+    pub base_digest: String,
+    pub changes: Vec<ConfigTreeChange>,
+    pub entrypoints: Vec<String>,
+}
+
+/// Effective Prompt catalog projected from one immutable Workspace config revision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspacePromptProjection {
+    pub workspace_id: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub config_revision: u64,
+    pub source_digest: String,
+    pub projection_digest: String,
+    pub schema_fingerprint: String,
+    pub toolchain_fingerprint: String,
+    pub catalog: EffectivePromptCatalog,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EffectivePromptCatalog {
+    pub templates: BTreeMap<String, String>,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub config_revision: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_digest: String,
+    pub schema_fingerprint: String,
+    pub toolchain_fingerprint: String,
+    pub catalog_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum FlowSourceKind {
+    Builtin,
+    Workspace,
+}
+
+/// Current source record for one Workspace-authored Flow.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct FlowSourceRecord {
+    pub workspace_id: String,
+    pub flow_id: String,
+    pub source_kind: FlowSourceKind,
+    pub name: String,
+    pub path: String,
+    pub content: String,
+    pub content_digest: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub revision: u64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(transparent)]
+pub struct FlowSourceListResponse(pub Vec<FlowSourceRecord>);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PutFlowRequest {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct FlowSourceResolveRequest {
+    pub selector: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct CompiledFlowTransition {
+    pub id: String,
+    pub target: String,
+    pub condition: String,
+    pub synthetic: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct CompiledFlowState {
+    pub id: String,
+    pub instructions: String,
+    pub terminal: bool,
+    pub transitions: Vec<CompiledFlowTransition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct CompiledFlowDefinition {
+    pub schema_version: u32,
+    pub name: String,
+    pub initial: String,
+    pub states: BTreeMap<String, CompiledFlowState>,
+    pub content_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedFlowSource {
+    pub selector: String,
+    pub workspace_id: String,
+    pub flow_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub revision: u64,
+    pub content_digest: String,
+    pub definition: CompiledFlowDefinition,
+}
+
+/// Query parameters for the bounded Memory staging list.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryStagingQuery {
+    #[schemars(range(min = 0, max = 1000))]
+    pub limit: Option<u32>,
+}
+
+/// Public wrapper retaining the established tagged Memory backend wire shape.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct MemoryBackendRequest(pub memory::backend::MemoryBackendOperation);
+
+/// Public wrapper retaining the established tagged Memory backend response shape.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct MemoryBackendResponse(pub memory::backend::MemoryBackendHttpResponse);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryConsolidateStagingRequest {
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryConsolidationResponse {
+    pub status: String,
+    pub summary: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub candidate_count: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub total_bytes: u64,
 }
 
 pub const WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES: usize = 128;
@@ -1467,7 +2312,7 @@ impl<'de> Deserialize<'de> for WorkspaceDeletionOperationResponse {
 }
 
 /// Read-only Profile catalog projected from one active Workspace config revision.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
 #[serde(deny_unknown_fields)]
@@ -1476,6 +2321,7 @@ pub struct ProfileSettingsResponse {
     pub registry_revision: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional, type = "number | null"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub config_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tree_digest: Option<String>,
@@ -1488,7 +2334,7 @@ pub struct ProfileSettingsResponse {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
 #[serde(deny_unknown_fields)]
@@ -1506,7 +2352,7 @@ pub struct WorkspaceProfileSummary {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceProfileSourceSummary {
@@ -1519,11 +2365,12 @@ pub struct WorkspaceProfileSourceSummary {
     pub editable: bool,
     pub revision: String,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub size_bytes: u64,
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceProfileSourceProvenance {
@@ -2969,20 +3816,27 @@ pub struct WorkerRestoreResponse {
     pub result: WorkerRestoreResult,
 }
 
+pub const MEMORY_API_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+pub const MEMORY_API_MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
+pub const MEMORY_API_MAX_COLLECTION_ITEMS: usize = 500;
+pub const MEMORY_API_MAX_STRING_BYTES: usize = 1024 * 1024;
+pub const MEMORY_API_MAX_IDENTIFIER_BYTES: usize = 512;
+
 /// Public Workspace Memory document projection.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct MemoryDocumentResponse {
     pub body_md: String,
     pub created_at: String,
     pub updated_at: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub bytes: usize,
     pub record_source: String,
 }
 
 /// Candidate kinds exposed by the Memory staging resource.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryCandidateKind {
@@ -2995,7 +3849,7 @@ pub enum MemoryCandidateKind {
 }
 
 /// Typed, bounded provenance classification for public Memory evidence anchors.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryEvidenceOriginKind {
@@ -3013,7 +3867,7 @@ pub enum MemoryEvidenceOriginKind {
 ///
 /// This is provenance only. It carries no message body, prompt, reasoning,
 /// secret, tool output, or authorization authority.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
 #[serde(deny_unknown_fields)]
@@ -3033,27 +3887,30 @@ pub struct MemoryEvidenceOrigin {
     pub flow_definition_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional, type = "number | null"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub flow_definition_revision: Option<u64>,
 }
 
 /// Record-level source range for one Memory staging candidate.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct MemorySourceRef {
     pub segment_id: String,
     #[cfg_attr(feature = "typescript", ts(type = "[number, number]"))]
+    #[schemars(with = "JsonSafeU64Pair")]
     pub range: [u64; 2],
 }
 
 /// Bounded evidence snippet included in one Memory staging record.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct MemoryStagingEvidence {
     pub id: String,
     pub kind: String,
     #[cfg_attr(feature = "typescript", ts(type = "[number, number] | null"))]
+    #[schemars(with = "Option<JsonSafeU64Pair>")]
     pub entry_range: Option<[u64; 2]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(
@@ -3066,13 +3923,14 @@ pub struct MemoryStagingEvidence {
 }
 
 /// Bounded source anchor included in one Memory staging record.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct MemorySourceEvidenceRef {
     pub session_id: Option<String>,
     pub segment_id: Option<String>,
     #[cfg_attr(feature = "typescript", ts(type = "[number, number] | null"))]
+    #[schemars(with = "Option<JsonSafeU64Pair>")]
     pub entry_range: Option<[u64; 2]>,
     pub evidence_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3087,7 +3945,7 @@ pub struct MemorySourceEvidenceRef {
 }
 
 /// Public projection of one valid Memory staging record.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct MemoryStagingRecord {
@@ -3104,24 +3962,29 @@ pub struct MemoryStagingRecord {
 }
 
 /// Public list entry for one valid Memory staging record.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct MemoryStagingEntry {
     pub id: String,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub byte_len: u64,
     pub record: MemoryStagingRecord,
 }
 
 /// Public response returned by the Workspace Memory staging list resource.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct MemoryStagingListResponse {
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub limit: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub returned_count: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub total_valid_count: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub invalid_count: usize,
     pub truncated: bool,
     pub order: String,
@@ -3150,8 +4013,11 @@ pub fn memory_api_typescript() -> String {
         MemoryStagingListResponse::decl(&config),
     ];
 
+    let limits = format!(
+        "export const MEMORY_API_LIMITS = {{\n  maxResponseBytes: {MEMORY_API_MAX_RESPONSE_BYTES},\n  maxDocumentBytes: {MEMORY_API_MAX_DOCUMENT_BYTES},\n  maxCollectionItems: {MEMORY_API_MAX_COLLECTION_ITEMS},\n  maxStringBytes: {MEMORY_API_MAX_STRING_BYTES},\n  maxIdentifierBytes: {MEMORY_API_MAX_IDENTIFIER_BYTES},\n}} as const;"
+    );
     format!(
-        "// Generated from server-api. Do not edit by hand.\n// Regenerate: cargo run -q -p server-api --features typescript --example generate_memory_api_types > web/workspace/src/lib/generated/memory-api.ts\n\n{}\n",
+        "// Generated from server-api. Do not edit by hand.\n// Regenerate: cargo run -q -p server-api --features typescript --example generate_memory_api_types > web/workspace/src/lib/generated/memory-api.ts\n\n{limits}\n\n{}\n",
         declarations
             .into_iter()
             .map(|declaration| format!("export {declaration}"))
@@ -3161,18 +4027,20 @@ pub fn memory_api_typescript() -> String {
 }
 
 /// Workspace-owned Memory settings returned by the shared Server API.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceMemorySettings {
     pub workspace_id: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub settings_revision: u64,
     pub language: String,
 }
 
 /// Compare-and-swap update for Workspace-owned Memory settings.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateWorkspaceMemorySettingsRequest {
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub expected_revision: u64,
     pub language: String,
 }
@@ -3180,7 +4048,7 @@ pub struct UpdateWorkspaceMemorySettingsRequest {
 /// Public metadata for one Workspace-scoped Repository SSH credential.
 ///
 /// Secret references and secret material are deliberately not part of this DTO.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositorySshCredential {
@@ -3190,6 +4058,7 @@ pub struct RepositorySshCredential {
     pub public_key_algorithm: String,
     pub public_key_fingerprint: String,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub current_revision: u64,
     pub status: String,
     pub created_at: String,
@@ -3198,7 +4067,11 @@ pub struct RepositorySshCredential {
     pub referenced_repositories: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(transparent)]
+pub struct RepositorySshCredentialListResponse(pub Vec<RepositorySshCredential>);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct CreateRepositorySshCredentialRequest {
@@ -3210,7 +4083,7 @@ pub struct CreateRepositorySshCredentialRequest {
     pub passphrase: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct GenerateRepositorySshCredentialRequest {
@@ -3219,41 +4092,44 @@ pub struct GenerateRepositorySshCredentialRequest {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositorySshPublicKey {
     pub credential_id: String,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub current_revision: u64,
     pub public_key_algorithm: String,
     pub public_key_fingerprint: String,
     pub public_key: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RotateRepositorySshCredentialRequest {
     pub operation_id: String,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub expected_revision: u64,
     pub private_key: String,
     #[serde(default)]
     pub passphrase: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct DeleteRepositorySshCredentialRequest {
     pub operation_id: String,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub expected_revision: u64,
 }
 
 /// Public metadata for an explicitly pinned SSH host key.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositorySshHostTrust {
@@ -3265,6 +4141,7 @@ pub struct RepositorySshHostTrust {
     pub host_key: String,
     pub fingerprint: String,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub current_revision: u64,
     pub created_at: String,
     pub updated_at: String,
@@ -3272,7 +4149,11 @@ pub struct RepositorySshHostTrust {
     pub referenced_repositories: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(transparent)]
+pub struct RepositorySshHostTrustListResponse(pub Vec<RepositorySshHostTrust>);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct PutRepositorySshHostTrustRequest {
@@ -3283,19 +4164,37 @@ pub struct PutRepositorySshHostTrustRequest {
     pub host_key: String,
     #[serde(default)]
     #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub expected_revision: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepositorySshHostTrustMutationResponse {
+    #[serde(flatten)]
+    pub host_trust: RepositorySshHostTrust,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub created: bool,
+}
+
+impl api_macros::HttpSuccess for RepositorySshHostTrustMutationResponse {
+    fn status_code(&self) -> u16 {
+        if self.created { 201 } else { 200 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct DeleteRepositorySshHostTrustRequest {
     pub operation_id: String,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub expected_revision: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "typescript", ts(rename_all = "snake_case"))]
 #[serde(rename_all = "snake_case")]
@@ -3304,7 +4203,7 @@ pub enum RepositoryAccessMode {
     ReadWrite,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositorySshAccessBinding {
@@ -3315,12 +4214,13 @@ pub struct RepositorySshAccessBinding {
 }
 
 /// Secret-free active Repository access projection consumed by later Runtime work.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryAccessProjection {
     pub workspace_id: String,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub config_revision: u64,
     pub projection_digest: String,
     pub bindings: Vec<RepositorySshAccessBinding>,
@@ -3340,7 +4240,7 @@ pub const SKILL_API_MAX_PATH_BYTES: usize = 1_024;
 pub const SKILL_API_MAX_DIGEST_BYTES: usize = 128;
 pub const SKILL_API_MAX_RESPONSE_BYTES: usize = 2_097_152;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "typescript", ts(rename_all = "snake_case"))]
 #[serde(rename_all = "snake_case")]
@@ -3349,7 +4249,7 @@ pub enum SkillDiagnosticSeverity {
     Warning,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct SkillDiagnostic {
@@ -3389,7 +4289,7 @@ impl SkillDiagnostic {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "typescript", ts(rename_all = "snake_case"))]
 #[serde(rename_all = "snake_case")]
@@ -3398,7 +4298,7 @@ pub enum SkillSourceKind {
     Workspace,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct SkillProvenance {
@@ -3418,7 +4318,7 @@ pub struct SkillProvenance {
     pub tree_digest: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "typescript", ts(rename_all = "snake_case"))]
 #[serde(rename_all = "snake_case")]
@@ -3427,7 +4327,7 @@ pub enum SkillActivationStatus {
     Inactive,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "typescript", ts(rename_all = "snake_case"))]
 #[serde(rename_all = "snake_case")]
@@ -3436,16 +4336,17 @@ pub enum SkillProjectionStatus {
     Invalid,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct SkillProjectionIdentity {
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub config_revision: u64,
     pub tree_digest: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct SkillResourceRef {
@@ -3457,7 +4358,7 @@ pub struct SkillResourceRef {
     pub diagnostic: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct SkillCatalogEntry {
@@ -3470,7 +4371,7 @@ pub struct SkillCatalogEntry {
     pub diagnostics: Vec<SkillDiagnostic>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct SkillCatalogResponse {
@@ -3480,7 +4381,7 @@ pub struct SkillCatalogResponse {
     pub diagnostics: Vec<SkillDiagnostic>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct SkillDetailResponse {
@@ -3497,6 +4398,17 @@ pub struct SkillDetailResponse {
     pub allowed_tools: Vec<String>,
     pub allowed_tools_status: String,
     pub resources: Vec<SkillResourceRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct SkillActivationResponse {
+    pub name: String,
+    pub provenance: SkillProvenance,
+    #[serde(default)]
+    pub diagnostics: Vec<SkillDiagnostic>,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3770,6 +4682,16 @@ pub fn legacy_catalog_typescript() -> String {
         WorkspaceSigningIdentityPublic::decl(&config),
         WorkspacePublicIdentityBundle::decl(&config),
         WorkspaceSigningIdentityResponse::decl(&config),
+        ConfigContentType::decl(&config),
+        ConfigEntry::decl(&config),
+        ConfigTreeSnapshot::decl(&config),
+        ConfigTreeChange::decl(&config),
+        ConfigProjectionValidator::decl(&config),
+        ConfigSchemaContribution::decl(&config),
+        WorkspaceConfigSchemaBundle::decl(&config),
+        ToolchainContract::decl(&config),
+        WorkspaceConfigTreeResponse::decl(&config),
+        ConfigCommitRequest::decl(&config),
         ProfileSettingsResponse::decl(&config),
         WorkspaceProfileSummary::decl(&config),
         WorkspaceProfileSourceSummary::decl(&config),
@@ -3866,6 +4788,7 @@ pub fn skill_api_typescript() -> String {
         SkillCatalogEntry::decl(&config),
         SkillCatalogResponse::decl(&config),
         SkillDetailResponse::decl(&config),
+        SkillActivationResponse::decl(&config),
     ];
     let limits = format!(
         "export const SKILL_API_AUTHORITY = \"{SKILL_CATALOG_AUTHORITY}\" as const;\n\nexport const SKILL_API_LIMITS = {{\n  maxSafeInteger: {SKILL_API_MAX_SAFE_INTEGER},\n  maxCatalogEntries: {SKILL_API_MAX_CATALOG_ENTRIES},\n  maxOverrides: {SKILL_API_MAX_OVERRIDES},\n  maxDiagnostics: {SKILL_API_MAX_DIAGNOSTICS},\n  maxResources: {SKILL_API_MAX_RESOURCES},\n  maxAllowedTools: {SKILL_API_MAX_ALLOWED_TOOLS},\n  maxNameBytes: {SKILL_API_MAX_NAME_BYTES},\n  maxLabelBytes: {SKILL_API_MAX_LABEL_BYTES},\n  maxBodyBytes: {SKILL_API_MAX_BODY_BYTES},\n  maxPathBytes: {SKILL_API_MAX_PATH_BYTES},\n  maxDigestBytes: {SKILL_API_MAX_DIGEST_BYTES},\n  maxResponseBytes: {SKILL_API_MAX_RESPONSE_BYTES},\n}} as const;"
@@ -4189,6 +5112,198 @@ mod tests {
                 "workspace_deletion_get",
                 HttpMethod::Get,
                 "/api/workspace-deletions/{operation_id}",
+            ),
+        ] {
+            let operation = operations
+                .iter()
+                .find(|operation| operation.operation_id == operation_id)
+                .unwrap_or_else(|| panic!("missing ServerApi operation {operation_id}"));
+            assert_eq!(operation.method, method, "{operation_id}");
+            assert_eq!(operation.path, path, "{operation_id}");
+        }
+    }
+
+    #[test]
+    fn workspace_configuration_domain_operations_are_in_server_api_metadata() {
+        let operations = ServerApiMetadata::OPERATIONS;
+        for (operation_id, method, path) in [
+            ("workspace_current", HttpMethod::Get, "/api/workspace"),
+            (
+                "workspace_scoped",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/workspace",
+            ),
+            (
+                "workspace_metadata_settings",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/settings",
+            ),
+            (
+                "workspace_metadata_settings_update",
+                HttpMethod::Put,
+                "/api/w/{workspace_id}/settings",
+            ),
+            (
+                "workspace_signing_identity",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/settings/signing-identity",
+            ),
+            (
+                "workspace_signing_identity_provision",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/settings/signing-identity/provision",
+            ),
+            (
+                "workspace_memory_settings",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/settings/memory",
+            ),
+            (
+                "workspace_memory_settings_update",
+                HttpMethod::Put,
+                "/api/w/{workspace_id}/settings/memory",
+            ),
+            (
+                "repository_access_projection",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/settings/repository-access",
+            ),
+            (
+                "repository_ssh_credential_list",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/settings/repository-access/credentials",
+            ),
+            (
+                "repository_ssh_credential_create",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/settings/repository-access/credentials",
+            ),
+            (
+                "repository_ssh_credential_generate",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/settings/repository-access/credentials/generate",
+            ),
+            (
+                "repository_ssh_credential_get",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}",
+            ),
+            (
+                "repository_ssh_credential_delete",
+                HttpMethod::Delete,
+                "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}",
+            ),
+            (
+                "repository_ssh_credential_public_key",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}/public-key",
+            ),
+            (
+                "repository_ssh_credential_rotate",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}/rotate",
+            ),
+            (
+                "repository_ssh_host_trust_list",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/settings/repository-access/host-trusts",
+            ),
+            (
+                "repository_ssh_host_trust_put",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/settings/repository-access/host-trusts",
+            ),
+            (
+                "repository_ssh_host_trust_get",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/settings/repository-access/host-trusts/{host_trust_id}",
+            ),
+            (
+                "repository_ssh_host_trust_delete",
+                HttpMethod::Delete,
+                "/api/w/{workspace_id}/settings/repository-access/host-trusts/{host_trust_id}",
+            ),
+            (
+                "workspace_config_tree",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/config/source-tree",
+            ),
+            (
+                "workspace_prompt_projection",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/config/projections/prompts",
+            ),
+            (
+                "workspace_config_tree_commit",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/config/source-tree/commit",
+            ),
+            (
+                "workspace_config_revision",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/config/source-tree/revisions/{revision}",
+            ),
+            (
+                "workspace_config_entry",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/config/source-tree/entries/{path}",
+            ),
+            (
+                "profile_settings",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/settings/profiles",
+            ),
+            ("flow_list", HttpMethod::Get, "/api/w/{workspace_id}/flows"),
+            ("flow_put", HttpMethod::Put, "/api/w/{workspace_id}/flows"),
+            (
+                "flow_resolve",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/flows/resolve",
+            ),
+            (
+                "flow_get",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/flows/{flow_id}",
+            ),
+            (
+                "memory_document",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/memory",
+            ),
+            (
+                "memory_staging_list",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/memory/staging",
+            ),
+            (
+                "memory_backend",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/memory/backend",
+            ),
+            (
+                "memory_consolidation",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/memory/consolidation",
+            ),
+            (
+                "skill_list",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/skills",
+            ),
+            (
+                "skill_lint",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/skills/lint",
+            ),
+            (
+                "skill_get",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/skills/{name}",
+            ),
+            (
+                "skill_activate",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/skills/{name}/activate",
             ),
         ] {
             let operation = operations
@@ -4892,6 +6007,8 @@ mod tests {
         assert!(!output.contains("export type RepositoryObservedStatus ="));
         assert!(output.contains("export type WorkspaceMetadataSettingsResponse ="));
         assert!(output.contains("export type WorkspaceMetadataMutationResponse ="));
+        assert!(output.contains("export type WorkspaceConfigTreeResponse ="));
+        assert!(output.contains("export type ConfigCommitRequest ="));
         assert!(output.contains("export type ProfileSettingsResponse ="));
         assert!(output.contains("config_revision?: number | null"));
         assert!(output.contains("provenance: WorkspaceProfileSourceProvenance"));
@@ -4902,6 +6019,34 @@ mod tests {
         assert!(output.contains("status: RuntimeConnectionTestStatus"));
         assert!(output.contains("failure_kind: RuntimeConnectionTestFailureKind | null"));
         assert!(!output.contains("repository_key: string, display_name"));
+    }
+
+    #[cfg(feature = "typescript")]
+    #[test]
+    fn generated_legacy_server_api_contract_is_current() {
+        fn normalize(value: &str) -> String {
+            value
+                .chars()
+                .filter_map(|character| match character {
+                    character if character.is_whitespace() => None,
+                    ',' => Some(';'),
+                    character => Some(character),
+                })
+                .collect::<String>()
+                .replace("=|", "=")
+                .replace(";}", "}")
+        }
+
+        let expected = legacy_catalog_typescript();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/workspace/src/lib/generated/legacy-server-api.ts");
+        let actual = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        assert_eq!(
+            normalize(&actual),
+            normalize(&expected),
+            "regenerate legacy Server API TypeScript types and format the generated file",
+        );
     }
 
     #[test]

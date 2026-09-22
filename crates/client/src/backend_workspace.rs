@@ -128,6 +128,45 @@ fn server_api_client(
         .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))
 }
 
+pub(crate) fn memory_document_blocking(
+    backend: &BackendApiClient,
+    workspace_id: &str,
+) -> Result<server_api::MemoryDocumentResponse, BackendWorkspaceClientError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?;
+    runtime.block_on(async {
+        server_api_client(backend)?
+            .memory_document(workspace_id.to_owned())
+            .await
+            .map_err(|error| server_client_error(backend, error))
+    })
+}
+
+pub(crate) fn memory_staging_list_blocking(
+    backend: &BackendApiClient,
+    workspace_id: &str,
+    limit: usize,
+) -> Result<server_api::MemoryStagingListResponse, BackendWorkspaceClientError> {
+    let limit = u32::try_from(limit).map_err(|_| {
+        BackendWorkspaceClientError::InvalidTarget("Memory staging limit exceeds u32".to_string())
+    })?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?;
+    runtime.block_on(async {
+        server_api_client(backend)?
+            .memory_staging_list(
+                workspace_id.to_owned(),
+                server_api::MemoryStagingQuery { limit: Some(limit) },
+            )
+            .await
+            .map_err(|error| server_client_error(backend, error))
+    })
+}
+
 pub fn list_backend_workspaces_blocking(
     target: &BackendWorkspaceCatalogTarget,
 ) -> Result<Vec<BackendWorkspace>, BackendWorkspaceClientError> {

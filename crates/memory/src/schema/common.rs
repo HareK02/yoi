@@ -4,14 +4,23 @@ use lint_common::RecordLintError;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Schema-only representation for JSON integers that must remain exactly
+/// representable by JavaScript consumers.
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+pub struct MemoryJsonSafeU64(#[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))] u64);
+
+pub type JsonSafeU64Pair = [MemoryJsonSafeU64; 2];
+
 pub use lint_common::Frontmatter;
 
 /// Reference to a session-store entry range. Stored in `sources` /
 /// `last_sources` arrays for traceability back to raw session logs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct SourceRef {
     pub segment_id: String,
     /// `[start_entry, end_entry]` inclusive range of session-store entry indices.
+    #[schemars(with = "crate::schema::JsonSafeU64Pair")]
     pub range: [u64; 2],
 }
 
@@ -99,6 +108,7 @@ pub struct EvidenceOrigin {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_definition_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub flow_definition_revision: Option<u64>,
 }
 
@@ -118,6 +128,7 @@ pub struct SourceEvidenceRef {
     pub segment_id: Option<String>,
     /// `[start_entry, end_entry]` inclusive range of session-store entry indices.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<crate::schema::JsonSafeU64Pair>")]
     pub entry_range: Option<[u64; 2]>,
     /// Host-assigned evidence id within the referenced evidence set.
     #[serde(default, skip_serializing_if = "Option::is_none")]

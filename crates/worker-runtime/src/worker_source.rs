@@ -532,18 +532,29 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
                 response.status, response.body
             )));
         }
-        let projection: WorkspacePromptProjection =
+        let wire_projection: server_api::WorkspacePromptProjection =
             serde_json::from_str(&response.body).map_err(|error| {
                 WorkspaceClientError::Request(format!(
                     "invalid active Workspace Prompt projection response: {error}"
                 ))
             })?;
-        if projection.workspace_id != self.workspace_id {
+        if wire_projection.workspace_id != self.workspace_id {
             return Err(WorkspaceClientError::Request(format!(
                 "active Workspace Prompt projection scope mismatch: expected {}, got {}",
-                self.workspace_id, projection.workspace_id
+                self.workspace_id, wire_projection.workspace_id
             )));
         }
+        let projection: WorkspacePromptProjection =
+            serde_json::from_value(serde_json::to_value(wire_projection).map_err(|error| {
+                WorkspaceClientError::Request(format!(
+                    "project active Workspace Prompt projection response: {error}"
+                ))
+            })?)
+            .map_err(|error| {
+                WorkspaceClientError::Request(format!(
+                    "convert active Workspace Prompt projection response: {error}"
+                ))
+            })?;
         let resolution = cache
             .observe(projection)
             .map_err(WorkspaceClientError::Request)?;

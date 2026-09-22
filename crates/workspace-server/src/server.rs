@@ -26,6 +26,7 @@ use memory::backend::{
 };
 use protocol::Segment;
 use protocol::stream::{decode_method, encode_event};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use server_api::{
     ActorAuthMethod, AuthBootstrapUserRequest, AuthPublicConfig, AuthUserResponse,
@@ -3729,6 +3730,84 @@ fn generated_workspace_catalog_contract_router(service: ServerApiContractService
 fn generated_workspace_contract_router(service: ServerApiContractService) -> Router {
     let service = Arc::new(service);
     Router::new()
+        .merge(server_api::server_api_axum::workspace_current(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_scoped(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_metadata_settings(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_metadata_settings_update(service.clone()))
+        .merge(server_api::server_api_axum::workspace_signing_identity(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_signing_identity_provision(service.clone()))
+        .merge(server_api::server_api_axum::workspace_memory_settings(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_memory_settings_update(service.clone()))
+        .merge(server_api::server_api_axum::repository_access_projection(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::repository_ssh_credential_list(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::repository_ssh_credential_create(service.clone()))
+        .merge(server_api::server_api_axum::repository_ssh_credential_generate(service.clone()))
+        .merge(server_api::server_api_axum::repository_ssh_credential_get(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::repository_ssh_credential_delete(service.clone()))
+        .merge(server_api::server_api_axum::repository_ssh_credential_public_key(service.clone()))
+        .merge(server_api::server_api_axum::repository_ssh_credential_rotate(service.clone()))
+        .merge(server_api::server_api_axum::repository_ssh_host_trust_list(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::repository_ssh_host_trust_put(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::repository_ssh_host_trust_get(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::repository_ssh_host_trust_delete(service.clone()))
+        .merge(server_api::server_api_axum::workspace_config_tree(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_prompt_projection(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_config_tree_commit(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_config_revision(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_config_entry(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::profile_settings(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::flow_list(service.clone()))
+        .merge(server_api::server_api_axum::flow_put(service.clone()))
+        .merge(server_api::server_api_axum::flow_resolve(service.clone()))
+        .merge(server_api::server_api_axum::flow_get(service.clone()))
+        .merge(server_api::server_api_axum::memory_document(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::memory_staging_list(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::memory_backend(service.clone()))
+        .merge(server_api::server_api_axum::memory_consolidation(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::skill_list(service.clone()))
+        .merge(server_api::server_api_axum::skill_lint(service.clone()))
+        .merge(server_api::server_api_axum::skill_get(service.clone()))
+        .merge(server_api::server_api_axum::skill_activate(service.clone()))
         .merge(server_api::server_api_axum::worker_session(service.clone()))
         .merge(server_api::server_api_axum::repository_list(
             service.clone(),
@@ -3742,7 +3821,19 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::repository_detail_alias(
             service.clone(),
         ))
-        .merge(server_api::server_api_axum::repository_create(service))
+        .merge(server_api::server_api_axum::repository_create(
+            service.clone(),
+        ))
+        .layer(middleware::from_fn_with_state(
+            service.as_ref().clone(),
+            attach_server_request_context,
+        ))
+}
+
+fn project_server_dto<T: Serialize, U: DeserializeOwned>(value: &T) -> Result<U> {
+    let value = serde_json::to_value(value)
+        .map_err(|error| Error::RegistryInconsistency(error.to_string()))?;
+    serde_json::from_value(value).map_err(|error| Error::RegistryInconsistency(error.to_string()))
 }
 
 impl server_api::ServerApi for ServerApiContractService {
@@ -4001,6 +4092,667 @@ impl server_api::ServerApi for ServerApiContractService {
             })
     }
 
+    async fn workspace_current(
+        &self,
+        context: server_api::ServerRequestContext,
+    ) -> std::result::Result<WorkspaceResponse, server_api::RepositoryApiError> {
+        workspace_response(self.workspace_api()?, context.actor)
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_scoped(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+    ) -> std::result::Result<WorkspaceResponse, server_api::RepositoryApiError> {
+        let api = self.workspace_api()?;
+        validate_workspace_scope(api, &workspace_id)
+            .map_err(ApiError::into_repository_api_error)?;
+        workspace_response(api, context.actor)
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_metadata_settings(
+        &self,
+        workspace_id: String,
+    ) -> std::result::Result<WorkspaceMetadataSettingsResponse, server_api::RepositoryApiError>
+    {
+        scoped_get_workspace_settings(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_metadata_settings_update(
+        &self,
+        workspace_id: String,
+        request: UpdateWorkspaceMetadataRequest,
+    ) -> std::result::Result<WorkspaceMetadataMutationResponse, server_api::RepositoryApiError>
+    {
+        scoped_update_workspace_settings(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Json(request),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_signing_identity(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+    ) -> std::result::Result<WorkspaceSigningIdentityResponse, server_api::RepositoryApiError> {
+        scoped_get_workspace_signing_identity(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Extension(actor),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_signing_identity_provision(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+    ) -> std::result::Result<WorkspaceSigningIdentityResponse, server_api::RepositoryApiError> {
+        scoped_provision_workspace_signing_identity(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Extension(actor),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_memory_settings(
+        &self,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::WorkspaceMemorySettings, server_api::RepositoryApiError>
+    {
+        scoped_get_workspace_memory_settings(
+            State(self.workspace_api()?.clone()),
+            AxumPath(workspace_id),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_memory_settings_update(
+        &self,
+        workspace_id: String,
+        request: server_api::UpdateWorkspaceMemorySettingsRequest,
+    ) -> std::result::Result<server_api::WorkspaceMemorySettings, server_api::RepositoryApiError>
+    {
+        scoped_update_workspace_memory_settings(
+            State(self.workspace_api()?.clone()),
+            AxumPath(workspace_id),
+            Json(request),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn repository_access_projection(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+    ) -> std::result::Result<RepositoryAccessProjection, server_api::RepositoryApiError> {
+        scoped_get_repository_access_projection(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Extension(actor),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn repository_ssh_credential_list(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+    ) -> std::result::Result<
+        server_api::RepositorySshCredentialListResponse,
+        server_api::RepositoryApiError,
+    > {
+        scoped_list_repository_ssh_credentials(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Extension(actor),
+        )
+        .await
+        .map(|Json(response)| server_api::RepositorySshCredentialListResponse(response))
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn repository_ssh_credential_create(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        request: CreateRepositorySshCredentialRequest,
+    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryApiError> {
+        scoped_create_repository_ssh_credential(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Extension(actor),
+            Json(request),
+        )
+        .await
+        .map(|(_status, Json(response))| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn repository_ssh_credential_generate(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        request: GenerateRepositorySshCredentialRequest,
+    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryApiError> {
+        scoped_generate_repository_ssh_credential(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Extension(actor),
+            Json(request),
+        )
+        .await
+        .map(|(_status, Json(response))| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn repository_ssh_credential_get(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        credential_id: String,
+    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryApiError> {
+        scoped_get_repository_ssh_credential(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRepositoryCredentialPath {
+                workspace_id,
+                credential_id,
+            }),
+            Extension(actor),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn repository_ssh_credential_delete(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        credential_id: String,
+        request: DeleteRepositorySshCredentialRequest,
+    ) -> std::result::Result<(), server_api::RepositoryApiError> {
+        scoped_delete_repository_ssh_credential(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRepositoryCredentialPath {
+                workspace_id,
+                credential_id,
+            }),
+            Extension(actor),
+            Json(request),
+        )
+        .await
+        .map(|_| ())
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn repository_ssh_credential_public_key(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        credential_id: String,
+    ) -> std::result::Result<RepositorySshPublicKey, server_api::RepositoryApiError> {
+        scoped_get_repository_ssh_public_key(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRepositoryCredentialPath {
+                workspace_id,
+                credential_id,
+            }),
+            Extension(actor),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn repository_ssh_credential_rotate(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        credential_id: String,
+        request: RotateRepositorySshCredentialRequest,
+    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryApiError> {
+        scoped_rotate_repository_ssh_credential(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRepositoryCredentialPath {
+                workspace_id,
+                credential_id,
+            }),
+            Extension(actor),
+            Json(request),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn repository_ssh_host_trust_list(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+    ) -> std::result::Result<
+        server_api::RepositorySshHostTrustListResponse,
+        server_api::RepositoryApiError,
+    > {
+        scoped_list_repository_ssh_host_trusts(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Extension(actor),
+        )
+        .await
+        .map(|Json(response)| server_api::RepositorySshHostTrustListResponse(response))
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn repository_ssh_host_trust_put(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        request: PutRepositorySshHostTrustRequest,
+    ) -> std::result::Result<
+        server_api::RepositorySshHostTrustMutationResponse,
+        server_api::RepositoryApiError,
+    > {
+        let created = request.expected_revision.is_none();
+        scoped_put_repository_ssh_host_trust(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Extension(actor),
+            Json(request),
+        )
+        .await
+        .map(
+            |(_status, Json(host_trust))| server_api::RepositorySshHostTrustMutationResponse {
+                host_trust,
+                created,
+            },
+        )
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn repository_ssh_host_trust_get(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        host_trust_id: String,
+    ) -> std::result::Result<RepositorySshHostTrust, server_api::RepositoryApiError> {
+        scoped_get_repository_ssh_host_trust(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRepositoryHostTrustPath {
+                workspace_id,
+                host_trust_id,
+            }),
+            Extension(actor),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn repository_ssh_host_trust_delete(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        host_trust_id: String,
+        request: DeleteRepositorySshHostTrustRequest,
+    ) -> std::result::Result<(), server_api::RepositoryApiError> {
+        scoped_delete_repository_ssh_host_trust(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRepositoryHostTrustPath {
+                workspace_id,
+                host_trust_id,
+            }),
+            Extension(actor),
+            Json(request),
+        )
+        .await
+        .map(|_| ())
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_config_tree(
+        &self,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::WorkspaceConfigTreeResponse, server_api::RepositoryApiError>
+    {
+        scoped_get_workspace_config_tree(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_prompt_projection(
+        &self,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::WorkspacePromptProjection, server_api::RepositoryApiError>
+    {
+        scoped_get_prompt_projection(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .and_then(|Json(response)| {
+            project_server_dto(&response)
+                .map(Json)
+                .map_err(ApiError::from)
+        })
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_config_tree_commit(
+        &self,
+        workspace_id: String,
+        request: server_api::ConfigCommitRequest,
+    ) -> std::result::Result<server_api::WorkspaceConfigTreeResponse, server_api::RepositoryApiError>
+    {
+        let request = project_server_dto(&request)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        scoped_commit_workspace_config_tree(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Json(request),
+        )
+        .await
+        .map(|(_status, Json(response))| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_config_revision(
+        &self,
+        workspace_id: String,
+        revision: String,
+    ) -> std::result::Result<server_api::ConfigTreeSnapshot, server_api::RepositoryApiError> {
+        let revision = revision.parse::<u64>().map_err(|_| {
+            ApiError::from(Error::InvalidInput(
+                "config revision must be an unsigned integer".into(),
+            ))
+            .into_repository_api_error()
+        })?;
+        scoped_get_workspace_config_revision(
+            State(self.workspace_api()?.clone()),
+            AxumPath(WorkspaceConfigRevisionPath {
+                workspace_id,
+                revision,
+            }),
+        )
+        .await
+        .and_then(|Json(response)| {
+            project_server_dto(&response)
+                .map(Json)
+                .map_err(ApiError::from)
+        })
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_config_entry(
+        &self,
+        workspace_id: String,
+        path: String,
+    ) -> std::result::Result<server_api::ConfigEntry, server_api::RepositoryApiError> {
+        scoped_get_workspace_config_entry(
+            State(self.workspace_api()?.clone()),
+            AxumPath(WorkspaceConfigEntryPath { workspace_id, path }),
+        )
+        .await
+        .and_then(|Json(response)| {
+            project_server_dto(&response)
+                .map(Json)
+                .map_err(ApiError::from)
+        })
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn profile_settings(
+        &self,
+        workspace_id: String,
+    ) -> std::result::Result<ProfileSettingsResponse, server_api::RepositoryApiError> {
+        scoped_get_profile_settings(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn flow_list(
+        &self,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::FlowSourceListResponse, server_api::RepositoryApiError>
+    {
+        scoped_list_flows(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .and_then(|Json(response)| {
+            project_server_dto(&response)
+                .map(Json)
+                .map_err(ApiError::from)
+        })
+        .map(|Json(response)| server_api::FlowSourceListResponse(response))
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn flow_put(
+        &self,
+        workspace_id: String,
+        request: server_api::PutFlowRequest,
+    ) -> std::result::Result<server_api::FlowSourceRecord, server_api::RepositoryApiError> {
+        scoped_put_flow(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Json(request),
+        )
+        .await
+        .and_then(|Json(response)| {
+            project_server_dto(&response)
+                .map(Json)
+                .map_err(ApiError::from)
+        })
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn flow_resolve(
+        &self,
+        workspace_id: String,
+        request: server_api::FlowSourceResolveRequest,
+    ) -> std::result::Result<server_api::ResolvedFlowSource, server_api::RepositoryApiError> {
+        let request = project_server_dto(&request)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        scoped_resolve_flow_source(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Json(request),
+        )
+        .await
+        .and_then(|Json(response)| {
+            project_server_dto(&response)
+                .map(Json)
+                .map_err(ApiError::from)
+        })
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn flow_get(
+        &self,
+        workspace_id: String,
+        flow_id: String,
+    ) -> std::result::Result<server_api::FlowSourceRecord, server_api::RepositoryApiError> {
+        scoped_get_flow(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedFlowPath {
+                workspace_id,
+                flow_id,
+            }),
+        )
+        .await
+        .and_then(|Json(response)| {
+            project_server_dto(&response)
+                .map(Json)
+                .map_err(ApiError::from)
+        })
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn memory_document(
+        &self,
+        workspace_id: String,
+    ) -> std::result::Result<MemoryDocumentResponse, server_api::RepositoryApiError> {
+        scoped_get_memory_document(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn memory_staging_list(
+        &self,
+        workspace_id: String,
+        query: server_api::MemoryStagingQuery,
+    ) -> std::result::Result<MemoryStagingListResponse, server_api::RepositoryApiError> {
+        scoped_list_memory_staging(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Query(MemoryStagingQuery {
+                limit: query.limit.map(|limit| limit as usize),
+            }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn memory_backend(
+        &self,
+        workspace_id: String,
+        request: server_api::MemoryBackendRequest,
+    ) -> std::result::Result<server_api::MemoryBackendResponse, server_api::RepositoryApiError>
+    {
+        scoped_memory_backend_operation(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Json(request.0),
+        )
+        .await
+        .map(|Json(response)| server_api::MemoryBackendResponse(response))
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn memory_consolidation(
+        &self,
+        workspace_id: String,
+        request: server_api::MemoryConsolidateStagingRequest,
+    ) -> std::result::Result<server_api::MemoryConsolidationResponse, server_api::RepositoryApiError>
+    {
+        scoped_memory_consolidation(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Json(MemoryConsolidateStagingOperation {
+                force: request.force,
+            }),
+        )
+        .await
+        .map(|Json(response)| server_api::MemoryConsolidationResponse {
+            status: response.status,
+            summary: response.summary,
+            candidate_count: response.candidate_count,
+            total_bytes: response.total_bytes,
+        })
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn skill_list(
+        &self,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::SkillCatalogResponse, server_api::RepositoryApiError> {
+        scoped_list_skills(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn skill_lint(
+        &self,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::SkillCatalogResponse, server_api::RepositoryApiError> {
+        scoped_lint_skills(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn skill_get(
+        &self,
+        workspace_id: String,
+        name: String,
+    ) -> std::result::Result<server_api::SkillDetailResponse, server_api::RepositoryApiError> {
+        scoped_get_skill(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedSkillPath { workspace_id, name }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn skill_activate(
+        &self,
+        workspace_id: String,
+        name: String,
+    ) -> std::result::Result<server_api::SkillActivationResponse, server_api::RepositoryApiError>
+    {
+        scoped_activate_skill(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedSkillPath { workspace_id, name }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
     async fn worker_session(
         &self,
         workspace_id: String,
@@ -4125,97 +4877,6 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
     let scoped_ticket_orchestration_plans_query_path =
         format!("/api/w/{{workspace_id}}{TICKET_ORCHESTRATION_PLANS_QUERY_PATH}");
     let workspace = Router::new()
-        .route("/api/workspace", get(get_workspace))
-        .route("/api/w/{workspace_id}/workspace", get(scoped_get_workspace))
-        .route(
-            "/api/w/{workspace_id}/settings",
-            get(scoped_get_workspace_settings).put(scoped_update_workspace_settings),
-        )
-        .route(
-            "/api/w/{workspace_id}/settings/signing-identity",
-            get(scoped_get_workspace_signing_identity),
-        )
-        .route(
-            "/api/w/{workspace_id}/settings/signing-identity/provision",
-            post(scoped_provision_workspace_signing_identity),
-        )
-        .route(
-            "/api/w/{workspace_id}/settings/memory",
-            get(scoped_get_workspace_memory_settings)
-                .put(scoped_update_workspace_memory_settings),
-        )
-        .route(
-            "/api/w/{workspace_id}/settings/repository-access",
-            get(scoped_get_repository_access_projection),
-        )
-        .route(
-            "/api/w/{workspace_id}/settings/repository-access/credentials",
-            get(scoped_list_repository_ssh_credentials)
-                .post(scoped_create_repository_ssh_credential),
-        )
-        .route(
-            "/api/w/{workspace_id}/settings/repository-access/credentials/generate",
-            post(scoped_generate_repository_ssh_credential),
-        )
-        .route(
-            "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}",
-            get(scoped_get_repository_ssh_credential)
-                .delete(scoped_delete_repository_ssh_credential),
-        )
-        .route(
-            "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}/public-key",
-            get(scoped_get_repository_ssh_public_key),
-        )
-        .route(
-            "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}/rotate",
-            post(scoped_rotate_repository_ssh_credential),
-        )
-        .route(
-            "/api/w/{workspace_id}/settings/repository-access/host-trusts",
-            get(scoped_list_repository_ssh_host_trusts)
-                .post(scoped_put_repository_ssh_host_trust),
-        )
-        .route(
-            "/api/w/{workspace_id}/settings/repository-access/host-trusts/{host_trust_id}",
-            get(scoped_get_repository_ssh_host_trust)
-                .delete(scoped_delete_repository_ssh_host_trust),
-        )
-        .route(
-            "/api/w/{workspace_id}/config/source-tree",
-            get(scoped_get_workspace_config_tree),
-        )
-        .route(
-            "/api/w/{workspace_id}/config/projections/prompts",
-            get(scoped_get_prompt_projection),
-        )
-        .route(
-            "/api/w/{workspace_id}/config/source-tree/commit",
-            post(scoped_commit_workspace_config_tree),
-        )
-        .route(
-            "/api/w/{workspace_id}/config/source-tree/revisions/{revision}",
-            get(scoped_get_workspace_config_revision),
-        )
-        .route(
-            "/api/w/{workspace_id}/config/source-tree/entries/{*path}",
-            get(scoped_get_workspace_config_entry),
-        )
-        .route(
-            "/api/w/{workspace_id}/settings/profiles",
-            get(scoped_get_profile_settings),
-        )
-        .route(
-            "/api/w/{workspace_id}/flows",
-            get(scoped_list_flows).put(scoped_put_flow),
-        )
-        .route(
-            "/api/w/{workspace_id}/flows/resolve",
-            post(scoped_resolve_flow_source),
-        )
-        .route(
-            "/api/w/{workspace_id}/flows/{flow_id}",
-            get(scoped_get_flow),
-        )
         .route("/api/tickets", get(list_tickets))
         .route(
             "/api/w/{workspace_id}/tickets",
@@ -4225,30 +4886,7 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
             "/api/w/{workspace_id}/tickets/query",
             post(scoped_query_tickets),
         )
-        .route(
-            "/api/w/{workspace_id}/memory",
-            get(scoped_get_memory_document),
-        )
-        .route(
-            "/api/w/{workspace_id}/memory/staging",
-            get(scoped_list_memory_staging),
-        )
-        .route(
-            "/api/w/{workspace_id}/memory/backend",
-            post(scoped_memory_backend_operation),
-        )
-        .route(
-            "/api/w/{workspace_id}/memory/consolidation",
-            post(scoped_memory_consolidation),
-        )
         .route("/api/tickets/{id}", get(get_ticket))
-        .route("/api/w/{workspace_id}/skills", get(scoped_list_skills))
-        .route("/api/w/{workspace_id}/skills/lint", get(scoped_lint_skills))
-        .route("/api/w/{workspace_id}/skills/{name}", get(scoped_get_skill))
-        .route(
-            "/api/w/{workspace_id}/skills/{name}/activate",
-            get(scoped_activate_skill),
-        )
         .route(
             "/api/w/{workspace_id}/tickets/default-intake-ready-body",
             post(scoped_default_intake_ready_body),
@@ -5094,13 +5732,6 @@ struct ScopedFlowPath {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PutFlowRequest {
-    path: String,
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct AttachCurrentWorkerWorkdirRequest {
     alias: String,
     working_directory_id: String,
@@ -5209,7 +5840,7 @@ async fn scoped_list_flows(
 async fn scoped_put_flow(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    Json(request): Json<PutFlowRequest>,
+    Json(request): Json<server_api::PutFlowRequest>,
 ) -> ApiResult<Json<FlowSourceRecord>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let definition = flow::compile_flow_source(&request.content).map_err(|error| {
@@ -5297,15 +5928,6 @@ async fn scoped_get_flow(
         .get_flow_source(&path.workspace_id, &path.flow_id)?
         .ok_or_else(|| Error::InvalidRecordId(path.flow_id))?;
     Ok(Json(source))
-}
-
-async fn scoped_get_workspace(
-    headers: HeaderMap,
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
-) -> ApiResult<Json<WorkspaceResponse>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    get_workspace(headers, State(api)).await
 }
 
 async fn scoped_get_workspace_settings(
@@ -5506,13 +6128,6 @@ async fn scoped_get_prompt_projection(
         .prompt_projection_cache
         .resolve(&path.workspace_id, &state)?;
     Ok(Json(projection.as_ref().clone()))
-}
-
-#[derive(Debug, Serialize)]
-struct WorkspaceConfigTreeResponse {
-    snapshot: ConfigTreeSnapshot,
-    contract: config_source::ToolchainContract,
-    projection_digest: String,
 }
 
 async fn scoped_get_workspace_memory_settings(
@@ -5798,7 +6413,7 @@ async fn scoped_delete_repository_ssh_host_trust(
 async fn scoped_get_workspace_config_tree(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
-) -> ApiResult<Json<WorkspaceConfigTreeResponse>> {
+) -> ApiResult<Json<server_api::WorkspaceConfigTreeResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let state = api
         .config_store
@@ -5812,11 +6427,7 @@ async fn scoped_get_workspace_config_tree(
             ),
             projection_digest: config_source::digest_bytes(b"[]"),
         });
-    Ok(Json(WorkspaceConfigTreeResponse {
-        snapshot: state.snapshot,
-        contract: state.contract,
-        projection_digest: state.projection_digest,
-    }))
+    Ok(Json(project_server_dto(&state)?))
 }
 
 async fn scoped_get_workspace_config_entry(
@@ -5844,7 +6455,7 @@ async fn scoped_commit_workspace_config_tree(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     Json(request): Json<ConfigCommitRequest>,
-) -> ApiResult<(StatusCode, Json<WorkspaceConfigTreeResponse>)> {
+) -> ApiResult<(StatusCode, Json<server_api::WorkspaceConfigTreeResponse>)> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let candidate = api
         .config_store
@@ -5871,14 +6482,7 @@ async fn scoped_commit_workspace_config_tree(
             .runtime
             .observe_workspace_prompt_projection((*projection).clone());
     }
-    Ok((
-        StatusCode::CREATED,
-        Json(WorkspaceConfigTreeResponse {
-            snapshot: state.snapshot,
-            contract: state.contract,
-            projection_digest: state.projection_digest,
-        }),
-    ))
+    Ok((StatusCode::CREATED, Json(project_server_dto(&state)?)))
 }
 
 async fn scoped_get_profile_settings(
@@ -15915,12 +16519,10 @@ async fn require_actor(api: &ServerAuthApi, headers: &HeaderMap) -> ApiResult<Re
     })
 }
 
-async fn get_workspace(
-    headers: HeaderMap,
-    State(api): State<WorkspaceApi>,
-) -> ApiResult<Json<WorkspaceResponse>> {
-    let cookie_name = auth_public_config(&api.config).cookie_name;
-    let actor = resolve_request_actor(api.store.as_ref(), &headers, &cookie_name).await?;
+async fn workspace_response(
+    api: &WorkspaceApi,
+    actor: Option<RequestActor>,
+) -> ApiResult<WorkspaceResponse> {
     let schema_version = api.store.schema_version().await?;
     let stored = api
         .store
@@ -15932,7 +16534,7 @@ async fn get_workspace(
         .is_some_and(|actor| stored.owner_account_id == actor.account_id);
     let companion_status = api.companion.status();
     let companion_console = companion_console_extension_point(&companion_status);
-    Ok(Json(WorkspaceResponse {
+    Ok(WorkspaceResponse {
         workspace_id: stored.workspace_id,
         display_name: stored.display_name,
         record_authority: "server_db".to_string(),
@@ -15958,7 +16560,7 @@ async fn get_workspace(
             },
             companion_console,
         },
-    }))
+    })
 }
 
 fn companion_console_extension_point(
@@ -22570,10 +23172,10 @@ mod tests {
     #[test]
     fn workspace_deletion_execution_is_server_owned_and_polling_is_read_only() {
         let source = include_str!("server.rs");
-        let start = handler_source(source, "start_server_workspace_deletion");
+        let start = handler_source(source, "workspace_deletion_start");
         assert!(start.contains("schedule_workspace_deletion"));
         assert!(!start.contains("execute_workspace_deletion(&request"));
-        let poll = handler_source(source, "get_server_workspace_deletion");
+        let poll = handler_source(source, "workspace_deletion_get");
         assert!(!poll.contains("execute_workspace_deletion"));
         assert!(source.contains("api.recover_workspace_deletions().await?"));
     }
@@ -22611,9 +23213,10 @@ mod tests {
             .find(&format!("async fn {name}"))
             .unwrap_or_else(|| panic!("missing handler {name}"));
         let tail = &source[start..];
-        let end = tail[1..]
-            .find("\nasync fn ")
-            .map(|offset| offset + 1)
+        let end = ["\nasync fn ", "\n    async fn "]
+            .into_iter()
+            .filter_map(|prefix| tail[1..].find(prefix).map(|offset| offset + 1))
+            .min()
             .unwrap_or(tail.len());
         &tail[..end]
     }
@@ -37190,6 +37793,55 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
         assert_eq!(shown["title"], "Objective CRUD updated");
         assert_eq!(shown["state"], "paused");
         assert_eq!(shown["linked_tickets"], json!(["00000000001J3"]));
+    }
+
+    #[tokio::test]
+    async fn generated_config_source_routes_preserve_nested_entry_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_app(dir.path()).await;
+        let source_tree_path = format!("/api/w/{TEST_WORKSPACE_ID}/config/source-tree");
+        let initial = get_json(app.clone(), &source_tree_path).await;
+        let revision = initial["snapshot"]["revision"].as_u64().unwrap();
+        let digest = initial["snapshot"]["digest"].as_str().unwrap();
+
+        let committed = request_json(
+            app.clone(),
+            "POST",
+            &format!("{source_tree_path}/commit"),
+            Some(json!({
+                "base_revision": revision,
+                "base_digest": digest,
+                "changes": [{
+                    "kind": "create",
+                    "path": "notes/readme.txt",
+                    "content_type": "text",
+                    "content": "nested entry"
+                }],
+                "entrypoints": ["main.dcdl"]
+            })),
+            StatusCode::CREATED,
+        )
+        .await;
+        let committed_revision = committed["snapshot"]["revision"].as_u64().unwrap();
+
+        let revision_snapshot = get_json(
+            app.clone(),
+            &format!("{source_tree_path}/revisions/{committed_revision}"),
+        )
+        .await;
+        assert_eq!(revision_snapshot["revision"], committed_revision);
+        assert_eq!(
+            revision_snapshot["entries"]["notes/readme.txt"]["content"],
+            "nested entry"
+        );
+
+        let entry = get_json(
+            app,
+            &format!("{source_tree_path}/entries/notes%2Freadme.txt"),
+        )
+        .await;
+        assert_eq!(entry["path"], "notes/readme.txt");
+        assert_eq!(entry["content"], "nested entry");
     }
 
     #[tokio::test]

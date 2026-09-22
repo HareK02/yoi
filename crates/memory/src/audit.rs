@@ -4,6 +4,7 @@
 //! backend operation boundary. Repository-local audit logs are not an authority.
 
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -11,7 +12,7 @@ fn is_zero_usize(value: &usize) -> bool {
     *value == 0
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditWorker {
     MemoryExtract,
@@ -27,7 +28,7 @@ impl AuditWorker {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerLifecycleStatus {
     Started,
@@ -49,7 +50,7 @@ impl WorkerLifecycleStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditTrigger {
     SessionEnd,
@@ -77,7 +78,7 @@ impl AuditTrigger {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditStatus {
     Success,
@@ -85,7 +86,7 @@ pub enum AuditStatus {
     Skipped,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelAudit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ref_: Option<String>,
@@ -95,31 +96,39 @@ pub struct ModelAudit {
     pub model_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct UsageAudit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub output_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub total_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub cache_read_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub cache_creation_input_tokens: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ExtractAudit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segment_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<crate::schema::JsonSafeU64Pair>")]
     pub entry_range: Option<[u64; 2]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<crate::schema::JsonSafeU64Pair>")]
     pub history_range: Option<[u64; 2]>,
     #[serde(default)]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub staging_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub staging_ids: Vec<String>,
@@ -127,13 +136,16 @@ pub struct ExtractAudit {
     pub staging_paths: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ConsolidationAudit {
     #[serde(default)]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub staging_count: usize,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub invalid_staging_count: usize,
     #[serde(default)]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub staging_bytes: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consumed_staging_ids: Vec<String>,
@@ -141,19 +153,25 @@ pub struct ConsolidationAudit {
     pub operations: OperationCounts,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct OperationCounts {
     #[serde(default)]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub write: usize,
     #[serde(default)]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub edit: usize,
     #[serde(default)]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub delete: usize,
     #[serde(default)]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub drop: usize,
     #[serde(default)]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub merge: usize,
     #[serde(default)]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub trim: usize,
 }
 
@@ -163,15 +181,17 @@ impl OperationCounts {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MemorySettingsAudit {
     pub workspace_id: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub settings_revision: u64,
     pub language: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkerLifecycleAudit {
+    #[schemars(with = "String")]
     pub run_id: Uuid,
     pub worker: AuditWorker,
     pub status: WorkerLifecycleStatus,
@@ -189,7 +209,7 @@ pub struct WorkerLifecycleAudit {
     pub consolidation: Option<ConsolidationAudit>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RecordOperationAudit {
     pub op: String,
     pub status: AuditStatus,
@@ -204,7 +224,7 @@ pub struct RecordOperationAudit {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RecordUsageAudit {
     pub op: String,
     pub status: AuditStatus,
@@ -216,12 +236,13 @@ pub struct RecordUsageAudit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub result_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AuditPayload {
     WorkerLifecycle(WorkerLifecycleAudit),
@@ -229,9 +250,11 @@ pub enum AuditPayload {
     RecordUsage(RecordUsageAudit),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AuditEvent {
+    #[schemars(with = "String")]
     pub id: Uuid,
+    #[schemars(with = "String")]
     pub occurred_at: DateTime<Utc>,
     #[serde(flatten)]
     pub payload: AuditPayload,

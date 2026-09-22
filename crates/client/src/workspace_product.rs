@@ -310,14 +310,14 @@ impl BackendWorkspaceProductClient {
     }
 
     pub fn memory_document(&self) -> Result<MemoryDocumentResponse, BackendWorkspaceClientError> {
-        self.get_json("/memory")
+        crate::backend_workspace::memory_document_blocking(&self.api, &self.workspace_id)
     }
 
     pub fn list_memory_staging(
         &self,
         limit: usize,
     ) -> Result<MemoryStagingListResponse, BackendWorkspaceClientError> {
-        self.get_json(&format!("/memory/staging?limit={limit}"))
+        crate::backend_workspace::memory_staging_list_blocking(&self.api, &self.workspace_id, limit)
     }
 
     pub fn launch_ticket_intake(
@@ -813,7 +813,16 @@ mod tests {
 
         let error = client.list_memory_staging(10).unwrap_err();
 
-        assert!(matches!(error, BackendWorkspaceClientError::Http(_)));
+        assert!(matches!(
+            error,
+            BackendWorkspaceClientError::ServerApi(
+                server_api::client_support::ClientError::Failure(
+                    server_api::client_support::ClientFailure::Decode {
+                        kind: server_api::client_support::DecodeKind::Success,
+                    },
+                ),
+            )
+        ));
         assert!(
             request
                 .recv()

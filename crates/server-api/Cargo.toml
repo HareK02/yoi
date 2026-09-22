@@ -11,6 +11,7 @@ typescript = ["dep:ts-rs", "protocol/typescript"]
 
 [dependencies]
 api-macros = { workspace = true, features = ["reqwest", "axum", "openapi"] }
+memory.workspace = true
 protocol.workspace = true
 runtime-api.workspace = true
 schemars.workspace = true

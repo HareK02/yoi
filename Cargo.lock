@@ -4149,6 +4149,7 @@ name = "server-api"
 version = "0.1.0"
 dependencies = [
  "api-macros",
+ "memory",
  "protocol",
  "runtime-api",
  "schemars",
