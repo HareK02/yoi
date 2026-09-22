@@ -1,6 +1,94 @@
 {
   "components": {
     "schemas": {
+      "ActorAuthMethod": {
+        "description": "Authentication method that established the current request actor.",
+        "enum": [
+          "browser_session",
+          "api_token"
+        ],
+        "type": "string"
+      },
+      "AuthBootstrapUserRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "handle": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "handle"
+        ],
+        "type": "object"
+      },
+      "AuthPublicConfig": {
+        "additionalProperties": false,
+        "description": "Public browser-authentication configuration.",
+        "properties": {
+          "cookie_name": {
+            "type": "string"
+          },
+          "origin": {
+            "type": "string"
+          },
+          "public_base_url": {
+            "type": "string"
+          },
+          "rp_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "rp_id",
+          "origin",
+          "public_base_url",
+          "cookie_name"
+        ],
+        "type": "object"
+      },
+      "AuthUserResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "user": {
+            "$ref": "#/components/schemas/AuthenticatedUser"
+          }
+        },
+        "required": [
+          "user"
+        ],
+        "type": "object"
+      },
+      "AuthenticatedUser": {
+        "additionalProperties": false,
+        "description": "Public user identity returned by authentication operations.",
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "handle": {
+            "type": "string"
+          },
+          "user_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "account_id",
+          "handle",
+          "display_name"
+        ],
+        "type": "object"
+      },
       "CreateWorkspaceRepositoryRequest": {
         "additionalProperties": false,
         "description": "Browser/user intent for registering one Repository in a Workspace.\n\nThe Server parses and canonicalizes `source`; callers cannot assert a\ntransport classification or supply credential material through this DTO.",
@@ -41,6 +129,146 @@
           "workspace_id",
           "repository_key",
           "replayed"
+        ],
+        "type": "object"
+      },
+      "DeviceAccessTokenType": {
+        "enum": [
+          "Bearer"
+        ],
+        "type": "string"
+      },
+      "DeviceLoginApprovalStatus": {
+        "enum": [
+          "approved"
+        ],
+        "type": "string"
+      },
+      "DeviceLoginApproveRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "user_code": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_code"
+        ],
+        "type": "object"
+      },
+      "DeviceLoginApproveResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/DeviceLoginApprovalStatus"
+          },
+          "user": {
+            "$ref": "#/components/schemas/AuthenticatedUser"
+          }
+        },
+        "required": [
+          "status",
+          "user"
+        ],
+        "type": "object"
+      },
+      "DeviceLoginPollRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "device_code": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_code"
+        ],
+        "type": "object"
+      },
+      "DeviceLoginPollResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "access_token": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/DeviceLoginPollStatus"
+          },
+          "token_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeviceAccessTokenType"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "DeviceLoginPollStatus": {
+        "enum": [
+          "pending",
+          "approved",
+          "expired",
+          "denied",
+          "consumed"
+        ],
+        "type": "string"
+      },
+      "DeviceLoginStartRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "client_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "DeviceLoginStartResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "device_code": {
+            "type": "string"
+          },
+          "expires_in": {
+            "format": "uint64",
+            "maximum": 86400,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "interval": {
+            "format": "uint64",
+            "maximum": 60,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "user_code": {
+            "type": "string"
+          },
+          "verification_uri": {
+            "type": "string"
+          },
+          "verification_uri_complete": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_code",
+          "user_code",
+          "verification_uri",
+          "verification_uri_complete",
+          "expires_in",
+          "interval"
         ],
         "type": "object"
       },
@@ -123,7 +351,114 @@
         ],
         "type": "object"
       },
+      "HealthResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "InitialRepositoryIntent": {
+        "additionalProperties": false,
+        "description": "Initial Repository registration intent for Workspace creation.",
+        "properties": {
+          "default_ref": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repository_key": {
+            "type": "string"
+          },
+          "uri": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository_key",
+          "uri"
+        ],
+        "type": "object"
+      },
+      "PasskeyLoginOptionsRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "browser_origin": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "handle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "PasskeyLoginOptionsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "challenge_id": {
+            "type": "string"
+          },
+          "public_key": true
+        },
+        "required": [
+          "challenge_id",
+          "public_key"
+        ],
+        "type": "object"
+      },
+      "PasskeyRegistrationOptionsRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "browser_origin": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "handle": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "handle"
+        ],
+        "type": "object"
+      },
+      "PasskeyRegistrationOptionsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "challenge_id": {
+            "type": "string"
+          },
+          "public_key": true
+        },
+        "required": [
+          "challenge_id",
+          "public_key"
+        ],
+        "type": "object"
+      },
       "RepositoryApiError": {
+        "additionalProperties": false,
         "description": "Error body shared by the existing repository routes and their generated adapters.",
         "properties": {
           "diagnostics": {
@@ -334,6 +669,449 @@
         ],
         "type": "object"
       },
+      "RequestActor": {
+        "additionalProperties": false,
+        "description": "Authenticated actor returned by `GET /api/auth/whoami`.",
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "auth_method": {
+            "$ref": "#/components/schemas/ActorAuthMethod"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "handle": {
+            "type": "string"
+          },
+          "user_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "account_id",
+          "handle",
+          "display_name",
+          "auth_method"
+        ],
+        "type": "object"
+      },
+      "WhoamiResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RequestActor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "WorkspaceCatalogListResponse": {
+        "description": "Public response returned by `GET /api/workspaces`.\n\nThe transparent newtype keeps the established top-level JSON array while making the\ncomplete list response a named cross-crate and generated-TypeScript authority.",
+        "items": {
+          "$ref": "#/components/schemas/WorkspaceSummary"
+        },
+        "type": "array"
+      },
+      "WorkspaceCreateRequest": {
+        "additionalProperties": false,
+        "description": "Request for atomically creating a Workspace and its initial Repository.",
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "operation_key": {
+            "type": "string"
+          },
+          "repository": {
+            "$ref": "#/components/schemas/InitialRepositoryIntent"
+          }
+        },
+        "required": [
+          "operation_key",
+          "display_name",
+          "repository"
+        ],
+        "type": "object"
+      },
+      "WorkspaceCreateResponse": {
+        "additionalProperties": false,
+        "description": "Response returned after atomically creating a Workspace and its first Repository.",
+        "properties": {
+          "config_revision": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "replayed": {
+            "type": "boolean"
+          },
+          "repository": {
+            "$ref": "#/components/schemas/WorkspaceRepositoryRecord"
+          },
+          "request_fingerprint": {
+            "type": "string"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WorkspaceSummary"
+          }
+        },
+        "required": [
+          "workspace",
+          "repository",
+          "config_revision",
+          "request_fingerprint",
+          "replayed"
+        ],
+        "type": "object"
+      },
+      "WorkspaceDeletionBlocker": {
+        "additionalProperties": false,
+        "description": "One bounded, user-actionable blocker returned by preflight or execution.",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/WorkspaceDeletionBlockerKind"
+          },
+          "message": {
+            "type": "string"
+          },
+          "resource_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resource_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "message"
+        ],
+        "type": "object"
+      },
+      "WorkspaceDeletionBlockerKind": {
+        "description": "Stable category explaining why Workspace deletion cannot currently advance.",
+        "enum": [
+          "last_accessible_workspace",
+          "revision_conflict",
+          "dirty_workdir",
+          "worker_removal_blocked",
+          "workdir_removal_blocked",
+          "retention_hold",
+          "cleanup_unavailable"
+        ],
+        "type": "string"
+      },
+      "WorkspaceDeletionOperationResponse": {
+        "additionalProperties": false,
+        "description": "Durable deletion operation projection used by request responses and polling.",
+        "properties": {
+          "blockers": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceDeletionBlocker"
+            },
+            "type": "array"
+          },
+          "child_operation_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "failure_category": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "resources": {
+            "$ref": "#/components/schemas/WorkspaceDeletionResourceCounts"
+          },
+          "state": {
+            "$ref": "#/components/schemas/WorkspaceDeletionState"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "workspace_id",
+          "display_name",
+          "state",
+          "resources",
+          "child_operation_ids",
+          "blockers",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "WorkspaceDeletionPreflightResponse": {
+        "additionalProperties": false,
+        "description": "Owner-only impact preview for deleting one Workspace.",
+        "properties": {
+          "blockers": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceDeletionBlocker"
+            },
+            "type": "array"
+          },
+          "can_delete": {
+            "type": "boolean"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "expected_revision": {
+            "description": "Opaque persisted Workspace metadata revision used as a CAS fence.",
+            "type": "string"
+          },
+          "resources": {
+            "$ref": "#/components/schemas/WorkspaceDeletionResourceCounts"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "display_name",
+          "expected_revision",
+          "can_delete",
+          "resources",
+          "blockers"
+        ],
+        "type": "object"
+      },
+      "WorkspaceDeletionRequest": {
+        "additionalProperties": false,
+        "description": "Idempotent request to start or resume Workspace deletion.",
+        "properties": {
+          "confirmation": {
+            "type": "string"
+          },
+          "expected_revision": {
+            "type": "string"
+          },
+          "operation_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "expected_revision",
+          "confirmation"
+        ],
+        "type": "object"
+      },
+      "WorkspaceDeletionResourceCounts": {
+        "additionalProperties": false,
+        "description": "Workspace-owned resources summarized before destructive confirmation.",
+        "properties": {
+          "artifacts": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "repositories": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "runtime_bindings": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "secrets": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "workdirs": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "workers": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "workers",
+          "workdirs",
+          "repositories",
+          "runtime_bindings",
+          "secrets",
+          "artifacts"
+        ],
+        "type": "object"
+      },
+      "WorkspaceDeletionState": {
+        "description": "Lifecycle state for one durable Workspace deletion operation.",
+        "enum": [
+          "queued",
+          "running",
+          "blocked",
+          "failed",
+          "succeeded"
+        ],
+        "type": "string"
+      },
+      "WorkspaceListQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "WorkspaceRepositoryRecord": {
+        "additionalProperties": false,
+        "description": "Public Repository record embedded in Workspace creation responses.",
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "default_ref": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "observed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "observed_status": {
+            "$ref": "#/components/schemas/RepositoryObservedStatus"
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repository_key": {
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/RepositorySource"
+          },
+          "source_fingerprint": {
+            "type": "string"
+          },
+          "source_revision": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "repository_key",
+          "kind",
+          "source",
+          "source_revision",
+          "source_fingerprint",
+          "observed_status",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "WorkspaceSummary": {
+        "additionalProperties": false,
+        "description": "Public Workspace catalog item returned by `GET /api/workspaces`.",
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "owner_account_id": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "owner_account_id",
+          "display_name",
+          "state",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "string": {
         "type": "string"
       }
@@ -353,10 +1131,424 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:bac8ba9340cf541183e96715dd4ccd8367f965cdcfc398e6d5091f26a903e1ef"
+    "x-yoi-source-digest": "sha256:b478a5e12b43d9ac1261ba31358a5b80bb31e398bd57eccbd797f5e92c6f48b7"
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/auth/bootstrap-user": {
+      "post": {
+        "operationId": "auth_bootstrap_user",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthBootstrapUserRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthUserResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
+    "/api/auth/config": {
+      "get": {
+        "operationId": "auth_config",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthPublicConfig"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
+    "/api/auth/device-login/approve": {
+      "post": {
+        "operationId": "auth_device_login_approve",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeviceLoginApproveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceLoginApproveResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/auth/device-login/poll": {
+      "post": {
+        "operationId": "auth_device_login_poll",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeviceLoginPollRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceLoginPollResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
+    "/api/auth/device-login/start": {
+      "post": {
+        "operationId": "auth_device_login_start",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeviceLoginStartRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceLoginStartResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
+    "/api/auth/passkeys/login/options": {
+      "post": {
+        "operationId": "auth_passkey_login_options",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyLoginOptionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasskeyLoginOptionsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
+    "/api/auth/passkeys/registration/options": {
+      "post": {
+        "operationId": "auth_passkey_registration_options",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyRegistrationOptionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasskeyRegistrationOptionsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
+    "/api/auth/whoami": {
+      "get": {
+        "operationId": "auth_whoami",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WhoamiResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
     "/api/repositories": {
       "get": {
         "operationId": "repository_list_alias",
@@ -846,6 +2038,492 @@
             "browserSession": []
           }
         ]
+      }
+    },
+    "/api/workspace-deletions/{operation_id}": {
+      "get": {
+        "operationId": "workspace_deletion_get",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceDeletionOperationResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/workspaces": {
+      "get": {
+        "operationId": "workspace_catalog_list",
+        "parameters": [
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceListQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceCatalogListResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "post": {
+        "operationId": "workspace_catalog_create",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceCreateResponse"
+                }
+              }
+            },
+            "description": "Alternate successful response"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceCreateResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/workspaces/{workspace_id}/deletion": {
+      "get": {
+        "operationId": "workspace_deletion_preflight",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceDeletionPreflightResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "post": {
+        "operationId": "workspace_deletion_start",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceDeletionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceDeletionOperationResponse"
+                }
+              }
+            },
+            "description": "Alternate successful response"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceDeletionOperationResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
       }
     }
   }

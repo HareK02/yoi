@@ -22,6 +22,7 @@ pub type ServerApiClientError = client_support::ClientError<ServerApiError>;
 
 /// Error body shared by the existing repository routes and their generated adapters.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepositoryApiError {
     pub error: String,
     pub message: String,
@@ -76,6 +77,28 @@ macro_rules! impl_openapi_schema {
 }
 
 impl_openapi_schema!(
+    AuthBootstrapUserRequest,
+    AuthPublicConfig,
+    AuthUserResponse,
+    DeviceLoginApproveRequest,
+    DeviceLoginApproveResponse,
+    DeviceLoginPollRequest,
+    DeviceLoginPollResponse,
+    DeviceLoginStartRequest,
+    DeviceLoginStartResponse,
+    HealthResponse,
+    PasskeyLoginOptionsRequest,
+    PasskeyLoginOptionsResponse,
+    PasskeyRegistrationOptionsRequest,
+    PasskeyRegistrationOptionsResponse,
+    WhoamiResponse,
+    WorkspaceCreateRequest,
+    WorkspaceCreateResponse,
+    WorkspaceDeletionOperationResponse,
+    WorkspaceDeletionPreflightResponse,
+    WorkspaceDeletionRequest,
+    WorkspaceListQuery,
+    WorkspaceCatalogListResponse,
     CreateWorkspaceRepositoryRequest,
     CreateWorkspaceRepositoryResponse,
     RepositoryApiError,
@@ -92,6 +115,162 @@ pub struct WorkspaceWorkerSessionResponse {
 
 #[api(reqwest, axum, openapi)]
 pub trait ServerApi {
+    #[get("/health", status = 200, error_status = 400)]
+    async fn health(&self) -> Result<HealthResponse, RepositoryApiError>;
+
+    #[get("/api/auth/config", status = 200, error_status = 400)]
+    async fn auth_config(&self) -> Result<AuthPublicConfig, RepositoryApiError>;
+
+    #[post(
+        "/api/auth/bootstrap-user",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [500]
+    )]
+    async fn auth_bootstrap_user(
+        &self,
+        #[body] request: AuthBootstrapUserRequest,
+    ) -> Result<AuthUserResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/auth/passkeys/registration/options",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [500, 502]
+    )]
+    async fn auth_passkey_registration_options(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[body] request: PasskeyRegistrationOptionsRequest,
+    ) -> Result<PasskeyRegistrationOptionsResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/auth/passkeys/login/options",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [500, 502]
+    )]
+    async fn auth_passkey_login_options(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[body] request: PasskeyLoginOptionsRequest,
+    ) -> Result<PasskeyLoginOptionsResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/auth/device-login/start",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [500, 502]
+    )]
+    async fn auth_device_login_start(
+        &self,
+        #[body] request: DeviceLoginStartRequest,
+    ) -> Result<DeviceLoginStartResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/auth/device-login/approve",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 500, 502],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn auth_device_login_approve(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[body] request: DeviceLoginApproveRequest,
+    ) -> Result<DeviceLoginApproveResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/auth/device-login/poll",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [500, 502]
+    )]
+    async fn auth_device_login_poll(
+        &self,
+        #[body] request: DeviceLoginPollRequest,
+    ) -> Result<DeviceLoginPollResponse, RepositoryApiError>;
+
+    #[get("/api/auth/whoami", status = 200, error_status = 400)]
+    async fn auth_whoami(
+        &self,
+        #[extension] context: ServerRequestContext,
+    ) -> Result<WhoamiResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/workspaces",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_catalog_list(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[query] query: WorkspaceListQuery,
+    ) -> Result<WorkspaceCatalogListResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/workspaces",
+        status = 201,
+        alternate_status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 409, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_catalog_create(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[body] request: WorkspaceCreateRequest,
+    ) -> Result<WorkspaceCreateResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/workspaces/{workspace_id}/deletion",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_deletion_preflight(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+    ) -> Result<WorkspaceDeletionPreflightResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/workspaces/{workspace_id}/deletion",
+        status = 202,
+        alternate_status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_deletion_start(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: WorkspaceDeletionRequest,
+    ) -> Result<WorkspaceDeletionOperationResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/workspace-deletions/{operation_id}",
+        status = 200,
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_deletion_get(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] operation_id: String,
+    ) -> Result<WorkspaceDeletionOperationResponse, RepositoryApiError>;
+
     #[get(
         "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/session",
         status = 200,
@@ -204,8 +383,30 @@ pub fn canonical_openapi_document()
     })
 }
 
+/// Server-local request context populated by authentication middleware.
+///
+/// Generated clients and OpenAPI omit extension parameters; operation implementations use this
+/// value instead of re-parsing transport headers inside domain handlers.
+#[derive(Debug, Clone)]
+pub struct ServerRequestContext {
+    pub actor: Option<RequestActor>,
+    pub origin: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HealthResponse {
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceListQuery {
+    pub limit: Option<u32>,
+}
+
 /// Public browser-authentication configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct AuthPublicConfig {
@@ -216,7 +417,7 @@ pub struct AuthPublicConfig {
 }
 
 /// Authentication method that established the current request actor.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ActorAuthMethod {
@@ -225,7 +426,7 @@ pub enum ActorAuthMethod {
 }
 
 /// Public user identity returned by authentication operations.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct AuthenticatedUser {
@@ -236,7 +437,7 @@ pub struct AuthenticatedUser {
 }
 
 /// Authenticated actor returned by `GET /api/auth/whoami`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RequestActor {
@@ -258,14 +459,14 @@ impl RequestActor {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WhoamiResponse {
     pub actor: Option<RequestActor>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct AuthBootstrapUserRequest {
@@ -275,14 +476,14 @@ pub struct AuthBootstrapUserRequest {
     pub display_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct AuthUserResponse {
     pub user: AuthenticatedUser,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct PasskeyRegistrationOptionsRequest {
@@ -295,12 +496,13 @@ pub struct PasskeyRegistrationOptionsRequest {
     pub browser_origin: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct PasskeyRegistrationOptionsResponse {
     pub challenge_id: String,
     #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
+    #[schemars(with = "serde_json::Value")]
     pub public_key: CreationChallengeResponse,
 }
 
@@ -313,7 +515,7 @@ pub struct PasskeyRegistrationCompleteRequest {
     pub credential: RegisterPublicKeyCredential,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct PasskeyLoginOptionsRequest {
@@ -325,12 +527,13 @@ pub struct PasskeyLoginOptionsRequest {
     pub browser_origin: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct PasskeyLoginOptionsResponse {
     pub challenge_id: String,
     #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
+    #[schemars(with = "serde_json::Value")]
     pub public_key: RequestChallengeResponse,
 }
 
@@ -343,7 +546,7 @@ pub struct PasskeyLoginCompleteRequest {
     pub credential: PublicKeyCredential,
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct DeviceLoginStartRequest {
@@ -355,16 +558,19 @@ pub struct DeviceLoginStartRequest {
 const DEVICE_LOGIN_EXPIRES_IN_MAX_SECONDS: u64 = 24 * 60 * 60;
 const DEVICE_LOGIN_POLL_INTERVAL_MAX_SECONDS: u64 = 60;
 
-#[derive(Clone, Serialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct DeviceLoginStartResponse {
     pub device_code: String,
     pub user_code: String,
     pub verification_uri: String,
     pub verification_uri_complete: String,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 1, max = 86400))]
     pub expires_in: u64,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 1, max = 60))]
     pub interval: u64,
 }
 
@@ -420,21 +626,21 @@ impl std::fmt::Debug for DeviceLoginStartResponse {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct DeviceLoginApproveRequest {
     pub user_code: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceLoginApprovalStatus {
     Approved,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct DeviceLoginApproveResponse {
@@ -442,20 +648,20 @@ pub struct DeviceLoginApproveResponse {
     pub user: AuthenticatedUser,
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct DeviceLoginPollRequest {
     pub device_code: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum DeviceAccessTokenType {
     Bearer,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceLoginPollStatus {
@@ -466,7 +672,7 @@ pub enum DeviceLoginPollStatus {
     Consumed,
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct DeviceLoginPollResponse {
@@ -680,7 +886,7 @@ impl RepositoryObservedStatus {
 }
 
 /// Public Workspace catalog item returned by `GET /api/workspaces`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceSummary {
@@ -696,12 +902,12 @@ pub struct WorkspaceSummary {
 ///
 /// The transparent newtype keeps the established top-level JSON array while making the
 /// complete list response a named cross-crate and generated-TypeScript authority.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkspaceCatalogListResponse(pub Vec<WorkspaceSummary>);
 
 /// Public Repository record embedded in Workspace creation responses.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceRepositoryRecord {
@@ -712,6 +918,7 @@ pub struct WorkspaceRepositoryRecord {
     pub source: RepositorySource,
     pub default_ref: Option<String>,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub source_revision: u64,
     pub source_fingerprint: String,
     pub observed_status: RepositoryObservedStatus,
@@ -721,7 +928,7 @@ pub struct WorkspaceRepositoryRecord {
 }
 
 /// Initial Repository registration intent for Workspace creation.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InitialRepositoryIntent {
     pub repository_key: String,
@@ -731,7 +938,7 @@ pub struct InitialRepositoryIntent {
 }
 
 /// Request for atomically creating a Workspace and its initial Repository.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceCreateRequest {
     pub operation_key: String,
@@ -740,16 +947,23 @@ pub struct WorkspaceCreateRequest {
 }
 
 /// Response returned after atomically creating a Workspace and its first Repository.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceCreateResponse {
     pub workspace: WorkspaceSummary,
     pub repository: WorkspaceRepositoryRecord,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub config_revision: u64,
     pub request_fingerprint: String,
     pub replayed: bool,
+}
+
+impl api_macros::HttpSuccess for WorkspaceCreateResponse {
+    fn status_code(&self) -> u16 {
+        if self.replayed { 200 } else { 201 }
+    }
 }
 
 /// Browser authentication configuration exposed by the scoped Workspace summary.
@@ -1016,7 +1230,7 @@ where
 }
 
 /// Lifecycle state for one durable Workspace deletion operation.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceDeletionState {
@@ -1028,7 +1242,7 @@ pub enum WorkspaceDeletionState {
 }
 
 /// Stable category explaining why Workspace deletion cannot currently advance.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceDeletionBlockerKind {
@@ -1042,8 +1256,9 @@ pub enum WorkspaceDeletionBlockerKind {
 }
 
 /// One bounded, user-actionable blocker returned by preflight or execution.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceDeletionBlocker {
     pub kind: WorkspaceDeletionBlockerKind,
     pub resource_kind: Option<String>,
@@ -1052,27 +1267,34 @@ pub struct WorkspaceDeletionBlocker {
 }
 
 /// Workspace-owned resources summarized before destructive confirmation.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceDeletionResourceCounts {
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub workers: u64,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub workdirs: u64,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub repositories: u64,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub runtime_bindings: u64,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub secrets: u64,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub artifacts: u64,
 }
 
 /// Owner-only impact preview for deleting one Workspace.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceDeletionPreflightResponse {
     pub workspace_id: String,
     pub display_name: String,
@@ -1084,8 +1306,9 @@ pub struct WorkspaceDeletionPreflightResponse {
 }
 
 /// Idempotent request to start or resume Workspace deletion.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceDeletionRequest {
     pub operation_id: String,
     pub expected_revision: String,
@@ -1093,8 +1316,9 @@ pub struct WorkspaceDeletionRequest {
 }
 
 /// Durable deletion operation projection used by request responses and polling.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceDeletionOperationResponse {
     pub operation_id: String,
     pub workspace_id: String,
@@ -1107,6 +1331,16 @@ pub struct WorkspaceDeletionOperationResponse {
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
+}
+
+impl api_macros::HttpSuccess for WorkspaceDeletionOperationResponse {
+    fn status_code(&self) -> u16 {
+        if self.state == WorkspaceDeletionState::Succeeded {
+            200
+        } else {
+            202
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -3881,7 +4115,6 @@ mod tests {
     #[test]
     fn worker_session_contract_and_flattened_availability_are_stable() {
         let operations = ServerApiMetadata::OPERATIONS;
-        assert_eq!(operations.len(), 6);
         let operation = operations
             .iter()
             .find(|operation| operation.operation_id == "worker_session")
@@ -3902,6 +4135,69 @@ mod tests {
         let value = serde_json::to_value(response).unwrap();
         assert_eq!(value["availability"], "live_protocol");
         assert_eq!(value["subject"]["kind"], "runtime_worker");
+    }
+
+    #[test]
+    fn auth_and_workspace_catalog_operations_are_in_server_api_metadata() {
+        let operations = ServerApiMetadata::OPERATIONS;
+        for (operation_id, method, path) in [
+            ("health", HttpMethod::Get, "/health"),
+            ("auth_config", HttpMethod::Get, "/api/auth/config"),
+            (
+                "auth_passkey_registration_options",
+                HttpMethod::Post,
+                "/api/auth/passkeys/registration/options",
+            ),
+            (
+                "auth_passkey_login_options",
+                HttpMethod::Post,
+                "/api/auth/passkeys/login/options",
+            ),
+            (
+                "auth_device_login_start",
+                HttpMethod::Post,
+                "/api/auth/device-login/start",
+            ),
+            (
+                "auth_device_login_approve",
+                HttpMethod::Post,
+                "/api/auth/device-login/approve",
+            ),
+            (
+                "auth_device_login_poll",
+                HttpMethod::Post,
+                "/api/auth/device-login/poll",
+            ),
+            ("auth_whoami", HttpMethod::Get, "/api/auth/whoami"),
+            ("workspace_catalog_list", HttpMethod::Get, "/api/workspaces"),
+            (
+                "workspace_catalog_create",
+                HttpMethod::Post,
+                "/api/workspaces",
+            ),
+            (
+                "workspace_deletion_preflight",
+                HttpMethod::Get,
+                "/api/workspaces/{workspace_id}/deletion",
+            ),
+            (
+                "workspace_deletion_start",
+                HttpMethod::Post,
+                "/api/workspaces/{workspace_id}/deletion",
+            ),
+            (
+                "workspace_deletion_get",
+                HttpMethod::Get,
+                "/api/workspace-deletions/{operation_id}",
+            ),
+        ] {
+            let operation = operations
+                .iter()
+                .find(|operation| operation.operation_id == operation_id)
+                .unwrap_or_else(|| panic!("missing ServerApi operation {operation_id}"));
+            assert_eq!(operation.method, method, "{operation_id}");
+            assert_eq!(operation.path, path, "{operation_id}");
+        }
     }
 
     #[test]
@@ -5246,6 +5542,75 @@ mod openapi_artifact_tests {
             generated, checked_in,
             "regenerate with `cargo run -p server-api --example export_openapi -- openapi/server-api.json`",
         );
+    }
+
+    #[test]
+    fn auth_and_workspace_catalog_contract_is_strict_and_excludes_cookie_routes() {
+        let document = canonical_openapi_document().expect("canonical OpenAPI contract must build");
+        let value: serde_json::Value =
+            serde_json::from_str(&document.to_json().expect("document must serialize"))
+                .expect("document must be JSON");
+
+        for (path, method) in [
+            ("/health", "get"),
+            ("/api/auth/config", "get"),
+            ("/api/auth/bootstrap-user", "post"),
+            ("/api/auth/passkeys/registration/options", "post"),
+            ("/api/auth/passkeys/login/options", "post"),
+            ("/api/auth/device-login/start", "post"),
+            ("/api/auth/device-login/approve", "post"),
+            ("/api/auth/device-login/poll", "post"),
+            ("/api/auth/whoami", "get"),
+            ("/api/workspaces", "get"),
+            ("/api/workspaces", "post"),
+            ("/api/workspaces/{workspace_id}/deletion", "get"),
+            ("/api/workspaces/{workspace_id}/deletion", "post"),
+            ("/api/workspace-deletions/{operation_id}", "get"),
+        ] {
+            assert!(
+                value["paths"][path][method].is_object(),
+                "missing {method} {path}"
+            );
+        }
+        let workspace_catalog = &value["paths"]["/api/workspaces"];
+        for method in ["get", "post"] {
+            assert_eq!(
+                workspace_catalog[method]["security"][0]["bearerAuth"],
+                serde_json::json!([])
+            );
+            assert_eq!(
+                workspace_catalog[method]["security"][1]["browserSession"],
+                serde_json::json!([])
+            );
+        }
+        for status in ["200", "201"] {
+            assert!(workspace_catalog["post"]["responses"][status].is_object());
+        }
+        let deletion_start = &value["paths"]["/api/workspaces/{workspace_id}/deletion"]["post"];
+        for status in ["200", "202", "409"] {
+            assert!(deletion_start["responses"][status].is_object());
+        }
+        for path in [
+            "/api/auth/passkeys/registration/complete",
+            "/api/auth/passkeys/login/complete",
+            "/api/auth/logout",
+        ] {
+            assert!(
+                value["paths"].get(path).is_none(),
+                "cookie response route {path} must remain outside ServerApi"
+            );
+        }
+        for schema in [
+            "RepositoryApiError",
+            "WorkspaceCreateRequest",
+            "WorkspaceDeletionRequest",
+            "DeviceLoginStartResponse",
+        ] {
+            assert_eq!(
+                value["components"]["schemas"][schema]["additionalProperties"], false,
+                "{schema} must reject unknown fields"
+            );
+        }
     }
 
     #[test]

@@ -1133,6 +1133,50 @@ impl From<&WorkspaceApi> for ServerAuthApi {
 }
 
 #[derive(Clone)]
+enum ServerApiContractService {
+    Server(WorkspaceServerApi),
+    Workspace(WorkspaceApi),
+}
+
+impl ServerApiContractService {
+    fn auth_api(&self) -> ServerAuthApi {
+        match self {
+            Self::Server(api) => ServerAuthApi {
+                config: api.template.as_ref().clone(),
+                store: api.store.clone(),
+            },
+            Self::Workspace(api) => ServerAuthApi::from(api),
+        }
+    }
+
+    fn server_api(
+        &self,
+    ) -> std::result::Result<&WorkspaceServerApi, server_api::RepositoryApiError> {
+        match self {
+            Self::Server(api) => Ok(api),
+            Self::Workspace(_) => Err(server_api::RepositoryApiError::new(
+                StatusCode::NOT_FOUND.as_u16(),
+                "Not Found",
+                "Server catalog operation is unavailable on a Workspace-local router",
+                Vec::new(),
+            )),
+        }
+    }
+
+    fn workspace_api(&self) -> std::result::Result<&WorkspaceApi, server_api::RepositoryApiError> {
+        match self {
+            Self::Workspace(api) => Ok(api),
+            Self::Server(_) => Err(server_api::RepositoryApiError::new(
+                StatusCode::NOT_FOUND.as_u16(),
+                "Not Found",
+                "Workspace-local operation is unavailable on the Server catalog router",
+                Vec::new(),
+            )),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct WorkerRemovalService {
     workspace_id: String,
     store: Arc<dyn ControlPlaneStore>,
@@ -1990,173 +2034,6 @@ fn forbidden_server_response(message: &str) -> Response {
         .into_response()
 }
 
-#[derive(Debug, Deserialize)]
-struct WorkspaceListQuery {
-    limit: Option<usize>,
-}
-
-async fn server_health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "status": "ok" }))
-}
-
-async fn list_server_workspaces(
-    State(api): State<WorkspaceServerApi>,
-    headers: HeaderMap,
-    Query(query): Query<WorkspaceListQuery>,
-) -> Response {
-    let owner_account_id = match resolve_server_actor(&api, &headers).await {
-        Ok(Some(actor)) => actor.account_id,
-        Ok(None) => match api.catalog.is_empty() {
-            Ok(true) => {
-                return Json(WorkspaceCatalogListResponse(Vec::new())).into_response();
-            }
-            Ok(false) => return StatusCode::UNAUTHORIZED.into_response(),
-            Err(error) => return server_error_response(error),
-        },
-        Err(error) => return server_error_response(error),
-    };
-    match api
-        .catalog
-        .list(&owner_account_id, query.limit.unwrap_or(100))
-    {
-        Ok(workspaces) => Json(WorkspaceCatalogListResponse(
-            workspaces.into_iter().map(workspace_summary).collect(),
-        ))
-        .into_response(),
-        Err(error) => server_error_response(error),
-    }
-}
-
-async fn create_server_workspace(
-    State(api): State<WorkspaceServerApi>,
-    headers: HeaderMap,
-    Json(request): Json<WorkspaceCreateRequest>,
-) -> Response {
-    let owner_account_id = match resolve_server_actor(&api, &headers).await {
-        Ok(Some(actor)) => actor.account_id,
-        Ok(None) => {
-            return forbidden_server_response("Workspace creation requires an authenticated owner");
-        }
-        Err(error) => return server_error_response(error),
-    };
-    let created = match api.catalog.create(request, owner_account_id) {
-        Ok(created) => created,
-        Err(error) => return server_error_response(error),
-    };
-    if let Err(error) = api
-        .router_for_workspace(&created.workspace.workspace_id)
-        .await
-    {
-        return server_error_response(error);
-    }
-    let status = if created.replayed {
-        StatusCode::OK
-    } else {
-        StatusCode::CREATED
-    };
-    (status, Json(workspace_create_response(created))).into_response()
-}
-
-async fn preflight_server_workspace_deletion(
-    State(api): State<WorkspaceServerApi>,
-    AxumPath(workspace_id): AxumPath<String>,
-    headers: HeaderMap,
-) -> Response {
-    let actor_account_id = match resolve_server_actor(&api, &headers).await {
-        Ok(Some(actor)) => actor.account_id,
-        Ok(None) => return forbidden_server_response("Workspace deletion requires its owner"),
-        Err(error) => return server_error_response(error),
-    };
-    match api
-        .workspace_deletion_preflight(&actor_account_id, &workspace_id)
-        .await
-    {
-        Ok(preflight) => Json(preflight).into_response(),
-        Err(error) => server_error_response(error),
-    }
-}
-
-async fn start_server_workspace_deletion(
-    State(api): State<WorkspaceServerApi>,
-    AxumPath(workspace_id): AxumPath<String>,
-    headers: HeaderMap,
-    Json(request): Json<WorkspaceDeletionRequest>,
-) -> Response {
-    let actor_account_id = match resolve_server_actor(&api, &headers).await {
-        Ok(Some(actor)) => actor.account_id,
-        Ok(None) => return forbidden_server_response("Workspace deletion requires its owner"),
-        Err(error) => return server_error_response(error),
-    };
-    let mutation_lock = api.mutation_lock(&workspace_id).await;
-    let _mutation_guard = mutation_lock.lock().await;
-    let existing = match api
-        .store
-        .workspace_deletion_operation(&actor_account_id, &request.operation_id)
-    {
-        Ok(existing) => existing,
-        Err(error) => return server_error_response(error),
-    };
-    if existing.is_none() {
-        let preflight = match api
-            .workspace_deletion_preflight(&actor_account_id, &workspace_id)
-            .await
-        {
-            Ok(preflight) => preflight,
-            Err(error) => return server_error_response(error),
-        };
-        if !preflight.can_delete {
-            return (StatusCode::CONFLICT, Json(preflight)).into_response();
-        }
-    }
-    let reservation =
-        match api
-            .store
-            .reserve_workspace_deletion(&actor_account_id, &workspace_id, &request)
-        {
-            Ok(reservation) => reservation,
-            Err(error) => return server_error_response(error),
-        };
-    if let Some(handle) = api.hook_handles.lock().await.remove(&workspace_id) {
-        handle.abort();
-    }
-    let operation = reservation.operation;
-    if operation.state != WorkspaceDeletionState::Succeeded {
-        api.schedule_workspace_deletion(request.operation_id).await;
-    }
-    let status = if operation.state == WorkspaceDeletionState::Succeeded {
-        StatusCode::OK
-    } else {
-        StatusCode::ACCEPTED
-    };
-    (status, Json(operation)).into_response()
-}
-
-async fn get_server_workspace_deletion(
-    State(api): State<WorkspaceServerApi>,
-    AxumPath(operation_id): AxumPath<String>,
-    headers: HeaderMap,
-) -> Response {
-    let actor_account_id = match resolve_server_actor(&api, &headers).await {
-        Ok(Some(actor)) => actor.account_id,
-        Ok(None) => {
-            return forbidden_server_response("Workspace deletion status requires its owner");
-        }
-        Err(error) => return server_error_response(error),
-    };
-    match api
-        .store
-        .workspace_deletion_operation(&actor_account_id, &operation_id)
-    {
-        Ok(Some(operation)) => Json(operation).into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            "Workspace deletion operation not found",
-        )
-            .into_response(),
-        Err(error) => server_error_response(error),
-    }
-}
-
 fn workspace_summary(record: WorkspaceRecord) -> WorkspaceSummary {
     WorkspaceSummary {
         workspace_id: record.workspace_id,
@@ -2666,22 +2543,17 @@ pub async fn build_workspace_server_router(
     let api = WorkspaceServerApi::new(template, store);
     api.preload().await?;
     api.recover_workspace_deletions().await?;
+    let contract_service = ServerApiContractService::Server(api.clone());
     let catalog = Router::new()
-        .route("/health", get(server_health))
-        .route(
-            "/api/workspaces",
-            get(list_server_workspaces).post(create_server_workspace),
-        )
-        .route(
-            "/api/workspaces/{workspace_id}/deletion",
-            get(preflight_server_workspace_deletion).post(start_server_workspace_deletion),
-        )
-        .route(
-            "/api/workspace-deletions/{operation_id}",
-            get(get_server_workspace_deletion),
-        )
         .fallback(dispatch_workspace_request)
-        .with_state(api.clone());
+        .with_state(api.clone())
+        .merge(server_api::server_api_axum::health(Arc::new(
+            contract_service.clone(),
+        )))
+        .merge(generated_auth_contract_router(contract_service.clone()))
+        .merge(generated_workspace_catalog_contract_router(
+            contract_service,
+        ));
     Ok(auth
         .merge(catalog)
         .layer(axum::middleware::from_fn_with_state(
@@ -3752,39 +3624,383 @@ fn configured_repository_from_record(record: RepositoryRecord) -> Result<Configu
 
 fn build_server_auth_router(api: ServerAuthApi) -> Router {
     Router::new()
-        .route("/api/auth/config", get(get_auth_config))
-        .route("/api/auth/bootstrap-user", post(post_auth_bootstrap_user))
-        .route(
-            "/api/auth/passkeys/registration/options",
-            post(post_passkey_registration_options),
-        )
         .route(
             "/api/auth/passkeys/registration/complete",
             post(post_passkey_registration_complete),
-        )
-        .route(
-            "/api/auth/passkeys/login/options",
-            post(post_passkey_login_options),
         )
         .route(
             "/api/auth/passkeys/login/complete",
             post(post_passkey_login_complete),
         )
         .route("/api/auth/logout", post(post_auth_logout))
-        .route(
-            "/api/auth/device-login/start",
-            post(post_device_login_start),
-        )
-        .route(
-            "/api/auth/device-login/approve",
-            post(post_device_login_approve),
-        )
-        .route("/api/auth/device-login/poll", post(post_device_login_poll))
-        .route("/api/auth/whoami", get(get_auth_whoami))
         .with_state(api)
 }
 
-impl server_api::ServerApi for WorkspaceApi {
+async fn attach_server_origin_context(mut request: Request, next: Next) -> Response {
+    let actor = request.extensions().get::<RequestActor>().cloned();
+    let origin = request_origin(request.headers());
+    request
+        .extensions_mut()
+        .insert(server_api::ServerRequestContext { actor, origin });
+    next.run(request).await
+}
+
+async fn attach_server_request_context(
+    State(service): State<ServerApiContractService>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let actor = if let Some(actor) = request.extensions().get::<RequestActor>().cloned() {
+        Some(actor)
+    } else {
+        let auth = service.auth_api();
+        match resolve_request_actor(
+            auth.store.as_ref(),
+            request.headers(),
+            &auth_public_config(&auth.config).cookie_name,
+        )
+        .await
+        {
+            Ok(actor) => actor,
+            Err(error) => return server_error_response(error),
+        }
+    };
+    let origin = request_origin(request.headers());
+    request
+        .extensions_mut()
+        .insert(server_api::ServerRequestContext { actor, origin });
+    next.run(request).await
+}
+
+fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
+    let service = Arc::new(service);
+    let origin_context = Router::new()
+        .merge(server_api::server_api_axum::auth_passkey_registration_options(service.clone()))
+        .merge(server_api::server_api_axum::auth_passkey_login_options(
+            service.clone(),
+        ))
+        .layer(middleware::from_fn(attach_server_origin_context));
+    let actor_context = Router::new()
+        .merge(server_api::server_api_axum::auth_device_login_approve(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::auth_whoami(service.clone()))
+        .layer(middleware::from_fn_with_state(
+            service.as_ref().clone(),
+            attach_server_request_context,
+        ));
+    Router::new()
+        .merge(server_api::server_api_axum::auth_config(service.clone()))
+        .merge(server_api::server_api_axum::auth_bootstrap_user(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::auth_device_login_start(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::auth_device_login_poll(service))
+        .merge(origin_context)
+        .merge(actor_context)
+}
+
+fn generated_workspace_catalog_contract_router(service: ServerApiContractService) -> Router {
+    let service = Arc::new(service);
+    Router::new()
+        .merge(server_api::server_api_axum::workspace_catalog_list(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_catalog_create(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_deletion_preflight(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_deletion_start(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_deletion_get(
+            service.clone(),
+        ))
+        .layer(middleware::from_fn_with_state(
+            service.as_ref().clone(),
+            attach_server_request_context,
+        ))
+}
+
+fn generated_workspace_contract_router(service: ServerApiContractService) -> Router {
+    let service = Arc::new(service);
+    Router::new()
+        .merge(server_api::server_api_axum::worker_session(service.clone()))
+        .merge(server_api::server_api_axum::repository_list(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::repository_list_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::repository_detail(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::repository_detail_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::repository_create(service))
+}
+
+impl server_api::ServerApi for ServerApiContractService {
+    async fn health(
+        &self,
+    ) -> std::result::Result<server_api::HealthResponse, server_api::RepositoryApiError> {
+        Ok(server_api::HealthResponse {
+            status: "ok".to_string(),
+        })
+    }
+
+    async fn auth_config(
+        &self,
+    ) -> std::result::Result<AuthPublicConfig, server_api::RepositoryApiError> {
+        Ok(auth_public_config(&self.auth_api().config))
+    }
+
+    async fn auth_bootstrap_user(
+        &self,
+        request: AuthBootstrapUserRequest,
+    ) -> std::result::Result<AuthUserResponse, server_api::RepositoryApiError> {
+        post_auth_bootstrap_user(State(self.auth_api()), Json(request))
+            .await
+            .map(|Json(response)| response)
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn auth_passkey_registration_options(
+        &self,
+        context: server_api::ServerRequestContext,
+        mut request: PasskeyRegistrationOptionsRequest,
+    ) -> std::result::Result<PasskeyRegistrationOptionsResponse, server_api::RepositoryApiError>
+    {
+        if request.browser_origin.is_none() {
+            request.browser_origin = context.origin;
+        }
+        post_passkey_registration_options(State(self.auth_api()), HeaderMap::new(), Json(request))
+            .await
+            .map(|Json(response)| response)
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn auth_passkey_login_options(
+        &self,
+        context: server_api::ServerRequestContext,
+        mut request: PasskeyLoginOptionsRequest,
+    ) -> std::result::Result<PasskeyLoginOptionsResponse, server_api::RepositoryApiError> {
+        if request.browser_origin.is_none() {
+            request.browser_origin = context.origin;
+        }
+        post_passkey_login_options(State(self.auth_api()), HeaderMap::new(), Json(request))
+            .await
+            .map(|Json(response)| response)
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn auth_device_login_start(
+        &self,
+        request: DeviceLoginStartRequest,
+    ) -> std::result::Result<DeviceLoginStartResponse, server_api::RepositoryApiError> {
+        post_device_login_start(State(self.auth_api()), Json(request))
+            .await
+            .map(|Json(response)| response)
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn auth_device_login_approve(
+        &self,
+        context: server_api::ServerRequestContext,
+        request: DeviceLoginApproveRequest,
+    ) -> std::result::Result<DeviceLoginApproveResponse, server_api::RepositoryApiError> {
+        let actor = context.actor.ok_or_else(|| {
+            server_api::RepositoryApiError::new(
+                StatusCode::UNAUTHORIZED.as_u16(),
+                "Unauthorized",
+                "request requires a browser session or Bearer API token",
+                Vec::new(),
+            )
+        })?;
+        approve_device_login(&self.auth_api(), actor, request)
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn auth_device_login_poll(
+        &self,
+        request: DeviceLoginPollRequest,
+    ) -> std::result::Result<DeviceLoginPollResponse, server_api::RepositoryApiError> {
+        post_device_login_poll(State(self.auth_api()), Json(request))
+            .await
+            .map(|Json(response)| response)
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn auth_whoami(
+        &self,
+        context: server_api::ServerRequestContext,
+    ) -> std::result::Result<WhoamiResponse, server_api::RepositoryApiError> {
+        Ok(WhoamiResponse {
+            actor: context.actor,
+        })
+    }
+
+    async fn workspace_catalog_list(
+        &self,
+        context: server_api::ServerRequestContext,
+        query: server_api::WorkspaceListQuery,
+    ) -> std::result::Result<WorkspaceCatalogListResponse, server_api::RepositoryApiError> {
+        let api = self.server_api()?;
+        let Some(actor) = context.actor else {
+            return if api
+                .catalog
+                .is_empty()
+                .map_err(|error| ApiError::from(error).into_repository_api_error())?
+            {
+                Ok(WorkspaceCatalogListResponse(Vec::new()))
+            } else {
+                Err(server_api::RepositoryApiError::new(
+                    StatusCode::UNAUTHORIZED.as_u16(),
+                    "Unauthorized",
+                    "authentication required",
+                    Vec::new(),
+                ))
+            };
+        };
+        let workspaces = api
+            .catalog
+            .list(
+                &actor.account_id,
+                query.limit.unwrap_or(100).try_into().unwrap_or(200),
+            )
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        Ok(WorkspaceCatalogListResponse(
+            workspaces.into_iter().map(workspace_summary).collect(),
+        ))
+    }
+
+    async fn workspace_catalog_create(
+        &self,
+        context: server_api::ServerRequestContext,
+        request: WorkspaceCreateRequest,
+    ) -> std::result::Result<WorkspaceCreateResponse, server_api::RepositoryApiError> {
+        let api = self.server_api()?;
+        let actor = context.actor.ok_or_else(|| {
+            server_api::RepositoryApiError::new(
+                StatusCode::FORBIDDEN.as_u16(),
+                "Forbidden",
+                "Workspace creation requires an authenticated owner",
+                Vec::new(),
+            )
+        })?;
+        let created = api
+            .catalog
+            .create(request, actor.account_id)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        api.router_for_workspace(&created.workspace.workspace_id)
+            .await
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        Ok(workspace_create_response(created))
+    }
+
+    async fn workspace_deletion_preflight(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+    ) -> std::result::Result<WorkspaceDeletionPreflightResponse, server_api::RepositoryApiError>
+    {
+        let api = self.server_api()?;
+        let actor = context.actor.ok_or_else(|| {
+            server_api::RepositoryApiError::new(
+                StatusCode::FORBIDDEN.as_u16(),
+                "Forbidden",
+                "Workspace deletion requires its owner",
+                Vec::new(),
+            )
+        })?;
+        api.workspace_deletion_preflight(&actor.account_id, &workspace_id)
+            .await
+            .map_err(|error| ApiError::from(error).into_repository_api_error())
+    }
+
+    async fn workspace_deletion_start(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: WorkspaceDeletionRequest,
+    ) -> std::result::Result<WorkspaceDeletionOperationResponse, server_api::RepositoryApiError>
+    {
+        let api = self.server_api()?;
+        let actor = context.actor.ok_or_else(|| {
+            server_api::RepositoryApiError::new(
+                StatusCode::FORBIDDEN.as_u16(),
+                "Forbidden",
+                "Workspace deletion requires its owner",
+                Vec::new(),
+            )
+        })?;
+        let mutation_lock = api.mutation_lock(&workspace_id).await;
+        let _mutation_guard = mutation_lock.lock().await;
+        let existing = api
+            .store
+            .workspace_deletion_operation(&actor.account_id, &request.operation_id)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        if existing.is_none() {
+            let preflight = api
+                .workspace_deletion_preflight(&actor.account_id, &workspace_id)
+                .await
+                .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+            if !preflight.can_delete {
+                return Err(server_api::RepositoryApiError::new(
+                    StatusCode::CONFLICT.as_u16(),
+                    "Conflict",
+                    "Workspace deletion preflight is blocked",
+                    Vec::new(),
+                ));
+            }
+        }
+        let reservation = api
+            .store
+            .reserve_workspace_deletion(&actor.account_id, &workspace_id, &request)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        if let Some(handle) = api.hook_handles.lock().await.remove(&workspace_id) {
+            handle.abort();
+        }
+        let operation = reservation.operation;
+        if operation.state != WorkspaceDeletionState::Succeeded {
+            api.schedule_workspace_deletion(request.operation_id).await;
+        }
+        Ok(operation)
+    }
+
+    async fn workspace_deletion_get(
+        &self,
+        context: server_api::ServerRequestContext,
+        operation_id: String,
+    ) -> std::result::Result<WorkspaceDeletionOperationResponse, server_api::RepositoryApiError>
+    {
+        let api = self.server_api()?;
+        let actor = context.actor.ok_or_else(|| {
+            server_api::RepositoryApiError::new(
+                StatusCode::FORBIDDEN.as_u16(),
+                "Forbidden",
+                "Workspace deletion status requires its owner",
+                Vec::new(),
+            )
+        })?;
+        api.store
+            .workspace_deletion_operation(&actor.account_id, &operation_id)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?
+            .ok_or_else(|| {
+                server_api::RepositoryApiError::new(
+                    StatusCode::NOT_FOUND.as_u16(),
+                    "Not Found",
+                    "Workspace deletion operation not found",
+                    Vec::new(),
+                )
+            })
+    }
+
     async fn worker_session(
         &self,
         workspace_id: String,
@@ -3792,7 +4008,14 @@ impl server_api::ServerApi for WorkspaceApi {
         worker_id: String,
     ) -> std::result::Result<server_api::WorkspaceWorkerSessionResponse, server_api::ServerApiError>
     {
-        if workspace_id != self.config.workspace_id {
+        let api = self.workspace_api().map_err(|_| {
+            runtime_api::RuntimeApiError::new(
+                StatusCode::NOT_FOUND.as_u16(),
+                "workspace_not_found",
+                "Workspace was not found",
+            )
+        })?;
+        if workspace_id != api.config.workspace_id {
             return Err(runtime_api::RuntimeApiError::new(
                 StatusCode::NOT_FOUND.as_u16(),
                 "workspace_not_found",
@@ -3800,7 +4023,7 @@ impl server_api::ServerApi for WorkspaceApi {
             ));
         }
         let worker = RuntimeWorkerRef::new(runtime_id.clone(), worker_id.clone());
-        let observation = self
+        let observation = api
             .runtime
             .worker_session(&workspace_id, &worker)
             .map_err(|_error| {
@@ -3824,20 +4047,18 @@ impl server_api::ServerApi for WorkspaceApi {
         workspace_id: String,
     ) -> std::result::Result<server_api::RepositoryListResponse, server_api::RepositoryApiError>
     {
-        scoped_list_repositories(
-            State(self.clone()),
-            AxumPath(ScopedWorkspacePath { workspace_id }),
-        )
-        .await
-        .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        let api = self.workspace_api()?.clone();
+        scoped_list_repositories(State(api), AxumPath(ScopedWorkspacePath { workspace_id }))
+            .await
+            .map(|Json(response)| response)
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn repository_list_alias(
         &self,
     ) -> std::result::Result<server_api::RepositoryListResponse, server_api::RepositoryApiError>
     {
-        list_repositories(State(self.clone()))
+        list_repositories(State(self.workspace_api()?.clone()))
             .await
             .map(|Json(response)| response)
             .map_err(ApiError::into_repository_api_error)
@@ -3849,8 +4070,9 @@ impl server_api::ServerApi for WorkspaceApi {
         repository_key: String,
     ) -> std::result::Result<server_api::RepositoryDetailResponse, server_api::RepositoryApiError>
     {
+        let api = self.workspace_api()?.clone();
         scoped_repository_detail(
-            State(self.clone()),
+            State(api),
             AxumPath(ScopedRepositoryPath {
                 workspace_id,
                 repository_key,
@@ -3866,10 +4088,13 @@ impl server_api::ServerApi for WorkspaceApi {
         repository_key: String,
     ) -> std::result::Result<server_api::RepositoryDetailResponse, server_api::RepositoryApiError>
     {
-        repository_detail(State(self.clone()), AxumPath(repository_key))
-            .await
-            .map(|Json(response)| response)
-            .map_err(ApiError::into_repository_api_error)
+        repository_detail(
+            State(self.workspace_api()?.clone()),
+            AxumPath(repository_key),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
     }
 
     async fn repository_create(
@@ -3880,7 +4105,7 @@ impl server_api::ServerApi for WorkspaceApi {
     ) -> std::result::Result<CreateWorkspaceRepositoryResponse, server_api::RepositoryApiError>
     {
         scoped_create_repository(
-            State(self.clone()),
+            State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
             Extension(actor),
             Json(request),
@@ -3892,7 +4117,9 @@ impl server_api::ServerApi for WorkspaceApi {
 }
 
 fn build_inner_router(api: WorkspaceApi) -> Router {
-    let auth = build_server_auth_router(ServerAuthApi::from(&api));
+    let contract_service = ServerApiContractService::Workspace(api.clone());
+    let auth = build_server_auth_router(ServerAuthApi::from(&api))
+        .merge(generated_auth_contract_router(contract_service.clone()));
     let scoped_ticket_relations_query_path =
         format!("/api/w/{{workspace_id}}{TICKET_RELATIONS_QUERY_PATH}");
     let scoped_ticket_orchestration_plans_query_path =
@@ -4489,11 +4716,9 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
             "/api/w/{workspace_id}/hosts/{host_id}/workers",
             get(scoped_list_host_workers),
         )
-        .merge(
-            server_api::ServerApiAxum::router(api.clone()).with_state::<WorkspaceApi>(()),
-        )
         .fallback(get(static_or_spa_fallback))
-        .with_state(api);
+        .with_state(api)
+        .merge(generated_workspace_contract_router(contract_service));
     auth.merge(workspace)
         .layer(middleware::from_fn(log_failed_api_response))
 }
@@ -15038,10 +15263,6 @@ async fn scoped_list_host_workers(
     list_host_workers(State(api), AxumPath(path.host_id)).await
 }
 
-async fn get_auth_config(State(api): State<ServerAuthApi>) -> ApiResult<Json<AuthPublicConfig>> {
-    Ok(Json(auth_public_config(&api.config)))
-}
-
 async fn post_auth_bootstrap_user(
     State(api): State<ServerAuthApi>,
     Json(request): Json<AuthBootstrapUserRequest>,
@@ -15387,12 +15608,11 @@ async fn post_device_login_start(
     .into())
 }
 
-async fn post_device_login_approve(
-    State(api): State<ServerAuthApi>,
-    headers: HeaderMap,
-    Json(request): Json<DeviceLoginApproveRequest>,
-) -> ApiResult<Json<DeviceLoginApproveResponse>> {
-    let actor = require_actor(&api, &headers).await?;
+fn approve_device_login(
+    api: &ServerAuthApi,
+    actor: RequestActor,
+    request: DeviceLoginApproveRequest,
+) -> ApiResult<DeviceLoginApproveResponse> {
     let flow = api
         .store
         .get_device_login_flow_by_user_code(&request.user_code.trim().to_ascii_uppercase())?
@@ -15441,10 +15661,10 @@ async fn post_device_login_approve(
         )
         .into());
     }
-    Ok(Json(DeviceLoginApproveResponse {
+    Ok(DeviceLoginApproveResponse {
         status: DeviceLoginApprovalStatus::Approved,
         user: actor.user(),
-    }))
+    })
 }
 
 async fn post_device_login_poll(
@@ -15485,15 +15705,6 @@ async fn post_device_login_poll(
         status: DeviceLoginPollStatus::Approved,
         access_token: consumed.issued_access_token,
         token_type: Some(DeviceAccessTokenType::Bearer),
-    }))
-}
-
-async fn get_auth_whoami(
-    State(api): State<ServerAuthApi>,
-    headers: HeaderMap,
-) -> ApiResult<Json<WhoamiResponse>> {
-    Ok(Json(WhoamiResponse {
-        actor: resolve_actor(&api, &headers).await?,
     }))
 }
 
