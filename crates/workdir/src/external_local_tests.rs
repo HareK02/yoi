@@ -290,6 +290,22 @@ async fn external_grep_honors_gitignore_above_a_nested_search_root() {
         root.path().join(".gitignore"),
     )
     .unwrap();
+    let glob_with_symlinked_ignore = WorkdirSession::glob(
+        &session,
+        GlobRequest {
+            pattern: "*.txt".to_string(),
+            path: WorkdirPath::new("").unwrap(),
+            limit: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        glob_with_symlinked_ignore
+            .paths
+            .iter()
+            .any(|path| path.as_str() == "nested/visible.txt")
+    );
     let symlink_error = WorkdirSession::grep(
         &session,
         GrepRequest {

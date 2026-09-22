@@ -47,6 +47,15 @@ pub fn run_glob(
     let mut walker = WalkBuilder::new(walker_root);
     walker.hidden(false).follow_links(false);
     if traversal.is_some() {
+        // Descriptor providers must never let WalkBuilder open pathname-based
+        // ignore files, which may be symlinked outside the pinned root. Glob's
+        // explicit pattern remains the complete selection contract.
+        walker
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .ignore(false)
+            .parents(false);
         let search_relative = base.strip_prefix(root).map_err(|_| {
             FsError::InvalidArgument("glob base is outside its provider root".to_string())
         })?;
