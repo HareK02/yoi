@@ -570,6 +570,21 @@ mod tests {
     }
 
     #[test]
+    fn builtin_codex_catalog_includes_gpt_6_sol_and_luna() {
+        let models = load_builtin_models().unwrap();
+
+        for model_id in ["gpt-6-sol", "gpt-6-luna"] {
+            let model = models
+                .iter()
+                .find(|model| model.provider == "codex-oauth" && model.id == model_id)
+                .unwrap_or_else(|| panic!("missing codex-oauth/{model_id}"));
+            assert_eq!(model.context_window, Some(1_050_000));
+            assert_eq!(model.max_context_window, Some(272_000));
+            assert!(model.capability.is_some());
+        }
+    }
+
+    #[test]
     fn load_providers_from_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("providers.toml");
