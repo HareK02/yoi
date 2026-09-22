@@ -24,7 +24,9 @@ pub fn run_stat(
         .check_cancelled()
         .map_err(|error| map_io(&logical, error))?;
     let path = resolve(root, &logical)?;
-    let resolved = resolve_access_path(&path).map_err(|error| map_io(&logical, error))?;
+    let resolved = access
+        .resolve_access_path(&path)
+        .map_err(|error| map_io(&logical, error))?;
     if !access.is_readable_paths(&path, &resolved) {
         return Err(FsError::OutOfScope(PathBuf::from(logical.as_str())));
     }
@@ -308,7 +310,7 @@ pub fn run_list(
         }
         let entry = entry.map_err(|error| map_io(&logical, error))?;
         let logical_absolute = logical_base.join(entry.file_name());
-        let resolved = match resolve_access_path(&logical_absolute) {
+        let resolved = match access.resolve_access_path(&logical_absolute) {
             Ok(resolved) => resolved,
             Err(_) => continue,
         };
@@ -380,7 +382,10 @@ fn require_access(
     write: bool,
     allow_symlink_directory: bool,
 ) -> Result<PathBuf, FsError> {
-    let symlink = direct_symlink(path);
+    let resolved = access
+        .resolve_access_path(path)
+        .map_err(|error| map_io(logical, error))?;
+    let symlink = (resolved != path).then(|| direct_symlink(path)).flatten();
     if let Some(info) = symlink.as_ref()
         && !info.target_exists
     {
@@ -390,7 +395,6 @@ fn require_access(
             target: PathBuf::from("<provider-internal target>"),
         });
     }
-    let resolved = resolve_access_path(path).map_err(|error| map_io(logical, error))?;
     if let Some(info) = symlink {
         let allowed = if write {
             access.is_writable_paths(path, &resolved)

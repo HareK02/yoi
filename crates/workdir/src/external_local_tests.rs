@@ -2,9 +2,10 @@ use crate::http::{
     WorkdirSessionOperation, WorkdirSessionOperationResult, dispatch_workdir_session_operation,
 };
 use crate::{
-    BoundedReadLimits, CommandRequest, EditRequest, ExternalWorkdirRoot, LocalWorkdirSession,
-    ReadRequest, Workdir, WorkdirError, WorkdirPath, WorkdirSession, WorkdirSessionCapabilities,
-    WorkdirSessionCapability, WriteRequest,
+    BoundedReadLimits, CommandRequest, EditRequest, ExternalWorkdirRoot, GlobRequest,
+    GrepOutputMode, GrepRequest, LocalWorkdirSession, ReadRequest, Workdir, WorkdirError,
+    WorkdirPath, WorkdirSession, WorkdirSessionCapabilities, WorkdirSessionCapability,
+    WriteRequest,
 };
 
 fn external_session(root: &tempfile::TempDir, limits: BoundedReadLimits) -> LocalWorkdirSession {
@@ -206,10 +207,13 @@ async fn external_local_provider_rejects_symlink_roots_and_traversal() {
         )
         .await
         .unwrap_err();
-        assert!(matches!(
-            error,
-            WorkdirError::SymlinkOutOfScope { .. } | WorkdirError::OutOfScope(_)
-        ));
+        assert!(
+            matches!(
+                error,
+                WorkdirError::SymlinkOutOfScope { .. } | WorkdirError::OutOfScope(_)
+            ),
+            "unexpected error for {path}: {error:?}"
+        );
     }
 
     let parent = tempfile::tempdir().unwrap();
@@ -226,18 +230,101 @@ async fn external_local_provider_rejects_symlink_roots_and_traversal() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn external_grep_honors_gitignore_above_a_nested_search_root() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("nested")).unwrap();
+    std::fs::write(root.path().join(".gitignore"), "nested/ignored.txt\n").unwrap();
+    std::fs::write(root.path().join("nested/ignored.txt"), "needle ignored\n").unwrap();
+    std::fs::write(root.path().join("nested/visible.txt"), "needle visible\n").unwrap();
+    let session = external_session(&root, BoundedReadLimits::new(4096, 1024).unwrap());
+
+    let result = WorkdirSession::grep(
+        &session,
+        GrepRequest {
+            pattern: "needle".to_string(),
+            path: WorkdirPath::new("nested").unwrap(),
+            glob: Some("*.txt".to_string()),
+            file_type: None,
+            case_insensitive: false,
+            before_context: 0,
+            after_context: 0,
+            multiline: false,
+            output_mode: GrepOutputMode::FilesWithMatches,
+            limit: 10,
+            offset: 0,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(result.output.contains("nested/visible.txt"));
+    assert!(!result.output.contains("nested/ignored.txt"));
+
+    std::fs::write(root.path().join(".gitignore"), "nested/\n").unwrap();
+    let explicit_ignored_root = WorkdirSession::grep(
+        &session,
+        GrepRequest {
+            pattern: "needle".to_string(),
+            path: WorkdirPath::new("nested").unwrap(),
+            glob: Some("*.txt".to_string()),
+            file_type: None,
+            case_insensitive: false,
+            before_context: 0,
+            after_context: 0,
+            multiline: false,
+            output_mode: GrepOutputMode::FilesWithMatches,
+            limit: 10,
+            offset: 0,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(explicit_ignored_root.output.contains("nested/visible.txt"));
+    assert!(explicit_ignored_root.output.contains("nested/ignored.txt"));
+
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("ignore-rules"), "nested/visible.txt\n").unwrap();
+    std::fs::remove_file(root.path().join(".gitignore")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("ignore-rules"),
+        root.path().join(".gitignore"),
+    )
+    .unwrap();
+    let symlink_error = WorkdirSession::grep(
+        &session,
+        GrepRequest {
+            pattern: "needle".to_string(),
+            path: WorkdirPath::new("nested").unwrap(),
+            glob: Some("*.txt".to_string()),
+            file_type: None,
+            case_insensitive: false,
+            before_context: 0,
+            after_context: 0,
+            multiline: false,
+            output_mode: GrepOutputMode::FilesWithMatches,
+            limit: 10,
+            offset: 0,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(symlink_error, WorkdirError::OutOfScope(_)));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn external_local_provider_keeps_pre_grant_root_when_path_changes_before_session_creation() {
     let parent = tempfile::tempdir().unwrap();
     let approved = parent.path().join("shared");
     std::fs::create_dir(&approved).unwrap();
-    std::fs::write(approved.join("item.txt"), "approved").unwrap();
+    std::fs::write(approved.join("approved.txt"), "approved needle").unwrap();
 
     // This is the CLI's approval/open boundary. Remote grant creation happens
     // only after this descriptor has been pinned.
     let pinned = ExternalWorkdirRoot::pin(&approved).unwrap();
     std::fs::rename(&approved, parent.path().join("approved-original")).unwrap();
     std::fs::create_dir(&approved).unwrap();
-    std::fs::write(approved.join("item.txt"), "replacement").unwrap();
+    std::fs::write(approved.join("replacement.txt"), "replacement needle").unwrap();
 
     let session = LocalWorkdirSession::external_read_only_pinned(
         Workdir::new("external-workdir-pre-grant-pin"),
@@ -248,7 +335,7 @@ async fn external_local_provider_keeps_pre_grant_root_when_path_changes_before_s
     let read = WorkdirSession::read(
         &session,
         ReadRequest {
-            path: WorkdirPath::new("item.txt").unwrap(),
+            path: WorkdirPath::new("approved.txt").unwrap(),
             offset: 0,
             limit: 10,
             max_bytes: 1024,
@@ -256,7 +343,91 @@ async fn external_local_provider_keeps_pre_grant_root_when_path_changes_before_s
     )
     .await
     .unwrap();
-    assert_eq!(read.bytes, b"approved");
+    assert_eq!(read.bytes, b"approved needle");
+
+    let glob = WorkdirSession::glob(
+        &session,
+        GlobRequest {
+            pattern: "*.txt".to_string(),
+            path: WorkdirPath::new("").unwrap(),
+            limit: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        glob.paths
+            .iter()
+            .map(|path| path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["approved.txt"]
+    );
+
+    let grep = WorkdirSession::grep(
+        &session,
+        GrepRequest {
+            pattern: "needle".to_string(),
+            path: WorkdirPath::new("").unwrap(),
+            glob: Some("*.txt".to_string()),
+            file_type: None,
+            case_insensitive: false,
+            before_context: 0,
+            after_context: 0,
+            multiline: false,
+            output_mode: GrepOutputMode::FilesWithMatches,
+            limit: 10,
+            offset: 0,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(grep.output.contains("approved.txt"));
+    assert!(!grep.output.contains("replacement.txt"));
+
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "secret needle").unwrap();
+    std::fs::remove_file(approved.join("replacement.txt")).unwrap();
+    std::fs::remove_dir(&approved).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &approved).unwrap();
+
+    let glob_after_symlink_swap = WorkdirSession::glob(
+        &session,
+        GlobRequest {
+            pattern: "*.txt".to_string(),
+            path: WorkdirPath::new("").unwrap(),
+            limit: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        glob_after_symlink_swap
+            .paths
+            .iter()
+            .map(|path| path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["approved.txt"]
+    );
+    let grep_after_symlink_swap = WorkdirSession::grep(
+        &session,
+        GrepRequest {
+            pattern: "needle".to_string(),
+            path: WorkdirPath::new("").unwrap(),
+            glob: Some("*.txt".to_string()),
+            file_type: None,
+            case_insensitive: false,
+            before_context: 0,
+            after_context: 0,
+            multiline: false,
+            output_mode: GrepOutputMode::FilesWithMatches,
+            limit: 10,
+            offset: 0,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(grep_after_symlink_swap.output.contains("approved.txt"));
+    assert!(!grep_after_symlink_swap.output.contains("secret.txt"));
 }
 
 #[cfg(target_os = "linux")]

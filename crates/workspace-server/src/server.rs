@@ -723,6 +723,7 @@ struct ExternalProviderConnection {
 }
 
 struct ExternalWorkdirExpiryTask {
+    task_id: Uuid,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -8991,7 +8992,7 @@ async fn open_current_worker_workdir_session_locked(
         })?;
     if let WorkdirRegistrySource::ExternalGrant { grant_id } = &workdir.source {
         close_current_worker_attachment_session_locked(api, worker).await?;
-        let grant = api
+        let mut grant = api
             .store
             .get_external_workdir_grant(&api.config.workspace_id, grant_id)?
             .ok_or_else(|| Error::RuntimeOperationFailed {
@@ -9003,45 +9004,15 @@ async fn open_current_worker_workdir_session_locked(
             .map(|expires_at| expires_at.with_timezone(&Utc) <= Utc::now())
             .unwrap_or(true);
         if expired {
-            let updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-            api.store.update_external_workdir_grant_state(
-                &api.config.workspace_id,
-                grant_id,
-                &grant.provider_instance_id,
-                grant.generation,
-                "expired",
-                &updated_at,
-            )?;
+            grant = fence_external_workdir_grant_expired(api, grant_id)
+                .await
+                .map_err(|error| error.error)?;
+        }
+        if matches!(grant.status.as_str(), "revoked" | "expired") {
+            cleanup_external_workdir_attachments_with_lock(api, &grant.workdir_id, Some(worker))
+                .await
+                .map_err(|error| error.error)?;
             cancel_external_workdir_expiry(api, grant_id);
-            let connection = {
-                api.external_workdir_providers
-                    .lock()
-                    .expect("External Workdir provider registry poisoned")
-                    .disconnect(grant_id, grant.generation)
-            };
-            if let Some(connection) = connection {
-                let _ = connection
-                    .sender
-                    .send(ExternalProviderCommand::Revoke {
-                        reason: workdir::external::ExternalWorkdirRevokeReason::Expired,
-                    })
-                    .await;
-            }
-            close_current_worker_command_sessions_for_alias_locked(api, worker, &link.alias)
-                .await?;
-            api.store.detach_worker_workdir(
-                &api.config.workspace_id,
-                worker,
-                Some(&link.workdir_id),
-                &updated_at,
-            )?;
-            sync_runtime_worker_workdir_attachments(api, worker).map_err(|error| error.error)?;
-            api.worker_projection.refresh(worker)?;
-            return Err(Error::RuntimeOperationFailed {
-                runtime_id: "workspace-backend".to_string(),
-                code: "external_workdir_provider_expired".to_string(),
-                message: "External Workdir grant has expired".to_string(),
-            });
         }
         if grant.status != "online" {
             return Err(Error::RuntimeOperationFailed {
@@ -11950,22 +11921,30 @@ fn schedule_external_workdir_expiry(
     let grant_id = grant.grant_id.clone();
     let task_api = api.clone();
     let task_grant_id = grant_id.clone();
+    let task_id = Uuid::now_v7();
+    let task_instance_id = task_id;
+    let (start_sender, start_receiver) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
+        if start_receiver.await.is_err() {
+            return;
+        }
         let delay = (expires_at - Utc::now()).to_std().unwrap_or_default();
         tokio::time::sleep(delay).await;
         loop {
             match expire_external_workdir_grant(&task_api, &task_grant_id).await {
-                Ok(()) => break,
+                Ok(true) => break,
+                Ok(false) => {
+                    // Wall time may have moved backwards after the monotonic
+                    // sleep was calculated. Keep ownership and recheck without
+                    // detaching an active grant.
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
                 Err(error) => {
                     tracing::error!(grant_id = %task_grant_id, error = ?error, "Backend External Workdir expiry cleanup requires retry");
                     let retryable = task_api
                         .store
                         .get_external_workdir_grant(&task_api.config.workspace_id, &task_grant_id)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|grant| {
-                            matches!(grant.status.as_str(), "revoked" | "expired")
-                        });
+                        .map_or(true, |grant| grant.is_some());
                     if !retryable {
                         break;
                     }
@@ -11973,14 +11952,26 @@ fn schedule_external_workdir_expiry(
                 }
             }
         }
+        let mut tasks = task_api
+            .external_workdir_expiry_tasks
+            .lock()
+            .expect("External Workdir expiry task registry poisoned");
+        if tasks
+            .get(&task_grant_id)
+            .is_some_and(|task| task.task_id == task_instance_id)
+        {
+            tasks.remove(&task_grant_id);
+        }
     });
     let mut tasks = api
         .external_workdir_expiry_tasks
         .lock()
         .expect("External Workdir expiry task registry poisoned");
-    if let Some(existing) = tasks.insert(grant_id, ExternalWorkdirExpiryTask { handle }) {
+    if let Some(existing) = tasks.insert(grant_id, ExternalWorkdirExpiryTask { task_id, handle }) {
         existing.handle.abort();
     }
+    drop(tasks);
+    let _ = start_sender.send(());
     Ok(())
 }
 
@@ -11995,20 +11986,23 @@ fn cancel_external_workdir_expiry(api: &WorkspaceApi, grant_id: &str) {
     }
 }
 
-async fn expire_external_workdir_grant(api: &WorkspaceApi, grant_id: &str) -> ApiResult<()> {
+async fn fence_external_workdir_grant_expired(
+    api: &WorkspaceApi,
+    grant_id: &str,
+) -> ApiResult<ExternalWorkdirGrantRecord> {
     loop {
-        let grant = api
+        let mut grant = api
             .store
             .get_external_workdir_grant(&api.config.workspace_id, grant_id)?
             .ok_or_else(|| Error::InvalidInput("Unknown External Workdir grant".to_string()))?;
         if matches!(grant.status.as_str(), "revoked" | "expired") {
-            break;
+            return Ok(grant);
         }
         let expires_at = chrono::DateTime::parse_from_rfc3339(&grant.expires_at)
             .map(|value| value.with_timezone(&Utc))
             .map_err(|_| Error::Store("External Workdir grant has invalid expiry".to_string()))?;
         if expires_at > Utc::now() {
-            return Ok(());
+            return Ok(grant);
         }
         let updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         if !api.store.update_external_workdir_grant_state(
@@ -12050,20 +12044,19 @@ async fn expire_external_workdir_grant(api: &WorkspaceApi, grant_id: &str) -> Ap
             ),
             &updated_at,
         )?;
-        break;
+        grant.status = "expired".to_string();
+        grant.updated_at = updated_at;
+        return Ok(grant);
     }
-    cleanup_external_workdir_attachments_for_grant(api, grant_id).await
 }
 
-async fn cleanup_external_workdir_attachments_for_grant(
-    api: &WorkspaceApi,
-    grant_id: &str,
-) -> ApiResult<()> {
-    let grant = api
-        .store
-        .get_external_workdir_grant(&api.config.workspace_id, grant_id)?
-        .ok_or_else(|| Error::InvalidInput("Unknown External Workdir grant".to_string()))?;
-    cleanup_external_workdir_attachments(api, &grant.workdir_id).await
+async fn expire_external_workdir_grant(api: &WorkspaceApi, grant_id: &str) -> ApiResult<bool> {
+    let grant = fence_external_workdir_grant_expired(api, grant_id).await?;
+    if !matches!(grant.status.as_str(), "revoked" | "expired") {
+        return Ok(false);
+    }
+    cleanup_external_workdir_attachments(api, &grant.workdir_id).await?;
+    Ok(true)
 }
 
 async fn scoped_create_external_workdir_grant(
@@ -12166,7 +12159,7 @@ async fn scoped_external_workdir_provider_ws(
     ws: WebSocketUpgrade,
 ) -> ApiResult<Response> {
     validate_workspace_scope(&api, &workspace_id)?;
-    let grant = api
+    let mut grant = api
         .store
         .get_external_workdir_grant(&workspace_id, &grant_id)?
         .ok_or_else(|| Error::InvalidInput("Unknown External Workdir grant".to_string()))?;
@@ -12180,17 +12173,14 @@ async fn scoped_external_workdir_provider_ws(
         .map(|expires_at| expires_at.with_timezone(&Utc) <= now)
         .unwrap_or(true);
     if expired {
-        api.store.update_external_workdir_grant_state(
-            &workspace_id,
-            &grant_id,
-            &grant.provider_instance_id,
-            grant.generation,
-            "expired",
-            &now.to_rfc3339_opts(SecondsFormat::Nanos, true),
-        )?;
-        cancel_external_workdir_expiry(&api, &grant_id);
+        grant = fence_external_workdir_grant_expired(&api, &grant_id).await?;
+    }
+    if matches!(grant.status.as_str(), "revoked" | "expired") {
         cleanup_external_workdir_attachments(&api, &grant.workdir_id).await?;
-        return Err(Error::InvalidInput("External Workdir grant has expired".to_string()).into());
+        cancel_external_workdir_expiry(&api, &grant_id);
+        return Err(
+            Error::InvalidInput(format!("External Workdir grant is {}", grant.status)).into(),
+        );
     }
     Ok(ws
         .max_message_size(workdir::external::MAX_EXTERNAL_PROVIDER_FRAME_BYTES)
@@ -12551,24 +12541,13 @@ async fn scoped_get_external_workdir_grant(
             .map(|expires_at| expires_at.with_timezone(&Utc) <= now)
             .unwrap_or(true);
     if expired {
-        let updated_at = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
-        if api.store.update_external_workdir_grant_state(
-            &workspace_id,
-            &grant_id,
-            &grant.provider_instance_id,
-            grant.generation,
-            "expired",
-            &updated_at,
-        )? {
-            grant.status = "expired".to_string();
-            grant.updated_at = updated_at;
-        }
-        cancel_external_workdir_expiry(&api, &grant_id);
+        grant = fence_external_workdir_grant_expired(&api, &grant_id).await?;
     }
     // Terminal cleanup is retryable: a prior expiry/revoke may have committed
     // its fence before Runtime/session projection completed.
     if matches!(grant.status.as_str(), "expired" | "revoked") {
         cleanup_external_workdir_attachments(&api, &grant.workdir_id).await?;
+        cancel_external_workdir_expiry(&api, &grant_id);
     }
     Ok(Json(external_workdir_grant_response(&grant)))
 }
@@ -12615,7 +12594,6 @@ async fn scoped_revoke_external_workdir_grant(
         }
         grant.status = "revoked".to_string();
         grant.updated_at = updated_at;
-        cancel_external_workdir_expiry(&api, &grant_id);
         api.store.record_external_workdir_audit(
             &workspace_id,
             "account",
@@ -12634,12 +12612,21 @@ async fn scoped_revoke_external_workdir_grant(
     // Cleanup is deliberately retried for terminal grants. A prior revoke may
     // have committed its fence before a Runtime/session projection failure.
     cleanup_external_workdir_attachments(&api, &grant.workdir_id).await?;
+    cancel_external_workdir_expiry(&api, &grant_id);
     Ok(Json(external_workdir_grant_response(&grant)))
 }
 
 async fn cleanup_external_workdir_attachments(
     api: &WorkspaceApi,
     workdir_id: &str,
+) -> ApiResult<()> {
+    cleanup_external_workdir_attachments_with_lock(api, workdir_id, None).await
+}
+
+async fn cleanup_external_workdir_attachments_with_lock(
+    api: &WorkspaceApi,
+    workdir_id: &str,
+    already_locked_worker: Option<&RuntimeWorkerRef>,
 ) -> ApiResult<()> {
     let workdir = api
         .store
@@ -12657,7 +12644,7 @@ async fn cleanup_external_workdir_attachments(
         &now,
     )?;
 
-    match release_external_workdir_attachments(api, workdir_id).await {
+    match release_external_workdir_attachments(api, workdir_id, already_locked_worker).await {
         Ok(()) => {
             let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
             api.store.update_external_workdir_cleanup_state(
@@ -12705,16 +12692,66 @@ async fn cleanup_external_workdir_attachments(
     }
 }
 
-async fn release_external_workdir_attachments(
+#[cfg(test)]
+fn external_workdir_cleanup_failure_slot() -> &'static Mutex<Option<String>> {
+    use std::sync::OnceLock;
+
+    static INJECTED_WORKDIR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    INJECTED_WORKDIR.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn inject_external_workdir_cleanup_failure(workdir_id: &str) {
+    *external_workdir_cleanup_failure_slot()
+        .lock()
+        .expect("External cleanup injection lock poisoned") = Some(workdir_id.to_string());
+}
+
+#[cfg(test)]
+fn take_external_workdir_cleanup_failure(workdir_id: &str) -> bool {
+    let mut injected = external_workdir_cleanup_failure_slot()
+        .lock()
+        .expect("External cleanup injection lock poisoned");
+    if injected.as_deref() == Some(workdir_id) {
+        *injected = None;
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+fn external_workdir_cleanup_reconciliations() -> &'static Mutex<HashMap<String, usize>> {
+    use std::sync::OnceLock;
+
+    static RECONCILIATIONS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    RECONCILIATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn record_external_workdir_cleanup_reconciliation(workdir_id: &str) {
+    let mut reconciliations = external_workdir_cleanup_reconciliations()
+        .lock()
+        .expect("External cleanup reconciliation lock poisoned");
+    *reconciliations.entry(workdir_id.to_string()).or_default() += 1;
+}
+
+#[cfg(test)]
+fn external_workdir_cleanup_reconciliation_count(workdir_id: &str) -> usize {
+    external_workdir_cleanup_reconciliations()
+        .lock()
+        .expect("External cleanup reconciliation lock poisoned")
+        .get(workdir_id)
+        .copied()
+        .unwrap_or_default()
+}
+
+async fn release_external_workdir_attachment_locked(
     api: &WorkspaceApi,
     workdir_id: &str,
+    link: &WorkerWorkdirLinkRecord,
 ) -> ApiResult<()> {
-    let links = api
-        .store
-        .list_workdir_worker_links(&api.config.workspace_id, workdir_id)?;
-    for link in links.into_iter().filter(|link| link.unlinked_at.is_none()) {
-        let lock = current_worker_session_lock(api, &link.worker);
-        let _guard = lock.lock().await;
+    if link.unlinked_at.is_none() {
         close_current_worker_attachment_session_locked(api, &link.worker).await?;
         close_current_worker_command_sessions_for_alias_locked(api, &link.worker, &link.alias)
             .await?;
@@ -12724,10 +12761,47 @@ async fn release_external_workdir_attachments(
             Some(workdir_id),
             &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
         )?;
-        sync_runtime_worker_workdir_attachments(api, &link.worker)?;
-        api.worker_projection
-            .refresh(&link.worker)
-            .map_err(ApiError::from)?;
+        #[cfg(test)]
+        if take_external_workdir_cleanup_failure(workdir_id) {
+            return Err(Error::RuntimeOperationFailed {
+                runtime_id: "workspace-backend".to_string(),
+                code: "injected_external_workdir_cleanup_failure".to_string(),
+                message: "injected External Workdir attachment cleanup failure".to_string(),
+            }
+            .into());
+        }
+    }
+    // Reconcile even an already-unlinked durable link. A previous cleanup may
+    // have committed detach before Runtime persistence or projection failed.
+    #[cfg(test)]
+    record_external_workdir_cleanup_reconciliation(workdir_id);
+    sync_runtime_worker_workdir_attachments(api, &link.worker)?;
+    api.worker_projection
+        .refresh(&link.worker)
+        .map_err(ApiError::from)?;
+    Ok(())
+}
+
+async fn release_external_workdir_attachments(
+    api: &WorkspaceApi,
+    workdir_id: &str,
+    already_locked_worker: Option<&RuntimeWorkerRef>,
+) -> ApiResult<()> {
+    let Some(link) = api
+        .store
+        .latest_workdir_worker_link(&api.config.workspace_id, workdir_id)?
+    else {
+        return Ok(());
+    };
+    // The newest link is the only possible active attachment and remains the
+    // durable reconciliation target if detach committed before Runtime update.
+    // Missing/ambiguous Runtime state remains a retryable cleanup failure.
+    if already_locked_worker == Some(&link.worker) {
+        release_external_workdir_attachment_locked(api, workdir_id, &link).await?;
+    } else {
+        let lock = current_worker_session_lock(api, &link.worker);
+        let _guard = lock.lock().await;
+        release_external_workdir_attachment_locked(api, workdir_id, &link).await?;
     }
     Ok(())
 }
@@ -21226,7 +21300,13 @@ mod tests {
                             .map_err(Error::from)
                         })
                         .unwrap();
-                    if cleanup_state == "completed" {
+                    if cleanup_state == "completed"
+                        && !api
+                            .external_workdir_expiry_tasks
+                            .lock()
+                            .unwrap()
+                            .contains_key(&grant.grant_id)
+                    {
                         break;
                     }
                 }
@@ -21235,6 +21315,219 @@ mod tests {
         })
         .await
         .expect("Backend-owned expiry must run without a provider socket");
+    }
+
+    #[tokio::test]
+    async fn session_open_expiry_persists_cleanup_retry_without_deadlocking() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let Json(created_worker) = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                display_name: "External expiry Worker".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachments: Vec::new(),
+                control_operation_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let worker = RuntimeWorkerRef::new(&created_worker.runtime_id, &created_worker.worker_id);
+        let now = Utc::now();
+        let created_at = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let grant = ExternalWorkdirGrantRecord {
+            grant_id: "session-open-expiry-grant".to_string(),
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            workdir_id: "session-open-expiry-workdir".to_string(),
+            provider_instance_id: "session-open-expiry-provider".to_string(),
+            display_name: "Session-open expiry".to_string(),
+            permissions: "read_only".to_string(),
+            created_by: test_browser_request_actor().account_id,
+            created_at: created_at.clone(),
+            expires_at: (now + Duration::minutes(5)).to_rfc3339_opts(SecondsFormat::Nanos, true),
+            generation: 1,
+            status: "online".to_string(),
+            updated_at: created_at.clone(),
+        };
+        api.store
+            .create_external_workdir_grant(
+                &grant,
+                &WorkdirRegistryRecord {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    workdir_id: grant.workdir_id.clone(),
+                    display_name: Some(grant.display_name.clone()),
+                    source: WorkdirRegistrySource::ExternalGrant {
+                        grant_id: grant.grant_id.clone(),
+                    },
+                    creation_selector: None,
+                    creation_ref: None,
+                    creation_tree: None,
+                    current_selector: None,
+                    current_ref: None,
+                    current_tree: None,
+                    observed_at_epoch_seconds: None,
+                    materialization_status: "present".to_string(),
+                    cleanliness: "unknown".to_string(),
+                    created_at: created_at.clone(),
+                    updated_at: created_at.clone(),
+                },
+            )
+            .unwrap();
+        schedule_external_workdir_expiry(&api, &grant).unwrap();
+        let link = WorkerWorkdirLinkRecord {
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            worker: worker.clone(),
+            workdir_id: grant.workdir_id.clone(),
+            alias: "expired-external".to_string(),
+            linked_at: created_at,
+            unlinked_at: None,
+        };
+        api.store.attach_worker_workdir(&link).unwrap();
+        sync_runtime_worker_workdir_attachments(&api, &worker).unwrap();
+        assert!(
+            !expire_external_workdir_grant(&api, &grant.grant_id)
+                .await
+                .unwrap(),
+            "an early scheduler wake must retain ownership without cleanup"
+        );
+        assert!(
+            api.store
+                .list_workdir_worker_links(TEST_WORKSPACE_ID, &grant.workdir_id)
+                .unwrap()
+                .iter()
+                .any(|current| current.unlinked_at.is_none())
+        );
+        api.config_store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE external_workdir_grants SET expires_at = ?1 WHERE workspace_id = ?2 AND grant_id = ?3",
+                    rusqlite::params![
+                        (now - Duration::seconds(1))
+                            .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                        TEST_WORKSPACE_ID,
+                        grant.grant_id,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        inject_external_workdir_cleanup_failure(&grant.workdir_id);
+        let session_lock = current_worker_session_lock(&api, &worker);
+        let session_guard = session_lock.lock().await;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            open_current_worker_workdir_session_locked(&api, &worker, &link),
+        )
+        .await
+        .expect("session-open expiry cleanup must not reacquire its Worker lock")
+        .expect_err("injected attachment cleanup must surface");
+        assert!(matches!(
+            error,
+            Error::RuntimeOperationFailed { ref code, .. }
+                if code == "injected_external_workdir_cleanup_failure"
+        ));
+        let (status, cleanup_state, cleanup_error): (String, String, Option<String>) = api
+            .config_store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT status, cleanup_state, cleanup_error FROM external_workdir_grants WHERE workspace_id = ?1 AND grant_id = ?2",
+                    rusqlite::params![TEST_WORKSPACE_ID, grant.grant_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(Error::from)
+            })
+            .unwrap();
+        assert_eq!(status, "expired");
+        assert_eq!(cleanup_state, "retry_required");
+        assert_eq!(cleanup_error.as_deref(), Some("attachment_release_failed"));
+        assert!(
+            api.external_workdir_expiry_tasks
+                .lock()
+                .unwrap()
+                .contains_key(&grant.grant_id),
+            "retry ownership must remain until cleanup completes"
+        );
+        assert!(
+            api.store
+                .list_workdir_worker_links(TEST_WORKSPACE_ID, &grant.workdir_id)
+                .unwrap()
+                .iter()
+                .all(|current| current.unlinked_at.is_some()),
+            "durable detach commits before the injected Runtime reconciliation failure"
+        );
+        assert_eq!(
+            external_workdir_cleanup_reconciliation_count(&grant.workdir_id),
+            0,
+            "injected failure occurs after durable detach but before Runtime reconciliation"
+        );
+        drop(session_guard);
+
+        assert!(
+            expire_external_workdir_grant(&api, &grant.grant_id)
+                .await
+                .unwrap()
+        );
+        cancel_external_workdir_expiry(&api, &grant.grant_id);
+        let (cleanup_state, cleanup_error): (String, Option<String>) = api
+            .config_store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT cleanup_state, cleanup_error FROM external_workdir_grants WHERE workspace_id = ?1 AND grant_id = ?2",
+                    rusqlite::params![TEST_WORKSPACE_ID, grant.grant_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(Error::from)
+            })
+            .unwrap();
+        assert_eq!(cleanup_state, "completed");
+        assert_eq!(cleanup_error, None);
+        assert!(
+            api.store
+                .list_workdir_worker_links(TEST_WORKSPACE_ID, &grant.workdir_id)
+                .unwrap()
+                .iter()
+                .all(|current| current.unlinked_at.is_some())
+        );
+        assert_eq!(
+            external_workdir_cleanup_reconciliation_count(&grant.workdir_id),
+            1,
+            "retry must reconcile an already-unlinked durable attachment"
+        );
+        assert!(
+            api.runtime
+                .worker(&worker)
+                .unwrap()
+                .workdir_attachments
+                .iter()
+                .all(
+                    |attachment| attachment.working_directory.summary.working_directory_id
+                        != grant.workdir_id
+                ),
+            "retry must reconcile Runtime state for an already-unlinked durable attachment"
+        );
+        let audit_actions: Vec<String> = api
+            .config_store
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT action FROM audit_events WHERE workspace_id = ?1 AND target_kind = 'external_workdir_grant' AND target_id = ?2 ORDER BY created_at",
+                )?;
+                statement
+                    .query_map(rusqlite::params![TEST_WORKSPACE_ID, grant.grant_id], |row| {
+                        row.get(0)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Error::from)
+            })
+            .unwrap();
+        assert!(audit_actions.contains(&"external_workdir_grant_expired".to_string()));
+        assert!(audit_actions.contains(&"external_workdir_cleanup_attention_required".to_string()));
+        assert!(audit_actions.contains(&"external_workdir_cleanup_completed".to_string()));
     }
 
     #[tokio::test]

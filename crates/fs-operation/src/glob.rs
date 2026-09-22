@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use globset::Glob;
 use ignore::WalkBuilder;
 
-use crate::{FsAccessPolicy, FsError, FsPath, GlobRequest, GlobResult, resolve_access_path};
+use crate::{FsAccessPolicy, FsError, FsPath, GlobRequest, GlobResult};
 
 /// Execute a bounded glob entirely inside the provider process.
 pub fn run_glob(
@@ -19,10 +19,12 @@ pub fn run_glob(
         path: PathBuf::from(request.path.as_str()),
         source,
     })?;
-    let base_resolved = resolve_access_path(base).map_err(|error| FsError::Io {
-        path: PathBuf::from(request.path.as_str()),
-        source: error,
-    })?;
+    let base_resolved = access
+        .resolve_access_path(base)
+        .map_err(|error| FsError::Io {
+            path: PathBuf::from(request.path.as_str()),
+            source: error,
+        })?;
     if !access.is_readable_paths(base, &base_resolved) {
         return Err(FsError::OutOfScope(PathBuf::from(request.path.as_str())));
     }
@@ -32,8 +34,33 @@ pub fn run_glob(
     let mut matches = Vec::new();
     let mut retained_path_bytes = 0_usize;
     let mut provider_truncated = false;
-    let mut walker = WalkBuilder::new(base);
+    let traversal = access
+        .open_traversal_root(base, &base_resolved)
+        .map_err(|source| FsError::Io {
+            path: PathBuf::from(request.path.as_str()),
+            source,
+        })?;
+    let walker_root = traversal
+        .as_ref()
+        .map(|traversal| traversal.path())
+        .unwrap_or(base);
+    let mut walker = WalkBuilder::new(walker_root);
     walker.hidden(false).follow_links(false);
+    if traversal.is_some() {
+        let search_relative = base.strip_prefix(root).map_err(|_| {
+            FsError::InvalidArgument("glob base is outside its provider root".to_string())
+        })?;
+        let search_relative = search_relative.to_path_buf();
+        let filter_root = walker_root.to_path_buf();
+        walker.filter_entry(move |entry| {
+            entry
+                .path()
+                .strip_prefix(&filter_root)
+                .is_ok_and(|relative| {
+                    relative.starts_with(&search_relative) || search_relative.starts_with(relative)
+                })
+        });
+    }
     let mut visited = 0_usize;
     for entry in walker.build().flatten() {
         access.check_cancelled().map_err(|source| FsError::Io {
@@ -47,19 +74,28 @@ pub fn run_glob(
                 crate::MAX_TRAVERSAL_ENTRIES
             )));
         }
-        let path = entry.path();
-        let readable = resolve_access_path(path)
-            .is_ok_and(|resolved| access.is_readable_paths(path, &resolved));
-        if !path.is_file() || !readable {
-            continue;
-        }
-        let Ok(file) = access.open_read_file(path, path) else {
+        let walked_path = entry.path();
+        let path = if traversal.is_some() {
+            let relative = walked_path.strip_prefix(walker_root).map_err(|_| {
+                FsError::InvalidArgument(
+                    "descriptor traversal returned a path outside its root".to_string(),
+                )
+            })?;
+            root.join(relative)
+        } else {
+            walked_path.to_path_buf()
+        };
+        let resolved = match access.resolve_access_path(&path) {
+            Ok(resolved) if access.is_readable_paths(&path, &resolved) => resolved,
+            _ => continue,
+        };
+        let Ok(file) = access.open_read_file(&path, &resolved) else {
             continue;
         };
         if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
             continue;
         }
-        let relative = path.strip_prefix(base).unwrap_or(path);
+        let relative = path.strip_prefix(base).unwrap_or(&path);
         if !matcher.is_match(relative) {
             continue;
         }

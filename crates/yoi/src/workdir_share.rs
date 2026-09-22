@@ -77,11 +77,29 @@ impl Drop for OperationTask {
     }
 }
 
+fn pin_selected_root(path: &std::path::Path) -> Result<ExternalWorkdirRoot, String> {
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("failed to resolve current directory: {error}"))?;
+    pin_selected_root_from(path, &cwd)
+}
+
+fn pin_selected_root_from(
+    path: &std::path::Path,
+    cwd: &std::path::Path,
+) -> Result<ExternalWorkdirRoot, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    ExternalWorkdirRoot::pin(absolute).map_err(|error| error.to_string())
+}
+
 pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
     // Pin before creating remote authority: the Backend grant can never outlive
     // a failed local approval/open race, and subsequent path replacement cannot
     // redirect the provider.
-    let pinned_root = ExternalWorkdirRoot::pin(&options.path).map_err(|error| error.to_string())?;
+    let pinned_root = pin_selected_root(&options.path)?;
 
     let client = BackendApiClient::from_stored_token(&options.backend_url)
         .map_err(|error| error.to_string())?;
@@ -618,6 +636,16 @@ fn encode_path_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_share_path_is_resolved_and_pinned_before_backend_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let pinned = pin_selected_root_from(std::path::Path::new("."), directory.path()).unwrap();
+        assert_eq!(
+            pinned.canonical_path(),
+            directory.path().canonicalize().unwrap()
+        );
+    }
 
     #[tokio::test]
     async fn operation_shutdown_waits_until_executor_has_stopped() {

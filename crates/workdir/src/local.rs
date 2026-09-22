@@ -246,9 +246,7 @@ impl ScopeAccess {
 
     fn path_is_confined(&self, logical: &Path, resolved: &Path) -> bool {
         !self.reject_symlinks
-            || (logical.starts_with(&self.root)
-                && resolved.starts_with(&self.root)
-                && fs_operation::first_symlink(logical).is_none())
+            || (logical.starts_with(&self.root) && resolved.starts_with(&self.root))
     }
 }
 
@@ -281,6 +279,54 @@ impl fs_operation::FsAccessPolicy for ScopeAccess {
         Ok(())
     }
 
+    fn resolve_access_path(&self, logical: &Path) -> std::io::Result<PathBuf> {
+        if !self.reject_symlinks {
+            return fs_operation::resolve_access_path(logical);
+        }
+        if logical.starts_with(&self.root) {
+            Ok(logical.to_path_buf())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "path is outside provider root",
+            ))
+        }
+    }
+
+    fn open_traversal_root(
+        &self,
+        _logical: &Path,
+        resolved: &Path,
+    ) -> std::io::Result<Option<fs_operation::FsTraversalRoot>> {
+        if !self.reject_symlinks {
+            return Ok(None);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+
+            let directory = self.open_confined(resolved)?;
+            if !directory.metadata()?.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    "path is not a directory",
+                ));
+            }
+            let root = self
+                .pinned_root
+                .as_ref()
+                .expect("confined traversal requires a pinned root")
+                .try_clone()?;
+            let path = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd()));
+            return Ok(Some(fs_operation::FsTraversalRoot::new(path, root)));
+        }
+        #[cfg(not(target_os = "linux"))]
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "descriptor-rooted traversal is unavailable on this platform",
+        ))
+    }
+
     fn open_read_file(&self, _logical: &Path, resolved: &Path) -> std::io::Result<std::fs::File> {
         if self.reject_symlinks {
             self.open_confined(resolved)
@@ -289,11 +335,15 @@ impl fs_operation::FsAccessPolicy for ScopeAccess {
         }
     }
 
-    fn read_metadata(&self, logical: &Path, resolved: &Path) -> std::io::Result<std::fs::Metadata> {
+    fn read_metadata(
+        &self,
+        _logical: &Path,
+        resolved: &Path,
+    ) -> std::io::Result<std::fs::Metadata> {
         if self.reject_symlinks {
             self.open_confined(resolved)?.metadata()
         } else {
-            std::fs::symlink_metadata(logical)
+            std::fs::metadata(resolved)
         }
     }
 
@@ -1367,6 +1417,11 @@ fn sanitize_error(error: WorkdirError, logical: &WorkdirPath) -> WorkdirError {
         WorkdirError::ReadOnly(_) => WorkdirError::ReadOnly(path),
         WorkdirError::IsDirectory(_) => WorkdirError::IsDirectory(path),
         WorkdirError::NotFound(_) => WorkdirError::NotFound(path),
+        WorkdirError::Io { source, .. }
+            if source.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            WorkdirError::OutOfScope(path)
+        }
         WorkdirError::Io { source, .. } => WorkdirError::Unavailable(format!(
             "I/O operation failed for {logical}: {}",
             source.kind()

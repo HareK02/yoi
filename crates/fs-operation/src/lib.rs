@@ -110,7 +110,14 @@ pub fn open_beneath_no_symlinks_at(
         ) as RawFd
     };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error());
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "symbolic links are not permitted by this provider",
+            ));
+        }
+        return Err(error);
     }
     // SAFETY: fd is a new owned descriptor returned by openat2.
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
@@ -147,6 +154,26 @@ pub fn open_beneath_no_symlinks(_root: &Path, _path: &Path) -> std::io::Result<s
     ))
 }
 
+/// Keeps a descriptor-backed traversal path alive for the duration of a walk.
+#[derive(Debug)]
+pub struct FsTraversalRoot {
+    path: PathBuf,
+    _directory: std::fs::File,
+}
+
+impl FsTraversalRoot {
+    pub fn new(path: PathBuf, directory: std::fs::File) -> Self {
+        Self {
+            path,
+            _directory: directory,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// Provider-owned access policy used by local filesystem operations.
 pub trait FsAccessPolicy: Send + Sync {
     fn is_readable(&self, path: &Path) -> bool;
@@ -156,6 +183,23 @@ pub trait FsAccessPolicy: Send + Sync {
     /// use this for per-operation cancellation and deadlines.
     fn check_cancelled(&self) -> std::io::Result<()> {
         Ok(())
+    }
+
+    /// Resolve a logical path for authorization. Descriptor-confined providers
+    /// may retain the lexical path because the subsequent open is the authority.
+    fn resolve_access_path(&self, logical: &Path) -> std::io::Result<PathBuf> {
+        resolve_access_path(logical)
+    }
+
+    /// Return a descriptor-backed traversal root when pathname walking would
+    /// violate provider confinement. The retained directory keeps procfs-style
+    /// descriptor paths valid for the complete walk.
+    fn open_traversal_root(
+        &self,
+        _logical: &Path,
+        _resolved: &Path,
+    ) -> std::io::Result<Option<FsTraversalRoot>> {
+        Ok(None)
     }
 
     /// Open an already-authorized readable file. Capability providers override
@@ -168,10 +212,10 @@ pub trait FsAccessPolicy: Send + Sync {
     /// override this to prevent a path swap between authorization and stat.
     fn read_metadata(
         &self,
-        logical: &Path,
-        _resolved: &Path,
+        _logical: &Path,
+        resolved: &Path,
     ) -> std::io::Result<std::fs::Metadata> {
-        std::fs::symlink_metadata(logical)
+        std::fs::metadata(resolved)
     }
 
     /// Open an already-authorized directory for bounded enumeration.

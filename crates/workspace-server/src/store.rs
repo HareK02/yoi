@@ -1743,6 +1743,11 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         workspace_id: &str,
         workdir_id: &str,
     ) -> Result<Vec<WorkerWorkdirLinkRecord>>;
+    fn latest_workdir_worker_link(
+        &self,
+        workspace_id: &str,
+        workdir_id: &str,
+    ) -> Result<Option<WorkerWorkdirLinkRecord>>;
 }
 
 #[derive(Clone)]
@@ -8291,6 +8296,26 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             rows.collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(Error::from)
+        })
+    }
+
+    fn latest_workdir_worker_link(
+        &self,
+        workspace_id: &str,
+        workdir_id: &str,
+    ) -> Result<Option<WorkerWorkdirLinkRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at
+                   FROM worker_workdir_links
+                   WHERE workspace_id = ?1 AND workdir_id = ?2
+                   ORDER BY linked_at DESC, rowid DESC
+                   LIMIT 1"#,
+                params![workspace_id, workdir_id],
+                read_worker_workdir_link_record,
+            )
+            .optional()
+            .map_err(Error::from)
         })
     }
 }
